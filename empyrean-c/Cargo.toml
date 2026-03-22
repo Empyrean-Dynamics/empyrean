@@ -1,0 +1,10 @@
+[package]
+name = "empyrean-c"
+version = "0.1.0"
+edition = "2024"
+authors = ["Joachim Moeyens <joachim@empyrean-dynamics.com>", "Empyrean Dynamics"]
+publish = false
+
+[lib]
+name = "empyrean"
+crate-type = ["cdylib", "staticlib"]

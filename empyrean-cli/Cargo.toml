@@ -1,0 +1,9 @@
+[package]
+name = "empyrean-cli"
+version = "0.1.0"
+edition = "2024"
+authors = ["Joachim Moeyens <joachim@empyrean-dynamics.com>", "Empyrean Dynamics"]
+
+[[bin]]
+name = "empyrean"
+path = "src/main.rs"

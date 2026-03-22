@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = [
+    "empyrean",
+    "empyrean-sys",
+    "empyrean-c",
+    "empyrean-py",
+    "empyrean-cli",
+]

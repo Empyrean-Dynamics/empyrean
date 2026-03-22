@@ -1,0 +1,8 @@
+[package]
+name = "empyrean"
+version = "0.1.0"
+edition = "2024"
+authors = ["Joachim Moeyens <joachim@empyrean-dynamics.com>", "Empyrean Dynamics"]
+
+[lib]
+name = "empyrean"

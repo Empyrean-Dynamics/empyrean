@@ -1,0 +1,9 @@
+[package]
+name = "empyrean-sys"
+version = "0.1.0"
+edition = "2024"
+authors = ["Joachim Moeyens <joachim@empyrean-dynamics.com>", "Empyrean Dynamics"]
+links = "empyrean"
+
+[lib]
+name = "empyrean_sys"

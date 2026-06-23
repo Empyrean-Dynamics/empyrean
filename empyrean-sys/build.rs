@@ -20,6 +20,7 @@
 
 use std::env;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -135,30 +136,33 @@ fn download_prebuilt(lib_file: &str) -> PathBuf {
     }
 
     let url = format!("https://github.com/{REPO}/releases/download/v{VERSION}/{stem}.tar.gz");
-    let tarball = cache.join(format!("{stem}.tar.gz"));
     eprintln!("empyrean-sys: fetching prebuilt {stem} from {url}");
-    run(
-        "curl",
-        &["-fsSL", "-o", path_str(&tarball), &url],
-        &format!("download libempyrean from {url}"),
-    );
+
+    // Download into memory with a pure-Rust HTTPS client (rustls), following
+    // GitHub's redirect to the asset CDN — no system curl / wget / tar needed,
+    // so the crate builds in minimal containers too.
+    let resp = ureq::get(&url)
+        .call()
+        .unwrap_or_else(|e| panic!("download libempyrean from {url}: {e}"));
+    let mut bytes = Vec::new();
+    resp.into_reader()
+        .read_to_end(&mut bytes)
+        .unwrap_or_else(|e| panic!("read libempyrean download from {url}: {e}"));
 
     // Verify the pinned SHA-256 before trusting the binary.
-    let got = sha256_hex(&tarball);
+    let got = sha256_hex(&bytes);
     if got != expected_sha {
-        let _ = fs::remove_file(&tarball);
         panic!(
             "libempyrean checksum mismatch for {stem}.tar.gz\n  expected {expected_sha}\n  got      {got}\n\
              Refusing to use an unverified binary."
         );
     }
 
-    run(
-        "tar",
-        &["xzf", path_str(&tarball), "-C", path_str(&cache)],
-        "extract libempyrean tarball",
-    );
-    let _ = fs::remove_file(&tarball);
+    // Extract the gzip-compressed tar in-process.
+    let decoder = flate2::read::GzDecoder::new(&bytes[..]);
+    tar::Archive::new(decoder)
+        .unpack(&cache)
+        .unwrap_or_else(|e| panic!("extract {stem}.tar.gz: {e}"));
     assert!(
         lib_path.exists(),
         "{stem}.tar.gz did not contain {lib_file}"
@@ -218,9 +222,8 @@ fn cache_dir() -> PathBuf {
         .join(format!("{}-{}", target_arch(), target_os()))
 }
 
-fn sha256_hex(path: &Path) -> String {
-    let bytes = fs::read(path).expect("read tarball for checksum");
-    let digest = Sha256::digest(&bytes);
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "empyrean-sys"
-version = "0.7.0-rc.1"
+version = "0.7.0-rc.2"
 edition = "2024"
 rust-version = "1.90.0"
 authors = ["Joachim Moeyens <joachim@empyrean-dynamics.com>", "Empyrean Dynamics"]
@@ -36,7 +36,12 @@ links = "empyrean"
 name = "empyrean_sys"
 
 [build-dependencies]
-# Verifies the pinned SHA-256 of the downloaded prebuilt libempyrean.
-# curl / tar / install_name_tool / patchelf are invoked from the build
-# script (present on the supported macOS / Linux targets).
+# The build script downloads, verifies, and extracts the prebuilt libempyrean
+# entirely in-process (no system curl / wget / tar), so the crate builds even
+# in minimal containers. ureq uses rustls (no OpenSSL) and follows the GitHub
+# release redirect. Only install_name_tool (macOS, ships with the toolchain
+# you link with) / patchelf (Linux, optional, graceful fallback) are shelled.
+ureq = "2"
+flate2 = "1"
+tar = "0.4"
 sha2 = "0.10"

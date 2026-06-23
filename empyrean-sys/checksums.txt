@@ -8,5 +8,5 @@
 # ../target/release build and never reads them.
 #
 # Format: <asset-stem> <sha256>
-libempyrean-macos-aarch64 51ecbafc3c9a8bdf7191d083ae68b22b1381171099dad5df5e750b055b039f11
-libempyrean-linux-x86_64 951a95ae2430e75b93832499ae61f8946bc41c12d304edda2f5cdc5d9dc58d9c
+libempyrean-macos-aarch64 594992575cb7bc7991fd3654b3aa43607ac36e9c1316ee48b3996ceda0243fb3
+libempyrean-linux-x86_64 0bddb76e1b18e5b2e42bba85565899ac24912deade677bceee4fb0dfbff2210e

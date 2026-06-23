@@ -1,8 +1,55 @@
 [package]
 name = "empyrean"
-version = "0.1.0"
+version = "0.7.0-rc.0"
 edition = "2024"
+rust-version = "1.90.0"
 authors = ["Joachim Moeyens <joachim@empyrean-dynamics.com>", "Empyrean Dynamics"]
+description = "Uncertainty-first orbit propagation, ephemeris, orbit determination, and event detection for asteroids and comets, powered by automatic differentiation"
+homepage = "https://www.empyrean-dynamics.com"
+documentation = "https://docs.rs/empyrean"
+repository = "https://github.com/Empyrean-Dynamics/empyrean"
+readme = "README.md"
+license = "BSD-3-Clause"
+# crates.io enforces a 5-keyword max, 20-char-each limit. The five
+# we ship lead with the unique angle (every routine in the
+# propagator carries exact derivatives) and follow with the three
+# headline pipelines a user would search for.
+keywords = ["astrodynamics", "autodiff", "differentiable", "ephemeris", "propagation"]
+categories = ["science", "aerospace::space-protocols", "api-bindings"]
+# Ship only the wrapper sources, the per-crate README + LICENSE, and
+# the docs.rs KaTeX header. Sibling Rust crates (`empyrean-sys`,
+# `empyrean-c`, `empyrean-cli`, `empyrean-py`) and the validation
+# runners are excluded — this crate is the documented public Rust
+# surface, not the workspace as a whole. Cargo's `include` rejects
+# paths outside the crate directory, so anything we want shipped has
+# to live under `empyrean/`.
+include = [
+    "src/**/*",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE",
+    "docs/katex-header.html",
+]
 
 [lib]
 name = "empyrean"
+
+[package.metadata.docs.rs]
+# KaTeX include so the math-heavy docstrings render on docs.rs. The
+# header lives inside this crate dir (rather than at the workspace
+# root) because `cargo publish` strips anything outside the crate.
+rustdoc-args = ["--html-in-header", "docs/katex-header.html"]
+
+[dependencies]
+# `version` is required for `cargo publish`. `path` wins for sibling-
+# checkout development; the version pin is what crates.io users get
+# (cargo strips the `path` from the published manifest automatically).
+empyrean-sys = { path = "../empyrean-sys", version = "0.7.0-rc.0" }
+
+[dev-dependencies]
+# Cross-channel parity test (tests/parity.rs) reads the shared parity
+# manifest + committed core oracle. float_roundtrip matches the core
+# oracle's correctly-rounded float parsing so both start from byte-
+# identical inputs (the chaotic impactor amplifies 1-ULP differences).
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }

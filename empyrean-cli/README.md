@@ -1,0 +1,77 @@
+<img src="https://raw.githubusercontent.com/Empyrean-Dynamics/empyrean/main/docs/empyrean-dynamics-icon.png" width="140" alt="empyrean-cli">
+
+# empyrean-cli
+Command-line interface for empyrean — orbit propagation, ephemeris generation, orbit determination, and event detection
+
+<a href="https://github.com/Empyrean-Dynamics/empyrean/actions/workflows/ci.yml"><img src="https://github.com/Empyrean-Dynamics/empyrean/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+<a href="https://crates.io/crates/empyrean-cli"><img src="https://img.shields.io/crates/v/empyrean-cli.svg?style=flat-square&label=crates.io" alt="crates.io"></a>
+<a href="https://docs.rs/empyrean-cli"><img src="https://img.shields.io/docsrs/empyrean-cli?style=flat-square&label=docs.rs" alt="docs.rs"></a>
+<a href="https://github.com/Empyrean-Dynamics/empyrean/blob/main/LICENSE-BSD"><img src="https://img.shields.io/badge/source-BSD--3--Clause-blue.svg?style=flat-square" alt="Source license"></a>
+<a href="https://github.com/Empyrean-Dynamics/empyrean/blob/main/LICENSE-BINARY"><img src="https://img.shields.io/badge/binary-proprietary-lightgrey.svg?style=flat-square" alt="Binary license"></a>
+<a href="Cargo.toml"><img src="https://img.shields.io/badge/rustc-1.90%2B-orange?style=flat-square&logo=rust" alt="MSRV 1.90"></a>
+<br>
+<a href="https://claude.ai"><img src="https://img.shields.io/badge/Built%20with-Claude%20Code-D97757?logo=anthropic&logoColor=white&style=flat-square" alt="Built with Claude Code"></a>
+<a href="https://www.empyrean-dynamics.com"><img src="https://img.shields.io/badge/Website-empyrean--dynamics.com-1a1a2e?logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9IndoaXRlIiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCI+PGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iMTAiLz48bGluZSB4MT0iMiIgeTE9IjEyIiB4Mj0iMjIiIHkyPSIxMiIvPjxwYXRoIGQ9Ik0xMiAyYTE1LjMgMTUuMyAwIDAgMSA0IDEwIDE1LjMgMTUuMyAwIDAgMS00IDEwIDE1LjMgMTUuMyAwIDAgMS00LTEwIDE1LjMgMTUuMyAwIDAgMSA0LTEweiIvPjwvc3ZnPg==&logoColor=white&style=flat-square" alt="Website"></a>
+<a href="https://github.com/Empyrean-Dynamics"><img src="https://img.shields.io/badge/GitHub-Empyrean--Dynamics-1a1a2e?logo=github&logoColor=white&style=flat-square" alt="GitHub"></a>
+
+---
+
+empyrean-cli is the command-line interface to empyrean. It publishes
+one binary — `empyrean` — that runs every headline pipeline (orbit
+propagation, ephemeris generation, orbit determination, and event
+detection) and emits Parquet output you can join in pandas / Polars /
+DuckDB.
+
+## Install
+
+```sh
+cargo install empyrean-cli
+```
+
+or grab a pre-built binary for your platform from
+[GitHub Releases](https://github.com/Empyrean-Dynamics/empyrean/releases).
+The installed binary is named `empyrean`.
+
+## Quickstart
+
+```sh
+# One-time: download SPICE kernels into ~/.empyrean/data/.
+empyrean init
+
+# Propagate Apophis 10 years past its SBDB epoch.
+empyrean propagate --object-id 99942 --epoch 64922.0 --out-dir ./out
+
+# Generate an ephemeris from the same orbit at observatory 568.
+empyrean ephemeris --object-id 99942 --observers 568 --epoch 64922.0 --out-dir ./out
+
+# Fit an orbit from an ADES PSV.
+empyrean determine apophis.psv --out-dir ./out
+
+# Confirm the build provenance — every binary carries the `<tag>+<sha>`
+# strings of the villeneuve / scott / hyperjet commits it was built against.
+empyrean version
+```
+
+All commands emit Parquet tables under `--out-dir`. The schemas match
+the Python and Rust API outputs exactly — same `orbit_id` /
+`object_id` join keys, same time scales, same physical units — so you
+can mix-and-match channels for the same workflow.
+
+## Runtime requirement
+
+The `empyrean` binary links against `libempyrean.{dylib,so,dll}`,
+which is distributed separately as a binary release on
+[GitHub](https://github.com/Empyrean-Dynamics/empyrean/releases) and
+inside the published Python wheel. `cargo install empyrean-cli` will
+build the binary and expects to find the dylib on the system library
+path at runtime.
+
+## License
+
+Source code in this crate is licensed under the
+[BSD 3-Clause License](LICENSE). The installed `empyrean` binary —
+which embeds the closed-source `libempyrean` runtime — is governed
+by a separate proprietary binary license; see the main repository for
+the dual-license breakdown.
+
+Copyright © 2024–2026 Joachim Moeyens. All rights reserved.

@@ -1,9 +1,47 @@
 [package]
 name = "empyrean-cli"
-version = "0.1.0"
+version = "0.7.0-rc.0"
 edition = "2024"
+rust-version = "1.90.0"
 authors = ["Joachim Moeyens <joachim@empyrean-dynamics.com>", "Empyrean Dynamics"]
+description = "Command-line interface for empyrean — orbit propagation, ephemeris generation, orbit determination, and event detection"
+homepage = "https://www.empyrean-dynamics.com"
+documentation = "https://docs.rs/empyrean-cli"
+repository = "https://github.com/Empyrean-Dynamics/empyrean"
+readme = "README.md"
+license = "BSD-3-Clause"
+# crates.io enforces a 5-keyword max, 20-char-each limit. These five
+# lead with the unique angle (the installed binary is `empyrean`) and
+# follow with the three headline pipelines a user would search for.
+keywords = ["astrodynamics", "cli", "ephemeris", "propagation", "asteroids"]
+categories = ["command-line-utilities", "science", "aerospace::space-protocols"]
+# Ship only the binary sources + the per-crate README + LICENSE. The
+# CLI does not depend on `..` paths above the crate root, so cargo
+# publish has everything it needs in this directory.
+include = [
+    "src/**/*",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE",
+]
 
 [[bin]]
 name = "empyrean"
 path = "src/main.rs"
+
+[dependencies]
+# CLI is a distribution channel — same closed-source posture as the
+# Python wheel and C SDK. Compute and I/O both go through the empyrean
+# wrapper (which sits over the public C ABI exposed by empyrean-c).
+empyrean = { path = "../empyrean", version = "0.7.0-rc.0" }
+
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[dev-dependencies]
+# CLI parity test (tests/parity.rs). float_roundtrip makes serde_json parse
+# the shared parity manifest's floats bit-identically to the core oracle.
+serde_json = { version = "1", features = ["float_roundtrip"] }

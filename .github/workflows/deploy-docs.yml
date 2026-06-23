@@ -1,0 +1,103 @@
+name: Deploy docs to Cloudflare Pages
+
+# Builds the empyrean-py Sphinx docs (with sibling empyrean-sphinx-theme
+# checked out alongside) and pushes the resulting `_build/html/` to the
+# `empyrean-docs` Cloudflare Pages project, which serves
+# `docs.empyrean-dynamics.com`.
+#
+# We use Actions instead of Cloudflare's native git integration because
+# `empyrean-py/pyproject.toml` has a `[tool.uv.sources]` entry pointing
+# at `../../empyrean-sphinx-theme` (a sibling repo). Cloudflare's
+# auto-build container can't satisfy that on its own.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'empyrean-py/docs/**'
+      - 'empyrean-py/pyproject.toml'
+      - '.github/workflows/deploy-docs.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout empyrean
+        uses: actions/checkout@v4
+        with:
+          path: empyrean
+
+      - name: Checkout empyrean-sphinx-theme (sibling)
+        uses: actions/checkout@v4
+        with:
+          repository: Empyrean-Dynamics/empyrean-sphinx-theme
+          token: ${{ secrets.SPHINX_THEME_READ_TOKEN }}
+          path: empyrean-sphinx-theme
+
+      # Building the empyrean-py wheel (maturin, triggered by `pip install
+      # -e ".[docs]"` for autodoc) compiles the full Rust dep tree:
+      # empyrean → empyrean-core (path) → villeneuve / scott (git-tag pins).
+      # empyrean-core is a path dependency, so it must be checked out as a
+      # sibling of the `empyrean/` checkout dir (i.e. directly under the
+      # workspace root); villeneuve / scott resolve over HTTPS via the
+      # insteadOf rewrite below. Without this the docs build fails with
+      # "failed to read .../empyrean-core/Cargo.toml".
+      - name: Configure git for private dependencies
+        run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "ssh://git@github.com/"
+
+      - name: Checkout sibling repos
+        run: |
+          for repo in empyrean-core empyrean-validation villeneuve scott; do
+            git clone --depth 1 https://x-access-token:${{ secrets.GH_PAT }}@github.com/Empyrean-Dynamics/$repo.git "$repo"
+          done
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # empyrean-py links libempyrean from target/release. empyrean-c is a
+      # workspace member, not a cargo dependency of empyrean-py, so the
+      # editable install below (maturin) won't build it — build the cdylib
+      # first, exactly as ci.yml does, or the wheel link fails with
+      # "unable to find library -lempyrean".
+      - name: Build libempyrean (release)
+        working-directory: empyrean
+        run: cargo build -p empyrean-c --release
+
+      - name: Install build deps + theme + docs extras
+        working-directory: empyrean/empyrean-py
+        run: |
+          python -m pip install --upgrade pip
+          # Install the theme as editable from the sibling checkout (also
+          # pulls sphinx); `empyrean-sphinx-theme` is then already satisfied
+          # for the docs group below, which can't fetch it from PyPI.
+          pip install -e ../../empyrean-sphinx-theme
+          # empyrean itself (editable) so autodoc can import it; this builds
+          # the maturin wheel and links the libempyrean we built above.
+          pip install -e .
+          # Docs dependencies live in a PEP 735 [dependency-groups] table,
+          # not a [project.optional-dependencies] extra — `.[docs]` is empty
+          # and silently installs nothing. Install the group explicitly.
+          pip install --group docs
+
+      # Sphinx autodoc imports `empyrean`, whose PyO3 extension dlopens
+      # libempyrean at runtime. The editable install (unlike a repaired
+      # wheel) doesn't bundle it and empyrean-sys bakes no rpath, so point
+      # the loader at the cdylib we built above.
+      - name: Build HTML
+        working-directory: empyrean/empyrean-py/docs
+        run: make html
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/empyrean/target/release
+
+      - name: Publish to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy empyrean/empyrean-py/docs/_build/html --project-name=empyrean-docs --branch=main

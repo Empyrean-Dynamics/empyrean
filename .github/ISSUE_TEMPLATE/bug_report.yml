@@ -1,0 +1,176 @@
+name: Bug report
+description: Report a reproducible bug — Python, Rust, CLI, or C ABI.
+title: "[bug]: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing. We triage every issue, and the two pieces below
+        — **version output** and **reproducer** — are what determine
+        whether we can act on it the same day or whether it sits in a
+        back-and-forth queue. Please fill them both in.
+
+        If your bug is not reproducible by us (no version, no repro
+        script), we'll close the issue and ask you to refile with both.
+        That isn't us being unfriendly — it's that without a runnable
+        repro, every bug is an indistinguishable shape and triage takes
+        an order of magnitude longer.
+
+  - type: dropdown
+    id: channel
+    attributes:
+      label: Distribution channel
+      description: Which surface are you calling empyrean through?
+      options:
+        - Python wheel (`pip install empyrean`)
+        - Rust crate (`empyrean` on crates.io)
+        - CLI binary (`empyrean`)
+        - C ABI (`libempyrean.dylib` / `.so` / `.dll`)
+    validations:
+      required: true
+
+  - type: textarea
+    id: version
+    attributes:
+      label: Version output
+      description: |
+        Paste the **full output** of one of these — the lines below
+        carry both the wrapper version *and* the underlying
+        `villeneuve` / `scott` / `nolan` git commits the cdylib was
+        built against, which is what we need to reproduce.
+
+        - **Python**:
+          ```python
+          import empyrean; print(empyrean.version_string())
+          ```
+        - **Rust**:
+          ```rust
+          println!("{}", empyrean::version_string()?);
+          ```
+        - **CLI**:
+          ```sh
+          empyrean version
+          ```
+        - **C ABI**: call `empyrean_version_string()` and print the
+          returned string (free with `empyrean_string_free`).
+      render: text
+      placeholder: |
+        empyrean-cli 0.7.0
+        empyrean-core 0.7.0
+        villeneuve    1.10.0
+        scott         1.5.0
+        nolan         1.5.2-dev+c1f605c
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproducer
+    attributes:
+      label: Minimal reproducer
+      description: |
+        A single `.py` or `.rs` (or, for CLI bugs, the exact shell
+        invocation + any input-file contents) we can run start-to-finish
+        without modification to see the bug. **Required.**
+
+        - Keep it minimal: < 100 lines wherever possible. Strip
+          everything that isn't load-bearing for the bug.
+        - Include any input-file contents inline (small ADES PSV /
+          orbits file) or paste a fenced block we can save and run.
+        - For larger reproducers (input file > a few KB), upload to a
+          [GitHub gist](https://gist.github.com/) and link it here —
+          but please still post a paragraph summary of what the
+          reproducer does so triage doesn't require opening the gist.
+        - For CLI bugs: include the exact command, the full stderr,
+          and the working directory / data dir state.
+
+        We can run from `pip install empyrean` / `cargo add empyrean` /
+        the published CLI binary — please don't include
+        `git+ssh://…/empyrean-core` or sibling-checkout `[patch]`
+        blocks in your reproducer's `Cargo.toml`. If you need an
+        unreleased fix, tag the issue accordingly and we'll work
+        from a branch.
+      render: python
+      placeholder: |
+        # repro.py — Apophis 10y propagation returns NaN at the close approach.
+        import empyrean
+        import numpy as np
+
+        orbits = empyrean.query_sbdb(["99942"])
+        t0 = orbits.coordinates.epoch.to_numpy()[0]
+        result = empyrean.propagate(orbits, np.array([t0 + 10 * 365.25]))
+        print(result.states.position.to_numpy())   # observed: [nan, nan, nan]
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: |
+        What did you expect to happen? If you're comparing against a
+        reference (JPL Horizons, ASSIST, an earlier empyrean release,
+        a paper, …), name it and quote the value you expected.
+      placeholder: |
+        Position should be ~[-0.30, +0.45, +0.18] AU at MJD 64922 TDB
+        per Horizons ephemeris run on the same epoch. (Horizons output
+        attached.)
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: |
+        What actually happened? Paste the output, the error message,
+        the traceback, or the diff vs the expected value.
+      placeholder: |
+        propagate returned `[nan, nan, nan]` with no warning or error.
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      description: macOS 14.5 / Ubuntu 24.04 / Windows 11 / …
+      placeholder: macOS 14.5 (Apple Silicon)
+    validations:
+      required: true
+
+  - type: input
+    id: language_version
+    attributes:
+      label: Language runtime version
+      description: |
+        - **Python channel** — `python --version` (e.g. `Python 3.12.4`)
+        - **Rust channel** — `rustc --version` (e.g. `rustc 1.90.0`)
+        - **CLI / C ABI** — the OS / arch alone is fine; include the
+          target triple if it's non-default.
+      placeholder: Python 3.12.4
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: |
+        Optional: links to prior issues, notes on triage priority,
+        screenshots, profile output, anything that helps. Skip if
+        you've covered it above.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Pre-submit checklist
+      options:
+        - label: I searched [open and closed issues](https://github.com/Empyrean-Dynamics/empyrean/issues?q=is%3Aissue) for an existing report and didn't find one.
+          required: true
+        - label: My reproducer runs against a published release (no `[patch]` overrides, no `git+ssh://…/empyrean-core` deps).
+          required: true
+        - label: I've verified the bug reproduces on the version I pasted above (not just on an older release I happen to have installed).
+          required: true

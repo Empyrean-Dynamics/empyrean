@@ -7,3 +7,44 @@ members = [
     "empyrean-py",
     "empyrean-cli",
 ]
+# Note: the historical `validation/runners/core` workspace member moved
+# to `empyrean-core/src/bin/validate-core.rs` (behind the `validate`
+# feature). The "shared villeneuve.rlib for bit-identical numerics"
+# invariant still holds because every Rust runner here resolves
+# villeneuve through the same `[patch]` overrides below.
+
+# Force the entire dep tree below empyrean-core (which transitively pulls
+# villeneuve / scott / nolan via git-tag pins) to resolve to the primary
+# sibling checkouts. Without this patch we'd get two different copies
+# of each crate in the graph and `EphemerisData` / `Orbits<AU>` /
+# `RejectionStrategy` types would collide between the tagged and the
+# sibling versions.
+# Release profile for the published cdylib (empyrean-c → libempyrean.dylib /
+# .so / .dll), the empyrean-py PyO3 wheel, and the empyrean-cli binary.
+# Symbols are stripped so the only names visible in the dynamic symbol
+# table are the `pub extern "C" fn empyrean_*` exports declared in
+# empyrean-c — internal Rust mangled names + debuginfo are removed.
+# This is a closed-source distribution policy: the C ABI is the only
+# surface external code is permitted to call into; stripping enforces
+# that no `empyrean_core::*` / `villeneuve::*` symbols leak out of the
+# wheel or cdylib.
+[profile.release]
+strip = "symbols"
+# Drive empyrean-core's hot-path codegen toward bit-exact between the
+# libempyrean.dylib produced here and validate-core's separate static
+# build in the empyrean-core workspace. codegen-units = 1 + lto = "fat"
+# removes the cross-codegen-unit partitioning that profile/feature
+# parity alone can't unify (it was the source of the residual ~0.3 mm
+# core-vs-rust propagation drift after option-A feature alignment).
+# Pairs with the matching block in empyrean-core/Cargo.toml. Build
+# cost: ~3-5× slower release link.
+codegen-units = 1
+lto = "fat"
+
+# No sibling-checkout [patch] overrides: scott and villeneuve are released,
+# so the monorepo consumes their tagged git dependencies via empyrean-core
+# (scott v1.10.0, villeneuve v1.14.0), fetched from GitHub. CI fetches them
+# over HTTPS with the GH_PAT insteadOf rewrite. To co-develop a sibling
+# against this workspace, re-add a `[patch."ssh://…git"] <crate> = { path =
+# "../<repo>" }` block here (cargo only honours [patch] at the workspace
+# root, not from a path-dep's manifest).

@@ -1,0 +1,427 @@
+name: Release
+
+# Triggered by pushing a tag of the form `vX.Y.Z` (e.g. `v0.7.0`).
+# The tag should point at a commit on `main` whose Cargo.toml /
+# pyproject.toml versions all equal `X.Y.Z` — the `verify` job below
+# enforces this consistency before any artifacts are built or published.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+
+jobs:
+  # ── Verify all distribution-channel versions match the tag ──────
+  # Fails the workflow up-front if any of the five Cargo.toml
+  # versions or the empyrean-py pyproject.toml version disagree
+  # with the tag (or with each other).
+  verify:
+    name: Verify Versions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure git for private dependencies
+        run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "ssh://git@github.com/"
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify versions match tag across all distribution channels
+        run: |
+          set -eu
+          tag="${GITHUB_REF#refs/tags/v}"
+          echo "Tag version:  $tag"
+          echo
+
+          # Pre-release versions are spelled differently per ecosystem:
+          # Cargo/SemVer uses `0.7.0-rc.0`, PyPI/PEP 440 uses `0.7.0rc0`.
+          # Compare a canonical form (separators stripped) so a pre-release
+          # tag matches both; finals are byte-identical everywhere and
+          # unaffected.
+          canon() { echo "$1" | tr -d '.-'; }
+
+          metadata=$(cargo metadata --no-deps --format-version 1)
+          mismatch=0
+
+          # Every crate that ships externally (cargo or wheel).
+          # empyrean-c is `publish = false` but its version still ships
+          # inside the dylib, so check it too.
+          crates=(empyrean empyrean-sys empyrean-c empyrean-cli empyrean-py)
+          for crate in "${crates[@]}"; do
+            v=$(echo "$metadata" | jq -r --arg name "$crate" '.packages[] | select(.name == $name) | .version')
+            if [ -z "$v" ] || [ "$v" = "null" ]; then
+              echo "::error::could not read version for crate $crate"
+              mismatch=1
+              continue
+            fi
+            if [ "$(canon "$v")" != "$(canon "$tag")" ]; then
+              echo "::error::$crate Cargo.toml version is $v, expected $tag"
+              mismatch=1
+            else
+              printf "  OK  %-20s %s\n" "$crate" "$v"
+            fi
+          done
+
+          # empyrean-py also has a pyproject.toml — that's what PyPI
+          # actually publishes against, so it must match too.
+          py_version=$(python -c 'import tomllib; print(tomllib.load(open("empyrean-py/pyproject.toml","rb"))["project"]["version"])')
+          if [ "$(canon "$py_version")" != "$(canon "$tag")" ]; then
+            echo "::error::empyrean-py/pyproject.toml version is $py_version, expected $tag"
+            mismatch=1
+          else
+            printf "  OK  %-20s %s\n" "pyproject.toml" "$py_version"
+          fi
+
+          [ "$mismatch" -eq 0 ] || { echo; echo "Version mismatch — refusing to release."; exit 1; }
+          echo
+          echo "All distribution channels at version $tag."
+
+  # ── Build CLI binary ───────────────────────────────────────
+  cli:
+    name: CLI (${{ matrix.os }})
+    needs: verify
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: target/release/empyrean
+            artifact: empyrean-linux-x86_64
+          - os: macos-14
+            target: aarch64-apple-darwin
+            binary: target/release/empyrean
+            artifact: empyrean-macos-aarch64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure git for private dependencies
+        run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "ssh://git@github.com/"
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      # The CLI binary links libempyrean (through empyrean-sys's `links`
+      # directive, which cargo won't build transitively), so build the
+      # cdylib first — otherwise the final link fails with `-lempyrean`
+      # not found. Mirrors the c-lib / wheels / publish-crates jobs.
+      - name: Build libempyrean (release)
+        run: cargo build -p empyrean-c --release
+
+      - name: Build CLI (release, stripped)
+        run: cargo build --release --bin empyrean
+
+      - name: Verify stripped + no internal symbol leak
+        run: |
+          file ${{ matrix.binary }}
+          ls -lh ${{ matrix.binary }}
+          leaked=$(nm ${{ matrix.binary }} 2>/dev/null | grep -ioE "empyrean_core|villeneuve|scott|nolan|hyperjet" | sort -u || true)
+          if [ -n "$leaked" ]; then
+            echo "::error::internal crate symbols leaked into the CLI binary:"; echo "$leaked"; exit 1
+          fi
+          echo "OK: no internal symbols in ${{ matrix.binary }}"
+
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp ${{ matrix.binary }} dist/
+          cp LICENSE dist/
+          cd dist && tar czf ../${{ matrix.artifact }}.tar.gz *
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.tar.gz
+
+  # ── Build C shared library ─────────────────────────────────
+  c-lib:
+    name: C Library (${{ matrix.os }})
+    needs: verify
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            lib: target/release/libempyrean.so
+            artifact: libempyrean-linux-x86_64
+          - os: macos-14
+            lib: target/release/libempyrean.dylib
+            artifact: libempyrean-macos-aarch64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure git for private dependencies
+        run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "ssh://git@github.com/"
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Build C API (release, stripped)
+        run: cargo build -p empyrean-c --release
+
+      - name: Verify stripped + no internal symbol leak
+        run: |
+          file ${{ matrix.lib }}
+          leaked=$(nm ${{ matrix.lib }} 2>/dev/null | grep -ioE "empyrean_core|villeneuve|scott|nolan|hyperjet" | sort -u || true)
+          if [ -n "$leaked" ]; then
+            echo "::error::internal crate symbols leaked into ${{ matrix.lib }}:"; echo "$leaked"; exit 1
+          fi
+          echo "OK: only the C ABI is exported; no internal symbols in ${{ matrix.lib }}"
+
+      - name: Package library
+        run: |
+          mkdir -p dist
+          cp ${{ matrix.lib }} dist/
+          cp include/empyrean.h dist/
+          cp LICENSE dist/
+          cd dist && tar czf ../${{ matrix.artifact }}.tar.gz *
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.tar.gz
+
+  # ── Build Python wheels ────────────────────────────────────
+  wheels:
+    name: Wheel (${{ matrix.os }}, py${{ matrix.python }})
+    needs: verify
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: "3.12"
+          - os: macos-14
+            python: "3.12"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure git for private dependencies
+        run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "ssh://git@github.com/"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Install maturin
+        run: pip install maturin
+
+      # empyrean-sys links libempyrean (the closed-source cdylib) through its
+      # build.rs `links` directive, not a cargo dependency, so maturin won't
+      # build it transitively. Build it first so the extension can link it.
+      - name: Build libempyrean (release)
+        run: cargo build -p empyrean-c --release
+
+      # --auditwheel=repair copies libempyrean into the wheel and rewrites the
+      # extension's rpath, so the published wheel is self-contained. Without it
+      # the wheel references a build-tree dylib that won't exist on the user's
+      # machine and `import empyrean` fails at load time.
+      - name: Build wheel (stripped, self-contained)
+        run: cd empyrean-py && maturin build --release --strip --auditwheel=repair --out ../target/wheels
+
+      - name: Verify wheel symbols stripped (no internal leak)
+        run: |
+          whl=$(ls target/wheels/*.whl | head -1)
+          tmp=$(mktemp -d)
+          python -m zipfile -e "$whl" "$tmp"
+          libs=$(find "$tmp" \( -name "*.so" -o -name "*.dylib" \))
+          echo "Inspecting bundled libraries:"; echo "$libs"
+          leaked=$(for f in $libs; do nm "$f" 2>/dev/null; done | grep -ioE "empyrean_core|villeneuve|scott|nolan|hyperjet" | sort -u || true)
+          if [ -n "$leaked" ]; then
+            echo "::error::internal crate symbols leaked into the wheel:"; echo "$leaked"; exit 1
+          fi
+          echo "OK: no internal symbols in the wheel's bundled libraries"
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.os }}-py${{ matrix.python }}
+          path: target/wheels/*.whl
+
+  # ── Publish wheels to PyPI ─────────────────────────────────
+  publish-pypi:
+    name: Publish wheel to PyPI
+    needs: wheels
+    runs-on: ubuntu-latest
+    # Trusted Publishing (OIDC): no token. `id-token: write` mints the OIDC
+    # token PyPI verifies against the trusted-publisher config (repo +
+    # workflow + environment). The `pypi` environment SHOULD carry a
+    # required-reviewer gate so this job pauses for manual approval; the
+    # guard step below fails the job CLOSED if that gate is not actually
+    # configured, so a publish can never run unreviewed.
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - name: Require an armed reviewer gate (fail closed)
+        env:
+          # Needs read access to environment settings: a classic PAT with
+          # `repo` scope, or a fine-grained token with Administration:read.
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          set -uo pipefail
+          env_name=pypi
+          if ! rules=$(gh api "repos/${{ github.repository }}/environments/${env_name}" \
+                          --jq '[.protection_rules[].type] | join(",")' 2>/tmp/gate_err); then
+            echo "::error::Cannot read the '${env_name}' environment. The token (GH_PAT) needs"
+            echo "repo scope (classic) or Administration:read (fine-grained) to inspect it."
+            cat /tmp/gate_err || true
+            exit 1
+          fi
+          echo "'${env_name}' protection rules: ${rules:-<none>}"
+          case "$rules" in
+            *required_reviewers*) echo "OK: '${env_name}' requires a reviewer before publishing." ;;
+            *) echo "::error::'${env_name}' has no required-reviewers gate. Refusing to publish unreviewed."
+               echo "Arm it: repo Settings > Environments > ${env_name} > Required reviewers, then re-run."
+               exit 1 ;;
+          esac
+
+      - name: Download wheels
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Stage wheels for upload
+        run: |
+          mkdir -p dist
+          find artifacts -name '*.whl' -exec cp {} dist/ \;
+          ls -la dist
+
+      - name: Publish to PyPI (Trusted Publishing / OIDC)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          skip-existing: true
+
+  # ── Publish Rust crates to crates.io ────────────────────────
+  # Sequenced: empyrean-sys → empyrean → empyrean-cli, with a
+  # pause for the index to catch up between dependent crates.
+  # empyrean-c is `publish = false` (cdylib only) and is not
+  # pushed to crates.io.
+  publish-crates:
+    name: Publish to crates.io
+    needs: verify
+    runs-on: ubuntu-latest
+    # The `crates-io` environment SHOULD carry a required-reviewer gate (and,
+    # ideally, hold CARGO_REGISTRY_TOKEN as an environment-scoped secret) so
+    # all three crate publishes pause for manual approval. The guard step
+    # below fails the job CLOSED if that gate is not configured, so the
+    # publishes can never run unreviewed.
+    environment: crates-io
+    # `cargo publish` verifies each crate by building it from the packaged
+    # tarball, where build.rs's CARGO_MANIFEST_DIR-relative paths to the
+    # header/lib no longer resolve. Point empyrean-sys's build.rs at the
+    # checked-out header + the libempyrean built below so verification
+    # genuinely compiles (and the empyrean-cli verify can link the dylib).
+    env:
+      EMPYREAN_INCLUDE_DIR: ${{ github.workspace }}/include
+      EMPYREAN_LIB_DIR: ${{ github.workspace }}/target/release
+    steps:
+      - name: Require an armed reviewer gate (fail closed)
+        env:
+          # Needs read access to environment settings: a classic PAT with
+          # `repo` scope, or a fine-grained token with Administration:read.
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          set -uo pipefail
+          env_name=crates-io
+          if ! rules=$(gh api "repos/${{ github.repository }}/environments/${env_name}" \
+                          --jq '[.protection_rules[].type] | join(",")' 2>/tmp/gate_err); then
+            echo "::error::Cannot read the '${env_name}' environment. The token (GH_PAT) needs"
+            echo "repo scope (classic) or Administration:read (fine-grained) to inspect it."
+            cat /tmp/gate_err || true
+            exit 1
+          fi
+          echo "'${env_name}' protection rules: ${rules:-<none>}"
+          case "$rules" in
+            *required_reviewers*) echo "OK: '${env_name}' requires a reviewer before publishing." ;;
+            *) echo "::error::'${env_name}' has no required-reviewers gate. Refusing to publish unreviewed."
+               echo "Arm it: repo Settings > Environments > ${env_name} > Required reviewers, then re-run."
+               exit 1 ;;
+          esac
+
+      - uses: actions/checkout@v4
+
+      - name: Configure git for private dependencies
+        run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "ssh://git@github.com/"
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      # Build libempyrean so `cargo publish`'s verification step can link it
+      # (empyrean-cli) and bindgen can find the header.
+      - name: Build libempyrean (release)
+        run: cargo build -p empyrean-c --release
+
+      - name: Publish empyrean-sys
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p empyrean-sys
+
+      - name: Wait for crates.io to index empyrean-sys
+        run: sleep 30
+
+      - name: Publish empyrean
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p empyrean
+
+      - name: Wait for crates.io to index empyrean
+        run: sleep 30
+
+      - name: Publish empyrean-cli
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p empyrean-cli
+
+  # ── Create GitHub Release ──────────────────────────────────
+  release:
+    name: Create Release
+    needs: [cli, c-lib, wheels, publish-pypi, publish-crates]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: List artifacts
+        run: find artifacts -type f | sort
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.whl

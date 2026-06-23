@@ -1,0 +1,15 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or general discussion
+    url: https://github.com/Empyrean-Dynamics/empyrean/discussions
+    about: |
+      Usage questions, design / methodology discussion, comparisons against
+      other tools, anything that isn't a concrete bug or a specific feature
+      request. Issues are reserved for actionable, reproducible reports.
+  - name: Validation finding
+    url: https://github.com/Empyrean-Dynamics/empyrean/discussions/categories/validation
+    about: |
+      If empyrean's numbers disagree with another tool (JPL Horizons, ASSIST,
+      find_orb, …) or with a published reference at a level you don't
+      consider acceptable, post the diff in Discussions → Validation. We
+      triage validation findings the same week.

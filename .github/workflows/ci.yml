@@ -1,0 +1,406 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+
+jobs:
+  # ── Build & Lint ────────────────────────────────────────────────
+  build-lint:
+    name: Build & Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure git for private dependencies
+        run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "ssh://git@github.com/"
+
+      # empyrean-core is a path dependency (../../empyrean-core from the
+      # member crates), so it must exist as a sibling of this checkout —
+      # and empyrean-core's manifest in turn references
+      # empyrean-validation as an optional path dep (its validate
+      # feature), which cargo metadata insists on resolving. Plain git
+      # clone because actions/checkout cannot write outside the
+      # workspace; villeneuve / scott git pins resolve via the
+      # insteadOf rewrite above.
+      - name: Checkout sibling repos
+        run: |
+          for repo in empyrean-core empyrean-validation villeneuve scott; do
+            git clone --depth 1 https://x-access-token:${{ secrets.GH_PAT }}@github.com/Empyrean-Dynamics/$repo.git ../$repo
+          done
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt, clippy
+          rustflags: ""
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      # empyrean-sys links libempyrean from target/release, so the
+      # cdylib must exist there before anything builds against the
+      # wrapper — a debug-only workspace build never produces it.
+      - name: Build libempyrean (release)
+        run: cargo build -p empyrean-c --release
+
+      - name: Build (debug)
+        run: cargo build --workspace --verbose
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+
+  # ── Rust: tests ─────────────────────────────────────────────────
+  test:
+    name: Rust Tests
+    needs: build-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure git for private dependencies
+        run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "ssh://git@github.com/"
+
+      # empyrean-core is a path dependency (../../empyrean-core from the
+      # member crates), so it must exist as a sibling of this checkout —
+      # and empyrean-core's manifest in turn references
+      # empyrean-validation as an optional path dep (its validate
+      # feature), which cargo metadata insists on resolving. Plain git
+      # clone because actions/checkout cannot write outside the
+      # workspace; villeneuve / scott git pins resolve via the
+      # insteadOf rewrite above.
+      - name: Checkout sibling repos
+        run: |
+          for repo in empyrean-core empyrean-validation villeneuve scott; do
+            git clone --depth 1 https://x-access-token:${{ secrets.GH_PAT }}@github.com/Empyrean-Dynamics/$repo.git ../$repo
+          done
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Cache SPICE kernels
+        id: cache-kernels
+        uses: actions/cache@v4
+        with:
+          path: data
+          key: data-full-v1
+
+      - name: Download SPICE kernels
+        if: steps.cache-kernels.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p data
+          cd data
+          curl -sSfL --retry 8 --retry-connrefused --retry-all-errors --connect-timeout 30 -o de440.bsp https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/planets/de440.bsp
+          curl -sSfL --retry 8 --retry-connrefused --retry-all-errors --connect-timeout 30 -o gm_de440.tpc https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/gm_de440.tpc
+          curl -sSfL --retry 8 --retry-connrefused --retry-all-errors --connect-timeout 30 -o earth_latest_high_prec.bpc https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/earth_latest_high_prec.bpc
+          curl -sSfL --retry 8 --retry-connrefused --retry-all-errors --connect-timeout 30 -o earth_620120_250826.bpc https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/earth_620120_250826.bpc
+          curl -sSfL --retry 8 --retry-connrefused --retry-all-errors --connect-timeout 30 -o earth_2025_250826_2125_predict.bpc https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/earth_2025_250826_2125_predict.bpc
+          curl -sSfL --retry 8 --retry-connrefused --retry-all-errors --connect-timeout 30 -o moon_pa_de440_200625.bpc https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/moon_pa_de440_200625.bpc
+          curl -sSfL --retry 8 --retry-connrefused --retry-all-errors --connect-timeout 30 -o sb441-n16.bsp https://ssd.jpl.nasa.gov/ftp/eph/small_bodies/asteroids_de441/sb441-n16.bsp
+          curl -sSfL --retry 8 --retry-connrefused --retry-all-errors --connect-timeout 30 -o jwst_rec.bsp https://naif.jpl.nasa.gov/pub/naif/JWST/kernels/spk/jwst_rec.bsp
+          curl -sSfL --retry 8 --retry-connrefused --retry-all-errors --connect-timeout 30 -o EGM2008.gfc "https://icgem.gfz-potsdam.de/getmodel/gfc/c50128797a9cb62e936337c890e4425f03f0461d7329b09a8cc8561504465340/EGM2008.gfc"
+          curl -sSfL --retry 8 --retry-connrefused --retry-all-errors --connect-timeout 30 https://minorplanetcenter.net/Extended_Files/obscodes_extended.json.gz | gunzip > obscodes_extended.json
+          curl -sSfL --retry 8 --retry-connrefused --retry-all-errors --connect-timeout 30 -o jgmro_120f_sha.tab https://pds-geosciences.wustl.edu/mro/mro-m-rss-5-sdp-v1/mrors_1xxx/data/shadr/jgmro_120f_sha.tab
+          curl -sSfL --retry 8 --retry-connrefused --retry-all-errors --connect-timeout 30 -o shgj180u.a01 https://pds-geosciences.wustl.edu/mgn/mgn-v-rss-5-gravity-l2-v1/mg_5201/gravity/shgj180u.a01
+          curl -sSfL --retry 8 --retry-connrefused --retry-all-errors --connect-timeout 30 -o jggrx_0900d_sha.tab https://pds-geosciences.wustl.edu/grail/grail-l-lgrs-5-rdr-v1/grail_1001/shadr/jggrx_0900d_sha.tab
+          curl -sSfL --retry 8 --retry-connrefused --retry-all-errors --connect-timeout 30 -o ggmes_100v08_sha.tab https://pgda.gsfc.nasa.gov/data/PGDA_HgM008/ggmes_100v08_sha.tab
+
+      - name: Cache API responses
+        uses: actions/cache@v4
+        with:
+          path: ~/.empyrean/cache
+          key: api-cache
+
+      # empyrean-sys links libempyrean from target/release, so the
+      # cdylib must exist there before anything builds against the
+      # wrapper — a debug-only workspace build never produces it.
+      - name: Build libempyrean (release)
+        run: cargo build -p empyrean-c --release
+
+      - name: Run tests
+        # empyrean-sys links libempyrean as a dylib (build.rs:
+        # rustc-link-lib=dylib=empyrean from target/release), so its
+        # smoke test needs the cdylib on the runtime loader path —
+        # built above by "Build libempyrean (release)".
+        run: cargo test --workspace --verbose
+        env:
+          EMPYREAN_DATA_DIR: ${{ github.workspace }}/data
+          LD_LIBRARY_PATH: ${{ github.workspace }}/target/release:${{ env.LD_LIBRARY_PATH }}
+
+      # Compile every code snippet in the empyrean wrapper's doc
+      # comments. `cargo test --doc` extracts each ``` block, attaches
+      # the test harness, and compiles + runs (or just compiles when
+      # annotated `no_run` / skipped when annotated `ignore`). Catches
+      # API drift — if a docstring example references a renamed or
+      # removed item, this surfaces it here instead of when a user
+      # copies the snippet into their own code. empyrean-cli is a
+      # binary crate, so no lib doctests; empyrean-c is C-ABI-only.
+      - name: Doc-tests (snippet compilation)
+        run: cargo test --doc -p empyrean
+        env:
+          EMPYREAN_DATA_DIR: ${{ github.workspace }}/data
+
+      # Verify rustdoc generation itself succeeds without unresolved
+      # intra-doc links or other warnings — catches dangling [`Foo`]
+      # references in /// comments before they become broken HTML.
+      - name: Build rustdoc (deny warnings)
+        run: cargo doc --no-deps -p empyrean
+        env:
+          RUSTDOCFLAGS: --html-in-header docs/katex-header.html -D warnings
+          EMPYREAN_DATA_DIR: ${{ github.workspace }}/data
+
+  # ── C API: release build + symbol verification ─────────────────
+  c:
+    name: C (${{ matrix.os }})
+    needs: build-lint
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            lib: target/release/libempyrean.so
+            nm_cmd: "nm -D"
+            nm_filter: " T "
+          - os: macos-14
+            lib: target/release/libempyrean.dylib
+            nm_cmd: "nm -gU"
+            nm_filter: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure git for private dependencies
+        run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "ssh://git@github.com/"
+
+      # empyrean-core is a path dependency (../../empyrean-core from the
+      # member crates), so it must exist as a sibling of this checkout —
+      # and empyrean-core's manifest in turn references
+      # empyrean-validation as an optional path dep (its validate
+      # feature), which cargo metadata insists on resolving. Plain git
+      # clone because actions/checkout cannot write outside the
+      # workspace; villeneuve / scott git pins resolve via the
+      # insteadOf rewrite above.
+      - name: Checkout sibling repos
+        run: |
+          for repo in empyrean-core empyrean-validation villeneuve scott; do
+            git clone --depth 1 https://x-access-token:${{ secrets.GH_PAT }}@github.com/Empyrean-Dynamics/$repo.git ../$repo
+          done
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Build C API (release, stripped)
+        run: cargo build -p empyrean-c --release
+
+      - name: Verify library exists
+        run: |
+          ls -lh ${{ matrix.lib }}
+          file ${{ matrix.lib }}
+
+      - name: Verify symbol stripping
+        run: |
+          echo "=== Exported symbols ==="
+          ${{ matrix.nm_cmd }} ${{ matrix.lib }}
+
+          echo ""
+          echo "=== Checking for leaked symbols ==="
+          LEAKED=$(${{ matrix.nm_cmd }} ${{ matrix.lib }} | grep -v "empyrean_" | grep -c "${{ matrix.nm_filter }}" || true)
+          if [ "$LEAKED" -gt 0 ]; then
+            echo "FAIL: $LEAKED non-API symbols leaked!"
+            ${{ matrix.nm_cmd }} ${{ matrix.lib }} | grep -v "empyrean_"
+            exit 1
+          fi
+
+          API=$(${{ matrix.nm_cmd }} ${{ matrix.lib }} | grep -c "empyrean_" || true)
+          echo "OK: $API API symbols, 0 leaked."
+
+      - name: Verify header exists
+        run: test -f include/empyrean.h
+
+      - name: Upload C API artifact
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: libempyrean-${{ matrix.os }}
+          path: |
+            ${{ matrix.lib }}
+            include/empyrean.h
+
+  # ── Python: build wheel + tests + benchmarks ─────────────────
+  python:
+    name: Python (${{ matrix.os }}, ${{ matrix.python }})
+    needs: build-lint
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: "3.12"
+          - os: macos-14
+            python: "3.12"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure git for private dependencies
+        run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "ssh://git@github.com/"
+
+      # empyrean-core is a path dependency (../../empyrean-core from the
+      # member crates), so it must exist as a sibling of this checkout —
+      # and empyrean-core's manifest in turn references
+      # empyrean-validation as an optional path dep (its validate
+      # feature), which cargo metadata insists on resolving. Plain git
+      # clone because actions/checkout cannot write outside the
+      # workspace; villeneuve / scott git pins resolve via the
+      # insteadOf rewrite above.
+      - name: Checkout sibling repos
+        run: |
+          for repo in empyrean-core empyrean-validation villeneuve scott; do
+            git clone --depth 1 https://x-access-token:${{ secrets.GH_PAT }}@github.com/Empyrean-Dynamics/$repo.git ../$repo
+          done
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+
+      - name: Install Python dependencies
+        run: uv pip install --system maturin numpy pyarrow quivr pytest pytest-benchmark pandas ruff
+
+      - name: Lint Python (ruff check + ruff format --check)
+        run: |
+          ruff check empyrean-py/python/empyrean/ empyrean-py/tests/
+          ruff format --check empyrean-py/python/empyrean/ empyrean-py/tests/
+
+      - name: Type-check Python (mypy --strict)
+        run: |
+          uv pip install --system mypy
+          cd empyrean-py && mypy --config-file pyproject.toml python/empyrean/
+
+      # empyrean-sys links libempyrean from target/release — build the
+      # cdylib before the wheel (empyrean-c is a workspace member, not
+      # a cargo dependency of empyrean-py, so maturin won't build it).
+      - name: Build libempyrean (release)
+        run: cargo build -p empyrean-c --release
+
+      - name: Build wheel
+        run: cd empyrean-py && maturin build --release
+
+      - name: Install wheel
+        run: pip install target/wheels/*.whl
+
+      - name: Import test
+        run: python -c "import empyrean; print('Types:', [t for t in dir(empyrean) if t[0].isupper()])"
+
+      # ── SPICE kernel cache ──
+      - name: Cache SPICE kernels
+        id: cache-kernels
+        uses: actions/cache@v4
+        with:
+          path: data
+          key: data-full-v1
+
+      - name: Download SPICE kernels
+        if: steps.cache-kernels.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p data
+          cd data
+          curl -sSfL --retry 8 --retry-connrefused --retry-all-errors --connect-timeout 30 -o de440.bsp https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/planets/de440.bsp
+          curl -sSfL --retry 8 --retry-connrefused --retry-all-errors --connect-timeout 30 -o gm_de440.tpc https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/gm_de440.tpc
+          curl -sSfL --retry 8 --retry-connrefused --retry-all-errors --connect-timeout 30 -o earth_latest_high_prec.bpc https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/earth_latest_high_prec.bpc
+          curl -sSfL --retry 8 --retry-connrefused --retry-all-errors --connect-timeout 30 -o earth_620120_250826.bpc https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/earth_620120_250826.bpc
+          curl -sSfL --retry 8 --retry-connrefused --retry-all-errors --connect-timeout 30 -o earth_2025_250826_2125_predict.bpc https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/earth_2025_250826_2125_predict.bpc
+          curl -sSfL --retry 8 --retry-connrefused --retry-all-errors --connect-timeout 30 -o moon_pa_de440_200625.bpc https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/moon_pa_de440_200625.bpc
+          curl -sSfL --retry 8 --retry-connrefused --retry-all-errors --connect-timeout 30 -o sb441-n16.bsp https://ssd.jpl.nasa.gov/ftp/eph/small_bodies/asteroids_de441/sb441-n16.bsp
+          curl -sSfL --retry 8 --retry-connrefused --retry-all-errors --connect-timeout 30 -o jwst_rec.bsp https://naif.jpl.nasa.gov/pub/naif/JWST/kernels/spk/jwst_rec.bsp
+          curl -sSfL --retry 8 --retry-connrefused --retry-all-errors --connect-timeout 30 -o EGM2008.gfc "https://icgem.gfz-potsdam.de/getmodel/gfc/c50128797a9cb62e936337c890e4425f03f0461d7329b09a8cc8561504465340/EGM2008.gfc"
+          curl -sSfL --retry 8 --retry-connrefused --retry-all-errors --connect-timeout 30 https://minorplanetcenter.net/Extended_Files/obscodes_extended.json.gz | gunzip > obscodes_extended.json
+          curl -sSfL --retry 8 --retry-connrefused --retry-all-errors --connect-timeout 30 -o jgmro_120f_sha.tab https://pds-geosciences.wustl.edu/mro/mro-m-rss-5-sdp-v1/mrors_1xxx/data/shadr/jgmro_120f_sha.tab
+          curl -sSfL --retry 8 --retry-connrefused --retry-all-errors --connect-timeout 30 -o shgj180u.a01 https://pds-geosciences.wustl.edu/mgn/mgn-v-rss-5-gravity-l2-v1/mg_5201/gravity/shgj180u.a01
+          curl -sSfL --retry 8 --retry-connrefused --retry-all-errors --connect-timeout 30 -o jggrx_0900d_sha.tab https://pds-geosciences.wustl.edu/grail/grail-l-lgrs-5-rdr-v1/grail_1001/shadr/jggrx_0900d_sha.tab
+          curl -sSfL --retry 8 --retry-connrefused --retry-all-errors --connect-timeout 30 -o ggmes_100v08_sha.tab https://pgda.gsfc.nasa.gov/data/PGDA_HgM008/ggmes_100v08_sha.tab
+
+      # ── Validation data from villeneuve ──
+      - name: Fetch validation data from villeneuve
+        run: |
+          mkdir -p empyrean-py/tests/data
+          cd empyrean-py/tests/data
+          BASE="https://raw.githubusercontent.com/Empyrean-Dynamics/villeneuve/main/data/validation"
+          for f in cartesian_ssb_ecliptic.csv cartesian_ssb_icrf.csv \
+                   cartesian_sun_ecliptic.csv cartesian_sun_icrf.csv \
+                   cometary_sbdb.csv elements_sun_ecliptic.csv \
+                   ephemeris_observer.csv metadata.txt \
+                   observer_geocentric_icrf.csv observer_ssb_ecliptic.csv \
+                   observer_ssb_icrf.csv observer_sun_ecliptic.csv \
+                   observer_sun_icrf.csv planet_ssb_icrf.csv \
+                   planet_sun_icrf.csv propagated_ssb_equatorial.csv \
+                   propagated_sun_ecliptic.csv; do
+            curl -sSfL --retry 8 --retry-connrefused --retry-all-errors --connect-timeout 30 -H "Authorization: token ${{ secrets.GH_PAT }}" \
+              "$BASE/$f" -o "$f"
+          done
+
+      # ── Tests ──
+      - name: Validation tests
+        run: cd empyrean-py && pytest tests/test_transforms.py -v
+        env:
+          EMPYREAN_DATA_DIR: ${{ github.workspace }}/data
+
+      - name: Benchmarks
+        run: cd empyrean-py && pytest tests/test_benchmarks.py --benchmark-only --benchmark-json=benchmark.json
+        env:
+          EMPYREAN_DATA_DIR: ${{ github.workspace }}/data
+
+      - name: Upload benchmark results
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmarks-${{ matrix.os }}-py${{ matrix.python }}
+          path: empyrean-py/benchmark.json
+
+      - name: Upload wheel
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.os }}-py${{ matrix.python }}
+          path: target/wheels/*.whl
+
+
+  # ── Cross-repo: trigger validation suite ────────────────────────
+  # On a successful main push (not PR), fire the validation workflow
+  # in empyrean-validation. Per the validation workflow's "Cross-repo
+  # dispatch" doc block: empyrean pushes to main → fire immediately
+  # because every push to main is the next wheel / cdylib / CLI build
+  # users will pull.
+  #
+  # Requires `VALIDATION_DISPATCH_TOKEN` — a fine-grained PAT scoped
+  # to the empyrean-validation repo only with `actions: write`.
+  trigger-validation:
+    name: Trigger validation suite
+    needs: [build-lint, test, c, python]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch sibling-main-push to empyrean-validation
+        env:
+          GH_TOKEN: ${{ secrets.VALIDATION_DISPATCH_TOKEN }}
+        run: |
+          gh api repos/Empyrean-Dynamics/empyrean-validation/dispatches \
+            -f event_type=sibling-main-push \
+            -f "client_payload[source]=${{ github.repository }}" \
+            -f "client_payload[sha]=${{ github.sha }}"

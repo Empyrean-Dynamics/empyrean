@@ -1,10 +1,27 @@
 [package]
 name = "empyrean-py"
-version = "0.1.0"
+version = "0.7.0-rc.0"
 edition = "2024"
+rust-version = "1.90.0"
 authors = ["Joachim Moeyens <joachim@empyrean-dynamics.com>", "Empyrean Dynamics"]
+description = "PyO3 binding crate for the empyrean Python wheel. Not published to crates.io — see the empyrean package on PyPI."
+homepage = "https://www.empyrean-dynamics.com"
+repository = "https://github.com/Empyrean-Dynamics/empyrean"
+readme = "README.md"
+license = "BSD-3-Clause"
+# Compiled into the empyrean PyPI wheel by maturin; not a standalone
+# crates.io publication. Distribution channel is `pip install empyrean`.
 publish = false
 
 [lib]
-name = "empyrean"
+# Compiled into `_empyrean_rs.cpython-<abi>.so` (or .pyd) and bundled
+# into the wheel by maturin. The leading underscore marks it private —
+# user-facing API lives in `empyrean-py/python/empyrean/__init__.py`.
+name = "_empyrean_rs"
 crate-type = ["cdylib"]
+
+[dependencies]
+empyrean = { path = "../empyrean" }
+pyo3 = { version = "0.26", features = ["extension-module"] }
+numpy = "0.26"
+serde_json = "1"

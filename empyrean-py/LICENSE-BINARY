@@ -1,0 +1,66 @@
+EMPYREAN BINARY LICENSE
+
+Copyright (c) 2024-2026 Joachim Moeyens.
+All rights reserved.
+
+This license governs use of the pre-compiled binary components of empyrean,
+including libempyrean shared libraries, empyrean command-line binaries, and
+Python wheels containing compiled Rust code ("Binary Components"). The source
+code in this repository is licensed separately under the BSD 3-Clause
+License; see LICENSE-BSD.
+
+1. GRANT OF USE
+
+   You are granted a non-exclusive, royalty-free license to download, install,
+   and use the Binary Components for any purpose, including commercial use,
+   subject to the restrictions below.
+
+2. RESTRICTIONS
+
+   You may not:
+
+   (a) redistribute the Binary Components to third parties, whether standalone
+       or as part of another software package;
+
+   (b) modify, adapt, translate, reverse engineer, decompile, disassemble, or
+       create derivative works based on the Binary Components;
+
+   (c) remove or alter any copyright notices or other proprietary markings
+       contained in the Binary Components.
+
+3. NO WARRANTY
+
+   THE BINARY COMPONENTS ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+   EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
+
+4. NO GUARANTEE OF ACCURACY
+
+   THE BINARY COMPONENTS PERFORM NUMERICAL COMPUTATIONS INCLUDING BUT NOT
+   LIMITED TO ORBITAL PROPAGATION, EPHEMERIS GENERATION, ORBIT DETERMINATION,
+   IMPACT PROBABILITY ESTIMATION, AND COORDINATE TRANSFORMATIONS. NO
+   REPRESENTATION OR WARRANTY IS MADE REGARDING THE ACCURACY, COMPLETENESS,
+   RELIABILITY, OR CORRECTNESS OF ANY COMPUTED RESULT. OUTPUTS OF THE BINARY
+   COMPONENTS SHOULD NOT BE USED AS THE SOLE BASIS FOR ANY DECISION,
+   INCLUDING BUT NOT LIMITED TO PLANETARY SCIENCE, MISSION PLANNING,
+   COLLISION AVOIDANCE, OR NAVIGATION, WITHOUT INDEPENDENT VERIFICATION.
+
+5. LIMITATION OF LIABILITY
+
+   IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY DIRECT, INDIRECT,
+   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING BUT
+   NOT LIMITED TO LOSS OF DATA, LOSS OF PROFITS, BUSINESS INTERRUPTION, OR
+   PERSONAL INJURY) ARISING OUT OF OR IN CONNECTION WITH THE USE OR INABILITY
+   TO USE THE BINARY COMPONENTS, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH
+   DAMAGES.
+
+6. TERMINATION
+
+   This license terminates automatically if you fail to comply with its terms.
+   Upon termination, you must destroy all copies of the Binary Components in
+   your possession.
+
+7. GOVERNING LAW
+
+   This license is governed by the laws of the State of Washington, United
+   States, without regard to its conflict of law provisions.

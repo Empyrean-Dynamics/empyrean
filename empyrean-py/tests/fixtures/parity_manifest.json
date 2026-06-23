@@ -1,0 +1,50 @@
+{
+  "_comment": "Single source of truth for the cross-channel parity tests (bd empyrean-na4h.2, ADR cross-channel-parity). Consumed by: empyrean-core/src/bin/parity-oracle.rs (generates core_parity_oracle.json from `scenarios`), empyrean-py/tests/test_core_parity.py, empyrean/tests/parity.rs (wrapper), and the cli parity test. Each channel runs `scenarios` through its own API, projects to the fingerprint vocabulary, and diffs against the committed oracle using `known_drops` + `tolerances`. Add a scenario / drop ONCE here and every channel picks it up.",
+  "tolerances": {
+    "_comment": "rtol/atol are the default; a scenario may override rtol (see impactor). The oracle (empyrean-core) and the channels (libempyrean dylib) are SEPARATELY compiled, so a chaotic trajectory amplifies ULP-level codegen differences — fine for well-conditioned cases (apophis, 1e-6) but not the near-surface impactor, whose covariance-derived fields (sigma_distance) drift a few e-6. The impactor's job is drop detection (0.0-vs-real signals, caught at any tolerance), so it earns a loose rtol.",
+    "rtol": 1e-6,
+    "atol": 1e-9,
+    "epoch_tol_days": 1e-3
+  },
+  "scenarios": [
+    {
+      "name": "apophis",
+      "_comment": "Apophis at MJD 61000 TDB (SBDB). Fires close approaches / periapses / possible impacts.",
+      "epoch_mjd_tdb": 61000.0,
+      "state": [
+        -7.85264914906904643e-02,
+        -8.19748051902064567e-01,
+        4.18939515323390882e-02,
+        1.98751024968884596e-02,
+        1.32208844536140196e-03,
+        3.99496044422352188e-04
+      ],
+      "cov_diag": [1e-16, 1e-16, 1e-16, 1e-20, 1e-20, 1e-20],
+      "grid": { "start": 61000.0, "step": 60.0, "n": 40 },
+      "ip_end_mjd": 63000.0,
+      "ephemeris_obs_code": "500",
+      "ephemeris_epochs": [61000.5, 61010.5, 61020.5]
+    },
+    {
+      "name": "impactor",
+      "_comment": "2008 TC3 final approach (MJD 54746 TDB), cometary->cartesian of the SBDB elements (villeneuve test_jet2.rs). Fires impacts / atmospheric + shadow entries.",
+      "epoch_mjd_tdb": 54746.0,
+      "state": [
+        0.9703740077176525,
+        0.24140202303297825,
+        0.00010161047612020427,
+        -0.008415158408739472,
+        0.01715090747796052,
+        -0.0008295684050048718
+      ],
+      "cov_diag": [1e-12, 1e-12, 1e-12, 1e-16, 1e-16, 1e-16],
+      "grid": { "start": 54746.0, "step": 0.04, "n": 26 },
+      "ip_end_mjd": 54748.0,
+      "rtol": 1e-3,
+      "ephemeris_obs_code": null,
+      "ephemeris_epochs": []
+    }
+  ],
+  "_known_drops_comment": "All C-ABI event-field drops (empyrean-14cz.1 periapsis relative state, .2 possible-impact payload, .3 shadow geometry) are now wired through to the wrapper + py channels — known_drops is empty. The CLI keeps its own channel-specific allow-list (CLI_EXTRA_DROPS in empyrean-cli/tests/parity.rs) because its events FILE writer is still common-fields-only (empyrean-i7u5 events half).",
+  "known_drops": []
+}

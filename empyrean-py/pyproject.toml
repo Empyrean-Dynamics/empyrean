@@ -4,13 +4,222 @@ build-backend = "maturin"
 
 [project]
 name = "empyrean"
-version = "0.1.0"
-description = "Python bindings for the empyrean astrodynamics engine"
+version = "0.7.0rc0"
+description = "Uncertainty-first orbit propagation, ephemeris, orbit determination, and event detection for asteroids and comets, powered by automatic differentiation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "LicenseRef-Proprietary"
+# Ship both license files so PyPI users see the dual-license setup.
+# `license = LicenseRef-Proprietary` reflects the wheel itself (a
+# binary distribution governed by LICENSE-BINARY); LICENSE-BSD is
+# bundled alongside as documentation that the upstream sources are
+# permissively licensed.
+license-files = ["LICENSE-BSD", "LICENSE-BINARY"]
 authors = [
     { name = "Joachim Moeyens", email = "joachim@empyrean-dynamics.com" },
-    { name = "Empyrean Dynamics" },
 ]
-requires-python = ">=3.10"
+maintainers = [
+    { name = "Empyrean Dynamics", email = "joachim@empyrean-dynamics.com" },
+]
+keywords = [
+    "astrodynamics",
+    "autodiff",
+    "differentiable-astrodynamics",
+    "orbits",
+    "ephemeris",
+    "orbit-determination",
+    "spice",
+    "neo",
+    "asteroid",
+    "planetary-science",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: Other/Proprietary License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Astronomy",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Typing :: Typed",
+]
+dependencies = [
+    # Columnar tables + array primitives at the public API boundary.
+    "quivr>=0.8.0",
+    "numpy>=1.21",
+    "pyarrow>=14.0",
+    # SPICE kernels + observatory codes shipped via PyPI by B612 Foundation.
+    # Required so a fresh `pip install empyrean` produces a ready-to-use
+    # kernel set without any network access on first call. The runtime
+    # discovery code in `empyrean/__init__.py` symlinks these into the
+    # XDG-compliant b612-cache directory under villeneuve's expected
+    # filenames.
+    "naif-de440>=2020.12.21.1",
+    "jpl-small-bodies-de441-n16>=2021.3.31.1",
+    "naif-eop-high-prec>=2026.4.19",
+    "naif-eop-historical>=2024.8.28.1",
+    "naif-eop-predict>=2024.8.28.1",
+    "mpc-obscodes>=2026.4.18",
+]
+
+[project.optional-dependencies]
+# User-facing optional feature: gates Epochs.from_astropy / to_astropy.
+astropy = ["astropy>=5.0"]
+
+# PEP 735 dependency groups — developer-only, NOT part of the published
+# wheel metadata. Install with `pip install --group test` (pip ≥ 25.0)
+# or `uv sync --group dev` / `uv pip install --group dev`.
+[dependency-groups]
+test = [
+    "pytest>=7",
+    "pytest-benchmark>=4",
+    "pandas>=2.0",
+]
+lint = [
+    "ruff>=0.6",
+    "mypy>=1.10",
+]
+docs = [
+    "sphinx>=7",
+    "sphinx-autodoc-typehints>=2.0",
+    "sphinx-copybutton>=0.5",
+    "sphinx-design>=0.5",
+    "myst-parser>=3.0",            # Markdown source files
+    "sphinxcontrib-katex>=0.9",    # math, consistent with Rust /// KaTeX docs
+    # Empyrean's custom Sphinx theme. Once the private repo lands, pin
+    # via SSH+tag here; until then, [tool.uv.sources] below resolves
+    # this to the local sibling checkout.
+    "empyrean-sphinx-theme",
+]
+# Everything needed for day-to-day development.
+dev = [
+    {include-group = "test"},
+    {include-group = "lint"},
+    {include-group = "docs"},
+    "astropy>=5.0",
+]
+
+# [project.urls] left intentionally unset — fill in once public homepage
+# / docs / issue-tracker URLs are settled.
+
+# Source overrides for development. Once empyrean-sphinx-theme has a
+# tagged release on its private GitHub repo, replace this block with a
+# git+SSH pin in [dependency-groups].docs above; CI will need a deploy
+# key on Empyrean-Dynamics/empyrean-sphinx-theme to clone.
+[tool.uv.sources]
+empyrean-sphinx-theme = { path = "../../empyrean-sphinx-theme", editable = true }
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
+python-source = "python"
+module-name = "empyrean._empyrean_rs"
+# Strip symbols on release wheels — required by the closed-source
+# distribution model (LICENSE governs the binary; symbols would expose
+# internal Rust structure of empyrean-core, villeneuve, scott, nolan).
+strip = true
+# Make sure the bundled gm_de440.tpc and the py.typed marker land in
+# the wheel. python-source already pulls the package tree, but listing
+# the data files explicitly keeps them visible if someone tightens the
+# default include set.
+include = [
+    { path = "python/empyrean/_data/gm_de440.tpc", format = ["sdist", "wheel"] },
+    { path = "python/empyrean/py.typed",           format = ["sdist", "wheel"] },
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = [
+    "python/empyrean/_data/",
+    "tests/fixtures/",
+]
+
+[tool.ruff.lint]
+extend-select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "I",    # isort (import ordering)
+    "W",    # pycodestyle warnings
+    "B",    # bugbear (likely bugs / footguns)
+    "UP",   # pyupgrade (modernize syntax for target-version)
+    "NPY",  # numpy-specific lints
+    "RUF",  # ruff-native rules
+]
+ignore = [
+    # Math typography is intentional throughout the codebase. `×`, `σ`,
+    # `Δ`, `Φ`, `Σ`, `α`, `β`, `γ`, `λ`, `μ`, `ε`, `ν`, `π`, `θ`, `χ`,
+    # `²`, `³`, `½`, `…` etc. appear in docstrings, NumPy / quivr column
+    # descriptions, and printed CLI output for covariance dimensions
+    # (`9×9`), sigma-points (`σ-points`), B-plane terms (`Δr`), and so on.
+    # RUF001/002/003 flag every such glyph as ambiguous; suppress globally.
+    "RUF001",  # ambiguous Unicode in string
+    "RUF002",  # ambiguous Unicode in docstring
+    "RUF003",  # ambiguous Unicode in comment
+]
+
+[tool.ruff.lint.per-file-ignores]
+# __init__.py legitimately re-exports symbols without using them locally.
+"__init__.py" = ["F401"]
+# Tests assert against blind exceptions when the failure mode is
+# "construction-time validation panicked"; tightening the type each
+# time would couple the test to internals it doesn't care about.
+"tests/*" = ["B017"]
+
+[tool.ruff.format]
+docstring-code-format = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: marks long-running integration tests (deselect with '-m \"not slow\"')",
+]
+
+# mypy's type-check target, NOT the package's runtime support floor (that
+# stays >=3.10, enforced by ruff's target-version = "py310" + the UP rules
+# below, which flag any 3.11/3.12-only syntax in our own code). It must be
+# >= 3.12 because numpy's bundled stubs (>=2.4) use PEP 695 `type` aliases,
+# which mypy rejects with a hard syntax error under any older target —
+# erroring out before it reaches our code. Do not lower this to 3.10.
+[tool.mypy]
+python_version = "3.12"
+strict = true
+exclude = [
+    "python/empyrean/_data/",
+    "tests/",
+]
+# pyo3 module is dynamically generated; mypy can't see the .so symbols.
+[[tool.mypy.overrides]]
+module = "empyrean._empyrean_rs"
+ignore_missing_imports = true
+
+# Third-party SPICE / observatory-code data packages we vendor at install
+# time but don't ship type stubs for. We only touch one module-level
+# attribute on each (the file path) and never call any of their functions,
+# so accepting `Any` from the import is safe.
+[[tool.mypy.overrides]]
+module = [
+    "naif_de440",
+    "jpl_small_bodies_de441_n16",
+    "naif_eop_high_prec",
+    "naif_eop_historical",
+    "naif_eop_predict",
+    "mpc_obscodes",
+    "pyarrow",
+    "pyarrow.parquet",
+    "pyarrow.compute",
+]
+ignore_missing_imports = true
+
+# astropy is an optional/lazy dependency: imported only under TYPE_CHECKING
+# and inside the try/except in Epochs.from_astropy / to_astropy. It ships no
+# type stubs, so accepting `Any` from the import keeps these gated code paths
+# clean without pulling astropy into the core type-check surface.
+[[tool.mypy.overrides]]
+module = ["astropy", "astropy.time"]
+ignore_missing_imports = true

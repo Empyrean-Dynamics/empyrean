@@ -1,0 +1,21 @@
+/* Shrink and de-emphasise the section-anchor pilcrows (¶). The
+ * empyrean-sphinx-theme renders them at the heading's full font
+ * size, which dominates the visual hierarchy. */
+.headerlink {
+    font-size: 0.55em;
+    margin-left: 0.4em;
+    opacity: 0.35;
+    vertical-align: middle;
+    text-decoration: none;
+}
+
+.headerlink:hover {
+    opacity: 0.85;
+    text-decoration: none;
+}
+
+/* Also tame the pilcrow on inline ::: blocks like {func} / {class}
+ * cross-reference targets. */
+:where(h1, h2, h3, h4, h5, h6) a.headerlink {
+    font-weight: 400;
+}

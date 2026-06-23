@@ -1,9 +1,37 @@
 [package]
 name = "empyrean-sys"
-version = "0.1.0"
+version = "0.7.0-rc.0"
 edition = "2024"
+rust-version = "1.90.0"
 authors = ["Joachim Moeyens <joachim@empyrean-dynamics.com>", "Empyrean Dynamics"]
+description = "Low-level FFI bindings to the libempyrean astrodynamics C ABI. For an ergonomic Rust API, use the empyrean crate."
+homepage = "https://www.empyrean-dynamics.com"
+documentation = "https://docs.rs/empyrean-sys"
+repository = "https://github.com/Empyrean-Dynamics/empyrean"
+readme = "README.md"
+license = "BSD-3-Clause"
+# crates.io enforces a 5-keyword max, 20-char-each limit. These five
+# describe the FFI nature of the crate so users searching for low-
+# level bindings find it; the higher-level `empyrean` crate carries
+# the workflow-flavored keywords (propagation / ephemeris / etc.).
+keywords = ["astrodynamics", "ffi", "bindings", "sys", "differentiable"]
+categories = ["external-ffi-bindings", "science", "aerospace::space-protocols"]
+# Bindings + the C header are the only sources that need to ship; the
+# build script regenerates the FFI surface at compile time.
+include = [
+    "src/**/*",
+    "build.rs",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE",
+]
+# Cargo build-script convention for crates that wrap a native library.
+# Setting `links` makes Cargo enforce that at most one copy of
+# empyrean-sys appears in any final binary's dep graph.
 links = "empyrean"
 
 [lib]
 name = "empyrean_sys"
+
+[build-dependencies]
+bindgen = "0.71"

@@ -418,10 +418,26 @@ jobs:
       - name: List artifacts
         run: find artifacts -type f | sort
 
+      - name: Extract tag annotation as release notes
+        id: notes
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          git fetch --force origin "refs/tags/${tag}:refs/tags/${tag}"
+          {
+            echo 'body<<__EOF__'
+            git tag -l --format='%(contents)' "$tag"
+            echo '__EOF__'
+          } >> "$GITHUB_OUTPUT"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
+          # Use the annotated tag message as the release body (not GitHub's
+          # auto-generated changelog). Pre-release tags (-rc/-beta/-alpha) are
+          # flagged so the final vX.Y.Z stays the "Latest" release.
+          body: ${{ steps.notes.outputs.body }}
+          generate_release_notes: false
+          prerelease: ${{ contains(github.ref_name, 'rc') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') }}
           files: |
             artifacts/**/*.tar.gz
             artifacts/**/*.whl

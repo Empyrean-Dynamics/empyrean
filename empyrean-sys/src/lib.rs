@@ -4,15 +4,23 @@
 //! Prefer the safe wrapper crate [`empyrean`](https://docs.rs/empyrean)
 //! unless you need direct access to the C ABI.
 //!
-//! # Local development
+//! # Linking `libempyrean`
 //!
-//! The build script expects `libempyrean` and `empyrean.h` to be available.
-//! By default it looks in the sibling `empyrean-internal` checkout's
-//! `target/release` and `include` directories. Override with
-//! `EMPYREAN_LIB_DIR` and `EMPYREAN_INCLUDE_DIR` environment variables.
+//! The build script resolves the prebuilt `libempyrean` shared library in this
+//! order:
+//!
+//! 1. `EMPYREAN_LIB_DIR` — a directory containing the library (explicit
+//!    override, offline use, or a locally built library).
+//! 2. A sibling `../target/release` workspace build (in-tree development).
+//! 3. Otherwise it downloads the version-matched, checksum-pinned prebuilt for
+//!    your platform from the GitHub release and caches it under
+//!    `~/.cache/empyrean`. Set `EMPYREAN_FORCE_DOWNLOAD=1` to force this path.
+//!
+//! The bindings below are pre-generated and committed, so building needs no C
+//! header and no `libclang` / `bindgen`.
 #![allow(non_upper_case_globals)]
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
 #![allow(dead_code)]
 
-include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+include!("bindings.rs");

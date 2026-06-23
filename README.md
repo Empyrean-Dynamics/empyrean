@@ -66,8 +66,8 @@ and **orbit determination** (including iterative `Session` fitting) —
 each shown end-to-end in Python, Rust, and CLI.
 
 > **Defaults.** Each example uses the production hot-path: Standard
-> force-model tier (Sun + planets + 16 SB441-N16 asteroid perturbers
-> + Earth J2-J4 + non-grav), GR15 integrator, `First` (linear-
+> force-model tier (Sun + planets + Moon + EIH GR + 16 SB441-N16 asteroid perturbers
+> + Sun J2 + Earth J2-J4 + Marsden non-grav), GR15 integrator, `First` (linear-
 > covariance) uncertainty propagation, ICRF frame. See
 > [`empyrean.propagation.config`](empyrean-py/python/empyrean/propagation/config.py)
 > (Python) or [`PropagationConfig`](empyrean/src/propagate/config.rs)

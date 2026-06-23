@@ -2,8 +2,8 @@
 
 empyrean is a Python toolkit for high-precision Solar System dynamics
 — trajectory propagation, ephemeris generation, orbit determination,
-and event analysis (close approaches, occultations, eclipses,
-sphere-of-influence crossings) on real Solar System bodies. It pairs a
+and event analysis (close approaches, gravitational capture, eclipses,
+atmospheric entry) on real Solar System bodies. It pairs a
 friendly, columnar Python surface (PyArrow / quivr tables, dataclass
 configs, type-hinted everything) with a Rust engine that delivers
 production-grade numerics at millisecond-class single-orbit
@@ -13,7 +13,7 @@ The full pipeline runs in one process: query JPL SBDB or MPC for an
 orbit, propagate it forward or backward across decades, predict
 apparent positions for any observatory in the MPC catalog, fit an
 orbit from astrometric observations, and detect close approaches,
-occultations, and eclipses along the trajectory — all without leaving
+gravitational capture, and eclipses along the trajectory — all without leaving
 Python and without round-tripping to a server.
 
 ## How it's built
@@ -24,8 +24,8 @@ package, each owning one layer of the stack:
 | Library | What it owns |
 |---|---|
 | **[nolan](https://github.com/Empyrean-Dynamics/nolan)** | Forward-mode automatic differentiation. The `Jet1` / `Jet2` number types that ride through every position, velocity, and force computation — so state-transition matrices (STMs) and state-transition tensors (STTs) come out as a by-product of integration, no finite differences. This is what makes uncertainty-first propagation possible at production speed. |
-| **[villeneuve](https://github.com/Empyrean-Dynamics/villeneuve)** | Numerical propagation. Force models from approximate (point-mass planets, Moon, and Pluto) through standard (planets, sixteen asteroid perturbers, EIH general relativity, Earth zonal harmonics, Marsden non-gravitationals). High-order adaptive integration. Ephemeris generation against the MPC observatory catalog. Event detection — close approaches, occultations, eclipses, sphere-of-influence crossings, atmospheric entry / exit. |
-| **[scott](https://github.com/Empyrean-Dynamics/scott)** | Orbit determination. Initial-orbit determination (Herget) and differential correction with adaptive multi-layer outlier rejection, per-station bias fitting, and catalog astrometric debiasing (EFCC2020). Returns the fitted orbit + covariance + per-observation residuals + an acceptability verdict you can gate on.|
+| **[villeneuve](https://github.com/Empyrean-Dynamics/villeneuve)** | Numerical propagation. Force models from approximate (point-mass planets, Moon, and Pluto) through standard (planets, sixteen asteroid perturbers, EIH general relativity, Earth zonal harmonics, Marsden non-gravitationals). High-order adaptive integration. Ephemeris generation against the MPC observatory catalog. Event detection — close approaches, eclipses (shadow entry / exit), gravitational capture, atmospheric entry / exit. |
+| **[scott](https://github.com/Empyrean-Dynamics/scott)** | Orbit determination. Initial-orbit determination (Gauss, Herget, systematic ranging) and differential correction with adaptive multi-layer outlier rejection, per-station bias fitting, and catalog astrometric debiasing (EFCC2020). Returns the fitted orbit + covariance + per-observation residuals + an acceptability verdict you can gate on.|
 
 Each library ships as a proprietary compiled binary; empyrean is the
 Python integration layer that exposes their behaviour through a single
@@ -119,9 +119,9 @@ fit = empyrean.refine(orbits, obs)                  # scott + villeneuve
 epoch_0 = fit.orbit.coordinates.epoch
 targets = empyrean.Epochs.from_mjd(epoch_0.mjd_tdb() + 10 * 365.25, scale="tdb")
 result  = empyrean.propagate(fit.orbit, targets)
-result.events.close_approaches      # one row per CA per body
-result.events.occultations          # background-star occultation events
-result.events.eclipses              # umbral / penumbral entries
+result.events.close_approach_starts  # one row per CA per body
+result.events.capture_starts         # temporary gravitational capture
+result.events.shadow_entries         # umbral / penumbral entry (eclipse)
 
 # 5. Predict apparent positions at Mauna Kea (obs code 568) → Ephemeris.
 #    generate_ephemeris reads its prediction times from the Observers.

@@ -1,6 +1,6 @@
 [package]
 name = "empyrean-sys"
-version = "0.7.0-rc.0"
+version = "0.7.0-rc.1"
 edition = "2024"
 rust-version = "1.90.0"
 authors = ["Joachim Moeyens <joachim@empyrean-dynamics.com>", "Empyrean Dynamics"]
@@ -16,11 +16,13 @@ license = "BSD-3-Clause"
 # the workflow-flavored keywords (propagation / ephemeris / etc.).
 keywords = ["astrodynamics", "ffi", "bindings", "sys", "differentiable"]
 categories = ["external-ffi-bindings", "science", "aerospace::space-protocols"]
-# Bindings + the C header are the only sources that need to ship; the
-# build script regenerates the FFI surface at compile time.
+# The pre-generated bindings (src/bindings.rs) ship with the crate, so
+# no C header or libclang/bindgen is needed at build time. The build
+# script only locates / downloads the prebuilt libempyrean and links it.
 include = [
     "src/**/*",
     "build.rs",
+    "checksums.txt",
     "Cargo.toml",
     "README.md",
     "LICENSE",
@@ -34,4 +36,7 @@ links = "empyrean"
 name = "empyrean_sys"
 
 [build-dependencies]
-bindgen = "0.71"
+# Verifies the pinned SHA-256 of the downloaded prebuilt libempyrean.
+# curl / tar / install_name_tool / patchelf are invoked from the build
+# script (present on the supported macOS / Linux targets).
+sha2 = "0.10"

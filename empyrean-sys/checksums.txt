@@ -1,0 +1,12 @@
+# SHA-256 of each libempyrean-<target>.tar.gz release asset.
+#
+# These pin the exact prebuilt engine binary to this crate version. They are
+# REGENERATED and re-pinned automatically by .github/workflows/release.yml at
+# publish time (from the just-built release artifacts), so the published crate
+# always carries the correct hashes for its own release. The values committed
+# here are the last-released reference; in-tree development links the local
+# ../target/release build and never reads them.
+#
+# Format: <asset-stem> <sha256>
+libempyrean-macos-aarch64 51ecbafc3c9a8bdf7191d083ae68b22b1381171099dad5df5e750b055b039f11
+libempyrean-linux-x86_64 951a95ae2430e75b93832499ae61f8946bc41c12d304edda2f5cdc5d9dc58d9c

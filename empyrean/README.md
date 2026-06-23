@@ -28,11 +28,11 @@ empyrean = "0.7"
 
 ## What it does
 
-- **Propagation** — N-body with general relativity, Earth J2–J4, 16 asteroid perturbers, Marsden non-gravitational model. Adaptive 15th-order Gauss-Radau integrator.
+- **Propagation** — N-body (Sun, planets, Moon, Pluto) with EIH general relativity, Sun J2 and Earth J2–J4 zonal harmonics, 16 asteroid perturbers, and the Marsden non-gravitational model — selectable across Approximate / Basic / Standard force-model tiers (Standard is the default). GR15 and DOP853 integrators.
 - **Uncertainty** — First-order (Jet1) state transition matrices; second-order (Jet2) state transition tensors.
 - **Ephemeris** — RA/Dec, rates, photometry (H–G, H–G₁G₂, H–G₁₂), light time, phase angle, solar elongation, local horizon.
-- **Orbit determination** — Herget IOD → N-body differential correction with STM caching and outlier rejection. Validated against `find_orb` and JPL SBDB.
-- **Events** — Close approach, periapsis, SOI entry/exit, shadow, atmospheric entry, possible impact.
+- **Orbit determination** — Gauss, Herget, and systematic-ranging (admissible region + Manifold of Variations) IOD → N-body differential correction with STM caching and outlier rejection. Validated against `find_orb` and JPL SBDB.
+- **Events** — Close approach (start/end), periapsis, gravitational capture (start/end), shadow entry/exit, atmospheric entry/exit, impact, and possible impact.
 
 ## Quick start
 
@@ -52,7 +52,7 @@ println!("{} states, {} events", result.states.len(), result.events.len());
 
 ## Orbit determination
 
-`determine` runs a full Herget IOD → N-body differential correction. The
+`determine` runs a full IOD (Gauss / Herget / systematic ranging) → N-body differential correction. The
 fitted `result.orbit` is a re-feedable [`Orbit`] carrying state, covariance,
 and any fitted non-gravitational parameters — pass it straight back into
 `propagate`, `generate_ephemeris`, or `compute_impact_probabilities`.

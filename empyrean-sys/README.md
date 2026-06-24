@@ -48,18 +48,23 @@ and Rust-native lifetime management.
 
 ## Runtime requirement
 
-empyrean-sys links against `libempyrean.{dylib,so,dll}`, which is
-distributed separately as a binary release on
+empyrean-sys opens `libempyrean.{dylib,so,dll}` at run time via
+`libloading` (dlopen). The library is distributed separately as a
+binary release on
 [GitHub](https://github.com/Empyrean-Dynamics/empyrean/releases) and
-inside the published Python wheel. `bindgen` regenerates the FFI
-declarations from `include/empyrean.h` at build time, so the header
-must also be on the include path.
+inside the published Python wheel. The path is resolved from the
+`EMPYREAN_LIB` environment variable if set, else a `libempyrean.*`
+sitting next to the loaded module, else a build-time location — a
+sibling `../target/release` build, an `EMPYREAN_LIB_DIR` override, or
+a checksum-pinned download from the GitHub release. The FFI bindings
+are pre-generated and committed, so no C header, libclang, or bindgen
+is needed to build.
 
 ## License
 
 Source code in this crate is licensed under the
 [BSD 3-Clause License](LICENSE). The closed-source `libempyrean`
-runtime it links against is governed by a separate proprietary binary
+runtime it loads at runtime is governed by a separate proprietary binary
 license; see the main repository for the dual-license breakdown.
 
 Copyright © 2024–2026 Joachim Moeyens. All rights reserved.

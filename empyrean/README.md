@@ -140,12 +140,13 @@ for bp in &bps {
 
 ## Runtime requirement
 
-This crate links against `libempyrean.{dylib,so,dll}`, which is
-distributed separately as a binary release on
+This crate (via empyrean-sys) loads `libempyrean.{dylib,so,dll}` at
+run time, which is distributed separately as a binary release on
 [GitHub](https://github.com/Empyrean-Dynamics/empyrean/releases) and
-inside the published Python wheel. `cargo install empyrean-cli`
-will build the binary against the cdylib and expects to find it on
-the system library path.
+inside the published Python wheel. The library is opened from a path
+resolved at build/run time — a local `../target/release` build, an
+`EMPYREAN_LIB_DIR` override, or a checksum-pinned prebuilt downloaded
+from the GitHub release; no system library path setup is required.
 
 The full distribution surface (Python wheel, CLI binary, C SDK, this
 Rust crate) lives at the
@@ -170,7 +171,7 @@ independent verification. See the LICENSE file for the full terms.
 
 Source code in this crate is licensed under the
 [BSD 3-Clause License](LICENSE). The closed-source `libempyrean`
-runtime it links against is governed by a separate proprietary
+runtime it loads at runtime is governed by a separate proprietary
 binary license; see the main repository for the dual-license breakdown.
 
 Copyright © 2024–2026 Joachim Moeyens. All rights reserved.

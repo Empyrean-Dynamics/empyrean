@@ -22,7 +22,8 @@ header (`include/empyrean.h`) emitted by `cbindgen`.
 It is **not published to crates.io** — Rust callers should use the
 [`empyrean`](https://crates.io/crates/empyrean) safe wrapper crate or
 the [`empyrean-sys`](https://crates.io/crates/empyrean-sys) raw FFI
-crate, which both link against the cdylib this crate produces. The
+crate, which both load (dlopen) the cdylib this crate produces at run
+time. The
 binary artifact is distributed via
 [GitHub releases](https://github.com/Empyrean-Dynamics/empyrean/releases)
 and bundled into the published Python wheel.

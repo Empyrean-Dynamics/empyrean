@@ -59,12 +59,13 @@ can mix-and-match channels for the same workflow.
 
 ## Runtime requirement
 
-The `empyrean` binary links against `libempyrean.{dylib,so,dll}`,
+The `empyrean` binary loads `libempyrean.{dylib,so,dll}` at run time,
 which is distributed separately as a binary release on
 [GitHub](https://github.com/Empyrean-Dynamics/empyrean/releases) and
-inside the published Python wheel. `cargo install empyrean-cli` will
-build the binary and expects to find the dylib on the system library
-path at runtime.
+inside the published Python wheel. The library is opened from a path
+resolved at build time — a local `../target/release` build, an
+`EMPYREAN_LIB_DIR` override, or a checksum-pinned prebuilt downloaded
+from the GitHub release; no system library path setup is needed.
 
 ## License
 

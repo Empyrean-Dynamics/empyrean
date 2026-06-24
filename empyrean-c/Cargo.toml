@@ -1,6 +1,6 @@
 [package]
 name = "empyrean-c"
-version = "0.7.0-rc.2"
+version = "0.7.0-rc.3"
 edition = "2024"
 rust-version = "1.90.0"
 authors = ["Joachim Moeyens <joachim@empyrean-dynamics.com>", "Empyrean Dynamics"]
@@ -31,6 +31,16 @@ parquet = "58"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 csv = "1"
+
+# The engine's HTTP client (reqwest -> native-tls) links system OpenSSL on
+# Linux. Vendor it statically so libempyrean carries no external libssl /
+# libcrypto runtime dependency: the Python wheel bundles the dlopen'd engine as
+# a plain file that auditwheel can't see (and so can't vendor its deps for), so
+# the engine must be self-contained. macOS uses Security.framework, so this is
+# Linux-only; the dependency exists solely to enable openssl's `vendored`
+# feature across the build via Cargo feature unification.
+[target.'cfg(target_os = "linux")'.dependencies]
+openssl = { version = "0.10", features = ["vendored"] }
 
 [build-dependencies]
 cbindgen = "0.29"

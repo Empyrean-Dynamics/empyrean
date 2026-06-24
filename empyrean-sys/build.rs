@@ -1,7 +1,10 @@
 //! Build script for `empyrean-sys`.
 //!
-//! Locates `libempyrean` (the prebuilt engine shared library) and emits the
-//! link directives. Resolution order:
+//! Resolves the absolute path of the prebuilt `libempyrean` shared library and
+//! writes it to `$OUT_DIR/lib_path.rs` for the runtime loader. The library is
+//! opened with `libloading` at run time — there is **no** link-time native
+//! dependency, so no `install_name_tool` / `patchelf` / rpath / loader-path
+//! environment is involved. Resolution order:
 //!
 //!   1. `EMPYREAN_LIB_DIR` — explicit override (offline / air-gapped / a
 //!      locally built library).
@@ -11,18 +14,14 @@
 //!      version from the GitHub release, verified against a pinned SHA-256, into
 //!      a persistent per-version cache.
 //!
-//! For the downloaded case the library's install name / soname is rewritten to
-//! its absolute cache path, so binaries that link `empyrean` resolve it at run
-//! time without any rpath, `DYLD_LIBRARY_PATH`, or `LD_LIBRARY_PATH` setup.
-//!
-//! FFI bindings are pre-generated and committed (`src/bindings.rs`), so building
-//! this crate needs neither the C header nor `libclang` / `bindgen`.
+//! Download and extraction are done in-process (ureq + flate2 + tar), so the
+//! build needs no system `curl` / `wget` / `tar`. FFI bindings are pre-generated
+//! and committed, so it needs no C header and no `libclang` / `bindgen` either.
 
 use std::env;
 use std::fs;
 use std::io::Read;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 
 use sha2::{Digest, Sha256};
 
@@ -72,10 +71,13 @@ fn main() {
     println!("cargo:rerun-if-env-changed=EMPYREAN_LIB_DIR");
     println!("cargo:rerun-if-env-changed=EMPYREAN_FORCE_DOWNLOAD");
 
-    // docs.rs builds in a network-isolated sandbox and does not link the final
-    // artifact. Skip locating/downloading libempyrean there; the committed
-    // bindings still compile, so `cargo doc` succeeds.
+    let out = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR")).join("lib_path.rs");
+
+    // docs.rs builds in a network-isolated sandbox and never loads the library.
+    // Write a placeholder path so the crate compiles; the loader is lazy and is
+    // never invoked there.
     if env::var_os("DOCS_RS").is_some() {
+        fs::write(&out, "pub const LIB_PATH: &str = \"\";\n").expect("write lib_path.rs");
         return;
     }
 
@@ -89,9 +91,15 @@ fn main() {
         lib_path.display(),
     );
 
-    println!("cargo:rustc-link-search=native={}", lib_dir.display());
-    println!("cargo:rustc-link-lib=dylib=empyrean");
-    println!("cargo:rerun-if-changed={}", lib_path.display());
+    // The library is opened by absolute path at run time (libloading), so there
+    // is no link-time dependency to emit — just record where it lives.
+    let abs = lib_path.canonicalize().unwrap_or(lib_path);
+    fs::write(
+        &out,
+        format!("pub const LIB_PATH: &str = {:?};\n", abs.to_string_lossy()),
+    )
+    .expect("write lib_path.rs");
+    println!("cargo:rerun-if-changed={}", abs.display());
 }
 
 fn resolve_lib_dir(lib_file: &str) -> PathBuf {
@@ -168,42 +176,7 @@ fn download_prebuilt(lib_file: &str) -> PathBuf {
         "{stem}.tar.gz did not contain {lib_file}"
     );
 
-    bake_absolute_path(&lib_path);
     cache
-}
-
-/// Rewrite the library's recorded path to its absolute cache location so that
-/// any binary linking it loads it from there at run time, with no rpath or
-/// loader-path environment needed.
-fn bake_absolute_path(lib_path: &Path) {
-    let abs = lib_path
-        .canonicalize()
-        .unwrap_or_else(|_| lib_path.to_path_buf());
-    let abs = path_str(&abs);
-    match target_os().as_str() {
-        "macos" => run(
-            "install_name_tool",
-            &["-id", abs, abs],
-            "set absolute install_name on libempyrean.dylib",
-        ),
-        "linux" => {
-            if which("patchelf") {
-                run(
-                    "patchelf",
-                    &["--set-soname", abs, abs],
-                    "set absolute soname on libempyrean.so",
-                );
-            } else {
-                println!(
-                    "cargo:warning=patchelf not found; if a binary linking `empyrean` fails to \
-                     load libempyrean.so, install patchelf and rebuild, or add {} to \
-                     LD_LIBRARY_PATH.",
-                    lib_path.parent().unwrap().display()
-                );
-            }
-        }
-        _ => {}
-    }
 }
 
 fn cache_dir() -> PathBuf {
@@ -225,28 +198,4 @@ fn cache_dir() -> PathBuf {
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn which(cmd: &str) -> bool {
-    Command::new(cmd)
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-fn run(cmd: &str, args: &[&str], what: &str) {
-    let out = Command::new(cmd)
-        .args(args)
-        .output()
-        .unwrap_or_else(|e| panic!("failed to spawn `{cmd}` ({what}): {e}"));
-    assert!(
-        out.status.success(),
-        "`{cmd}` failed ({what}):\n{}",
-        String::from_utf8_lossy(&out.stderr),
-    );
-}
-
-fn path_str(p: &Path) -> &str {
-    p.to_str().expect("non-UTF8 path")
 }

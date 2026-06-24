@@ -3078,57 +3078,26 @@ impl Default for EmpyreanStateResult {
         }
     }
 }
-unsafe extern "C" {
-    #[doc = " Return a pointer to the last error message (thread-local, null-terminated).\n\n The pointer is valid until the next call that sets an error on the same\n thread."]
-    pub fn empyrean_last_error() -> *const ::std::os::raw::c_char;
-}
-unsafe extern "C" {
-    #[doc = " Create a **minimal** `EmpyreanContext` from a DE440 SPK file and a\n GM TPC file.\n\n Loads ONLY the planetary ephemeris and gravitational parameters —\n no Earth/Moon BPC kernels, no SB441-N16 asteroid perturbers, no\n MPC observatory codes, no Earth gravity field. This is sufficient\n for coordinate transforms and basic propagation under the\n `Approximate` force model, but is **not** enough for production\n orbit propagation, orbit determination, or topocentric ephemeris\n generation. Most callers should use\n [`empyrean_context_from_data_dir`] instead, which loads the full\n Standard-tier kernel set (downloading any missing files).\n\n Use [`empyrean_context_with_spk`] to chain additional SPK kernels\n (e.g. SB441-N16) onto a context built by this function.\n\n Returns a heap-allocated pointer on success, or null on error.\n Call `empyrean_last_error()` to retrieve the error message when null is\n returned.  The caller owns the returned pointer and must free it with\n `empyrean_context_free()`."]
-    pub fn empyrean_context_new_minimal(
+pub struct EmpyreanLib {
+    __library: ::libloading::Library,
+    pub empyrean_last_error: unsafe extern "C" fn() -> *const ::std::os::raw::c_char,
+    pub empyrean_context_new_minimal: unsafe extern "C" fn(
         de440_path: *const ::std::os::raw::c_char,
         gm_path: *const ::std::os::raw::c_char,
-    ) -> *mut EmpyreanContext;
-}
-unsafe extern "C" {
-    #[doc = " Load an additional SPK kernel into an existing context, in place.\n\n Useful for layering SB441-N16 asteroid perturbers or spacecraft\n SPK kernels (JWST, Gaia, custom probes) on top of a context built\n by [`empyrean_context_new_minimal`] or [`empyrean_context_from_data_dir`].\n The merged context picks up the new kernel's body coverage on top\n of what was already loaded.\n\n Returns 0 on success; negative error code on failure. The context\n pointer remains valid and unchanged when this function returns\n non-zero — failure does not invalidate `ctx`."]
-    pub fn empyrean_context_with_spk(
+    ) -> *mut EmpyreanContext,
+    pub empyrean_context_with_spk: unsafe extern "C" fn(
         ctx: *mut EmpyreanContext,
         spk_path: *const ::std::os::raw::c_char,
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Create a new `EmpyreanContext` from a data directory.\n\n Loads the full Standard-tier kernel set (DE440, SB441-N16, Earth/Moon\n BPCs, GM, MPC observatory codes) from `data_dir`, downloading any\n missing files. Pass null for `data_dir` to use the platform XDG\n data directory (`~/.empyrean/data` on Linux/macOS).\n\n Returns a heap-allocated pointer on success, or null on error.\n Call `empyrean_last_error()` to retrieve the error message when null is\n returned. The caller owns the returned pointer and must free it with\n `empyrean_context_free()`."]
-    pub fn empyrean_context_from_data_dir(
-        data_dir: *const ::std::os::raw::c_char,
-    ) -> *mut EmpyreanContext;
-}
-unsafe extern "C" {
-    #[doc = " Free an `EmpyreanContext` previously returned by `empyrean_context_new()`.\n\n Passing null is a no-op."]
-    pub fn empyrean_context_free(ctx: *mut EmpyreanContext);
-}
-unsafe extern "C" {
-    #[doc = " Return the platform XDG-compliant default data directory as a\n heap-allocated, NUL-terminated UTF-8 string.\n\n Mirrors villeneuve's [`DataManager::new`] resolution: honors\n `EMPYREAN_DATA_DIR` first, then falls back to `dirs::data_dir()` —\n `~/.local/share/empyrean/data/` on Linux, `~/Library/Application\n Support/empyrean/data/` on macOS, `%APPDATA%\\empyrean\\data\\` on\n Windows. Cheap (no filesystem I/O).\n\n Returns null on failure (non-UTF-8 path, NUL byte in path, panic).\n Call `empyrean_last_error()` for details.\n\n **The caller owns the returned pointer and must release it with\n [`empyrean_string_free`].**"]
-    pub fn empyrean_default_data_dir() -> *mut ::std::os::raw::c_char;
-}
-unsafe extern "C" {
-    #[doc = " Free a string returned by an empyrean C API function (e.g.,\n [`empyrean_default_data_dir`], [`empyrean_version_string`]).\n\n Passing null is a no-op. Passing any pointer not obtained from an\n empyrean string-returning function is undefined behavior."]
-    pub fn empyrean_string_free(s: *mut ::std::os::raw::c_char);
-}
-unsafe extern "C" {
-    #[doc = " Multi-line version report — `empyrean-core <ver>\\nvilleneuve <ver>\\n…`.\n\n Mirrors [`empyrean_core::version_string`]. Useful for `--version`-style\n output and for verifying the build provenance of a deployed cdylib.\n Returns null on allocation failure (extremely unlikely — the strings\n are short and `&'static` underneath); call `empyrean_last_error()` if\n it does.\n\n **The caller owns the returned pointer and must release it with\n [`empyrean_string_free`].**"]
-    pub fn empyrean_version_string() -> *mut ::std::os::raw::c_char;
-}
-unsafe extern "C" {
-    #[doc = " Populate `out` with the per-crate versions of the empyrean stack.\n\n Returns 0 on success, non-zero on failure (`empyrean_last_error()`\n has the details). On failure `out` is left zero-initialized — no\n allocation needs freeing.\n\n **The caller owns the strings inside `out` and must release the\n whole struct with [`empyrean_versions_free`] when done.**"]
-    pub fn empyrean_versions(out: *mut EmpyreanVersions) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Free the version strings inside `versions` (each was heap-allocated\n by a previous successful [`empyrean_versions`] call). After this\n returns, `versions` itself is zero-initialized — safe to drop on\n the caller's stack.\n\n Passing null is a no-op. Calling this twice on the same struct, or\n passing a struct that wasn't populated by [`empyrean_versions`], is\n undefined behavior."]
-    pub fn empyrean_versions_free(versions: *mut EmpyreanVersions);
-}
-unsafe extern "C" {
-    #[doc = " Generate predicted ephemeris for orbits and observers.\n\n Returns 0 on success, negative error code on failure.\n On success, `result_out` is populated with ephemeris entries.\n The caller must free the result with `empyrean_ephemeris_result_free()`."]
-    pub fn empyrean_generate_ephemeris(
+    ) -> i32,
+    pub empyrean_context_from_data_dir:
+        unsafe extern "C" fn(data_dir: *const ::std::os::raw::c_char) -> *mut EmpyreanContext,
+    pub empyrean_context_free: unsafe extern "C" fn(ctx: *mut EmpyreanContext),
+    pub empyrean_default_data_dir: unsafe extern "C" fn() -> *mut ::std::os::raw::c_char,
+    pub empyrean_string_free: unsafe extern "C" fn(s: *mut ::std::os::raw::c_char),
+    pub empyrean_version_string: unsafe extern "C" fn() -> *mut ::std::os::raw::c_char,
+    pub empyrean_versions: unsafe extern "C" fn(out: *mut EmpyreanVersions) -> i32,
+    pub empyrean_versions_free: unsafe extern "C" fn(versions: *mut EmpyreanVersions),
+    pub empyrean_generate_ephemeris: unsafe extern "C" fn(
         ctx: *const EmpyreanContext,
         orbits_ptr: *const EmpyreanOrbit,
         num_orbits: usize,
@@ -3136,15 +3105,9 @@ unsafe extern "C" {
         num_observers: usize,
         config: *const EmpyreanEphemerisConfig,
         result_out: *mut EmpyreanEphemerisResult,
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Free an ephemeris result previously returned by `empyrean_generate_ephemeris()`."]
-    pub fn empyrean_ephemeris_result_free(result: *mut EmpyreanEphemerisResult);
-}
-unsafe extern "C" {
-    #[doc = " Run [`empyrean_core::impact::compute_impact_probabilities`] over a\n caller-supplied set of [`UncertaintyMethod`] variants and return\n the flattened IP records tagged by method.\n\n Caller is responsible for freeing the result via\n [`empyrean_compute_impact_probabilities_result_free`].\n\n # Returns\n `0` on success, negative on failure (see [`crate::set_last_error`]).\n\n # Safety\n All non-null pointer arguments must point to valid arrays of the\n indicated length for the duration of the call. The output struct\n is allocated by the caller; pointer fields inside it are allocated\n here and owned by the result."]
-    pub fn empyrean_compute_impact_probabilities(
+    ) -> i32,
+    pub empyrean_ephemeris_result_free: unsafe extern "C" fn(result: *mut EmpyreanEphemerisResult),
+    pub empyrean_compute_impact_probabilities: unsafe extern "C" fn(
         ctx: *const EmpyreanContext,
         orbits_ptr: *const EmpyreanOrbit,
         num_orbits: usize,
@@ -3154,17 +3117,10 @@ unsafe extern "C" {
         body_filter_naif: *const i32,
         num_body_filter: usize,
         result_out: *mut EmpyreanImpactProbabilitiesResult,
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Free the records array allocated by\n [`empyrean_compute_impact_probabilities`]. After calling, the\n struct's `records` is reset to null and `num_records` to 0."]
-    pub fn empyrean_compute_impact_probabilities_result_free(
-        result: *mut EmpyreanImpactProbabilitiesResult,
-    );
-}
-unsafe extern "C" {
-    #[doc = " Run [`empyrean_core::impact::compute_b_planes`] over a caller-\n supplied set of [`UncertaintyMethod`] variants and return the\n flattened B-plane records tagged by method.\n\n Caller is responsible for freeing the result via\n [`empyrean_compute_b_planes_result_free`].\n\n # Safety\n Same contract as\n [`empyrean_compute_impact_probabilities`]."]
-    pub fn empyrean_compute_b_planes(
+    ) -> i32,
+    pub empyrean_compute_impact_probabilities_result_free:
+        unsafe extern "C" fn(result: *mut EmpyreanImpactProbabilitiesResult),
+    pub empyrean_compute_b_planes: unsafe extern "C" fn(
         ctx: *const EmpyreanContext,
         orbits_ptr: *const EmpyreanOrbit,
         num_orbits: usize,
@@ -3174,205 +3130,125 @@ unsafe extern "C" {
         body_filter_naif: *const i32,
         num_body_filter: usize,
         result_out: *mut EmpyreanBPlanesResult,
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Free the records array allocated by [`empyrean_compute_b_planes`]."]
-    pub fn empyrean_compute_b_planes_result_free(result: *mut EmpyreanBPlanesResult);
-}
-unsafe extern "C" {
-    #[doc = " Free a batch previously returned by an `empyrean_orbits_read_*`\n function. Passing null is a no-op."]
-    pub fn empyrean_orbits_batch_free(batch: *mut EmpyreanOrbitBatch);
-}
-unsafe extern "C" {
-    #[doc = " Read an orbits parquet file. Caller frees the result with\n [`empyrean_orbits_batch_free`]."]
-    pub fn empyrean_orbits_read_parquet(
+    ) -> i32,
+    pub empyrean_compute_b_planes_result_free:
+        unsafe extern "C" fn(result: *mut EmpyreanBPlanesResult),
+    pub empyrean_orbits_batch_free: unsafe extern "C" fn(batch: *mut EmpyreanOrbitBatch),
+    pub empyrean_orbits_read_parquet: unsafe extern "C" fn(
         path: *const ::std::os::raw::c_char,
         out: *mut EmpyreanOrbitBatch,
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Write an orbit batch to a parquet file."]
-    pub fn empyrean_orbits_write_parquet(
+    ) -> i32,
+    pub empyrean_orbits_write_parquet: unsafe extern "C" fn(
         path: *const ::std::os::raw::c_char,
         batch: *const EmpyreanOrbitBatch,
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Read an orbits JSON file (array of orbit-row objects). Caller frees\n with [`empyrean_orbits_batch_free`]."]
-    pub fn empyrean_orbits_read_json(
+    ) -> i32,
+    pub empyrean_orbits_read_json: unsafe extern "C" fn(
         path: *const ::std::os::raw::c_char,
         out: *mut EmpyreanOrbitBatch,
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Write an orbit batch to JSON."]
-    pub fn empyrean_orbits_write_json(
+    ) -> i32,
+    pub empyrean_orbits_write_json: unsafe extern "C" fn(
         path: *const ::std::os::raw::c_char,
         batch: *const EmpyreanOrbitBatch,
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Read an orbits CSV file.\n\n CSV does not carry covariance (use parquet for covariance round-trip)."]
-    pub fn empyrean_orbits_read_csv(
+    ) -> i32,
+    pub empyrean_orbits_read_csv: unsafe extern "C" fn(
         path: *const ::std::os::raw::c_char,
         out: *mut EmpyreanOrbitBatch,
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Write an orbit batch to CSV."]
-    pub fn empyrean_orbits_write_csv(
+    ) -> i32,
+    pub empyrean_orbits_write_csv: unsafe extern "C" fn(
         path: *const ::std::os::raw::c_char,
         batch: *const EmpyreanOrbitBatch,
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Write ephemeris entries to parquet using the villeneuve schema."]
-    pub fn empyrean_ephemeris_write_parquet(
+    ) -> i32,
+    pub empyrean_ephemeris_write_parquet: unsafe extern "C" fn(
         path: *const ::std::os::raw::c_char,
         entries_ptr: *const EmpyreanEphemerisEntry,
         num_entries: usize,
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Write ephemeris entries to JSON."]
-    pub fn empyrean_ephemeris_write_json(
+    ) -> i32,
+    pub empyrean_ephemeris_write_json: unsafe extern "C" fn(
         path: *const ::std::os::raw::c_char,
         entries_ptr: *const EmpyreanEphemerisEntry,
         num_entries: usize,
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Write ephemeris entries to CSV."]
-    pub fn empyrean_ephemeris_write_csv(
+    ) -> i32,
+    pub empyrean_ephemeris_write_csv: unsafe extern "C" fn(
         path: *const ::std::os::raw::c_char,
         entries_ptr: *const EmpyreanEphemerisEntry,
         num_entries: usize,
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Write events to parquet."]
-    pub fn empyrean_events_write_parquet(
+    ) -> i32,
+    pub empyrean_events_write_parquet: unsafe extern "C" fn(
         path: *const ::std::os::raw::c_char,
         events_ptr: *const EmpyreanEvent,
         num_events: usize,
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Write events to JSON."]
-    pub fn empyrean_events_write_json(
+    ) -> i32,
+    pub empyrean_events_write_json: unsafe extern "C" fn(
         path: *const ::std::os::raw::c_char,
         events_ptr: *const EmpyreanEvent,
         num_events: usize,
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Write events to CSV."]
-    pub fn empyrean_events_write_csv(
+    ) -> i32,
+    pub empyrean_events_write_csv: unsafe extern "C" fn(
         path: *const ::std::os::raw::c_char,
         events_ptr: *const EmpyreanEvent,
         num_events: usize,
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Write OD residuals to parquet."]
-    pub fn empyrean_residuals_write_parquet(
+    ) -> i32,
+    pub empyrean_residuals_write_parquet: unsafe extern "C" fn(
         path: *const ::std::os::raw::c_char,
         obs_ptr: *const EmpyreanObservationResult,
         num_obs: usize,
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Write OD residuals to JSON."]
-    pub fn empyrean_residuals_write_json(
+    ) -> i32,
+    pub empyrean_residuals_write_json: unsafe extern "C" fn(
         path: *const ::std::os::raw::c_char,
         obs_ptr: *const EmpyreanObservationResult,
         num_obs: usize,
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Write OD residuals to CSV."]
-    pub fn empyrean_residuals_write_csv(
+    ) -> i32,
+    pub empyrean_residuals_write_csv: unsafe extern "C" fn(
         path: *const ::std::os::raw::c_char,
         obs_ptr: *const EmpyreanObservationResult,
         num_obs: usize,
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Find the dominant eigenvalue and eigenvector of a 6x6 symmetric matrix.\n\n Returns 0 on success. `eigenvalue_out` receives the eigenvalue,\n `eigenvector_out` receives the 6-element eigenvector."]
-    pub fn empyrean_eigenvector_max_6x6(
+    ) -> i32,
+    pub empyrean_eigenvector_max_6x6: unsafe extern "C" fn(
         matrix: *const [[f64; 6usize]; 6usize],
         eigenvalue_out: *mut f64,
         eigenvector_out: *mut [f64; 6usize],
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Split a 6D Gaussian into K weighted components along the dominant\n eigenvector of the covariance.\n\n `weights_out`, `means_out`, `covariances_out` must point to arrays\n of size K, K×6, and K×6×6 respectively. Returns 0 on success."]
-    pub fn empyrean_split_gaussian(
+    ) -> i32,
+    pub empyrean_split_gaussian: unsafe extern "C" fn(
         mean: *const [f64; 6usize],
         covariance: *const [[f64; 6usize]; 6usize],
         k: usize,
         weights_out: *mut f64,
         means_out: *mut [f64; 6usize],
         covariances_out: *mut [[f64; 6usize]; 6usize],
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Compute observer states for given observatory codes and epochs.\n\n Returns 0 on success, negative error code on failure.\n On success, `result_out` is populated with observer states.\n The caller must free the result with `empyrean_observer_result_free()`."]
-    pub fn empyrean_get_observers(
+    ) -> i32,
+    pub empyrean_get_observers: unsafe extern "C" fn(
         ctx: *const EmpyreanContext,
         obs_codes: *const *const ::std::os::raw::c_char,
         num_codes: usize,
         epochs_mjd_tdb: *const f64,
         num_epochs: usize,
         result_out: *mut EmpyreanObserverResult,
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Free an observer result previously returned by `empyrean_get_observers()`.\n\n Passing a zeroed/null result is a no-op."]
-    pub fn empyrean_observer_result_free(result: *mut EmpyreanObserverResult);
-}
-unsafe extern "C" {
-    #[doc = " Read ADES PSV / MPC80 data from a string and pack into the C array.\n\n `path_or_content` is a null-terminated UTF-8 string with the ADES\n content directly (not a file path)."]
-    pub fn empyrean_read_ades(
+    ) -> i32,
+    pub empyrean_observer_result_free: unsafe extern "C" fn(result: *mut EmpyreanObserverResult),
+    pub empyrean_read_ades: unsafe extern "C" fn(
         content: *const ::std::os::raw::c_char,
         observations_out: *mut *mut EmpyreanObservation,
         num_observations_out: *mut usize,
         radar_out: *mut *mut EmpyreanRadarObservation,
         num_radar_out: *mut usize,
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Free an observation array previously returned by `empyrean_read_ades()`.\n Copy a caller-owned array of [`EmpyreanObservation`] into a fresh\n allocation that matches the layout produced by\n [`empyrean_read_ades`].\n\n The strings on the input observations (`perm_id` / `prov_id` /\n `obs_time`) are duplicated into freshly-allocated `CString`s so the\n returned array owns its own memory independent of the input.\n\n On success populates `*out_ptr` with the new array and `*out_num`\n with its length, both freeable with [`empyrean_observations_free`].\n\n Returns 0 on success; negative error code on failure."]
-    pub fn empyrean_observations_from_array(
+    ) -> i32,
+    pub empyrean_observations_from_array: unsafe extern "C" fn(
         input: *const EmpyreanObservation,
         num: usize,
         out_ptr: *mut *mut EmpyreanObservation,
         out_num: *mut usize,
-    ) -> i32;
-}
-unsafe extern "C" {
-    pub fn empyrean_observations_free(observations: *mut EmpyreanObservation, num: usize);
-}
-unsafe extern "C" {
-    #[doc = " Copy a caller-owned array of [`EmpyreanRadarObservation`] into a fresh\n allocation matching the layout produced by [`empyrean_read_ades`].\n\n The nullable `*mut c_char` fields (`perm_id` / `prov_id` / `trk_sub` /\n `obs_time` / `remarks`) are duplicated into freshly-allocated\n `CString`s so the returned array owns its own memory independent of the\n input. All scalar fields (including the ADES-native delay/Doppler\n values) are copied verbatim — no unit conversion, nothing zeroed.\n\n On success populates `*out_ptr` with the new array and `*out_num` with\n its length, both freeable with [`empyrean_radar_observations_free`].\n\n Returns 0 on success; negative error code on failure."]
-    pub fn empyrean_radar_observations_from_array(
+    ) -> i32,
+    pub empyrean_observations_free:
+        unsafe extern "C" fn(observations: *mut EmpyreanObservation, num: usize),
+    pub empyrean_radar_observations_from_array: unsafe extern "C" fn(
         input: *const EmpyreanRadarObservation,
         num: usize,
         out_ptr: *mut *mut EmpyreanRadarObservation,
         out_num: *mut usize,
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Free a radar observation array previously returned by\n [`empyrean_read_ades`] or [`empyrean_radar_observations_from_array`]."]
-    pub fn empyrean_radar_observations_free(
-        observations: *mut EmpyreanRadarObservation,
-        num: usize,
-    );
-}
-unsafe extern "C" {
-    #[doc = " Run the full orbit determination pipeline.\n\n When `num_initial_orbits > 0`, the supplied orbits are used as DC\n seeds (one per ADES object_id encountered in `observations`,\n matched by orbit index). Pass `null, 0` to let the IOD pipeline\n produce its own seeds."]
-    pub fn empyrean_determine(
+    ) -> i32,
+    pub empyrean_radar_observations_free:
+        unsafe extern "C" fn(observations: *mut EmpyreanRadarObservation, num: usize),
+    pub empyrean_determine: unsafe extern "C" fn(
         ctx: *const EmpyreanContext,
         observations: *const EmpyreanObservation,
         num_observations: usize,
@@ -3382,41 +3258,26 @@ unsafe extern "C" {
         num_initial_orbits: usize,
         config: *const EmpyreanODConfig,
         result_out: *mut EmpyreanODResult,
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Free an OD result previously returned by `empyrean_determine()` or `empyrean_refine()`."]
-    pub fn empyrean_od_result_free(result: *mut EmpyreanODResult);
-}
-unsafe extern "C" {
-    #[doc = " Evaluate residuals for a single orbit against observations."]
-    pub fn empyrean_evaluate(
+    ) -> i32,
+    pub empyrean_od_result_free: unsafe extern "C" fn(result: *mut EmpyreanODResult),
+    pub empyrean_evaluate: unsafe extern "C" fn(
         ctx: *const EmpyreanContext,
         orbit: *const EmpyreanOrbit,
         observations: *const EmpyreanObservation,
         num_observations: usize,
         config: *const EmpyreanODConfig,
         result_out: *mut EmpyreanEvaluateResult,
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Free an evaluate result previously returned by `empyrean_evaluate()`."]
-    pub fn empyrean_evaluate_result_free(result: *mut EmpyreanEvaluateResult);
-}
-unsafe extern "C" {
-    #[doc = " Refine a single orbit estimate with new observations using a\n Bayesian prior."]
-    pub fn empyrean_refine(
+    ) -> i32,
+    pub empyrean_evaluate_result_free: unsafe extern "C" fn(result: *mut EmpyreanEvaluateResult),
+    pub empyrean_refine: unsafe extern "C" fn(
         ctx: *const EmpyreanContext,
         orbit: *const EmpyreanOrbit,
         observations: *const EmpyreanObservation,
         num_observations: usize,
         config: *const EmpyreanODConfig,
         result_out: *mut EmpyreanODResult,
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Evaluate an observation plan: how much each candidate observation would\n tighten the prior orbit covariance.\n\n `orbit` must carry a 6×6 Cartesian covariance (e.g. a `determine` result).\n `planned` is an array of `num_planned` candidate observations. `orbit_id`\n may be null (defaults to `\"orbit_0\"`). On success populates `*result_out`\n (caller-allocated); free with [`empyrean_plan_result_free`].\n\n Returns 0 on success, -1 for a null/invalid argument, -3 if planning fails\n (missing/singular prior covariance, an infeasible or invalid candidate, an\n ephemeris-generation error), -99 on an internal panic. The error message is\n retrievable via `empyrean_last_error()`."]
-    pub fn empyrean_evaluate_plan(
+    ) -> i32,
+    pub empyrean_evaluate_plan: unsafe extern "C" fn(
         ctx: *const EmpyreanContext,
         orbit: *const EmpyreanOrbit,
         orbit_id: *const ::std::os::raw::c_char,
@@ -3424,15 +3285,9 @@ unsafe extern "C" {
         num_planned: usize,
         config: *const EmpyreanPlanningConfig,
         result_out: *mut EmpyreanPlanResult,
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Free the heap allocations inside a plan result populated by\n [`empyrean_evaluate_plan`]. Does not free the caller-allocated struct."]
-    pub fn empyrean_plan_result_free(result: *mut EmpyreanPlanResult);
-}
-unsafe extern "C" {
-    #[doc = " Propagate orbits to the requested target times.\n\n Returns 0 on success, negative error code on failure.\n On success, `result_out` is populated with the propagated states.\n The caller must free the result with `empyrean_propagation_result_free()`."]
-    pub fn empyrean_propagate(
+    ) -> i32,
+    pub empyrean_plan_result_free: unsafe extern "C" fn(result: *mut EmpyreanPlanResult),
+    pub empyrean_propagate: unsafe extern "C" fn(
         ctx: *const EmpyreanContext,
         orbits_ptr: *const EmpyreanOrbit,
         num_orbits: usize,
@@ -3440,45 +3295,29 @@ unsafe extern "C" {
         num_times: usize,
         config: *const EmpyreanPropagationConfig,
         result_out: *mut EmpyreanPropagationResult,
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Free a propagation result previously returned by `empyrean_propagate()`."]
-    pub fn empyrean_propagation_result_free(result: *mut EmpyreanPropagationResult);
-}
-unsafe extern "C" {
-    #[doc = " Resolved-kind tagged covariance at every output epoch for one orbit,\n Cartesian basis. On success `out_series` owns the array; free with\n [`empyrean_tagged_covariance_series_free`]. On error `out_series` is\n left null and the detail is on `empyrean_last_error()`.\n\n # Safety\n `result` must be a valid pointer returned by `empyrean_propagate`;\n `out_series` must be a valid pointer to write the result into."]
-    pub fn empyrean_propagation_covariance_series_cartesian(
+    ) -> i32,
+    pub empyrean_propagation_result_free:
+        unsafe extern "C" fn(result: *mut EmpyreanPropagationResult),
+    pub empyrean_propagation_covariance_series_cartesian: unsafe extern "C" fn(
         result: *const EmpyreanPropagationResult,
         orbit_index: usize,
         out_series: *mut *mut EmpyreanTaggedCovarianceSeries,
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Resolved-kind tagged covariance at a single `(orbit_index,\n epoch_index)`, Cartesian basis (the gm-free point query). `out` is\n written on success.\n\n # Safety\n `result` and `out` must be valid pointers; `result` from `empyrean_propagate`."]
-    pub fn empyrean_propagation_covariance_at_cartesian(
+    ) -> i32,
+    pub empyrean_propagation_covariance_at_cartesian: unsafe extern "C" fn(
         result: *const EmpyreanPropagationResult,
         orbit_index: usize,
         epoch_index: usize,
         out: *mut EmpyreanTaggedCovariance,
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Free a series returned by\n [`empyrean_propagation_covariance_series_cartesian`].\n\n # Safety\n `series` must be null or a pointer returned by that accessor, freed once."]
-    pub fn empyrean_tagged_covariance_series_free(series: *mut EmpyreanTaggedCovarianceSeries);
-}
-unsafe extern "C" {
-    #[doc = " Query the JPL Small-Body Database for one or more orbits.\n\n `object_ids` is an array of `num_object_ids` null-terminated UTF-8\n designations / names / SPK IDs (e.g. `\"apophis\"`, `\"99942\"`,\n `\"2024 YR4\"`, `\"67P\"`). `cache_dir` may be null to skip caching, or\n a directory path where SBDB JSON responses are cached on disk.\n\n On success the populated [`EmpyreanOrbitBatch`] must be released with\n [`empyrean_orbits_batch_free`](crate::io::empyrean_orbits_batch_free)."]
-    pub fn empyrean_query_sbdb(
+    ) -> i32,
+    pub empyrean_tagged_covariance_series_free:
+        unsafe extern "C" fn(series: *mut EmpyreanTaggedCovarianceSeries),
+    pub empyrean_query_sbdb: unsafe extern "C" fn(
         object_ids: *const *const ::std::os::raw::c_char,
         num_object_ids: usize,
         cache_dir: *const ::std::os::raw::c_char,
         out: *mut EmpyreanOrbitBatch,
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Query JPL Horizons for predicted ephemeris records.\n\n `object_ids` is an array of `num_object_ids` null-terminated UTF-8\n designations / names / SPK IDs. `obs_code` is the MPC observatory\n code as a null-terminated string. `times_mjd_tdb` carries\n `num_times` epochs in MJD TDB.\n\n On success populates an [`EmpyreanEphemerisResult`] with one entry\n per `(object_id × epoch)`. Free with\n [`empyrean_ephemeris_result_free`](crate::ephemeris::empyrean_ephemeris_result_free).\n\n All angular values are converted to **degrees** at the FFI boundary\n (Horizons natively returns radians)."]
-    pub fn empyrean_query_horizons(
+    ) -> i32,
+    pub empyrean_query_horizons: unsafe extern "C" fn(
         object_ids: *const *const ::std::os::raw::c_char,
         num_object_ids: usize,
         obs_code: *const ::std::os::raw::c_char,
@@ -3486,109 +3325,63 @@ unsafe extern "C" {
         num_times: usize,
         cache_dir: *const ::std::os::raw::c_char,
         out: *mut EmpyreanEphemerisResult,
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Query JPL Horizons for a Cartesian state vector at a single epoch.\n\n `command` is the Horizons COMMAND string as a null-terminated UTF-8\n string (e.g. `\"99942;\"`, `\"DES=C/2019 Q4;\"`). `epoch_mjd_tdb` is\n the epoch in MJD TDB. `cache_dir` may be null to skip caching, or\n a directory path where Horizons JSON responses are cached on disk.\n\n On success writes the position (AU) to `out_pos` (length 3) and the\n velocity (AU/day) to `out_vel` (length 3) — both solar-system\n barycenter (SSB) centered, ICRF."]
-    pub fn empyrean_query_horizons_vectors(
+    ) -> i32,
+    pub empyrean_query_horizons_vectors: unsafe extern "C" fn(
         command: *const ::std::os::raw::c_char,
         epoch_mjd_tdb: f64,
         cache_dir: *const ::std::os::raw::c_char,
         out_pos: *mut f64,
         out_vel: *mut f64,
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Query the MPC observations API for ADES records of one or more\n designations.\n\n `designations` is an array of `num_designations` null-terminated\n UTF-8 designations (e.g. `\"99942\"`, `\"2024 YR4\"`, `\"67P\"`). The\n MPC API returns ADES_DF JSON; this function parses each row into\n the C-ABI [`EmpyreanObservation`] struct, filling the full ADES\n schema (perm_id / prov_id / trk_sub / mode / sys / ctr / pos1-3 /\n rms_corr / mag / rms_mag / band / ast_cat / phot_cat / phot_ap /\n log_snr / seeing / exp / rms_fit / n_stars / notes / remarks) when\n present in the JSON.\n\n On success `*out_ptr` carries a heap-allocated array of length\n `*out_num`. Free with\n [`empyrean_observations_free`](crate::od::empyrean_observations_free)."]
-    pub fn empyrean_query_observations(
+    ) -> i32,
+    pub empyrean_query_observations: unsafe extern "C" fn(
         designations: *const *const ::std::os::raw::c_char,
         num_designations: usize,
         cache_dir: *const ::std::os::raw::c_char,
         out_ptr: *mut *mut EmpyreanObservation,
         out_num: *mut usize,
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Query the JPL `sb_radar` API for delay/Doppler radar astrometry of one\n or more designations.\n\n `designations` is an array of `num_designations` null-terminated UTF-8\n designations (e.g. `\"99942\"`, `\"2024 YR4\"`). Asteroid radar astrometry\n is a JPL SSD product — it is **not** served by the MPC observations API\n (`empyrean_query_observations` returns only optical / occultation\n records), so radar ships as its own live-query entry point. JPL\n `sb_radar` JSON records are converted to ADES-native scott\n `RadarObservation`s and packed into the C-ABI\n [`EmpyreanRadarObservation`] struct (the same layout\n [`empyrean_read_ades`](crate::od::empyrean_read_ades) emits): the delay\n value is in seconds, its σ in microseconds, Doppler in Hz, frequency in\n MHz, and the `com` flag is a tri-state i8. `cache_dir` may be null to\n skip caching, or a directory path where `sb_radar` JSON responses are\n cached on disk.\n\n An object with no radar astrometry contributes no records (it is not an\n error). A JPL record that fails to parse (missing required field, or an\n unrecognised DSN station code) is rejected loudly rather than silently\n dropped — the whole call fails so no radar quietly goes missing.\n\n On success `*out_ptr` carries a heap-allocated array of length\n `*out_num`. Free with\n [`empyrean_radar_observations_free`](crate::od::empyrean_radar_observations_free)."]
-    pub fn empyrean_query_radar(
+    ) -> i32,
+    pub empyrean_query_radar: unsafe extern "C" fn(
         designations: *const *const ::std::os::raw::c_char,
         num_designations: usize,
         cache_dir: *const ::std::os::raw::c_char,
         out_ptr: *mut *mut EmpyreanRadarObservation,
         out_num: *mut usize,
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Construct a new orbit-determination session over a fixed\n observation set.\n\n Returns a heap-allocated handle on success, or null on error.\n The caller owns the returned pointer and must free it with\n [`empyrean_session_free`]."]
-    pub fn empyrean_session_new(
+    ) -> i32,
+    pub empyrean_session_new: unsafe extern "C" fn(
         observations: *const EmpyreanObservation,
         num_observations: usize,
         config: *const EmpyreanODConfig,
-    ) -> *mut EmpyreanSession;
-}
-unsafe extern "C" {
-    #[doc = " Free a session previously returned by [`empyrean_session_new`].\n Passing null is a no-op."]
-    pub fn empyrean_session_free(session: *mut EmpyreanSession);
-}
-unsafe extern "C" {
-    #[doc = " Total number of observations in the session (masked or not).\n Returns 0 if `session` is null."]
-    pub fn empyrean_session_n_observations(session: *const EmpyreanSession) -> usize;
-}
-unsafe extern "C" {
-    #[doc = " Number of observations currently masked."]
-    pub fn empyrean_session_n_masked(session: *const EmpyreanSession) -> usize;
-}
-unsafe extern "C" {
-    #[doc = " Number of observations active (not masked) in the next refine."]
-    pub fn empyrean_session_n_active(session: *const EmpyreanSession) -> usize;
-}
-unsafe extern "C" {
-    #[doc = " Mask the observation at `idx`. Returns 0 on success, -1 on null\n or out-of-bounds."]
-    pub fn empyrean_session_mask(session: *mut EmpyreanSession, idx: usize) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Unmask the observation at `idx`. Returns 0 on success, -1 on null\n or out-of-bounds."]
-    pub fn empyrean_session_unmask(session: *mut EmpyreanSession, idx: usize) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Clear all masks. Returns 0 on success, -1 on null."]
-    pub fn empyrean_session_unmask_all(session: *mut EmpyreanSession) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Whether the observation at `idx` is masked. Returns 1 = masked,\n 0 = active, 255 (-1 cast) on null/out-of-bounds."]
-    pub fn empyrean_session_is_masked(session: *const EmpyreanSession, idx: usize) -> u8;
-}
-unsafe extern "C" {
-    #[doc = " Run an OD refine using the current mask state.\n\n On the first call, runs the full IOD → DC pipeline. On subsequent\n calls, uses the previously-fit orbit as the IOD seed (skipping the\n IOD step). Pushes the new fit onto the session's history.\n\n On success populates `result_out` with the latest fit. The caller\n must free `result_out` with [`empyrean_od_result_free`](crate::od::empyrean_od_result_free)."]
-    pub fn empyrean_session_refine(
+    ) -> *mut EmpyreanSession,
+    pub empyrean_session_free: unsafe extern "C" fn(session: *mut EmpyreanSession),
+    pub empyrean_session_n_observations:
+        unsafe extern "C" fn(session: *const EmpyreanSession) -> usize,
+    pub empyrean_session_n_masked: unsafe extern "C" fn(session: *const EmpyreanSession) -> usize,
+    pub empyrean_session_n_active: unsafe extern "C" fn(session: *const EmpyreanSession) -> usize,
+    pub empyrean_session_mask:
+        unsafe extern "C" fn(session: *mut EmpyreanSession, idx: usize) -> i32,
+    pub empyrean_session_unmask:
+        unsafe extern "C" fn(session: *mut EmpyreanSession, idx: usize) -> i32,
+    pub empyrean_session_unmask_all: unsafe extern "C" fn(session: *mut EmpyreanSession) -> i32,
+    pub empyrean_session_is_masked:
+        unsafe extern "C" fn(session: *const EmpyreanSession, idx: usize) -> u8,
+    pub empyrean_session_refine: unsafe extern "C" fn(
         session: *mut EmpyreanSession,
         ctx: *const EmpyreanContext,
         result_out: *mut EmpyreanODResult,
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Number of fits in the session history."]
-    pub fn empyrean_session_history_len(session: *const EmpyreanSession) -> usize;
-}
-unsafe extern "C" {
-    #[doc = " Copy the i-th history entry into `result_out`. Returns 0 on\n success, -1 on null/out-of-bounds. Caller frees `result_out` with\n [`empyrean_od_result_free`](crate::od::empyrean_od_result_free)."]
-    pub fn empyrean_session_get_history(
+    ) -> i32,
+    pub empyrean_session_history_len:
+        unsafe extern "C" fn(session: *const EmpyreanSession) -> usize,
+    pub empyrean_session_get_history: unsafe extern "C" fn(
         session: *const EmpyreanSession,
         idx: usize,
         result_out: *mut EmpyreanODResult,
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Diff the current fit against an earlier history entry. Returns 0\n on success, -1 if there is no current fit or `prior_idx` is out\n of bounds."]
-    pub fn empyrean_session_diff(
+    ) -> i32,
+    pub empyrean_session_diff: unsafe extern "C" fn(
         session: *const EmpyreanSession,
         prior_idx: usize,
         diff_out: *mut EmpyreanSessionDiff,
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Query body states relative to a center body at given epochs.\n\n Returns 0 on success, negative error code on failure.\n On success, `result_out` is populated with body states.\n The caller must free the result with `empyrean_state_result_free()`."]
-    pub fn empyrean_get_states(
+    ) -> i32,
+    pub empyrean_get_states: unsafe extern "C" fn(
         ctx: *const EmpyreanContext,
         target_naif_id: i32,
         center_naif_id: i32,
@@ -3596,37 +3389,1021 @@ unsafe extern "C" {
         num_epochs: usize,
         frame: i32,
         result_out: *mut EmpyreanStateResult,
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Free a state result previously returned by `empyrean_get_states()`.\n\n Passing a zeroed/null result is a no-op."]
-    pub fn empyrean_state_result_free(result: *mut EmpyreanStateResult);
-}
-unsafe extern "C" {
-    #[doc = " Parse an ISO 8601 UTC string (e.g. ``\"2024-08-01T00:00:00.000Z\"``)\n to MJD in the requested target scale.\n\n `scale` is `0` for UTC, `1` for TDB.\n\n On success writes the MJD value to `*out_mjd` and returns 0.\n On failure returns a negative code; consult\n [`empyrean_last_error`](crate::empyrean_last_error)."]
-    pub fn empyrean_iso_to_mjd(
+    ) -> i32,
+    pub empyrean_state_result_free: unsafe extern "C" fn(result: *mut EmpyreanStateResult),
+    pub empyrean_iso_to_mjd: unsafe extern "C" fn(
         iso: *const ::std::os::raw::c_char,
         scale: i32,
         out_mjd: *mut f64,
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Format an MJD value (in the given scale) as an ISO 8601 UTC string.\n\n `scale` is `0` for UTC, `1` for TDB. Writes a null-terminated\n string of length ≤ `buf_len-1` into `out_buf`. A 32-byte buffer is\n always sufficient (typical output is 24 bytes:\n ``\"2024-08-01T00:00:00.000Z\"``).\n\n Returns 0 on success; negative on failure."]
-    pub fn empyrean_mjd_to_iso(
+    ) -> i32,
+    pub empyrean_mjd_to_iso: unsafe extern "C" fn(
         mjd: f64,
         scale: i32,
         out_buf: *mut ::std::os::raw::c_char,
         buf_len: usize,
-    ) -> i32;
-}
-unsafe extern "C" {
-    #[doc = " Transform a coordinate state to a new representation, frame, and/or origin.\n\n Returns 0 on success or a negative error code on failure.\n Call `empyrean_last_error()` to retrieve the error message on failure."]
-    pub fn empyrean_transform_coordinates(
+    ) -> i32,
+    pub empyrean_transform_coordinates: unsafe extern "C" fn(
         ctx: *const EmpyreanContext,
         input: *const CoordinateState,
         target_representation: i32,
         target_frame: i32,
         target_origin: i32,
         output: *mut CoordinateState,
-    ) -> i32;
+    ) -> i32,
+}
+impl EmpyreanLib {
+    pub unsafe fn new<P>(path: P) -> Result<Self, ::libloading::Error>
+    where
+        P: AsRef<::std::ffi::OsStr>,
+    {
+        let library = ::libloading::Library::new(path)?;
+        Self::from_library(library)
+    }
+    pub unsafe fn from_library<L>(library: L) -> Result<Self, ::libloading::Error>
+    where
+        L: Into<::libloading::Library>,
+    {
+        let __library = library.into();
+        let empyrean_last_error = __library.get(b"empyrean_last_error\0").map(|sym| *sym)?;
+        let empyrean_context_new_minimal = __library
+            .get(b"empyrean_context_new_minimal\0")
+            .map(|sym| *sym)?;
+        let empyrean_context_with_spk = __library
+            .get(b"empyrean_context_with_spk\0")
+            .map(|sym| *sym)?;
+        let empyrean_context_from_data_dir = __library
+            .get(b"empyrean_context_from_data_dir\0")
+            .map(|sym| *sym)?;
+        let empyrean_context_free = __library.get(b"empyrean_context_free\0").map(|sym| *sym)?;
+        let empyrean_default_data_dir = __library
+            .get(b"empyrean_default_data_dir\0")
+            .map(|sym| *sym)?;
+        let empyrean_string_free = __library.get(b"empyrean_string_free\0").map(|sym| *sym)?;
+        let empyrean_version_string = __library
+            .get(b"empyrean_version_string\0")
+            .map(|sym| *sym)?;
+        let empyrean_versions = __library.get(b"empyrean_versions\0").map(|sym| *sym)?;
+        let empyrean_versions_free = __library.get(b"empyrean_versions_free\0").map(|sym| *sym)?;
+        let empyrean_generate_ephemeris = __library
+            .get(b"empyrean_generate_ephemeris\0")
+            .map(|sym| *sym)?;
+        let empyrean_ephemeris_result_free = __library
+            .get(b"empyrean_ephemeris_result_free\0")
+            .map(|sym| *sym)?;
+        let empyrean_compute_impact_probabilities = __library
+            .get(b"empyrean_compute_impact_probabilities\0")
+            .map(|sym| *sym)?;
+        let empyrean_compute_impact_probabilities_result_free = __library
+            .get(b"empyrean_compute_impact_probabilities_result_free\0")
+            .map(|sym| *sym)?;
+        let empyrean_compute_b_planes = __library
+            .get(b"empyrean_compute_b_planes\0")
+            .map(|sym| *sym)?;
+        let empyrean_compute_b_planes_result_free = __library
+            .get(b"empyrean_compute_b_planes_result_free\0")
+            .map(|sym| *sym)?;
+        let empyrean_orbits_batch_free = __library
+            .get(b"empyrean_orbits_batch_free\0")
+            .map(|sym| *sym)?;
+        let empyrean_orbits_read_parquet = __library
+            .get(b"empyrean_orbits_read_parquet\0")
+            .map(|sym| *sym)?;
+        let empyrean_orbits_write_parquet = __library
+            .get(b"empyrean_orbits_write_parquet\0")
+            .map(|sym| *sym)?;
+        let empyrean_orbits_read_json = __library
+            .get(b"empyrean_orbits_read_json\0")
+            .map(|sym| *sym)?;
+        let empyrean_orbits_write_json = __library
+            .get(b"empyrean_orbits_write_json\0")
+            .map(|sym| *sym)?;
+        let empyrean_orbits_read_csv = __library
+            .get(b"empyrean_orbits_read_csv\0")
+            .map(|sym| *sym)?;
+        let empyrean_orbits_write_csv = __library
+            .get(b"empyrean_orbits_write_csv\0")
+            .map(|sym| *sym)?;
+        let empyrean_ephemeris_write_parquet = __library
+            .get(b"empyrean_ephemeris_write_parquet\0")
+            .map(|sym| *sym)?;
+        let empyrean_ephemeris_write_json = __library
+            .get(b"empyrean_ephemeris_write_json\0")
+            .map(|sym| *sym)?;
+        let empyrean_ephemeris_write_csv = __library
+            .get(b"empyrean_ephemeris_write_csv\0")
+            .map(|sym| *sym)?;
+        let empyrean_events_write_parquet = __library
+            .get(b"empyrean_events_write_parquet\0")
+            .map(|sym| *sym)?;
+        let empyrean_events_write_json = __library
+            .get(b"empyrean_events_write_json\0")
+            .map(|sym| *sym)?;
+        let empyrean_events_write_csv = __library
+            .get(b"empyrean_events_write_csv\0")
+            .map(|sym| *sym)?;
+        let empyrean_residuals_write_parquet = __library
+            .get(b"empyrean_residuals_write_parquet\0")
+            .map(|sym| *sym)?;
+        let empyrean_residuals_write_json = __library
+            .get(b"empyrean_residuals_write_json\0")
+            .map(|sym| *sym)?;
+        let empyrean_residuals_write_csv = __library
+            .get(b"empyrean_residuals_write_csv\0")
+            .map(|sym| *sym)?;
+        let empyrean_eigenvector_max_6x6 = __library
+            .get(b"empyrean_eigenvector_max_6x6\0")
+            .map(|sym| *sym)?;
+        let empyrean_split_gaussian = __library
+            .get(b"empyrean_split_gaussian\0")
+            .map(|sym| *sym)?;
+        let empyrean_get_observers = __library.get(b"empyrean_get_observers\0").map(|sym| *sym)?;
+        let empyrean_observer_result_free = __library
+            .get(b"empyrean_observer_result_free\0")
+            .map(|sym| *sym)?;
+        let empyrean_read_ades = __library.get(b"empyrean_read_ades\0").map(|sym| *sym)?;
+        let empyrean_observations_from_array = __library
+            .get(b"empyrean_observations_from_array\0")
+            .map(|sym| *sym)?;
+        let empyrean_observations_free = __library
+            .get(b"empyrean_observations_free\0")
+            .map(|sym| *sym)?;
+        let empyrean_radar_observations_from_array = __library
+            .get(b"empyrean_radar_observations_from_array\0")
+            .map(|sym| *sym)?;
+        let empyrean_radar_observations_free = __library
+            .get(b"empyrean_radar_observations_free\0")
+            .map(|sym| *sym)?;
+        let empyrean_determine = __library.get(b"empyrean_determine\0").map(|sym| *sym)?;
+        let empyrean_od_result_free = __library
+            .get(b"empyrean_od_result_free\0")
+            .map(|sym| *sym)?;
+        let empyrean_evaluate = __library.get(b"empyrean_evaluate\0").map(|sym| *sym)?;
+        let empyrean_evaluate_result_free = __library
+            .get(b"empyrean_evaluate_result_free\0")
+            .map(|sym| *sym)?;
+        let empyrean_refine = __library.get(b"empyrean_refine\0").map(|sym| *sym)?;
+        let empyrean_evaluate_plan = __library.get(b"empyrean_evaluate_plan\0").map(|sym| *sym)?;
+        let empyrean_plan_result_free = __library
+            .get(b"empyrean_plan_result_free\0")
+            .map(|sym| *sym)?;
+        let empyrean_propagate = __library.get(b"empyrean_propagate\0").map(|sym| *sym)?;
+        let empyrean_propagation_result_free = __library
+            .get(b"empyrean_propagation_result_free\0")
+            .map(|sym| *sym)?;
+        let empyrean_propagation_covariance_series_cartesian = __library
+            .get(b"empyrean_propagation_covariance_series_cartesian\0")
+            .map(|sym| *sym)?;
+        let empyrean_propagation_covariance_at_cartesian = __library
+            .get(b"empyrean_propagation_covariance_at_cartesian\0")
+            .map(|sym| *sym)?;
+        let empyrean_tagged_covariance_series_free = __library
+            .get(b"empyrean_tagged_covariance_series_free\0")
+            .map(|sym| *sym)?;
+        let empyrean_query_sbdb = __library.get(b"empyrean_query_sbdb\0").map(|sym| *sym)?;
+        let empyrean_query_horizons = __library
+            .get(b"empyrean_query_horizons\0")
+            .map(|sym| *sym)?;
+        let empyrean_query_horizons_vectors = __library
+            .get(b"empyrean_query_horizons_vectors\0")
+            .map(|sym| *sym)?;
+        let empyrean_query_observations = __library
+            .get(b"empyrean_query_observations\0")
+            .map(|sym| *sym)?;
+        let empyrean_query_radar = __library.get(b"empyrean_query_radar\0").map(|sym| *sym)?;
+        let empyrean_session_new = __library.get(b"empyrean_session_new\0").map(|sym| *sym)?;
+        let empyrean_session_free = __library.get(b"empyrean_session_free\0").map(|sym| *sym)?;
+        let empyrean_session_n_observations = __library
+            .get(b"empyrean_session_n_observations\0")
+            .map(|sym| *sym)?;
+        let empyrean_session_n_masked = __library
+            .get(b"empyrean_session_n_masked\0")
+            .map(|sym| *sym)?;
+        let empyrean_session_n_active = __library
+            .get(b"empyrean_session_n_active\0")
+            .map(|sym| *sym)?;
+        let empyrean_session_mask = __library.get(b"empyrean_session_mask\0").map(|sym| *sym)?;
+        let empyrean_session_unmask = __library
+            .get(b"empyrean_session_unmask\0")
+            .map(|sym| *sym)?;
+        let empyrean_session_unmask_all = __library
+            .get(b"empyrean_session_unmask_all\0")
+            .map(|sym| *sym)?;
+        let empyrean_session_is_masked = __library
+            .get(b"empyrean_session_is_masked\0")
+            .map(|sym| *sym)?;
+        let empyrean_session_refine = __library
+            .get(b"empyrean_session_refine\0")
+            .map(|sym| *sym)?;
+        let empyrean_session_history_len = __library
+            .get(b"empyrean_session_history_len\0")
+            .map(|sym| *sym)?;
+        let empyrean_session_get_history = __library
+            .get(b"empyrean_session_get_history\0")
+            .map(|sym| *sym)?;
+        let empyrean_session_diff = __library.get(b"empyrean_session_diff\0").map(|sym| *sym)?;
+        let empyrean_get_states = __library.get(b"empyrean_get_states\0").map(|sym| *sym)?;
+        let empyrean_state_result_free = __library
+            .get(b"empyrean_state_result_free\0")
+            .map(|sym| *sym)?;
+        let empyrean_iso_to_mjd = __library.get(b"empyrean_iso_to_mjd\0").map(|sym| *sym)?;
+        let empyrean_mjd_to_iso = __library.get(b"empyrean_mjd_to_iso\0").map(|sym| *sym)?;
+        let empyrean_transform_coordinates = __library
+            .get(b"empyrean_transform_coordinates\0")
+            .map(|sym| *sym)?;
+        Ok(EmpyreanLib {
+            __library,
+            empyrean_last_error,
+            empyrean_context_new_minimal,
+            empyrean_context_with_spk,
+            empyrean_context_from_data_dir,
+            empyrean_context_free,
+            empyrean_default_data_dir,
+            empyrean_string_free,
+            empyrean_version_string,
+            empyrean_versions,
+            empyrean_versions_free,
+            empyrean_generate_ephemeris,
+            empyrean_ephemeris_result_free,
+            empyrean_compute_impact_probabilities,
+            empyrean_compute_impact_probabilities_result_free,
+            empyrean_compute_b_planes,
+            empyrean_compute_b_planes_result_free,
+            empyrean_orbits_batch_free,
+            empyrean_orbits_read_parquet,
+            empyrean_orbits_write_parquet,
+            empyrean_orbits_read_json,
+            empyrean_orbits_write_json,
+            empyrean_orbits_read_csv,
+            empyrean_orbits_write_csv,
+            empyrean_ephemeris_write_parquet,
+            empyrean_ephemeris_write_json,
+            empyrean_ephemeris_write_csv,
+            empyrean_events_write_parquet,
+            empyrean_events_write_json,
+            empyrean_events_write_csv,
+            empyrean_residuals_write_parquet,
+            empyrean_residuals_write_json,
+            empyrean_residuals_write_csv,
+            empyrean_eigenvector_max_6x6,
+            empyrean_split_gaussian,
+            empyrean_get_observers,
+            empyrean_observer_result_free,
+            empyrean_read_ades,
+            empyrean_observations_from_array,
+            empyrean_observations_free,
+            empyrean_radar_observations_from_array,
+            empyrean_radar_observations_free,
+            empyrean_determine,
+            empyrean_od_result_free,
+            empyrean_evaluate,
+            empyrean_evaluate_result_free,
+            empyrean_refine,
+            empyrean_evaluate_plan,
+            empyrean_plan_result_free,
+            empyrean_propagate,
+            empyrean_propagation_result_free,
+            empyrean_propagation_covariance_series_cartesian,
+            empyrean_propagation_covariance_at_cartesian,
+            empyrean_tagged_covariance_series_free,
+            empyrean_query_sbdb,
+            empyrean_query_horizons,
+            empyrean_query_horizons_vectors,
+            empyrean_query_observations,
+            empyrean_query_radar,
+            empyrean_session_new,
+            empyrean_session_free,
+            empyrean_session_n_observations,
+            empyrean_session_n_masked,
+            empyrean_session_n_active,
+            empyrean_session_mask,
+            empyrean_session_unmask,
+            empyrean_session_unmask_all,
+            empyrean_session_is_masked,
+            empyrean_session_refine,
+            empyrean_session_history_len,
+            empyrean_session_get_history,
+            empyrean_session_diff,
+            empyrean_get_states,
+            empyrean_state_result_free,
+            empyrean_iso_to_mjd,
+            empyrean_mjd_to_iso,
+            empyrean_transform_coordinates,
+        })
+    }
+    #[doc = " Return a pointer to the last error message (thread-local, null-terminated).\n\n The pointer is valid until the next call that sets an error on the same\n thread."]
+    pub unsafe fn empyrean_last_error(&self) -> *const ::std::os::raw::c_char {
+        (self.empyrean_last_error)()
+    }
+    #[doc = " Create a **minimal** `EmpyreanContext` from a DE440 SPK file and a\n GM TPC file.\n\n Loads ONLY the planetary ephemeris and gravitational parameters —\n no Earth/Moon BPC kernels, no SB441-N16 asteroid perturbers, no\n MPC observatory codes, no Earth gravity field. This is sufficient\n for coordinate transforms and basic propagation under the\n `Approximate` force model, but is **not** enough for production\n orbit propagation, orbit determination, or topocentric ephemeris\n generation. Most callers should use\n [`empyrean_context_from_data_dir`] instead, which loads the full\n Standard-tier kernel set (downloading any missing files).\n\n Use [`empyrean_context_with_spk`] to chain additional SPK kernels\n (e.g. SB441-N16) onto a context built by this function.\n\n Returns a heap-allocated pointer on success, or null on error.\n Call `empyrean_last_error()` to retrieve the error message when null is\n returned.  The caller owns the returned pointer and must free it with\n `empyrean_context_free()`."]
+    pub unsafe fn empyrean_context_new_minimal(
+        &self,
+        de440_path: *const ::std::os::raw::c_char,
+        gm_path: *const ::std::os::raw::c_char,
+    ) -> *mut EmpyreanContext {
+        (self.empyrean_context_new_minimal)(de440_path, gm_path)
+    }
+    #[doc = " Load an additional SPK kernel into an existing context, in place.\n\n Useful for layering SB441-N16 asteroid perturbers or spacecraft\n SPK kernels (JWST, Gaia, custom probes) on top of a context built\n by [`empyrean_context_new_minimal`] or [`empyrean_context_from_data_dir`].\n The merged context picks up the new kernel's body coverage on top\n of what was already loaded.\n\n Returns 0 on success; negative error code on failure. The context\n pointer remains valid and unchanged when this function returns\n non-zero — failure does not invalidate `ctx`."]
+    pub unsafe fn empyrean_context_with_spk(
+        &self,
+        ctx: *mut EmpyreanContext,
+        spk_path: *const ::std::os::raw::c_char,
+    ) -> i32 {
+        (self.empyrean_context_with_spk)(ctx, spk_path)
+    }
+    #[doc = " Create a new `EmpyreanContext` from a data directory.\n\n Loads the full Standard-tier kernel set (DE440, SB441-N16, Earth/Moon\n BPCs, GM, MPC observatory codes) from `data_dir`, downloading any\n missing files. Pass null for `data_dir` to use the platform XDG\n data directory (`~/.empyrean/data` on Linux/macOS).\n\n Returns a heap-allocated pointer on success, or null on error.\n Call `empyrean_last_error()` to retrieve the error message when null is\n returned. The caller owns the returned pointer and must free it with\n `empyrean_context_free()`."]
+    pub unsafe fn empyrean_context_from_data_dir(
+        &self,
+        data_dir: *const ::std::os::raw::c_char,
+    ) -> *mut EmpyreanContext {
+        (self.empyrean_context_from_data_dir)(data_dir)
+    }
+    #[doc = " Free an `EmpyreanContext` previously returned by `empyrean_context_new()`.\n\n Passing null is a no-op."]
+    pub unsafe fn empyrean_context_free(&self, ctx: *mut EmpyreanContext) {
+        (self.empyrean_context_free)(ctx)
+    }
+    #[doc = " Return the platform XDG-compliant default data directory as a\n heap-allocated, NUL-terminated UTF-8 string.\n\n Mirrors villeneuve's [`DataManager::new`] resolution: honors\n `EMPYREAN_DATA_DIR` first, then falls back to `dirs::data_dir()` —\n `~/.local/share/empyrean/data/` on Linux, `~/Library/Application\n Support/empyrean/data/` on macOS, `%APPDATA%\\empyrean\\data\\` on\n Windows. Cheap (no filesystem I/O).\n\n Returns null on failure (non-UTF-8 path, NUL byte in path, panic).\n Call `empyrean_last_error()` for details.\n\n **The caller owns the returned pointer and must release it with\n [`empyrean_string_free`].**"]
+    pub unsafe fn empyrean_default_data_dir(&self) -> *mut ::std::os::raw::c_char {
+        (self.empyrean_default_data_dir)()
+    }
+    #[doc = " Free a string returned by an empyrean C API function (e.g.,\n [`empyrean_default_data_dir`], [`empyrean_version_string`]).\n\n Passing null is a no-op. Passing any pointer not obtained from an\n empyrean string-returning function is undefined behavior."]
+    pub unsafe fn empyrean_string_free(&self, s: *mut ::std::os::raw::c_char) {
+        (self.empyrean_string_free)(s)
+    }
+    #[doc = " Multi-line version report — `empyrean-core <ver>\\nvilleneuve <ver>\\n…`.\n\n Mirrors [`empyrean_core::version_string`]. Useful for `--version`-style\n output and for verifying the build provenance of a deployed cdylib.\n Returns null on allocation failure (extremely unlikely — the strings\n are short and `&'static` underneath); call `empyrean_last_error()` if\n it does.\n\n **The caller owns the returned pointer and must release it with\n [`empyrean_string_free`].**"]
+    pub unsafe fn empyrean_version_string(&self) -> *mut ::std::os::raw::c_char {
+        (self.empyrean_version_string)()
+    }
+    #[doc = " Populate `out` with the per-crate versions of the empyrean stack.\n\n Returns 0 on success, non-zero on failure (`empyrean_last_error()`\n has the details). On failure `out` is left zero-initialized — no\n allocation needs freeing.\n\n **The caller owns the strings inside `out` and must release the\n whole struct with [`empyrean_versions_free`] when done.**"]
+    pub unsafe fn empyrean_versions(&self, out: *mut EmpyreanVersions) -> i32 {
+        (self.empyrean_versions)(out)
+    }
+    #[doc = " Free the version strings inside `versions` (each was heap-allocated\n by a previous successful [`empyrean_versions`] call). After this\n returns, `versions` itself is zero-initialized — safe to drop on\n the caller's stack.\n\n Passing null is a no-op. Calling this twice on the same struct, or\n passing a struct that wasn't populated by [`empyrean_versions`], is\n undefined behavior."]
+    pub unsafe fn empyrean_versions_free(&self, versions: *mut EmpyreanVersions) {
+        (self.empyrean_versions_free)(versions)
+    }
+    #[doc = " Generate predicted ephemeris for orbits and observers.\n\n Returns 0 on success, negative error code on failure.\n On success, `result_out` is populated with ephemeris entries.\n The caller must free the result with `empyrean_ephemeris_result_free()`."]
+    pub unsafe fn empyrean_generate_ephemeris(
+        &self,
+        ctx: *const EmpyreanContext,
+        orbits_ptr: *const EmpyreanOrbit,
+        num_orbits: usize,
+        observers_ptr: *const EmpyreanObserver,
+        num_observers: usize,
+        config: *const EmpyreanEphemerisConfig,
+        result_out: *mut EmpyreanEphemerisResult,
+    ) -> i32 {
+        (self.empyrean_generate_ephemeris)(
+            ctx,
+            orbits_ptr,
+            num_orbits,
+            observers_ptr,
+            num_observers,
+            config,
+            result_out,
+        )
+    }
+    #[doc = " Free an ephemeris result previously returned by `empyrean_generate_ephemeris()`."]
+    pub unsafe fn empyrean_ephemeris_result_free(&self, result: *mut EmpyreanEphemerisResult) {
+        (self.empyrean_ephemeris_result_free)(result)
+    }
+    #[doc = " Run [`empyrean_core::impact::compute_impact_probabilities`] over a\n caller-supplied set of [`UncertaintyMethod`] variants and return\n the flattened IP records tagged by method.\n\n Caller is responsible for freeing the result via\n [`empyrean_compute_impact_probabilities_result_free`].\n\n # Returns\n `0` on success, negative on failure (see [`crate::set_last_error`]).\n\n # Safety\n All non-null pointer arguments must point to valid arrays of the\n indicated length for the duration of the call. The output struct\n is allocated by the caller; pointer fields inside it are allocated\n here and owned by the result."]
+    pub unsafe fn empyrean_compute_impact_probabilities(
+        &self,
+        ctx: *const EmpyreanContext,
+        orbits_ptr: *const EmpyreanOrbit,
+        num_orbits: usize,
+        end_mjd_tdb: f64,
+        methods_ptr: *const EmpyreanUncertaintyMethod,
+        num_methods: usize,
+        body_filter_naif: *const i32,
+        num_body_filter: usize,
+        result_out: *mut EmpyreanImpactProbabilitiesResult,
+    ) -> i32 {
+        (self.empyrean_compute_impact_probabilities)(
+            ctx,
+            orbits_ptr,
+            num_orbits,
+            end_mjd_tdb,
+            methods_ptr,
+            num_methods,
+            body_filter_naif,
+            num_body_filter,
+            result_out,
+        )
+    }
+    #[doc = " Free the records array allocated by\n [`empyrean_compute_impact_probabilities`]. After calling, the\n struct's `records` is reset to null and `num_records` to 0."]
+    pub unsafe fn empyrean_compute_impact_probabilities_result_free(
+        &self,
+        result: *mut EmpyreanImpactProbabilitiesResult,
+    ) {
+        (self.empyrean_compute_impact_probabilities_result_free)(result)
+    }
+    #[doc = " Run [`empyrean_core::impact::compute_b_planes`] over a caller-\n supplied set of [`UncertaintyMethod`] variants and return the\n flattened B-plane records tagged by method.\n\n Caller is responsible for freeing the result via\n [`empyrean_compute_b_planes_result_free`].\n\n # Safety\n Same contract as\n [`empyrean_compute_impact_probabilities`]."]
+    pub unsafe fn empyrean_compute_b_planes(
+        &self,
+        ctx: *const EmpyreanContext,
+        orbits_ptr: *const EmpyreanOrbit,
+        num_orbits: usize,
+        end_mjd_tdb: f64,
+        methods_ptr: *const EmpyreanUncertaintyMethod,
+        num_methods: usize,
+        body_filter_naif: *const i32,
+        num_body_filter: usize,
+        result_out: *mut EmpyreanBPlanesResult,
+    ) -> i32 {
+        (self.empyrean_compute_b_planes)(
+            ctx,
+            orbits_ptr,
+            num_orbits,
+            end_mjd_tdb,
+            methods_ptr,
+            num_methods,
+            body_filter_naif,
+            num_body_filter,
+            result_out,
+        )
+    }
+    #[doc = " Free the records array allocated by [`empyrean_compute_b_planes`]."]
+    pub unsafe fn empyrean_compute_b_planes_result_free(&self, result: *mut EmpyreanBPlanesResult) {
+        (self.empyrean_compute_b_planes_result_free)(result)
+    }
+    #[doc = " Free a batch previously returned by an `empyrean_orbits_read_*`\n function. Passing null is a no-op."]
+    pub unsafe fn empyrean_orbits_batch_free(&self, batch: *mut EmpyreanOrbitBatch) {
+        (self.empyrean_orbits_batch_free)(batch)
+    }
+    #[doc = " Read an orbits parquet file. Caller frees the result with\n [`empyrean_orbits_batch_free`]."]
+    pub unsafe fn empyrean_orbits_read_parquet(
+        &self,
+        path: *const ::std::os::raw::c_char,
+        out: *mut EmpyreanOrbitBatch,
+    ) -> i32 {
+        (self.empyrean_orbits_read_parquet)(path, out)
+    }
+    #[doc = " Write an orbit batch to a parquet file."]
+    pub unsafe fn empyrean_orbits_write_parquet(
+        &self,
+        path: *const ::std::os::raw::c_char,
+        batch: *const EmpyreanOrbitBatch,
+    ) -> i32 {
+        (self.empyrean_orbits_write_parquet)(path, batch)
+    }
+    #[doc = " Read an orbits JSON file (array of orbit-row objects). Caller frees\n with [`empyrean_orbits_batch_free`]."]
+    pub unsafe fn empyrean_orbits_read_json(
+        &self,
+        path: *const ::std::os::raw::c_char,
+        out: *mut EmpyreanOrbitBatch,
+    ) -> i32 {
+        (self.empyrean_orbits_read_json)(path, out)
+    }
+    #[doc = " Write an orbit batch to JSON."]
+    pub unsafe fn empyrean_orbits_write_json(
+        &self,
+        path: *const ::std::os::raw::c_char,
+        batch: *const EmpyreanOrbitBatch,
+    ) -> i32 {
+        (self.empyrean_orbits_write_json)(path, batch)
+    }
+    #[doc = " Read an orbits CSV file.\n\n CSV does not carry covariance (use parquet for covariance round-trip)."]
+    pub unsafe fn empyrean_orbits_read_csv(
+        &self,
+        path: *const ::std::os::raw::c_char,
+        out: *mut EmpyreanOrbitBatch,
+    ) -> i32 {
+        (self.empyrean_orbits_read_csv)(path, out)
+    }
+    #[doc = " Write an orbit batch to CSV."]
+    pub unsafe fn empyrean_orbits_write_csv(
+        &self,
+        path: *const ::std::os::raw::c_char,
+        batch: *const EmpyreanOrbitBatch,
+    ) -> i32 {
+        (self.empyrean_orbits_write_csv)(path, batch)
+    }
+    #[doc = " Write ephemeris entries to parquet using the villeneuve schema."]
+    pub unsafe fn empyrean_ephemeris_write_parquet(
+        &self,
+        path: *const ::std::os::raw::c_char,
+        entries_ptr: *const EmpyreanEphemerisEntry,
+        num_entries: usize,
+    ) -> i32 {
+        (self.empyrean_ephemeris_write_parquet)(path, entries_ptr, num_entries)
+    }
+    #[doc = " Write ephemeris entries to JSON."]
+    pub unsafe fn empyrean_ephemeris_write_json(
+        &self,
+        path: *const ::std::os::raw::c_char,
+        entries_ptr: *const EmpyreanEphemerisEntry,
+        num_entries: usize,
+    ) -> i32 {
+        (self.empyrean_ephemeris_write_json)(path, entries_ptr, num_entries)
+    }
+    #[doc = " Write ephemeris entries to CSV."]
+    pub unsafe fn empyrean_ephemeris_write_csv(
+        &self,
+        path: *const ::std::os::raw::c_char,
+        entries_ptr: *const EmpyreanEphemerisEntry,
+        num_entries: usize,
+    ) -> i32 {
+        (self.empyrean_ephemeris_write_csv)(path, entries_ptr, num_entries)
+    }
+    #[doc = " Write events to parquet."]
+    pub unsafe fn empyrean_events_write_parquet(
+        &self,
+        path: *const ::std::os::raw::c_char,
+        events_ptr: *const EmpyreanEvent,
+        num_events: usize,
+    ) -> i32 {
+        (self.empyrean_events_write_parquet)(path, events_ptr, num_events)
+    }
+    #[doc = " Write events to JSON."]
+    pub unsafe fn empyrean_events_write_json(
+        &self,
+        path: *const ::std::os::raw::c_char,
+        events_ptr: *const EmpyreanEvent,
+        num_events: usize,
+    ) -> i32 {
+        (self.empyrean_events_write_json)(path, events_ptr, num_events)
+    }
+    #[doc = " Write events to CSV."]
+    pub unsafe fn empyrean_events_write_csv(
+        &self,
+        path: *const ::std::os::raw::c_char,
+        events_ptr: *const EmpyreanEvent,
+        num_events: usize,
+    ) -> i32 {
+        (self.empyrean_events_write_csv)(path, events_ptr, num_events)
+    }
+    #[doc = " Write OD residuals to parquet."]
+    pub unsafe fn empyrean_residuals_write_parquet(
+        &self,
+        path: *const ::std::os::raw::c_char,
+        obs_ptr: *const EmpyreanObservationResult,
+        num_obs: usize,
+    ) -> i32 {
+        (self.empyrean_residuals_write_parquet)(path, obs_ptr, num_obs)
+    }
+    #[doc = " Write OD residuals to JSON."]
+    pub unsafe fn empyrean_residuals_write_json(
+        &self,
+        path: *const ::std::os::raw::c_char,
+        obs_ptr: *const EmpyreanObservationResult,
+        num_obs: usize,
+    ) -> i32 {
+        (self.empyrean_residuals_write_json)(path, obs_ptr, num_obs)
+    }
+    #[doc = " Write OD residuals to CSV."]
+    pub unsafe fn empyrean_residuals_write_csv(
+        &self,
+        path: *const ::std::os::raw::c_char,
+        obs_ptr: *const EmpyreanObservationResult,
+        num_obs: usize,
+    ) -> i32 {
+        (self.empyrean_residuals_write_csv)(path, obs_ptr, num_obs)
+    }
+    #[doc = " Find the dominant eigenvalue and eigenvector of a 6x6 symmetric matrix.\n\n Returns 0 on success. `eigenvalue_out` receives the eigenvalue,\n `eigenvector_out` receives the 6-element eigenvector."]
+    pub unsafe fn empyrean_eigenvector_max_6x6(
+        &self,
+        matrix: *const [[f64; 6usize]; 6usize],
+        eigenvalue_out: *mut f64,
+        eigenvector_out: *mut [f64; 6usize],
+    ) -> i32 {
+        (self.empyrean_eigenvector_max_6x6)(matrix, eigenvalue_out, eigenvector_out)
+    }
+    #[doc = " Split a 6D Gaussian into K weighted components along the dominant\n eigenvector of the covariance.\n\n `weights_out`, `means_out`, `covariances_out` must point to arrays\n of size K, K×6, and K×6×6 respectively. Returns 0 on success."]
+    pub unsafe fn empyrean_split_gaussian(
+        &self,
+        mean: *const [f64; 6usize],
+        covariance: *const [[f64; 6usize]; 6usize],
+        k: usize,
+        weights_out: *mut f64,
+        means_out: *mut [f64; 6usize],
+        covariances_out: *mut [[f64; 6usize]; 6usize],
+    ) -> i32 {
+        (self.empyrean_split_gaussian)(mean, covariance, k, weights_out, means_out, covariances_out)
+    }
+    #[doc = " Compute observer states for given observatory codes and epochs.\n\n Returns 0 on success, negative error code on failure.\n On success, `result_out` is populated with observer states.\n The caller must free the result with `empyrean_observer_result_free()`."]
+    pub unsafe fn empyrean_get_observers(
+        &self,
+        ctx: *const EmpyreanContext,
+        obs_codes: *const *const ::std::os::raw::c_char,
+        num_codes: usize,
+        epochs_mjd_tdb: *const f64,
+        num_epochs: usize,
+        result_out: *mut EmpyreanObserverResult,
+    ) -> i32 {
+        (self.empyrean_get_observers)(
+            ctx,
+            obs_codes,
+            num_codes,
+            epochs_mjd_tdb,
+            num_epochs,
+            result_out,
+        )
+    }
+    #[doc = " Free an observer result previously returned by `empyrean_get_observers()`.\n\n Passing a zeroed/null result is a no-op."]
+    pub unsafe fn empyrean_observer_result_free(&self, result: *mut EmpyreanObserverResult) {
+        (self.empyrean_observer_result_free)(result)
+    }
+    #[doc = " Read ADES PSV / MPC80 data from a string and pack into the C array.\n\n `path_or_content` is a null-terminated UTF-8 string with the ADES\n content directly (not a file path)."]
+    pub unsafe fn empyrean_read_ades(
+        &self,
+        content: *const ::std::os::raw::c_char,
+        observations_out: *mut *mut EmpyreanObservation,
+        num_observations_out: *mut usize,
+        radar_out: *mut *mut EmpyreanRadarObservation,
+        num_radar_out: *mut usize,
+    ) -> i32 {
+        (self.empyrean_read_ades)(
+            content,
+            observations_out,
+            num_observations_out,
+            radar_out,
+            num_radar_out,
+        )
+    }
+    #[doc = " Free an observation array previously returned by `empyrean_read_ades()`.\n Copy a caller-owned array of [`EmpyreanObservation`] into a fresh\n allocation that matches the layout produced by\n [`empyrean_read_ades`].\n\n The strings on the input observations (`perm_id` / `prov_id` /\n `obs_time`) are duplicated into freshly-allocated `CString`s so the\n returned array owns its own memory independent of the input.\n\n On success populates `*out_ptr` with the new array and `*out_num`\n with its length, both freeable with [`empyrean_observations_free`].\n\n Returns 0 on success; negative error code on failure."]
+    pub unsafe fn empyrean_observations_from_array(
+        &self,
+        input: *const EmpyreanObservation,
+        num: usize,
+        out_ptr: *mut *mut EmpyreanObservation,
+        out_num: *mut usize,
+    ) -> i32 {
+        (self.empyrean_observations_from_array)(input, num, out_ptr, out_num)
+    }
+    pub unsafe fn empyrean_observations_free(
+        &self,
+        observations: *mut EmpyreanObservation,
+        num: usize,
+    ) {
+        (self.empyrean_observations_free)(observations, num)
+    }
+    #[doc = " Copy a caller-owned array of [`EmpyreanRadarObservation`] into a fresh\n allocation matching the layout produced by [`empyrean_read_ades`].\n\n The nullable `*mut c_char` fields (`perm_id` / `prov_id` / `trk_sub` /\n `obs_time` / `remarks`) are duplicated into freshly-allocated\n `CString`s so the returned array owns its own memory independent of the\n input. All scalar fields (including the ADES-native delay/Doppler\n values) are copied verbatim — no unit conversion, nothing zeroed.\n\n On success populates `*out_ptr` with the new array and `*out_num` with\n its length, both freeable with [`empyrean_radar_observations_free`].\n\n Returns 0 on success; negative error code on failure."]
+    pub unsafe fn empyrean_radar_observations_from_array(
+        &self,
+        input: *const EmpyreanRadarObservation,
+        num: usize,
+        out_ptr: *mut *mut EmpyreanRadarObservation,
+        out_num: *mut usize,
+    ) -> i32 {
+        (self.empyrean_radar_observations_from_array)(input, num, out_ptr, out_num)
+    }
+    #[doc = " Free a radar observation array previously returned by\n [`empyrean_read_ades`] or [`empyrean_radar_observations_from_array`]."]
+    pub unsafe fn empyrean_radar_observations_free(
+        &self,
+        observations: *mut EmpyreanRadarObservation,
+        num: usize,
+    ) {
+        (self.empyrean_radar_observations_free)(observations, num)
+    }
+    #[doc = " Run the full orbit determination pipeline.\n\n When `num_initial_orbits > 0`, the supplied orbits are used as DC\n seeds (one per ADES object_id encountered in `observations`,\n matched by orbit index). Pass `null, 0` to let the IOD pipeline\n produce its own seeds."]
+    pub unsafe fn empyrean_determine(
+        &self,
+        ctx: *const EmpyreanContext,
+        observations: *const EmpyreanObservation,
+        num_observations: usize,
+        radar: *const EmpyreanRadarObservation,
+        num_radar: usize,
+        initial_orbits: *const EmpyreanOrbit,
+        num_initial_orbits: usize,
+        config: *const EmpyreanODConfig,
+        result_out: *mut EmpyreanODResult,
+    ) -> i32 {
+        (self.empyrean_determine)(
+            ctx,
+            observations,
+            num_observations,
+            radar,
+            num_radar,
+            initial_orbits,
+            num_initial_orbits,
+            config,
+            result_out,
+        )
+    }
+    #[doc = " Free an OD result previously returned by `empyrean_determine()` or `empyrean_refine()`."]
+    pub unsafe fn empyrean_od_result_free(&self, result: *mut EmpyreanODResult) {
+        (self.empyrean_od_result_free)(result)
+    }
+    #[doc = " Evaluate residuals for a single orbit against observations."]
+    pub unsafe fn empyrean_evaluate(
+        &self,
+        ctx: *const EmpyreanContext,
+        orbit: *const EmpyreanOrbit,
+        observations: *const EmpyreanObservation,
+        num_observations: usize,
+        config: *const EmpyreanODConfig,
+        result_out: *mut EmpyreanEvaluateResult,
+    ) -> i32 {
+        (self.empyrean_evaluate)(
+            ctx,
+            orbit,
+            observations,
+            num_observations,
+            config,
+            result_out,
+        )
+    }
+    #[doc = " Free an evaluate result previously returned by `empyrean_evaluate()`."]
+    pub unsafe fn empyrean_evaluate_result_free(&self, result: *mut EmpyreanEvaluateResult) {
+        (self.empyrean_evaluate_result_free)(result)
+    }
+    #[doc = " Refine a single orbit estimate with new observations using a\n Bayesian prior."]
+    pub unsafe fn empyrean_refine(
+        &self,
+        ctx: *const EmpyreanContext,
+        orbit: *const EmpyreanOrbit,
+        observations: *const EmpyreanObservation,
+        num_observations: usize,
+        config: *const EmpyreanODConfig,
+        result_out: *mut EmpyreanODResult,
+    ) -> i32 {
+        (self.empyrean_refine)(
+            ctx,
+            orbit,
+            observations,
+            num_observations,
+            config,
+            result_out,
+        )
+    }
+    #[doc = " Evaluate an observation plan: how much each candidate observation would\n tighten the prior orbit covariance.\n\n `orbit` must carry a 6×6 Cartesian covariance (e.g. a `determine` result).\n `planned` is an array of `num_planned` candidate observations. `orbit_id`\n may be null (defaults to `\"orbit_0\"`). On success populates `*result_out`\n (caller-allocated); free with [`empyrean_plan_result_free`].\n\n Returns 0 on success, -1 for a null/invalid argument, -3 if planning fails\n (missing/singular prior covariance, an infeasible or invalid candidate, an\n ephemeris-generation error), -99 on an internal panic. The error message is\n retrievable via `empyrean_last_error()`."]
+    pub unsafe fn empyrean_evaluate_plan(
+        &self,
+        ctx: *const EmpyreanContext,
+        orbit: *const EmpyreanOrbit,
+        orbit_id: *const ::std::os::raw::c_char,
+        planned: *const EmpyreanPlannedObservation,
+        num_planned: usize,
+        config: *const EmpyreanPlanningConfig,
+        result_out: *mut EmpyreanPlanResult,
+    ) -> i32 {
+        (self.empyrean_evaluate_plan)(
+            ctx,
+            orbit,
+            orbit_id,
+            planned,
+            num_planned,
+            config,
+            result_out,
+        )
+    }
+    #[doc = " Free the heap allocations inside a plan result populated by\n [`empyrean_evaluate_plan`]. Does not free the caller-allocated struct."]
+    pub unsafe fn empyrean_plan_result_free(&self, result: *mut EmpyreanPlanResult) {
+        (self.empyrean_plan_result_free)(result)
+    }
+    #[doc = " Propagate orbits to the requested target times.\n\n Returns 0 on success, negative error code on failure.\n On success, `result_out` is populated with the propagated states.\n The caller must free the result with `empyrean_propagation_result_free()`."]
+    pub unsafe fn empyrean_propagate(
+        &self,
+        ctx: *const EmpyreanContext,
+        orbits_ptr: *const EmpyreanOrbit,
+        num_orbits: usize,
+        times_ptr: *const f64,
+        num_times: usize,
+        config: *const EmpyreanPropagationConfig,
+        result_out: *mut EmpyreanPropagationResult,
+    ) -> i32 {
+        (self.empyrean_propagate)(
+            ctx, orbits_ptr, num_orbits, times_ptr, num_times, config, result_out,
+        )
+    }
+    #[doc = " Free a propagation result previously returned by `empyrean_propagate()`."]
+    pub unsafe fn empyrean_propagation_result_free(&self, result: *mut EmpyreanPropagationResult) {
+        (self.empyrean_propagation_result_free)(result)
+    }
+    #[doc = " Resolved-kind tagged covariance at every output epoch for one orbit,\n Cartesian basis. On success `out_series` owns the array; free with\n [`empyrean_tagged_covariance_series_free`]. On error `out_series` is\n left null and the detail is on `empyrean_last_error()`.\n\n # Safety\n `result` must be a valid pointer returned by `empyrean_propagate`;\n `out_series` must be a valid pointer to write the result into."]
+    pub unsafe fn empyrean_propagation_covariance_series_cartesian(
+        &self,
+        result: *const EmpyreanPropagationResult,
+        orbit_index: usize,
+        out_series: *mut *mut EmpyreanTaggedCovarianceSeries,
+    ) -> i32 {
+        (self.empyrean_propagation_covariance_series_cartesian)(result, orbit_index, out_series)
+    }
+    #[doc = " Resolved-kind tagged covariance at a single `(orbit_index,\n epoch_index)`, Cartesian basis (the gm-free point query). `out` is\n written on success.\n\n # Safety\n `result` and `out` must be valid pointers; `result` from `empyrean_propagate`."]
+    pub unsafe fn empyrean_propagation_covariance_at_cartesian(
+        &self,
+        result: *const EmpyreanPropagationResult,
+        orbit_index: usize,
+        epoch_index: usize,
+        out: *mut EmpyreanTaggedCovariance,
+    ) -> i32 {
+        (self.empyrean_propagation_covariance_at_cartesian)(result, orbit_index, epoch_index, out)
+    }
+    #[doc = " Free a series returned by\n [`empyrean_propagation_covariance_series_cartesian`].\n\n # Safety\n `series` must be null or a pointer returned by that accessor, freed once."]
+    pub unsafe fn empyrean_tagged_covariance_series_free(
+        &self,
+        series: *mut EmpyreanTaggedCovarianceSeries,
+    ) {
+        (self.empyrean_tagged_covariance_series_free)(series)
+    }
+    #[doc = " Query the JPL Small-Body Database for one or more orbits.\n\n `object_ids` is an array of `num_object_ids` null-terminated UTF-8\n designations / names / SPK IDs (e.g. `\"apophis\"`, `\"99942\"`,\n `\"2024 YR4\"`, `\"67P\"`). `cache_dir` may be null to skip caching, or\n a directory path where SBDB JSON responses are cached on disk.\n\n On success the populated [`EmpyreanOrbitBatch`] must be released with\n [`empyrean_orbits_batch_free`](crate::io::empyrean_orbits_batch_free)."]
+    pub unsafe fn empyrean_query_sbdb(
+        &self,
+        object_ids: *const *const ::std::os::raw::c_char,
+        num_object_ids: usize,
+        cache_dir: *const ::std::os::raw::c_char,
+        out: *mut EmpyreanOrbitBatch,
+    ) -> i32 {
+        (self.empyrean_query_sbdb)(object_ids, num_object_ids, cache_dir, out)
+    }
+    #[doc = " Query JPL Horizons for predicted ephemeris records.\n\n `object_ids` is an array of `num_object_ids` null-terminated UTF-8\n designations / names / SPK IDs. `obs_code` is the MPC observatory\n code as a null-terminated string. `times_mjd_tdb` carries\n `num_times` epochs in MJD TDB.\n\n On success populates an [`EmpyreanEphemerisResult`] with one entry\n per `(object_id × epoch)`. Free with\n [`empyrean_ephemeris_result_free`](crate::ephemeris::empyrean_ephemeris_result_free).\n\n All angular values are converted to **degrees** at the FFI boundary\n (Horizons natively returns radians)."]
+    pub unsafe fn empyrean_query_horizons(
+        &self,
+        object_ids: *const *const ::std::os::raw::c_char,
+        num_object_ids: usize,
+        obs_code: *const ::std::os::raw::c_char,
+        times_mjd_tdb: *const f64,
+        num_times: usize,
+        cache_dir: *const ::std::os::raw::c_char,
+        out: *mut EmpyreanEphemerisResult,
+    ) -> i32 {
+        (self.empyrean_query_horizons)(
+            object_ids,
+            num_object_ids,
+            obs_code,
+            times_mjd_tdb,
+            num_times,
+            cache_dir,
+            out,
+        )
+    }
+    #[doc = " Query JPL Horizons for a Cartesian state vector at a single epoch.\n\n `command` is the Horizons COMMAND string as a null-terminated UTF-8\n string (e.g. `\"99942;\"`, `\"DES=C/2019 Q4;\"`). `epoch_mjd_tdb` is\n the epoch in MJD TDB. `cache_dir` may be null to skip caching, or\n a directory path where Horizons JSON responses are cached on disk.\n\n On success writes the position (AU) to `out_pos` (length 3) and the\n velocity (AU/day) to `out_vel` (length 3) — both solar-system\n barycenter (SSB) centered, ICRF."]
+    pub unsafe fn empyrean_query_horizons_vectors(
+        &self,
+        command: *const ::std::os::raw::c_char,
+        epoch_mjd_tdb: f64,
+        cache_dir: *const ::std::os::raw::c_char,
+        out_pos: *mut f64,
+        out_vel: *mut f64,
+    ) -> i32 {
+        (self.empyrean_query_horizons_vectors)(command, epoch_mjd_tdb, cache_dir, out_pos, out_vel)
+    }
+    #[doc = " Query the MPC observations API for ADES records of one or more\n designations.\n\n `designations` is an array of `num_designations` null-terminated\n UTF-8 designations (e.g. `\"99942\"`, `\"2024 YR4\"`, `\"67P\"`). The\n MPC API returns ADES_DF JSON; this function parses each row into\n the C-ABI [`EmpyreanObservation`] struct, filling the full ADES\n schema (perm_id / prov_id / trk_sub / mode / sys / ctr / pos1-3 /\n rms_corr / mag / rms_mag / band / ast_cat / phot_cat / phot_ap /\n log_snr / seeing / exp / rms_fit / n_stars / notes / remarks) when\n present in the JSON.\n\n On success `*out_ptr` carries a heap-allocated array of length\n `*out_num`. Free with\n [`empyrean_observations_free`](crate::od::empyrean_observations_free)."]
+    pub unsafe fn empyrean_query_observations(
+        &self,
+        designations: *const *const ::std::os::raw::c_char,
+        num_designations: usize,
+        cache_dir: *const ::std::os::raw::c_char,
+        out_ptr: *mut *mut EmpyreanObservation,
+        out_num: *mut usize,
+    ) -> i32 {
+        (self.empyrean_query_observations)(
+            designations,
+            num_designations,
+            cache_dir,
+            out_ptr,
+            out_num,
+        )
+    }
+    #[doc = " Query the JPL `sb_radar` API for delay/Doppler radar astrometry of one\n or more designations.\n\n `designations` is an array of `num_designations` null-terminated UTF-8\n designations (e.g. `\"99942\"`, `\"2024 YR4\"`). Asteroid radar astrometry\n is a JPL SSD product — it is **not** served by the MPC observations API\n (`empyrean_query_observations` returns only optical / occultation\n records), so radar ships as its own live-query entry point. JPL\n `sb_radar` JSON records are converted to ADES-native scott\n `RadarObservation`s and packed into the C-ABI\n [`EmpyreanRadarObservation`] struct (the same layout\n [`empyrean_read_ades`](crate::od::empyrean_read_ades) emits): the delay\n value is in seconds, its σ in microseconds, Doppler in Hz, frequency in\n MHz, and the `com` flag is a tri-state i8. `cache_dir` may be null to\n skip caching, or a directory path where `sb_radar` JSON responses are\n cached on disk.\n\n An object with no radar astrometry contributes no records (it is not an\n error). A JPL record that fails to parse (missing required field, or an\n unrecognised DSN station code) is rejected loudly rather than silently\n dropped — the whole call fails so no radar quietly goes missing.\n\n On success `*out_ptr` carries a heap-allocated array of length\n `*out_num`. Free with\n [`empyrean_radar_observations_free`](crate::od::empyrean_radar_observations_free)."]
+    pub unsafe fn empyrean_query_radar(
+        &self,
+        designations: *const *const ::std::os::raw::c_char,
+        num_designations: usize,
+        cache_dir: *const ::std::os::raw::c_char,
+        out_ptr: *mut *mut EmpyreanRadarObservation,
+        out_num: *mut usize,
+    ) -> i32 {
+        (self.empyrean_query_radar)(designations, num_designations, cache_dir, out_ptr, out_num)
+    }
+    #[doc = " Construct a new orbit-determination session over a fixed\n observation set.\n\n Returns a heap-allocated handle on success, or null on error.\n The caller owns the returned pointer and must free it with\n [`empyrean_session_free`]."]
+    pub unsafe fn empyrean_session_new(
+        &self,
+        observations: *const EmpyreanObservation,
+        num_observations: usize,
+        config: *const EmpyreanODConfig,
+    ) -> *mut EmpyreanSession {
+        (self.empyrean_session_new)(observations, num_observations, config)
+    }
+    #[doc = " Free a session previously returned by [`empyrean_session_new`].\n Passing null is a no-op."]
+    pub unsafe fn empyrean_session_free(&self, session: *mut EmpyreanSession) {
+        (self.empyrean_session_free)(session)
+    }
+    #[doc = " Total number of observations in the session (masked or not).\n Returns 0 if `session` is null."]
+    pub unsafe fn empyrean_session_n_observations(&self, session: *const EmpyreanSession) -> usize {
+        (self.empyrean_session_n_observations)(session)
+    }
+    #[doc = " Number of observations currently masked."]
+    pub unsafe fn empyrean_session_n_masked(&self, session: *const EmpyreanSession) -> usize {
+        (self.empyrean_session_n_masked)(session)
+    }
+    #[doc = " Number of observations active (not masked) in the next refine."]
+    pub unsafe fn empyrean_session_n_active(&self, session: *const EmpyreanSession) -> usize {
+        (self.empyrean_session_n_active)(session)
+    }
+    #[doc = " Mask the observation at `idx`. Returns 0 on success, -1 on null\n or out-of-bounds."]
+    pub unsafe fn empyrean_session_mask(&self, session: *mut EmpyreanSession, idx: usize) -> i32 {
+        (self.empyrean_session_mask)(session, idx)
+    }
+    #[doc = " Unmask the observation at `idx`. Returns 0 on success, -1 on null\n or out-of-bounds."]
+    pub unsafe fn empyrean_session_unmask(&self, session: *mut EmpyreanSession, idx: usize) -> i32 {
+        (self.empyrean_session_unmask)(session, idx)
+    }
+    #[doc = " Clear all masks. Returns 0 on success, -1 on null."]
+    pub unsafe fn empyrean_session_unmask_all(&self, session: *mut EmpyreanSession) -> i32 {
+        (self.empyrean_session_unmask_all)(session)
+    }
+    #[doc = " Whether the observation at `idx` is masked. Returns 1 = masked,\n 0 = active, 255 (-1 cast) on null/out-of-bounds."]
+    pub unsafe fn empyrean_session_is_masked(
+        &self,
+        session: *const EmpyreanSession,
+        idx: usize,
+    ) -> u8 {
+        (self.empyrean_session_is_masked)(session, idx)
+    }
+    #[doc = " Run an OD refine using the current mask state.\n\n On the first call, runs the full IOD → DC pipeline. On subsequent\n calls, uses the previously-fit orbit as the IOD seed (skipping the\n IOD step). Pushes the new fit onto the session's history.\n\n On success populates `result_out` with the latest fit. The caller\n must free `result_out` with [`empyrean_od_result_free`](crate::od::empyrean_od_result_free)."]
+    pub unsafe fn empyrean_session_refine(
+        &self,
+        session: *mut EmpyreanSession,
+        ctx: *const EmpyreanContext,
+        result_out: *mut EmpyreanODResult,
+    ) -> i32 {
+        (self.empyrean_session_refine)(session, ctx, result_out)
+    }
+    #[doc = " Number of fits in the session history."]
+    pub unsafe fn empyrean_session_history_len(&self, session: *const EmpyreanSession) -> usize {
+        (self.empyrean_session_history_len)(session)
+    }
+    #[doc = " Copy the i-th history entry into `result_out`. Returns 0 on\n success, -1 on null/out-of-bounds. Caller frees `result_out` with\n [`empyrean_od_result_free`](crate::od::empyrean_od_result_free)."]
+    pub unsafe fn empyrean_session_get_history(
+        &self,
+        session: *const EmpyreanSession,
+        idx: usize,
+        result_out: *mut EmpyreanODResult,
+    ) -> i32 {
+        (self.empyrean_session_get_history)(session, idx, result_out)
+    }
+    #[doc = " Diff the current fit against an earlier history entry. Returns 0\n on success, -1 if there is no current fit or `prior_idx` is out\n of bounds."]
+    pub unsafe fn empyrean_session_diff(
+        &self,
+        session: *const EmpyreanSession,
+        prior_idx: usize,
+        diff_out: *mut EmpyreanSessionDiff,
+    ) -> i32 {
+        (self.empyrean_session_diff)(session, prior_idx, diff_out)
+    }
+    #[doc = " Query body states relative to a center body at given epochs.\n\n Returns 0 on success, negative error code on failure.\n On success, `result_out` is populated with body states.\n The caller must free the result with `empyrean_state_result_free()`."]
+    pub unsafe fn empyrean_get_states(
+        &self,
+        ctx: *const EmpyreanContext,
+        target_naif_id: i32,
+        center_naif_id: i32,
+        epochs_mjd_tdb: *const f64,
+        num_epochs: usize,
+        frame: i32,
+        result_out: *mut EmpyreanStateResult,
+    ) -> i32 {
+        (self.empyrean_get_states)(
+            ctx,
+            target_naif_id,
+            center_naif_id,
+            epochs_mjd_tdb,
+            num_epochs,
+            frame,
+            result_out,
+        )
+    }
+    #[doc = " Free a state result previously returned by `empyrean_get_states()`.\n\n Passing a zeroed/null result is a no-op."]
+    pub unsafe fn empyrean_state_result_free(&self, result: *mut EmpyreanStateResult) {
+        (self.empyrean_state_result_free)(result)
+    }
+    #[doc = " Parse an ISO 8601 UTC string (e.g. ``\"2024-08-01T00:00:00.000Z\"``)\n to MJD in the requested target scale.\n\n `scale` is `0` for UTC, `1` for TDB.\n\n On success writes the MJD value to `*out_mjd` and returns 0.\n On failure returns a negative code; consult\n [`empyrean_last_error`](crate::empyrean_last_error)."]
+    pub unsafe fn empyrean_iso_to_mjd(
+        &self,
+        iso: *const ::std::os::raw::c_char,
+        scale: i32,
+        out_mjd: *mut f64,
+    ) -> i32 {
+        (self.empyrean_iso_to_mjd)(iso, scale, out_mjd)
+    }
+    #[doc = " Format an MJD value (in the given scale) as an ISO 8601 UTC string.\n\n `scale` is `0` for UTC, `1` for TDB. Writes a null-terminated\n string of length ≤ `buf_len-1` into `out_buf`. A 32-byte buffer is\n always sufficient (typical output is 24 bytes:\n ``\"2024-08-01T00:00:00.000Z\"``).\n\n Returns 0 on success; negative on failure."]
+    pub unsafe fn empyrean_mjd_to_iso(
+        &self,
+        mjd: f64,
+        scale: i32,
+        out_buf: *mut ::std::os::raw::c_char,
+        buf_len: usize,
+    ) -> i32 {
+        (self.empyrean_mjd_to_iso)(mjd, scale, out_buf, buf_len)
+    }
+    #[doc = " Transform a coordinate state to a new representation, frame, and/or origin.\n\n Returns 0 on success or a negative error code on failure.\n Call `empyrean_last_error()` to retrieve the error message on failure."]
+    pub unsafe fn empyrean_transform_coordinates(
+        &self,
+        ctx: *const EmpyreanContext,
+        input: *const CoordinateState,
+        target_representation: i32,
+        target_frame: i32,
+        target_origin: i32,
+        output: *mut CoordinateState,
+    ) -> i32 {
+        (self.empyrean_transform_coordinates)(
+            ctx,
+            input,
+            target_representation,
+            target_frame,
+            target_origin,
+            output,
+        )
+    }
 }

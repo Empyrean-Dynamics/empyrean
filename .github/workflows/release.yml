@@ -201,18 +201,11 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}.tar.gz
 
-  # ── Build Python wheels ────────────────────────────────────
-  wheels:
-    name: Wheel (${{ matrix.os }}, py${{ matrix.python }})
+  # ── Build the macOS wheel ──────────────────────────────────
+  wheels-macos:
+    name: Wheel (macos-14, py3.12)
     needs: verify
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            python: "3.12"
-          - os: macos-14
-            python: "3.12"
-    runs-on: ${{ matrix.os }}
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
 
@@ -222,7 +215,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python }}
+          python-version: "3.12"
 
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -232,16 +225,27 @@ jobs:
       - name: Install maturin
         run: pip install maturin
 
-      # empyrean-sys links libempyrean (the closed-source cdylib) through its
-      # build.rs `links` directive, not a cargo dependency, so maturin won't
-      # build it transitively. Build it first so the extension can link it.
+      # empyrean-sys does NOT depend on empyrean-c as a cargo crate; it opens
+      # the engine at run time (dlopen), so maturin won't build the cdylib
+      # transitively. Build it first so it exists to bundle below.
       - name: Build libempyrean (release)
         run: cargo build -p empyrean-c --release
 
-      # --auditwheel=repair copies libempyrean into the wheel and rewrites the
-      # extension's rpath, so the published wheel is self-contained. Without it
-      # the wheel references a build-tree dylib that won't exist on the user's
-      # machine and `import empyrean` fails at load time.
+      # Bundle the engine INSIDE the wheel, next to the extension. At run time
+      # empyrean-sys finds libempyrean.dylib beside the loaded extension via
+      # dladdr (empyrean-sys/src/lib.rs), so the wheel is self-contained and
+      # relocatable with no build-machine path baked in. pyproject's
+      # [tool.maturin].include ships it in the wheel only.
+      - name: Bundle libempyrean beside the extension
+        run: |
+          set -euo pipefail
+          cp target/release/libempyrean.dylib empyrean-py/python/empyrean/
+          echo "bundled libempyrean.dylib -> empyrean-py/python/empyrean/"
+
+      # delocate (via --auditwheel=repair) vendors external deps of the
+      # extension and normalizes the macOS tag; --strip keeps internal symbols
+      # out. The bundled engine is not a link-time dep, so delocate leaves it in
+      # place beside the extension, found at run time via dladdr.
       - name: Build wheel (stripped, self-contained)
         run: cd empyrean-py && maturin build --release --strip --auditwheel=repair --out ../target/wheels
 
@@ -261,13 +265,90 @@ jobs:
       - name: Upload wheel
         uses: actions/upload-artifact@v4
         with:
-          name: wheel-${{ matrix.os }}-py${{ matrix.python }}
+          name: wheel-macos-14-py3.12
+          path: target/wheels/*.whl
+
+  # ── Build the Linux (manylinux_2_28) wheel ─────────────────
+  # Built INSIDE the manylinux_2_28 container so BOTH the pyo3 extension and the
+  # bundled libempyrean link against the same old glibc floor (2.28). The engine
+  # is dlopen'd — not a DT_NEEDED of the extension — so auditwheel cannot see it
+  # and never folds its glibc requirement into the wheel tag. Building everything
+  # against the 2.28 floor is what keeps the manylinux_2_28 tag honest and the
+  # wheel installable on older distros.
+  wheels-linux:
+    name: Wheel (manylinux_2_28, py3.12)
+    needs: verify
+    runs-on: ubuntu-latest
+    container: quay.io/pypa/manylinux_2_28_x86_64
+    env:
+      PYBIN: /opt/python/cp312-cp312/bin
+    steps:
+      - uses: actions/checkout@v4
+
+      # libempyrean statically vendors OpenSSL on Linux (empyrean-c links the
+      # engine, whose HTTP client pulls native-tls -> openssl). The vendored
+      # build compiles OpenSSL from source via openssl-src, which needs perl.
+      - name: Install build deps (perl for vendored OpenSSL)
+        run: dnf install -y perl-core
+
+      # The container checks out the workspace under a different owner; let git
+      # (used by cargo to fetch the private engine deps) operate on it.
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory '*'
+
+      - name: Configure git for private dependencies
+        run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "ssh://git@github.com/"
+
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install maturin
+        run: $PYBIN/python -m pip install --upgrade maturin
+
+      # Build the engine inside the container so libempyrean links glibc 2.28.
+      - name: Build libempyrean (release)
+        run: cargo build -p empyrean-c --release
+
+      # Bundle the engine beside the extension (found at run time via dladdr);
+      # pyproject's [tool.maturin].include ships it in the wheel only.
+      - name: Bundle libempyrean beside the extension
+        run: |
+          set -euo pipefail
+          cp target/release/libempyrean.so empyrean-py/python/empyrean/
+          echo "bundled libempyrean.so -> empyrean-py/python/empyrean/"
+
+      # maturin tags the wheel manylinux_2_28 (the container's glibc floor) and
+      # --auditwheel=repair validates the extension against that policy; --strip
+      # keeps internal symbols out. The bundled engine, built against the same
+      # 2.28 floor, is left in place beside the extension.
+      - name: Build wheel (stripped, manylinux_2_28)
+        run: cd empyrean-py && "$PYBIN/maturin" build --release --strip --auditwheel=repair -i "$PYBIN/python" --out ../target/wheels
+
+      - name: Verify wheel symbols stripped (no internal leak)
+        run: |
+          whl=$(ls target/wheels/*.whl | head -1)
+          tmp=$(mktemp -d)
+          "$PYBIN/python" -m zipfile -e "$whl" "$tmp"
+          libs=$(find "$tmp" \( -name "*.so" -o -name "*.dylib" \))
+          echo "Inspecting bundled libraries:"; echo "$libs"
+          leaked=$(for f in $libs; do nm "$f" 2>/dev/null; done | grep -ioE "empyrean_core|villeneuve|scott|nolan|hyperjet" | sort -u || true)
+          if [ -n "$leaked" ]; then
+            echo "::error::internal crate symbols leaked into the wheel:"; echo "$leaked"; exit 1
+          fi
+          echo "OK: no internal symbols in the wheel's bundled libraries"
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-linux-manylinux_2_28-py3.12
           path: target/wheels/*.whl
 
   # ── Publish wheels to PyPI ─────────────────────────────────
   publish-pypi:
     name: Publish wheel to PyPI
-    needs: wheels
+    needs: [wheels-linux, wheels-macos]
     runs-on: ubuntu-latest
     # Trusted Publishing (OIDC): no token. `id-token: write` mints the OIDC
     # token PyPI verifies against the trusted-publisher config (repo +
@@ -335,12 +416,12 @@ jobs:
     # publishes can never run unreviewed.
     environment: crates-io
     # `cargo publish` verifies each crate by building it from the packaged
-    # tarball, where build.rs's CARGO_MANIFEST_DIR-relative paths to the
-    # header/lib no longer resolve. Point empyrean-sys's build.rs at the
-    # checked-out header + the libempyrean built below so verification
-    # genuinely compiles (and the empyrean-cli verify can link the dylib).
+    # tarball, where build.rs's CARGO_MANIFEST_DIR-relative path to the engine
+    # no longer resolves. Point empyrean-sys's build.rs at the libempyrean built
+    # below so the verify build can resolve and record a path. The library is
+    # opened at run time (not linked) and the bindings are pre-generated, so
+    # there is no header / libclang dependency.
     env:
-      EMPYREAN_INCLUDE_DIR: ${{ github.workspace }}/include
       EMPYREAN_LIB_DIR: ${{ github.workspace }}/target/release
     steps:
       - name: Require an armed reviewer gate (fail closed)
@@ -376,9 +457,8 @@ jobs:
         with:
           rustflags: ""
 
-      # Build libempyrean so `cargo publish`'s verification step links it (via
-      # EMPYREAN_LIB_DIR) and so the header regenerated by empyrean-c's build is
-      # current for the bindings refresh below.
+      # Build libempyrean so `cargo publish`'s verification step can resolve its
+      # path (via EMPYREAN_LIB_DIR). It is opened at run time, not linked.
       - name: Build libempyrean (release)
         run: cargo build -p empyrean-c --release
 
@@ -387,8 +467,9 @@ jobs:
       # for the consumer's platform from THIS release and verifies it against a
       # pinned SHA-256. Attach the per-platform tarballs to the release and
       # re-pin their checksums into the crate so the published hashes match the
-      # exact artifacts shipped here; refresh the committed FFI bindings from
-      # the freshly built header so the ABI is in sync.
+      # exact artifacts shipped here. (The FFI bindings are pre-generated and
+      # committed — see empyrean-sys/src/bindings.rs — so nothing is regenerated
+      # at publish time.)
       - name: Download prebuilt libempyrean tarballs
         uses: actions/download-artifact@v4
         with:
@@ -420,16 +501,6 @@ jobs:
           } > empyrean-sys/checksums.txt
           echo "Pinned checksums for ${tag}:"; cat empyrean-sys/checksums.txt
 
-      - name: Refresh committed FFI bindings from the header
-        run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq libclang-dev
-          cargo install --quiet --locked bindgen-cli
-          bindgen include/empyrean.h -o empyrean-sys/src/bindings.rs \
-            --allowlist-function 'empyrean_.*' \
-            --allowlist-type 'Empyrean.*' \
-            --allowlist-var 'EMPYREAN_.*' \
-            --with-derive-default
-
       - name: Publish empyrean-sys
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
@@ -454,7 +525,7 @@ jobs:
   # ── Create GitHub Release ──────────────────────────────────
   release:
     name: Create Release
-    needs: [cli, c-lib, wheels, publish-pypi, publish-crates]
+    needs: [cli, c-lib, wheels-linux, wheels-macos, publish-pypi, publish-crates]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

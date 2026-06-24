@@ -1,6 +1,6 @@
 [package]
 name = "empyrean-sys"
-version = "0.7.0-rc.2"
+version = "0.7.0-rc.3"
 edition = "2024"
 rust-version = "1.90.0"
 authors = ["Joachim Moeyens <joachim@empyrean-dynamics.com>", "Empyrean Dynamics"]
@@ -16,9 +16,10 @@ license = "BSD-3-Clause"
 # the workflow-flavored keywords (propagation / ephemeris / etc.).
 keywords = ["astrodynamics", "ffi", "bindings", "sys", "differentiable"]
 categories = ["external-ffi-bindings", "science", "aerospace::space-protocols"]
-# The pre-generated bindings (src/bindings.rs) ship with the crate, so
-# no C header or libclang/bindgen is needed at build time. The build
-# script only locates / downloads the prebuilt libempyrean and links it.
+# The pre-generated bindings (src/bindings.rs) ship with the crate, so no C
+# header or libclang/bindgen is needed at build time. The build script only
+# locates / downloads the prebuilt libempyrean and records its path; the library
+# is opened at run time, so there is no native link step (no `links` key).
 include = [
     "src/**/*",
     "build.rs",
@@ -27,20 +28,24 @@ include = [
     "README.md",
     "LICENSE",
 ]
-# Cargo build-script convention for crates that wrap a native library.
-# Setting `links` makes Cargo enforce that at most one copy of
-# empyrean-sys appears in any final binary's dep graph.
-links = "empyrean"
 
 [lib]
 name = "empyrean_sys"
+
+[dependencies]
+# libempyrean is opened at run time by a resolved path, so the only requirement
+# on the host is the Rust toolchain — no install_name_tool / patchelf / rpath.
+libloading = "0.8"
+# Used (on unix) to locate the engine library next to the currently loaded
+# module via `dladdr`, so prebuilt artifacts (e.g. Python wheels that bundle the
+# engine beside the extension) are self-contained and relocatable.
+libc = "0.2"
 
 [build-dependencies]
 # The build script downloads, verifies, and extracts the prebuilt libempyrean
 # entirely in-process (no system curl / wget / tar), so the crate builds even
 # in minimal containers. ureq uses rustls (no OpenSSL) and follows the GitHub
-# release redirect. Only install_name_tool (macOS, ships with the toolchain
-# you link with) / patchelf (Linux, optional, graceful fallback) are shelled.
+# release redirect.
 ureq = "2"
 flate2 = "1"
 tar = "0.4"

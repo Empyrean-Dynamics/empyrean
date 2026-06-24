@@ -44,9 +44,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      # empyrean-sys links libempyrean from target/release, so the
-      # cdylib must exist there before anything builds against the
-      # wrapper — a debug-only workspace build never produces it.
+      # empyrean-sys resolves and dlopens libempyrean from target/release
+      # (it must exist there before anything builds against the wrapper) —
+      # a debug-only workspace build never produces it.
       - name: Build libempyrean (release)
         run: cargo build -p empyrean-c --release
 
@@ -119,20 +119,24 @@ jobs:
           path: ~/.empyrean/cache
           key: api-cache
 
-      # empyrean-sys links libempyrean from target/release, so the
-      # cdylib must exist there before anything builds against the
-      # wrapper — a debug-only workspace build never produces it.
+      # empyrean-sys resolves and dlopens libempyrean from target/release
+      # (it must exist there before anything builds against the wrapper) —
+      # a debug-only workspace build never produces it.
       - name: Build libempyrean (release)
         run: cargo build -p empyrean-c --release
 
       - name: Run tests
-        # empyrean-sys links libempyrean as a dylib (build.rs:
-        # rustc-link-lib=dylib=empyrean from target/release), so its
-        # smoke test needs the cdylib on the runtime loader path —
-        # built above by "Build libempyrean (release)".
+        # empyrean-sys dlopens libempyrean at runtime from the path
+        # resolved at build time (the sibling ../target/release in CI),
+        # so its smoke test needs the cdylib to already exist there —
+        # built above by "Build libempyrean (release)". build.rs emits
+        # no link directives.
         run: cargo test --workspace --verbose
         env:
           EMPYREAN_DATA_DIR: ${{ github.workspace }}/data
+          # Belt-and-suspenders only; the loader opens libempyrean by a
+          # resolved absolute / self-located path, not via this OS search
+          # path.
           LD_LIBRARY_PATH: ${{ github.workspace }}/target/release:${{ env.LD_LIBRARY_PATH }}
 
       # Compile every code snippet in the empyrean wrapper's doc

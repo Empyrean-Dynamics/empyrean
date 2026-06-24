@@ -84,15 +84,12 @@ typedef struct Session Session;
 #define EMPYREAN_REJECTION_OCCULTATION_UNSUPPORTED 8
 
 /**
- * Tagged by the multi-group outward-expansion wrapper: the
- * observation belongs to an opposition group / sub-arc that could
- * not be reconciled with the in-family fit (either the pre-add
- * entrance χ² gate or the post-fit consistency gate rejected the
- * group, or its differential correction failed numerically). The
- * observation is not noisy — it is incompatible with the dynamical
- * regime of the converged in-arc fit (e.g. cross-Hill-sphere
- * transition, chaotic-capture interior, regime change between pre-
- * and post-encounter geometry).
+ * The observation belongs to an opposition group / sub-arc that
+ * could not be reconciled with the converged fit. The observation
+ * is not necessarily noisy — it is incompatible with the dynamical
+ * regime of the in-arc fit (e.g. cross-Hill-sphere transition,
+ * chaotic-capture interior, regime change between pre- and
+ * post-encounter geometry).
  */
 #define EMPYREAN_REJECTION_OUTSIDE_ARC 9
 
@@ -611,15 +608,15 @@ struct EmpyreanUncertaintyMethod {
      */
     uint64_t mc_seed;
     /**
-     * Auto-method tuning parameter; selected automatically.
+     * Auto: first-order regime tuning parameter.
      */
     double auto_threshold_first;
     /**
-     * Auto-method tuning parameter; selected automatically.
+     * Auto: adaptive-mixture regime tuning parameter.
      */
     double auto_threshold_mixture;
     /**
-     * Auto-method tuning parameter; selected automatically.
+     * Auto: impact-probability tuning parameter for the higher-order pass.
      */
     double auto_threshold_ip_skip;
     /**
@@ -1238,13 +1235,13 @@ struct EmpyreanEvent {
      */
     double kappa;
     /**
-     * `CovarianceRegimeChange` payload: audit field for this resolved
-     * regime. NaN for non-regime events.
+     * `CovarianceRegimeChange` payload: lower κ value recorded in
+     * this audit payload. NaN for non-regime events.
      */
     double threshold_below;
     /**
-     * `CovarianceRegimeChange` payload: audit field for this resolved
-     * regime. NaN for non-regime events.
+     * `CovarianceRegimeChange` payload: upper κ value recorded in
+     * this audit payload. NaN for non-regime events.
      */
     double threshold_above;
     /**

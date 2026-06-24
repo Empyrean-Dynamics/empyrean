@@ -21,6 +21,11 @@ empyrean-py/uv.lock
 # source. Each rebuild churns bytes — keep it out of commits.
 empyrean-py/python/empyrean/_empyrean_rs*.so
 empyrean-py/python/empyrean/_empyrean_rs*.pyd
+# The closed-source engine, copied next to the extension by the release
+# workflow so it ships inside the wheel (found at run time via dladdr).
+# Build output, never committed.
+empyrean-py/python/empyrean/libempyrean.dylib
+empyrean-py/python/empyrean/libempyrean.so
 
 # Validation C-runner binary — compiled artifact of
 # `make -C validation/runners/c`, not source.

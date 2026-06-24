@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "empyrean"
-version = "0.7.0rc2"
+version = "0.7.0rc3"
 description = "Uncertainty-first orbit propagation, ephemeris, orbit determination, and event detection for asteroids and comets, powered by automatic differentiation"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -127,9 +127,16 @@ strip = true
 # the wheel. python-source already pulls the package tree, but listing
 # the data files explicitly keeps them visible if someone tightens the
 # default include set.
+#
+# The closed-source engine (libempyrean.{dylib,so}) is copied next to the
+# extension by the release workflow before `maturin build`; it ships in the
+# WHEEL only (never the sdist) so the wheel is self-contained — at run time
+# empyrean-sys finds it beside the extension via `dladdr`. It is .gitignored,
+# so a normal source build simply omits it and falls back to a local engine.
 include = [
     { path = "python/empyrean/_data/gm_de440.tpc", format = ["sdist", "wheel"] },
     { path = "python/empyrean/py.typed",           format = ["sdist", "wheel"] },
+    { path = "python/empyrean/libempyrean.*",      format = ["wheel"] },
 ]
 
 [tool.ruff]

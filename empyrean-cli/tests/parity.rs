@@ -151,7 +151,10 @@ fn write_input_json(s: &Scenario, dir: &Path) -> PathBuf {
     path
 }
 
-/// Run the CLI binary with the dylib + data dir on the environment.
+/// Run the CLI binary with the data dir on the environment. The
+/// DYLD_LIBRARY_PATH / LD_LIBRARY_PATH dylib env below is
+/// belt-and-suspenders only — the binary dlopens libempyrean by a
+/// resolved absolute path, not via the loader search path.
 fn run_cli(args: &[&str]) -> bool {
     let bin = env!("CARGO_BIN_EXE_empyrean");
     let dylib_dir = Path::new(bin).parent().unwrap();

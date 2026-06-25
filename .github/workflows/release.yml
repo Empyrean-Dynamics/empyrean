@@ -1,9 +1,13 @@
 name: Release
 
-# Triggered by pushing a tag of the form `vX.Y.Z` (e.g. `v0.7.0`).
-# The tag should point at a commit on `main` whose Cargo.toml /
-# pyproject.toml versions all equal `X.Y.Z` — the `verify` job below
-# enforces this consistency before any artifacts are built or published.
+# Step 2 of the two-step release. Triggered by pushing a tag of the form
+# `vX.Y.Z` (e.g. `v0.7.0`). The tag MUST point at a commit on `main` that
+# (a) has Cargo.toml / pyproject.toml versions all equal to `X.Y.Z` — the
+# `verify` job enforces this — and (b) has had its engine checksums pinned by
+# prepare-release.yml (step 1). This workflow does NOT build or re-hash the
+# hash-pinned libempyrean tarballs; it reuses the exact tarballs prepared in
+# step 1, re-verifies them against the committed empyrean-sys/checksums.txt,
+# and fails closed on any mismatch. Run prepare-release.yml before tagging.
 on:
   push:
     tags:
@@ -11,6 +15,11 @@ on:
 
 permissions:
   contents: write
+  # `gh run download` (publish-crates) reuses the libempyrean tarballs that
+  # prepare-release.yml built, so this workflow needs to read another run's
+  # artifacts. Setting any permission explicitly drops the rest to none, so
+  # actions:read must be named even though contents:write is the obvious one.
+  actions: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -120,7 +129,7 @@ jobs:
       # The CLI binary links libempyrean (through empyrean-sys's `links`
       # directive, which cargo won't build transitively), so build the
       # cdylib first — otherwise the final link fails with `-lempyrean`
-      # not found. Mirrors the c-lib / wheels / publish-crates jobs.
+      # not found. Mirrors the wheels / publish-crates jobs.
       - name: Build libempyrean (release)
         run: cargo build -p empyrean-c --release
 
@@ -150,56 +159,13 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}.tar.gz
 
-  # ── Build C shared library ─────────────────────────────────
-  c-lib:
-    name: C Library (${{ matrix.os }})
-    needs: verify
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            lib: target/release/libempyrean.so
-            artifact: libempyrean-linux-x86_64
-          - os: macos-14
-            lib: target/release/libempyrean.dylib
-            artifact: libempyrean-macos-aarch64
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Configure git for private dependencies
-        run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "ssh://git@github.com/"
-
-      - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          rustflags: ""
-
-      - name: Build C API (release, stripped)
-        run: cargo build -p empyrean-c --release
-
-      - name: Verify stripped + no internal symbol leak
-        run: |
-          file ${{ matrix.lib }}
-          leaked=$(nm ${{ matrix.lib }} 2>/dev/null | grep -ioE "empyrean_core|villeneuve|scott|nolan|hyperjet" | sort -u || true)
-          if [ -n "$leaked" ]; then
-            echo "::error::internal crate symbols leaked into ${{ matrix.lib }}:"; echo "$leaked"; exit 1
-          fi
-          echo "OK: only the C ABI is exported; no internal symbols in ${{ matrix.lib }}"
-
-      - name: Package library
-        run: |
-          mkdir -p dist
-          cp ${{ matrix.lib }} dist/
-          cp include/empyrean.h dist/
-          cp LICENSE dist/
-          cd dist && tar czf ../${{ matrix.artifact }}.tar.gz *
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}.tar.gz
+  # ── (libempyrean tarballs come from prepare-release.yml) ────
+  # The hash-pinned libempyrean-<target>.tar.gz assets are built and pinned by
+  # prepare-release.yml BEFORE this tag is cut, because they are not
+  # reproducible — re-building here would change their bytes and break
+  # verification against the committed checksums. publish-crates downloads those
+  # exact tarballs from the Prepare Release run, re-verifies them against
+  # empyrean-sys/checksums.txt, and serves them from the release.
 
   # ── Build the macOS wheel ──────────────────────────────────
   wheels-macos:
@@ -407,7 +373,7 @@ jobs:
   # pushed to crates.io.
   publish-crates:
     name: Publish to crates.io
-    needs: [verify, c-lib]
+    needs: [verify]
     runs-on: ubuntu-latest
     # The `crates-io` environment SHOULD carry a required-reviewer gate (and,
     # ideally, hold CARGO_REGISTRY_TOKEN as an environment-scoped secret) so
@@ -463,43 +429,90 @@ jobs:
         run: cargo build -p empyrean-c --release
 
       # ── Release automation for the crates.io download path ─────────────
-      # empyrean-sys's published build.rs downloads the prebuilt libempyrean
-      # for the consumer's platform from THIS release and verifies it against a
-      # pinned SHA-256. Attach the per-platform tarballs to the release and
-      # re-pin their checksums into the crate so the published hashes match the
-      # exact artifacts shipped here. (The FFI bindings are pre-generated and
-      # committed — see empyrean-sys/src/bindings.rs — so nothing is regenerated
-      # at publish time.)
-      - name: Download prebuilt libempyrean tarballs
-        uses: actions/download-artifact@v4
-        with:
-          pattern: libempyrean-*
-          path: libempyrean-dist
-          merge-multiple: true
-
-      - name: Attach libempyrean to the release and pin its checksums
+      # empyrean-sys's published build.rs downloads the prebuilt libempyrean for
+      # the consumer's platform from THIS release and verifies it against the
+      # SHA-256 already committed in empyrean-sys/checksums.txt. Those tarballs
+      # are not reproducible, so they are NOT rebuilt here: prepare-release.yml
+      # built and pinned them before the tag was cut. Reuse the exact tarballs
+      # from that run, re-verify them against the committed hashes (fail closed
+      # on any mismatch — no regeneration, no silent fallback), and serve them
+      # from the release so the published hashes match the artifacts byte for
+      # byte. (The FFI bindings are pre-generated and committed — see
+      # empyrean-sys/src/bindings.rs — so nothing is regenerated at publish time.)
+      - name: Reuse, verify, and serve the prepared libempyrean tarballs
         env:
           # The default workflow token inherits this workflow's `contents:
-          # write`, which `gh release create/upload` needs. GH_PAT (used by the
-          # reviewer-gate step) is scoped only for reading environment settings.
+          # write` (gh release create/upload) and `actions: read` (gh run
+          # download / list). GH_PAT is scoped only for reading environment
+          # settings.
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           tag="${GITHUB_REF#refs/tags/}"
-          # Make the engine binaries downloadable the instant the crate is live;
-          # the Create Release job finalises the notes afterwards.
+
+          # Reuse the tarballs prepared by prepare-release.yml — never rebuild
+          # them (non-reproducible bytes). Pick the latest successful Prepare
+          # Release run on main; the per-asset hash check below fails the
+          # release closed if it is the wrong or a stale one.
+          prep_run=$(gh run list --workflow=prepare-release.yml --branch main \
+                       --status success --limit 1 --json databaseId \
+                       --jq '.[0].databaseId')
+          if [ -z "$prep_run" ] || [ "$prep_run" = "null" ]; then
+            echo "::error::No successful 'Prepare Release' run on main. Run prepare-release.yml before tagging."
+            exit 1
+          fi
+          echo "Reusing libempyrean tarballs from Prepare Release run ${prep_run}."
+          rm -rf libempyrean-dist
+          gh run download "$prep_run" --pattern 'libempyrean-*' --dir libempyrean-dist
+
+          # Verify each committed checksum against the prepared tarball. A
+          # mismatch means the tag was cut from a commit whose checksums.txt
+          # does not match the prepared binaries — refuse to publish.
+          fail=0
+          pinned=0
+          while read -r stem want; do
+            case "$stem" in ''|\#*) continue ;; esac
+            pinned=$((pinned + 1))
+            tarball=$(find libempyrean-dist -name "${stem}.tar.gz" | head -1)
+            if [ -z "$tarball" ]; then
+              echo "::error::prepared tarball ${stem}.tar.gz not found in the Prepare Release artifacts"
+              fail=1; continue
+            fi
+            got=$(sha256sum "$tarball" | awk '{print $1}')
+            if [ "$got" != "$want" ]; then
+              echo "::error::${stem}: committed ${want} != prepared ${got}. Re-run prepare-release for this commit."
+              fail=1
+            else
+              printf "  OK  %-26s %s\n" "$stem" "$got"
+            fi
+          done < empyrean-sys/checksums.txt
+          [ "$fail" -eq 0 ] || { echo "Checksum verification failed — refusing to publish."; exit 1; }
+
+          # A verify that checks nothing must never report success. Require at
+          # least one pinned entry (so an empty/garbled/truncated checksums.txt
+          # fails closed instead of passing vacuously), and require a 1:1 match
+          # with the tarballs we are about to serve (so a tarball the loop never
+          # verified — e.g. a new target not yet pinned — cannot ship unchecked).
+          served=$(find libempyrean-dist -name 'libempyrean-*.tar.gz' | wc -l | tr -d ' ')
+          if [ "$pinned" -lt 1 ]; then
+            echo "::error::empyrean-sys/checksums.txt pins no libempyrean tarballs — refusing to publish."
+            exit 1
+          fi
+          if [ "$pinned" -ne "$served" ]; then
+            echo "::error::pinned ${pinned} tarball(s) but the Prepare Release run served ${served} — every served tarball must be pinned. Refusing to publish."
+            exit 1
+          fi
+          echo "Verified ${pinned} pinned tarball(s), all matching the prepared bytes."
+
+          # Serve the verified tarballs from the release so build.rs can download
+          # them the instant the crate is live; the Create Release job finalises
+          # the notes afterwards. These are the prepared bytes, so they match the
+          # committed hashes exactly.
           gh release view "$tag" >/dev/null 2>&1 \
             || gh release create "$tag" --prerelease --title "$tag" --notes "Publishing…"
-          gh release upload "$tag" libempyrean-dist/libempyrean-*.tar.gz --clobber
-          {
-            echo "# SHA-256 of each libempyrean-<target>.tar.gz release asset."
-            echo "# Regenerated by .github/workflows/release.yml at publish time."
-            echo "# Format: <asset-stem> <sha256>"
-            for t in libempyrean-dist/libempyrean-*.tar.gz; do
-              printf '%s %s\n' "$(basename "$t" .tar.gz)" "$(sha256sum "$t" | awk '{print $1}')"
-            done
-          } > empyrean-sys/checksums.txt
-          echo "Pinned checksums for ${tag}:"; cat empyrean-sys/checksums.txt
+          find libempyrean-dist -name 'libempyrean-*.tar.gz' \
+            -exec gh release upload "$tag" {} --clobber \;
+          echo "Verified and served libempyrean tarballs for ${tag}."
 
       - name: Publish empyrean-sys
         env:
@@ -525,7 +538,7 @@ jobs:
   # ── Create GitHub Release ──────────────────────────────────
   release:
     name: Create Release
-    needs: [cli, c-lib, wheels-linux, wheels-macos, publish-pypi, publish-crates]
+    needs: [cli, wheels-linux, wheels-macos, publish-pypi, publish-crates]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

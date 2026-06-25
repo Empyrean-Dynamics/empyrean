@@ -1,0 +1,243 @@
+name: Prepare Release
+
+# Step 1 of the two-step release. Run this (Actions > Prepare Release > Run
+# workflow) on `main` AFTER bumping every manifest to the target version and
+# BEFORE tagging.
+#
+# Why this exists: empyrean-sys's published build.rs downloads the prebuilt
+# libempyrean for the consumer's platform from the GitHub release and verifies
+# it against the SHA-256 pinned in empyrean-sys/checksums.txt. Those tarballs
+# are NOT reproducible (build nondeterminism + tar mtimes), so the committed
+# hash can only be correct if it is taken from the EXACT tarball the release
+# will serve. This job builds those tarballs once, pins their hashes into
+# checksums.txt, commits that, and keeps the exact tarballs as run artifacts.
+# release.yml (triggered by the tag you then push) downloads THESE artifacts,
+# re-verifies them against the committed hashes, and serves them — it never
+# rebuilds or regenerates. So a build from the git tag verifies against the
+# same binary the release serves, not just the crates.io artifact.
+#
+# After this run finishes: pull the checksum commit, then tag it `v<version>`
+# and push the tag to trigger release.yml.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, e.g. 0.7.0-rc.5 (must already be set in every manifest on this branch)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+
+jobs:
+  # ── Verify all distribution-channel versions match the requested version ──
+  # Same check release.yml runs against the tag, run here against the dispatch
+  # input so a mismatch is caught before any binaries are built or pinned.
+  verify:
+    name: Verify Versions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure git for private dependencies
+        run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "ssh://git@github.com/"
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify versions match the requested release across all channels
+        run: |
+          set -eu
+          want="${{ inputs.version }}"
+          echo "Requested version:  $want"
+          echo
+
+          # Cargo/SemVer uses `0.7.0-rc.5`, PyPI/PEP 440 uses `0.7.0rc5`; compare
+          # a canonical form (separators stripped) so a pre-release matches both.
+          canon() { echo "$1" | tr -d '.-'; }
+
+          metadata=$(cargo metadata --no-deps --format-version 1)
+          mismatch=0
+
+          crates=(empyrean empyrean-sys empyrean-c empyrean-cli empyrean-py)
+          for crate in "${crates[@]}"; do
+            v=$(echo "$metadata" | jq -r --arg name "$crate" '.packages[] | select(.name == $name) | .version')
+            if [ -z "$v" ] || [ "$v" = "null" ]; then
+              echo "::error::could not read version for crate $crate"
+              mismatch=1
+              continue
+            fi
+            if [ "$(canon "$v")" != "$(canon "$want")" ]; then
+              echo "::error::$crate Cargo.toml version is $v, expected $want"
+              mismatch=1
+            else
+              printf "  OK  %-20s %s\n" "$crate" "$v"
+            fi
+          done
+
+          py_version=$(python -c 'import tomllib; print(tomllib.load(open("empyrean-py/pyproject.toml","rb"))["project"]["version"])')
+          if [ "$(canon "$py_version")" != "$(canon "$want")" ]; then
+            echo "::error::empyrean-py/pyproject.toml version is $py_version, expected $want"
+            mismatch=1
+          else
+            printf "  OK  %-20s %s\n" "pyproject.toml" "$py_version"
+          fi
+
+          [ "$mismatch" -eq 0 ] || { echo; echo "Version mismatch — bump the manifests to $want before preparing."; exit 1; }
+          echo
+          echo "All distribution channels at version $want."
+
+  # ── Build the libempyrean tarballs that the release will serve ──────────
+  # Identical packaging to release.yml's c-lib job. These exact tarballs (NOT a
+  # rebuild) are what get pinned and reused, so the hash holds end to end.
+  build-libs:
+    name: Build libempyrean (${{ matrix.os }})
+    needs: verify
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            lib: target/release/libempyrean.so
+            artifact: libempyrean-linux-x86_64
+          - os: macos-14
+            lib: target/release/libempyrean.dylib
+            artifact: libempyrean-macos-aarch64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure git for private dependencies
+        run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "ssh://git@github.com/"
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Build C API (release, stripped)
+        run: cargo build -p empyrean-c --release
+
+      - name: Verify stripped + no internal symbol leak
+        run: |
+          file ${{ matrix.lib }}
+          leaked=$(nm ${{ matrix.lib }} 2>/dev/null | grep -ioE "empyrean_core|villeneuve|scott|nolan|hyperjet" | sort -u || true)
+          if [ -n "$leaked" ]; then
+            echo "::error::internal crate symbols leaked into ${{ matrix.lib }}:"; echo "$leaked"; exit 1
+          fi
+          echo "OK: only the C ABI is exported; no internal symbols in ${{ matrix.lib }}"
+
+      - name: Package library
+        run: |
+          mkdir -p dist
+          cp ${{ matrix.lib }} dist/
+          cp include/empyrean.h dist/
+          cp LICENSE dist/
+          cd dist && tar czf ../${{ matrix.artifact }}.tar.gz *
+
+      - name: Upload prepared tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.tar.gz
+
+  # ── Pin the hashes of those exact tarballs and commit them ──────────────
+  pin:
+    name: Pin checksums and commit
+    needs: build-libs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Push the checksum commit with the default GITHUB_TOKEN, which carries
+          # the workflow-level `permissions: contents: write` for THIS repo. That
+          # explicit grant works even when the repo's default Actions token is
+          # read-only (the repo setting is only a default; a workflow `permissions`
+          # block overrides it — only an org-level cap could block it). NOT GH_PAT:
+          # that PAT is scoped read-only to the sibling engine repos (for cloning
+          # private deps during the build) and has no write access here, so using
+          # it for the push fails with a 403.
+          token: ${{ github.token }}
+          # Full history so the safety `git pull --rebase` below is not shallow.
+          fetch-depth: 0
+
+      - name: Download prepared tarballs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: libempyrean-*
+          path: libempyrean-dist
+          merge-multiple: true
+
+      - name: Regenerate checksums.txt from the prepared tarballs
+        run: |
+          set -euo pipefail
+          want="${{ inputs.version }}"
+          {
+            echo "# SHA-256 of each libempyrean-<target>.tar.gz release asset."
+            echo "#"
+            echo "# empyrean-sys's published build.rs downloads the prebuilt engine binary for"
+            echo "# the consumer's platform from the matching GitHub release and verifies it"
+            echo "# against the hash pinned here. These are committed BEFORE the release tag is"
+            echo "# cut, by .github/workflows/prepare-release.yml, which builds the binaries and"
+            echo "# pins THESE exact tarballs (release.yml reuses and re-verifies them, never"
+            echo "# rebuilds), so a build from the git tag verifies against the same binary the"
+            echo "# release serves. in-tree development links the local ../target/release build"
+            echo "# and never reads this file."
+            echo "#"
+            echo "# Pinned for v${want}."
+            echo "#"
+            echo "# Format: <asset-stem> <sha256>"
+            for t in libempyrean-dist/libempyrean-*.tar.gz; do
+              printf '%s %s\n' "$(basename "$t" .tar.gz)" "$(sha256sum "$t" | awk '{print $1}')"
+            done
+          } > empyrean-sys/checksums.txt
+          echo "Pinned checksums for v${want}:"; cat empyrean-sys/checksums.txt
+
+      - name: Commit checksums if they changed
+        run: |
+          set -euo pipefail
+          want="${{ inputs.version }}"
+          if git diff --quiet -- empyrean-sys/checksums.txt; then
+            echo "checksums.txt already matches the prepared binaries — nothing to commit."
+          else
+            git config user.name  "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add empyrean-sys/checksums.txt
+            git commit -m "Pin libempyrean checksums for v${want}"
+            # Rebase in case main advanced during the release window; the
+            # checksum commit is independent of any other change, so this is safe.
+            git pull --rebase
+            git push
+            echo "Committed and pushed updated checksums.txt."
+          fi
+
+      - name: Next steps
+        run: |
+          set -euo pipefail
+          want="${{ inputs.version }}"
+          sha=$(git rev-parse HEAD)
+          {
+            echo "## Prepared v${want}"
+            echo
+            echo "Checksums pinned at \`${sha}\`. To release:"
+            echo
+            echo '```'
+            echo "git pull"
+            echo "git tag -a v${want} -m \"<release notes>\" ${sha}"
+            echo "git push origin v${want}"
+            echo '```'
+            echo
+            echo "release.yml will reuse the tarballs prepared by THIS run"
+            echo "(\`${{ github.run_id }}\`) and verify them against the committed hashes."
+          } >> "$GITHUB_STEP_SUMMARY"

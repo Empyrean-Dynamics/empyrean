@@ -1,12 +1,16 @@
 # SHA-256 of each libempyrean-<target>.tar.gz release asset.
 #
-# These pin the exact prebuilt engine binary to this crate version. They are
-# REGENERATED and re-pinned automatically by .github/workflows/release.yml at
-# publish time (from the just-built release artifacts), so the published crate
-# always carries the correct hashes for its own release. The values committed
-# here are the last-released reference; in-tree development links the local
-# ../target/release build and never reads them.
+# empyrean-sys's published build.rs downloads the prebuilt engine binary for
+# the consumer's platform from the matching GitHub release and verifies it
+# against the hash pinned here. These are committed BEFORE the release tag is
+# cut, by .github/workflows/prepare-release.yml, which builds the binaries and
+# pins THESE exact tarballs (release.yml reuses and re-verifies them, never
+# rebuilds), so a build from the git tag verifies against the same binary the
+# release serves. in-tree development links the local ../target/release build
+# and never reads this file.
+#
+# Pinned for v0.7.0-rc.4.
 #
 # Format: <asset-stem> <sha256>
-libempyrean-macos-aarch64 594992575cb7bc7991fd3654b3aa43607ac36e9c1316ee48b3996ceda0243fb3
-libempyrean-linux-x86_64 0bddb76e1b18e5b2e42bba85565899ac24912deade677bceee4fb0dfbff2210e
+libempyrean-macos-aarch64 b09f29659aae2022e37d7c27872770cce2d9e243a8fb3add4f669100569f808f
+libempyrean-linux-x86_64 0094ac26510c774f16f760ed8cfd820ed0fc35e66dcc23baec1f4d10e997b338

@@ -24,6 +24,25 @@ mod transform;
 use std::cell::RefCell;
 use std::ffi::{CStr, CString, c_char};
 use std::path::Path;
+use std::sync::Mutex;
+
+/// Serializes native context CONSTRUCTION across the C ABI.
+///
+/// The engine's first-init kernel provisioning does writable-cache file I/O
+/// that is not safe to run concurrently — building several contexts at once
+/// raced and surfaced as a path-less `I/O error: ... (os error 2)`. Guarding
+/// the constructors here (rather than in a higher-level wrapper) makes the C ABI
+/// itself thread-safe, so every consumer — the Rust wrapper, the Python package,
+/// and direct C SDK users — is protected. It guards construction / in-place
+/// kernel loading ONLY; propagation, ephemeris, and OD on a built context are
+/// concurrency-safe and never take this lock.
+static CONSTRUCT_LOCK: Mutex<()> = Mutex::new(());
+
+/// Acquire the construction lock, recovering from a poisoned mutex (a panic in
+/// one constructor must not wedge all future construction).
+fn construct_lock() -> std::sync::MutexGuard<'static, ()> {
+    CONSTRUCT_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// C FFI opaque handle. Internally an [`empyrean_core::Context`]; the
 /// C header forward-declares `struct EmpyreanContext` — callers only
@@ -149,7 +168,11 @@ pub unsafe extern "C" fn empyrean_context_new_minimal(
             }
         };
 
-        match empyrean_core::Context::new(Path::new(de440_str), Path::new(gm_str)) {
+        let outcome = {
+            let _guard = construct_lock();
+            empyrean_core::Context::new(Path::new(de440_str), Path::new(gm_str))
+        };
+        match outcome {
             Ok(ctx) => Box::into_raw(Box::new(ctx)),
             Err(e) => {
                 set_last_error(&e.to_string());
@@ -196,7 +219,13 @@ pub unsafe extern "C" fn empyrean_context_with_spk(
             }
         };
         let ctx_ref = unsafe { &mut *ctx };
-        match ctx_ref.load_spk(Path::new(path_str)) {
+        let outcome = {
+            // In-place kernel loading mutates the shared native pool — serialize
+            // it with the other constructors.
+            let _guard = construct_lock();
+            ctx_ref.load_spk(Path::new(path_str))
+        };
+        match outcome {
             Ok(()) => 0,
             Err(e) => {
                 set_last_error(&format!("load_spk failed: {e}"));
@@ -246,7 +275,11 @@ pub unsafe extern "C" fn empyrean_context_from_data_dir(
             }
         };
 
-        match empyrean_core::Context::from_data_dir(dir_opt) {
+        let outcome = {
+            let _guard = construct_lock();
+            empyrean_core::Context::from_data_dir(dir_opt)
+        };
+        match outcome {
             Ok(ctx) => Box::into_raw(Box::new(ctx)),
             Err(e) => {
                 set_last_error(&e.to_string());

@@ -1,6 +1,6 @@
 [package]
 name = "empyrean"
-version = "0.7.0-rc.3"
+version = "0.7.0-rc.4"
 edition = "2024"
 rust-version = "1.90.0"
 authors = ["Joachim Moeyens <joachim@empyrean-dynamics.com>", "Empyrean Dynamics"]
@@ -44,7 +44,7 @@ rustdoc-args = ["--html-in-header", "docs/katex-header.html"]
 # `version` is required for `cargo publish`. `path` wins for sibling-
 # checkout development; the version pin is what crates.io users get
 # (cargo strips the `path` from the published manifest automatically).
-empyrean-sys = { path = "../empyrean-sys", version = "0.7.0-rc.3" }
+empyrean-sys = { path = "../empyrean-sys", version = "0.7.0-rc.4" }
 
 [dev-dependencies]
 # Cross-channel parity test (tests/parity.rs) reads the shared parity

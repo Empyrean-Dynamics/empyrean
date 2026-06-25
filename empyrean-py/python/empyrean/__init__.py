@@ -360,15 +360,26 @@ def initialize(
         if b612:
             data_dir = str(_stage_b612_cache(b612))
 
-    _initialize(data_dir=data_dir, de440_path=de440_path, gm_path=gm_path)
+    _initialize(
+        data_dir=None if data_dir is None else str(data_dir),
+        de440_path=None if de440_path is None else str(de440_path),
+        gm_path=None if gm_path is None else str(gm_path),
+    )
 
 
 def download_data(*, data_dir: str | pathlib.Path | None = None) -> str:
-    """Download all required SPICE kernel files.
+    """Provision a usable data directory with the required SPICE kernels.
 
-    Downloads to the OS-appropriate XDG data directory by default
-    (see :func:`default_data_dir`). Skips files that are already
-    present and up-to-date.
+    Provisions the OS-appropriate XDG data directory by default (see
+    :func:`default_data_dir`); pass ``data_dir`` to target another. Idempotent:
+    files already present are kept; only missing files are downloaded.
+
+    If the B612 Foundation data packages (``naif-de440``,
+    ``jpl-small-bodies-de441-n16``, ``naif-eop-high-prec``,
+    ``naif-eop-historical``, ``naif-eop-predict``, ``mpc-obscodes``) are
+    installed and no explicit ``data_dir`` is given, their kernels are staged
+    from the installed wheels with **zero network access**, and only what they
+    do not supply (e.g. ``bias.dat``) is downloaded.
 
     Parameters
     ----------
@@ -379,9 +390,17 @@ def download_data(*, data_dir: str | pathlib.Path | None = None) -> str:
     Returns
     -------
     str
-        Path to the data directory.
+        Path to the provisioned data directory.
     """
+    # Prefer installed B612 data packages — symlink the kernels they ship into
+    # the data dir (no network) and let the engine fetch only the remainder.
+    if data_dir is None:
+        b612 = _discover_b612_data()
+        if b612:
+            data_dir = str(_stage_b612_cache(b612))
+
     from empyrean._empyrean_rs import _download_data
 
-    result: str = _download_data(data_dir=data_dir)
+    # The binding takes Option<&str>; coerce an explicit pathlib.Path.
+    result: str = _download_data(data_dir=None if data_dir is None else str(data_dir))
     return result

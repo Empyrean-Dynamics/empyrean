@@ -59,5 +59,42 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// Collapse a doubly-wrapped `"I/O error: I/O error: ..."` prefix down to a
+/// single `"I/O error: "`.
+///
+/// The native engine wraps an already-formatted `io::Error` string inside
+/// another `io::Error`, so a missing-file failure arrives as
+/// `"I/O error: I/O error: No such file or directory (os error 2)"`. Keep one
+/// prefix so the message reads cleanly.
+pub(crate) fn dedupe_io_prefix(msg: &str) -> String {
+    let mut s = msg.to_string();
+    while s.starts_with("I/O error: I/O error: ") {
+        // Drop the first prefix, leaving exactly one.
+        s = s.replacen("I/O error: ", "", 1);
+    }
+    s
+}
+
 /// Result type for empyrean FFI calls.
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::dedupe_io_prefix;
+
+    #[test]
+    fn collapses_doubled_io_prefix() {
+        assert_eq!(
+            dedupe_io_prefix("I/O error: I/O error: No such file or directory (os error 2)"),
+            "I/O error: No such file or directory (os error 2)"
+        );
+        // single prefix and unrelated messages are untouched
+        assert_eq!(dedupe_io_prefix("I/O error: nope"), "I/O error: nope");
+        assert_eq!(dedupe_io_prefix("convergence failed"), "convergence failed");
+        // triple collapses to one
+        assert_eq!(
+            dedupe_io_prefix("I/O error: I/O error: I/O error: boom"),
+            "I/O error: boom"
+        );
+    }
+}

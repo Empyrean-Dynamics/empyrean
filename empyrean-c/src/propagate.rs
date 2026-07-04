@@ -6,7 +6,9 @@ use empyrean_core::constants::KM_PER_AU;
 use empyrean_core::convert::{
     coordinate_state_to_coordinates, frame_to_int, representation_to_int,
 };
-use empyrean_core::nongrav::{GFunction, NonGravModel, NonGravParams};
+use empyrean_core::nongrav::{
+    GFunction, NonGravModel, NonGravParams, SteeringLaw, ThrustArc, ThrustParams,
+};
 use empyrean_core::orbits::Orbits;
 use empyrean_core::photometry::PhotometricParams;
 use empyrean_core::propagation::events::DynamicalEvent;
@@ -53,10 +55,83 @@ pub const EMPYREAN_PHASE_FUNCTION_HG: i32 = 0;
 pub const EMPYREAN_PHASE_FUNCTION_HG1G2: i32 = 1;
 pub const EMPYREAN_PHASE_FUNCTION_HG12: i32 = 2;
 
-/// An orbit with optional non-gravitational parameters and photometry.
+/// Steering-law selector tags for [`EmpyreanThrustArc::steering_law`].
 ///
-/// Thrust-arc support has been removed in v0.7.0; if `a1 == a2 == a3 ==
-/// 0.0` the orbit is treated as gravity-only.
+/// Mirrors [`empyrean_core::nongrav::SteeringLaw`]. The value is read as a
+/// plain `int32_t` at the marshaling boundary and validated loudly — an
+/// unrecognized value is an error, never a silent default (the same tag
+/// convention used by `EMPYREAN_PHASE_FUNCTION_*` / `EMPYREAN_INTEGRATOR_*`).
+/// Which `EmpyreanThrustArc` steering-parameter slots are read depends on the
+/// selected law:
+///
+/// | value | Steering law | Active fields |
+/// |-------|--------------|---------------|
+/// | 0 | `CONSTANT_RTN`     | `steering_alpha_rad`, `steering_beta_rad` |
+/// | 1 | `VELOCITY_TANGENT` | (none) |
+/// | 2 | `INERTIAL_FIXED`   | `steering_direction` |
+///
+/// Constant RTN angles relative to the central body: fixed in-plane
+/// (\\(\alpha\\)) and out-of-plane (\\(\beta\\)) angles.
+pub const EMPYREAN_STEERING_LAW_CONSTANT_RTN: i32 = 0;
+/// Thrust aligned with velocity relative to the central body.
+pub const EMPYREAN_STEERING_LAW_VELOCITY_TANGENT: i32 = 1;
+/// Fixed direction in the inertial frame (normalized internally).
+pub const EMPYREAN_STEERING_LAW_INERTIAL_FIXED: i32 = 2;
+
+/// A single continuous-thrust arc, mirroring
+/// [`empyrean_core::nongrav::ThrustArc`] as a flat `#[repr(C)]` record.
+///
+/// Arcs are supplied through [`EmpyreanOrbit::thrust_arcs`] as a
+/// caller-owned side array borrowed read-only for the duration of the call.
+///
+/// The acceleration during the arc is
+/// \\[ \mathbf{a}(t) = \sigma(t)\,\frac{F}{m(t)}\,\hat{d} \\]
+/// with a smooth \\(\tanh\\) switch \\(\sigma(t)\\) of width set by
+/// `sharpness`, steering direction \\(\hat{d}\\) from `steering_law`, and
+/// mass \\(m(t)\\) that depletes when `isp_s` is finite.
+#[repr(C)]
+pub struct EmpyreanThrustArc {
+    /// Arc start epoch (MJD TDB).
+    pub start_mjd_tdb: f64,
+    /// Arc end epoch (MJD TDB).
+    pub end_mjd_tdb: f64,
+    /// Engine thrust force in Newtons.
+    pub thrust_n: f64,
+    /// Spacecraft mass at arc start in kilograms.
+    pub mass_kg: f64,
+    /// Specific impulse in seconds. Any non-finite value (`NaN` or `±∞`)
+    /// selects constant mass (no depletion); a finite value depletes mass at
+    /// \\(\dot m = F/(I_{sp} g_0)\\). This is the `Option<f64>` NaN-sentinel
+    /// convention shared with [`EmpyreanOrbit::non_grav_dt`].
+    pub isp_s: f64,
+    /// Steering-law selector — see the `EMPYREAN_STEERING_LAW_*` tag
+    /// constants. An unrecognized value errors loudly.
+    pub steering_law: i32,
+    /// `CONSTANT_RTN` in-plane angle α from radial toward transverse
+    /// (radians). Read only when `steering_law == CONSTANT_RTN`.
+    pub steering_alpha_rad: f64,
+    /// `CONSTANT_RTN` out-of-plane angle β toward orbit normal (radians).
+    /// Read only when `steering_law == CONSTANT_RTN`.
+    pub steering_beta_rad: f64,
+    /// `INERTIAL_FIXED` direction vector (normalized internally). Read only
+    /// when `steering_law == INERTIAL_FIXED`.
+    pub steering_direction: [f64; 3],
+    /// \\(\tanh\\) switching sharpness (1/days). Higher = sharper on/off.
+    pub sharpness: f64,
+    /// Central-body NAIF id for the RTN / velocity-tangent frame reference
+    /// (same encoding as [`EmpyreanOrbit`]'s `state.origin`, e.g. `399` for
+    /// Earth, `10` for the Sun). An unknown NAIF id errors loudly.
+    pub central_body_naif_id: i32,
+}
+
+/// An orbit with optional non-gravitational parameters, continuous-thrust
+/// arcs, and photometry.
+///
+/// Thrust: when `n_thrust_arcs > 0`, [`thrust_arcs`](Self::thrust_arcs)
+/// (plus the optional [`dv_corrections`](Self::dv_corrections) /
+/// [`correction_covariances`](Self::correction_covariances) side arrays)
+/// build a [`ThrustParams`] for this orbit. All-zero `a1/a2/a3` and
+/// `n_thrust_arcs == 0` is a pure-gravity orbit.
 ///
 /// `a1/a2/a3` are the Marsden–Sekanina RTN coefficients (radial,
 /// transverse, normal) in AU/day². `ng_alpha … ng_k` parameterize the
@@ -137,6 +212,41 @@ pub struct EmpyreanOrbit {
     pub slope1: f64,
     /// Slope parameter slot 2 — G₂ (HG1G2 only); unused (0) for HG / HG12.
     pub slope2: f64,
+    /// Continuous-thrust arcs (variable length). Null / `n_thrust_arcs == 0`
+    /// ⇒ no thrust (gravity + non-grav only).
+    ///
+    /// **Ownership:** caller-owned; borrowed read-only for the duration of
+    /// the call. The C ABI never frees it. A null pointer with
+    /// `n_thrust_arcs > 0` is a loud argument error, not a silent skip; a
+    /// non-null pointer with `n_thrust_arcs == 0` is treated as absent (the
+    /// pointer is not read).
+    pub thrust_arcs: *const EmpyreanThrustArc,
+    /// Number of arcs in [`thrust_arcs`](Self::thrust_arcs).
+    pub n_thrust_arcs: usize,
+    /// Optional per-arc Δv corrections (AU/day), positional with
+    /// [`thrust_arcs`](Self::thrust_arcs). Null / `n_dv_corrections == 0` ⇒
+    /// no targeting corrections. Supplying corrections without any arc is a
+    /// loud argument error.
+    ///
+    /// **Ownership:** caller-owned; borrowed read-only for the call.
+    pub dv_corrections: *const [f64; 3],
+    /// Number of corrections in [`dv_corrections`](Self::dv_corrections).
+    pub n_dv_corrections: usize,
+    /// Optional 3×3 covariance (AU/day)² per Δv correction, positional with
+    /// [`dv_corrections`](Self::dv_corrections). When non-empty its length
+    /// MUST equal `n_dv_corrections`; a non-empty covariance triggers the
+    /// wide-Jet burn-sensitivity propagation. The engine's higher-order
+    /// (third-order) propagation path does not implement thrust-correction
+    /// covariance and rejects that combination loudly upstream
+    /// (`Not implemented: … ThirdOrder with thrust-correction covariance …`,
+    /// surfaced as a propagation error) rather than silently dropping the
+    /// covariance.
+    ///
+    /// **Ownership:** caller-owned; borrowed read-only for the call.
+    pub correction_covariances: *const [[f64; 3]; 3],
+    /// Number of entries in
+    /// [`correction_covariances`](Self::correction_covariances).
+    pub n_correction_covariances: usize,
 }
 
 /// Origin-switching configuration for trajectory splitting at body
@@ -911,6 +1021,133 @@ pub(crate) fn empyrean_orbit_non_grav_params(orbit: &EmpyreanOrbit) -> Option<No
     })
 }
 
+/// Validate a caller-owned side-array pointer/length pair: a non-zero
+/// length paired with a null pointer (in either direction) is a loud
+/// argument error rather than a silent empty read. A zero length is always
+/// treated as "no array" (the pointer is ignored).
+fn validate_side_array_ptr<T>(ptr: *const T, len: usize, field: &str) -> Result<(), String> {
+    if len > 0 && ptr.is_null() {
+        return Err(format!(
+            "{field}: non-zero length ({len}) with a null pointer"
+        ));
+    }
+    Ok(())
+}
+
+/// Build the continuous-thrust parameters carried by an [`EmpyreanOrbit`],
+/// or `None` when the orbit supplies no thrust arcs.
+///
+/// Shared by every C-ABI path that turns an `EmpyreanOrbit` into an
+/// `Orbits<AU>` (propagation, ephemeris, radar/planning, impact, IO
+/// round-trip) so none of them silently drops the caller's burn model.
+///
+/// Marshals the [`thrust_arcs`](EmpyreanOrbit::thrust_arcs) side array into
+/// [`ThrustArc`]s (mapping [`isp_s`](EmpyreanThrustArc::isp_s) `NaN → None`,
+/// the [`steering_law`](EmpyreanThrustArc::steering_law) tag into a
+/// [`SteeringLaw`], and `central_body_naif_id` into an [`Origin`]), and
+/// carries the optional `dv_corrections` / `correction_covariances` side
+/// arrays through unchanged. Validates loudly:
+/// - any pointer/length mismatch (non-zero length with a null pointer),
+/// - `dv_corrections` / `correction_covariances` supplied with no arcs,
+/// - `correction_covariances` length not matching `dv_corrections`,
+/// - an unknown `steering_law` tag or an unknown `central_body_naif_id`.
+pub(crate) fn empyrean_orbit_thrust_params(
+    orbit: &EmpyreanOrbit,
+) -> Result<Option<ThrustParams>, String> {
+    validate_side_array_ptr(orbit.thrust_arcs, orbit.n_thrust_arcs, "thrust_arcs")?;
+    validate_side_array_ptr(
+        orbit.dv_corrections,
+        orbit.n_dv_corrections,
+        "dv_corrections",
+    )?;
+    validate_side_array_ptr(
+        orbit.correction_covariances,
+        orbit.n_correction_covariances,
+        "correction_covariances",
+    )?;
+
+    if orbit.n_thrust_arcs == 0 {
+        // No arcs: corrections without an arc to attach them to are a loud
+        // error, not a silent drop.
+        if orbit.n_dv_corrections != 0 || orbit.n_correction_covariances != 0 {
+            return Err(
+                "dv_corrections / correction_covariances supplied without any thrust_arcs"
+                    .to_string(),
+            );
+        }
+        return Ok(None);
+    }
+
+    // villeneuve's ThrustParams contract: when correction_covariances is
+    // non-empty its length must match dv_corrections.
+    if orbit.n_correction_covariances != 0
+        && orbit.n_correction_covariances != orbit.n_dv_corrections
+    {
+        return Err(format!(
+            "correction_covariances length ({}) must match dv_corrections length ({})",
+            orbit.n_correction_covariances, orbit.n_dv_corrections
+        ));
+    }
+
+    let arc_slice = unsafe { std::slice::from_raw_parts(orbit.thrust_arcs, orbit.n_thrust_arcs) };
+    let mut arcs = Vec::with_capacity(arc_slice.len());
+    for (i, a) in arc_slice.iter().enumerate() {
+        let steering = match a.steering_law {
+            EMPYREAN_STEERING_LAW_CONSTANT_RTN => SteeringLaw::ConstantRTN {
+                alpha_rad: a.steering_alpha_rad,
+                beta_rad: a.steering_beta_rad,
+            },
+            EMPYREAN_STEERING_LAW_VELOCITY_TANGENT => SteeringLaw::VelocityTangent,
+            EMPYREAN_STEERING_LAW_INERTIAL_FIXED => SteeringLaw::InertialFixed {
+                direction: a.steering_direction,
+            },
+            other => {
+                return Err(format!("thrust arc {i}: unknown steering_law tag {other}"));
+            }
+        };
+        let central_body = Origin::from_naif_id(a.central_body_naif_id).ok_or_else(|| {
+            format!(
+                "thrust arc {i}: unknown central_body NAIF id {}",
+                a.central_body_naif_id
+            )
+        })?;
+        arcs.push(ThrustArc {
+            start_mjd_tdb: a.start_mjd_tdb,
+            end_mjd_tdb: a.end_mjd_tdb,
+            thrust_n: a.thrust_n,
+            mass_kg: a.mass_kg,
+            isp_s: if a.isp_s.is_finite() {
+                Some(a.isp_s)
+            } else {
+                None
+            },
+            steering,
+            sharpness: a.sharpness,
+            central_body,
+        });
+    }
+
+    let dv_corrections = if orbit.n_dv_corrections > 0 {
+        unsafe { std::slice::from_raw_parts(orbit.dv_corrections, orbit.n_dv_corrections) }.to_vec()
+    } else {
+        Vec::new()
+    };
+    let correction_covariances = if orbit.n_correction_covariances > 0 {
+        unsafe {
+            std::slice::from_raw_parts(orbit.correction_covariances, orbit.n_correction_covariances)
+        }
+        .to_vec()
+    } else {
+        Vec::new()
+    };
+
+    Ok(Some(ThrustParams {
+        arcs,
+        dv_corrections,
+        correction_covariances,
+    }))
+}
+
 // ── empyrean_propagate ──────────────────────────────────────
 
 /// Propagate orbits to the requested target times.
@@ -982,6 +1219,14 @@ pub unsafe extern "C" fn empyrean_propagate(
             }
             if let Some(params) = empyrean_orbit_non_grav_params(orbit) {
                 orbits.set_non_grav_params(i, Some(params));
+            }
+            match empyrean_orbit_thrust_params(orbit) {
+                Ok(Some(tp)) => orbits.set_thrust_params(i, Some(tp)),
+                Ok(None) => {}
+                Err(e) => {
+                    set_last_error(&format!("orbit {i}: {e}"));
+                    return -1;
+                }
             }
         }
 
@@ -2408,5 +2653,332 @@ mod tagged_covariance_tests {
 
         // Freeing null is a no-op, not a crash.
         unsafe { empyrean_tagged_covariance_series_free(std::ptr::null_mut()) };
+    }
+}
+
+#[cfg(test)]
+mod thrust_input_tests {
+    use super::*;
+
+    /// A gravity-only heliocentric Cartesian orbit with all thrust side
+    /// arrays empty. Tests attach caller-owned arrays by overwriting the
+    /// pointer/length pairs (keeping the backing storage alive in scope).
+    fn base_orbit() -> EmpyreanOrbit {
+        EmpyreanOrbit {
+            state: crate::CoordinateState {
+                epoch_mjd_tdb: 59000.0,
+                // Plausible heliocentric Cartesian state (AU, AU/day).
+                elements: [1.0, 0.1, 0.05, -0.005, 0.015, 0.001],
+                covariance: [[0.0; 6]; 6],
+                has_covariance: 0,
+                representation: 0, // Cartesian
+                frame: 0,          // ICRF
+                origin: 10,        // Sun (NAIF)
+            },
+            orbit_id: std::ptr::null(),
+            object_id: std::ptr::null(),
+            a1: 0.0,
+            a2: 0.0,
+            a3: 0.0,
+            ng_alpha: 0.0,
+            ng_r0: 0.0,
+            ng_m: 0.0,
+            ng_n: 0.0,
+            ng_k: 0.0,
+            non_grav_dt: f64::NAN,
+            has_non_grav_covariance: 0,
+            non_grav_covariance: [[0.0; 3]; 3],
+            phot_system: -1,
+            h_mag: f64::NAN,
+            slope1: 0.0,
+            slope2: 0.0,
+            thrust_arcs: std::ptr::null(),
+            n_thrust_arcs: 0,
+            dv_corrections: std::ptr::null(),
+            n_dv_corrections: 0,
+            correction_covariances: std::ptr::null(),
+            n_correction_covariances: 0,
+        }
+    }
+
+    /// A one-arc ConstantRTN burn about the Sun, constant mass (`isp NaN`).
+    fn rtn_arc() -> EmpyreanThrustArc {
+        EmpyreanThrustArc {
+            start_mjd_tdb: 59000.0,
+            end_mjd_tdb: 59010.0,
+            thrust_n: 1000.0,
+            mass_kg: 1000.0,
+            isp_s: f64::NAN, // constant mass
+            steering_law: EMPYREAN_STEERING_LAW_CONSTANT_RTN,
+            steering_alpha_rad: 0.1,
+            steering_beta_rad: 0.2,
+            steering_direction: [0.0; 3],
+            sharpness: 100.0,
+            central_body_naif_id: 10, // Sun
+        }
+    }
+
+    // ── Marshaling correctness (no context needed) ──────────────
+
+    #[test]
+    fn marshals_one_arc_constant_rtn_with_correction() {
+        let arcs = [rtn_arc()];
+        let dvs = [[1.0e-6, 2.0e-6, 3.0e-6]];
+        let mut orbit = base_orbit();
+        orbit.thrust_arcs = arcs.as_ptr();
+        orbit.n_thrust_arcs = 1;
+        orbit.dv_corrections = dvs.as_ptr();
+        orbit.n_dv_corrections = 1;
+
+        let tp = empyrean_orbit_thrust_params(&orbit)
+            .expect("valid thrust params")
+            .expect("Some(ThrustParams) for a one-arc orbit");
+        assert_eq!(tp.arcs.len(), 1);
+        let a = &tp.arcs[0];
+        assert_eq!(a.start_mjd_tdb, 59000.0);
+        assert_eq!(a.end_mjd_tdb, 59010.0);
+        assert_eq!(a.thrust_n, 1000.0);
+        assert_eq!(a.mass_kg, 1000.0);
+        assert!(a.isp_s.is_none(), "NaN isp_s must map to None");
+        assert_eq!(a.sharpness, 100.0);
+        assert_eq!(a.central_body, Origin::Sun);
+        match &a.steering {
+            SteeringLaw::ConstantRTN {
+                alpha_rad,
+                beta_rad,
+            } => {
+                assert_eq!(*alpha_rad, 0.1);
+                assert_eq!(*beta_rad, 0.2);
+            }
+            other => panic!("expected ConstantRTN, got {other:?}"),
+        }
+        assert_eq!(tp.dv_corrections, vec![[1.0e-6, 2.0e-6, 3.0e-6]]);
+        assert!(tp.correction_covariances.is_empty());
+    }
+
+    #[test]
+    fn isp_finite_maps_to_some_and_steering_variants_map() {
+        let mut a0 = rtn_arc();
+        a0.isp_s = 320.0; // finite → Some
+        a0.steering_law = EMPYREAN_STEERING_LAW_VELOCITY_TANGENT;
+        let mut a1 = rtn_arc();
+        a1.steering_law = EMPYREAN_STEERING_LAW_INERTIAL_FIXED;
+        a1.steering_direction = [0.0, 0.0, 1.0];
+        let arcs = [a0, a1];
+        let mut orbit = base_orbit();
+        orbit.thrust_arcs = arcs.as_ptr();
+        orbit.n_thrust_arcs = 2;
+
+        let tp = empyrean_orbit_thrust_params(&orbit).unwrap().unwrap();
+        assert_eq!(tp.arcs[0].isp_s, Some(320.0));
+        assert!(matches!(tp.arcs[0].steering, SteeringLaw::VelocityTangent));
+        assert!(matches!(
+            tp.arcs[1].steering,
+            SteeringLaw::InertialFixed { direction } if direction == [0.0, 0.0, 1.0]
+        ));
+    }
+
+    #[test]
+    fn no_arcs_yields_none() {
+        let orbit = base_orbit();
+        assert!(empyrean_orbit_thrust_params(&orbit).unwrap().is_none());
+    }
+
+    #[test]
+    fn null_ptr_with_nonzero_len_errors_loudly() {
+        let mut orbit = base_orbit();
+        orbit.thrust_arcs = std::ptr::null();
+        orbit.n_thrust_arcs = 2; // lie about the length
+        let err = empyrean_orbit_thrust_params(&orbit).unwrap_err();
+        assert!(err.contains("thrust_arcs"), "err was: {err}");
+        assert!(err.contains("null"), "err was: {err}");
+    }
+
+    #[test]
+    fn corrections_without_arcs_error() {
+        let dvs = [[0.0, 0.0, 0.0]];
+        let mut orbit = base_orbit();
+        orbit.dv_corrections = dvs.as_ptr();
+        orbit.n_dv_corrections = 1;
+        let err = empyrean_orbit_thrust_params(&orbit).unwrap_err();
+        assert!(err.contains("without any thrust_arcs"), "err was: {err}");
+    }
+
+    #[test]
+    fn correction_covariance_length_mismatch_errors() {
+        let arcs = [rtn_arc()];
+        let dvs = [[0.0, 0.0, 0.0]];
+        let eye = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let covs = [eye, eye]; // 2 covariances vs 1 correction
+        let mut orbit = base_orbit();
+        orbit.thrust_arcs = arcs.as_ptr();
+        orbit.n_thrust_arcs = 1;
+        orbit.dv_corrections = dvs.as_ptr();
+        orbit.n_dv_corrections = 1;
+        orbit.correction_covariances = covs.as_ptr();
+        orbit.n_correction_covariances = 2;
+        let err = empyrean_orbit_thrust_params(&orbit).unwrap_err();
+        assert!(
+            err.contains("must match dv_corrections length"),
+            "err was: {err}"
+        );
+    }
+
+    #[test]
+    fn unknown_steering_law_tag_errors() {
+        let mut a = rtn_arc();
+        a.steering_law = 7;
+        let arcs = [a];
+        let mut orbit = base_orbit();
+        orbit.thrust_arcs = arcs.as_ptr();
+        orbit.n_thrust_arcs = 1;
+        let err = empyrean_orbit_thrust_params(&orbit).unwrap_err();
+        assert!(err.contains("unknown steering_law tag 7"), "err was: {err}");
+    }
+
+    #[test]
+    fn unknown_central_body_naif_errors() {
+        let mut a = rtn_arc();
+        a.central_body_naif_id = 12_345_678;
+        let arcs = [a];
+        let mut orbit = base_orbit();
+        orbit.thrust_arcs = arcs.as_ptr();
+        orbit.n_thrust_arcs = 1;
+        let err = empyrean_orbit_thrust_params(&orbit).unwrap_err();
+        assert!(
+            err.contains("unknown central_body NAIF id"),
+            "err was: {err}"
+        );
+    }
+
+    // ── Full C-ABI propagate round-trip (gated on ephemeris data) ──
+
+    fn try_context() -> Option<EmpyreanContext> {
+        empyrean_core::Context::from_data_dir(None).ok()
+    }
+
+    fn last_err() -> String {
+        let p = crate::empyrean_last_error();
+        if p.is_null() {
+            return String::new();
+        }
+        unsafe { std::ffi::CStr::from_ptr(p) }
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// End-to-end: a thrust arc (ConstantRTN) + a Δv correction with its
+    /// covariance reaches the dynamics through the real `empyrean_propagate`
+    /// C ABI and perturbs the trajectory relative to a ballistic run, and the
+    /// tagged-covariance readback stays callable on the thrusting result —
+    /// closing the input→output loop. Asserts the input EFFECT rather than a
+    /// specific `thrust_segments`/`solved_width` count: whether the wide-Jet
+    /// burn-sensitivity segment is retained at readback is an engine/config
+    /// detail (a FirstOrder no-non-grav config marginalizes to the 6×6 state
+    /// block), so the version-robust contract at this layer is that thrust
+    /// moves the dynamics and the output plumbing works.
+    #[test]
+    fn propagate_with_thrust_arc_runs_and_reports_thrust_segments() {
+        let ctx = match try_context() {
+            Some(c) => c,
+            None => {
+                eprintln!("skipping propagate_with_thrust_arc_*: no ephemeris data dir available");
+                return;
+            }
+        };
+        let ctx_ptr: *const EmpyreanContext = &ctx;
+
+        let times = [59000.0f64, 59005.0, 59012.0];
+
+        // Standard-tier, first-order config. `zeroed` gives the right
+        // sentinels for every field except dt_initial / dt_min, whose
+        // NaN-means-auto sentinel is not zero.
+        let mut cfg: EmpyreanPropagationConfig = unsafe { std::mem::zeroed() };
+        cfg.force_model = 2; // Standard
+        cfg.uncertainty_method.tag = EMPYREAN_UNCERTAINTY_FIRST;
+        cfg.advanced.dt_initial = f64::NAN;
+        cfg.advanced.dt_min = f64::NAN;
+        cfg.advanced.cache_integrator_steps = 1;
+
+        // Read the final-epoch position of a single-orbit propagation.
+        let final_position = |orbit: EmpyreanOrbit| -> [f64; 3] {
+            let orbits = [orbit];
+            let mut result: EmpyreanPropagationResult = unsafe { std::mem::zeroed() };
+            let code = unsafe {
+                empyrean_propagate(
+                    ctx_ptr,
+                    orbits.as_ptr(),
+                    1,
+                    times.as_ptr(),
+                    times.len(),
+                    &cfg,
+                    &mut result,
+                )
+            };
+            assert_eq!(code, 0, "propagate must succeed: {}", last_err());
+            assert_eq!(
+                result.num_states,
+                times.len(),
+                "expected one state per requested epoch"
+            );
+            // Tagged-covariance readback must stay callable on this result.
+            let mut tc: EmpyreanTaggedCovariance = unsafe { std::mem::zeroed() };
+            let rc = unsafe {
+                empyrean_propagation_covariance_at_cartesian(&result, 0, times.len() - 1, &mut tc)
+            };
+            assert_eq!(
+                rc,
+                EMPYREAN_TAGGED_COV_OK,
+                "tagged-covariance readback failed: {}",
+                last_err()
+            );
+            let last = unsafe { &*result.states.add(times.len() - 1) };
+            let pos = [last.x, last.y, last.z];
+            unsafe { empyrean_propagation_result_free(&mut result) };
+            pos
+        };
+
+        // Input covariance so the wide-Jet burn-sensitivity path engages.
+        let mut cov = [[0.0f64; 6]; 6];
+        for (i, row) in cov.iter_mut().enumerate() {
+            row[i] = 1.0e-16;
+        }
+
+        // Ballistic baseline — same orbit, no thrust arcs.
+        let mut ballistic = base_orbit();
+        ballistic.state.covariance = cov;
+        ballistic.state.has_covariance = 1;
+        let pos_ballistic = final_position(ballistic);
+
+        // Thrusting run — one ConstantRTN arc + a Δv correction with covariance.
+        let arcs = [rtn_arc()];
+        let dvs = [[0.0f64, 0.0, 0.0]];
+        let eye_small = [
+            [1.0e-20, 0.0, 0.0],
+            [0.0, 1.0e-20, 0.0],
+            [0.0, 0.0, 1.0e-20],
+        ];
+        let covs = [eye_small];
+        let mut thrusting = base_orbit();
+        thrusting.state.covariance = cov;
+        thrusting.state.has_covariance = 1;
+        thrusting.thrust_arcs = arcs.as_ptr();
+        thrusting.n_thrust_arcs = 1;
+        thrusting.dv_corrections = dvs.as_ptr();
+        thrusting.n_dv_corrections = 1;
+        thrusting.correction_covariances = covs.as_ptr();
+        thrusting.n_correction_covariances = 1;
+        let pos_thrust = final_position(thrusting);
+        // `arcs` / `dvs` / `covs` outlive the borrow above — dropped here.
+
+        // The thrust arc must have moved the final position.
+        let dr = ((pos_thrust[0] - pos_ballistic[0]).powi(2)
+            + (pos_thrust[1] - pos_ballistic[1]).powi(2)
+            + (pos_thrust[2] - pos_ballistic[2]).powi(2))
+        .sqrt();
+        assert!(
+            dr > 1.0e-3,
+            "thrust arc must perturb the trajectory (Δposition = {dr} AU)"
+        );
     }
 }

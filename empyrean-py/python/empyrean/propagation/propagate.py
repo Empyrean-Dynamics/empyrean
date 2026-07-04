@@ -9,6 +9,7 @@ import quivr as qv
 
 if TYPE_CHECKING:
     from empyrean.ephemeris.sensitivity import StateSensitivities
+    from empyrean.orbits.thrust import ThrustParams
     from empyrean.propagation.tagged_covariance import TaggedCovariances
 
 from empyrean._convert import (
@@ -90,6 +91,7 @@ def propagate(
     num_threads: int | None = None,
     events: EventConfig | None = None,
     tagged_covariance: bool = False,
+    thrust_arcs: "Sequence[ThrustParams | None] | None" = None,
 ) -> PropagationResult:
     """Propagate orbits to target epochs.
 
@@ -138,6 +140,20 @@ def propagate(
         :meth:`~empyrean.PropagationResult.tagged_covariance_series`
         becomes usable. Off by default — the readback recomputes the
         resolved kind per orbit, so it isn't free.
+    thrust_arcs : sequence of ThrustParams or None, optional
+        Structured continuous-thrust / finite-burn input, one entry per
+        orbit and positionally aligned with ``orbits`` (pass ``None`` for
+        the gravity / non-grav-only orbits, or the whole argument
+        ``None`` for a fully ballistic batch). Build each entry from
+        :class:`~empyrean.ThrustParams` /
+        :class:`~empyrean.ThrustArc` / a
+        :class:`~empyrean.orbits.thrust.SteeringLaw` variant. A non-empty
+        :attr:`~empyrean.ThrustParams.correction_covariances` triggers the
+        burn-sensitivity propagation whose solved segments surface in the
+        tagged-covariance
+        :attr:`~empyrean.TaggedCovariance.thrust_segments` (requires
+        ``tagged_covariance=True``). Length or arc/correction mismatches
+        raise, never silently degrade.
 
     Returns
     -------
@@ -347,6 +363,18 @@ def propagate(
             f"{type(uncertainty_method).__name__}"
         )
 
+    # ── Structured thrust input ──────────────────────────────
+    # One ThrustParams (or None) per orbit, positionally aligned with the
+    # batch. The binding reconstructs each into a wrapper ThrustParams and
+    # attaches it per orbit; None entries stay gravity / non-grav only.
+    thrust_arg: list[ThrustParams | None] | None = None
+    if thrust_arcs is not None:
+        thrust_arg = list(thrust_arcs)
+        if len(thrust_arg) != n:
+            raise ValueError(
+                f"thrust_arcs must have one entry per orbit (got {len(thrust_arg)} for {n} orbits)"
+            )
+
     # ── Call Rust ─────────────────────────────────────────────
     # Thread the full nested PropagationConfig as a single dict so that
     # advanced fields (events.dense_output, diagnostics.*, advanced.*,
@@ -373,6 +401,7 @@ def propagate(
         phot_model,
         num_threads=num_threads,
         epsilon=epsilon,
+        thrust_arcs=thrust_arg,
         non_grav_dts=non_grav_dts,
         ng_alphas=ng_alphas,
         ng_r0s=ng_r0s,

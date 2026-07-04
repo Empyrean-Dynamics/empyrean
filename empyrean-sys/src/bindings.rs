@@ -42,6 +42,9 @@ pub const EMPYREAN_PHASE_FUNCTION_NONE: i32 = -1;
 pub const EMPYREAN_PHASE_FUNCTION_HG: u32 = 0;
 pub const EMPYREAN_PHASE_FUNCTION_HG1G2: u32 = 1;
 pub const EMPYREAN_PHASE_FUNCTION_HG12: u32 = 2;
+pub const EMPYREAN_STEERING_LAW_CONSTANT_RTN: u32 = 0;
+pub const EMPYREAN_STEERING_LAW_VELOCITY_TANGENT: u32 = 1;
+pub const EMPYREAN_STEERING_LAW_INERTIAL_FIXED: u32 = 2;
 pub const EMPYREAN_INTEGRATOR_GR15: u32 = 0;
 pub const EMPYREAN_INTEGRATOR_DOP853: u32 = 1;
 pub const EMPYREAN_ORIGIN_SWITCHING_DEFAULT: u32 = 0;
@@ -150,7 +153,61 @@ const _: () = {
     ["Offset of field: CoordinateState::origin"]
         [::std::mem::offset_of!(CoordinateState, origin) - 356usize];
 };
-#[doc = " An orbit with optional non-gravitational parameters and photometry.\n\n Thrust-arc support has been removed in v0.7.0; if `a1 == a2 == a3 ==\n 0.0` the orbit is treated as gravity-only.\n\n `a1/a2/a3` are the Marsden–Sekanina RTN coefficients (radial,\n transverse, normal) in AU/day². `ng_alpha … ng_k` parameterize the\n g(r) distance-dependent scaling:\n \\\\[ g(r) = \\alpha \\\\, (r/r_0)^{-m} \\\\, (1 + (r/r_0)^n)^{-k} \\\\].\n All-zeros for the g-function fields selects the inverse-square\n default (Yarkovsky / SRP asteroid case): \\\\(\\alpha = r_0 = 1\\\\),\n \\\\(m = 2\\\\), \\\\(n = k = 0\\\\). Comets typically pass SBDB's\n Marsden water-ice values\n (\\\\(\\alpha = 0.1113, r_0 = 2.808, m = 2.15, n = 5.093, k = 4.6142\\\\)).\n\n Photometry: when `phot_system` is one of the `EMPYREAN_PHASE_FUNCTION_*`\n non-`NONE` constants, ephemeris generation produces apparent magnitude\n using the (`H`, `slope1`, `slope2`) triple per the chosen phase function:\n\n | Model | `H` | `slope1` | `slope2` |\n |-------|-----|----------|----------|\n | `HG`     | absolute magnitude | G    | unused (0)  |\n | `HG1G2`  | absolute magnitude | G₁   | G₂          |\n | `HG12`   | absolute magnitude | G₁₂  | unused (0)  |"]
+#[doc = " A single continuous-thrust arc, mirroring\n [`empyrean_core::nongrav::ThrustArc`] as a flat `#[repr(C)]` record.\n\n Arcs are supplied through [`EmpyreanOrbit::thrust_arcs`] as a\n caller-owned side array borrowed read-only for the duration of the call.\n\n The acceleration during the arc is\n \\\\[ \\mathbf{a}(t) = \\sigma(t)\\,\\frac{F}{m(t)}\\,\\hat{d} \\\\]\n with a smooth \\\\(\\tanh\\\\) switch \\\\(\\sigma(t)\\\\) of width set by\n `sharpness`, steering direction \\\\(\\hat{d}\\\\) from `steering_law`, and\n mass \\\\(m(t)\\\\) that depletes when `isp_s` is finite."]
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct EmpyreanThrustArc {
+    #[doc = " Arc start epoch (MJD TDB)."]
+    pub start_mjd_tdb: f64,
+    #[doc = " Arc end epoch (MJD TDB)."]
+    pub end_mjd_tdb: f64,
+    #[doc = " Engine thrust force in Newtons."]
+    pub thrust_n: f64,
+    #[doc = " Spacecraft mass at arc start in kilograms."]
+    pub mass_kg: f64,
+    #[doc = " Specific impulse in seconds. `NaN` selects constant mass (no\n depletion); a finite value depletes mass at \\\\(\\dot m = F/(I_{sp} g_0)\\\\).\n This is the `Option<f64>` NaN-sentinel convention shared with\n [`EmpyreanOrbit::non_grav_dt`]."]
+    pub isp_s: f64,
+    #[doc = " Steering-law selector — see the `EMPYREAN_STEERING_LAW_*` tag\n constants. An unrecognized value errors loudly."]
+    pub steering_law: i32,
+    #[doc = " `CONSTANT_RTN` in-plane angle α from radial toward transverse\n (radians). Read only when `steering_law == CONSTANT_RTN`."]
+    pub steering_alpha_rad: f64,
+    #[doc = " `CONSTANT_RTN` out-of-plane angle β toward orbit normal (radians).\n Read only when `steering_law == CONSTANT_RTN`."]
+    pub steering_beta_rad: f64,
+    #[doc = " `INERTIAL_FIXED` direction vector (normalized internally). Read only\n when `steering_law == INERTIAL_FIXED`."]
+    pub steering_direction: [f64; 3usize],
+    #[doc = " \\\\(\\tanh\\\\) switching sharpness (1/days). Higher = sharper on/off."]
+    pub sharpness: f64,
+    #[doc = " Central-body NAIF id for the RTN / velocity-tangent frame reference\n (same encoding as [`EmpyreanOrbit`]'s `state.origin`, e.g. `399` for\n Earth, `10` for the Sun). An unknown NAIF id errors loudly."]
+    pub central_body_naif_id: i32,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of EmpyreanThrustArc"][::std::mem::size_of::<EmpyreanThrustArc>() - 104usize];
+    ["Alignment of EmpyreanThrustArc"][::std::mem::align_of::<EmpyreanThrustArc>() - 8usize];
+    ["Offset of field: EmpyreanThrustArc::start_mjd_tdb"]
+        [::std::mem::offset_of!(EmpyreanThrustArc, start_mjd_tdb) - 0usize];
+    ["Offset of field: EmpyreanThrustArc::end_mjd_tdb"]
+        [::std::mem::offset_of!(EmpyreanThrustArc, end_mjd_tdb) - 8usize];
+    ["Offset of field: EmpyreanThrustArc::thrust_n"]
+        [::std::mem::offset_of!(EmpyreanThrustArc, thrust_n) - 16usize];
+    ["Offset of field: EmpyreanThrustArc::mass_kg"]
+        [::std::mem::offset_of!(EmpyreanThrustArc, mass_kg) - 24usize];
+    ["Offset of field: EmpyreanThrustArc::isp_s"]
+        [::std::mem::offset_of!(EmpyreanThrustArc, isp_s) - 32usize];
+    ["Offset of field: EmpyreanThrustArc::steering_law"]
+        [::std::mem::offset_of!(EmpyreanThrustArc, steering_law) - 40usize];
+    ["Offset of field: EmpyreanThrustArc::steering_alpha_rad"]
+        [::std::mem::offset_of!(EmpyreanThrustArc, steering_alpha_rad) - 48usize];
+    ["Offset of field: EmpyreanThrustArc::steering_beta_rad"]
+        [::std::mem::offset_of!(EmpyreanThrustArc, steering_beta_rad) - 56usize];
+    ["Offset of field: EmpyreanThrustArc::steering_direction"]
+        [::std::mem::offset_of!(EmpyreanThrustArc, steering_direction) - 64usize];
+    ["Offset of field: EmpyreanThrustArc::sharpness"]
+        [::std::mem::offset_of!(EmpyreanThrustArc, sharpness) - 88usize];
+    ["Offset of field: EmpyreanThrustArc::central_body_naif_id"]
+        [::std::mem::offset_of!(EmpyreanThrustArc, central_body_naif_id) - 96usize];
+};
+#[doc = " An orbit with optional non-gravitational parameters, continuous-thrust\n arcs, and photometry.\n\n Thrust: when `n_thrust_arcs > 0`, [`thrust_arcs`](Self::thrust_arcs)\n (plus the optional [`dv_corrections`](Self::dv_corrections) /\n [`correction_covariances`](Self::correction_covariances) side arrays)\n build a [`ThrustParams`] for this orbit. All-zero `a1/a2/a3` and\n `n_thrust_arcs == 0` is a pure-gravity orbit.\n\n `a1/a2/a3` are the Marsden–Sekanina RTN coefficients (radial,\n transverse, normal) in AU/day². `ng_alpha … ng_k` parameterize the\n g(r) distance-dependent scaling:\n \\\\[ g(r) = \\alpha \\\\, (r/r_0)^{-m} \\\\, (1 + (r/r_0)^n)^{-k} \\\\].\n All-zeros for the g-function fields selects the inverse-square\n default (Yarkovsky / SRP asteroid case): \\\\(\\alpha = r_0 = 1\\\\),\n \\\\(m = 2\\\\), \\\\(n = k = 0\\\\). Comets typically pass SBDB's\n Marsden water-ice values\n (\\\\(\\alpha = 0.1113, r_0 = 2.808, m = 2.15, n = 5.093, k = 4.6142\\\\)).\n\n Photometry: when `phot_system` is one of the `EMPYREAN_PHASE_FUNCTION_*`\n non-`NONE` constants, ephemeris generation produces apparent magnitude\n using the (`H`, `slope1`, `slope2`) triple per the chosen phase function:\n\n | Model | `H` | `slope1` | `slope2` |\n |-------|-----|----------|----------|\n | `HG`     | absolute magnitude | G    | unused (0)  |\n | `HG1G2`  | absolute magnitude | G₁   | G₂          |\n | `HG12`   | absolute magnitude | G₁₂  | unused (0)  |"]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct EmpyreanOrbit {
@@ -189,10 +246,22 @@ pub struct EmpyreanOrbit {
     pub slope1: f64,
     #[doc = " Slope parameter slot 2 — G₂ (HG1G2 only); unused (0) for HG / HG12."]
     pub slope2: f64,
+    #[doc = " Continuous-thrust arcs (variable length). Null / `n_thrust_arcs == 0`\n ⇒ no thrust (gravity + non-grav only).\n\n **Ownership:** caller-owned; borrowed read-only for the duration of\n the call. The C ABI never frees it. A null pointer with\n `n_thrust_arcs > 0` (or vice versa) is a loud argument error, not a\n silent skip."]
+    pub thrust_arcs: *const EmpyreanThrustArc,
+    #[doc = " Number of arcs in [`thrust_arcs`](Self::thrust_arcs)."]
+    pub n_thrust_arcs: usize,
+    #[doc = " Optional per-arc Δv corrections (AU/day), positional with\n [`thrust_arcs`](Self::thrust_arcs). Null / `n_dv_corrections == 0` ⇒\n no targeting corrections. Supplying corrections without any arc is a\n loud argument error.\n\n **Ownership:** caller-owned; borrowed read-only for the call."]
+    pub dv_corrections: *const [f64; 3usize],
+    #[doc = " Number of corrections in [`dv_corrections`](Self::dv_corrections)."]
+    pub n_dv_corrections: usize,
+    #[doc = " Optional 3×3 covariance (AU/day)² per Δv correction, positional with\n [`dv_corrections`](Self::dv_corrections). When non-empty its length\n MUST equal `n_dv_corrections`; a non-empty covariance triggers the\n wide-Jet burn-sensitivity propagation. The engine's higher-order\n (third-order) propagation path does not implement thrust-correction\n covariance and rejects that combination loudly upstream\n (`Not implemented: … ThirdOrder with thrust-correction covariance …`,\n surfaced as a propagation error) rather than silently dropping the\n covariance.\n\n **Ownership:** caller-owned; borrowed read-only for the call."]
+    pub correction_covariances: *const [[f64; 3usize]; 3usize],
+    #[doc = " Number of entries in\n [`correction_covariances`](Self::correction_covariances)."]
+    pub n_correction_covariances: usize,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of EmpyreanOrbit"][::std::mem::size_of::<EmpyreanOrbit>() - 560usize];
+    ["Size of EmpyreanOrbit"][::std::mem::size_of::<EmpyreanOrbit>() - 608usize];
     ["Alignment of EmpyreanOrbit"][::std::mem::align_of::<EmpyreanOrbit>() - 8usize];
     ["Offset of field: EmpyreanOrbit::state"]
         [::std::mem::offset_of!(EmpyreanOrbit, state) - 0usize];
@@ -227,6 +296,18 @@ const _: () = {
         [::std::mem::offset_of!(EmpyreanOrbit, slope1) - 544usize];
     ["Offset of field: EmpyreanOrbit::slope2"]
         [::std::mem::offset_of!(EmpyreanOrbit, slope2) - 552usize];
+    ["Offset of field: EmpyreanOrbit::thrust_arcs"]
+        [::std::mem::offset_of!(EmpyreanOrbit, thrust_arcs) - 560usize];
+    ["Offset of field: EmpyreanOrbit::n_thrust_arcs"]
+        [::std::mem::offset_of!(EmpyreanOrbit, n_thrust_arcs) - 568usize];
+    ["Offset of field: EmpyreanOrbit::dv_corrections"]
+        [::std::mem::offset_of!(EmpyreanOrbit, dv_corrections) - 576usize];
+    ["Offset of field: EmpyreanOrbit::n_dv_corrections"]
+        [::std::mem::offset_of!(EmpyreanOrbit, n_dv_corrections) - 584usize];
+    ["Offset of field: EmpyreanOrbit::correction_covariances"]
+        [::std::mem::offset_of!(EmpyreanOrbit, correction_covariances) - 592usize];
+    ["Offset of field: EmpyreanOrbit::n_correction_covariances"]
+        [::std::mem::offset_of!(EmpyreanOrbit, n_correction_covariances) - 600usize];
 };
 impl Default for EmpyreanOrbit {
     fn default() -> Self {
@@ -292,11 +373,11 @@ pub struct EmpyreanUncertaintyMethod {
     pub mc_seed_some: u8,
     #[doc = " MonteCarlo: RNG seed when `mc_seed_some == 1`."]
     pub mc_seed: u64,
-    #[doc = " Auto-method tuning parameter; selected automatically."]
+    #[doc = " Auto: first-order regime tuning parameter."]
     pub auto_threshold_first: f64,
-    #[doc = " Auto-method tuning parameter; selected automatically."]
+    #[doc = " Auto: adaptive-mixture regime tuning parameter."]
     pub auto_threshold_mixture: f64,
-    #[doc = " Auto-method tuning parameter; selected automatically."]
+    #[doc = " Auto: impact-probability tuning parameter for the higher-order pass."]
     pub auto_threshold_ip_skip: f64,
     #[doc = " Auto: adaptive-Gaussian-mixture maximum recursion depth."]
     pub auto_gmm_max_depth: u64,
@@ -1060,9 +1141,9 @@ pub struct EmpyreanEvent {
     pub resolved_kind: u8,
     #[doc = " `CovarianceRegimeChange` payload: local nonlinearity κ\n recorded at the CA. NaN for non-regime events."]
     pub kappa: f64,
-    #[doc = " `CovarianceRegimeChange` payload: audit field for this resolved\n regime. NaN for non-regime events."]
+    #[doc = " `CovarianceRegimeChange` payload: lower κ value recorded in\n this audit payload. NaN for non-regime events."]
     pub threshold_below: f64,
-    #[doc = " `CovarianceRegimeChange` payload: audit field for this resolved\n regime. NaN for non-regime events."]
+    #[doc = " `CovarianceRegimeChange` payload: upper κ value recorded in\n this audit payload. NaN for non-regime events."]
     pub threshold_above: f64,
     #[doc = " `CaptureStart` / `CaptureEnd` payload: two-body energy w.r.t. the\n capturing body (AU²/day²). NaN for non-capture events."]
     pub two_body_energy: f64,

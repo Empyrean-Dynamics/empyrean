@@ -214,6 +214,37 @@ typedef struct Session Session;
 #define EMPYREAN_PHASE_FUNCTION_HG12 2
 
 /**
+ * Steering-law selector tags for [`EmpyreanThrustArc::steering_law`].
+ *
+ * Mirrors [`empyrean_core::nongrav::SteeringLaw`]. The value is read as a
+ * plain `int32_t` at the marshaling boundary and validated loudly — an
+ * unrecognized value is an error, never a silent default (the same tag
+ * convention used by `EMPYREAN_PHASE_FUNCTION_*` / `EMPYREAN_INTEGRATOR_*`).
+ * Which `EmpyreanThrustArc` steering-parameter slots are read depends on the
+ * selected law:
+ *
+ * | value | Steering law | Active fields |
+ * |-------|--------------|---------------|
+ * | 0 | `CONSTANT_RTN`     | `steering_alpha_rad`, `steering_beta_rad` |
+ * | 1 | `VELOCITY_TANGENT` | (none) |
+ * | 2 | `INERTIAL_FIXED`   | `steering_direction` |
+ *
+ * Constant RTN angles relative to the central body: fixed in-plane
+ * (\\(\alpha\\)) and out-of-plane (\\(\beta\\)) angles.
+ */
+#define EMPYREAN_STEERING_LAW_CONSTANT_RTN 0
+
+/**
+ * Thrust aligned with velocity relative to the central body.
+ */
+#define EMPYREAN_STEERING_LAW_VELOCITY_TANGENT 1
+
+/**
+ * Fixed direction in the inertial frame (normalized internally).
+ */
+#define EMPYREAN_STEERING_LAW_INERTIAL_FIXED 2
+
+/**
  * Integrator backend tag for [`EmpyreanAdvancedIntegratorConfig::integrator`].
  *
  * - `0` = GR15 (Gauss-Radau 15, derived solely from Everhart 1985 and
@@ -418,10 +449,83 @@ struct CoordinateState {
 };
 
 /**
- * An orbit with optional non-gravitational parameters and photometry.
+ * A single continuous-thrust arc, mirroring
+ * [`empyrean_core::nongrav::ThrustArc`] as a flat `#[repr(C)]` record.
  *
- * Thrust-arc support has been removed in v0.7.0; if `a1 == a2 == a3 ==
- * 0.0` the orbit is treated as gravity-only.
+ * Arcs are supplied through [`EmpyreanOrbit::thrust_arcs`] as a
+ * caller-owned side array borrowed read-only for the duration of the call.
+ *
+ * The acceleration during the arc is
+ * \\[ \mathbf{a}(t) = \sigma(t)\,\frac{F}{m(t)}\,\hat{d} \\]
+ * with a smooth \\(\tanh\\) switch \\(\sigma(t)\\) of width set by
+ * `sharpness`, steering direction \\(\hat{d}\\) from `steering_law`, and
+ * mass \\(m(t)\\) that depletes when `isp_s` is finite.
+ */
+struct EmpyreanThrustArc {
+    /**
+     * Arc start epoch (MJD TDB).
+     */
+    double start_mjd_tdb;
+    /**
+     * Arc end epoch (MJD TDB).
+     */
+    double end_mjd_tdb;
+    /**
+     * Engine thrust force in Newtons.
+     */
+    double thrust_n;
+    /**
+     * Spacecraft mass at arc start in kilograms.
+     */
+    double mass_kg;
+    /**
+     * Specific impulse in seconds. Any non-finite value (`NaN` or `±∞`)
+     * selects constant mass (no depletion); a finite value depletes mass at
+     * \\(\dot m = F/(I_{sp} g_0)\\). This is the `Option<f64>` NaN-sentinel
+     * convention shared with [`EmpyreanOrbit::non_grav_dt`].
+     */
+    double isp_s;
+    /**
+     * Steering-law selector — see the `EMPYREAN_STEERING_LAW_*` tag
+     * constants. An unrecognized value errors loudly.
+     */
+    int32_t steering_law;
+    /**
+     * `CONSTANT_RTN` in-plane angle α from radial toward transverse
+     * (radians). Read only when `steering_law == CONSTANT_RTN`.
+     */
+    double steering_alpha_rad;
+    /**
+     * `CONSTANT_RTN` out-of-plane angle β toward orbit normal (radians).
+     * Read only when `steering_law == CONSTANT_RTN`.
+     */
+    double steering_beta_rad;
+    /**
+     * `INERTIAL_FIXED` direction vector (normalized internally). Read only
+     * when `steering_law == INERTIAL_FIXED`.
+     */
+    double steering_direction[3];
+    /**
+     * \\(\tanh\\) switching sharpness (1/days). Higher = sharper on/off.
+     */
+    double sharpness;
+    /**
+     * Central-body NAIF id for the RTN / velocity-tangent frame reference
+     * (same encoding as [`EmpyreanOrbit`]'s `state.origin`, e.g. `399` for
+     * Earth, `10` for the Sun). An unknown NAIF id errors loudly.
+     */
+    int32_t central_body_naif_id;
+};
+
+/**
+ * An orbit with optional non-gravitational parameters, continuous-thrust
+ * arcs, and photometry.
+ *
+ * Thrust: when `n_thrust_arcs > 0`, [`thrust_arcs`](Self::thrust_arcs)
+ * (plus the optional [`dv_corrections`](Self::dv_corrections) /
+ * [`correction_covariances`](Self::correction_covariances) side arrays)
+ * build a [`ThrustParams`] for this orbit. All-zero `a1/a2/a3` and
+ * `n_thrust_arcs == 0` is a pure-gravity orbit.
  *
  * `a1/a2/a3` are the Marsden–Sekanina RTN coefficients (radial,
  * transverse, normal) in AU/day². `ng_alpha … ng_k` parameterize the
@@ -536,6 +640,53 @@ struct EmpyreanOrbit {
      * Slope parameter slot 2 — G₂ (HG1G2 only); unused (0) for HG / HG12.
      */
     double slope2;
+    /**
+     * Continuous-thrust arcs (variable length). Null / `n_thrust_arcs == 0`
+     * ⇒ no thrust (gravity + non-grav only).
+     *
+     * **Ownership:** caller-owned; borrowed read-only for the duration of
+     * the call. The C ABI never frees it. A null pointer with
+     * `n_thrust_arcs > 0` is a loud argument error, not a silent skip; a
+     * non-null pointer with `n_thrust_arcs == 0` is treated as absent (the
+     * pointer is not read).
+     */
+    const struct EmpyreanThrustArc *thrust_arcs;
+    /**
+     * Number of arcs in [`thrust_arcs`](Self::thrust_arcs).
+     */
+    uintptr_t n_thrust_arcs;
+    /**
+     * Optional per-arc Δv corrections (AU/day), positional with
+     * [`thrust_arcs`](Self::thrust_arcs). Null / `n_dv_corrections == 0` ⇒
+     * no targeting corrections. Supplying corrections without any arc is a
+     * loud argument error.
+     *
+     * **Ownership:** caller-owned; borrowed read-only for the call.
+     */
+    const double (*dv_corrections)[3];
+    /**
+     * Number of corrections in [`dv_corrections`](Self::dv_corrections).
+     */
+    uintptr_t n_dv_corrections;
+    /**
+     * Optional 3×3 covariance (AU/day)² per Δv correction, positional with
+     * [`dv_corrections`](Self::dv_corrections). When non-empty its length
+     * MUST equal `n_dv_corrections`; a non-empty covariance triggers the
+     * wide-Jet burn-sensitivity propagation. The engine's higher-order
+     * (third-order) propagation path does not implement thrust-correction
+     * covariance and rejects that combination loudly upstream
+     * (`Not implemented: … ThirdOrder with thrust-correction covariance …`,
+     * surfaced as a propagation error) rather than silently dropping the
+     * covariance.
+     *
+     * **Ownership:** caller-owned; borrowed read-only for the call.
+     */
+    const double (*correction_covariances)[3][3];
+    /**
+     * Number of entries in
+     * [`correction_covariances`](Self::correction_covariances).
+     */
+    uintptr_t n_correction_covariances;
 };
 
 /**

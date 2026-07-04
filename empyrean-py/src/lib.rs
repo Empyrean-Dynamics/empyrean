@@ -48,6 +48,93 @@ fn origin_from_naif(naif: i32) -> PyResult<empyrean::Origin> {
         .ok_or_else(|| PyValueError::new_err(format!("unknown NAIF id for origin: {naif}")))
 }
 
+// ── Structured thrust input extraction ─────────────────────
+//
+// Rebuilds the wrapper's `empyrean::ThrustParams` / `ThrustArc` /
+// `SteeringLaw` (parity with the engine surface) from the Python
+// dataclasses in `empyrean.orbits.thrust`. Field names match the wrapper
+// one-for-one; every malformed field surfaces loudly as a `ValueError`
+// rather than degrading to a default.
+
+/// Extract the wrapper [`empyrean::SteeringLaw`] from a Python steering
+/// dataclass. The variant is discriminated by the Python class name
+/// (`ConstantRTN` / `VelocityTangent` / `InertialFixed`); an
+/// unrecognized type errors loudly.
+fn extract_steering(obj: &Bound<'_, PyAny>) -> PyResult<empyrean::SteeringLaw> {
+    let ty = obj.get_type().name()?;
+    let ty = ty.to_str()?;
+    match ty {
+        "ConstantRTN" => Ok(empyrean::SteeringLaw::ConstantRTN {
+            alpha_rad: obj.getattr("alpha_rad")?.extract()?,
+            beta_rad: obj.getattr("beta_rad")?.extract()?,
+        }),
+        "VelocityTangent" => Ok(empyrean::SteeringLaw::VelocityTangent),
+        "InertialFixed" => Ok(empyrean::SteeringLaw::InertialFixed {
+            direction: obj.getattr("direction")?.extract()?,
+        }),
+        other => Err(PyValueError::new_err(format!(
+            "unknown steering law '{other}'; expected ConstantRTN, VelocityTangent, or InertialFixed"
+        ))),
+    }
+}
+
+/// Extract the arc's central body. Accepts a typed `Origin` (canonical
+/// `.name`), its canonical string, or a bare NAIF integer — the same
+/// shapes `origin_to_naif` accepts on the Python side.
+fn extract_central_body(obj: &Bound<'_, PyAny>) -> PyResult<empyrean::Origin> {
+    if let Ok(naif) = obj.extract::<i32>() {
+        return origin_from_naif(naif);
+    }
+    let name: String = match obj.getattr("name") {
+        Ok(attr) => attr.extract()?,
+        Err(_) => obj.str()?.extract()?,
+    };
+    name.parse::<empyrean::Origin>()
+        .map_err(|e| PyValueError::new_err(format!("unknown central_body {name:?}: {e}")))
+}
+
+/// Extract a single wrapper [`empyrean::ThrustArc`] from a Python
+/// `ThrustArc` dataclass. `isp_s = None` marshals to a constant-mass arc.
+fn extract_thrust_arc(obj: &Bound<'_, PyAny>) -> PyResult<empyrean::ThrustArc> {
+    let steering = extract_steering(&obj.getattr("steering")?)?;
+    let central_body = extract_central_body(&obj.getattr("central_body")?)?;
+    let isp_obj = obj.getattr("isp_s")?;
+    let isp_s: Option<f64> = if isp_obj.is_none() {
+        None
+    } else {
+        Some(isp_obj.extract()?)
+    };
+    Ok(empyrean::ThrustArc::new(
+        obj.getattr("start_mjd_tdb")?.extract()?,
+        obj.getattr("end_mjd_tdb")?.extract()?,
+        obj.getattr("thrust_n")?.extract()?,
+        obj.getattr("mass_kg")?.extract()?,
+        obj.getattr("sharpness")?.extract()?,
+        steering,
+        central_body,
+    )
+    .with_isp(isp_s))
+}
+
+/// Extract a wrapper [`empyrean::ThrustParams`] from a Python
+/// `ThrustParams` dataclass. `dv_corrections` and `correction_covariances`
+/// are carried through with their exact lengths so the engine's own
+/// length-consistency check fires — the mismatch is never silently
+/// repaired or dropped.
+fn extract_thrust_params(obj: &Bound<'_, PyAny>) -> PyResult<empyrean::ThrustParams> {
+    let arc_items: Vec<Bound<'_, PyAny>> = obj.getattr("arcs")?.extract()?;
+    let mut arcs = Vec::with_capacity(arc_items.len());
+    for a in &arc_items {
+        arcs.push(extract_thrust_arc(a)?);
+    }
+    let dv_corrections: Vec<[f64; 3]> = obj.getattr("dv_corrections")?.extract()?;
+    let correction_covariances: Vec<[[f64; 3]; 3]> =
+        obj.getattr("correction_covariances")?.extract()?;
+    Ok(empyrean::ThrustParams::new(arcs)
+        .with_dv_corrections(dv_corrections)
+        .with_correction_covariances(correction_covariances))
+}
+
 // ══════════════════════════════════════════════════════════
 //  _initialize
 // ══════════════════════════════════════════════════════════
@@ -501,15 +588,22 @@ fn _query_radar<'py>(
 
 /// Propagate orbits to target epochs.
 ///
-/// v0.7.0: drops thrust arcs, MonteCarlo / SigmaPoint /
-/// GaussianMixture uncertainty methods, ForceModelTier::Full, and
-/// num_threads. Those unused kwargs are accepted for ABI
-/// compatibility with older Python callers and rejected with a
-/// clear error if used. Photometric params (`phot_h`, `phot_slope1`,
-/// `phot_slope2`, `phot_system`) ARE wired — propagation is
-/// agnostic to V-magnitude, but the photometry attached here flows
-/// downstream to ephemeris generation. `Auto` uncertainty (tag 4)
-/// is wired.
+/// Drops MonteCarlo / SigmaPoint / GaussianMixture uncertainty methods,
+/// ForceModelTier::Full, and num_threads. Those unused kwargs are
+/// accepted for ABI compatibility with older Python callers and rejected
+/// with a clear error if used. Photometric params (`phot_h`,
+/// `phot_slope1`, `phot_slope2`, `phot_system`) ARE wired — propagation
+/// is agnostic to V-magnitude, but the photometry attached here flows
+/// downstream to ephemeris generation. `Auto` uncertainty (tag 4) is
+/// wired.
+///
+/// `thrust_arcs` carries structured continuous-thrust input — one Python
+/// `ThrustParams` (or `None`) per orbit, positionally aligned with the
+/// batch. Each is reconstructed into a wrapper `empyrean::ThrustParams`
+/// and attached per orbit; a non-empty `correction_covariances` triggers
+/// the burn-sensitivity propagation whose solved segments surface in
+/// `TaggedCovariance::thrust_segments`. Length or arc/correction
+/// mismatches surface loudly as an error, never silently degraded.
 #[pyfunction]
 #[pyo3(signature = (
     orbit_ids,
@@ -573,7 +667,14 @@ fn _propagate<'py>(
     phot_slope2: Option<PyReadonlyArray1<'py, f64>>,
     num_threads: Option<usize>,
     epsilon: Option<f64>,
-    thrust_arcs: Option<String>,
+    // Structured continuous-thrust input, one entry per orbit (or the
+    // whole arg `None` for a fully ballistic batch). Each entry is a
+    // Python `ThrustParams` (its `arcs` / `dv_corrections` /
+    // `correction_covariances` attributes are read here) or Python `None`
+    // for a gravity / non-grav-only orbit. Reconstructed into the wrapper
+    // `empyrean::ThrustParams` and attached per orbit via
+    // `Orbit::with_thrust` (parity with `Orbits::set_thrust_params`).
+    thrust_arcs: Option<Vec<Option<Bound<'py, PyAny>>>>,
     ng_alphas: Option<PyReadonlyArray1<'py, f64>>,
     ng_r0s: Option<PyReadonlyArray1<'py, f64>>,
     ng_ms: Option<PyReadonlyArray1<'py, f64>>,
@@ -605,11 +706,6 @@ fn _propagate<'py>(
         mc_n_samples,
         mc_seed,
     );
-    if thrust_arcs.is_some() {
-        return Err(PyValueError::new_err(
-            "thrust_arcs is not supported in empyrean v0.7.0",
-        ));
-    }
     let ctx = get_context()?;
 
     let epochs_arr = epochs.as_array().to_owned();
@@ -635,6 +731,29 @@ fn _propagate<'py>(
     let dt_arr = non_grav_dts.as_ref().map(|a| a.as_array().to_owned());
 
     let n = epochs_arr.len();
+
+    // Structured thrust inputs: one wrapper `ThrustParams` (or `None`)
+    // per orbit, positionally aligned with the orbit batch. Extracted up
+    // front so a malformed arc surfaces loudly before any propagation.
+    let thrust_params: Option<Vec<Option<empyrean::ThrustParams>>> = match thrust_arcs {
+        Some(entries) => {
+            if entries.len() != n {
+                return Err(PyValueError::new_err(format!(
+                    "thrust_arcs must have one entry per orbit: got {} for {n} orbits",
+                    entries.len()
+                )));
+            }
+            let mut out = Vec::with_capacity(n);
+            for entry in &entries {
+                match entry {
+                    Some(obj) => out.push(Some(extract_thrust_params(obj)?)),
+                    None => out.push(None),
+                }
+            }
+            Some(out)
+        }
+        None => None,
+    };
 
     let mut orbits: Vec<empyrean::Orbit> = Vec::with_capacity(n);
     for i in 0..n {
@@ -698,6 +817,14 @@ fn _propagate<'py>(
             // a clear array if HG1G2 fits matter).
             let s2 = phot_slope2_arr.as_ref().map_or(0.0, |a| a[i]);
             orbit = orbit.with_photometry(pf, h, g, s2);
+        }
+        // Continuous-thrust parameters (parity with
+        // `Orbits::set_thrust_params`). Attached per orbit; a `None` entry
+        // leaves the orbit gravity / non-grav only.
+        if let Some(tp) = &thrust_params
+            && let Some(params) = &tp[i]
+        {
+            orbit = orbit.with_thrust(Some(params.clone()));
         }
         orbits.push(orbit);
     }
@@ -4288,6 +4415,11 @@ fn pydict_to_orbit_batch<'py>(dict: &Bound<'py, PyDict>) -> PyResult<empyrean::O
             h_mag: f64::NAN,
             slope1: 0.0,
             slope2: 0.0,
+            // Continuous-thrust is input-only and variable-length per
+            // orbit; the OrbitBatch I/O schema doesn't carry it (same as
+            // photometry above). Supply thrust via `propagate`'s
+            // `thrust_arcs` when needed.
+            thrust: None,
         });
     }
     empyrean::OrbitBatch::new(orbits, orbit_ids, object_ids).map_err(to_pyerr)

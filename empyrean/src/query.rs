@@ -111,6 +111,9 @@ fn ffi_batch_to_owned(batch: &empyrean_sys::EmpyreanOrbitBatch) -> Result<OrbitB
             h_mag: ffi_orbit.h_mag,
             slope1: ffi_orbit.slope1,
             slope2: ffi_orbit.slope2,
+            // SBDB / Horizons queries return ballistic orbits; thrust is a
+            // caller-supplied input, never reconstructed from a query.
+            thrust: None,
         });
         let id_ptr = unsafe { *batch.orbit_ids.add(i) };
         let id = if id_ptr.is_null() {

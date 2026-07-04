@@ -1,6 +1,7 @@
 //! Orbit input type (coordinate state + non-grav parameters).
 
 use crate::coordinate::CoordinateState;
+use crate::thrust::{ThrustArc, ThrustParams};
 
 /// Phase-function model for HG-family photometry.
 ///
@@ -89,6 +90,12 @@ pub struct Orbit {
     pub slope1: f64,
     /// Slope parameter slot 2 — G₂ (HG1G2 only); 0 for HG / HG12.
     pub slope2: f64,
+    /// Continuous-thrust parameters (arcs + optional Δv corrections).
+    /// `None` is a pure gravity + non-grav orbit. When
+    /// [`ThrustParams::correction_covariances`] is non-empty the
+    /// resulting burn-sensitivity segments surface in the propagated
+    /// [`TaggedCovariance::thrust_segments`](crate::TaggedCovariance).
+    pub thrust: Option<ThrustParams>,
 }
 
 impl Orbit {
@@ -113,6 +120,7 @@ impl Orbit {
             h_mag: f64::NAN,
             slope1: 0.0,
             slope2: 0.0,
+            thrust: None,
         }
     }
 
@@ -195,6 +203,16 @@ impl Orbit {
         self.with_photometry(PhaseFunction::HG, h, g, 0.0)
     }
 
+    /// Attach continuous-thrust parameters (arcs + optional Δv
+    /// corrections). Pass `None` for a pure gravity + non-grav orbit.
+    /// A non-empty [`ThrustParams::correction_covariances`] engages the
+    /// burn-sensitivity propagation whose solved segments appear in the
+    /// output [`TaggedCovariance::thrust_segments`](crate::TaggedCovariance).
+    pub fn with_thrust(mut self, thrust: Option<ThrustParams>) -> Self {
+        self.thrust = thrust;
+        self
+    }
+
     /// Convert to an FFI struct, returning the C struct alongside a
     /// keepalive bag that owns the heap-allocated identifier strings.
     ///
@@ -219,6 +237,46 @@ impl Orbit {
             CString::new(self.object_id.as_deref().unwrap_or("")).unwrap_or_default();
         let orbit_id_ptr = orbit_id_cstr.as_ptr();
         let object_id_ptr = object_id_cstr.as_ptr();
+        // Marshal the optional thrust params into caller-owned side arrays
+        // held by the keepalive. The `EmpyreanOrbit` borrows raw pointers
+        // into these Vecs — a Vec's heap buffer address is stable across
+        // the move into `OrbitFfiKeep` and the outer keep vector, so the
+        // pointers stay valid for the FFI call (same contract as the id
+        // CStrings above). Absent thrust → null pointers + zero lengths.
+        let thrust_arcs: Vec<empyrean_sys::EmpyreanThrustArc> = self
+            .thrust
+            .as_ref()
+            .map(|tp| tp.arcs.iter().map(ThrustArc::to_ffi).collect())
+            .unwrap_or_default();
+        let dv_corrections: Vec<[f64; 3]> = self
+            .thrust
+            .as_ref()
+            .map(|tp| tp.dv_corrections.clone())
+            .unwrap_or_default();
+        let correction_covariances: Vec<[[f64; 3]; 3]> = self
+            .thrust
+            .as_ref()
+            .map(|tp| tp.correction_covariances.clone())
+            .unwrap_or_default();
+        // `slice::as_ptr` on an empty Vec is non-null (dangling); the C
+        // ABI keys off the length, but keep the null/0 pairing explicit so
+        // an empty side array reads as "absent", matching every other
+        // C-ABI path.
+        let thrust_arcs_ptr = if thrust_arcs.is_empty() {
+            std::ptr::null()
+        } else {
+            thrust_arcs.as_ptr()
+        };
+        let dv_corrections_ptr = if dv_corrections.is_empty() {
+            std::ptr::null()
+        } else {
+            dv_corrections.as_ptr()
+        };
+        let correction_covariances_ptr = if correction_covariances.is_empty() {
+            std::ptr::null()
+        } else {
+            correction_covariances.as_ptr()
+        };
         let ffi = empyrean_sys::EmpyreanOrbit {
             state: self.state.to_ffi()?,
             orbit_id: orbit_id_ptr,
@@ -243,10 +301,19 @@ impl Orbit {
             h_mag: h,
             slope1: s1,
             slope2: s2,
+            thrust_arcs: thrust_arcs_ptr,
+            n_thrust_arcs: thrust_arcs.len(),
+            dv_corrections: dv_corrections_ptr,
+            n_dv_corrections: dv_corrections.len(),
+            correction_covariances: correction_covariances_ptr,
+            n_correction_covariances: correction_covariances.len(),
         };
         let keep = OrbitFfiKeep {
             _orbit_id: orbit_id_cstr,
             _object_id: object_id_cstr,
+            _thrust_arcs: thrust_arcs,
+            _dv_corrections: dv_corrections,
+            _correction_covariances: correction_covariances,
         };
         Ok((ffi, keep))
     }
@@ -258,4 +325,10 @@ impl Orbit {
 pub(crate) struct OrbitFfiKeep {
     _orbit_id: std::ffi::CString,
     _object_id: std::ffi::CString,
+    /// Marshaled thrust-arc side array the FFI `EmpyreanOrbit` borrows.
+    _thrust_arcs: Vec<empyrean_sys::EmpyreanThrustArc>,
+    /// Δv-correction side array the FFI `EmpyreanOrbit` borrows.
+    _dv_corrections: Vec<[f64; 3]>,
+    /// Correction-covariance side array the FFI `EmpyreanOrbit` borrows.
+    _correction_covariances: Vec<[[f64; 3]; 3]>,
 }

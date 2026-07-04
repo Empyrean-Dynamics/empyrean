@@ -44,6 +44,20 @@ pub struct PropagateArgs {
     /// in-process — the daemon fast path is skipped when this is set.
     #[arg(long)]
     pub tagged_covariance: bool,
+
+    /// Path to a JSON thrust file describing continuous-thrust arcs
+    /// (finite burns / low-thrust). Applied to every orbit in the batch.
+    /// Schema: `{ "arcs": [{ "start_mjd_tdb", "end_mjd_tdb", "thrust_n",
+    /// "mass_kg", "isp_s"?, "steering", "sharpness", "central_body" }],
+    /// "dv_corrections"?, "correction_covariances"? }`. `steering` is
+    /// `{ "type": "constant_rtn", "alpha_rad", "beta_rad" }`,
+    /// `{ "type": "velocity_tangent" }`, or `{ "type": "inertial_fixed",
+    /// "direction": [x, y, z] }`; `central_body` is a NAIF body code
+    /// (10 = Sun, 399 = Earth, 301 = Moon); `isp_s` omitted = constant
+    /// mass. Runs in-process — the daemon fast path is skipped when this
+    /// is set so the thrust is never silently dropped.
+    #[arg(long)]
+    pub thrust_arcs: Option<PathBuf>,
 }
 
 /// Astronomical unit in km (IAU 2012, exact). The tagged-covariance
@@ -51,11 +65,13 @@ pub struct PropagateArgs {
 const AU_KM: f64 = 149_597_870.7;
 
 pub fn run(data_dir: Option<PathBuf>, args: PropagateArgs) -> Result<()> {
-    // Try daemon first — but only when the tagged-covariance readback is
-    // not requested. The daemon protocol returns a summary string and
-    // cannot stream the per-epoch series, so `--tagged-covariance` falls
-    // through to the in-process path below.
-    if !args.tagged_covariance {
+    // Try daemon first — but only when neither the tagged-covariance
+    // readback nor a thrust file is requested. The daemon protocol
+    // returns a summary string and cannot stream the per-epoch series
+    // (`--tagged-covariance`), and its wire request carries no thrust
+    // fields, so `--thrust-arcs` must also fall through to the in-process
+    // path below — sending it to the daemon would silently drop the burn.
+    if !args.tagged_covariance && args.thrust_arcs.is_none() {
         let request = crate::daemon::protocol::Request::Propagate {
             object_ids: args.object_ids.clone(),
             input_path: args.input.as_ref().map(|p| p.display().to_string()),
@@ -81,7 +97,25 @@ pub fn run(data_dir: Option<PathBuf>, args: PropagateArgs) -> Result<()> {
         empyrean::Context::from_data_dir(data_dir.as_deref()).context("failed to load context")?;
     eprintln!("Loaded context ({:.1}s)", t0.elapsed().as_secs_f64());
 
-    let batch = orbit_input::load_orbits(&args.object_ids, &args.input)?;
+    let mut batch = orbit_input::load_orbits(&args.object_ids, &args.input)?;
+
+    // Attach continuous-thrust parameters, if any. One thrust file
+    // describes one `ThrustParams`, applied to every orbit in the batch.
+    // The engine enforces the dv_corrections / correction_covariances
+    // length contract (and rejects ThirdOrder + correction covariances)
+    // at propagation time; any violation surfaces below as a loud
+    // `propagation failed` error rather than being repaired here.
+    if let Some(thrust_path) = &args.thrust_arcs {
+        let thrust = crate::io::thrust_input::load_thrust_params(thrust_path)?;
+        eprintln!(
+            "Attaching {} thrust arc(s) to {} orbit(s)",
+            thrust.arcs.len(),
+            batch.len()
+        );
+        for orbit in batch.orbits.iter_mut() {
+            orbit.thrust = Some(thrust.clone());
+        }
+    }
 
     let config = PropagationConfig {
         force_model: args.force_model.to_empyrean(),

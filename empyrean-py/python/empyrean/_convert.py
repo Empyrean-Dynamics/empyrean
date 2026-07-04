@@ -399,9 +399,12 @@ def orbit_batch_dict_to_orbits(result: dict[str, Any]) -> AnyOrbits:
 
     Non-grav columns (``a1`` / ``a2`` / ``a3`` / ``g_*``) are attached
     to the ``non_grav`` field when at least one row has a non-zero
-    coefficient. Photometric and thrust columns are not exposed at the
-    C-ABI surface — they round-trip through parquet only when written
-    by paths that bypass the v0.7.0 wrapper.
+    coefficient. Photometric columns are not exposed on this batch dict.
+    Continuous-thrust is not an Orbits-table column at all — thrust arcs
+    are variable-length per orbit, so they are supplied as structured
+    input at propagation time via the ``thrust_arcs`` keyword of
+    :func:`empyrean.propagate` (see
+    :class:`~empyrean.ThrustParams`), not carried on the orbit rows.
     """
     from empyrean.orbits.nongrav import NonGravParams
     from empyrean.orbits.orbits import (

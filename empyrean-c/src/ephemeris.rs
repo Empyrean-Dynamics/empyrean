@@ -12,7 +12,8 @@ use empyrean_core::time::Epoch;
 
 use crate::observers::EmpyreanObserver;
 use crate::propagate::{
-    EmpyreanOrbit, EmpyreanPropagationConfig, empyrean_orbit_photometric_params, int_to_force_model,
+    EmpyreanOrbit, EmpyreanPropagationConfig, empyrean_orbit_photometric_params,
+    empyrean_orbit_thrust_params, int_to_force_model,
 };
 use crate::{EmpyreanContext, set_last_error};
 
@@ -234,6 +235,14 @@ pub unsafe extern "C" fn empyrean_generate_ephemeris(
             }
             if let Some(ph) = empyrean_orbit_photometric_params(orbit) {
                 orbits.set_photometric_params(i, Some(ph));
+            }
+            match empyrean_orbit_thrust_params(orbit) {
+                Ok(Some(tp)) => orbits.set_thrust_params(i, Some(tp)),
+                Ok(None) => {}
+                Err(e) => {
+                    set_last_error(&format!("orbit {i}: {e}"));
+                    return -1;
+                }
             }
         }
 

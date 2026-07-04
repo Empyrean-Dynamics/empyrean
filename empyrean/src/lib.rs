@@ -112,6 +112,7 @@ mod propagate;
 mod query;
 mod session;
 mod states;
+mod thrust;
 pub mod time;
 mod transform;
 mod version;
@@ -151,6 +152,7 @@ pub use query::{
 };
 pub use session::{Session, SessionDiff};
 pub use states::State;
+pub use thrust::{SteeringLaw, ThrustArc, ThrustParams};
 pub use time::{Epoch, TimeScale, iso_to_mjd, mjd_to_iso};
 pub use version::{Versions, version_string, versions};
 

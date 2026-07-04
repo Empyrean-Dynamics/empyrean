@@ -27,16 +27,15 @@ empyrean-sys = "0.7"
 
 ```rust
 use empyrean_sys::*;
-use std::ffi::CString;
 
 // All entry points are unsafe; pointer ownership and lifetime are the
-// caller's responsibility. See empyrean/include/empyrean.h for the
-// authoritative C ABI documentation.
+// caller's responsibility. See include/empyrean.h at the repository
+// root for the authoritative C ABI documentation.
 unsafe {
-    let mut ctx: *mut empyrean_context_t = std::ptr::null_mut();
-    let data_dir = CString::new("").unwrap();
-    let rc = empyrean_context_new(data_dir.as_ptr(), &mut ctx);
-    assert_eq!(rc, 0);
+    // Null data_dir = the platform default data directory; downloads
+    // any missing kernels. Returns null on error (see empyrean_last_error).
+    let ctx: *mut EmpyreanContext = empyrean_context_from_data_dir(std::ptr::null());
+    assert!(!ctx.is_null());
     empyrean_context_free(ctx);
 }
 ```
@@ -48,17 +47,22 @@ and Rust-native lifetime management.
 
 ## Runtime requirement
 
-empyrean-sys opens `libempyrean.{dylib,so,dll}` at run time via
+empyrean-sys opens `libempyrean.{dylib,so}` at run time via
 `libloading` (dlopen). The library is distributed separately as a
 binary release on
 [GitHub](https://github.com/Empyrean-Dynamics/empyrean/releases) and
 inside the published Python wheel. The path is resolved from the
 `EMPYREAN_LIB` environment variable if set, else a `libempyrean.*`
-sitting next to the loaded module, else a build-time location — a
-sibling `../target/release` build, an `EMPYREAN_LIB_DIR` override, or
-a checksum-pinned download from the GitHub release. The FFI bindings
-are pre-generated and committed, so no C header, libclang, or bindgen
-is needed to build.
+sitting next to the loaded module, else a build-time location — an
+`EMPYREAN_LIB_DIR` override, a sibling `../target/release` build, or
+a checksum-pinned download from the GitHub release (in that order).
+The FFI bindings are pre-generated and committed, so no C header,
+libclang, or bindgen is needed to build.
+
+Prebuilt engine binaries are currently published for two targets:
+macOS arm64 (`macos-aarch64`) and Linux x86_64 (`linux-x86_64`). On
+other targets the build stops with an error unless `EMPYREAN_LIB_DIR`
+points at an engine build.
 
 ## License
 

@@ -336,9 +336,9 @@ def initialize(
     ``naif-eop-historical``, ``naif-eop-predict``, ``mpc-obscodes``) are
     installed and no explicit paths are provided, empyrean stages a
     symlinked cache under the platform XDG data directory
-    (``$XDG_DATA_HOME/empyrean/b612-cache/`` on Linux,
-    ``~/Library/Application Support/empyrean/b612-cache/`` on macOS,
-    ``%APPDATA%\\empyrean\\b612-cache\\`` on Windows; honors
+    (``$XDG_DATA_HOME/empyrean/data/`` on Linux,
+    ``~/Library/Application Support/empyrean/data/`` on macOS,
+    ``%APPDATA%\\empyrean\\data\\`` on Windows; honors
     ``EMPYREAN_DATA_DIR``) and uses that as the data directory — zero
     network access required. Falls back to ``data_dir`` (default: same
     XDG location, ``data/`` instead of ``b612-cache/``) plus

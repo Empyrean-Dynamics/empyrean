@@ -5,7 +5,6 @@ Command-line interface for empyrean — orbit propagation, ephemeris generation,
 
 <a href="https://github.com/Empyrean-Dynamics/empyrean/actions/workflows/ci.yml"><img src="https://github.com/Empyrean-Dynamics/empyrean/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
 <a href="https://crates.io/crates/empyrean-cli"><img src="https://img.shields.io/crates/v/empyrean-cli.svg?style=flat-square&label=crates.io" alt="crates.io"></a>
-<a href="https://docs.rs/empyrean-cli"><img src="https://img.shields.io/docsrs/empyrean-cli?style=flat-square&label=docs.rs" alt="docs.rs"></a>
 <a href="https://github.com/Empyrean-Dynamics/empyrean/blob/main/LICENSE-BSD"><img src="https://img.shields.io/badge/source-BSD--3--Clause-blue.svg?style=flat-square" alt="Source license"></a>
 <a href="https://github.com/Empyrean-Dynamics/empyrean/blob/main/LICENSE-BINARY"><img src="https://img.shields.io/badge/binary-proprietary-lightgrey.svg?style=flat-square" alt="Binary license"></a>
 <a href="Cargo.toml"><img src="https://img.shields.io/badge/rustc-1.90%2B-orange?style=flat-square&logo=rust" alt="MSRV 1.90"></a>
@@ -28,14 +27,31 @@ DuckDB.
 cargo install empyrean-cli
 ```
 
-or grab a pre-built binary for your platform from
+`cargo install` fetches the closed-source `libempyrean` engine
+automatically (a checksum-pinned download at build time). Prebuilt
+engine binaries exist for macOS arm64 (`macos-aarch64`) and Linux
+x86_64 (`linux-x86_64`); other targets are not yet supported.
+
+Alternatively, grab a pre-built binary for your platform from
 [GitHub Releases](https://github.com/Empyrean-Dynamics/empyrean/releases).
-The installed binary is named `empyrean`.
+The installed binary is named `empyrean`. The release tarball
+(`empyrean-<target>.tar.gz`) contains the binary + LICENSE only — also
+download the matching `libempyrean-<target>.tar.gz` and either place
+the shared library next to the binary or point `EMPYREAN_LIB` at it:
+
+```sh
+tar xzf empyrean-macos-aarch64.tar.gz
+tar xzf libempyrean-macos-aarch64.tar.gz
+export EMPYREAN_LIB=$PWD/libempyrean.dylib   # or place it next to `empyrean`
+./empyrean version
+```
 
 ## Quickstart
 
 ```sh
-# One-time: download SPICE kernels into ~/.empyrean/data/.
+# One-time: download SPICE kernels into the platform data directory
+# (~/.local/share/empyrean/data/ on Linux, ~/Library/Application Support/empyrean/data/
+# on macOS; honors EMPYREAN_DATA_DIR).
 empyrean init
 
 # Propagate Apophis 10 years past its SBDB epoch.
@@ -48,31 +64,43 @@ empyrean ephemeris --object-id 99942 --observers 568 --epoch 64922.0 --out-dir .
 empyrean determine apophis.psv --out-dir ./out
 
 # Confirm the build provenance — every binary carries the `<tag>+<sha>`
-# strings of the villeneuve / scott / hyperjet commits it was built against.
+# strings of the villeneuve / scott / nolan commits it was built against.
 empyrean version
 ```
 
-All commands emit Parquet tables under `--out-dir`. The schemas match
-the Python and Rust API outputs exactly — same `orbit_id` /
+All commands emit Parquet tables under `--out-dir` by default
+(`--format json` / `--format csv` are also available). The schemas
+match the Python and Rust API outputs exactly — same `orbit_id` /
 `object_id` join keys, same time scales, same physical units — so you
 can mix-and-match channels for the same workflow.
 
+Beyond the headline pipelines: `propagate` takes `--uncertainty-method`
+(`first-order` / `second-order` / `sigma-point` / `monte-carlo` /
+`auto`) and `--tagged-covariance`; `empyrean query horizons-vectors`
+fetches JPL Horizons state vectors; `empyrean cache info` / `cache clear`
+manage the API response cache; and `empyrean serve` / `empyrean stop`
+run a daemon that keeps the loaded kernels in memory for faster
+subsequent commands. See `empyrean <command> --help` for the full
+flag surface.
+
 ## Runtime requirement
 
-The `empyrean` binary loads `libempyrean.{dylib,so,dll}` at run time,
+The `empyrean` binary loads `libempyrean.{dylib,so}` at run time,
 which is distributed separately as a binary release on
 [GitHub](https://github.com/Empyrean-Dynamics/empyrean/releases) and
-inside the published Python wheel. The library is opened from a path
-resolved at build time — a local `../target/release` build, an
-`EMPYREAN_LIB_DIR` override, or a checksum-pinned prebuilt downloaded
-from the GitHub release; no system library path setup is needed.
+inside the published Python wheel. The path is resolved from the
+`EMPYREAN_LIB` environment variable if set, else a `libempyrean.*`
+sitting next to the binary, else a build-time location — an
+`EMPYREAN_LIB_DIR` override, a sibling `../target/release` build, or
+a checksum-pinned prebuilt downloaded from the GitHub release (in
+that order); no system library path setup is needed.
 
 ## License
 
 Source code in this crate is licensed under the
-[BSD 3-Clause License](LICENSE). The installed `empyrean` binary —
-which embeds the closed-source `libempyrean` runtime — is governed
-by a separate proprietary binary license; see the main repository for
-the dual-license breakdown.
+[BSD 3-Clause License](LICENSE). The closed-source `libempyrean`
+runtime the binary loads at run time is governed by a separate
+proprietary binary license; see the main repository for the
+dual-license breakdown.
 
 Copyright © 2024–2026 Joachim Moeyens. All rights reserved.

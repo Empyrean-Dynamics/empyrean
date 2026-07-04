@@ -12,7 +12,8 @@ encounter.
 The companion quivr classes :class:`ImpactProbabilities` and
 :class:`BPlanes` carry a ``method`` string column (rather than an
 opaque int tag) so consumers can group / filter without consulting a
-mapping table — `ips.where(ips.method == "second_order")` reads
+mapping table — `ips.where(pc.field("method") == "second_order")`
+(with `import pyarrow.compute as pc`) reads
 exactly like the kind of query you actually want to write.
 """
 
@@ -54,7 +55,7 @@ _OrbitArg = FloatArray | npt.NDArray[np.bool_] | npt.NDArray[np.int32] | None
 # Stable text labels that show up in the `method` column of the
 # tables below. They line up with the `UncertaintyMethod` Python
 # enum's lowercase names, so a user who already has a method enum
-# can do `ips.where(ips.method == method.value)` (or the analogous
+# can do `ips.where(pc.field("method") == method.value)` (or the analogous
 # ``str(method)``) without an extra mapping step.
 
 METHOD_FIRST_ORDER = "first_order"

@@ -92,6 +92,14 @@ def propagate(
     events: EventConfig | None = None,
     tagged_covariance: bool = False,
     thrust_arcs: "Sequence[ThrustParams | None] | None" = None,
+    # Internal: a pre-built force-model handle
+    # (``empyrean._empyrean_rs.BuiltSystem``). When supplied, the forward
+    # model runs through the frozen handle (identity-guarded, never a
+    # silent rebuild) instead of assembling the force model one-shot.
+    # Set by :meth:`empyrean.BuiltSystem.propagate`; not part of the
+    # public call surface. The result is bit-identical to the one-shot on
+    # the matching key.
+    _builtsystem: Any = None,
 ) -> PropagationResult:
     """Propagate orbits to target epochs.
 
@@ -420,6 +428,7 @@ def propagate(
         mc_seed=mc_seed,
         propagation_config_dict=config._to_wire_dict(),
         with_tagged_covariance=tagged_covariance,
+        builtsystem=_builtsystem,
     )
 
     # ── Build CartesianOrbits from result ─────────────────────

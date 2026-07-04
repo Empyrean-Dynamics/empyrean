@@ -14,7 +14,7 @@ use empyrean_core::photometry::PhotometricParams;
 use empyrean_core::propagation::events::DynamicalEvent;
 use empyrean_core::propagation::{
     AdvancedIntegratorConfig, DiagnosticsConfig, EventConfig, IntegratorChoice,
-    OriginSwitchingConfig, PropagationConfig, UncertaintyMethod, propagate,
+    OriginSwitchingConfig, PropagationConfig, PropagationResult, UncertaintyMethod, propagate,
 };
 use empyrean_core::time::Epoch;
 
@@ -1181,54 +1181,17 @@ pub unsafe extern "C" fn empyrean_propagate(
         let orbit_slice = unsafe { std::slice::from_raw_parts(orbits_ptr, num_orbits) };
         let times_slice = unsafe { std::slice::from_raw_parts(times_ptr, num_times) };
 
-        // Build Orbits<AU> row by row.
-        let mut orbits: Orbits<empyrean_core::coordinates::AU> = Orbits::empty();
-        // Per-orbit identifiers, sized num_orbits. We use these to:
-        //   1. Push the user-supplied orbit_id into villeneuve's batch
-        //      (instead of fabricating "orbit_N"), so events emerge
-        //      tagged with the user's string.
-        //   2. Look up object_id by orbit_id when constructing C ABI
-        //      result rows (events / states), since villeneuve doesn't
-        //      track object_id internally.
-        let mut input_orbit_ids: Vec<String> = Vec::with_capacity(num_orbits);
-        let mut input_object_ids: Vec<String> = Vec::with_capacity(num_orbits);
-        for (i, orbit) in orbit_slice.iter().enumerate() {
-            let state = orbit.state.to_empyrean();
-            let coords = match coordinate_state_to_coordinates(&state) {
-                Ok(c) => c,
+        // Build Orbits<AU> row by row (non-grav + thrust attached). Shared
+        // with the BuiltSystem handle path so both marshal the caller's
+        // dynamics model through the identical code.
+        let (orbits, input_orbit_ids, input_object_ids) =
+            match build_orbits_for_propagation(orbit_slice) {
+                Ok(t) => t,
                 Err(e) => {
-                    set_last_error(&format!("orbit {i}: {e}"));
+                    set_last_error(&e);
                     return -1;
                 }
             };
-            // Use the caller-supplied orbit_id when present; fall back
-            // to the positional fabrication only if null/empty so older
-            // callers that haven't set the field keep working.
-            let id = c_str_to_string(orbit.orbit_id).unwrap_or_default();
-            let id = if id.is_empty() {
-                format!("orbit_{i}")
-            } else {
-                id
-            };
-            let obj = c_str_to_string(orbit.object_id).unwrap_or_default();
-            input_orbit_ids.push(id.clone());
-            input_object_ids.push(obj);
-            if let Err(e) = orbits.push(id, coords.into_radians()) {
-                set_last_error(&format!("orbit {i}: {e}"));
-                return -1;
-            }
-            if let Some(params) = empyrean_orbit_non_grav_params(orbit) {
-                orbits.set_non_grav_params(i, Some(params));
-            }
-            match empyrean_orbit_thrust_params(orbit) {
-                Ok(Some(tp)) => orbits.set_thrust_params(i, Some(tp)),
-                Ok(None) => {}
-                Err(e) => {
-                    set_last_error(&format!("orbit {i}: {e}"));
-                    return -1;
-                }
-            }
-        }
 
         let cfg = match build_propagation_config_from_c(config_ref) {
             Ok(c) => c,
@@ -1251,262 +1214,13 @@ pub unsafe extern "C" fn empyrean_propagate(
             }
         };
 
-        let n = prop_result.states.len();
-
-        let states_layout = std::alloc::Layout::array::<EmpyreanPropagatedState>(n)
-            .unwrap_or(std::alloc::Layout::new::<EmpyreanPropagatedState>());
-        let states_ptr = if n > 0 {
-            let ptr = unsafe { std::alloc::alloc(states_layout) } as *mut EmpyreanPropagatedState;
-            if ptr.is_null() {
-                set_last_error("allocation failed for states array");
-                return -5;
-            }
-            ptr
-        } else {
-            std::ptr::null_mut()
-        };
-
-        let ids_ptr = if n > 0 {
-            let layout = std::alloc::Layout::array::<*mut std::ffi::c_char>(n)
-                .unwrap_or(std::alloc::Layout::new::<*mut std::ffi::c_char>());
-            let ptr = unsafe { std::alloc::alloc(layout) } as *mut *mut std::ffi::c_char;
-            if ptr.is_null() {
-                set_last_error("allocation failed for object_ids array");
-                unsafe { std::alloc::dealloc(states_ptr as *mut u8, states_layout) };
-                return -5;
-            }
-            ptr
-        } else {
-            std::ptr::null_mut()
-        };
-
-        let n_times = times.len();
-        for (i, (orbit_id, coord, cov)) in prop_result.states.iter().enumerate() {
-            let (covariance, has_covariance) = match cov {
-                Some(c) => (*c, 1u8),
-                None => ([[0.0; 6]; 6], 0u8),
-            };
-
-            let orbit_idx = if n_times > 0 { i / n_times } else { 0 };
-            let time_idx = if n_times > 0 { i % n_times } else { 0 };
-            let chain = prop_result.sensitivity.get(orbit_idx);
-            let (stm, has_stm) = match chain.and_then(|c| c.stm(time_idx)) {
-                Some(m) => (m.matrix, 1u8),
-                None => ([[0.0; 6]; 6], 0u8),
-            };
-            let (stt, has_stt) = match chain.and_then(|c| c.stt(time_idx)) {
-                Some(t) => (t.tensor, 1u8),
-                None => ([[[0.0; 6]; 6]; 6], 0u8),
-            };
-            let resolved_kind = chain
-                .and_then(|c| c.resolved_kinds().get(time_idx).copied())
-                .map(covariance_kind_to_u8)
-                .unwrap_or(EMPYREAN_COVARIANCE_KIND_LINEAR);
-
-            let out_state = EmpyreanPropagatedState {
-                epoch_mjd_tdb: coord.t.mjd_tdb(),
-                x: coord.x,
-                y: coord.y,
-                z: coord.z,
-                vx: coord.vx,
-                vy: coord.vy,
-                vz: coord.vz,
-                origin: coord.origin.naif_id(),
-                frame: frame_to_int(coord.frame),
-                covariance,
-                has_covariance,
-                stm,
-                has_stm,
-                stt,
-                has_stt,
-                resolved_kind,
-            };
-
-            unsafe {
-                states_ptr.add(i).write(out_state);
-            }
-
-            let c_id = CString::new(orbit_id).unwrap_or_else(|_| CString::new("?").unwrap());
-            unsafe {
-                ids_ptr.add(i).write(c_id.into_raw());
-            }
-        }
-
-        // Pre-flatten through `event_to_c`. Variants the v0.7.0
-        // distribution channel intentionally gates off (HighSensitivity,
-        // ChaoticRegion, HighNonlinearity, Keyhole, Bifurcation —
-        // diagnostic-only, payloads not yet shaped for the C ABI)
-        // become `None` and are dropped here rather than collapsed
-        // into a generic `event_type = "other"` row.
-        let events_emitted: Vec<EmpyreanEvent> = {
-            let object_id_map: std::collections::HashMap<String, String> = input_orbit_ids
-                .iter()
-                .zip(input_object_ids.iter())
-                .map(|(o, x)| (o.clone(), x.clone()))
-                .collect();
-            prop_result
-                .events
-                .iter()
-                .filter_map(|ev| event_to_c(ev, &object_id_map))
-                .collect()
-        };
-        let n_ev = events_emitted.len();
-        let events_ptr = if n_ev > 0 {
-            let layout = std::alloc::Layout::array::<EmpyreanEvent>(n_ev)
-                .unwrap_or(std::alloc::Layout::new::<EmpyreanEvent>());
-            let ptr = unsafe { std::alloc::alloc(layout) } as *mut EmpyreanEvent;
-            if ptr.is_null() {
-                set_last_error("allocation failed for events array");
-                if !states_ptr.is_null() && n > 0 {
-                    unsafe { std::alloc::dealloc(states_ptr as *mut u8, states_layout) };
-                }
-                return -5;
-            }
-            ptr
-        } else {
-            std::ptr::null_mut()
-        };
-
-        for (i, out_ev) in events_emitted.into_iter().enumerate() {
-            unsafe {
-                events_ptr.add(i).write(out_ev);
-            }
-        }
-
-        // Build per-orbit mixture chains. The empyrean-core /
-        // villeneuve `result.mixtures` parallels `result.sensitivity`
-        // — one entry per input orbit, `Some(MixtureChain)` only
-        // when AGM actually fired. We surface ALL orbits (each gets
-        // an `EmpyreanMixtureChain` row) so the consumer can do
-        // a positional join with the input orbit batch; orbits
-        // without mixtures get a row with `num_ca_epochs == 0`.
-        let mixtures_count = prop_result.mixtures.len();
-        let mixtures_ptr = if mixtures_count > 0 {
-            let layout = std::alloc::Layout::array::<EmpyreanMixtureChain>(mixtures_count)
-                .unwrap_or(std::alloc::Layout::new::<EmpyreanMixtureChain>());
-            let ptr = unsafe { std::alloc::alloc(layout) } as *mut EmpyreanMixtureChain;
-            if ptr.is_null() {
-                set_last_error("allocation failed for mixtures array");
-                if !states_ptr.is_null() && n > 0 {
-                    let l = std::alloc::Layout::array::<EmpyreanPropagatedState>(n).unwrap();
-                    unsafe { std::alloc::dealloc(states_ptr as *mut u8, l) };
-                }
-                return -5;
-            }
-            for (mi, mixture_opt) in prop_result.mixtures.iter().enumerate() {
-                // Look up this orbit's id by indexing into the
-                // sensitivity vec — they're positionally aligned
-                // with `mixtures` per villeneuve's contract.
-                let orbit_id = input_orbit_ids.get(mi).map(String::as_str).unwrap_or("");
-                let chain = match mixture_opt {
-                    Some(c) => c,
-                    None => {
-                        unsafe {
-                            ptr.add(mi).write(EmpyreanMixtureChain {
-                                orbit_id: to_c_str(orbit_id),
-                                ca_epochs_mjd_tdb: std::ptr::null_mut(),
-                                num_ca_epochs: 0,
-                                components_per_epoch: std::ptr::null_mut(),
-                                components_offset: std::ptr::null_mut(),
-                                components: std::ptr::null_mut(),
-                                num_components_total: 0,
-                            });
-                        }
-                        continue;
-                    }
-                };
-                let n_epochs = chain.epochs.len();
-                let total_components: usize = chain.components.iter().map(|v| v.len()).sum();
-                // Allocate the three parallel arrays + the flattened
-                // components.
-                let epochs_layout = std::alloc::Layout::array::<f64>(n_epochs).unwrap();
-                let counts_layout = std::alloc::Layout::array::<usize>(n_epochs).unwrap();
-                let offsets_layout = std::alloc::Layout::array::<usize>(n_epochs).unwrap();
-                let comps_layout =
-                    std::alloc::Layout::array::<EmpyreanMixtureComponent>(total_components)
-                        .unwrap();
-                let epochs_p: *mut f64 = if n_epochs > 0 {
-                    (unsafe { std::alloc::alloc(epochs_layout) }) as *mut f64
-                } else {
-                    std::ptr::null_mut()
-                };
-                let counts_p: *mut usize = if n_epochs > 0 {
-                    (unsafe { std::alloc::alloc(counts_layout) }) as *mut usize
-                } else {
-                    std::ptr::null_mut()
-                };
-                let offsets_p: *mut usize = if n_epochs > 0 {
-                    (unsafe { std::alloc::alloc(offsets_layout) }) as *mut usize
-                } else {
-                    std::ptr::null_mut()
-                };
-                let comps_p: *mut EmpyreanMixtureComponent = if total_components > 0 {
-                    (unsafe { std::alloc::alloc(comps_layout) }) as *mut EmpyreanMixtureComponent
-                } else {
-                    std::ptr::null_mut()
-                };
-                let mut running_offset = 0usize;
-                for (k, t) in chain.epochs.iter().enumerate() {
-                    let comps = &chain.components[k];
-                    unsafe {
-                        epochs_p.add(k).write(*t);
-                        counts_p.add(k).write(comps.len());
-                        offsets_p.add(k).write(running_offset);
-                    }
-                    for (j, comp) in comps.iter().enumerate() {
-                        unsafe {
-                            comps_p
-                                .add(running_offset + j)
-                                .write(EmpyreanMixtureComponent {
-                                    weight: comp.weight,
-                                    mean: comp.mean,
-                                    covariance: comp.covariance,
-                                });
-                        }
-                    }
-                    running_offset += comps.len();
-                }
-                unsafe {
-                    ptr.add(mi).write(EmpyreanMixtureChain {
-                        orbit_id: to_c_str(orbit_id),
-                        ca_epochs_mjd_tdb: epochs_p,
-                        num_ca_epochs: n_epochs,
-                        components_per_epoch: counts_p,
-                        components_offset: offsets_p,
-                        components: comps_p,
-                        num_components_total: total_components,
-                    });
-                }
-            }
-            ptr
-        } else {
-            std::ptr::null_mut()
-        };
-
-        // Retain the rich result behind an opaque handle so the
-        // on-demand tagged-covariance accessors can recompute the
-        // resolved-kind readback and co-locate the per-epoch nominal
-        // state. `prop_result` is moved here after all flattening
-        // borrows have ended; freed by `empyrean_propagation_result_free`.
-        let handle = Box::new(PropagationResultHandle {
-            result: prop_result,
-            n_times,
-        });
-        let handle_ptr = Box::into_raw(handle) as *mut std::ffi::c_void;
-
-        unsafe {
-            (*result_out).states = states_ptr;
-            (*result_out).num_states = n;
-            (*result_out).object_ids = ids_ptr;
-            (*result_out).events = events_ptr;
-            (*result_out).num_events = n_ev;
-            (*result_out).mixtures = mixtures_ptr;
-            (*result_out).num_mixtures = mixtures_count;
-            (*result_out).lazy_handle = handle_ptr;
-        }
-
-        let _ = Origin::Earth; // reference Origin to suppress unused-import warnings
-        0
+        marshal_propagation_result(
+            prop_result,
+            times.len(),
+            &input_orbit_ids,
+            &input_object_ids,
+            result_out,
+        )
     }));
 
     match result {
@@ -1516,6 +1230,337 @@ pub unsafe extern "C" fn empyrean_propagate(
             -99
         }
     }
+}
+
+/// Build an `Orbits<AU>` batch (plus per-orbit `orbit_id` / `object_id`
+/// vectors) from a C-ABI orbit slice, attaching each row's non-grav and
+/// thrust parameters. Shared by the one-shot [`empyrean_propagate`] and the
+/// handle-based
+/// [`empyrean_builtsystem_propagate`](crate::built_system::empyrean_builtsystem_propagate)
+/// so both marshal the caller's dynamics model through the identical code
+/// (no silent divergence between the two entry points). The returned tuple is
+/// `(orbits, orbit_ids, object_ids)`.
+#[allow(clippy::type_complexity)]
+pub(crate) fn build_orbits_for_propagation(
+    orbit_slice: &[EmpyreanOrbit],
+) -> Result<
+    (
+        Orbits<empyrean_core::coordinates::AU>,
+        Vec<String>,
+        Vec<String>,
+    ),
+    String,
+> {
+    let mut orbits: Orbits<empyrean_core::coordinates::AU> = Orbits::empty();
+    // Per-orbit identifiers. We use these to:
+    //   1. Push the user-supplied orbit_id into villeneuve's batch
+    //      (instead of fabricating "orbit_N"), so events emerge
+    //      tagged with the user's string.
+    //   2. Look up object_id by orbit_id when constructing C ABI
+    //      result rows (events / states), since villeneuve doesn't
+    //      track object_id internally.
+    let mut input_orbit_ids: Vec<String> = Vec::with_capacity(orbit_slice.len());
+    let mut input_object_ids: Vec<String> = Vec::with_capacity(orbit_slice.len());
+    for (i, orbit) in orbit_slice.iter().enumerate() {
+        let state = orbit.state.to_empyrean();
+        let coords =
+            coordinate_state_to_coordinates(&state).map_err(|e| format!("orbit {i}: {e}"))?;
+        // Use the caller-supplied orbit_id when present; fall back
+        // to the positional fabrication only if null/empty so older
+        // callers that haven't set the field keep working.
+        let id = c_str_to_string(orbit.orbit_id).unwrap_or_default();
+        let id = if id.is_empty() {
+            format!("orbit_{i}")
+        } else {
+            id
+        };
+        let obj = c_str_to_string(orbit.object_id).unwrap_or_default();
+        input_orbit_ids.push(id.clone());
+        input_object_ids.push(obj);
+        orbits
+            .push(id, coords.into_radians())
+            .map_err(|e| format!("orbit {i}: {e}"))?;
+        if let Some(params) = empyrean_orbit_non_grav_params(orbit) {
+            orbits.set_non_grav_params(i, Some(params));
+        }
+        match empyrean_orbit_thrust_params(orbit) {
+            Ok(Some(tp)) => orbits.set_thrust_params(i, Some(tp)),
+            Ok(None) => {}
+            Err(e) => return Err(format!("orbit {i}: {e}")),
+        }
+    }
+    Ok((orbits, input_orbit_ids, input_object_ids))
+}
+
+/// Marshal a [`PropagationResult`] into the C-ABI
+/// [`EmpyreanPropagationResult`] (states + object ids + events + mixture
+/// chains + the lazy tagged-covariance handle). Shared verbatim by the
+/// one-shot [`empyrean_propagate`] and the handle-based
+/// [`empyrean_builtsystem_propagate`](crate::built_system::empyrean_builtsystem_propagate)
+/// so both emit byte-identical result buffers. Returns 0 on success or a
+/// negative allocation-failure code. Runs inside the caller's
+/// `catch_unwind`, so it installs no panic guard of its own.
+pub(crate) fn marshal_propagation_result(
+    prop_result: PropagationResult,
+    n_times: usize,
+    input_orbit_ids: &[String],
+    input_object_ids: &[String],
+    result_out: *mut EmpyreanPropagationResult,
+) -> i32 {
+    let n = prop_result.states.len();
+
+    let states_layout = std::alloc::Layout::array::<EmpyreanPropagatedState>(n)
+        .unwrap_or(std::alloc::Layout::new::<EmpyreanPropagatedState>());
+    let states_ptr = if n > 0 {
+        let ptr = unsafe { std::alloc::alloc(states_layout) } as *mut EmpyreanPropagatedState;
+        if ptr.is_null() {
+            set_last_error("allocation failed for states array");
+            return -5;
+        }
+        ptr
+    } else {
+        std::ptr::null_mut()
+    };
+
+    let ids_ptr = if n > 0 {
+        let layout = std::alloc::Layout::array::<*mut std::ffi::c_char>(n)
+            .unwrap_or(std::alloc::Layout::new::<*mut std::ffi::c_char>());
+        let ptr = unsafe { std::alloc::alloc(layout) } as *mut *mut std::ffi::c_char;
+        if ptr.is_null() {
+            set_last_error("allocation failed for object_ids array");
+            unsafe { std::alloc::dealloc(states_ptr as *mut u8, states_layout) };
+            return -5;
+        }
+        ptr
+    } else {
+        std::ptr::null_mut()
+    };
+
+    for (i, (orbit_id, coord, cov)) in prop_result.states.iter().enumerate() {
+        let (covariance, has_covariance) = match cov {
+            Some(c) => (*c, 1u8),
+            None => ([[0.0; 6]; 6], 0u8),
+        };
+
+        let orbit_idx = if n_times > 0 { i / n_times } else { 0 };
+        let time_idx = if n_times > 0 { i % n_times } else { 0 };
+        let chain = prop_result.sensitivity.get(orbit_idx);
+        let (stm, has_stm) = match chain.and_then(|c| c.stm(time_idx)) {
+            Some(m) => (m.matrix, 1u8),
+            None => ([[0.0; 6]; 6], 0u8),
+        };
+        let (stt, has_stt) = match chain.and_then(|c| c.stt(time_idx)) {
+            Some(t) => (t.tensor, 1u8),
+            None => ([[[0.0; 6]; 6]; 6], 0u8),
+        };
+        let resolved_kind = chain
+            .and_then(|c| c.resolved_kinds().get(time_idx).copied())
+            .map(covariance_kind_to_u8)
+            .unwrap_or(EMPYREAN_COVARIANCE_KIND_LINEAR);
+
+        let out_state = EmpyreanPropagatedState {
+            epoch_mjd_tdb: coord.t.mjd_tdb(),
+            x: coord.x,
+            y: coord.y,
+            z: coord.z,
+            vx: coord.vx,
+            vy: coord.vy,
+            vz: coord.vz,
+            origin: coord.origin.naif_id(),
+            frame: frame_to_int(coord.frame),
+            covariance,
+            has_covariance,
+            stm,
+            has_stm,
+            stt,
+            has_stt,
+            resolved_kind,
+        };
+
+        unsafe {
+            states_ptr.add(i).write(out_state);
+        }
+
+        let c_id = CString::new(orbit_id).unwrap_or_else(|_| CString::new("?").unwrap());
+        unsafe {
+            ids_ptr.add(i).write(c_id.into_raw());
+        }
+    }
+
+    // Pre-flatten through `event_to_c`. Variants the v0.7.0
+    // distribution channel intentionally gates off (HighSensitivity,
+    // ChaoticRegion, HighNonlinearity, Keyhole, Bifurcation —
+    // diagnostic-only, payloads not yet shaped for the C ABI)
+    // become `None` and are dropped here rather than collapsed
+    // into a generic `event_type = "other"` row.
+    let events_emitted: Vec<EmpyreanEvent> = {
+        let object_id_map: std::collections::HashMap<String, String> = input_orbit_ids
+            .iter()
+            .zip(input_object_ids.iter())
+            .map(|(o, x)| (o.clone(), x.clone()))
+            .collect();
+        prop_result
+            .events
+            .iter()
+            .filter_map(|ev| event_to_c(ev, &object_id_map))
+            .collect()
+    };
+    let n_ev = events_emitted.len();
+    let events_ptr = if n_ev > 0 {
+        let layout = std::alloc::Layout::array::<EmpyreanEvent>(n_ev)
+            .unwrap_or(std::alloc::Layout::new::<EmpyreanEvent>());
+        let ptr = unsafe { std::alloc::alloc(layout) } as *mut EmpyreanEvent;
+        if ptr.is_null() {
+            set_last_error("allocation failed for events array");
+            if !states_ptr.is_null() && n > 0 {
+                unsafe { std::alloc::dealloc(states_ptr as *mut u8, states_layout) };
+            }
+            return -5;
+        }
+        ptr
+    } else {
+        std::ptr::null_mut()
+    };
+
+    for (i, out_ev) in events_emitted.into_iter().enumerate() {
+        unsafe {
+            events_ptr.add(i).write(out_ev);
+        }
+    }
+
+    // Build per-orbit mixture chains. The empyrean-core /
+    // villeneuve `result.mixtures` parallels `result.sensitivity`
+    // — one entry per input orbit, `Some(MixtureChain)` only
+    // when AGM actually fired. We surface ALL orbits (each gets
+    // an `EmpyreanMixtureChain` row) so the consumer can do
+    // a positional join with the input orbit batch; orbits
+    // without mixtures get a row with `num_ca_epochs == 0`.
+    let mixtures_count = prop_result.mixtures.len();
+    let mixtures_ptr = if mixtures_count > 0 {
+        let layout = std::alloc::Layout::array::<EmpyreanMixtureChain>(mixtures_count)
+            .unwrap_or(std::alloc::Layout::new::<EmpyreanMixtureChain>());
+        let ptr = unsafe { std::alloc::alloc(layout) } as *mut EmpyreanMixtureChain;
+        if ptr.is_null() {
+            set_last_error("allocation failed for mixtures array");
+            if !states_ptr.is_null() && n > 0 {
+                let l = std::alloc::Layout::array::<EmpyreanPropagatedState>(n).unwrap();
+                unsafe { std::alloc::dealloc(states_ptr as *mut u8, l) };
+            }
+            return -5;
+        }
+        for (mi, mixture_opt) in prop_result.mixtures.iter().enumerate() {
+            // Look up this orbit's id by indexing into the
+            // sensitivity vec — they're positionally aligned
+            // with `mixtures` per villeneuve's contract.
+            let orbit_id = input_orbit_ids.get(mi).map(String::as_str).unwrap_or("");
+            let chain = match mixture_opt {
+                Some(c) => c,
+                None => {
+                    unsafe {
+                        ptr.add(mi).write(EmpyreanMixtureChain {
+                            orbit_id: to_c_str(orbit_id),
+                            ca_epochs_mjd_tdb: std::ptr::null_mut(),
+                            num_ca_epochs: 0,
+                            components_per_epoch: std::ptr::null_mut(),
+                            components_offset: std::ptr::null_mut(),
+                            components: std::ptr::null_mut(),
+                            num_components_total: 0,
+                        });
+                    }
+                    continue;
+                }
+            };
+            let n_epochs = chain.epochs.len();
+            let total_components: usize = chain.components.iter().map(|v| v.len()).sum();
+            // Allocate the three parallel arrays + the flattened
+            // components.
+            let epochs_layout = std::alloc::Layout::array::<f64>(n_epochs).unwrap();
+            let counts_layout = std::alloc::Layout::array::<usize>(n_epochs).unwrap();
+            let offsets_layout = std::alloc::Layout::array::<usize>(n_epochs).unwrap();
+            let comps_layout =
+                std::alloc::Layout::array::<EmpyreanMixtureComponent>(total_components).unwrap();
+            let epochs_p: *mut f64 = if n_epochs > 0 {
+                (unsafe { std::alloc::alloc(epochs_layout) }) as *mut f64
+            } else {
+                std::ptr::null_mut()
+            };
+            let counts_p: *mut usize = if n_epochs > 0 {
+                (unsafe { std::alloc::alloc(counts_layout) }) as *mut usize
+            } else {
+                std::ptr::null_mut()
+            };
+            let offsets_p: *mut usize = if n_epochs > 0 {
+                (unsafe { std::alloc::alloc(offsets_layout) }) as *mut usize
+            } else {
+                std::ptr::null_mut()
+            };
+            let comps_p: *mut EmpyreanMixtureComponent = if total_components > 0 {
+                (unsafe { std::alloc::alloc(comps_layout) }) as *mut EmpyreanMixtureComponent
+            } else {
+                std::ptr::null_mut()
+            };
+            let mut running_offset = 0usize;
+            for (k, t) in chain.epochs.iter().enumerate() {
+                let comps = &chain.components[k];
+                unsafe {
+                    epochs_p.add(k).write(*t);
+                    counts_p.add(k).write(comps.len());
+                    offsets_p.add(k).write(running_offset);
+                }
+                for (j, comp) in comps.iter().enumerate() {
+                    unsafe {
+                        comps_p
+                            .add(running_offset + j)
+                            .write(EmpyreanMixtureComponent {
+                                weight: comp.weight,
+                                mean: comp.mean,
+                                covariance: comp.covariance,
+                            });
+                    }
+                }
+                running_offset += comps.len();
+            }
+            unsafe {
+                ptr.add(mi).write(EmpyreanMixtureChain {
+                    orbit_id: to_c_str(orbit_id),
+                    ca_epochs_mjd_tdb: epochs_p,
+                    num_ca_epochs: n_epochs,
+                    components_per_epoch: counts_p,
+                    components_offset: offsets_p,
+                    components: comps_p,
+                    num_components_total: total_components,
+                });
+            }
+        }
+        ptr
+    } else {
+        std::ptr::null_mut()
+    };
+
+    // Retain the rich result behind an opaque handle so the
+    // on-demand tagged-covariance accessors can recompute the
+    // resolved-kind readback and co-locate the per-epoch nominal
+    // state. `prop_result` is moved here after all flattening
+    // borrows have ended; freed by `empyrean_propagation_result_free`.
+    let handle = Box::new(PropagationResultHandle {
+        result: prop_result,
+        n_times,
+    });
+    let handle_ptr = Box::into_raw(handle) as *mut std::ffi::c_void;
+
+    unsafe {
+        (*result_out).states = states_ptr;
+        (*result_out).num_states = n;
+        (*result_out).object_ids = ids_ptr;
+        (*result_out).events = events_ptr;
+        (*result_out).num_events = n_ev;
+        (*result_out).mixtures = mixtures_ptr;
+        (*result_out).num_mixtures = mixtures_count;
+        (*result_out).lazy_handle = handle_ptr;
+    }
+
+    let _ = Origin::Earth; // reference Origin to suppress unused-import warnings
+    0
 }
 
 /// Free a propagation result previously returned by `empyrean_propagate()`.
@@ -2014,13 +2059,13 @@ pub unsafe extern "C" fn empyrean_tagged_covariance_series_free(
     }));
 }
 
-unsafe fn free_c_str(ptr: *mut std::ffi::c_char) {
+pub(crate) unsafe fn free_c_str(ptr: *mut std::ffi::c_char) {
     if !ptr.is_null() {
         drop(unsafe { CString::from_raw(ptr) });
     }
 }
 
-fn to_c_str(s: &str) -> *mut std::ffi::c_char {
+pub(crate) fn to_c_str(s: &str) -> *mut std::ffi::c_char {
     CString::new(s)
         .unwrap_or_else(|_| CString::new("?").unwrap())
         .into_raw()

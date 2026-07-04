@@ -128,6 +128,14 @@ from empyrean.propagation.tagged_covariance import (
     TargetFunctional,
 )
 from empyrean.states import get_states
+from empyrean.system import (
+    BuiltSystem,
+    KernelKind,
+    KernelProvenance,
+    KernelRecord,
+    SystemDescription,
+    build_system,
+)
 
 
 def version_string() -> str:

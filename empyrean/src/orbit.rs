@@ -332,3 +332,27 @@ pub(crate) struct OrbitFfiKeep {
     /// Correction-covariance side array the FFI `EmpyreanOrbit` borrows.
     _correction_covariances: Vec<[[f64; 3]; 3]>,
 }
+
+/// Marshal a batch of orbits into their FFI representation plus the
+/// keepalive that owns the heap storage each `EmpyreanOrbit` borrows.
+///
+/// Single conversion path shared by every forward-model entry point — the
+/// one-shot [`Context::propagate`](crate::Context::propagate) /
+/// [`Context::generate_ephemeris`](crate::Context::generate_ephemeris) and
+/// the pre-built [`BuiltSystem`](crate::BuiltSystem) — so all of them feed
+/// the engine byte-identical orbit rows. The returned keepalive `Vec` must
+/// outlive every use of the returned `EmpyreanOrbit` slice.
+pub(crate) fn orbits_to_ffi(
+    orbits: &[Orbit],
+) -> crate::error::Result<(Vec<empyrean_sys::EmpyreanOrbit>, Vec<OrbitFfiKeep>)> {
+    let mut keep: Vec<OrbitFfiKeep> = Vec::with_capacity(orbits.len());
+    let ffi = orbits
+        .iter()
+        .map(|o| {
+            let (f, k) = o.to_ffi_with_keep()?;
+            keep.push(k);
+            Ok(f)
+        })
+        .collect::<crate::error::Result<Vec<_>>>()?;
+    Ok((ffi, keep))
+}

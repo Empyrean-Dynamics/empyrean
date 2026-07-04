@@ -643,6 +643,7 @@ fn _query_radar<'py>(
     mc_seed = None,
     propagation_config_dict = None,
     with_tagged_covariance = false,
+    builtsystem = None,
 ))]
 fn _propagate<'py>(
     py: Python<'py>,
@@ -695,6 +696,15 @@ fn _propagate<'py>(
     // readback arrays (aligned 1:1 with `states`) into the result dict.
     // The default non-tagged path is unchanged and pays nothing.
     with_tagged_covariance: bool,
+    // Optional reusable pre-built force-model handle. When present, the
+    // forward model runs through the frozen [`empyrean::BuiltSystem`]
+    // (validating the handle's key + source-data identity on every call —
+    // a mismatch is a loud, distinct error, never a silent rebuild)
+    // instead of assembling the force model one-shot. The result is
+    // bit-identical to the one-shot on the matching key: only *when* the
+    // force model is assembled differs, never the numerics or the
+    // marshaling below.
+    builtsystem: Option<Py<PyBuiltSystem>>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let _ = (
         num_threads,
@@ -879,9 +889,21 @@ fn _propagate<'py>(
         .collect();
     let n_times = times_slice.len();
 
-    let prop_result = py
-        .detach(|| ctx.propagate(&orbits, &times_slice, &config))
-        .map_err(to_pyerr)?;
+    // Dispatch through the reusable handle when supplied, else one-shot.
+    // Both release the GIL (`py.detach`) around the native propagation so
+    // a shared `Sync` handle runs concurrently across Python threads. The
+    // handle path runs the identity guard first: a data / frame /
+    // force-model / divisor / staleness mismatch is a loud, distinct
+    // error, never a silent rebuild.
+    let handle_ref: Option<&empyrean::BuiltSystem> = builtsystem.as_ref().map(|b| &b.get().inner);
+    let prop_result = match handle_ref {
+        Some(h) => py
+            .detach(|| h.propagate(ctx, &orbits, &times_slice, &config))
+            .map_err(builtsystem_guard_err)?,
+        None => py
+            .detach(|| ctx.propagate(&orbits, &times_slice, &config))
+            .map_err(to_pyerr)?,
+    };
 
     let m = prop_result.states.len();
 
@@ -1890,6 +1912,7 @@ fn _get_observers<'py>(
     mc_n_samples = 1000,
     mc_seed = None,
     ephemeris_config_dict = None,
+    builtsystem = None,
 ))]
 fn _generate_ephemeris<'py>(
     py: Python<'py>,
@@ -1934,6 +1957,12 @@ fn _generate_ephemeris<'py>(
     mc_n_samples: usize,
     mc_seed: Option<u64>,
     ephemeris_config_dict: Option<&Bound<'py, PyDict>>,
+    // Optional reusable pre-built force-model handle (see `_propagate`).
+    // The ephemeris pipeline integrates in EclipticJ2000, so an
+    // ephemeris-reuse handle must be frozen at `Frame::EclipticJ2000` and
+    // the engine-default divisor; a mismatching handle is rejected loudly
+    // by the identity guard rather than served under the wrong dynamics.
+    builtsystem: Option<Py<PyBuiltSystem>>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let _ = (
         epsilon,
@@ -2094,9 +2123,18 @@ fn _generate_ephemeris<'py>(
         eph_config.propagation.force_model = force_model_tier;
         eph_config.propagation.frame = empyrean::Frame::EclipticJ2000;
     }
-    let eph_result = py
-        .detach(|| ctx.generate_ephemeris(&orbits, &observers, &eph_config))
-        .map_err(to_pyerr)?;
+    // Dispatch through the reusable handle when supplied, else one-shot.
+    // Both release the GIL around the native call; the handle path runs
+    // the identity guard first (loud, distinct error on any mismatch).
+    let handle_ref: Option<&empyrean::BuiltSystem> = builtsystem.as_ref().map(|b| &b.get().inner);
+    let eph_result = match handle_ref {
+        Some(h) => py
+            .detach(|| h.generate_ephemeris(ctx, &orbits, &observers, &eph_config))
+            .map_err(builtsystem_guard_err)?,
+        None => py
+            .detach(|| ctx.generate_ephemeris(&orbits, &observers, &eph_config))
+            .map_err(to_pyerr)?,
+    };
     let entries = &eph_result.entries;
 
     let m = entries.len();
@@ -4969,6 +5007,222 @@ impl PySession {
     }
 }
 
+// ══════════════════════════════════════════════════════════
+//  BuiltSystem — reusable pre-built force-model handle
+// ══════════════════════════════════════════════════════════
+
+/// Map a C-ABI force-model tier code (0/1/2) to the wrapper
+/// [`empyrean::ForceModelTier`]. An unknown code is a loud error — never
+/// a silent fallback into a wrong tier.
+fn force_model_tier_from_int(v: i32) -> PyResult<empyrean::ForceModelTier> {
+    match v {
+        0 => Ok(empyrean::ForceModelTier::Approximate),
+        1 => Ok(empyrean::ForceModelTier::Basic),
+        2 => Ok(empyrean::ForceModelTier::Standard),
+        _ => Err(PyRuntimeError::new_err(format!(
+            "unknown or unsupported force model tier: {v}"
+        ))),
+    }
+}
+
+/// Map a wrapper [`empyrean::ForceModelTier`] back to its C-ABI code.
+/// Explicit match (never an enum-as-int cast) so a reordering of the
+/// wrapper enum can't silently desync the Python-side code.
+fn force_model_tier_to_int(t: empyrean::ForceModelTier) -> i32 {
+    match t {
+        empyrean::ForceModelTier::Approximate => 0,
+        empyrean::ForceModelTier::Basic => 1,
+        empyrean::ForceModelTier::Standard => 2,
+    }
+}
+
+/// Convert a wrapper identity-guard rejection into a loud, axis-specific
+/// Python exception. A [`empyrean::BuiltSystem`] never silently rebuilds:
+/// a data / frame / force-model / divisor / staleness mismatch each
+/// surfaces as a distinct `ValueError`. Non-guard errors fall through to
+/// the ordinary runtime-error mapping.
+fn builtsystem_guard_err(e: empyrean::Error) -> PyErr {
+    match e.builtsystem_guard() {
+        Some(axis) => {
+            let detail = match axis {
+                empyrean::BuiltSystemGuardError::DataMismatch => {
+                    "data mismatch — this handle was built from different ephemeris \
+                     data than the active context; rebuild the handle after any \
+                     data (re)load"
+                }
+                empyrean::BuiltSystemGuardError::KeyMismatchFrame => {
+                    "frame mismatch — the call's frame differs from the handle's \
+                     frozen frame; rebuild the handle for this frame"
+                }
+                empyrean::BuiltSystemGuardError::KeyMismatchForceModel => {
+                    "force-model mismatch — the call's force model differs from the \
+                     handle's frozen force model; rebuild the handle for this \
+                     force model"
+                }
+                empyrean::BuiltSystemGuardError::KeyMismatchDivisor => {
+                    "divisor mismatch — the call's encounter-timescale divisor \
+                     differs from the handle's frozen divisor; rebuild the handle"
+                }
+                empyrean::BuiltSystemGuardError::Stale => {
+                    "stale handle — the context's data changed after this handle \
+                     was built; rebuild the handle"
+                }
+            };
+            PyValueError::new_err(format!("BuiltSystem identity guard: {detail} ({e})"))
+        }
+        None => to_pyerr(e),
+    }
+}
+
+/// Map a wrapper [`empyrean::KernelKind`] to its stable lowercase tag.
+fn kernel_kind_str(k: empyrean::KernelKind) -> &'static str {
+    match k {
+        empyrean::KernelKind::Spk => "spk",
+        empyrean::KernelKind::Bpc => "bpc",
+        empyrean::KernelKind::Tpc => "tpc",
+        empyrean::KernelKind::Gravity => "gravity",
+        empyrean::KernelKind::ObsCodes => "obscodes",
+    }
+}
+
+/// Marshal a wrapper [`empyrean::SystemDescription`] into the flat dict
+/// the Python `SystemDescription` dataclass consumes. Every provenance
+/// field is copied — no dropped or defaulted field; a `None` cell only
+/// where the native provenance genuinely has no value for that variant.
+fn system_description_to_pydict<'py>(
+    py: Python<'py>,
+    d: &empyrean::SystemDescription,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("force_model", force_model_tier_to_int(d.force_model))?;
+    dict.set_item("frame", empyrean::frame_to_int(d.frame))?;
+    dict.set_item("encounter_timescale_divisor", d.encounter_timescale_divisor)?;
+    dict.set_item("relativistic", d.relativistic)?;
+    dict.set_item("asteroids", d.asteroids)?;
+    dict.set_item("has_bpc", d.has_bpc)?;
+    dict.set_item("perturber_origins", d.perturber_origins.clone())?;
+
+    let kernels = pyo3::types::PyList::empty(py);
+    for rec in &d.kernels {
+        let k = PyDict::new(py);
+        k.set_item("kind", kernel_kind_str(rec.kind))?;
+        match &rec.provenance {
+            empyrean::KernelProvenance::File {
+                path,
+                sha256,
+                bytes,
+            } => {
+                k.set_item("provenance", "file")?;
+                k.set_item("path", path.to_string_lossy().into_owned())?;
+                k.set_item("sha256", sha256.clone())?;
+                k.set_item("bytes", *bytes)?;
+                k.set_item("name", Option::<String>::None)?;
+            }
+            empyrean::KernelProvenance::InMemory => {
+                k.set_item("provenance", "in_memory")?;
+                k.set_item("path", Option::<String>::None)?;
+                k.set_item("sha256", Option::<String>::None)?;
+                k.set_item("bytes", Option::<u64>::None)?;
+                k.set_item("name", Option::<String>::None)?;
+            }
+            empyrean::KernelProvenance::BuiltIn { name } => {
+                k.set_item("provenance", "built_in")?;
+                k.set_item("path", Option::<String>::None)?;
+                k.set_item("sha256", Option::<String>::None)?;
+                k.set_item("bytes", Option::<u64>::None)?;
+                k.set_item("name", name.clone())?;
+            }
+        }
+        kernels.append(k)?;
+    }
+    dict.set_item("kernels", kernels)?;
+    Ok(dict)
+}
+
+/// Opaque reusable force-model handle exposed to Python.
+///
+/// Wraps the safe-wrapper [`empyrean::BuiltSystem`], which is
+/// `Send + Sync`; the pyclass is therefore NOT `unsendable` and is
+/// `frozen`, so one handle can be shared by reference across Python
+/// threads. Each forward-model call (routed through `_propagate` /
+/// `_generate_ephemeris` with `builtsystem=self`) releases the GIL
+/// (`py.detach`) around the native propagation, so the shared `Sync`
+/// handle actually runs concurrently instead of being serialized by the
+/// GIL. The forward-model dispatch validates the handle's frozen key and
+/// the source-data identity on every call — any mismatch is a loud,
+/// distinct error, never a silent rebuild.
+#[pyclass(name = "BuiltSystem", frozen)]
+struct PyBuiltSystem {
+    inner: empyrean::BuiltSystem,
+    force_model: i32,
+    frame: i32,
+    encounter_timescale_divisor: f64,
+}
+
+#[pymethods]
+impl PyBuiltSystem {
+    /// Assemble the force model once for `(force_model, frame)`, freezing
+    /// `encounter_timescale_divisor` into the key. Pass `0.0` to freeze
+    /// the engine default. Uses the module-global context; rebuild the
+    /// handle after any data (re)load.
+    #[new]
+    #[pyo3(signature = (force_model, frame, encounter_timescale_divisor = 0.0))]
+    fn new(force_model: i32, frame: i32, encounter_timescale_divisor: f64) -> PyResult<Self> {
+        let ctx = get_context()?;
+        let tier = force_model_tier_from_int(force_model)?;
+        let fr = empyrean::int_to_frame(frame).map_err(to_pyerr)?;
+        let inner = ctx
+            .built_system(tier, fr, encounter_timescale_divisor)
+            .map_err(to_pyerr)?;
+        // Read the frozen divisor back so the recorded key reflects the
+        // engine default when the 0.0 sentinel was passed.
+        let divisor = inner
+            .describe()
+            .map(|d| d.encounter_timescale_divisor)
+            .unwrap_or(encounter_timescale_divisor);
+        Ok(Self {
+            inner,
+            force_model,
+            frame,
+            encounter_timescale_divisor: divisor,
+        })
+    }
+
+    /// The frozen force-model tier code (0 = Approximate, 1 = Basic,
+    /// 2 = Standard).
+    #[getter]
+    fn force_model(&self) -> i32 {
+        self.force_model
+    }
+
+    /// The frozen frame code.
+    #[getter]
+    fn frame(&self) -> i32 {
+        self.frame
+    }
+
+    /// The frozen encounter-timescale divisor (engine default resolved).
+    #[getter]
+    fn encounter_timescale_divisor(&self) -> f64 {
+        self.encounter_timescale_divisor
+    }
+
+    /// Full reproducibility summary of the frozen force model plus the
+    /// captured kernel manifest. Every field is populated; nothing is
+    /// defaulted.
+    fn describe<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let desc = self.inner.describe().map_err(to_pyerr)?;
+        system_description_to_pydict(py, &desc)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "BuiltSystem(force_model={}, frame={}, encounter_timescale_divisor={})",
+            self.force_model, self.frame, self.encounter_timescale_divisor
+        )
+    }
+}
+
 fn add_station_biases_to_dict(
     dict: &Bound<'_, PyDict>,
     biases: &[empyrean::StationBias],
@@ -5152,5 +5406,6 @@ fn _empyrean_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_write_residuals_json, m)?)?;
     m.add_function(wrap_pyfunction!(_write_residuals_csv, m)?)?;
     m.add_class::<PySession>()?;
+    m.add_class::<PyBuiltSystem>()?;
     Ok(())
 }

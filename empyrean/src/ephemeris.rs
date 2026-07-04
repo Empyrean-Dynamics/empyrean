@@ -250,35 +250,8 @@ impl Context {
         config: &EphemerisConfig,
     ) -> Result<EphemerisResult> {
         let _ = (Frame::ICRF, UncertaintyMethod::FirstOrder); // suppress unused-import in default-config branch
-        let mut _orbit_keep: Vec<crate::orbit::OrbitFfiKeep> = Vec::with_capacity(orbits.len());
-        let ffi_orbits: Vec<_> = orbits
-            .iter()
-            .map(|o| {
-                let (ffi, keep) = o.to_ffi_with_keep()?;
-                _orbit_keep.push(keep);
-                Ok(ffi)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let ffi_observers: Vec<empyrean_sys::EmpyreanObserver> = observers
-            .iter()
-            .map(|o| {
-                let mut code_bytes = [0u8; 4];
-                let src = o.obs_code.as_bytes();
-                let n = src.len().min(3);
-                code_bytes[..n].copy_from_slice(&src[..n]);
-                Ok(empyrean_sys::EmpyreanObserver {
-                    obs_code: code_bytes,
-                    epoch_mjd_tdb: o.epoch.mjd_tdb()?,
-                    x: o.position[0],
-                    y: o.position[1],
-                    z: o.position[2],
-                    vx: o.velocity[0],
-                    vy: o.velocity[1],
-                    vz: o.velocity[2],
-                    observing_night: o.observing_night,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let (ffi_orbits, _orbit_keep) = crate::orbit::orbits_to_ffi(orbits)?;
+        let ffi_observers = observers_to_ffi(observers)?;
 
         let mut result = empyrean_sys::EmpyreanEphemerisResult {
             entries: std::ptr::null_mut(),
@@ -301,26 +274,70 @@ impl Context {
         if code != 0 {
             return Err(Error::capture(code));
         }
-        let entries = unsafe {
+        Ok(marshal_ephemeris_result(&mut result))
+    }
+}
+
+/// Marshal an observer batch into the FFI representation. Shared by the
+/// one-shot [`Context::generate_ephemeris`] and the pre-built
+/// [`BuiltSystem::generate_ephemeris`](crate::BuiltSystem::generate_ephemeris)
+/// so both feed the engine byte-identical observer rows.
+pub(crate) fn observers_to_ffi(
+    observers: &[Observer],
+) -> Result<Vec<empyrean_sys::EmpyreanObserver>> {
+    observers
+        .iter()
+        .map(|o| {
+            let mut code_bytes = [0u8; 4];
+            let src = o.obs_code.as_bytes();
+            let n = src.len().min(3);
+            code_bytes[..n].copy_from_slice(&src[..n]);
+            Ok(empyrean_sys::EmpyreanObserver {
+                obs_code: code_bytes,
+                epoch_mjd_tdb: o.epoch.mjd_tdb()?,
+                x: o.position[0],
+                y: o.position[1],
+                z: o.position[2],
+                vx: o.velocity[0],
+                vy: o.velocity[1],
+                vz: o.velocity[2],
+                observing_night: o.observing_night,
+            })
+        })
+        .collect::<Result<Vec<_>>>()
+}
+
+/// Marshal a populated FFI ephemeris result into the safe
+/// [`EphemerisResult`] and free the raw result. Shared by the one-shot
+/// [`Context::generate_ephemeris`] and the pre-built
+/// [`BuiltSystem::generate_ephemeris`](crate::BuiltSystem::generate_ephemeris)
+/// so both produce byte-identical output.
+pub(crate) fn marshal_ephemeris_result(
+    result: &mut empyrean_sys::EmpyreanEphemerisResult,
+) -> EphemerisResult {
+    let entries = if result.entries.is_null() {
+        Vec::new()
+    } else {
+        unsafe {
             std::slice::from_raw_parts(result.entries, result.num_entries)
                 .iter()
                 .map(EphemerisEntry::from_ffi)
                 .collect()
-        };
-        let sensitivity = if result.sensitivity.is_null() {
-            Vec::new()
-        } else {
-            unsafe {
-                std::slice::from_raw_parts(result.sensitivity, result.num_sensitivity)
-                    .iter()
-                    .map(ObservationSensitivity::from_ffi)
-                    .collect()
-            }
-        };
-        unsafe { empyrean_sys::empyrean_ephemeris_result_free(&mut result) };
-        Ok(EphemerisResult {
-            entries,
-            sensitivity,
-        })
+        }
+    };
+    let sensitivity = if result.sensitivity.is_null() {
+        Vec::new()
+    } else {
+        unsafe {
+            std::slice::from_raw_parts(result.sensitivity, result.num_sensitivity)
+                .iter()
+                .map(ObservationSensitivity::from_ffi)
+                .collect()
+        }
+    };
+    unsafe { empyrean_sys::empyrean_ephemeris_result_free(result) };
+    EphemerisResult {
+        entries,
+        sensitivity,
     }
 }

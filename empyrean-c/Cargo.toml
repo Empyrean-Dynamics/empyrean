@@ -44,3 +44,9 @@ openssl = { version = "0.10", features = ["vendored"] }
 
 [build-dependencies]
 cbindgen = "0.29"
+
+[dev-dependencies]
+# Test-only: independently re-digests a loaded kernel to verify the
+# BuiltSystem handle's captured manifest reports the true SHA-256. Never
+# linked into the distributed cdylib.
+sha2 = "0.10"

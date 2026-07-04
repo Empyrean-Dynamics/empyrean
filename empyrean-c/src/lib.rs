@@ -7,6 +7,7 @@
 #![allow(clippy::missing_safety_doc)]
 #![allow(clippy::field_reassign_with_default)]
 
+mod built_system;
 mod ephemeris;
 mod impact;
 mod io;

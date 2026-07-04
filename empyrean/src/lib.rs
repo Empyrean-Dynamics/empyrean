@@ -98,6 +98,7 @@
 //!   [`PropagationConfig::frame`] to [`Frame::ICRF`] for ICRF output.
 #![warn(missing_docs)]
 
+mod built_system;
 mod context;
 mod coordinate;
 mod ephemeris;
@@ -117,6 +118,10 @@ pub mod time;
 mod transform;
 mod version;
 
+pub use built_system::{
+    BuiltSystem, BuiltSystemGuardError, KernelKind, KernelProvenance, KernelRecord,
+    SystemDescription,
+};
 pub use context::{Context, default_data_dir, download_data};
 pub use coordinate::{
     CoordinateState, Frame, Origin, Representation, frame_to_int, int_to_frame, int_to_rep,

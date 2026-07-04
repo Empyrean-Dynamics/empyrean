@@ -1,4 +1,4 @@
-"""Tests for the provenance-tagged covariance readback (empyrean-23z0).
+"""Tests for the provenance-tagged covariance readback.
 
 ``propagate(..., tagged_covariance=True)`` surfaces villeneuve's
 resolved-kind, provenance-tagged covariance at every output epoch —

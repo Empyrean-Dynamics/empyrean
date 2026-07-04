@@ -177,7 +177,7 @@ pub struct EmpyreanOrbit {
     pub ng_k: f64,
     #[doc = " SBDB non-grav time delay in days. Use NaN for no delay (the\n asteroid default and the Marsden water-ice default for comets\n SBDB doesn't fit a delay for). Set to a finite value (positive\n or negative) when SBDB's `model_pars[]` exposes a `DT` field —\n e.g. 67P (+45.7d), 46P/Wirtanen (−14.1d), 2I/Borisov (−65.1d)."]
     pub non_grav_dt: f64,
-    #[doc = " 1 when `non_grav_covariance` carries a non-grav prior covariance; 0\n otherwise. Set by the OD output path (a fitted orbit) so it re-feeds\n into a StateAndNonGrav refine without losing its non-grav prior\n (empyrean-wo4n); leave 0 for hand-built / SBDB / propagate inputs."]
+    #[doc = " 1 when `non_grav_covariance` carries a non-grav prior covariance; 0\n otherwise. Set by the OD output path (a fitted orbit) so it re-feeds\n into a StateAndNonGrav refine without losing its non-grav prior;\n leave 0 for hand-built / SBDB / propagate inputs."]
     pub has_non_grav_covariance: u8,
     #[doc = " Non-grav 3×3 covariance for (A1, A2, A3), row-major. Only read when\n `has_non_grav_covariance = 1`."]
     pub non_grav_covariance: [[f64; 3usize]; 3usize],
@@ -703,7 +703,7 @@ impl Default for EmpyreanEphemerisEntry {
         }
     }
 }
-#[doc = " One observation-sensitivity row — the partial derivatives of the\n sky-plane observable w.r.t. the input state, for a single\n `(orbit, observer, epoch)`. One row per observation epoch within each\n `(orbit_id, obs_code)` chain (bd empyrean-14cz.4). Owning struct: free\n the whole result with [`empyrean_ephemeris_result_free`]."]
+#[doc = " One observation-sensitivity row — the partial derivatives of the\n sky-plane observable w.r.t. the input state, for a single\n `(orbit, observer, epoch)`. One row per observation epoch within each\n `(orbit_id, obs_code)` chain. Owning struct: free\n the whole result with [`empyrean_ephemeris_result_free`]."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct EmpyreanObservationSensitivity {
@@ -2146,7 +2146,7 @@ pub struct EmpyreanNonGravParams {
     pub non_grav_dt: f64,
     #[doc = " 1 when `covariance` carries the fitted non-grav covariance; 0 otherwise."]
     pub has_covariance: u8,
-    #[doc = " Fitted non-grav 3×3 covariance for (A1, A2, A3), row-major. Only\n meaningful when `has_covariance = 1`. Re-feeding it onto an input\n orbit lets a fitted orbit flow into a StateAndNonGrav refine without\n losing its non-grav prior (empyrean-wo4n)."]
+    #[doc = " Fitted non-grav 3×3 covariance for (A1, A2, A3), row-major. Only\n meaningful when `has_covariance = 1`. Re-feeding it onto an input\n orbit lets a fitted orbit flow into a StateAndNonGrav refine without\n losing its non-grav prior."]
     pub covariance: [[f64; 3usize]; 3usize],
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
@@ -2250,7 +2250,7 @@ const _: () = {
         fractional_sigma_a_threshold
     ) - 112usize];
 };
-#[doc = " One per-station bias estimate from a Schur-eliminated nuisance fit.\n\n Mirrors [`scott::results::StationBias`]. Populated rows in the\n returned array correspond to stations that met the\n `min_obs_per_station` threshold; under-observed stations are absent.\n Timing fields are populated only when a `BiasKind::StationTiming`\n nuisance was active (currently no surface to enable it from the C\n ABI; reserved for the upcoming `empyrean-96r` follow-up).\n\n `obs_code` is heap-allocated and owned by the parent array — freed\n by [`empyrean_od_result_free`] when the result is freed. Don't free\n it manually."]
+#[doc = " One per-station bias estimate from a Schur-eliminated nuisance fit.\n\n Mirrors [`scott::results::StationBias`]. Populated rows in the\n returned array correspond to stations that met the\n `min_obs_per_station` threshold; under-observed stations are absent.\n Timing fields are populated only when a `BiasKind::StationTiming`\n nuisance was active (currently no surface to enable it from the C\n ABI; reserved for a planned follow-up).\n\n `obs_code` is heap-allocated and owned by the parent array — freed\n by [`empyrean_od_result_free`] when the result is freed. Don't free\n it manually."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct EmpyreanStationBias {
@@ -2261,7 +2261,7 @@ pub struct EmpyreanStationBias {
     pub sigma_ra_arcsec: f64,
     pub bias_dec_arcsec: f64,
     pub sigma_dec_arcsec: f64,
-    #[doc = " 1 when the timing bias is populated; 0 otherwise. Reserved for\n the post-empyrean-96r `BiasKind::StationTiming` epic."]
+    #[doc = " 1 when the timing bias is populated; 0 otherwise. Reserved for\n the planned `BiasKind::StationTiming` follow-up."]
     pub has_timing: u8,
     pub bias_timing_sec: f64,
     pub sigma_timing_sec: f64,

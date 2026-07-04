@@ -1,4 +1,4 @@
-"""Lock the SBDB non-grav round-trip (empyrean-14cz item 1).
+"""Lock the SBDB non-grav round-trip.
 
 ``query_sbdb`` -> ``orbit_batch_dict_to_orbits`` must carry the FULL
 Marsden-Sekanina g(r) — the exponents (alpha/r0/m/n/k) AND the thermal-lag

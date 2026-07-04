@@ -21,7 +21,7 @@ hardcoded fixtures this test runs through empyrean-py. Regenerate it with::
     cd empyrean-core && cargo run --features validate --bin parity-oracle -- \\
       --output ../empyrean/empyrean-py/tests/fixtures/core_parity_oracle.json
 
-Design (ADR cross-channel-parity, bd empyrean-na4h.2 / na4h.4):
+Cross-channel parity design:
 
 - Both sides start from **byte-identical** Cartesian states + covariance and
   run identical physics (ForceModelTier.Standard, all event detectors on),
@@ -31,7 +31,7 @@ Design (ADR cross-channel-parity, bd empyrean-na4h.2 / na4h.4):
   means the event streams diverged, which fails hard rather than comparing
   mismatched pairs).
 - Known C-ABI drops go in :data:`KNOWN_DROPS` keyed ``(table, field)`` with a
-  tracking issue. The list is **reverse-enforced**: if every occurrence of a
+  reason. The list is **reverse-enforced**: if every occurrence of a
   listed field starts matching core (the drop was fixed), the entry is stale
   and the test fails to force its removal.
 """
@@ -154,7 +154,7 @@ BPLANE_FIELDS = [
     "ip_linear",
 ]
 # Ephemeris sky-position scalars. The aberrated-state / sky-covariance drops
-# (empyrean-j2ue / -mgn9) are all-null and owned by test_no_silent_drops, so
+# are all-null and owned by test_no_silent_drops, so
 # they are intentionally not projected here.
 EPH_COORD_FIELDS = ["lon", "lat", "rho", "vrho", "vlon", "vlat"]
 EPH_TOP_FIELDS = [
@@ -172,11 +172,11 @@ EPH_TOP_FIELDS = [
     "sky_rate",
 ]
 
-# Fields the C ABI drops, by (table, field) -> tracking issue. Each is a
+# Fields the C ABI drops, by (table, field) -> reason. Each is a
 # value core populates but the channel hardcodes to a sentinel
-# (np.nan / 0.0). Remove an entry when its issue closes — the test
+# (np.nan / 0.0). Remove an entry when the drop is fixed — the test
 # reverse-enforces (fails if every occurrence starts matching core).
-# Known C-ABI drops (table, field) -> issue, from the shared manifest.
+# Known C-ABI drops (table, field) -> reason, from the shared manifest.
 # Reverse-enforced below: if every occurrence of a listed field starts
 # matching core (the drop was fixed), the entry is stale and the test fails
 # to force its removal from the manifest.

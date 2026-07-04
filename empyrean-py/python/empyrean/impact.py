@@ -68,7 +68,7 @@ METHOD_AUTO = "auto"
 # canonical Python label. The Rust side uses 0=First, 1=Second,
 # 2=SigmaPoint, 3=MonteCarlo, 4=Auto (matches the EMPYREAN_UNCERTAINTY_*
 # constants in empyrean-c/src/propagate.rs). A missing tag-4 entry silently
-# mislabelled Auto IP/B-plane rows (empyrean-uogb).
+# mislabelled Auto IP/B-plane rows.
 _TAG_TO_METHOD = {
     0: METHOD_FIRST_ORDER,
     1: METHOD_SECOND_ORDER,

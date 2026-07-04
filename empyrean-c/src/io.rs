@@ -208,7 +208,7 @@ fn row_to_orbit(row: &OrbitRow) -> Result<(EmpyreanOrbit, String, Option<String>
         // villeneuve::io::orbit_row gets a `non_grav_dt` field.
         non_grav_dt: f64::NAN,
         // Non-grav covariance is an OD-output concept (a fitted prior); the
-        // orbit-read paths don't carry it (empyrean-wo4n).
+        // orbit-read paths don't carry it.
         has_non_grav_covariance: 0,
         non_grav_covariance: [[0.0; 3]; 3],
         // OrbitRow JSON/parquet schema does not carry photometry yet;
@@ -432,7 +432,7 @@ pub(crate) fn orbits_to_batch(orbits: &Orbits<AU>) -> Result<EmpyreanOrbitBatch,
             ng_k: 0.0,
             non_grav_dt: f64::NAN,
             // Non-grav covariance is an OD-output concept; the read-orbits
-            // path doesn't carry it (empyrean-wo4n).
+            // path doesn't carry it.
             has_non_grav_covariance: 0,
             non_grav_covariance: [[0.0; 3]; 3],
             // Photometry is not currently carried through the read-orbits
@@ -692,8 +692,7 @@ struct EphemerisRow {
     mag: f64,
     mag_sigma: f64,
     // Topocentric / sky-motion angles — present on EmpyreanEphemerisEntry
-    // (the wrapper fills them) but previously omitted by every file writer
-    // (bd empyrean-i7u5).
+    // (the wrapper fills them) but previously omitted by every file writer.
     zenith_angle_deg: f64,
     azimuth_deg: f64,
     hour_angle_deg: f64,
@@ -793,7 +792,7 @@ pub unsafe extern "C" fn empyrean_ephemeris_write_csv(
 
 // Carries the full per-event-type payload, mirroring `EmpyreanEvent` —
 // previously common-fields-only, which silently dropped every type-specific
-// field on the file path (bd empyrean-i7u5). Inapplicable fields are NaN /
+// field on the file path. Inapplicable fields are NaN /
 // `-1` sentinels for a given event type, matching the in-memory Event.
 #[derive(Debug, Serialize, Deserialize)]
 struct EventRow {

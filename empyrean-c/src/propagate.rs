@@ -121,8 +121,8 @@ pub struct EmpyreanOrbit {
     pub non_grav_dt: f64,
     /// 1 when `non_grav_covariance` carries a non-grav prior covariance; 0
     /// otherwise. Set by the OD output path (a fitted orbit) so it re-feeds
-    /// into a StateAndNonGrav refine without losing its non-grav prior
-    /// (empyrean-wo4n); leave 0 for hand-built / SBDB / propagate inputs.
+    /// into a StateAndNonGrav refine without losing its non-grav prior;
+    /// leave 0 for hand-built / SBDB / propagate inputs.
     pub has_non_grav_covariance: u8,
     /// Non-grav 3×3 covariance for (A1, A2, A3), row-major. Only read when
     /// `has_non_grav_covariance = 1`.
@@ -897,7 +897,7 @@ pub(crate) fn empyrean_orbit_non_grav_params(orbit: &EmpyreanOrbit) -> Option<No
         a3: orbit.a3,
         model: NonGravModel::MarsdenSekanina(g_func),
         // Carry the non-grav prior covariance back in when present so a
-        // fitted orbit re-feeds into a StateAndNonGrav refine (empyrean-wo4n).
+        // fitted orbit re-feeds into a StateAndNonGrav refine.
         covariance: if orbit.has_non_grav_covariance != 0 {
             Some(orbit.non_grav_covariance)
         } else {

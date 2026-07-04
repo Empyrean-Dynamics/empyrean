@@ -291,7 +291,7 @@ def test_impact_probabilities_carry_user_orbit_id_and_object_id() -> None:
     reason=(
         "BPlanes schema has no orbit_id / object_id columns yet, and the "
         "underlying EmpyreanBPlane C struct (empyrean-c/src/impact.rs:75-94) "
-        "doesn't carry them either. Tracked in empyrean-3ud6 — when those "
+        "doesn't carry them either. A known gap — when those "
         "fields are wired through, this test should start passing and the "
         "xfail marker can be removed."
     ),

@@ -8,12 +8,13 @@
 //! exercises the CLI's **output-serialization** layer (the `write_*` file
 //! writers) end-to-end — the one surface py/wrapper don't touch.
 //!
-//! Scope (bd empyrean-na4h.5): the CLI has only `propagate` + `ephemeris`
-//! commands (no impact-probabilities / b-planes), so only those two ops are
-//! compared. Beyond the shared C-ABI drops, the CLI file writers drop more
-//! (bd empyrean-i7u5): `write_events_*` emits common fields only (no
-//! per-event-type fields), and the ephemeris writer omits the 6 topocentric
-//! angles. Those CLI-specific drops are allow-listed in CLI_EXTRA_DROPS.
+//! Scope: the CLI has only `propagate` + `ephemeris` commands (no
+//! impact-probabilities / b-planes), so only those two ops are compared.
+//! Historically, beyond the shared C-ABI drops, the CLI file writers
+//! dropped more: `write_events_*` emitted common fields only (no
+//! per-event-type fields), and the ephemeris writer omitted the 6
+//! topocentric angles. Any CLI-specific drops are allow-listed in
+//! CLI_EXTRA_DROPS.
 //!
 //! Needs kernels (EMPYREAN_DATA_DIR / XDG) + the `libempyrean` dylib. If the
 //! binary can't init a context, the test logs and returns (skips).
@@ -66,11 +67,12 @@ struct Manifest {
     tolerances: Tolerances,
 }
 
-/// CLI-only drops beyond the shared C-ABI ones. Now EMPTY: bd empyrean-i7u5
-/// is fully fixed — both the events file writer (full per-event-type
-/// payload) and the ephemeris writer (6 topocentric angles) carry every
-/// field the wrapper/core do. Kept as a hook so a future CLI-specific
-/// output drop has a home (and the test reverse-enforces a stale entry).
+/// CLI-only drops beyond the shared C-ABI ones. Now EMPTY: the historical
+/// CLI file-writer drops are fully fixed — both the events file writer
+/// (full per-event-type payload) and the ephemeris writer (6 topocentric
+/// angles) carry every field the wrapper/core do. Kept as a hook so a
+/// future CLI-specific output drop has a home (and the test
+/// reverse-enforces a stale entry).
 const CLI_EXTRA_DROPS: &[(&str, &str)] = &[];
 
 fn data_dir() -> PathBuf {
@@ -202,9 +204,8 @@ fn project_scenario(s: &Scenario, tmp: &Path) -> Option<BTreeMap<String, Option<
         let d_km = cell(r, &hdr, "distance_km");
         let rv = cell(r, &hdr, "relative_velocity_au_day");
         let c = |name: &str| cell(r, &hdr, name);
-        // The CLI events file now carries the full per-event-type payload
-        // (bd empyrean-i7u5 fixed), so each table compares everything the
-        // oracle emits for it.
+        // The CLI events file now carries the full per-event-type payload,
+        // so each table compares everything the oracle emits for it.
         let (table, fields): (&'static str, Row) = match et(r).as_str() {
             // close_approach START/END are zone-boundary (threshold-crossing)
             // events — ill-conditioned, and the CLI takes a single --epoch so
@@ -257,9 +258,9 @@ fn project_scenario(s: &Scenario, tmp: &Path) -> Option<BTreeMap<String, Option<
             // threshold crossing — a steep function the CLI's single --epoch
             // can't reproduce vs the oracle's grid for the chaotic impactor
             // (the only fixture that fires shadow; differs ~56%, like the
-            // close-approach boundaries). The fields ARE carried (i7u5 fixed
-            // — verified by the CSV header + the grid-driven py/wrapper
-            // channels); excluded from the CLI VALUE comparison only.
+            // close-approach boundaries). The fields ARE carried —
+            // verified by the CSV header + the grid-driven py/wrapper
+            // channels; excluded from the CLI VALUE comparison only.
             "shadow_entry" | "shadow_exit" => continue,
             _ => continue,
         };

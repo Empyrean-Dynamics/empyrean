@@ -77,8 +77,8 @@ pub struct Orbit {
     pub non_grav_dt: Option<f64>,
     /// Fitted non-grav 3×3 covariance for (A1, A2, A3), row-major. Set by
     /// the OD output path (a fitted orbit) so the orbit re-feeds into a
-    /// `StateAndNonGrav` refine without losing its non-grav prior
-    /// (empyrean-wo4n). `None` for hand-built / SBDB / propagate inputs.
+    /// `StateAndNonGrav` refine without losing its non-grav prior.
+    /// `None` for hand-built / SBDB / propagate inputs.
     pub ng_covariance: Option<[[f64; 3]; 3]>,
     /// Phase function. `None` disables magnitude computation in ephemeris
     /// generation; the corresponding row gets `mag = NaN`.
@@ -168,7 +168,7 @@ impl Orbit {
 
     /// Attach the fitted non-grav 3×3 covariance for (A1, A2, A3). Set by
     /// the OD output path so a fitted orbit re-feeds into a `StateAndNonGrav`
-    /// refine without losing its non-grav prior (empyrean-wo4n).
+    /// refine without losing its non-grav prior.
     pub fn with_nongrav_covariance(mut self, covariance: Option<[[f64; 3]; 3]>) -> Self {
         self.ng_covariance = covariance;
         self
@@ -236,7 +236,7 @@ impl Orbit {
             // is_finite() to decide whether to populate NonGravParams.dt.
             non_grav_dt: self.non_grav_dt.unwrap_or(f64::NAN),
             // Carry the fitted non-grav prior covariance into the FFI so a
-            // fitted orbit re-feeds into a StateAndNonGrav refine (empyrean-wo4n).
+            // fitted orbit re-feeds into a StateAndNonGrav refine.
             has_non_grav_covariance: u8::from(self.ng_covariance.is_some()),
             non_grav_covariance: self.ng_covariance.unwrap_or([[0.0; 3]; 3]),
             phot_system: phase_int,

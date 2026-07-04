@@ -8,7 +8,7 @@
 #ifndef EMPYREAN_H
 #define EMPYREAN_H
 
-/* Generated with cbindgen:0.29.2 */
+/* Generated with cbindgen:0.29.4 */
 
 #include <stddef.h>
 #include <stdint.h>
@@ -509,8 +509,8 @@ struct EmpyreanOrbit {
     /**
      * 1 when `non_grav_covariance` carries a non-grav prior covariance; 0
      * otherwise. Set by the OD output path (a fitted orbit) so it re-feeds
-     * into a StateAndNonGrav refine without losing its non-grav prior
-     * (empyrean-wo4n); leave 0 for hand-built / SBDB / propagate inputs.
+     * into a StateAndNonGrav refine without losing its non-grav prior;
+     * leave 0 for hand-built / SBDB / propagate inputs.
      */
     uint8_t has_non_grav_covariance;
     /**
@@ -989,7 +989,7 @@ struct EmpyreanEphemerisEntry {
  * One observation-sensitivity row — the partial derivatives of the
  * sky-plane observable w.r.t. the input state, for a single
  * `(orbit, observer, epoch)`. One row per observation epoch within each
- * `(orbit_id, obs_code)` chain (bd empyrean-14cz.4). Owning struct: free
+ * `(orbit_id, obs_code)` chain. Owning struct: free
  * the whole result with [`empyrean_ephemeris_result_free`].
  */
 struct EmpyreanObservationSensitivity {
@@ -2244,7 +2244,7 @@ struct EmpyreanNonGravParams {
      * Fitted non-grav 3×3 covariance for (A1, A2, A3), row-major. Only
      * meaningful when `has_covariance = 1`. Re-feeding it onto an input
      * orbit lets a fitted orbit flow into a StateAndNonGrav refine without
-     * losing its non-grav prior (empyrean-wo4n).
+     * losing its non-grav prior.
      */
     double covariance[3][3];
 };
@@ -2289,7 +2289,7 @@ struct EmpyreanAcceptabilityReport {
  * `min_obs_per_station` threshold; under-observed stations are absent.
  * Timing fields are populated only when a `BiasKind::StationTiming`
  * nuisance was active (currently no surface to enable it from the C
- * ABI; reserved for the upcoming `empyrean-96r` follow-up).
+ * ABI; reserved for a planned follow-up).
  *
  * `obs_code` is heap-allocated and owned by the parent array — freed
  * by [`empyrean_od_result_free`] when the result is freed. Don't free
@@ -2307,7 +2307,7 @@ struct EmpyreanStationBias {
     double sigma_dec_arcsec;
     /**
      * 1 when the timing bias is populated; 0 otherwise. Reserved for
-     * the post-empyrean-96r `BiasKind::StationTiming` epic.
+     * the planned `BiasKind::StationTiming` follow-up.
      */
     uint8_t has_timing;
     double bias_timing_sec;

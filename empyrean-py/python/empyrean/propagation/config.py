@@ -124,8 +124,8 @@ _UNCERTAINTY_METHOD_TO_INT = {
 
 # Inverse tag map for serializing a raw-int ``uncertainty_method`` back to its
 # wire string. Without this, ``_to_wire_dict`` coerced every non-str/non-enum
-# method (i.e. any legacy int) to "first_order" — a silent downgrade of the
-# exact class empyrean-uogb fixed for AUTO. Sigma-point / Monte-Carlo carry
+# method (i.e. any legacy int) to "first_order" — the same silent-downgrade
+# class of bug previously fixed for AUTO. Sigma-point / Monte-Carlo carry
 # their params via separate flat args, so they intentionally serialize to
 # "first_order" at the wrapper level (see apply_propagation_config_dict).
 _INT_TO_UNCERTAINTY_METHOD = {
@@ -323,8 +323,8 @@ class PropagationConfig:
             um = um_method  # not a valid method; falls through to "first_order"
         elif isinstance(um_method, int):
             # Legacy raw-int tag (0/1/4). Map back to the wire string instead
-            # of silently coercing to "first_order" (empyrean-uogb). Unknown
-            # ints (e.g. 2/3, whose params ride on flat args) fall through.
+            # of silently coercing to "first_order". Unknown ints (e.g. 2/3,
+            # whose params ride on flat args) fall through.
             um = _INT_TO_UNCERTAINTY_METHOD.get(um_method, um_method)
         else:
             um = um_method

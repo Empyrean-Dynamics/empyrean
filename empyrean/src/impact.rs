@@ -202,8 +202,8 @@ fn method_from_tag(tag: u8) -> UncertaintyMethod {
         3 => UncertaintyMethod::monte_carlo(1000),
         // Tag 4 = Auto (adaptive per-CA-window regime selection). Without
         // this arm, Auto IP / B-plane results were silently relabelled
-        // FirstOrder on readback (empyrean-uogb) — the IP value was correct
-        // but the reported method was wrong.
+        // FirstOrder on readback — the IP value was correct but the
+        // reported method was wrong.
         4 => UncertaintyMethod::auto(),
         _ => UncertaintyMethod::FirstOrder,
     }

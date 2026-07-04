@@ -7,7 +7,7 @@
 //! `core_parity_oracle.json` (produced by empyrean-core's `parity-oracle`
 //! binary). empyrean-core still carries every field; a field it populates
 //! that the wrapper drops, NaNs, or diverges on is a contract violation
-//! (bd empyrean-na4h.2, ADR cross-channel-parity).
+//! of the cross-channel parity design.
 //!
 //! Testing the wrapper directly (not only transitively via empyrean-py)
 //! gives attribution — a wrapper-layer drop fails here, localized — and
@@ -163,8 +163,7 @@ fn channel_fingerprint(ctx: &Context, s: &Scenario) -> BTreeMap<String, Option<f
                     ("distance_km", num(e.distance_km)),
                 ],
             ),
-            // Periapsis relative state now wired through the C ABI
-            // (empyrean-14cz.1).
+            // Periapsis relative state is wired through the C ABI.
             "periapsis" => (
                 "periapses",
                 vec![
@@ -195,8 +194,7 @@ fn channel_fingerprint(ctx: &Context, s: &Scenario) -> BTreeMap<String, Option<f
                 "atmospheric_exits",
                 vec![("distance_au", num(e.distance_au))],
             ),
-            // shadow_fraction / illumination now wired through the C ABI
-            // (empyrean-14cz.3).
+            // shadow_fraction / illumination are wired through the C ABI.
             "shadow_entry" => (
                 "shadow_entries",
                 vec![
@@ -211,8 +209,8 @@ fn channel_fingerprint(ctx: &Context, s: &Scenario) -> BTreeMap<String, Option<f
                     ("illumination", num(e.illumination)),
                 ],
             ),
-            // possible-impact probability payload now wired through the C
-            // ABI (empyrean-14cz.2). The miss distance is the generic event
+            // possible-impact probability payload is wired through the C
+            // ABI. The miss distance is the generic event
             // distance. ip_second_order/nonlinearity/ip_agm/ip_mc are NaN
             // (→ null) for this first-order run; oracle emits null too.
             "possible_impact" => (

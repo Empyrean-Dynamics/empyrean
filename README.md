@@ -69,7 +69,9 @@ All channels pull from the same published cdylib. Run `empyrean version`
 (CLI), `empyrean::version_string()` (Rust), or `empyrean.version_string()`
 (Python) to confirm the build provenance — every cdylib carries the
 `<tag>+<sha>` strings of the `villeneuve` / `scott` / `nolan` commits
-it was built against.
+it was built against. For per-run reproducibility, a built system
+handle's `describe()` additionally reports the force-model menu and the
+SHA-256 identity of every kernel that run loaded.
 
 ## Quickstart
 

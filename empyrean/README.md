@@ -146,6 +146,36 @@ println!("{} states", result.states.len());
 # Ok::<(), empyrean::Error>(())
 ```
 
+## System handles
+
+Assembling the force model (planets, Moon, asteroid perturbers,
+harmonics, relativistic corrections) has a fixed per-call cost. A
+[`BuiltSystem`] assembles it once for a frozen `{force model, frame,
+encounter-timescale divisor}` key and reuses it across many
+propagations — the build-once, propagate-many pattern for
+short-arc campaigns. It is `Send + Sync`, so `&handle` can be shared
+across threads. A call whose config disagrees with the frozen key, or
+that pairs the handle with a different data instance, is rejected
+loudly by axis — never silently rebuilt against the wrong dynamics.
+
+```rust,no_run
+# use empyrean::{Context, ForceModelTier, Frame, Orbit, PropagationConfig, Epoch};
+# let ctx = Context::from_data_dir(None)?;
+# let orbit: Orbit = ctx.query_sbdb("2020 SO")?.orbits.remove(0);
+// Build once; freeze the divisor at the engine default (0.0).
+let handle = ctx.built_system(ForceModelTier::Standard, Frame::EclipticJ2000, 0.0)?;
+
+let epochs = vec![Epoch::from_mjd_tdb(65020.0)];
+let result = handle.propagate(&ctx, &[orbit], &epochs, &PropagationConfig::default())?;
+println!("{} states", result.states.len());
+
+// describe() reports the reproducibility record: the force-model menu
+// plus the identity (SHA-256) of every loaded kernel.
+let desc = handle.describe()?;
+println!("{} perturbers, {} kernels", desc.perturber_origins.len(), desc.kernels.len());
+# Ok::<(), empyrean::Error>(())
+```
+
 ## Impact probability and B-plane geometry
 
 For each detected close approach you can ask for an impact-probability

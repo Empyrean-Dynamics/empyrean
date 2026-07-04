@@ -135,6 +135,31 @@ arc = ThrustArc(
 result = empyrean.propagate(orbits, epochs, thrust_arcs=[ThrustParams(arcs=[arc])])
 ```
 
+## System handles
+
+Assembling the force model has a fixed per-call cost. `build_system`
+assembles it once for a frozen `{force model, frame, encounter-timescale
+divisor}` key and returns a `BuiltSystem` you reuse across many
+propagations — the build-once, propagate-many pattern for short-arc
+campaigns. Its `propagate` / `generate_ephemeris` release the GIL, so
+the handle can be shared across threads. A call that disagrees with the
+frozen key is rejected loudly, never silently rebuilt; rebuild the
+handle after any `initialize()` / data reload.
+
+```python
+import empyrean
+
+# Build once for the Standard model in the ecliptic frame.
+system = empyrean.build_system("standard", "ecliptic_j2000")
+
+result = system.propagate(orbits, epochs)
+
+# describe() is the reproducibility record: the force-model menu plus the
+# identity (SHA-256) of every loaded kernel.
+desc = system.describe()
+print(len(desc.perturber_origins), "perturbers,", len(desc.kernels), "kernels")
+```
+
 ## Impact probability and B-plane geometry
 
 For each detected close approach, you can ask the propagator for an

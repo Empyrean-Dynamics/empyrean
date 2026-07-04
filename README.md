@@ -57,12 +57,13 @@ bodies like asteroids and comets, with plans to extend to cislunar space.
 Current release: **0.7.0** — see the [CHANGELOG](CHANGELOG.md).
 
 Prebuilt binaries — the engine cdylib, the CLI, and the Python wheels —
-currently target macOS arm64 (`macos-aarch64`) and Linux x86_64
-(`linux-x86_64`). Python wheels are published for CPython 3.12
-(`macosx_11_0_arm64`, `manylinux_2_28_x86_64`) with no source
-distribution. `cargo add empyrean` / `cargo install empyrean-cli`
-download the prebuilt engine for those two targets and stop with an
-error elsewhere.
+target four platforms: macOS arm64 (`macos-aarch64`), macOS x86_64
+(`macos-x86_64`), Linux x86_64 (`linux-x86_64`), and Linux aarch64
+(`linux-aarch64`). Python wheels are published as a single abi3
+stable-ABI wheel per architecture that installs on CPython 3.10 and
+every newer version (3.10–3.13), with no source distribution. `cargo add
+empyrean` / `cargo install empyrean-cli` download the prebuilt engine
+for those targets and stop with an error elsewhere.
 
 All channels pull from the same published cdylib. Run `empyrean version`
 (CLI), `empyrean::version_string()` (Rust), or `empyrean.version_string()`
@@ -79,7 +80,10 @@ each shown end-to-end in Python, Rust, and CLI.
 > **Defaults.** Each example uses the production hot-path: Standard
 > force-model tier (Sun + planets + Moon + EIH GR + 16 SB441-N16 asteroid perturbers
 > + Sun J2 + Earth J2-J4 + Marsden non-grav), GR15 integrator, `FirstOrder` (linear-
-> covariance) uncertainty propagation, ICRF frame. See
+> covariance) uncertainty propagation, ICRF frame. Finite-burn thrust
+> arcs (constant-RTN / velocity-tangent / inertial-fixed steering, with
+> per-arc Δv targeting corrections) are available as an optional
+> continuous-thrust force input on top of this model. See
 > [`empyrean.propagation.config`](empyrean-py/python/empyrean/propagation/config.py)
 > (Python) or [`PropagationConfig`](empyrean/src/propagate/config.rs)
 > (Rust) for the full configuration surface.

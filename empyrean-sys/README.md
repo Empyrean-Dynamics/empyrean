@@ -59,10 +59,11 @@ a checksum-pinned download from the GitHub release (in that order).
 The FFI bindings are pre-generated and committed, so no C header,
 libclang, or bindgen is needed to build.
 
-Prebuilt engine binaries are currently published for two targets:
-macOS arm64 (`macos-aarch64`) and Linux x86_64 (`linux-x86_64`). On
-other targets the build stops with an error unless `EMPYREAN_LIB_DIR`
-points at an engine build.
+Prebuilt engine binaries are currently published for four targets:
+macOS arm64 (`macos-aarch64`), macOS x86_64 (`macos-x86_64`), Linux
+x86_64 (`linux-x86_64`), and Linux aarch64 (`linux-aarch64`). On other
+targets the build stops with an error unless `EMPYREAN_LIB_DIR` points
+at an engine build.
 
 ## License
 

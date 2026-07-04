@@ -304,6 +304,10 @@ jobs:
           ruff format --check empyrean-py/python/empyrean/ empyrean-py/tests/
 
       - name: Type-check Python (mypy --strict)
+        # Static check: run once against the canonical target, not per-matrix —
+        # each Python resolves a different numpy whose stubs disagree on bare
+        # generics, so a per-version mypy is inconsistent, not more thorough.
+        if: matrix.python == '3.12'
         run: |
           uv pip install --system mypy
           cd empyrean-py && mypy --config-file pyproject.toml python/empyrean/

@@ -21,16 +21,23 @@ pip install empyrean
 
 A plain install pulls empyrean together with the B612 Foundation's
 pre-packaged SPICE kernels (~640 MB). After installation, the first
-call to `empyrean.initialize()` downloads a small remainder
-(`moon_pa`, `EGM2008`, `jwst_rec` — about 370 MB) that isn't available
-on PyPI.
+call to `empyrean.initialize()` downloads a small remainder (the
+`moon_pa` Moon-orientation kernel and the `bias.dat` star-catalog
+debiasing table — about 50 MB) that isn't available on PyPI.
+
+Wheels are currently published for CPython 3.12 on macOS arm64
+(`macosx_11_0_arm64`) and Linux x86_64 (`manylinux_2_28`). There is
+no source distribution, so `pip install empyrean` on other platforms
+or Python versions will not resolve — use the
+[other distribution channels](https://github.com/Empyrean-Dynamics/empyrean#install)
+in the meantime.
 
 ## What it does
 
 - **Propagation** — N-body (Sun, planets, Moon, Pluto) with EIH general relativity, Sun J2 and Earth J2–J4 zonal harmonics, 16 asteroid perturbers, and the Marsden non-gravitational model — selectable across Approximate / Basic / Standard force-model tiers (Standard is the default). GR15 and DOP853 integrators.
-- **Uncertainty** — First-order (Jet1) state transition matrices; second-order (Jet2) state transition tensors.
+- **Uncertainty** — First-order (Jet1) state transition matrices; second-order (Jet2) state transition tensors; unscented sigma-point and Monte Carlo sampling; an adaptive Auto mode that escalates the method automatically through close approaches and relaxes it elsewhere. Optional per-epoch tagged-covariance readback.
 - **Ephemeris** — RA/Dec, rates, photometry (H–G, H–G₁G₂, H–G₁₂), light time, phase angle, solar elongation, local horizon.
-- **Orbit determination** — Gauss, Herget, and systematic-ranging (admissible region + Manifold of Variations) IOD → N-body differential correction with STM caching and outlier rejection. Validated against `find_orb` and JPL SBDB.
+- **Orbit determination** — Gauss, Herget, and systematic-ranging (admissible region + Manifold of Variations) IOD → N-body differential correction over optical and radar (delay / Doppler) observations, with STM caching and outlier rejection. Validated against `find_orb` and JPL SBDB.
 - **Events** — Close approach (start/end), periapsis, gravitational capture (start/end), shadow entry/exit, atmospheric entry/exit, impact, and possible impact.
 
 ## Quick start
@@ -99,6 +106,8 @@ impact-probability assessment or a full B-plane breakdown — and run
 several uncertainty methods side-by-side on the same encounter:
 
 ```python
+import pyarrow.compute as pc
+
 from empyrean import UncertaintyMethod
 
 ips = empyrean.compute_impact_probabilities(
@@ -107,7 +116,7 @@ ips = empyrean.compute_impact_probabilities(
     methods=[UncertaintyMethod.FIRST_ORDER, UncertaintyMethod.SECOND_ORDER],
 )
 ips.epochs.scale                    # "tdb"
-ips.where(ips.method == "second_order").ip_second_order.to_numpy()
+ips.where(pc.field("method") == "second_order").ip_second_order.to_numpy()
 ips.ip_linear.to_numpy()            # always populated
 
 bps = empyrean.compute_b_planes(orbits, 63000.0, [UncertaintyMethod.SECOND_ORDER])
@@ -138,16 +147,18 @@ installation dependencies; the remainder download on first use.
 | `mpc-obscodes` | `obscodes_extended.json` | 266 KB |
 
 empyrean bundles `gm_de440.tpc` (12 KB) in the wheel itself. On
-`initialize()`, empyrean stages a symlinked cache at
-`~/.empyrean/b612-cache/` mapping these paths into the filenames
-villeneuve expects.
+`initialize()`, empyrean stages symlinks to these files in the
+platform data directory (`~/.local/share/empyrean/data/` on Linux,
+`~/Library/Application Support/empyrean/data/` on macOS; honors
+`EMPYREAN_DATA_DIR`) under the filenames the engine expects.
 
-**Downloaded on first `initialize()`**
+**Downloaded by the engine when needed**
 
-| File | Size | Source |
-|------|------|--------|
-| `moon_pa_de440_200625.bpc` | 12 MB | NAIF — Moon orientation |
-| `jwst_rec.bsp` | 121 MB | NAIF — JWST ephemeris (for JWST observations) |
+| File | Size | When | Source |
+|------|------|------|--------|
+| `moon_pa_de440_200625.bpc` | 12 MB | first `initialize()` | NAIF — Moon orientation |
+| `bias.dat` | 35 MB | first `initialize()` | Star-catalog debiasing table (Eggl et al. 2020) |
+| `jwst_rec.bsp` | 121 MB | on demand, for JWST observers | NAIF — JWST ephemeris |
 
 Any of these can be relocated with `EMPYREAN_DATA_DIR`, and individual
 files can be preset with `VILLENEUVE_*_PATH` environment variables.
@@ -157,7 +168,7 @@ files can be preset with `VILLENEUVE_*_PATH` environment variables.
 Validated against JPL Horizons, ASSIST (reboundx), and `find_orb` on
 43 objects across 13 dynamical populations (NEOs, MBAs, Trojans, TNOs,
 comets, etc.). Sub-meter propagation accuracy on bounded timescales.
-See [the validation report](https://github.com/Empyrean-Dynamics/empyrean#validation).
+See [the validation notes](https://github.com/Empyrean-Dynamics/empyrean#validation).
 
 ## No guarantee of accuracy
 

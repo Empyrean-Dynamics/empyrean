@@ -29,9 +29,9 @@ empyrean = "0.7"
 ## What it does
 
 - **Propagation** — N-body (Sun, planets, Moon, Pluto) with EIH general relativity, Sun J2 and Earth J2–J4 zonal harmonics, 16 asteroid perturbers, and the Marsden non-gravitational model — selectable across Approximate / Basic / Standard force-model tiers (Standard is the default). GR15 and DOP853 integrators.
-- **Uncertainty** — First-order (Jet1) state transition matrices; second-order (Jet2) state transition tensors.
+- **Uncertainty** — First-order (Jet1) state transition matrices; second-order (Jet2) state transition tensors; unscented sigma-point and Monte Carlo sampling; an adaptive Auto mode that escalates the method automatically through close approaches and relaxes it elsewhere. Optional per-epoch tagged-covariance readback.
 - **Ephemeris** — RA/Dec, rates, photometry (H–G, H–G₁G₂, H–G₁₂), light time, phase angle, solar elongation, local horizon.
-- **Orbit determination** — Gauss, Herget, and systematic-ranging (admissible region + Manifold of Variations) IOD → N-body differential correction with STM caching and outlier rejection. Validated against `find_orb` and JPL SBDB.
+- **Orbit determination** — Gauss, Herget, and systematic-ranging (admissible region + Manifold of Variations) IOD → N-body differential correction over optical and radar (delay / Doppler) observations, with STM caching and outlier rejection. Validated against `find_orb` and JPL SBDB.
 - **Events** — Close approach (start/end), periapsis, gravitational capture (start/end), shadow entry/exit, atmospheric entry/exit, impact, and possible impact.
 
 ## Quick start
@@ -140,13 +140,20 @@ for bp in &bps {
 
 ## Runtime requirement
 
-This crate (via empyrean-sys) loads `libempyrean.{dylib,so,dll}` at
+This crate (via empyrean-sys) loads `libempyrean.{dylib,so}` at
 run time, which is distributed separately as a binary release on
 [GitHub](https://github.com/Empyrean-Dynamics/empyrean/releases) and
-inside the published Python wheel. The library is opened from a path
-resolved at build/run time — a local `../target/release` build, an
-`EMPYREAN_LIB_DIR` override, or a checksum-pinned prebuilt downloaded
-from the GitHub release; no system library path setup is required.
+inside the published Python wheel. The path is resolved from the
+`EMPYREAN_LIB` environment variable if set, else a `libempyrean.*`
+sitting next to the loaded module, else a build-time location — an
+`EMPYREAN_LIB_DIR` override, a sibling `../target/release` build, or
+a checksum-pinned prebuilt downloaded from the GitHub release (in
+that order); no system library path setup is required.
+
+Prebuilt engine binaries are currently published for macOS arm64
+(`macos-aarch64`) and Linux x86_64 (`linux-x86_64`); on other targets
+the build stops with an error unless `EMPYREAN_LIB_DIR` points at an
+engine build.
 
 The full distribution surface (Python wheel, CLI binary, C SDK, this
 Rust crate) lives at the
@@ -157,7 +164,9 @@ see its README for installation paths and the cross-channel quickstart.
 
 Validated against JPL Horizons, ASSIST (reboundx), and `find_orb` on
 43 objects across 13 dynamical populations (NEOs, MBAs, Trojans, TNOs,
-comets, and more). Sub-meter propagation accuracy on bounded timescales.
+comets, and more). Sub-meter propagation accuracy on bounded timescales;
+see the [validation notes](https://github.com/Empyrean-Dynamics/empyrean#validation)
+in the main repository for the comparison setup.
 
 ## No guarantee of accuracy
 

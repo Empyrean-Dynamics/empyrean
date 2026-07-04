@@ -30,6 +30,14 @@ and bundled into the published Python wheel.
 
 ## Build
 
+> **Maintainers only.** empyrean-c depends on the closed-source
+> `empyrean-core` engine crate, which is not in this repository —
+> building from this source requires access to the private engine
+> repositories. Everyone else should use the released
+> `libempyrean-<target>.tar.gz` artifacts (currently `macos-aarch64`
+> and `linux-x86_64`), which bundle the shared library, the
+> `empyrean.h` header, and the LICENSE.
+
 ```sh
 # Build the cdylib + staticlib into target/release/.
 cargo build --release -p empyrean-c
@@ -51,9 +59,10 @@ on the Rust side shows up in the header automatically.
 #include "empyrean.h"
 
 int main(void) {
-    empyrean_context_t *ctx = NULL;
-    int rc = empyrean_context_new("", &ctx);
-    if (rc != 0) return rc;
+    /* NULL = the platform default data directory; downloads any
+       missing kernels. Returns NULL on error (see empyrean_last_error). */
+    EmpyreanContext *ctx = empyrean_context_from_data_dir(NULL);
+    if (ctx == NULL) return 1;
 
     /* ... call empyrean_propagate_*, empyrean_query_sbdb, ... */
 
@@ -68,7 +77,7 @@ dependencies are required at the C ABI boundary.
 ## Closed-source posture
 
 The internal Rust API (`empyrean-core` and its transitive deps —
-villeneuve, scott, hyperjet) is **never re-exported** through this
+villeneuve, scott, nolan) is **never re-exported** through this
 crate. Only the explicit `extern "C"` symbols declared in
 `src/lib.rs` cross the ABI boundary, and the release profile strips
 all other symbols from the dynamic symbol table.

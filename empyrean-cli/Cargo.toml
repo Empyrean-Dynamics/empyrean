@@ -6,7 +6,6 @@ rust-version = "1.90.0"
 authors = ["Joachim Moeyens <joachim@empyrean-dynamics.com>", "Empyrean Dynamics"]
 description = "Command-line interface for empyrean — orbit propagation, ephemeris generation, orbit determination, and event detection"
 homepage = "https://www.empyrean-dynamics.com"
-documentation = "https://docs.rs/empyrean-cli"
 repository = "https://github.com/Empyrean-Dynamics/empyrean"
 readme = "README.md"
 license = "BSD-3-Clause"

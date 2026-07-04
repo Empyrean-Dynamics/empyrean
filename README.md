@@ -52,8 +52,19 @@ bodies like asteroids and comets, with plans to extend to cislunar space.
 | Python | `pip install empyrean` |
 | Rust   | `cargo add empyrean` |
 | CLI    | `cargo install empyrean-cli` (or grab a binary from [Releases](https://github.com/Empyrean-Dynamics/empyrean/releases)) |
+| C      | download `libempyrean-<target>.tar.gz` from [Releases](https://github.com/Empyrean-Dynamics/empyrean/releases) — ships the shared library, `empyrean.h`, and LICENSE |
 
-All three pull from the same published cdylib. Run `empyrean version`
+Current release: **0.7.0** — see the [CHANGELOG](CHANGELOG.md).
+
+Prebuilt binaries — the engine cdylib, the CLI, and the Python wheels —
+currently target macOS arm64 (`macos-aarch64`) and Linux x86_64
+(`linux-x86_64`). Python wheels are published for CPython 3.12
+(`macosx_11_0_arm64`, `manylinux_2_28_x86_64`) with no source
+distribution. `cargo add empyrean` / `cargo install empyrean-cli`
+download the prebuilt engine for those two targets and stop with an
+error elsewhere.
+
+All channels pull from the same published cdylib. Run `empyrean version`
 (CLI), `empyrean::version_string()` (Rust), or `empyrean.version_string()`
 (Python) to confirm the build provenance — every cdylib carries the
 `<tag>+<sha>` strings of the `villeneuve` / `scott` / `nolan` commits
@@ -67,7 +78,7 @@ each shown end-to-end in Python, Rust, and CLI.
 
 > **Defaults.** Each example uses the production hot-path: Standard
 > force-model tier (Sun + planets + Moon + EIH GR + 16 SB441-N16 asteroid perturbers
-> + Sun J2 + Earth J2-J4 + Marsden non-grav), GR15 integrator, `First` (linear-
+> + Sun J2 + Earth J2-J4 + Marsden non-grav), GR15 integrator, `FirstOrder` (linear-
 > covariance) uncertainty propagation, ICRF frame. See
 > [`empyrean.propagation.config`](empyrean-py/python/empyrean/propagation/config.py)
 > (Python) or [`PropagationConfig`](empyrean/src/propagate/config.rs)
@@ -83,6 +94,9 @@ SBDB epoch.
 ```python
 import empyrean
 import numpy as np
+
+empyrean.download_data()   # SPICE kernels, first run only
+empyrean.initialize()
 
 # 1. Pull Apophis from SBDB (Cometary orbits with covariance + non-grav).
 orbits = empyrean.query_sbdb(["99942"])
@@ -118,15 +132,17 @@ println!("{} states, {} events", result.states.len(), result.events.len());
 #### CLI
 
 ```sh
-# One-time: download SPICE kernels into the data dir (~/.empyrean/data/).
+# One-time: download SPICE kernels into the platform data directory
+# (~/.local/share/empyrean/data/ on Linux, ~/Library/Application Support/empyrean/data/
+# on macOS; honors EMPYREAN_DATA_DIR).
 empyrean init
 
 # Propagate Apophis 10 years past its SBDB epoch (epoch ≈ 61269 → 64922 MJD TDB).
 empyrean propagate --object-id 99942 --epoch 64922.0 --out-dir ./out
 
-# Inspect the result Parquet — orbits + states + events tables, all with the
+# Inspect the result Parquet — states + events tables, both with the
 # same orbit_id / object_id keys you can join in pandas / Polars / DuckDB.
-ls out/    # orbits.parquet  states.parquet  events.parquet
+ls out/    # states.parquet  events.parquet
 ```
 
 ### Ephemeris
@@ -140,6 +156,8 @@ Mauna Kea (MPC observatory code 568) for the next three months.
 import empyrean
 import numpy as np
 
+empyrean.initialize()
+
 orbits = empyrean.query_sbdb(["99942"])
 
 # Sample at SBDB epoch + {0, 30, 60} days.
@@ -149,8 +167,8 @@ times = np.array([t0, t0 + 30.0, t0 + 60.0])
 observers = empyrean.get_observer_states(["568"], times)
 result = empyrean.generate_ephemeris(orbits, observers)
 
-# Ephemeris is a quivr table — RA, Dec (rad), range (AU), light-time (days),
-# orbit_id / object_id / observer_code / epoch keys for joining.
+# Ephemeris is a quivr table — RA, Dec (deg), range (AU), light-time (days),
+# orbit_id / object_id / obs_code keys for joining.
 print(result.ephemeris.to_dataframe())
 ```
 
@@ -204,6 +222,8 @@ Python / Rust only.
 
 ```python
 import empyrean
+
+empyrean.initialize()
 
 # 1. One-shot: read ADES PSV, run Gauss + Herget IOD + N-body DC + rejection.
 obs, _radar = empyrean.read_ades("apophis.psv")
@@ -270,14 +290,24 @@ println!(
 
 ```sh
 empyrean determine apophis.psv --out-dir ./out
-ls out/    # orbits.parquet  residuals.parquet  pipeline.parquet  station_biases.parquet
+ls out/    # fitted_orbit.parquet  residuals.parquet
 ```
 
-The CLI emits four sibling Parquet tables — orbits + per-observation
-residuals + per-trksub pipeline outcomes + per-station fitted biases —
-mirroring scott's output schema so you can join them in
+The CLI emits two sibling Parquet tables — the fitted orbit (state +
+covariance + any fitted non-gravitational parameters) and the
+per-observation residuals — that you can join in
 pandas / Polars / DuckDB the same way you would the propagation /
 ephemeris outputs.
+
+## Validation
+
+Every release is validated against JPL Horizons, ASSIST (reboundx),
+and `find_orb` on 43 objects across 13 dynamical populations (NEOs,
+MBAs, Trojans, TNOs, comets, and more). Propagated states agree with
+JPL Horizons at the sub-meter level on bounded timescales, and orbit
+determination results are cross-checked against `find_orb` fits and
+JPL SBDB solutions. Per-release changes are tracked in the
+[CHANGELOG](CHANGELOG.md).
 
 ## License
 

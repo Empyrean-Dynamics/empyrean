@@ -4,7 +4,38 @@ Notable changes to the empyrean distribution — the `empyrean`, `empyrean-sys`,
 `empyrean-c`, and `empyrean-cli` crates and the `empyrean` Python package. This
 project adheres to [Semantic Versioning](https://semver.org).
 
-## [0.7.0-rc.4] — unreleased
+## [0.7.0] — 2026-07-03
+
+First stable release of the empyrean distribution: uncertainty-first orbit
+propagation, ephemeris generation, orbit determination, and close-approach /
+impact analysis for asteroids and comets, powered by automatic
+differentiation. Distributed as a Rust crate (`empyrean`), a C ABI
+(libempyrean), a Python package (`empyrean` on PyPI), and a command-line tool
+over a consistent API. Includes all fixes from the 0.7.0 release candidates
+below.
+
+### Added
+
+- **Propagation & events.** N-body propagation with non-gravitational forces,
+  GR15 and DOP853 integrators, and event detection: close approaches, B-plane
+  geometry, and impact-probability estimation across multiple uncertainty
+  methods.
+- **Uncertainty on every published quantity.** Linear (first-order),
+  second-order, and adaptive uncertainty mapping via automatic
+  differentiation, with per-epoch tagged covariances.
+- **Orbit determination** via `determine` / `evaluate` / `refine`: initial
+  orbit determination through N-body differential correction with outlier
+  rejection, optical and radar astrometry, and non-gravitational parameter
+  recovery. Fitted orbits carry state, covariance, and non-gravitational
+  parameters for direct re-use in propagation and further fitting.
+- **Ephemeris generation** for ground-based observers with sky-plane
+  uncertainties.
+- **Data provisioning.** `download_data` fetches the complete kernel set into
+  a local data directory (idempotent — only missing files are downloaded); in
+  Python, installed B612 Foundation data packages are staged from the wheels
+  with no network access and only the remainder is fetched.
+
+## [0.7.0-rc.4] — 2026-06-25
 
 ### Fixed
 
@@ -35,4 +66,5 @@ project adheres to [Semantic Versioning](https://semver.org).
 Earlier release candidates (rc.0–rc.3) are documented in their tagged GitHub
 releases.
 
+[0.7.0]: https://github.com/Empyrean-Dynamics/empyrean/releases/tag/v0.7.0
 [0.7.0-rc.4]: https://github.com/Empyrean-Dynamics/empyrean/releases/tag/v0.7.0-rc.4

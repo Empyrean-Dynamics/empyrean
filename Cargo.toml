@@ -43,7 +43,7 @@ lto = "fat"
 
 # No sibling-checkout [patch] overrides: scott and villeneuve are released,
 # so the monorepo consumes their tagged git dependencies via empyrean-core
-# (scott v1.10.0, villeneuve v1.14.0), fetched from GitHub. CI fetches them
+# (scott v1.11.0, villeneuve v1.14.0), fetched from GitHub. CI fetches them
 # over HTTPS with the GH_PAT insteadOf rewrite. To co-develop a sibling
 # against this workspace, re-add a `[patch."ssh://…git"] <crate> = { path =
 # "../<repo>" }` block here (cargo only honours [patch] at the workspace

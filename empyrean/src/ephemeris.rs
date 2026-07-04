@@ -90,8 +90,7 @@ impl EphemerisEntry {
 
 /// Observation-sensitivity row: the partial derivatives of the sky-plane
 /// observable w.r.t. the input state, for one `(orbit, observer, epoch)`.
-/// Produced when the ephemeris uncertainty method traced the STM
-/// (bd empyrean-14cz.4).
+/// Produced when the ephemeris uncertainty method traced the STM.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObservationSensitivity {
     /// Orbit identifier.

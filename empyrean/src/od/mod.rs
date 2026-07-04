@@ -322,8 +322,7 @@ fn ffi_od_result_orbit(result: &empyrean_sys::EmpyreanODResult) -> crate::error:
             orbit = orbit.with_non_grav_dt(Some(ng.non_grav_dt));
         }
         // Carry the fitted non-grav covariance so the orbit re-feeds into a
-        // StateAndNonGrav refine without losing its non-grav prior
-        // (empyrean-wo4n).
+        // StateAndNonGrav refine without losing its non-grav prior.
         if ng.has_covariance != 0 {
             orbit = orbit.with_nongrav_covariance(Some(ng.covariance));
         }

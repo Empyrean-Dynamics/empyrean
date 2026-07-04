@@ -1,5 +1,5 @@
 {
-  "_comment": "Single source of truth for the cross-channel parity tests (bd empyrean-na4h.2, ADR cross-channel-parity). Consumed by: empyrean-core/src/bin/parity-oracle.rs (generates core_parity_oracle.json from `scenarios`), empyrean-py/tests/test_core_parity.py, empyrean/tests/parity.rs (wrapper), and the cli parity test. Each channel runs `scenarios` through its own API, projects to the fingerprint vocabulary, and diffs against the committed oracle using `known_drops` + `tolerances`. Add a scenario / drop ONCE here and every channel picks it up.",
+  "_comment": "Single source of truth for the cross-channel parity tests. Consumed by: empyrean-core/src/bin/parity-oracle.rs (generates core_parity_oracle.json from `scenarios`), empyrean-py/tests/test_core_parity.py, empyrean/tests/parity.rs (wrapper), and the cli parity test. Each channel runs `scenarios` through its own API, projects to the fingerprint vocabulary, and diffs against the committed oracle using `known_drops` + `tolerances`. Add a scenario / drop ONCE here and every channel picks it up.",
   "tolerances": {
     "_comment": "rtol/atol are the default; a scenario may override rtol (see impactor). The oracle (empyrean-core) and the channels (libempyrean dylib) are SEPARATELY compiled, so a chaotic trajectory amplifies ULP-level codegen differences — fine for well-conditioned cases (apophis, 1e-6) but not the near-surface impactor, whose covariance-derived fields (sigma_distance) drift a few e-6. The impactor's job is drop detection (0.0-vs-real signals, caught at any tolerance), so it earns a loose rtol.",
     "rtol": 1e-6,
@@ -45,6 +45,6 @@
       "ephemeris_epochs": []
     }
   ],
-  "_known_drops_comment": "All C-ABI event-field drops (empyrean-14cz.1 periapsis relative state, .2 possible-impact payload, .3 shadow geometry) are now wired through to the wrapper + py channels — known_drops is empty. The CLI keeps its own channel-specific allow-list (CLI_EXTRA_DROPS in empyrean-cli/tests/parity.rs) because its events FILE writer is still common-fields-only (empyrean-i7u5 events half).",
+  "_known_drops_comment": "All historical C-ABI event-field drops (periapsis relative state, possible-impact payload, shadow geometry) are now wired through to the wrapper + py channels — known_drops is empty. The CLI keeps its own channel-specific allow-list (CLI_EXTRA_DROPS in empyrean-cli/tests/parity.rs) for any CLI-specific file-writer drops.",
   "known_drops": []
 }

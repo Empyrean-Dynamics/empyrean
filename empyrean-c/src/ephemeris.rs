@@ -70,7 +70,7 @@ pub struct EmpyreanEphemerisEntry {
 /// One observation-sensitivity row — the partial derivatives of the
 /// sky-plane observable w.r.t. the input state, for a single
 /// `(orbit, observer, epoch)`. One row per observation epoch within each
-/// `(orbit_id, obs_code)` chain (bd empyrean-14cz.4). Owning struct: free
+/// `(orbit_id, obs_code)` chain. Owning struct: free
 /// the whole result with [`empyrean_ephemeris_result_free`].
 #[repr(C)]
 pub struct EmpyreanObservationSensitivity {
@@ -367,7 +367,7 @@ pub unsafe extern "C" fn empyrean_generate_ephemeris(
             }
         }
 
-        // ── Observation sensitivity chains (bd empyrean-14cz.4) ──
+        // ── Observation sensitivity chains ──
         // One row per (orbit, observer, epoch). Prefer the wide (state +
         // non-grav, 9-param) Jacobian/Hessian when present, else the 6-param.
         let mut sens_rows: Vec<EmpyreanObservationSensitivity> = Vec::new();
@@ -508,7 +508,7 @@ pub unsafe extern "C" fn empyrean_ephemeris_result_free(result: *mut EmpyreanEph
     }));
 }
 
-// ── Sensitivity flattening + FFI heap helpers (bd empyrean-14cz.4) ──
+// ── Sensitivity flattening + FFI heap helpers ──
 
 /// Row-major flatten of a `6 × N` matrix.
 fn flatten_2d<const N: usize>(m: &[[f64; N]; 6]) -> Vec<f64> {

@@ -206,7 +206,7 @@ def _orbits_to_dict(orbits: AnyOrbits) -> dict[str, list[Any] | np.ndarray]:
     # Non-grav parameters — thread the seed orbit's full force model so
     # evaluate / refine operate on the actual non-grav (A1/A2/A3 + g(r) + dt)
     # rather than silently gravity-only, and carry the fitted non-grav
-    # covariance so a StateAndNonGrav refine keeps its prior (empyrean-wo4n).
+    # covariance so a StateAndNonGrav refine keeps its prior.
     n = len(orbits)
     a1s = np.zeros(n, dtype=np.float64)
     a2s = np.zeros(n, dtype=np.float64)
@@ -445,7 +445,7 @@ def _build_cartesian_orbits_single(result: ResultDict, prefix: str = "") -> Cart
         dt = result.get(f"{p}non_grav_dt")
         # Fitted non-grav 3×3 covariance (row-major flat, 9), present only for
         # StateAndNonGrav fits. Carried so the orbit re-feeds into a
-        # StateAndNonGrav refine without losing its prior (empyrean-wo4n).
+        # StateAndNonGrav refine without losing its prior.
         ng_cov = result.get(f"{p}non_grav_cov")
         orbits_kwargs["non_grav"] = NonGravParams.from_kwargs(
             a1=[a1],

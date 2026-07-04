@@ -1,9 +1,8 @@
 //! PyO3 bindings for the empyrean v0.7.0 safe wrapper.
 //!
-//! Surfaces the v0.7.0 community-tier API: propagation, ephemeris,
-//! orbit determination, transforms. Thrust, planning/visibility, and
-//! the Full force model tier are excluded per the empyrean-core
-//! release.toml manifest.
+//! Surfaces the v0.7.0 public API: propagation, ephemeris, orbit
+//! determination, transforms. Thrust, planning/visibility, and the
+//! Full force-model tier are not exposed in this release.
 
 // PyO3 `#[pyfunction]` signatures mirror the Python API surface one-to-one, so
 // several take more than clippy's 7-argument threshold by design. The numpy
@@ -2001,7 +2000,7 @@ fn _generate_ephemeris<'py>(
     // fabricates per-entry `orbit_id` as `"orbit_{i}"` because
     // `EmpyreanOrbit` carries no orbit_id field. Recover the user's
     // orbit_id and object_id by parsing the index and looking it up
-    // in the input arrays. (TODO empyrean-3ud6: drop this once the
+    // in the input arrays. (TODO: drop this once the
     // C struct carries orbit_id / object_id directly.)
     for (i, e) in entries.iter().enumerate() {
         let user_idx = parse_fabricated_orbit_index(&e.orbit_id);
@@ -2071,7 +2070,7 @@ fn _generate_ephemeris<'py>(
     dict.set_item("sky_rate", PyArray1::from_owned_array(py, out_sky_rate))?;
     dict.set_item("obs_code", out_obs_codes_v)?;
 
-    // ── Observation sensitivities (bd empyrean-14cz.4) — one row per
+    // ── Observation sensitivities — one row per
     // (orbit, observer, epoch). jacobian/hessian are row-major-flattened
     // (6×n_params / 6×n_params²); hessian is None unless a second-order
     // method ran. Empty on the f64-only path. ──
@@ -2559,9 +2558,9 @@ fn build_orbit_from_dict<'py>(orbit_dict: &Bound<'py, PyDict>) -> PyResult<empyr
 
     // Non-grav (optional): thread the seed orbit's force model so evaluate /
     // refine operate on the actual non-grav (not silently gravity-only), and
-    // so a StateAndNonGrav refine keeps its fitted non-grav prior
-    // (empyrean-wo4n). Missing keys (e.g. an unseeded determine) leave the
-    // orbit gravity-only.
+    // so a StateAndNonGrav refine keeps its fitted non-grav prior.
+    // Missing keys (e.g. an unseeded determine) leave the orbit
+    // gravity-only.
     let arr1 = |key: &str| -> PyResult<Option<Vec<f64>>> {
         match orbit_dict.get_item(key)? {
             Some(o) => {
@@ -2592,7 +2591,7 @@ fn build_orbit_from_dict<'py>(orbit_dict: &Bound<'py, PyDict>) -> PyResult<empyr
         {
             orbit = orbit.with_non_grav_dt(Some(dt[0]));
         }
-        // Fitted non-grav covariance (optional; empyrean-wo4n).
+        // Fitted non-grav covariance (optional).
         if let Some(has) = orbit_dict.get_item("has_non_grav_cov")? {
             let has_arr: PyReadonlyArray1<'_, bool> = has.extract()?;
             if has_arr.as_array()[0]
@@ -3695,7 +3694,7 @@ fn apply_propagation_config_dict(
             // `uncertainty_method=AUTO` sugar and a config carrying it
             // resolve to the same wrapper variant — without this arm the
             // wire dict silently overrode the flat-arg auto() with
-            // first_order (empyrean-uogb).
+            // first_order.
             "auto" => empyrean::UncertaintyMethod::auto(),
             // Sigma-point / Monte Carlo / Gaussian Mixture map onto
             // FirstOrder at the wrapper level; their per-method params
@@ -4556,7 +4555,7 @@ fn pydict_to_events(dict: &Bound<'_, PyDict>) -> PyResult<Vec<empyrean::Event>> 
             // the capture / impact / covariance-regime payload columns
             // (persisting them needs the C-ABI parquet schema extended);
             // sentinel-fill on this round-trip read. The live propagate()
-            // event stream DOES carry them. Tracked: empyrean-evwr.
+            // event stream DOES carry them. A known gap, planned fix.
             two_body_energy: f64::NAN,
             jacobi_constant: f64::NAN,
             jacobi_constant_sigma: f64::NAN,
@@ -4910,7 +4909,7 @@ fn determine_result_to_pydict<'py>(
                 dict.set_item("orbit_non_grav_dt", dt)?;
             }
             // Fitted non-grav 3×3 covariance, row-major flat (9). Lets the
-            // orbit re-feed into a StateAndNonGrav refine (empyrean-wo4n).
+            // orbit re-feed into a StateAndNonGrav refine.
             if let Some(c) = o.ng_covariance {
                 let flat: Vec<f64> = c.iter().flatten().copied().collect();
                 dict.set_item("orbit_non_grav_cov", flat)?;

@@ -1,6 +1,6 @@
 [package]
 name = "empyrean-c"
-version = "0.7.0-rc.4"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.90.0"
 authors = ["Joachim Moeyens <joachim@empyrean-dynamics.com>", "Empyrean Dynamics"]

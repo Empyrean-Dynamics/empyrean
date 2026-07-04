@@ -37,5 +37,5 @@ class NonGravParams(qv.Table):
     # Fitted non-grav 3x3 covariance for (A1, A2, A3), row-major flattened
     # (9 values). Populated by orbit determination (StateAndNonGrav fits) so a
     # fitted orbit re-feeds into a StateAndNonGrav refine without losing its
-    # non-grav prior (empyrean-wo4n). Null for SBDB / hand-built / gravity-only.
+    # non-grav prior. Null for SBDB / hand-built / gravity-only.
     covariance = qv.LargeListColumn(qv.Float64Column(), nullable=True)

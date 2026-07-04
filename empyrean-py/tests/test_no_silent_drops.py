@@ -17,8 +17,8 @@ that **every nullable column has at least one non-null value**.
 When a column legitimately can be all-null in the test inputs (no
 covariance for an OD-only field, no observer for a heliocentric-only
 field, etc.) it goes in :data:`ALLOWED_ALL_NULL` with a reason. Each
-entry that points at a tracking bd issue should be removed when that
-issue closes — and the test enforces this in reverse: if an
+"known drop" entry should be removed when the drop is fixed — and
+the test enforces this in reverse: if an
 allow-listed column has *any* non-null values, the test fails to
 force the entry out.
 
@@ -62,14 +62,14 @@ from empyrean.propagation.events import EventConfig
 #
 # Keys are "<TableClassName>.<flat_column_path>" — the dotted path matches
 # what `pyarrow.Table.flatten()` produces for a quivr table. Each entry
-# pairs the column with a reason and (where applicable) a tracking issue.
+# pairs the column with a reason.
 #
 # Categories:
 #   - "by-design": column legitimately can be null in this test setup
 #     because the feature isn't requested or doesn't apply (e.g. impact
 #     fields on non-impact close approaches).
-#   - "<bd-issue>": column is silently dropped; closing the issue should
-#     re-populate it. When closed, REMOVE the entry — the test will
+#   - "known drop": column is silently dropped; fixing the drop should
+#     re-populate it. When fixed, REMOVE the entry — the test will
 #     enforce this by failing if the column starts having values.
 
 ALLOWED_ALL_NULL: dict[str, str] = {
@@ -77,7 +77,7 @@ ALLOWED_ALL_NULL: dict[str, str] = {
     # `result.states` is typed as `CartesianOrbits`, so it inherits the
     # input non_grav and photometric sub-tables that don't apply to a
     # propagation OUTPUT. Either change the schema (separate PropagatedStates
-    # type) or accept these as schema-leftover. Tracking via empyrean-3ud6.
+    # type) or accept these as schema-leftover.
     "PropagatedStates.non_grav": "schema-artifact (input fields on output table)",
     "PropagatedStates.non_grav.a1": "schema-artifact (input fields on output table)",
     "PropagatedStates.non_grav.a2": "schema-artifact (input fields on output table)",
@@ -102,23 +102,23 @@ ALLOWED_ALL_NULL: dict[str, str] = {
     # no aberrated x/y/z/vx/vy/vz + frame/origin). The six local-horizon /
     # sky-motion angles that used to live here (zenith_angle, azimuth,
     # hour_angle, lunar_elongation, position_angle, sky_rate) are now
-    # populated — empyrean-14cz — and are deliberately NOT on this list, so
+    # populated and are deliberately NOT on this list, so
     # this test re-fails if they ever regress to all-null. ──
-    "Ephemeris.aberrated_state": "empyrean-j2ue",
-    "Ephemeris.aberrated_state.epoch.days": "empyrean-j2ue",
-    "Ephemeris.aberrated_state.epoch.nanos": "empyrean-j2ue",
-    "Ephemeris.aberrated_state.x": "empyrean-j2ue",
-    "Ephemeris.aberrated_state.y": "empyrean-j2ue",
-    "Ephemeris.aberrated_state.z": "empyrean-j2ue",
-    "Ephemeris.aberrated_state.vx": "empyrean-j2ue",
-    "Ephemeris.aberrated_state.vy": "empyrean-j2ue",
-    "Ephemeris.aberrated_state.vz": "empyrean-j2ue",
-    # ── Ephemeris coordinates / aberrated_state covariance: empyrean-mgn9 ──
+    "Ephemeris.aberrated_state": "known drop (not in the C ABI flat schema)",
+    "Ephemeris.aberrated_state.epoch.days": "known drop (not in the C ABI flat schema)",
+    "Ephemeris.aberrated_state.epoch.nanos": "known drop (not in the C ABI flat schema)",
+    "Ephemeris.aberrated_state.x": "known drop (not in the C ABI flat schema)",
+    "Ephemeris.aberrated_state.y": "known drop (not in the C ABI flat schema)",
+    "Ephemeris.aberrated_state.z": "known drop (not in the C ABI flat schema)",
+    "Ephemeris.aberrated_state.vx": "known drop (not in the C ABI flat schema)",
+    "Ephemeris.aberrated_state.vy": "known drop (not in the C ABI flat schema)",
+    "Ephemeris.aberrated_state.vz": "known drop (not in the C ABI flat schema)",
+    # ── Ephemeris coordinates / aberrated_state covariance: known drop ──
     # 21 spherical-covariance off-diagonals + 21 Cartesian-covariance entries
     # all all-NaN even with covariance-bearing input. C ABI doesn't carry
     # them.
     **{
-        f"Ephemeris.coordinates.covariance.{c}": "empyrean-mgn9"
+        f"Ephemeris.coordinates.covariance.{c}": "known drop (covariance not in the C ABI)"
         for c in [
             "cov_rho_rho",
             "cov_rho_lon",
@@ -144,7 +144,7 @@ ALLOWED_ALL_NULL: dict[str, str] = {
         ]
     },
     **{
-        f"Ephemeris.aberrated_state.covariance.{c}": "empyrean-mgn9"
+        f"Ephemeris.aberrated_state.covariance.{c}": "known drop (covariance not in the C ABI)"
         for c in [
             "cov_x_x",
             "cov_x_y",
@@ -169,13 +169,13 @@ ALLOWED_ALL_NULL: dict[str, str] = {
             "cov_vz_vz",
         ]
     },
-    # ── BPlanes ip_linear: empyrean-1vsy (still pending) ──
+    # ── BPlanes ip_linear: known drop (still pending) ──
     # cov / ellipse fields below are now populated upstream (test
     # caught the stale entry) and have been removed; ip_linear stays
     # on the allow-list until the upstream fix lands.
-    "BPlanes.ip_linear": "empyrean-1vsy",
+    "BPlanes.ip_linear": "known drop (pending upstream fix)",
     # ── ObservationSensitivities: now wired through the C ABI
-    # (empyrean-14cz.4) — orbit_id key + Jacobian populated (deliberately
+    # — orbit_id key + Jacobian populated (deliberately
     # NOT listed). The Hessian is Jet2-only (null for the first-order
     # fixture); object_id is null because villeneuve's sensitivity chain is
     # keyed by (orbit_id, obs_code) and doesn't carry the optional object_id
@@ -190,13 +190,13 @@ ALLOWED_ALL_NULL: dict[str, str] = {
     "ImpactProbabilities.ip_second_order": "by-design (Jet2 method only)",
     "ImpactProbabilities.nonlinearity": "by-design (Jet2 method only)",
     "ImpactProbabilities.ip_agm": "by-design (AGM method only)",
-    # (Periapses.relative_{x,y,z,vx,vy,vz} were here under empyrean-14cz.1
+    # (Periapses.relative_{x,y,z,vx,vy,vz} were once dropped here
     # but are now wired through the C ABI and populated — removed, so this
     # test re-fails if they ever regress to all-null.)
     # ── PossibleImpacts second-order / AGM / Monte-Carlo probabilities are
     # method-dependent: NaN/null for the first-order Apophis fixture (the
     # engine only computes them under Jet2 / AGM / MC). Now carried through
-    # the C ABI (empyrean-14cz.2) — null here is by-design, not a drop. The
+    # the C ABI — null here is by-design, not a drop. The
     # 0.0-sentinel fields (effective_radius/sigma/ip_linear) the parity test
     # caught are wired too and deliberately NOT listed. ──
     "PossibleImpacts.ip_second_order": "by-design (Jet2 method only)",
@@ -445,8 +445,8 @@ def test_propagation_events_summary_no_silent_drops() -> None:
 
 
 # (accessor, class name) for every typed event sub-table. The
-# summary-only check above is blind to per-table drops (e.g. periapsis
-# relative_*, empyrean-14cz.1) — this walks each one.
+# summary-only check above is blind to per-table drops (e.g. the
+# historical periapsis relative_* drop) — this walks each one.
 _EVENT_SUBTABLES: list[tuple[str, str]] = [
     ("close_approach_starts", "CloseApproachStarts"),
     ("close_approach_ends", "CloseApproachEnds"),
@@ -511,10 +511,10 @@ def test_propagation_event_subtables_no_silent_drops() -> None:
     """Walk every typed event sub-table, not just ``events.summary``.
 
     An empty sub-table just means this fixture didn't fire that event
-    family (impacts / shadows / captures need their own fixtures — see
-    empyrean-na4h.1), so it's skipped rather than failed. The Apophis
+    family (impacts / shadows / captures have their own fixtures below),
+    so it's skipped rather than failed. The Apophis
     fixture fires close approaches + periapses, so this is what catches
-    the periapsis ``relative_*`` drop (empyrean-14cz.1).
+    the historical periapsis ``relative_*`` drop.
     """
     orbits = _full_feature_orbit()
     target_epochs = np.array([61000.0 + 60.0 * i for i in range(40)])
@@ -549,8 +549,8 @@ def test_impactor_event_subtables_no_silent_drops() -> None:
     ``impacts`` / ``atmospheric_entries`` / ``shadow_entries`` families —
     they'd stay invisibly empty in the Apophis walk above. 2008 TC3
     actually strikes the ground, firing all three. We *assert* they fired
-    (an empty result here is a fixture regression, not a silent skip — see
-    empyrean-na4h.1) and then walk every fired sub-table for silent drops.
+    (an empty result here is a fixture regression, not a silent skip)
+    and then walk every fired sub-table for silent drops.
     """
     orbit = _impactor_orbit()
     # Last day before impact (~MJD 54746.116), fine steps so the encounter
@@ -584,7 +584,7 @@ def test_impactor_event_subtables_no_silent_drops() -> None:
     )
 
 
-# ── Grazing flyby: atmospheric_exits + shadow_exits (empyrean-na4h.3) ──
+# ── Grazing flyby: atmospheric_exits + shadow_exits ──
 #
 # The 2008 TC3 impactor strikes the ground, so it only ever fires the
 # ``*_entry`` event families — it never comes back out. A grazing
@@ -678,7 +678,7 @@ def _grazing_flyby_orbit() -> tuple[CartesianOrbits, np.ndarray]:
 
 
 def test_grazer_event_subtables_no_silent_drops() -> None:
-    """Walk the atmospheric-exit / shadow-exit sub-tables (empyrean-na4h.3).
+    """Walk the atmospheric-exit / shadow-exit sub-tables.
 
     We *assert* atmospheric_exits and shadow_exits fired (and impacts == 0 —
     an impact means it struck the ground and the ``*_exit`` families would be
@@ -718,7 +718,7 @@ def test_grazer_event_subtables_no_silent_drops() -> None:
     )
 
 
-# ── Temporary capture: capture_starts + capture_ends (empyrean-na4h.3) ──
+# ── Temporary capture: capture_starts + capture_ends ──
 
 
 def _cd3_capture_orbit() -> CartesianOrbits:
@@ -804,12 +804,12 @@ def test_capture_event_subtables_no_silent_drops() -> None:
     )
 
 
-# ── Covariance regime change: UncertaintyMethod.AUTO (empyrean-na4h.3) ──
+# ── Covariance regime change: UncertaintyMethod.AUTO ──
 #
 # covariance_regime_changes fire under UncertaintyMethod.AUTO, which records a
 # Linear -> SecondOrder transition as a CovarianceRegimeChange. AUTO used to be
 # unreachable from empyrean.propagate (silently coerced to first_order in
-# PropagationConfig._to_wire_dict) — fixed in empyrean-uogb.
+# PropagationConfig._to_wire_dict) — since fixed.
 _KM_PER_AU = 149_597_870.7
 _S_PER_DAY = 86_400.0
 
@@ -855,13 +855,13 @@ def _auto_escalation_orbit() -> CartesianOrbits:
 
 
 def test_covariance_regime_changes_fire_under_auto() -> None:
-    """covariance_regime_changes fire under UncertaintyMethod.AUTO (empyrean-uogb).
+    """covariance_regime_changes fire under UncertaintyMethod.AUTO.
 
     The Apophis 2029 deep flyby with a 5000 km / 5 cm/s covariance drives AUTO
     to escalate to second order under a real Jet2 pass, so AUTO emits
     Linear -> SecondOrder (and back) regime-change rows at the CA window
     boundary. We assert the family fired (an empty result means
-    AUTO regressed to a silent first_order downgrade — the empyrean-uogb bug)
+    AUTO regressed to a silent first_order downgrade — a previously fixed bug)
     and walk the CovarianceRegimeChanges columns for silent drops, since this
     is the only fixture that reaches this event family.
     """
@@ -876,8 +876,7 @@ def test_covariance_regime_changes_fire_under_auto() -> None:
     )
     regime_changes = result.events.covariance_regime_changes
     assert len(regime_changes) > 0, (
-        "AUTO fired no covariance_regime_changes — likely a silent first_order "
-        "downgrade (empyrean-uogb regression)"
+        "AUTO fired no covariance_regime_changes — likely a silent first_order downgrade regression"
     )
 
     bad_null, bad_not_null = _check_no_silent_drops(regime_changes, "CovarianceRegimeChanges")
@@ -891,7 +890,7 @@ def test_auto_method_label_round_trips_in_ip_and_bplane() -> None:
 
     Auto IP/B-plane results were silently relabelled ``first_order`` on
     readback because the wrapper's ``method_from_tag`` and the Python
-    ``_TAG_TO_METHOD`` both lacked the tag-4 (Auto) arm (empyrean-uogb) — the
+    ``_TAG_TO_METHOD`` both lacked the tag-4 (Auto) arm — the
     IP value was correct but the reported method was wrong. Pin every method's
     label so a future tag-map gap fails loudly rather than silently collapsing
     to first_order.
@@ -942,8 +941,8 @@ def test_propagation_state_sensitivities_no_silent_drops() -> None:
 def test_ephemeris_observation_sensitivities_no_silent_drops() -> None:
     """Observation Jacobian/Hessian chains on ``EphemerisResult.sensitivity``.
 
-    Currently dropped at the C ABI (empyrean-14cz.4) — the table comes back
-    empty, so this skips today. When 14cz.4 is wired through it activates
+    Historically dropped at the C ABI — if the table comes back
+    empty, this skips. Once sensitivities are wired through it activates
     and asserts the columns are populated.
     """
     orbits = _full_feature_orbit()
@@ -951,7 +950,7 @@ def test_ephemeris_observation_sensitivities_no_silent_drops() -> None:
     result = generate_ephemeris(orbits, observers, uncertainty_method=UncertaintyMethod.FIRST_ORDER)
     sens = result.sensitivity
     if sens is None or len(sens) == 0:
-        pytest.skip("ObservationSensitivities empty (dropped at C ABI — empyrean-14cz.4).")
+        pytest.skip("ObservationSensitivities empty (dropped at C ABI).")
 
     bad_null, bad_not_null = _check_no_silent_drops(sens, "ObservationSensitivities")
     assert not (bad_null or bad_not_null), _format_failures(

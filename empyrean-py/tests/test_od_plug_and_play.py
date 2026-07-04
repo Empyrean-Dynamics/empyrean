@@ -287,19 +287,19 @@ def test_default_auto_fit_round_trips_non_grav_as_none(apophis_observations):
 
 
 def test_fit_orbit_carries_non_grav_covariance(apophis_fit):
-    """wo4n: a StateAndNonGrav fit carries its non-grav covariance on
+    """A StateAndNonGrav fit carries its non-grav covariance on
     ``fit.orbit.non_grav``, so the orbit re-feeds into a non-grav refine
     without losing its prior."""
     cov = apophis_fit.orbit.non_grav.covariance.to_pylist()[0]
-    assert cov is not None, "fitted orbit dropped its non-grav covariance (wo4n)"
+    assert cov is not None, "fitted orbit dropped its non-grav covariance"
     assert len(cov) == 9
     mat = np.asarray(cov, dtype=float).reshape(3, 3)
     assert np.all(np.isfinite(mat))
     assert np.all(np.diag(mat) > 0.0), "non-grav variances must be positive"
 
     # It must be the fitted POSTERIOR (the [6:9, 6:9] block of the 9x9), not
-    # the escalation seed prior (sigma=1e-7 -> 1e-14 diagonal). Sourcing the
-    # authoritative covariance_9x9 block is the wo4n fix.
+    # the escalation seed prior (sigma=1e-7 -> 1e-14 diagonal). The fix is
+    # sourcing the authoritative covariance_9x9 block.
     posterior_block = np.asarray(apophis_fit.covariance_9x9)[6:9, 6:9]
     np.testing.assert_allclose(mat, posterior_block, rtol=1e-9, atol=0)
     sigma_a2 = np.sqrt(mat[1, 1])
@@ -310,7 +310,7 @@ def test_fit_orbit_carries_non_grav_covariance(apophis_fit):
 
 
 def test_refine_state_and_non_grav_round_trips(apophis_fit, apophis_observations):
-    """wo4n: re-feeding a StateAndNonGrav fit into a StateAndNonGrav refine
+    """Re-feeding a StateAndNonGrav fit into a StateAndNonGrav refine
     converges — the 9x9 prior is carried on ``fit.orbit`` (no opaque
     'normal matrix is singular')."""
     refined = refine(

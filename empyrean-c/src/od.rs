@@ -554,7 +554,7 @@ pub struct EmpyreanAcceptabilityReport {
 /// `min_obs_per_station` threshold; under-observed stations are absent.
 /// Timing fields are populated only when a `BiasKind::StationTiming`
 /// nuisance was active (currently no surface to enable it from the C
-/// ABI; reserved for the upcoming `empyrean-96r` follow-up).
+/// ABI; reserved for a planned follow-up).
 ///
 /// `obs_code` is heap-allocated and owned by the parent array — freed
 /// by [`empyrean_od_result_free`] when the result is freed. Don't free
@@ -569,7 +569,7 @@ pub struct EmpyreanStationBias {
     pub bias_dec_arcsec: f64,
     pub sigma_dec_arcsec: f64,
     /// 1 when the timing bias is populated; 0 otherwise. Reserved for
-    /// the post-empyrean-96r `BiasKind::StationTiming` epic.
+    /// the planned `BiasKind::StationTiming` follow-up.
     pub has_timing: u8,
     pub bias_timing_sec: f64,
     pub sigma_timing_sec: f64,
@@ -605,7 +605,7 @@ pub struct EmpyreanNonGravParams {
     /// Fitted non-grav 3×3 covariance for (A1, A2, A3), row-major. Only
     /// meaningful when `has_covariance = 1`. Re-feeding it onto an input
     /// orbit lets a fitted orbit flow into a StateAndNonGrav refine without
-    /// losing its non-grav prior (empyrean-wo4n).
+    /// losing its non-grav prior.
     pub covariance: [[f64; 3]; 3],
 }
 
@@ -1485,7 +1485,7 @@ fn od_result_non_grav_to_c(od: &ODResult) -> (u8, EmpyreanNonGravParams) {
                 Some(d) => (1u8, d),
                 None => (0u8, f64::NAN),
             };
-            // Fitted non-grav covariance (empyrean-wo4n): carry it out so the
+            // Fitted non-grav covariance: carry it out so the
             // re-feedable orbit keeps its non-grav prior for a StateAndNonGrav
             // refine. Source it from the authoritative 9×9 posterior block
             // `od.covariance_9x9[6..9][6..9]` rather than the orbit's own

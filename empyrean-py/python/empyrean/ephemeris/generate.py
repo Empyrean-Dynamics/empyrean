@@ -367,7 +367,7 @@ def generate_ephemeris(
         sky_rate=_nullable_float("sky_rate"),
     )
 
-    # ── Observation sensitivities (bd empyrean-14cz.4) ──
+    # ── Observation sensitivities ──
     # One row per (orbit, observer, epoch). jacobian/hessian are row-major-
     # flattened (6·n_params / 6·n_params²); hessian is null unless a
     # second-order method ran. Empty table on the f64-only path.

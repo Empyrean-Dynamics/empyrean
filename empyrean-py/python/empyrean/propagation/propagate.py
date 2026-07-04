@@ -693,8 +693,7 @@ def _build_events(result: dict[str, Any]) -> Events:
     close_approach_starts = _common("close_approach_start", CloseApproachStarts)
     close_approach_ends = _common("close_approach_end", CloseApproachEnds)
 
-    # Periapses carry relative state vectors now wired through the C ABI
-    # (empyrean-14cz.1).
+    # Periapses carry relative state vectors wired through the C ABI.
     per_idx = _idx("periapsis")
     if per_idx:
         periapses = Periapses.from_kwargs(
@@ -735,9 +734,9 @@ def _build_events(result: dict[str, Any]) -> Events:
     # Possible impacts: probabilistic fields not in the flat schema.
     pi_idx = _idx("possible_impact")
     if pi_idx:
-        # PossibleImpact probability payload now wired through the C ABI
-        # (empyrean-14cz.2). The second-order / AGM / MC probabilities are
-        # NaN unless the matching uncertainty method ran.
+        # PossibleImpact probability payload is wired through the C ABI.
+        # The second-order / AGM / MC probabilities are NaN unless the
+        # matching uncertainty method ran.
         possible_impacts = PossibleImpacts.from_kwargs(
             orbit_id=_str(orbit_ids, pi_idx),
             object_id=_str_opt(object_ids, pi_idx),
@@ -821,8 +820,8 @@ def _build_events(result: dict[str, Any]) -> Events:
     capture_starts = _capture("capture_start", CaptureStarts)
     capture_ends = _capture("capture_end", CaptureEnds, with_n_periapses=True)
 
-    # Shadow events: shadow_fraction / illumination now carried through the
-    # C ABI (empyrean-14cz.3).
+    # Shadow events: shadow_fraction / illumination are carried through the
+    # C ABI.
     def _shadow(tag: str, cls: type[_EventTableT]) -> _EventTableT:
         idx = _idx(tag)
         if not idx:

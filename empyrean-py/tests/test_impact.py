@@ -41,7 +41,7 @@ def _make_test_orbit(*, with_non_grav: bool) -> CartesianOrbits:
 
 
 def test_compute_impact_probabilities_without_non_grav():
-    """Regression for empyrean-50jg.
+    """Regression: all-null non-grav sub-table must not break IP computation.
 
     `from_kwargs(orbit_id=[...], coordinates=...)` produces an
     `orbits.non_grav` value that is not Python `None` but holds an

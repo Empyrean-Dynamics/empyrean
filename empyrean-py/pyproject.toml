@@ -116,7 +116,13 @@ dev = [
 empyrean-sphinx-theme = { path = "../../empyrean-sphinx-theme", editable = true }
 
 [tool.maturin]
-features = ["pyo3/extension-module"]
+# abi3-py310 builds a single stable-ABI wheel (tagged cp310-abi3) that installs
+# on CPython 3.10 and every newer version, instead of one wheel per minor —
+# matching requires-python = ">=3.10" above. The heavy engine is dlopen'd and
+# Python-version-independent (see the libempyrean include below), so this
+# extension is thin FFI glue with no abi3-incompatible surface. Kept here beside
+# extension-module rather than in Cargo.toml so `cargo test` is unaffected.
+features = ["pyo3/extension-module", "pyo3/abi3-py310"]
 python-source = "python"
 module-name = "empyrean._empyrean_rs"
 # Strip symbols on release wheels — required by the closed-source

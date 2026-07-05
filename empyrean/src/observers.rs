@@ -52,7 +52,7 @@ impl Context {
                 CString::new(c).map_err(|_| Error::invalid_input("observatory code has NUL byte"))
             })
             .collect::<Result<Vec<_>>>()?;
-        let ptrs: Vec<*const i8> = cstrings.iter().map(|s| s.as_ptr()).collect();
+        let ptrs: Vec<*const std::ffi::c_char> = cstrings.iter().map(|s| s.as_ptr()).collect();
         let epochs_mjd_tdb: Vec<f64> = epochs
             .iter()
             .map(|e| e.mjd_tdb())

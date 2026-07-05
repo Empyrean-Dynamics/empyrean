@@ -99,7 +99,7 @@ pub struct Observation {
 
 impl Observation {
     pub(super) fn from_ffi(o: &empyrean_sys::EmpyreanObservation) -> Self {
-        fn cstr_opt(p: *mut i8) -> Option<String> {
+        fn cstr_opt(p: *mut std::ffi::c_char) -> Option<String> {
             if p.is_null() {
                 None
             } else {

@@ -358,7 +358,7 @@ pub struct Event {
 
 impl Event {
     pub(crate) fn from_ffi(e: &empyrean_sys::EmpyreanEvent) -> Self {
-        fn cstr_to_string(ptr: *const i8) -> String {
+        fn cstr_to_string(ptr: *const std::ffi::c_char) -> String {
             if ptr.is_null() {
                 String::new()
             } else {

@@ -126,6 +126,12 @@ jobs:
             binary: target/x86_64-apple-darwin/release/empyrean
             artifact: empyrean-macos-x86_64
     runs-on: ${{ matrix.os }}
+    # The CLI is cross-built with `--target`, so libempyrean lands at
+    # target/<triple>/release. Point empyrean-sys's build.rs at that dir so it
+    # uses the just-built engine instead of trying to download the (unpublished)
+    # engine for this pre-release tag.
+    env:
+      EMPYREAN_LIB_DIR: ${{ github.workspace }}/target/${{ matrix.target }}/release
     steps:
       - uses: actions/checkout@v4
 
@@ -203,6 +209,12 @@ jobs:
             target: x86_64-apple-darwin
             artifact: wheel-macos-x86_64
     runs-on: ${{ matrix.os }}
+    # The wheel is cross-built with `--target`, so libempyrean lands at
+    # target/<triple>/release. Point empyrean-sys's build.rs at that dir so it
+    # uses the just-built engine instead of trying to download the (unpublished)
+    # engine for this pre-release tag.
+    env:
+      EMPYREAN_LIB_DIR: ${{ github.workspace }}/target/${{ matrix.target }}/release
     steps:
       - uses: actions/checkout@v4
 

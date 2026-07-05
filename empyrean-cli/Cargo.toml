@@ -1,6 +1,6 @@
 [package]
 name = "empyrean-cli"
-version = "0.8.0-rc.0"
+version = "0.8.0-rc.1"
 edition = "2024"
 rust-version = "1.90.0"
 authors = ["Joachim Moeyens <joachim@empyrean-dynamics.com>", "Empyrean Dynamics"]
@@ -32,7 +32,7 @@ path = "src/main.rs"
 # CLI is a distribution channel — same closed-source posture as the
 # Python wheel and C SDK. Compute and I/O both go through the empyrean
 # wrapper (which sits over the public C ABI exposed by empyrean-c).
-empyrean = { path = "../empyrean", version = "0.8.0-rc.0" }
+empyrean = { path = "../empyrean", version = "0.8.0-rc.1" }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }

@@ -210,9 +210,13 @@ pub struct SystemDescription {
 ///
 /// Wraps an opaque native handle; the assembled force model and the captured
 /// kernel manifest live on the libempyrean heap and are released when this
-/// value is dropped. Construct with [`Context::built_system`]. See the
-/// [module docs](self) for the identity guard and the cross-thread reuse
-/// story.
+/// value is dropped. Construct with [`Context::built_system`].
+///
+/// Every forward-model call validates the handle against the call's context
+/// and config, erroring loudly on a data-identity, frozen-key, or staleness
+/// mismatch rather than silently rebuilding. The handle is `Send + Sync`, so
+/// `&handle` can be shared across threads for build-once, propagate-many
+/// reuse.
 pub struct BuiltSystem {
     raw: NonNull<empyrean_sys::EmpyreanBuiltSystem>,
 }

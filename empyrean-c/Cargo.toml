@@ -25,7 +25,7 @@ crate-type = ["cdylib", "staticlib"]
 # same release-pinning empyrean-core itself uses for villeneuve / scott.
 # To co-develop a local empyrean-core against this workspace, add a
 # `[patch."ssh://…empyrean-core.git"]` path override at the workspace root.
-empyrean-core = { git = "ssh://git@github.com/Empyrean-Dynamics/empyrean-core.git", tag = "v0.7.0", features = ["parquet"] }
+empyrean-core = { git = "ssh://git@github.com/Empyrean-Dynamics/empyrean-core.git", tag = "v0.8.0", features = ["parquet"] }
 arrow = "58"
 parquet = "58"
 serde = { version = "1", features = ["derive"] }

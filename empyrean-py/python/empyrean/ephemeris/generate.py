@@ -99,7 +99,7 @@ def generate_ephemeris(
 
     >>> cfg = EphemerisConfig(
     ...     propagation=PropagationConfig(
-    ...         force_model=ForceModelTier.FULL,
+    ...         force_model=ForceModelTier.STANDARD,
     ...         uncertainty_method=UncertaintyMethod.SECOND_ORDER,
     ...     ),
     ...     compute_diagnostics=False,

@@ -127,11 +127,10 @@ def propagate(
         dataclass (:class:`SigmaPoint(n_sigma=2.0)` etc.). Ignored if
         ``config`` is given.
     num_threads : int, optional
-        Threads for multi-orbit propagation. ``None`` (default) =
-        sequential; ``0`` = use all available cores; ``n`` > 0 = use
-        exactly ``n`` cores. Each orbit is integrated on a single
-        thread; parallelism is across orbits, not within a single
-        trajectory.
+        Threads for multi-orbit propagation. ``None`` (default) and
+        ``0`` both use all available cores; ``n`` > 0 pins exactly
+        ``n`` threads. Each orbit is integrated on a single thread;
+        parallelism is across orbits, not within a single trajectory.
     events : EventConfig, optional
         Event-detection toggles + body filter + dense-output cadence.
         Override individual flags here without rebuilding a full
@@ -178,7 +177,7 @@ def propagate(
     With a config object:
 
     >>> cfg = PropagationConfig(
-    ...     force_model=ForceModelTier.FULL,
+    ...     force_model=ForceModelTier.STANDARD,
     ...     uncertainty_method=SigmaPoint(n_sigma=2.0),
     ...     num_threads=8,
     ... )
@@ -186,7 +185,7 @@ def propagate(
 
     With inline kwargs (sugar):
 
-    >>> result = empyrean.propagate(orbits, times, force_model="full")
+    >>> result = empyrean.propagate(orbits, times, force_model="standard")
     """
     from empyrean._empyrean_rs import _propagate
 

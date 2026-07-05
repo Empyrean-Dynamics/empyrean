@@ -1702,8 +1702,9 @@ fn build_weighting_from_c(
 /// the user expected the production default.
 enum DebiasingChoice {
     /// `enabled = 1` + null `bias_dat_path` — leave `cfg.debiasing` at
-    /// scott's `ODConfig::default()` value (lazy-loads
-    /// `~/.empyrean/data/bias.dat`).
+    /// scott's `ODConfig::default()` value (lazy-loads `bias.dat` from
+    /// the platform data directory, e.g.
+    /// `~/.local/share/empyrean/data/bias.dat` on Linux).
     KeepDefault,
     /// `enabled = 0` — explicit disable.
     Disable,

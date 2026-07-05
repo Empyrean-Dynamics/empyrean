@@ -112,7 +112,8 @@ t0 = orbits.coordinates.epoch.to_numpy()[0]
 epochs = np.array([t0 + 10.0 * 365.25])
 result = empyrean.propagate(orbits, epochs)
 
-print(f"{len(result.states)} states, {len(result.events)} events")
+counts = result.events.count_by_type()
+print(f"{len(result.states)} states, {sum(counts.values())} events")
 ```
 
 #### Rust

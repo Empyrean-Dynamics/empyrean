@@ -13,7 +13,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 )]
 struct Cli {
     /// Path to SPICE kernel data directory.
-    /// Overrides EMPYREAN_DATA_DIR. Default: ~/.empyrean/data/
+    /// Overrides EMPYREAN_DATA_DIR. Default: the platform data dir
+    /// (~/.local/share/empyrean/data on Linux).
     #[arg(long, global = true, env = "EMPYREAN_DATA_DIR")]
     data_dir: Option<std::path::PathBuf>,
 

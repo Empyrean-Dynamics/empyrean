@@ -20,8 +20,9 @@ pip install empyrean
 ```
 
 A plain install pulls empyrean together with the B612 Foundation's
-pre-packaged SPICE kernels (~640 MB). After installation, the first
-call to `empyrean.initialize()` downloads a small remainder (the
+pre-packaged SPICE kernels (~740 MB — see the table below). After
+installation, the first call to `empyrean.initialize()` downloads a
+small remainder (the
 `moon_pa` Moon-orientation kernel and the `bias.dat` star-catalog
 debiasing table — about 50 MB) that isn't available on PyPI.
 

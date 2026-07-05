@@ -356,9 +356,9 @@ def initialize(
     ``~/Library/Application Support/empyrean/data/`` on macOS,
     ``%APPDATA%\\empyrean\\data\\`` on Windows; honors
     ``EMPYREAN_DATA_DIR``) and uses that as the data directory — zero
-    network access required. Falls back to ``data_dir`` (default: same
-    XDG location, ``data/`` instead of ``b612-cache/``) plus
-    :func:`download_data` otherwise.
+    network access required. Falls back to ``data_dir`` (default: the
+    same XDG ``.../empyrean/data/`` location) plus :func:`download_data`
+    otherwise.
 
     Parameters
     ----------

@@ -148,9 +148,11 @@ handle after any `initialize()` / data reload.
 
 ```python
 import empyrean
+from empyrean import ForceModelTier, Frame
 
-# Build once for the Standard model in the ecliptic frame.
-system = empyrean.build_system("standard", "ecliptic_j2000")
+# Build once for the Standard model in the ecliptic frame. force_model and
+# frame accept the enums or their string / int forms.
+system = empyrean.build_system(ForceModelTier.STANDARD, Frame.ECLIPTICJ2000)
 
 result = system.propagate(orbits, epochs)
 

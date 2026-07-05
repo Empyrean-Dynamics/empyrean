@@ -109,19 +109,21 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            binary: target/release/empyrean
+            binary: target/x86_64-unknown-linux-gnu/release/empyrean
             artifact: empyrean-linux-x86_64
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            binary: target/release/empyrean
+            binary: target/aarch64-unknown-linux-gnu/release/empyrean
             artifact: empyrean-linux-aarch64
           - os: macos-14
             target: aarch64-apple-darwin
-            binary: target/release/empyrean
+            binary: target/aarch64-apple-darwin/release/empyrean
             artifact: empyrean-macos-aarch64
-          - os: macos-13
+          # Cross-compiled on the arm64 macos-14 runner (the deprecated/scarce
+          # Intel macos-13 runner is retired); build target/host differ here.
+          - os: macos-14
             target: x86_64-apple-darwin
-            binary: target/release/empyrean
+            binary: target/x86_64-apple-darwin/release/empyrean
             artifact: empyrean-macos-x86_64
     runs-on: ${{ matrix.os }}
     steps:
@@ -133,6 +135,7 @@ jobs:
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
+          target: ${{ matrix.target }}
           rustflags: ""
 
       # The CLI binary links libempyrean (through empyrean-sys's `links`
@@ -140,10 +143,10 @@ jobs:
       # cdylib first — otherwise the final link fails with `-lempyrean`
       # not found. Mirrors the wheels / publish-crates jobs.
       - name: Build libempyrean (release)
-        run: cargo build -p empyrean-c --release
+        run: cargo build -p empyrean-c --release --target ${{ matrix.target }}
 
       - name: Build CLI (release, stripped)
-        run: cargo build --release --bin empyrean
+        run: cargo build --release --bin empyrean --target ${{ matrix.target }}
 
       - name: Verify stripped + no internal symbol leak
         run: |
@@ -179,7 +182,9 @@ jobs:
   # ── Build the macOS wheels (arm64 + x86_64, abi3) ──────────
   # One abi3 wheel per arch (cp310-abi3-macosx_*): the pyo3/abi3-py310 feature
   # in pyproject makes a single build cover CPython 3.10+, so the matrix spans
-  # ARCHITECTURES (Apple Silicon macos-14 + Intel macos-13), not Python minors.
+  # ARCHITECTURES, not Python minors. Both legs run on the arm64 macos-14 runner
+  # (the Intel macos-13 runner is retired) and cross-compile to their target:
+  # aarch64-apple-darwin natively and x86_64-apple-darwin cross.
   wheels-macos:
     name: Wheel (macOS ${{ matrix.arch }}, abi3)
     needs: verify
@@ -189,9 +194,13 @@ jobs:
         include:
           - os: macos-14
             arch: arm64
+            target: aarch64-apple-darwin
             artifact: wheel-macos-arm64
-          - os: macos-13
+          # Cross-compiled on the arm64 macos-14 runner (the deprecated/scarce
+          # Intel macos-13 runner is retired); build target/host differ here.
+          - os: macos-14
             arch: x86_64
+            target: x86_64-apple-darwin
             artifact: wheel-macos-x86_64
     runs-on: ${{ matrix.os }}
     steps:
@@ -210,6 +219,7 @@ jobs:
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
+          target: ${{ matrix.target }}
           rustflags: ""
 
       - name: Install maturin
@@ -219,7 +229,7 @@ jobs:
       # the engine at run time (dlopen), so maturin won't build the cdylib
       # transitively. Build it first so it exists to bundle below.
       - name: Build libempyrean (release)
-        run: cargo build -p empyrean-c --release
+        run: cargo build -p empyrean-c --release --target ${{ matrix.target }}
 
       # Bundle the engine INSIDE the wheel, next to the extension. At run time
       # empyrean-sys finds libempyrean.dylib beside the loaded extension via
@@ -229,7 +239,7 @@ jobs:
       - name: Bundle libempyrean beside the extension
         run: |
           set -euo pipefail
-          cp target/release/libempyrean.dylib empyrean-py/python/empyrean/
+          cp target/${{ matrix.target }}/release/libempyrean.dylib empyrean-py/python/empyrean/
           echo "bundled libempyrean.dylib -> empyrean-py/python/empyrean/"
 
       # delocate (via --auditwheel=repair) vendors external deps of the
@@ -237,7 +247,7 @@ jobs:
       # out. The bundled engine is not a link-time dep, so delocate leaves it in
       # place beside the extension, found at run time via dladdr.
       - name: Build wheel (stripped, self-contained)
-        run: cd empyrean-py && maturin build --release --strip --auditwheel=repair --out ../target/wheels
+        run: cd empyrean-py && maturin build --release --strip --auditwheel=repair --target ${{ matrix.target }} --out ../target/wheels
 
       - name: Verify wheel symbols stripped (no internal leak)
         run: |

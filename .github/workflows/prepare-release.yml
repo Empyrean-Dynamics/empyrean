@@ -112,16 +112,22 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            lib: target/release/libempyrean.so
+            target: x86_64-unknown-linux-gnu
+            lib: target/x86_64-unknown-linux-gnu/release/libempyrean.so
             artifact: libempyrean-linux-x86_64
           - os: ubuntu-24.04-arm
-            lib: target/release/libempyrean.so
+            target: aarch64-unknown-linux-gnu
+            lib: target/aarch64-unknown-linux-gnu/release/libempyrean.so
             artifact: libempyrean-linux-aarch64
           - os: macos-14
-            lib: target/release/libempyrean.dylib
+            target: aarch64-apple-darwin
+            lib: target/aarch64-apple-darwin/release/libempyrean.dylib
             artifact: libempyrean-macos-aarch64
-          - os: macos-13
-            lib: target/release/libempyrean.dylib
+          # Cross-compiled on the arm64 macos-14 runner (the deprecated/scarce
+          # Intel macos-13 runner is retired); build target/host differ here.
+          - os: macos-14
+            target: x86_64-apple-darwin
+            lib: target/x86_64-apple-darwin/release/libempyrean.dylib
             artifact: libempyrean-macos-x86_64
     runs-on: ${{ matrix.os }}
     steps:
@@ -133,10 +139,11 @@ jobs:
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
+          target: ${{ matrix.target }}
           rustflags: ""
 
       - name: Build C API (release, stripped)
-        run: cargo build -p empyrean-c --release
+        run: cargo build -p empyrean-c --release --target ${{ matrix.target }}
 
       - name: Verify stripped + no internal symbol leak
         run: |

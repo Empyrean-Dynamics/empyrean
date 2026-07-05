@@ -159,14 +159,14 @@ that pairs the handle with a different data instance, is rejected
 loudly by axis — never silently rebuilt against the wrong dynamics.
 
 ```rust,no_run
-# use empyrean::{Context, ForceModelTier, Frame, Orbit, PropagationConfig, Epoch};
+# use empyrean::{Context, ForceModelTier, Frame, PropagationConfig, Epoch};
 # let ctx = Context::from_data_dir(None)?;
-# let orbit: Orbit = ctx.query_sbdb("2020 SO")?.orbits.remove(0);
+# let orbits = empyrean::query_sbdb(&["Apophis"], None)?.orbits;
 // Build once; freeze the divisor at the engine default (0.0).
 let handle = ctx.built_system(ForceModelTier::Standard, Frame::EclipticJ2000, 0.0)?;
 
 let epochs = vec![Epoch::from_mjd_tdb(65020.0)];
-let result = handle.propagate(&ctx, &[orbit], &epochs, &PropagationConfig::default())?;
+let result = handle.propagate(&ctx, &orbits, &epochs, &PropagationConfig::default())?;
 println!("{} states", result.states.len());
 
 // describe() reports the reproducibility record: the force-model menu

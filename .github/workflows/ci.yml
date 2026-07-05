@@ -244,10 +244,21 @@ jobs:
     name: Python (${{ matrix.os }}, ${{ matrix.python }})
     needs: build-lint
     strategy:
+      fail-fast: false
+      # The abi3 wheel installs on every CPython >= 3.10, but the Python source
+      # (empyrean-py/python) can still trip a version-specific break — so span
+      # the declared support range on Linux: 3.10 (floor) + 3.12 (build/mypy
+      # target) + 3.13 (newest classifier). macOS keeps a single-version smoke
+      # since version-specific breaks are OS-independent. Add 3.14 here once the
+      # numpy/pyarrow/quivr stack ships 3.14 wheels.
       matrix:
         include:
           - os: ubuntu-latest
+            python: "3.10"
+          - os: ubuntu-latest
             python: "3.12"
+          - os: ubuntu-latest
+            python: "3.13"
           - os: macos-14
             python: "3.12"
     runs-on: ${{ matrix.os }}
@@ -293,6 +304,10 @@ jobs:
           ruff format --check empyrean-py/python/empyrean/ empyrean-py/tests/
 
       - name: Type-check Python (mypy --strict)
+        # Static check: run once against the canonical target, not per-matrix —
+        # each Python resolves a different numpy whose stubs disagree on bare
+        # generics, so a per-version mypy is inconsistent, not more thorough.
+        if: matrix.python == '3.12'
         run: |
           uv pip install --system mypy
           cd empyrean-py && mypy --config-file pyproject.toml python/empyrean/

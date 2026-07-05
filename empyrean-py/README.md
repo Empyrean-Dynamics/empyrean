@@ -20,21 +20,24 @@ pip install empyrean
 ```
 
 A plain install pulls empyrean together with the B612 Foundation's
-pre-packaged SPICE kernels (~640 MB). After installation, the first
-call to `empyrean.initialize()` downloads a small remainder (the
+pre-packaged SPICE kernels (~740 MB — see the table below). After
+installation, the first call to `empyrean.initialize()` downloads a
+small remainder (the
 `moon_pa` Moon-orientation kernel and the `bias.dat` star-catalog
 debiasing table — about 50 MB) that isn't available on PyPI.
 
-Wheels are currently published for CPython 3.12 on macOS arm64
-(`macosx_11_0_arm64`) and Linux x86_64 (`manylinux_2_28`). There is
-no source distribution, so `pip install empyrean` on other platforms
-or Python versions will not resolve — use the
+Wheels are published for CPython >= 3.10 as a single abi3 stable-ABI
+wheel per architecture — one wheel covers CPython 3.10 and every newer
+version — across four platforms: macOS arm64, macOS x86_64,
+manylinux_2_28 x86_64, and manylinux_2_28 aarch64. There is no source
+distribution, so `pip install empyrean` on other platforms will not
+resolve — use the
 [other distribution channels](https://github.com/Empyrean-Dynamics/empyrean#install)
 in the meantime.
 
 ## What it does
 
-- **Propagation** — N-body (Sun, planets, Moon, Pluto) with EIH general relativity, Sun J2 and Earth J2–J4 zonal harmonics, 16 asteroid perturbers, and the Marsden non-gravitational model — selectable across Approximate / Basic / Standard force-model tiers (Standard is the default). GR15 and DOP853 integrators.
+- **Propagation** — N-body (Sun, planets, Moon, Pluto) with EIH general relativity, Sun J2 and Earth J2–J4 zonal harmonics, 16 asteroid perturbers, and the Marsden non-gravitational model — selectable across Approximate / Basic / Standard force-model tiers (Standard is the default). GR15 and DOP853 integrators. Optional finite-burn thrust arcs — constant-RTN, velocity-tangent, or inertial-fixed steering, with per-arc Δv targeting corrections — layer on as a continuous-thrust force input.
 - **Uncertainty** — First-order (Jet1) state transition matrices; second-order (Jet2) state transition tensors; unscented sigma-point and Monte Carlo sampling; an adaptive Auto mode that escalates the method automatically through close approaches and relaxes it elsewhere. Optional per-epoch tagged-covariance readback.
 - **Ephemeris** — RA/Dec, rates, photometry (H–G, H–G₁G₂, H–G₁₂), light time, phase angle, solar elongation, local horizon.
 - **Orbit determination** — Gauss, Herget, and systematic-ranging (admissible region + Manifold of Variations) IOD → N-body differential correction over optical and radar (delay / Doppler) observations, with STM caching and outlier rejection. Validated against `find_orb` and JPL SBDB.
@@ -97,6 +100,67 @@ result = empyrean.propagate(
 )
 print(result.sensitivity.stms_array().shape)   # (N, 6, 6)
 print(result.sensitivity.stts_array().shape)   # (N, 6, 6, 6)
+```
+
+## Continuous thrust
+
+Model finite burns / low-thrust arcs by passing one `ThrustParams` per
+orbit through `propagate`'s `thrust_arcs` keyword (`None` for the
+ballistic orbits). Each `ThrustArc` carries its own thrust, mass,
+specific impulse, steering law (constant-RTN, velocity-tangent, or
+inertial-fixed), and central body — the burn perturbs the trajectory
+through the same differentiated dynamics as gravity and the
+non-gravitational forces.
+
+```python
+import empyrean
+from empyrean import Origin
+from empyrean.orbits.thrust import ConstantRTN, ThrustArc, ThrustParams
+
+# One finite burn: 1 N over MJD 65000-65010 on a 500 kg spacecraft,
+# mass depleting at Isp = 3000 s, steered at constant RTN angles
+# relative to the Sun. `sharpness` sets the tanh on/off transition.
+arc = ThrustArc(
+    start_mjd_tdb=65000.0,
+    end_mjd_tdb=65010.0,
+    thrust_n=1.0,
+    mass_kg=500.0,
+    steering=ConstantRTN(alpha_rad=0.0, beta_rad=0.0),
+    sharpness=100.0,
+    central_body=Origin.SUN,
+    isp_s=3000.0,
+)
+
+# One entry per orbit, positionally aligned with `orbits`. Add per-arc Δv
+# targeting corrections with ThrustParams(arcs=[arc], dv_corrections=[...]).
+result = empyrean.propagate(orbits, epochs, thrust_arcs=[ThrustParams(arcs=[arc])])
+```
+
+## System handles
+
+Assembling the force model has a fixed per-call cost. `build_system`
+assembles it once for a frozen `{force model, frame, encounter-timescale
+divisor}` key and returns a `BuiltSystem` you reuse across many
+propagations — the build-once, propagate-many pattern for short-arc
+campaigns. Its `propagate` / `generate_ephemeris` release the GIL, so
+the handle can be shared across threads. A call that disagrees with the
+frozen key is rejected loudly, never silently rebuilt; rebuild the
+handle after any `initialize()` / data reload.
+
+```python
+import empyrean
+from empyrean import ForceModelTier, Frame
+
+# Build once for the Standard model in the ecliptic frame. force_model and
+# frame accept the enums or their string / int forms.
+system = empyrean.build_system(ForceModelTier.STANDARD, Frame.ECLIPTICJ2000)
+
+result = system.propagate(orbits, epochs)
+
+# describe() is the reproducibility record: the force-model menu plus the
+# identity (SHA-256) of every loaded kernel.
+desc = system.describe()
+print(len(desc.perturber_origins), "perturbers,", len(desc.kernels), "kernels")
 ```
 
 ## Impact probability and B-plane geometry

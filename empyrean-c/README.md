@@ -34,9 +34,9 @@ and bundled into the published Python wheel.
 > `empyrean-core` engine crate, which is not in this repository —
 > building from this source requires access to the private engine
 > repositories. Everyone else should use the released
-> `libempyrean-<target>.tar.gz` artifacts (currently `macos-aarch64`
-> and `linux-x86_64`), which bundle the shared library, the
-> `empyrean.h` header, and the LICENSE.
+> `libempyrean-<target>.tar.gz` artifacts (currently `macos-aarch64`,
+> `macos-x86_64`, `linux-x86_64`, and `linux-aarch64`), which bundle the
+> shared library, the `empyrean.h` header, and the LICENSE.
 
 ```sh
 # Build the cdylib + staticlib into target/release/.

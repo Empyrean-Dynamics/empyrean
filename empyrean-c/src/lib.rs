@@ -7,6 +7,7 @@
 #![allow(clippy::missing_safety_doc)]
 #![allow(clippy::field_reassign_with_default)]
 
+mod built_system;
 mod ephemeris;
 mod impact;
 mod io;
@@ -246,8 +247,9 @@ pub unsafe extern "C" fn empyrean_context_with_spk(
 ///
 /// Loads the full Standard-tier kernel set (DE440, SB441-N16, Earth/Moon
 /// BPCs, GM, MPC observatory codes) from `data_dir`, downloading any
-/// missing files. Pass null for `data_dir` to use the platform XDG
-/// data directory (`~/.empyrean/data` on Linux/macOS).
+/// missing files. Pass null for `data_dir` to use the platform data
+/// directory (`~/.local/share/empyrean/data` on Linux,
+/// `~/Library/Application Support/empyrean/data` on macOS).
 ///
 /// Returns a heap-allocated pointer on success, or null on error.
 /// Call `empyrean_last_error()` to retrieve the error message when null is

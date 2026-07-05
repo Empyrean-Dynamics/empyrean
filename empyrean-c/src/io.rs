@@ -217,6 +217,16 @@ fn row_to_orbit(row: &OrbitRow) -> Result<(EmpyreanOrbit, String, Option<String>
         h_mag: f64::NAN,
         slope1: 0.0,
         slope2: 0.0,
+        // OrbitRow JSON/parquet schema does not carry continuous-thrust
+        // arcs; round-tripped orbits come back gravity/non-grav only. The
+        // side arrays are caller-owned on input, so the read path leaves
+        // them null/0.
+        thrust_arcs: std::ptr::null(),
+        n_thrust_arcs: 0,
+        dv_corrections: std::ptr::null(),
+        n_dv_corrections: 0,
+        correction_covariances: std::ptr::null(),
+        n_correction_covariances: 0,
     };
     Ok((orbit, row.orbit_id.clone(), row.object_id.clone()))
 }
@@ -393,6 +403,11 @@ pub(crate) fn batch_to_orbits(batch: &EmpyreanOrbitBatch) -> Result<Orbits<AU>, 
             };
             out.set_non_grav_params(i, Some(params));
         }
+        if let Some(tp) = crate::propagate::empyrean_orbit_thrust_params(orbit)
+            .map_err(|e| format!("orbit {i}: {e}"))?
+        {
+            out.set_thrust_params(i, Some(tp));
+        }
     }
     Ok(out)
 }
@@ -442,6 +457,15 @@ pub(crate) fn orbits_to_batch(orbits: &Orbits<AU>) -> Result<EmpyreanOrbitBatch,
             h_mag: f64::NAN,
             slope1: 0.0,
             slope2: 0.0,
+            // Thrust arcs are a caller-owned input side array; the
+            // orbits→batch output path emits null/0 (villeneuve's thrust
+            // provenance surfaces separately via TaggedCovariance).
+            thrust_arcs: std::ptr::null(),
+            n_thrust_arcs: 0,
+            dv_corrections: std::ptr::null(),
+            n_dv_corrections: 0,
+            correction_covariances: std::ptr::null(),
+            n_correction_covariances: 0,
         };
         if let Some(ph) = orbits.photometric_params(i) {
             orbit.h_mag = ph.h();

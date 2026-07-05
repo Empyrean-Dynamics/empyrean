@@ -106,14 +106,23 @@ jobs:
     name: Build libempyrean (${{ matrix.os }})
     needs: verify
     strategy:
+      # One arch per leg; a failure on one platform must not cancel the others
+      # (the pin job needs every tarball to regenerate a complete checksums.txt).
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             lib: target/release/libempyrean.so
             artifact: libempyrean-linux-x86_64
+          - os: ubuntu-24.04-arm
+            lib: target/release/libempyrean.so
+            artifact: libempyrean-linux-aarch64
           - os: macos-14
             lib: target/release/libempyrean.dylib
             artifact: libempyrean-macos-aarch64
+          - os: macos-13
+            lib: target/release/libempyrean.dylib
+            artifact: libempyrean-macos-x86_64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

@@ -195,6 +195,9 @@ fn ffi_orbit_to_owned(o: &empyrean_sys::EmpyreanOrbit) -> Result<Orbit> {
         h_mag: o.h_mag,
         slope1: o.slope1,
         slope2: o.slope2,
+        // Thrust is a caller-owned input side array; the OrbitRow schema
+        // doesn't carry it, so orbit reads never reconstruct it.
+        thrust: None,
     })
 }
 

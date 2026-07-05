@@ -1702,8 +1702,9 @@ fn build_weighting_from_c(
 /// the user expected the production default.
 enum DebiasingChoice {
     /// `enabled = 1` + null `bias_dat_path` — leave `cfg.debiasing` at
-    /// scott's `ODConfig::default()` value (lazy-loads
-    /// `~/.empyrean/data/bias.dat`).
+    /// scott's `ODConfig::default()` value (lazy-loads `bias.dat` from
+    /// the platform data directory, e.g.
+    /// `~/.local/share/empyrean/data/bias.dat` on Linux).
     KeepDefault,
     /// `enabled = 0` — explicit disable.
     Disable,
@@ -1984,6 +1985,12 @@ pub(crate) fn empyrean_orbit_to_orbits(
     // gravity-only orbit and silently discard A1/A2/A3 + g(r) + dt.
     if let Some(params) = crate::propagate::empyrean_orbit_non_grav_params(orbit) {
         out.set_non_grav_params(0, Some(params));
+    }
+    // Carry the caller's continuous-thrust model onto the orbit so the
+    // radar/optical planning (evaluate_plan) and OD (evaluate / refine)
+    // single-orbit paths never silently discard thrust arcs + corrections.
+    if let Some(tp) = crate::propagate::empyrean_orbit_thrust_params(orbit)? {
+        out.set_thrust_params(0, Some(tp));
     }
     Ok(out)
 }
@@ -3148,6 +3155,13 @@ mod tests {
             h_mag: f64::NAN,
             slope1: f64::NAN,
             slope2: f64::NAN,
+            // No continuous thrust (gravity + non-grav only).
+            thrust_arcs: std::ptr::null(),
+            n_thrust_arcs: 0,
+            dv_corrections: std::ptr::null(),
+            n_dv_corrections: 0,
+            correction_covariances: std::ptr::null(),
+            n_correction_covariances: 0,
         }
     }
 
@@ -3292,6 +3306,13 @@ mod tests {
             h_mag: f64::NAN,
             slope1: f64::NAN,
             slope2: f64::NAN,
+            // Re-fed OD output orbits carry no thrust arcs.
+            thrust_arcs: std::ptr::null(),
+            n_thrust_arcs: 0,
+            dv_corrections: std::ptr::null(),
+            n_dv_corrections: 0,
+            correction_covariances: std::ptr::null(),
+            n_correction_covariances: 0,
         }
     }
 

@@ -28,7 +28,7 @@ empyrean = "0.7"
 
 ## What it does
 
-- **Propagation** — N-body (Sun, planets, Moon, Pluto) with EIH general relativity, Sun J2 and Earth J2–J4 zonal harmonics, 16 asteroid perturbers, and the Marsden non-gravitational model — selectable across Approximate / Basic / Standard force-model tiers (Standard is the default). GR15 and DOP853 integrators.
+- **Propagation** — N-body (Sun, planets, Moon, Pluto) with EIH general relativity, Sun J2 and Earth J2–J4 zonal harmonics, 16 asteroid perturbers, and the Marsden non-gravitational model — selectable across Approximate / Basic / Standard force-model tiers (Standard is the default). GR15 and DOP853 integrators. Optional finite-burn thrust arcs — constant-RTN, velocity-tangent, or inertial-fixed steering, with per-arc Δv targeting corrections — layer on as a continuous-thrust force input.
 - **Uncertainty** — First-order (Jet1) state transition matrices; second-order (Jet2) state transition tensors; unscented sigma-point and Monte Carlo sampling; an adaptive Auto mode that escalates the method automatically through close approaches and relaxes it elsewhere. Optional per-epoch tagged-covariance readback.
 - **Ephemeris** — RA/Dec, rates, photometry (H–G, H–G₁G₂, H–G₁₂), light time, phase angle, solar elongation, local horizon.
 - **Orbit determination** — Gauss, Herget, and systematic-ranging (admissible region + Manifold of Variations) IOD → N-body differential correction over optical and radar (delay / Doppler) observations, with STM caching and outlier rejection. Validated against `find_orb` and JPL SBDB.
@@ -108,6 +108,74 @@ let result = ctx.propagate(&orbits, &epochs, &config)?;
 # Ok::<(), empyrean::Error>(())
 ```
 
+## Continuous thrust
+
+Model finite burns / low-thrust arcs by attaching a `ThrustParams` to an
+orbit before propagation. Each `ThrustArc` carries its own thrust, mass,
+specific impulse, steering law (constant-RTN, velocity-tangent, or
+inertial-fixed), and central body; the burn perturbs the trajectory
+through the same differentiated dynamics as gravity and the
+non-gravitational forces.
+
+```rust,no_run
+use empyrean::{Context, Epoch, Origin, PropagationConfig, SteeringLaw, ThrustArc, ThrustParams};
+
+let ctx = Context::from_data_dir(None)?;
+let orbit = empyrean::query_sbdb(&["Apophis"], None)?.orbits.remove(0);
+
+// One finite burn: 1 N over MJD 65000–65010 on a 500 kg spacecraft,
+// mass depleting at Isp = 3000 s, steered at constant RTN angles
+// relative to the Sun. `sharpness` sets the tanh on/off transition.
+let arc = ThrustArc::new(
+    65000.0,                                                   // start_mjd_tdb
+    65010.0,                                                   // end_mjd_tdb
+    1.0,                                                       // thrust_n (N)
+    500.0,                                                     // mass_kg
+    100.0,                                                     // sharpness (1/day)
+    SteeringLaw::ConstantRTN { alpha_rad: 0.0, beta_rad: 0.0 },
+    Origin::SUN,                                               // RTN frame reference
+)
+.with_isp(Some(3000.0));
+
+// Attach to the orbit and propagate. Add per-arc Δv targeting
+// corrections with `ThrustParams::new(arcs).with_dv_corrections(..)`.
+let orbit = orbit.with_thrust(Some(ThrustParams::new(vec![arc])));
+let epochs = vec![Epoch::from_mjd_tdb(65020.0)];
+let result = ctx.propagate(&[orbit], &epochs, &PropagationConfig::default())?;
+println!("{} states", result.states.len());
+# Ok::<(), empyrean::Error>(())
+```
+
+## System handles
+
+Assembling the force model (planets, Moon, asteroid perturbers,
+harmonics, relativistic corrections) has a fixed per-call cost. A
+[`BuiltSystem`] assembles it once for a frozen `{force model, frame,
+encounter-timescale divisor}` key and reuses it across many
+propagations — the build-once, propagate-many pattern for
+short-arc campaigns. It is `Send + Sync`, so `&handle` can be shared
+across threads. A call whose config disagrees with the frozen key, or
+that pairs the handle with a different data instance, is rejected
+loudly by axis — never silently rebuilt against the wrong dynamics.
+
+```rust,no_run
+# use empyrean::{Context, ForceModelTier, Frame, PropagationConfig, Epoch};
+# let ctx = Context::from_data_dir(None)?;
+# let orbits = empyrean::query_sbdb(&["Apophis"], None)?.orbits;
+// Build once; freeze the divisor at the engine default (0.0).
+let handle = ctx.built_system(ForceModelTier::Standard, Frame::EclipticJ2000, 0.0)?;
+
+let epochs = vec![Epoch::from_mjd_tdb(65020.0)];
+let result = handle.propagate(&ctx, &orbits, &epochs, &PropagationConfig::default())?;
+println!("{} states", result.states.len());
+
+// describe() reports the reproducibility record: the force-model menu
+// plus the identity (SHA-256) of every loaded kernel.
+let desc = handle.describe()?;
+println!("{} perturbers, {} kernels", desc.perturber_origins.len(), desc.kernels.len());
+# Ok::<(), empyrean::Error>(())
+```
+
 ## Impact probability and B-plane geometry
 
 For each detected close approach you can ask for an impact-probability
@@ -150,10 +218,11 @@ sitting next to the loaded module, else a build-time location — an
 a checksum-pinned prebuilt downloaded from the GitHub release (in
 that order); no system library path setup is required.
 
-Prebuilt engine binaries are currently published for macOS arm64
-(`macos-aarch64`) and Linux x86_64 (`linux-x86_64`); on other targets
-the build stops with an error unless `EMPYREAN_LIB_DIR` points at an
-engine build.
+Prebuilt engine binaries are currently published for four targets —
+macOS arm64 (`macos-aarch64`), macOS x86_64 (`macos-x86_64`), Linux
+x86_64 (`linux-x86_64`), and Linux aarch64 (`linux-aarch64`); on other
+targets the build stops with an error unless `EMPYREAN_LIB_DIR` points
+at an engine build.
 
 The full distribution surface (Python wheel, CLI binary, C SDK, this
 Rust crate) lives at the

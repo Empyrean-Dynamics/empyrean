@@ -104,16 +104,25 @@ jobs:
     name: CLI (${{ matrix.os }})
     needs: verify
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             binary: target/release/empyrean
             artifact: empyrean-linux-x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            binary: target/release/empyrean
+            artifact: empyrean-linux-aarch64
           - os: macos-14
             target: aarch64-apple-darwin
             binary: target/release/empyrean
             artifact: empyrean-macos-aarch64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            binary: target/release/empyrean
+            artifact: empyrean-macos-x86_64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -167,17 +176,32 @@ jobs:
   # exact tarballs from the Prepare Release run, re-verifies them against
   # empyrean-sys/checksums.txt, and serves them from the release.
 
-  # ── Build the macOS wheel ──────────────────────────────────
+  # ── Build the macOS wheels (arm64 + x86_64, abi3) ──────────
+  # One abi3 wheel per arch (cp310-abi3-macosx_*): the pyo3/abi3-py310 feature
+  # in pyproject makes a single build cover CPython 3.10+, so the matrix spans
+  # ARCHITECTURES (Apple Silicon macos-14 + Intel macos-13), not Python minors.
   wheels-macos:
-    name: Wheel (macos-14, py3.12)
+    name: Wheel (macOS ${{ matrix.arch }}, abi3)
     needs: verify
-    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            arch: arm64
+            artifact: wheel-macos-arm64
+          - os: macos-13
+            arch: x86_64
+            artifact: wheel-macos-x86_64
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Configure git for private dependencies
         run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "ssh://git@github.com/"
 
+      # Any CPython >= 3.10 works as the build interpreter — the abi3 wheel is
+      # forward-compatible regardless of which one builds it.
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -231,21 +255,35 @@ jobs:
       - name: Upload wheel
         uses: actions/upload-artifact@v4
         with:
-          name: wheel-macos-14-py3.12
+          name: ${{ matrix.artifact }}
           path: target/wheels/*.whl
 
-  # ── Build the Linux (manylinux_2_28) wheel ─────────────────
+  # ── Build the Linux wheels (x86_64 + aarch64, manylinux_2_28, abi3) ──
   # Built INSIDE the manylinux_2_28 container so BOTH the pyo3 extension and the
   # bundled libempyrean link against the same old glibc floor (2.28). The engine
   # is dlopen'd — not a DT_NEEDED of the extension — so auditwheel cannot see it
   # and never folds its glibc requirement into the wheel tag. Building everything
   # against the 2.28 floor is what keeps the manylinux_2_28 tag honest and the
-  # wheel installable on older distros.
+  # wheel installable on older distros. One abi3 wheel per arch (cp310-abi3): the
+  # matrix spans ARCHITECTURES (x86_64 + aarch64 on a native Arm runner), not
+  # Python minors — abi3-py310 already covers 3.10+ from a single build.
   wheels-linux:
-    name: Wheel (manylinux_2_28, py3.12)
+    name: Wheel (${{ matrix.tag }}, abi3)
     needs: verify
-    runs-on: ubuntu-latest
-    container: quay.io/pypa/manylinux_2_28_x86_64
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            container: quay.io/pypa/manylinux_2_28_x86_64
+            tag: manylinux_2_28_x86_64
+            artifact: wheel-linux-x86_64
+          - runner: ubuntu-24.04-arm
+            container: quay.io/pypa/manylinux_2_28_aarch64
+            tag: manylinux_2_28_aarch64
+            artifact: wheel-linux-aarch64
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
     env:
       PYBIN: /opt/python/cp312-cp312/bin
     steps:
@@ -308,7 +346,7 @@ jobs:
       - name: Upload wheel
         uses: actions/upload-artifact@v4
         with:
-          name: wheel-linux-manylinux_2_28-py3.12
+          name: ${{ matrix.artifact }}
           path: target/wheels/*.whl
 
   # ── Publish wheels to PyPI ─────────────────────────────────

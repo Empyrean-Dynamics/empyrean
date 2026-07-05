@@ -22,6 +22,111 @@ typedef struct Session Session;
 
 
 /**
+ * Success.
+ */
+#define EMPYREAN_BUILTSYSTEM_OK 0
+
+/**
+ * A required pointer argument was null.
+ */
+#define EMPYREAN_BUILTSYSTEM_NULL_POINTER -1
+
+/**
+ * An input was malformed (unknown force-model tier / frame code, a bad
+ * orbit row, a kernel-manifest read failure, an unresolvable config).
+ */
+#define EMPYREAN_BUILTSYSTEM_INVALID_ARGUMENT -2
+
+/**
+ * The forward model ran but failed for a reason unrelated to the identity
+ * guard (integration / transform / missing data). `empyrean_last_error()`
+ * carries the engine message.
+ */
+#define EMPYREAN_BUILTSYSTEM_PROPAGATION -3
+
+/**
+ * Heap allocation for an output buffer failed.
+ */
+#define EMPYREAN_BUILTSYSTEM_ALLOC -5
+
+/**
+ * Identity guard (a): the handle was NOT built from the ephemeris data the
+ * passed context holds (`Arc` identity). The handle would otherwise serve
+ * physics from a foreign kernel set — rebuild it against this context.
+ */
+#define EMPYREAN_BUILTSYSTEM_DATA_MISMATCH -20
+
+/**
+ * Identity guard (b): the per-call config's output frame diverges from the
+ * handle's frozen frame.
+ */
+#define EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_FRAME -21
+
+/**
+ * Identity guard (b): the per-call config's force-model tier diverges from
+ * the handle's frozen tier.
+ */
+#define EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_FORCE_MODEL -22
+
+/**
+ * Identity guard (b): the per-call config's encounter-timescale divisor
+ * diverges from the handle's frozen divisor.
+ */
+#define EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_DIVISOR -23
+
+/**
+ * Identity guard (c): the context's ephemeris data was mutated (a kernel
+ * load) after the handle was built. The handle refuses to serve results
+ * assembled from since-replaced kernels — rebuild it.
+ */
+#define EMPYREAN_BUILTSYSTEM_STALE -24
+
+/**
+ * A panic was caught at the FFI boundary.
+ */
+#define EMPYREAN_BUILTSYSTEM_PANIC -99
+
+/**
+ * SPK ephemeris kernel (planetary / small-body / spacecraft states).
+ */
+#define EMPYREAN_KERNEL_KIND_SPK 0
+
+/**
+ * Binary PCK body-orientation kernel (Earth / Moon rotation).
+ */
+#define EMPYREAN_KERNEL_KIND_BPC 1
+
+/**
+ * Text PCK of gravitational parameters.
+ */
+#define EMPYREAN_KERNEL_KIND_TPC 2
+
+/**
+ * Gravity-field coefficient model (spherical-harmonics file or built-in field).
+ */
+#define EMPYREAN_KERNEL_KIND_GRAVITY 3
+
+/**
+ * Observatory-code registry.
+ */
+#define EMPYREAN_KERNEL_KIND_OBSCODES 4
+
+/**
+ * Loaded from a file on disk; `path`, `sha256`, and `bytes` are populated.
+ */
+#define EMPYREAN_KERNEL_PROVENANCE_FILE 0
+
+/**
+ * Handed over pre-loaded in memory (no path known); hash fields are null/0.
+ */
+#define EMPYREAN_KERNEL_PROVENANCE_IN_MEMORY 1
+
+/**
+ * Synthesized from constants compiled into the engine; `name` is populated.
+ */
+#define EMPYREAN_KERNEL_PROVENANCE_BUILT_IN 2
+
+/**
  * Round-trip time-delay measurement: `delay_seconds` / `rms_delay_microseconds`
  * are valid; the Doppler pair is `f64::NAN`.
  */
@@ -214,6 +319,37 @@ typedef struct Session Session;
 #define EMPYREAN_PHASE_FUNCTION_HG12 2
 
 /**
+ * Steering-law selector tags for [`EmpyreanThrustArc::steering_law`].
+ *
+ * Mirrors [`empyrean_core::nongrav::SteeringLaw`]. The value is read as a
+ * plain `int32_t` at the marshaling boundary and validated loudly — an
+ * unrecognized value is an error, never a silent default (the same tag
+ * convention used by `EMPYREAN_PHASE_FUNCTION_*` / `EMPYREAN_INTEGRATOR_*`).
+ * Which `EmpyreanThrustArc` steering-parameter slots are read depends on the
+ * selected law:
+ *
+ * | value | Steering law | Active fields |
+ * |-------|--------------|---------------|
+ * | 0 | `CONSTANT_RTN`     | `steering_alpha_rad`, `steering_beta_rad` |
+ * | 1 | `VELOCITY_TANGENT` | (none) |
+ * | 2 | `INERTIAL_FIXED`   | `steering_direction` |
+ *
+ * Constant RTN angles relative to the central body: fixed in-plane
+ * (\\(\alpha\\)) and out-of-plane (\\(\beta\\)) angles.
+ */
+#define EMPYREAN_STEERING_LAW_CONSTANT_RTN 0
+
+/**
+ * Thrust aligned with velocity relative to the central body.
+ */
+#define EMPYREAN_STEERING_LAW_VELOCITY_TANGENT 1
+
+/**
+ * Fixed direction in the inertial frame (normalized internally).
+ */
+#define EMPYREAN_STEERING_LAW_INERTIAL_FIXED 2
+
+/**
  * Integrator backend tag for [`EmpyreanAdvancedIntegratorConfig::integrator`].
  *
  * - `0` = GR15 (Gauss-Radau 15, derived solely from Everhart 1985 and
@@ -366,6 +502,18 @@ typedef struct Session Session;
 #define EMPYREAN_TAGGED_COV_PANIC -99
 
 /**
+ * Opaque handle wrapping a pre-assembled force model plus the
+ * kernel-identity snapshot taken from the context at construction (so
+ * [`empyrean_builtsystem_describe`] is self-contained). Construct with
+ * [`empyrean_builtsystem_new`]; release with [`empyrean_builtsystem_free`].
+ *
+ * The handle is `Send + Sync`: hand `&EmpyreanBuiltSystem` (via a `const`
+ * pointer) to as many threads as you like. It borrows nothing from the
+ * context after construction.
+ */
+struct EmpyreanBuiltSystem;
+
+/**
  * C FFI opaque handle. Internally an [`empyrean_core::Context`]; the
  * C header forward-declares `struct EmpyreanContext` — callers only
  * see the pointer.
@@ -418,10 +566,83 @@ struct CoordinateState {
 };
 
 /**
- * An orbit with optional non-gravitational parameters and photometry.
+ * A single continuous-thrust arc, mirroring
+ * [`empyrean_core::nongrav::ThrustArc`] as a flat `#[repr(C)]` record.
  *
- * Thrust-arc support has been removed in v0.7.0; if `a1 == a2 == a3 ==
- * 0.0` the orbit is treated as gravity-only.
+ * Arcs are supplied through [`EmpyreanOrbit::thrust_arcs`] as a
+ * caller-owned side array borrowed read-only for the duration of the call.
+ *
+ * The acceleration during the arc is
+ * \\[ \mathbf{a}(t) = \sigma(t)\,\frac{F}{m(t)}\,\hat{d} \\]
+ * with a smooth \\(\tanh\\) switch \\(\sigma(t)\\) of width set by
+ * `sharpness`, steering direction \\(\hat{d}\\) from `steering_law`, and
+ * mass \\(m(t)\\) that depletes when `isp_s` is finite.
+ */
+struct EmpyreanThrustArc {
+    /**
+     * Arc start epoch (MJD TDB).
+     */
+    double start_mjd_tdb;
+    /**
+     * Arc end epoch (MJD TDB).
+     */
+    double end_mjd_tdb;
+    /**
+     * Engine thrust force in Newtons.
+     */
+    double thrust_n;
+    /**
+     * Spacecraft mass at arc start in kilograms.
+     */
+    double mass_kg;
+    /**
+     * Specific impulse in seconds. Any non-finite value (`NaN` or `±∞`)
+     * selects constant mass (no depletion); a finite value depletes mass at
+     * \\(\dot m = F/(I_{sp} g_0)\\). This is the `Option<f64>` NaN-sentinel
+     * convention shared with [`EmpyreanOrbit::non_grav_dt`].
+     */
+    double isp_s;
+    /**
+     * Steering-law selector — see the `EMPYREAN_STEERING_LAW_*` tag
+     * constants. An unrecognized value errors loudly.
+     */
+    int32_t steering_law;
+    /**
+     * `CONSTANT_RTN` in-plane angle α from radial toward transverse
+     * (radians). Read only when `steering_law == CONSTANT_RTN`.
+     */
+    double steering_alpha_rad;
+    /**
+     * `CONSTANT_RTN` out-of-plane angle β toward orbit normal (radians).
+     * Read only when `steering_law == CONSTANT_RTN`.
+     */
+    double steering_beta_rad;
+    /**
+     * `INERTIAL_FIXED` direction vector (normalized internally). Read only
+     * when `steering_law == INERTIAL_FIXED`.
+     */
+    double steering_direction[3];
+    /**
+     * \\(\tanh\\) switching sharpness (1/days). Higher = sharper on/off.
+     */
+    double sharpness;
+    /**
+     * Central-body NAIF id for the RTN / velocity-tangent frame reference
+     * (same encoding as [`EmpyreanOrbit`]'s `state.origin`, e.g. `399` for
+     * Earth, `10` for the Sun). An unknown NAIF id errors loudly.
+     */
+    int32_t central_body_naif_id;
+};
+
+/**
+ * An orbit with optional non-gravitational parameters, continuous-thrust
+ * arcs, and photometry.
+ *
+ * Thrust: when `n_thrust_arcs > 0`, [`thrust_arcs`](Self::thrust_arcs)
+ * (plus the optional [`dv_corrections`](Self::dv_corrections) /
+ * [`correction_covariances`](Self::correction_covariances) side arrays)
+ * build a [`ThrustParams`] for this orbit. All-zero `a1/a2/a3` and
+ * `n_thrust_arcs == 0` is a pure-gravity orbit.
  *
  * `a1/a2/a3` are the Marsden–Sekanina RTN coefficients (radial,
  * transverse, normal) in AU/day². `ng_alpha … ng_k` parameterize the
@@ -536,36 +757,53 @@ struct EmpyreanOrbit {
      * Slope parameter slot 2 — G₂ (HG1G2 only); unused (0) for HG / HG12.
      */
     double slope2;
-};
-
-/**
- * A single observer state for the C API.
- */
-struct EmpyreanObserver {
     /**
-     * MPC 3-character code, null-terminated (4 bytes).
+     * Continuous-thrust arcs (variable length). Null / `n_thrust_arcs == 0`
+     * ⇒ no thrust (gravity + non-grav only).
+     *
+     * **Ownership:** caller-owned; borrowed read-only for the duration of
+     * the call. The C ABI never frees it. A null pointer with
+     * `n_thrust_arcs > 0` is a loud argument error, not a silent skip; a
+     * non-null pointer with `n_thrust_arcs == 0` is treated as absent (the
+     * pointer is not read).
      */
-    uint8_t obs_code[4];
+    const struct EmpyreanThrustArc *thrust_arcs;
     /**
-     * Epoch as MJD TDB.
+     * Number of arcs in [`thrust_arcs`](Self::thrust_arcs).
      */
-    double epoch_mjd_tdb;
+    uintptr_t n_thrust_arcs;
     /**
-     * Position in ICRF relative to SSB (AU).
+     * Optional per-arc Δv corrections (AU/day), positional with
+     * [`thrust_arcs`](Self::thrust_arcs). Null / `n_dv_corrections == 0` ⇒
+     * no targeting corrections. Supplying corrections without any arc is a
+     * loud argument error.
+     *
+     * **Ownership:** caller-owned; borrowed read-only for the call.
      */
-    double x;
-    double y;
-    double z;
+    const double (*dv_corrections)[3];
     /**
-     * Velocity in ICRF relative to SSB (AU/day).
+     * Number of corrections in [`dv_corrections`](Self::dv_corrections).
      */
-    double vx;
-    double vy;
-    double vz;
+    uintptr_t n_dv_corrections;
     /**
-     * Observing night as YYYYMMDD integer, or -1 if unavailable.
+     * Optional 3×3 covariance (AU/day)² per Δv correction, positional with
+     * [`dv_corrections`](Self::dv_corrections). When non-empty its length
+     * MUST equal `n_dv_corrections`; a non-empty covariance triggers the
+     * wide-Jet burn-sensitivity propagation. The engine's higher-order
+     * (third-order) propagation path does not implement thrust-correction
+     * covariance and rejects that combination loudly upstream
+     * (`Not implemented: … ThirdOrder with thrust-correction covariance …`,
+     * surfaced as a propagation error) rather than silently dropping the
+     * covariance.
+     *
+     * **Ownership:** caller-owned; borrowed read-only for the call.
      */
-    int32_t observing_night;
+    const double (*correction_covariances)[3][3];
+    /**
+     * Number of entries in
+     * [`correction_covariances`](Self::correction_covariances).
+     */
+    uintptr_t n_correction_covariances;
 };
 
 /**
@@ -861,6 +1099,331 @@ struct EmpyreanPropagationConfig {
 };
 
 /**
+ * A single propagated Cartesian state.
+ */
+struct EmpyreanPropagatedState {
+    double epoch_mjd_tdb;
+    double x;
+    double y;
+    double z;
+    double vx;
+    double vy;
+    double vz;
+    int32_t origin;
+    int32_t frame;
+    double covariance[6][6];
+    uint8_t has_covariance;
+    /**
+     * State Transition Matrix Φ(t, t₀). Zero-filled when `has_stm` is 0.
+     */
+    double stm[6][6];
+    uint8_t has_stm;
+    /**
+     * State Transition Tensor Ψ(t, t₀). Zero-filled when `has_stt` is 0.
+     */
+    double stt[6][6][6];
+    uint8_t has_stt;
+    /**
+     * Resolved [`CovarianceKind`](empyrean_core::propagation::CovarianceKind)
+     * at this output epoch — see `EMPYREAN_COVARIANCE_KIND_*`.
+     * Defaults to `LINEAR` for non-Auto methods and for Auto epochs
+     * outside CA windows.
+     */
+    uint8_t resolved_kind;
+};
+
+/**
+ * A detected dynamical event from propagation.
+ *
+ * For `event_type = "covariance_regime_change"` the audit-trail
+ * fields (`previous_kind`, `resolved_kind`, `kappa`,
+ * `threshold_below`, `threshold_above`) carry the
+ * [`CovarianceRegimeChange`](empyrean_core::propagation::events::DynamicalEvent::CovarianceRegimeChange)
+ * payload and the body / distance / velocity fields are zeroed
+ * (regime changes don't carry a body or geometry — they're audit
+ * markers from
+ * [`UncertaintyMethod::Auto`](empyrean_core::propagation::UncertaintyMethod::Auto)).
+ * For all other events these fields are sentinel-filled
+ * (`0xFF` / NaN).
+ *
+ * Field names mirror empyrean-core's variant fields for the
+ * regime-change payload — no per-variant prefix.
+ */
+struct EmpyreanEvent {
+    char *event_type;
+    char *orbit_id;
+    /**
+     * Object identifier looked up by `orbit_id` from the input batch.
+     * Empty string when the input had no `object_id`. Owning C string —
+     * caller frees via `*_result_free`.
+     */
+    char *object_id;
+    char *body;
+    int32_t body_naif_id;
+    double epoch_mjd_tdb;
+    double distance_au;
+    double distance_km;
+    double relative_velocity_au_day;
+    /**
+     * `CovarianceRegimeChange` payload: previous resolved kind.
+     * Sentinel `0xFF` for non-regime events.
+     */
+    uint8_t previous_kind;
+    /**
+     * `CovarianceRegimeChange` payload: new resolved kind.
+     * Sentinel `0xFF` for non-regime events.
+     */
+    uint8_t resolved_kind;
+    /**
+     * `CovarianceRegimeChange` payload: local nonlinearity κ
+     * recorded at the CA. NaN for non-regime events.
+     */
+    double kappa;
+    /**
+     * `CovarianceRegimeChange` payload: lower κ value recorded in
+     * this audit payload. NaN for non-regime events.
+     */
+    double threshold_below;
+    /**
+     * `CovarianceRegimeChange` payload: upper κ value recorded in
+     * this audit payload. NaN for non-regime events.
+     */
+    double threshold_above;
+    /**
+     * `CaptureStart` / `CaptureEnd` payload: two-body energy w.r.t. the
+     * capturing body (AU²/day²). NaN for non-capture events.
+     */
+    double two_body_energy;
+    /**
+     * `CaptureStart` / `CaptureEnd` payload: Jacobi constant in the
+     * CR3BP. NaN for non-capture events or when unavailable.
+     */
+    double jacobi_constant;
+    /**
+     * `CaptureStart` / `CaptureEnd` payload: 1σ uncertainty on the
+     * Jacobi constant. NaN when unavailable.
+     */
+    double jacobi_constant_sigma;
+    /**
+     * `CaptureStart` / `CaptureEnd` payload: Jacobi constant at the L1
+     * gateway. NaN when unavailable.
+     */
+    double jacobi_constant_l1;
+    /**
+     * `CaptureStart` / `CaptureEnd` payload: Jacobi constant at the L2
+     * gateway. NaN when unavailable.
+     */
+    double jacobi_constant_l2;
+    /**
+     * `CaptureEnd` payload: number of periapsis passages during the
+     * temporary capture. `-1` sentinel for non-`CaptureEnd` events.
+     */
+    int32_t n_periapses;
+    /**
+     * `Impact` payload: planetodetic latitude of the surface intercept
+     * (degrees). NaN for non-impact events or when unresolved.
+     */
+    double impact_latitude_deg;
+    /**
+     * `Impact` payload: planetodetic longitude of the surface intercept
+     * (degrees). NaN for non-impact events or when unresolved.
+     */
+    double impact_longitude_deg;
+    /**
+     * `Impact` payload: altitude of the surface intercept above the
+     * reference ellipsoid (km). NaN for non-impact events or when
+     * unresolved.
+     */
+    double impact_altitude_km;
+    /**
+     * `ShadowEntry` / `ShadowExit` payload: fraction of the Sun's disk
+     * occulted by the body (0 = none, 1 = full umbra). NaN for
+     * non-shadow events.
+     */
+    double shadow_fraction;
+    /**
+     * `ShadowEntry` / `ShadowExit` payload: fraction of incident
+     * sunlight reaching the particle (1 = full sun, 0 = total eclipse).
+     * NaN for non-shadow events.
+     */
+    double illumination;
+    /**
+     * `Periapsis` payload: relative position w.r.t. the approached body
+     * (AU), components x/y/z. NaN for non-periapsis events.
+     */
+    double relative_x;
+    double relative_y;
+    double relative_z;
+    /**
+     * `Periapsis` payload: relative velocity w.r.t. the approached body
+     * (AU/day), components vx/vy/vz. NaN for non-periapsis events.
+     */
+    double relative_vx;
+    double relative_vy;
+    double relative_vz;
+    /**
+     * `PossibleImpact` payload: effective capture radius with
+     * gravitational focusing (AU / km). NaN for non-possible-impact events.
+     */
+    double effective_radius_au;
+    double effective_radius_km;
+    /**
+     * `PossibleImpact` payload: 1σ uncertainty along the miss direction
+     * (AU). NaN for non-possible-impact events.
+     */
+    double sigma_distance_au;
+    /**
+     * `PossibleImpact` payload: linear (STM-mapped) impact probability.
+     * NaN for non-possible-impact events.
+     */
+    double ip_linear;
+    /**
+     * `PossibleImpact` payload: second-order (Edgeworth) impact
+     * probability. NaN for non-possible-impact / first-order runs.
+     */
+    double ip_second_order;
+    /**
+     * `PossibleImpact` payload: local nonlinearity κ at the encounter.
+     * NaN when unavailable.
+     */
+    double nonlinearity;
+    /**
+     * `PossibleImpact` payload: adaptive-Gaussian-mixture impact
+     * probability. NaN when not an AGM run.
+     */
+    double ip_agm;
+    /**
+     * `PossibleImpact` payload: Monte-Carlo impact probability. NaN when
+     * not a Monte-Carlo run.
+     */
+    double ip_mc;
+};
+
+/**
+ * One Gaussian sub-component of an AGM mixture decomposition.
+ *
+ * Mirrors
+ * [`empyrean_core::propagation::MixtureComponent`]. The mean carries
+ * the *propagated* sub-Gaussian centroid at the CA epoch (f64 from
+ * the Jet2 integrator); the covariance is the linearly-mapped
+ * \\(\Phi \, \Sigma_k \, \Phi^\top\\) over the same propagation
+ * segment. A consumer can evaluate
+ * \\(\sum_k w_k \\, \mathcal{N}(x \mid \mu_k, \Sigma_k)\\) directly
+ * at the CA epoch.
+ */
+struct EmpyreanMixtureComponent {
+    double weight;
+    double mean[6];
+    double covariance[6][6];
+};
+
+/**
+ * Per-orbit AGM mixture decomposition retained by Auto / Mixture.
+ *
+ * Mirrors [`empyrean_core::propagation::MixtureChain`] in flat form.
+ * `ca_epochs_mjd_tdb` and `components_per_epoch` are
+ * `num_ca_epochs`-length parallel arrays. Components are flattened
+ * into a single `components` array — for CA index `k`, the slice is
+ * `components[components_offset[k] .. components_offset[k] +
+ * components_per_epoch[k]]`. `components_offset[k]` is the
+ * prefix-sum of `components_per_epoch[0..k]` (so
+ * `components_offset[0] == 0`).
+ *
+ * Only orbits whose AGM splits actually fired carry a chain;
+ * non-mixture orbits get one entry whose `num_ca_epochs == 0` and
+ * whose pointers are null.
+ */
+struct EmpyreanMixtureChain {
+    /**
+     * Owning C string — caller frees via `*_result_free`.
+     */
+    char *orbit_id;
+    /**
+     * `num_ca_epochs`-length array of CA epochs (mjd_tdb).
+     */
+    double *ca_epochs_mjd_tdb;
+    uintptr_t num_ca_epochs;
+    /**
+     * `num_ca_epochs`-length array of per-epoch component counts.
+     */
+    uintptr_t *components_per_epoch;
+    /**
+     * `num_ca_epochs`-length array of starting offsets into the
+     * flattened `components` array. `components_offset[k]` is the
+     * prefix-sum of `components_per_epoch[0..k]`.
+     */
+    uintptr_t *components_offset;
+    /**
+     * Flattened components — total length =
+     * sum(components_per_epoch).
+     */
+    struct EmpyreanMixtureComponent *components;
+    uintptr_t num_components_total;
+};
+
+/**
+ * Propagation result containing states, events, and object identifiers.
+ *
+ * `mixtures` parallels `object_ids` only when populated — it is
+ * per-orbit (not per-state), so its length is the distinct orbit
+ * count, not `num_states`.
+ */
+struct EmpyreanPropagationResult {
+    struct EmpyreanPropagatedState *states;
+    uintptr_t num_states;
+    char **object_ids;
+    struct EmpyreanEvent *events;
+    uintptr_t num_events;
+    /**
+     * One [`EmpyreanMixtureChain`] per input orbit (positional with
+     * the input orbit batch). Empty / null when no orbits produced
+     * mixtures (the typical case for FirstOrder / SecondOrder /
+     * SigmaPoint / MonteCarlo).
+     */
+    struct EmpyreanMixtureChain *mixtures;
+    uintptr_t num_mixtures;
+    /**
+     * Opaque retained handle to the rich propagation result, enabling
+     * the on-demand tagged-covariance accessors
+     * (`empyrean_propagation_covariance_series_cartesian` /
+     * `_covariance_at_cartesian`). **Do not dereference from C** — it is
+     * freed by `empyrean_propagation_result_free`. Null when the
+     * propagation produced no retainable result.
+     */
+    void *lazy_handle;
+};
+
+/**
+ * A single observer state for the C API.
+ */
+struct EmpyreanObserver {
+    /**
+     * MPC 3-character code, null-terminated (4 bytes).
+     */
+    uint8_t obs_code[4];
+    /**
+     * Epoch as MJD TDB.
+     */
+    double epoch_mjd_tdb;
+    /**
+     * Position in ICRF relative to SSB (AU).
+     */
+    double x;
+    double y;
+    double z;
+    /**
+     * Velocity in ICRF relative to SSB (AU/day).
+     */
+    double vx;
+    double vy;
+    double vz;
+    /**
+     * Observing night as YYYYMMDD integer, or -1 if unavailable.
+     */
+    int32_t observing_night;
+};
+
+/**
  * Ephemeris-generation configuration.
  *
  * Wraps the inner [`EmpyreanPropagationConfig`] (force model,
@@ -1058,6 +1621,99 @@ struct EmpyreanEphemerisResult {
 };
 
 /**
+ * One entry of the kernel-identity manifest captured by a handle.
+ *
+ * Names the provenance of each loaded data file — never any tuning
+ * rationale. Free the owning [`EmpyreanSystemDescription`] with
+ * [`empyrean_builtsystem_description_free`]; do not free these fields
+ * individually.
+ */
+struct EmpyreanKernelRecord {
+    /**
+     * Category of the entry (`EMPYREAN_KERNEL_KIND_*`).
+     */
+    int32_t kind;
+    /**
+     * Where the entry came from (`EMPYREAN_KERNEL_PROVENANCE_*`).
+     */
+    int32_t provenance;
+    /**
+     * Absolute path the kernel was loaded from. Non-null only for a
+     * `FILE` provenance; null otherwise. NUL-terminated UTF-8.
+     */
+    char *path;
+    /**
+     * Lowercase-hex SHA-256 of the file's bytes (64 chars). Non-null only
+     * for a `FILE` provenance; null otherwise. NUL-terminated UTF-8.
+     */
+    char *sha256;
+    /**
+     * Hashed file size in bytes. 0 unless `FILE` provenance.
+     */
+    uint64_t bytes;
+    /**
+     * Human-readable model name. Non-null only for a `BUILT_IN`
+     * provenance; null otherwise. NUL-terminated UTF-8.
+     */
+    char *name;
+};
+
+/**
+ * A reproducibility summary of a handle's frozen force model plus its
+ * captured kernel-identity manifest.
+ *
+ * Populated in full by [`empyrean_builtsystem_describe`] — every field
+ * reflects the assembled system; nothing is defaulted. Names the citable
+ * menu (tier, frame, GR, perturbers, BPC, kernel hashes) — never selection
+ * logic or tuning rationale. Release the heap-owned arrays with
+ * [`empyrean_builtsystem_description_free`].
+ */
+struct EmpyreanSystemDescription {
+    /**
+     * Force-model tier: 0=Approximate, 1=Basic, 2=Standard.
+     */
+    int32_t force_model;
+    /**
+     * Integration/output frame: 0=ICRF, 1=EclipticJ2000, 2=ITRF93.
+     */
+    int32_t frame;
+    /**
+     * The frozen encounter-timescale divisor.
+     */
+    double encounter_timescale_divisor;
+    /**
+     * 1 if the post-Newtonian (EIH) GR correction is enabled, else 0.
+     */
+    uint8_t relativistic;
+    /**
+     * 1 if the N16 asteroid perturbers are included, else 0.
+     */
+    uint8_t asteroids;
+    /**
+     * 1 if a BPC (body-fixed rotation) kernel is loaded, else 0.
+     */
+    uint8_t has_bpc;
+    /**
+     * Heap array of perturbing-body NAIF ids (length `num_perturbers`).
+     * Null when `num_perturbers == 0`.
+     */
+    int32_t *perturber_origins;
+    /**
+     * Number of entries in [`perturber_origins`](Self::perturber_origins).
+     */
+    uintptr_t num_perturbers;
+    /**
+     * Heap array of kernel-identity records (length `num_kernels`). Null
+     * when `num_kernels == 0`.
+     */
+    struct EmpyreanKernelRecord *kernels;
+    /**
+     * Number of entries in [`kernels`](Self::kernels).
+     */
+    uintptr_t num_kernels;
+};
+
+/**
  * One impact-probability record emitted by
  * [`empyrean_compute_impact_probabilities`]. Mirrors
  * [`empyrean_core::impact::ImpactProbability`] flattened to primitives;
@@ -1185,173 +1841,6 @@ struct EmpyreanOrbitBatch {
      * Number of orbits in the batch.
      */
     uintptr_t num_orbits;
-};
-
-/**
- * A detected dynamical event from propagation.
- *
- * For `event_type = "covariance_regime_change"` the audit-trail
- * fields (`previous_kind`, `resolved_kind`, `kappa`,
- * `threshold_below`, `threshold_above`) carry the
- * [`CovarianceRegimeChange`](empyrean_core::propagation::events::DynamicalEvent::CovarianceRegimeChange)
- * payload and the body / distance / velocity fields are zeroed
- * (regime changes don't carry a body or geometry — they're audit
- * markers from
- * [`UncertaintyMethod::Auto`](empyrean_core::propagation::UncertaintyMethod::Auto)).
- * For all other events these fields are sentinel-filled
- * (`0xFF` / NaN).
- *
- * Field names mirror empyrean-core's variant fields for the
- * regime-change payload — no per-variant prefix.
- */
-struct EmpyreanEvent {
-    char *event_type;
-    char *orbit_id;
-    /**
-     * Object identifier looked up by `orbit_id` from the input batch.
-     * Empty string when the input had no `object_id`. Owning C string —
-     * caller frees via `*_result_free`.
-     */
-    char *object_id;
-    char *body;
-    int32_t body_naif_id;
-    double epoch_mjd_tdb;
-    double distance_au;
-    double distance_km;
-    double relative_velocity_au_day;
-    /**
-     * `CovarianceRegimeChange` payload: previous resolved kind.
-     * Sentinel `0xFF` for non-regime events.
-     */
-    uint8_t previous_kind;
-    /**
-     * `CovarianceRegimeChange` payload: new resolved kind.
-     * Sentinel `0xFF` for non-regime events.
-     */
-    uint8_t resolved_kind;
-    /**
-     * `CovarianceRegimeChange` payload: local nonlinearity κ
-     * recorded at the CA. NaN for non-regime events.
-     */
-    double kappa;
-    /**
-     * `CovarianceRegimeChange` payload: lower κ value recorded in
-     * this audit payload. NaN for non-regime events.
-     */
-    double threshold_below;
-    /**
-     * `CovarianceRegimeChange` payload: upper κ value recorded in
-     * this audit payload. NaN for non-regime events.
-     */
-    double threshold_above;
-    /**
-     * `CaptureStart` / `CaptureEnd` payload: two-body energy w.r.t. the
-     * capturing body (AU²/day²). NaN for non-capture events.
-     */
-    double two_body_energy;
-    /**
-     * `CaptureStart` / `CaptureEnd` payload: Jacobi constant in the
-     * CR3BP. NaN for non-capture events or when unavailable.
-     */
-    double jacobi_constant;
-    /**
-     * `CaptureStart` / `CaptureEnd` payload: 1σ uncertainty on the
-     * Jacobi constant. NaN when unavailable.
-     */
-    double jacobi_constant_sigma;
-    /**
-     * `CaptureStart` / `CaptureEnd` payload: Jacobi constant at the L1
-     * gateway. NaN when unavailable.
-     */
-    double jacobi_constant_l1;
-    /**
-     * `CaptureStart` / `CaptureEnd` payload: Jacobi constant at the L2
-     * gateway. NaN when unavailable.
-     */
-    double jacobi_constant_l2;
-    /**
-     * `CaptureEnd` payload: number of periapsis passages during the
-     * temporary capture. `-1` sentinel for non-`CaptureEnd` events.
-     */
-    int32_t n_periapses;
-    /**
-     * `Impact` payload: planetodetic latitude of the surface intercept
-     * (degrees). NaN for non-impact events or when unresolved.
-     */
-    double impact_latitude_deg;
-    /**
-     * `Impact` payload: planetodetic longitude of the surface intercept
-     * (degrees). NaN for non-impact events or when unresolved.
-     */
-    double impact_longitude_deg;
-    /**
-     * `Impact` payload: altitude of the surface intercept above the
-     * reference ellipsoid (km). NaN for non-impact events or when
-     * unresolved.
-     */
-    double impact_altitude_km;
-    /**
-     * `ShadowEntry` / `ShadowExit` payload: fraction of the Sun's disk
-     * occulted by the body (0 = none, 1 = full umbra). NaN for
-     * non-shadow events.
-     */
-    double shadow_fraction;
-    /**
-     * `ShadowEntry` / `ShadowExit` payload: fraction of incident
-     * sunlight reaching the particle (1 = full sun, 0 = total eclipse).
-     * NaN for non-shadow events.
-     */
-    double illumination;
-    /**
-     * `Periapsis` payload: relative position w.r.t. the approached body
-     * (AU), components x/y/z. NaN for non-periapsis events.
-     */
-    double relative_x;
-    double relative_y;
-    double relative_z;
-    /**
-     * `Periapsis` payload: relative velocity w.r.t. the approached body
-     * (AU/day), components vx/vy/vz. NaN for non-periapsis events.
-     */
-    double relative_vx;
-    double relative_vy;
-    double relative_vz;
-    /**
-     * `PossibleImpact` payload: effective capture radius with
-     * gravitational focusing (AU / km). NaN for non-possible-impact events.
-     */
-    double effective_radius_au;
-    double effective_radius_km;
-    /**
-     * `PossibleImpact` payload: 1σ uncertainty along the miss direction
-     * (AU). NaN for non-possible-impact events.
-     */
-    double sigma_distance_au;
-    /**
-     * `PossibleImpact` payload: linear (STM-mapped) impact probability.
-     * NaN for non-possible-impact events.
-     */
-    double ip_linear;
-    /**
-     * `PossibleImpact` payload: second-order (Edgeworth) impact
-     * probability. NaN for non-possible-impact / first-order runs.
-     */
-    double ip_second_order;
-    /**
-     * `PossibleImpact` payload: local nonlinearity κ at the encounter.
-     * NaN when unavailable.
-     */
-    double nonlinearity;
-    /**
-     * `PossibleImpact` payload: adaptive-Gaussian-mixture impact
-     * probability. NaN when not an AGM run.
-     */
-    double ip_agm;
-    /**
-     * `PossibleImpact` payload: Monte-Carlo impact probability. NaN when
-     * not a Monte-Carlo run.
-     */
-    double ip_mc;
 };
 
 /**
@@ -2122,40 +2611,6 @@ struct EmpyreanODConfig {
 };
 
 /**
- * A single propagated Cartesian state.
- */
-struct EmpyreanPropagatedState {
-    double epoch_mjd_tdb;
-    double x;
-    double y;
-    double z;
-    double vx;
-    double vy;
-    double vz;
-    int32_t origin;
-    int32_t frame;
-    double covariance[6][6];
-    uint8_t has_covariance;
-    /**
-     * State Transition Matrix Φ(t, t₀). Zero-filled when `has_stm` is 0.
-     */
-    double stm[6][6];
-    uint8_t has_stm;
-    /**
-     * State Transition Tensor Ψ(t, t₀). Zero-filled when `has_stt` is 0.
-     */
-    double stt[6][6][6];
-    uint8_t has_stt;
-    /**
-     * Resolved [`CovarianceKind`](empyrean_core::propagation::CovarianceKind)
-     * at this output epoch — see `EMPYREAN_COVARIANCE_KIND_*`.
-     * Defaults to `LINEAR` for non-Auto methods and for Auto epochs
-     * outside CA windows.
-     */
-    uint8_t resolved_kind;
-};
-
-/**
  * Aggregate residual statistics.
  *
  * All angular quantities in arcseconds. NaN entries indicate the stat
@@ -2694,100 +3149,6 @@ struct EmpyreanPlanResult {
 };
 
 /**
- * One Gaussian sub-component of an AGM mixture decomposition.
- *
- * Mirrors
- * [`empyrean_core::propagation::MixtureComponent`]. The mean carries
- * the *propagated* sub-Gaussian centroid at the CA epoch (f64 from
- * the Jet2 integrator); the covariance is the linearly-mapped
- * \\(\Phi \, \Sigma_k \, \Phi^\top\\) over the same propagation
- * segment. A consumer can evaluate
- * \\(\sum_k w_k \\, \mathcal{N}(x \mid \mu_k, \Sigma_k)\\) directly
- * at the CA epoch.
- */
-struct EmpyreanMixtureComponent {
-    double weight;
-    double mean[6];
-    double covariance[6][6];
-};
-
-/**
- * Per-orbit AGM mixture decomposition retained by Auto / Mixture.
- *
- * Mirrors [`empyrean_core::propagation::MixtureChain`] in flat form.
- * `ca_epochs_mjd_tdb` and `components_per_epoch` are
- * `num_ca_epochs`-length parallel arrays. Components are flattened
- * into a single `components` array — for CA index `k`, the slice is
- * `components[components_offset[k] .. components_offset[k] +
- * components_per_epoch[k]]`. `components_offset[k]` is the
- * prefix-sum of `components_per_epoch[0..k]` (so
- * `components_offset[0] == 0`).
- *
- * Only orbits whose AGM splits actually fired carry a chain;
- * non-mixture orbits get one entry whose `num_ca_epochs == 0` and
- * whose pointers are null.
- */
-struct EmpyreanMixtureChain {
-    /**
-     * Owning C string — caller frees via `*_result_free`.
-     */
-    char *orbit_id;
-    /**
-     * `num_ca_epochs`-length array of CA epochs (mjd_tdb).
-     */
-    double *ca_epochs_mjd_tdb;
-    uintptr_t num_ca_epochs;
-    /**
-     * `num_ca_epochs`-length array of per-epoch component counts.
-     */
-    uintptr_t *components_per_epoch;
-    /**
-     * `num_ca_epochs`-length array of starting offsets into the
-     * flattened `components` array. `components_offset[k]` is the
-     * prefix-sum of `components_per_epoch[0..k]`.
-     */
-    uintptr_t *components_offset;
-    /**
-     * Flattened components — total length =
-     * sum(components_per_epoch).
-     */
-    struct EmpyreanMixtureComponent *components;
-    uintptr_t num_components_total;
-};
-
-/**
- * Propagation result containing states, events, and object identifiers.
- *
- * `mixtures` parallels `object_ids` only when populated — it is
- * per-orbit (not per-state), so its length is the distinct orbit
- * count, not `num_states`.
- */
-struct EmpyreanPropagationResult {
-    struct EmpyreanPropagatedState *states;
-    uintptr_t num_states;
-    char **object_ids;
-    struct EmpyreanEvent *events;
-    uintptr_t num_events;
-    /**
-     * One [`EmpyreanMixtureChain`] per input orbit (positional with
-     * the input orbit batch). Empty / null when no orbits produced
-     * mixtures (the typical case for FirstOrder / SecondOrder /
-     * SigmaPoint / MonteCarlo).
-     */
-    struct EmpyreanMixtureChain *mixtures;
-    uintptr_t num_mixtures;
-    /**
-     * Opaque retained handle to the rich propagation result, enabling
-     * the on-demand tagged-covariance accessors
-     * (`empyrean_propagation_covariance_series_cartesian` /
-     * `_covariance_at_cartesian`). **Do not dereference from C** — it is
-     * freed by `empyrean_propagation_result_free`. Null when the
-     * propagation produced no retainable result.
-     */
-    void *lazy_handle;
-};
-
-/**
  * Flattened, owned form of `empyrean_core::propagation::TaggedCovariance`
  * (villeneuve's provenance-tagged covariance). Self-describing: the 6×6
  * matrix together with the co-located nominal state, how the covariance
@@ -3022,8 +3383,9 @@ struct EmpyreanStateResult {
  *
  * Loads the full Standard-tier kernel set (DE440, SB441-N16, Earth/Moon
  * BPCs, GM, MPC observatory codes) from `data_dir`, downloading any
- * missing files. Pass null for `data_dir` to use the platform XDG
- * data directory (`~/.empyrean/data` on Linux/macOS).
+ * missing files. Pass null for `data_dir` to use the platform data
+ * directory (`~/.local/share/empyrean/data` on Linux,
+ * `~/Library/Application Support/empyrean/data` on macOS).
  *
  * Returns a heap-allocated pointer on success, or null on error.
  * Call `empyrean_last_error()` to retrieve the error message when null is
@@ -3103,6 +3465,116 @@ struct EmpyreanStateResult {
  * undefined behavior.
  */
  void empyrean_versions_free(struct EmpyreanVersions *versions);
+
+/**
+ * Assemble a reusable force-model handle for `(force_model, frame)` from
+ * `ctx`, freezing `encounter_timescale_divisor` into its key.
+ *
+ * - `force_model`: tier code (0=Approximate, 1=Basic, 2=Standard).
+ * - `frame`: output/integration frame code (0=ICRF, 1=EclipticJ2000, 2=ITRF93).
+ * - `encounter_timescale_divisor`: pass `0.0` to freeze the engine default;
+ *   any positive value freezes that divisor into the key *before* it is
+ *   used to validate calls.
+ * - `out`: receives the heap-allocated handle on success.
+ *
+ * The handle snapshots `ctx`'s kernel manifest at construction so
+ * [`empyrean_builtsystem_describe`] is self-contained. After you load any
+ * additional kernel into `ctx`, rebuild the handle — a stale handle is
+ * rejected loudly by every forward-model call, never silently reused.
+ *
+ * Returns [`EMPYREAN_BUILTSYSTEM_OK`] on success; on error, `out` is left
+ * untouched and `empyrean_last_error()` carries the message. The caller
+ * owns the returned handle and must free it with
+ * [`empyrean_builtsystem_free`].
+ */
+
+int32_t empyrean_builtsystem_new(const EmpyreanContext *ctx,
+                                 int32_t force_model,
+                                 int32_t frame,
+                                 double encounter_timescale_divisor,
+                                 struct EmpyreanBuiltSystem **out);
+
+/**
+ * Free a handle previously returned by [`empyrean_builtsystem_new`].
+ * Passing null is a no-op.
+ */
+ void empyrean_builtsystem_free(struct EmpyreanBuiltSystem *handle);
+
+/**
+ * Propagate `orbits` to `times` through the pre-built handle.
+ *
+ * Signature parallels the one-shot
+ * [`empyrean_propagate`](crate::propagate::empyrean_propagate) but takes
+ * `(handle, ctx, ...)`. Before dispatch the identity guard runs: the handle
+ * must have been built from `ctx`'s ephemeris data
+ * ([`EMPYREAN_BUILTSYSTEM_DATA_MISMATCH`]); the config must match the frozen
+ * key ([`EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_FRAME`] /
+ * `_FORCE_MODEL` / `_DIVISOR`); and the data must be unmutated since build
+ * ([`EMPYREAN_BUILTSYSTEM_STALE`]). On pass, the result is bit-identical to
+ * the one-shot with the same config.
+ *
+ * On success populates `result_out`; free it with
+ * [`empyrean_propagation_result_free`](crate::propagate::empyrean_propagation_result_free).
+ */
+
+int32_t empyrean_builtsystem_propagate(const struct EmpyreanBuiltSystem *handle,
+                                       const EmpyreanContext *ctx,
+                                       const struct EmpyreanOrbit *orbits_ptr,
+                                       uintptr_t num_orbits,
+                                       const double *times_ptr,
+                                       uintptr_t num_times,
+                                       const struct EmpyreanPropagationConfig *config,
+                                       struct EmpyreanPropagationResult *result_out);
+
+/**
+ * Generate predicted ephemeris for `orbits` and `observers` through the
+ * pre-built handle.
+ *
+ * Signature parallels the one-shot
+ * [`empyrean_generate_ephemeris`](crate::ephemeris::empyrean_generate_ephemeris)
+ * but takes `(handle, ctx, ...)`. Runs the same identity guard as
+ * [`empyrean_builtsystem_propagate`] before dispatch; on pass the result is
+ * bit-identical to the one-shot. Note the C-ABI ephemeris config carries no
+ * divisor knob, so a handle frozen at a non-default divisor is rejected here
+ * with [`EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_DIVISOR`] rather than served under
+ * the wrong dynamics — build the handle with the default divisor for
+ * ephemeris reuse.
+ *
+ * On success populates `result_out`; free it with
+ * [`empyrean_ephemeris_result_free`](crate::ephemeris::empyrean_ephemeris_result_free).
+ */
+
+int32_t empyrean_builtsystem_generate_ephemeris(const struct EmpyreanBuiltSystem *handle,
+                                                const EmpyreanContext *ctx,
+                                                const struct EmpyreanOrbit *orbits_ptr,
+                                                uintptr_t num_orbits,
+                                                const struct EmpyreanObserver *observers_ptr,
+                                                uintptr_t num_observers,
+                                                const struct EmpyreanEphemerisConfig *config,
+                                                struct EmpyreanEphemerisResult *result_out);
+
+/**
+ * Populate `out` with a full reproducibility summary of the handle's frozen
+ * force model and its captured kernel manifest.
+ *
+ * Every field is populated from the system description and the manifest
+ * snapshot — no field is left defaulted. Returns
+ * [`EMPYREAN_BUILTSYSTEM_OK`] on success. The caller owns the heap arrays
+ * inside `out` and must release them with
+ * [`empyrean_builtsystem_description_free`].
+ */
+
+int32_t empyrean_builtsystem_describe(const struct EmpyreanBuiltSystem *handle,
+                                      struct EmpyreanSystemDescription *out);
+
+/**
+ * Free the heap arrays inside a description populated by
+ * [`empyrean_builtsystem_describe`] (the perturber-id array and the kernel
+ * records with their C strings). After this returns `desc` is
+ * zero-initialized — safe to drop on the caller's stack. Passing null is a
+ * no-op.
+ */
+ void empyrean_builtsystem_description_free(struct EmpyreanSystemDescription *desc);
 
 /**
  * Generate predicted ephemeris for orbits and observers.

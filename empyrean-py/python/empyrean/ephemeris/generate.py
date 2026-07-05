@@ -47,6 +47,14 @@ def generate_ephemeris(
     # Reach for the structured config when you need them.
     force_model: ForceModelTier | str | None = None,
     uncertainty_method: UncertaintyMethodLike | None = None,
+    # Internal: a pre-built force-model handle
+    # (``empyrean._empyrean_rs.BuiltSystem``). When supplied, ephemeris
+    # generation runs through the frozen handle (identity-guarded, never a
+    # silent rebuild). Set by :meth:`empyrean.BuiltSystem.generate_ephemeris`;
+    # not part of the public call surface. Because the ephemeris pipeline
+    # integrates in EclipticJ2000, the handle must be frozen at
+    # ``Frame.ECLIPTICJ2000`` and the engine-default divisor.
+    _builtsystem: Any = None,
 ) -> EphemerisResult:
     """Generate predicted ephemeris (RA/Dec) for orbits at observer locations.
 
@@ -91,7 +99,7 @@ def generate_ephemeris(
 
     >>> cfg = EphemerisConfig(
     ...     propagation=PropagationConfig(
-    ...         force_model=ForceModelTier.FULL,
+    ...         force_model=ForceModelTier.STANDARD,
     ...         uncertainty_method=UncertaintyMethod.SECOND_ORDER,
     ...     ),
     ...     compute_diagnostics=False,
@@ -285,6 +293,7 @@ def generate_ephemeris(
         # toggles, integrator advanced knobs, and event-detection
         # settings all reach the C ABI.
         ephemeris_config_dict=config._to_wire_dict(),
+        builtsystem=_builtsystem,
     )
 
     # ── Build Ephemeris from result ──────────────────────────

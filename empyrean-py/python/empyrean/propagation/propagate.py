@@ -9,6 +9,7 @@ import quivr as qv
 
 if TYPE_CHECKING:
     from empyrean.ephemeris.sensitivity import StateSensitivities
+    from empyrean.orbits.thrust import ThrustParams
     from empyrean.propagation.tagged_covariance import TaggedCovariances
 
 from empyrean._convert import (
@@ -90,6 +91,15 @@ def propagate(
     num_threads: int | None = None,
     events: EventConfig | None = None,
     tagged_covariance: bool = False,
+    thrust_arcs: "Sequence[ThrustParams | None] | None" = None,
+    # Internal: a pre-built force-model handle
+    # (``empyrean._empyrean_rs.BuiltSystem``). When supplied, the forward
+    # model runs through the frozen handle (identity-guarded, never a
+    # silent rebuild) instead of assembling the force model one-shot.
+    # Set by :meth:`empyrean.BuiltSystem.propagate`; not part of the
+    # public call surface. The result is bit-identical to the one-shot on
+    # the matching key.
+    _builtsystem: Any = None,
 ) -> PropagationResult:
     """Propagate orbits to target epochs.
 
@@ -117,11 +127,10 @@ def propagate(
         dataclass (:class:`SigmaPoint(n_sigma=2.0)` etc.). Ignored if
         ``config`` is given.
     num_threads : int, optional
-        Threads for multi-orbit propagation. ``None`` (default) =
-        sequential; ``0`` = use all available cores; ``n`` > 0 = use
-        exactly ``n`` cores. Each orbit is integrated on a single
-        thread; parallelism is across orbits, not within a single
-        trajectory.
+        Threads for multi-orbit propagation. ``None`` (default) and
+        ``0`` both use all available cores; ``n`` > 0 pins exactly
+        ``n`` threads. Each orbit is integrated on a single thread;
+        parallelism is across orbits, not within a single trajectory.
     events : EventConfig, optional
         Event-detection toggles + body filter + dense-output cadence.
         Override individual flags here without rebuilding a full
@@ -138,6 +147,20 @@ def propagate(
         :meth:`~empyrean.PropagationResult.tagged_covariance_series`
         becomes usable. Off by default — the readback recomputes the
         resolved kind per orbit, so it isn't free.
+    thrust_arcs : sequence of ThrustParams or None, optional
+        Structured continuous-thrust / finite-burn input, one entry per
+        orbit and positionally aligned with ``orbits`` (pass ``None`` for
+        the gravity / non-grav-only orbits, or the whole argument
+        ``None`` for a fully ballistic batch). Build each entry from
+        :class:`~empyrean.ThrustParams` /
+        :class:`~empyrean.ThrustArc` / a
+        :class:`~empyrean.orbits.thrust.SteeringLaw` variant. A non-empty
+        :attr:`~empyrean.ThrustParams.correction_covariances` triggers the
+        burn-sensitivity propagation whose solved segments surface in the
+        tagged-covariance
+        :attr:`~empyrean.TaggedCovariance.thrust_segments` (requires
+        ``tagged_covariance=True``). Length or arc/correction mismatches
+        raise, never silently degrade.
 
     Returns
     -------
@@ -154,7 +177,7 @@ def propagate(
     With a config object:
 
     >>> cfg = PropagationConfig(
-    ...     force_model=ForceModelTier.FULL,
+    ...     force_model=ForceModelTier.STANDARD,
     ...     uncertainty_method=SigmaPoint(n_sigma=2.0),
     ...     num_threads=8,
     ... )
@@ -162,7 +185,7 @@ def propagate(
 
     With inline kwargs (sugar):
 
-    >>> result = empyrean.propagate(orbits, times, force_model="full")
+    >>> result = empyrean.propagate(orbits, times, force_model="standard")
     """
     from empyrean._empyrean_rs import _propagate
 
@@ -347,6 +370,18 @@ def propagate(
             f"{type(uncertainty_method).__name__}"
         )
 
+    # ── Structured thrust input ──────────────────────────────
+    # One ThrustParams (or None) per orbit, positionally aligned with the
+    # batch. The binding reconstructs each into a wrapper ThrustParams and
+    # attaches it per orbit; None entries stay gravity / non-grav only.
+    thrust_arg: list[ThrustParams | None] | None = None
+    if thrust_arcs is not None:
+        thrust_arg = list(thrust_arcs)
+        if len(thrust_arg) != n:
+            raise ValueError(
+                f"thrust_arcs must have one entry per orbit (got {len(thrust_arg)} for {n} orbits)"
+            )
+
     # ── Call Rust ─────────────────────────────────────────────
     # Thread the full nested PropagationConfig as a single dict so that
     # advanced fields (events.dense_output, diagnostics.*, advanced.*,
@@ -373,6 +408,7 @@ def propagate(
         phot_model,
         num_threads=num_threads,
         epsilon=epsilon,
+        thrust_arcs=thrust_arg,
         non_grav_dts=non_grav_dts,
         ng_alphas=ng_alphas,
         ng_r0s=ng_r0s,
@@ -391,6 +427,7 @@ def propagate(
         mc_seed=mc_seed,
         propagation_config_dict=config._to_wire_dict(),
         with_tagged_covariance=tagged_covariance,
+        builtsystem=_builtsystem,
     )
 
     # ── Build CartesianOrbits from result ─────────────────────

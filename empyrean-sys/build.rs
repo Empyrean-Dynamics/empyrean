@@ -38,7 +38,9 @@ const CHECKSUMS: &str = include_str!("checksums.txt");
 fn target_asset() -> Option<(String, String)> {
     let stem = match (target_os().as_str(), target_arch().as_str()) {
         ("macos", "aarch64") => "libempyrean-macos-aarch64",
+        ("macos", "x86_64") => "libempyrean-macos-x86_64",
         ("linux", "x86_64") => "libempyrean-linux-x86_64",
+        ("linux", "aarch64") => "libempyrean-linux-aarch64",
         _ => return None,
     };
     let sha = CHECKSUMS.lines().find_map(|line| {

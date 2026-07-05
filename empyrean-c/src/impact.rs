@@ -161,6 +161,11 @@ fn build_orbits_from_c(
             };
             orbits.set_non_grav_params(i, Some(params));
         }
+        if let Some(tp) = crate::propagate::empyrean_orbit_thrust_params(orbit)
+            .map_err(|e| format!("orbit {i}: {e}"))?
+        {
+            orbits.set_thrust_params(i, Some(tp));
+        }
     }
     Ok(orbits)
 }

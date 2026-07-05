@@ -82,6 +82,14 @@ from empyrean.orbits.orbits import (
     SphericalOrbits,
 )
 from empyrean.orbits.photometry import PhotometricParams
+from empyrean.orbits.thrust import (
+    ConstantRTN,
+    InertialFixed,
+    SteeringLaw,
+    ThrustArc,
+    ThrustParams,
+    VelocityTangent,
+)
 from empyrean.propagation.config import (
     AdvancedIntegratorConfig,
     DiagnosticsConfig,
@@ -120,6 +128,14 @@ from empyrean.propagation.tagged_covariance import (
     TargetFunctional,
 )
 from empyrean.states import get_states
+from empyrean.system import (
+    BuiltSystem,
+    KernelKind,
+    KernelProvenance,
+    KernelRecord,
+    SystemDescription,
+    build_system,
+)
 
 
 def version_string() -> str:
@@ -340,9 +356,9 @@ def initialize(
     ``~/Library/Application Support/empyrean/data/`` on macOS,
     ``%APPDATA%\\empyrean\\data\\`` on Windows; honors
     ``EMPYREAN_DATA_DIR``) and uses that as the data directory — zero
-    network access required. Falls back to ``data_dir`` (default: same
-    XDG location, ``data/`` instead of ``b612-cache/``) plus
-    :func:`download_data` otherwise.
+    network access required. Falls back to ``data_dir`` (default: the
+    same XDG ``.../empyrean/data/`` location) plus :func:`download_data`
+    otherwise.
 
     Parameters
     ----------

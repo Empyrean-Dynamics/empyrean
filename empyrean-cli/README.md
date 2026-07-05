@@ -29,8 +29,9 @@ cargo install empyrean-cli
 
 `cargo install` fetches the closed-source `libempyrean` engine
 automatically (a checksum-pinned download at build time). Prebuilt
-engine binaries exist for macOS arm64 (`macos-aarch64`) and Linux
-x86_64 (`linux-x86_64`); other targets are not yet supported.
+engine binaries exist for four targets — macOS arm64 (`macos-aarch64`),
+macOS x86_64 (`macos-x86_64`), Linux x86_64 (`linux-x86_64`), and Linux
+aarch64 (`linux-aarch64`); other targets are not yet supported.
 
 Alternatively, grab a pre-built binary for your platform from
 [GitHub Releases](https://github.com/Empyrean-Dynamics/empyrean/releases).
@@ -82,6 +83,42 @@ manage the API response cache; and `empyrean serve` / `empyrean stop`
 run a daemon that keeps the loaded kernels in memory for faster
 subsequent commands. See `empyrean <command> --help` for the full
 flag surface.
+
+## Continuous thrust
+
+`propagate` accepts `--thrust-arcs <FILE>`, a JSON file describing
+finite-burn / low-thrust arcs. One file describes one set of thrust
+parameters, applied to every orbit in the batch. Supplying it runs the
+propagation in-process (the daemon fast path is skipped) so the thrust
+is never silently dropped.
+
+```json
+{
+  "arcs": [
+    {
+      "start_mjd_tdb": 65000.0,
+      "end_mjd_tdb":    65010.0,
+      "thrust_n":       1.0,
+      "mass_kg":        500.0,
+      "isp_s":          3000.0,
+      "steering":       { "type": "constant_rtn", "alpha_rad": 0.0, "beta_rad": 0.0 },
+      "sharpness":      100.0,
+      "central_body":   10
+    }
+  ],
+  "dv_corrections":         [[0.0, 0.0, 0.0]],
+  "correction_covariances": [[[1e-20, 0, 0], [0, 1e-20, 0], [0, 0, 1e-20]]]
+}
+```
+
+- `isp_s` is optional — omit or `null` for constant mass; otherwise mass depletes over the burn.
+- `steering.type` is `constant_rtn` (with `alpha_rad`, `beta_rad`), `velocity_tangent`, or `inertial_fixed` (with `direction`).
+- `central_body` is a NAIF body code (10 = Sun, 399 = Earth, 301 = Moon) — the reference for the RTN / velocity-tangent frame.
+- `dv_corrections` is positional with `arcs`; `correction_covariances`, when present, must match its length. A mismatch is rejected at propagation time, never silently repaired.
+
+```sh
+empyrean propagate --object-id 99942 --epoch 64922.0 --thrust-arcs burn.json --out-dir ./out
+```
 
 ## Runtime requirement
 

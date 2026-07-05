@@ -98,6 +98,7 @@
 //!   [`PropagationConfig::frame`] to [`Frame::ICRF`] for ICRF output.
 #![warn(missing_docs)]
 
+mod built_system;
 mod context;
 mod coordinate;
 mod ephemeris;
@@ -112,10 +113,15 @@ mod propagate;
 mod query;
 mod session;
 mod states;
+mod thrust;
 pub mod time;
 mod transform;
 mod version;
 
+pub use built_system::{
+    BuiltSystem, BuiltSystemGuardError, KernelKind, KernelProvenance, KernelRecord,
+    SystemDescription,
+};
 pub use context::{Context, default_data_dir, download_data};
 pub use coordinate::{
     CoordinateState, Frame, Origin, Representation, frame_to_int, int_to_frame, int_to_rep,
@@ -151,6 +157,7 @@ pub use query::{
 };
 pub use session::{Session, SessionDiff};
 pub use states::State;
+pub use thrust::{SteeringLaw, ThrustArc, ThrustParams};
 pub use time::{Epoch, TimeScale, iso_to_mjd, mjd_to_iso};
 pub use version::{Versions, version_string, versions};
 

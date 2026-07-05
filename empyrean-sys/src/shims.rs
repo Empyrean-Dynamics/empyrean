@@ -1080,3 +1080,125 @@ pub unsafe fn empyrean_transform_coordinates(
         )
     }
 }
+/** Build a reusable force-model handle from a context.
+
+Assembles the force model once (perturber set, GR, harmonics, BPC) and
+captures a kernel-identity snapshot from `ctx`, so the handle can be
+reused across many [`empyrean_builtsystem_propagate`] /
+[`empyrean_builtsystem_generate_ephemeris`] calls and describe itself
+without the context. Pass `0.0` for `encounter_timescale_divisor` to
+freeze the engine default before the key is sealed.
+
+Returns [`EMPYREAN_BUILTSYSTEM_OK`] on success; on error `out` is left
+null. The caller owns the returned handle and must free it with
+[`empyrean_builtsystem_free`].*/
+#[inline]
+pub unsafe fn empyrean_builtsystem_new(
+    ctx: *const EmpyreanContext,
+    force_model: i32,
+    frame: i32,
+    encounter_timescale_divisor: f64,
+    out: *mut *mut EmpyreanBuiltSystem,
+) -> i32 {
+    unsafe {
+        lib().empyrean_builtsystem_new(ctx, force_model, frame, encounter_timescale_divisor, out)
+    }
+}
+/** Free a handle previously returned by [`empyrean_builtsystem_new`].
+Passing null is a no-op.*/
+#[inline]
+pub unsafe fn empyrean_builtsystem_free(handle: *mut EmpyreanBuiltSystem) {
+    unsafe { lib().empyrean_builtsystem_free(handle) }
+}
+/** Propagate `orbits` to `times` through the pre-built handle.
+
+Parallels the one-shot [`empyrean_propagate`] but takes `(handle, ctx,
+...)`. Before dispatch the identity guard runs: the handle must have been
+built from `ctx`'s ephemeris data
+([`EMPYREAN_BUILTSYSTEM_DATA_MISMATCH`]); the config must match the
+frozen key ([`EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_FRAME`] /
+`_FORCE_MODEL` / `_DIVISOR`); and the data must be unmutated since build
+([`EMPYREAN_BUILTSYSTEM_STALE`]). Any mismatch is a loud, distinct error
+— never a silent rebuild. On pass the result is bit-identical to the
+one-shot with the same config. Rebuild the handle after any `load_*`.
+
+On success populates `result_out`; free it with
+[`empyrean_propagation_result_free`].*/
+#[inline]
+pub unsafe fn empyrean_builtsystem_propagate(
+    handle: *const EmpyreanBuiltSystem,
+    ctx: *const EmpyreanContext,
+    orbits_ptr: *const EmpyreanOrbit,
+    num_orbits: usize,
+    times_ptr: *const f64,
+    num_times: usize,
+    config: *const EmpyreanPropagationConfig,
+    result_out: *mut EmpyreanPropagationResult,
+) -> i32 {
+    unsafe {
+        lib().empyrean_builtsystem_propagate(
+            handle, ctx, orbits_ptr, num_orbits, times_ptr, num_times, config, result_out,
+        )
+    }
+}
+/** Generate predicted ephemeris for `orbits` and `observers` through the
+pre-built handle.
+
+Parallels the one-shot [`empyrean_generate_ephemeris`] but takes
+`(handle, ctx, ...)`. Runs the same identity guard as
+[`empyrean_builtsystem_propagate`] before dispatch; on pass the result is
+bit-identical to the one-shot. The ephemeris config carries no divisor
+knob, so a handle frozen at a non-default divisor is rejected here with
+[`EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_DIVISOR`] rather than served under the
+wrong dynamics — build ephemeris-reuse handles at the default divisor.
+
+On success populates `result_out`; free it with
+[`empyrean_ephemeris_result_free`].*/
+#[inline]
+pub unsafe fn empyrean_builtsystem_generate_ephemeris(
+    handle: *const EmpyreanBuiltSystem,
+    ctx: *const EmpyreanContext,
+    orbits_ptr: *const EmpyreanOrbit,
+    num_orbits: usize,
+    observers_ptr: *const EmpyreanObserver,
+    num_observers: usize,
+    config: *const EmpyreanEphemerisConfig,
+    result_out: *mut EmpyreanEphemerisResult,
+) -> i32 {
+    unsafe {
+        lib().empyrean_builtsystem_generate_ephemeris(
+            handle,
+            ctx,
+            orbits_ptr,
+            num_orbits,
+            observers_ptr,
+            num_observers,
+            config,
+            result_out,
+        )
+    }
+}
+/** Populate `out` with a full reproducibility summary of the handle's
+frozen force model and its captured kernel manifest.
+
+Every field is populated from the system description and the manifest
+snapshot — no field is left defaulted. Returns
+[`EMPYREAN_BUILTSYSTEM_OK`] on success. The caller owns the heap arrays
+inside `out` and must release them with
+[`empyrean_builtsystem_description_free`].*/
+#[inline]
+pub unsafe fn empyrean_builtsystem_describe(
+    handle: *const EmpyreanBuiltSystem,
+    out: *mut EmpyreanSystemDescription,
+) -> i32 {
+    unsafe { lib().empyrean_builtsystem_describe(handle, out) }
+}
+/** Free the heap arrays inside a description populated by
+[`empyrean_builtsystem_describe`] (the perturber-id array and the kernel
+records with their C strings). After this returns `desc` is
+zero-initialized — safe to drop on the caller's stack. Passing null is a
+no-op.*/
+#[inline]
+pub unsafe fn empyrean_builtsystem_description_free(desc: *mut EmpyreanSystemDescription) {
+    unsafe { lib().empyrean_builtsystem_description_free(desc) }
+}

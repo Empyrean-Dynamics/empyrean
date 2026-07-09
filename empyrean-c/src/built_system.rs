@@ -462,7 +462,13 @@ pub unsafe extern "C" fn empyrean_builtsystem_generate_ephemeris(
                 return EMPYREAN_BUILTSYSTEM_INVALID_ARGUMENT;
             }
         };
-        let observers = build_observers_from_c(observer_slice);
+        let observers = match build_observers_from_c(observer_slice) {
+            Ok(o) => o,
+            Err(e) => {
+                set_last_error(&e);
+                return EMPYREAN_BUILTSYSTEM_INVALID_ARGUMENT;
+            }
+        };
         let config = match build_ephemeris_config_from_c(cfg_ref) {
             Ok(c) => c,
             Err(e) => {

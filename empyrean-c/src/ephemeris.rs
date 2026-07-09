@@ -50,7 +50,11 @@ pub struct EmpyreanEphemerisEntry {
     pub heliocentric_distance_au: f64,
     /// Predicted apparent magnitude. NaN if unavailable.
     pub mag: f64,
-    /// Magnitude uncertainty. NaN if unavailable.
+    /// Magnitude uncertainty (1σ). Finite iff photometry is enabled AND
+    /// the input orbit carried a state covariance; NaN otherwise. Today
+    /// this reflects the state contribution only — an H-magnitude
+    /// uncertainty is not yet an input, so `mag_sigma` under-reports σ_V
+    /// when the H uncertainty is significant.
     pub mag_sigma: f64,
     /// Topocentric zenith angle (degrees). NaN if unavailable (e.g. no
     /// observer geodetic position).
@@ -75,6 +79,13 @@ pub struct EmpyreanEphemerisEntry {
 /// `(orbit, observer, epoch)`. One row per observation epoch within each
 /// `(orbit_id, obs_code)` chain. Owning struct: free
 /// the whole result with [`empyrean_ephemeris_result_free`].
+///
+/// The Jacobian composes d(obs)/d(state at t_obs) * Phi(t_obs, t0) and
+/// omits the light-time terms (the -v * dtau/dx partial; the STM is
+/// sampled at t_obs rather than emission t_obs - tau): both are O(tau),
+/// landing in the velocity columns of the angle rows with fractional
+/// error ~ tau/dt (tau ~ 0.006-0.017 d) — negligible for multi-night
+/// arcs, growing as the arc shrinks toward intra-night.
 #[repr(C)]
 pub struct EmpyreanObservationSensitivity {
     /// Orbit identifier. Owning C string.
@@ -145,7 +156,11 @@ pub struct EmpyreanEphemerisConfig {
 /// Generate predicted ephemeris for orbits and observers.
 ///
 /// Returns 0 on success, negative error code on failure.
-/// On success, `result_out` is populated with ephemeris entries.
+/// On success, `result_out` is populated with ephemeris entries:
+/// `num_orbits * num_observers` rows, orbit-major, and within each orbit
+/// in **observer-input order** (sensitivity rows follow the same order).
+/// Each observer carries its own epoch, so positional pairing against
+/// the input observers is safe within an orbit block.
 /// The caller must free the result with `empyrean_ephemeris_result_free()`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn empyrean_generate_ephemeris(
@@ -180,7 +195,13 @@ pub unsafe extern "C" fn empyrean_generate_ephemeris(
                 return -1;
             }
         };
-        let observers = build_observers_from_c(observer_slice);
+        let observers = match build_observers_from_c(observer_slice) {
+            Ok(o) => o,
+            Err(e) => {
+                set_last_error(&e);
+                return -1;
+            }
+        };
         let config = match build_ephemeris_config_from_c(cfg_ref) {
             Ok(c) => c,
             Err(e) => {
@@ -272,9 +293,23 @@ pub(crate) fn build_orbits_for_ephemeris(
 
 /// Build a `Vec<Observer>` from a C-ABI observer slice (SSB-frame Cartesian
 /// station states). Shared by the one-shot and handle ephemeris paths.
-pub(crate) fn build_observers_from_c(observer_slice: &[EmpyreanObserver]) -> Vec<Observer> {
+pub(crate) fn build_observers_from_c(
+    observer_slice: &[EmpyreanObserver],
+) -> Result<Vec<Observer>, String> {
     let mut observers: Vec<Observer> = Vec::with_capacity(observer_slice.len());
-    for obs in observer_slice {
+    for (i, obs) in observer_slice.iter().enumerate() {
+        // The engine's observatory registry keys 3-byte MPC codes. A
+        // 4th byte must not be dropped: the 3-byte prefix would silently
+        // resolve to a DIFFERENT observatory (wrong topocentric geometry,
+        // no diagnostic).
+        if obs.obs_code[3] != 0 {
+            return Err(format!(
+                "observer {i}: observatory code {:?} uses all 4 bytes; \
+                 4-character MPC codes are not yet supported by the \
+                 engine's observatory registry",
+                String::from_utf8_lossy(&obs.obs_code)
+            ));
+        }
         let mut code = [b' '; 3];
         for (c, &b) in code.iter_mut().zip(obs.obs_code.iter()) {
             *c = if b == 0 { b' ' } else { b };
@@ -302,7 +337,7 @@ pub(crate) fn build_observers_from_c(observer_slice: &[EmpyreanObserver]) -> Vec
             observing_night,
         });
     }
-    observers
+    Ok(observers)
 }
 
 /// Build an [`EphemerisConfig`] from the C-ABI ephemeris config, honouring
@@ -419,6 +454,19 @@ pub(crate) fn marshal_ephemeris_result(
     // non-grav, 9-param) Jacobian/Hessian when present, else the 6-param.
     let mut sens_rows: Vec<EmpyreanObservationSensitivity> = Vec::new();
     for chain in &eph_result.sensitivity {
+        // Engine observatory codes are 3 bytes today (the 4th C-field
+        // byte is the NUL terminator). If the engine ever emits a longer
+        // code, surface it instead of clipping to a prefix that names a
+        // different observatory — the same contract the input paths
+        // enforce.
+        if chain.obs_code().len() > 3 {
+            set_last_error(&format!(
+                "sensitivity chain observatory code \"{}\" is longer than \
+                 3 bytes; 4-character MPC codes are not yet supported",
+                chain.obs_code()
+            ));
+            return -1;
+        }
         let mut obs_code = [0u8; 4];
         for (k, b) in chain.obs_code().bytes().take(3).enumerate() {
             obs_code[k] = b;
@@ -591,5 +639,44 @@ fn free_f64_array(ptr: *mut f64, len: usize) {
         unsafe {
             std::alloc::dealloc(ptr as *mut u8, layout);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn observer_with_code(code: [u8; 4]) -> EmpyreanObserver {
+        EmpyreanObserver {
+            obs_code: code,
+            epoch_mjd_tdb: 61000.0,
+            x: 1.0,
+            y: 0.0,
+            z: 0.0,
+            vx: 0.0,
+            vy: 0.01,
+            vz: 0.0,
+            observing_night: -1,
+        }
+    }
+
+    /// A 4-byte observatory code must be a loud error at the C boundary:
+    /// clipped to its 3-byte prefix it would silently alias a different
+    /// observatory (empyrean-agp9).
+    #[test]
+    fn four_byte_obs_code_is_rejected() {
+        let err = build_observers_from_c(&[observer_with_code(*b"W68a")])
+            .expect_err("4-byte observatory code must not convert");
+        assert!(err.contains("W68a"), "error names the code: {err}");
+        assert!(err.contains("4 bytes"), "error states the contract: {err}");
+    }
+
+    /// NUL-terminated 3-byte codes convert, space-padded to the engine's
+    /// 3-byte registry key.
+    #[test]
+    fn three_byte_obs_code_converts() {
+        let observers =
+            build_observers_from_c(&[observer_with_code(*b"W68\0")]).expect("3-byte code");
+        assert_eq!(observers[0].code, *b"W68");
     }
 }

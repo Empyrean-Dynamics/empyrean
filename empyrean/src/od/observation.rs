@@ -412,8 +412,18 @@ impl Observations {
             keep_strings.push(time_c);
             let mut obs_code = [0u8; 4];
             let bytes = obs.obs_code.as_bytes();
-            let n = bytes.len().min(3);
-            obs_code[..n].copy_from_slice(&bytes[..n]);
+            // Same contract as the ephemeris observer path: truncating a
+            // 4-character MPC code to its 3-byte prefix silently aliases a
+            // different observatory, so over-length codes are an error.
+            if bytes.len() > 3 {
+                return Err(Error::invalid_input(format!(
+                    "observatory code \"{}\" is longer than 3 bytes; \
+                     4-character MPC codes are not yet supported by the \
+                     engine's observatory registry",
+                    obs.obs_code
+                )));
+            }
+            obs_code[..bytes.len()].copy_from_slice(bytes);
             input.push(empyrean_sys::EmpyreanObservation {
                 perm_id: perm_ptr,
                 prov_id: prov_ptr,
@@ -699,6 +709,28 @@ impl Drop for Observations {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A 4-character observatory code must be a loud error at the FFI
+    /// boundary: clipped to 3 bytes it would silently alias a different
+    /// observatory (empyrean-agp9).
+    #[test]
+    fn four_char_obs_code_is_rejected() {
+        let obs = Observation {
+            obs_code: "W68a".to_string(),
+            obs_time: "2026-01-01T00:00:00Z".to_string(),
+            ..Observation::default()
+        };
+        let err = match Observations::from_array(&[obs]) {
+            Ok(_) => panic!("4-character observatory code must not marshal"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("W68a"), "error names the code: {msg}");
+        assert!(
+            msg.contains("longer than 3 bytes"),
+            "error states the contract: {msg}"
+        );
+    }
 
     /// Round-trips radar observations through the FFI boundary the
     /// `query_radar` path relies on: build the C array (`build_radar_ffi`),

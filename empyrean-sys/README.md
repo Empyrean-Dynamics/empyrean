@@ -22,7 +22,7 @@ type-check, or RAII-manage the underlying handles.
 
 ```toml
 [dependencies]
-empyrean-sys = "0.7"
+empyrean-sys = "0.8"
 ```
 
 ```rust

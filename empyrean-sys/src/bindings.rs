@@ -79,6 +79,7 @@ pub const EMPYREAN_COVARIANCE_KIND_SECOND_ORDER: u32 = 1;
 pub const EMPYREAN_COVARIANCE_KIND_THIRD_ORDER: u32 = 2;
 pub const EMPYREAN_COVARIANCE_KIND_MIXTURE: u32 = 3;
 pub const EMPYREAN_COVARIANCE_KIND_MONTE_CARLO: u32 = 4;
+pub const EMPYREAN_COVARIANCE_KIND_SIGMA_POINT: u32 = 5;
 pub const EMPYREAN_COVARIANCE_QUALITY_POSITIVE_DEFINITE: u32 = 0;
 pub const EMPYREAN_COVARIANCE_QUALITY_INDEFINITE: u32 = 1;
 pub const EMPYREAN_COVARIANCE_QUALITY_REPAIRED: u32 = 2;
@@ -93,6 +94,7 @@ pub const EMPYREAN_TAGGED_COV_STATE_MISSING: i32 = -5;
 pub const EMPYREAN_TAGGED_COV_TRANSFORM: i32 = -6;
 pub const EMPYREAN_TAGGED_COV_UNCERTAINTY: i32 = -7;
 pub const EMPYREAN_TAGGED_COV_EPOCH_INDEX_OUT_OF_RANGE: i32 = -8;
+pub const EMPYREAN_TAGGED_COV_SAMPLE_COVARIANCE_MISSING: i32 = -9;
 pub const EMPYREAN_TAGGED_COV_PANIC: i32 = -99;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -539,7 +541,7 @@ pub struct EmpyreanAdvancedIntegratorConfig {
     pub max_dense_steps: usize,
     #[doc = " Cache the integrator's per-step b-coefficients for fast\n interpolation (light-time iteration, dense output around close\n approaches, arbitrary-epoch state queries). 1 = on, 0 = off\n (default)."]
     pub cache_integrator_steps: u8,
-    #[doc = " Origin-switching trajectory-splitting configuration. Default\n disabled."]
+    #[doc = " Origin-switching trajectory-splitting configuration. Default\n enabled."]
     pub origin_switching: EmpyreanOriginSwitchingConfig,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]

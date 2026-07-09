@@ -1258,7 +1258,7 @@ fn _propagate<'py>(
 }
 
 /// Map a wrapper [`empyrean::CovarianceKind`] to its C-ABI integer code
-/// (`EMPYREAN_COVARIANCE_KIND_*`): Linear=0 … MonteCarlo=4. Explicit
+/// (`EMPYREAN_COVARIANCE_KIND_*`): Linear=0 … SigmaPoint=5. Explicit
 /// match — never an enum-as-int cast — so a reordering of the wrapper
 /// enum can't silently desync the Python-side code.
 fn covariance_kind_to_u8(kind: empyrean::CovarianceKind) -> u8 {
@@ -1268,6 +1268,7 @@ fn covariance_kind_to_u8(kind: empyrean::CovarianceKind) -> u8 {
         empyrean::CovarianceKind::ThirdOrder => 2,
         empyrean::CovarianceKind::Mixture => 3,
         empyrean::CovarianceKind::MonteCarlo => 4,
+        empyrean::CovarianceKind::SigmaPoint => 5,
     }
 }
 

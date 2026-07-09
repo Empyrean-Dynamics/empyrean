@@ -169,13 +169,15 @@ pub enum IntegratorChoice {
 }
 
 /// Trajectory splitting at body Laplace SOIs (Amato/Baù/Bombardelli
-/// 2017 §6). Default disabled (opt-in).
+/// 2017 §6). Default **enabled** — chaotic Earth-encounter
+/// trajectories are re-centered on the dominant body during flybys,
+/// preserving sub-meter precision. Set `enabled = false` to opt out.
 ///
 /// At this surface, `enabled = true` selects every monitored body —
 /// the per-body opt-in list is not exposed.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OriginSwitchingConfig {
-    /// Enable trajectory splitting. Default `false`.
+    /// Enable trajectory splitting. Default `true`.
     pub enabled: bool,
     /// Hysteresis band width for origin-switching.
     pub hysteresis: f64,

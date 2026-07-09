@@ -49,6 +49,10 @@ class Ephemeris(qv.Table):
 
     # Photometry
     mag = qv.Float64Column(nullable=True)
+    # 1-sigma magnitude uncertainty. Populated iff photometry is enabled
+    # AND the input orbit carried a state covariance; null otherwise.
+    # State contribution only — H-magnitude uncertainty is not yet an
+    # input, so sigma_V is under-reported when H uncertainty matters.
     mag_sigma = qv.Float64Column(nullable=True)
 
     # Local horizon

@@ -37,7 +37,12 @@ pub struct EphemerisEntry {
     pub heliocentric_distance_au: f64,
     /// Predicted apparent magnitude. NaN if unavailable.
     pub mag: f64,
-    /// Magnitude uncertainty. NaN if unavailable.
+    /// Magnitude uncertainty (1σ). Finite iff photometry is enabled AND
+    /// the input orbit carried a state covariance; NaN otherwise. Today
+    /// this reflects the **state contribution only** — an H-magnitude
+    /// uncertainty is not yet an input, so `mag_sigma` under-reports σ_V
+    /// when the H uncertainty is significant (the dominant photometric
+    /// error source for short-arc orbits).
     pub mag_sigma: f64,
     /// Topocentric zenith angle (degrees). NaN if unavailable.
     pub zenith_angle_deg: f64,
@@ -91,6 +96,13 @@ impl EphemerisEntry {
 /// Observation-sensitivity row: the partial derivatives of the sky-plane
 /// observable w.r.t. the input state, for one `(orbit, observer, epoch)`.
 /// Produced when the ephemeris uncertainty method traced the STM.
+///
+/// The Jacobian composes ∂(obs)/∂(state at t_obs) · Φ(t_obs, t₀) and
+/// omits the light-time terms: the −v·∂τ/∂x partial, and the STM is
+/// sampled at t_obs rather than at emission (t_obs − τ). Both terms are
+/// O(τ) and land in the velocity columns of the angle rows — fractional
+/// error ≈ τ/Δt with τ ≈ 0.006–0.017 d, negligible for multi-night arcs
+/// but growing as the arc shrinks toward intra-night.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObservationSensitivity {
     /// Orbit identifier.
@@ -242,7 +254,11 @@ impl EphemerisConfig {
 impl Context {
     /// Generate predicted ephemeris for orbits as seen by observers.
     ///
-    /// Returns `num_orbits * num_observers` entries (orbit-major order).
+    /// Returns `num_orbits * num_observers` entries, orbit-major; within
+    /// each orbit, entries (and [`ObservationSensitivity`] rows) follow
+    /// the **observer-input order**. Each observer carries its own epoch,
+    /// so there is no separate epoch axis — positional pairing against
+    /// the input observers is safe within an orbit block.
     pub fn generate_ephemeris(
         &self,
         orbits: &[Orbit],
@@ -290,8 +306,19 @@ pub(crate) fn observers_to_ffi(
         .map(|o| {
             let mut code_bytes = [0u8; 4];
             let src = o.obs_code.as_bytes();
-            let n = src.len().min(3);
-            code_bytes[..n].copy_from_slice(&src[..n]);
+            // The engine's observatory registry keys 3-byte MPC codes. A
+            // longer code must not be truncated: its 3-byte prefix would
+            // silently resolve to a DIFFERENT observatory (wrong
+            // topocentric geometry, no diagnostic).
+            if src.len() > 3 {
+                return Err(Error::invalid_input(format!(
+                    "observatory code \"{}\" is longer than 3 bytes; \
+                     4-character MPC codes are not yet supported by the \
+                     engine's observatory registry",
+                    o.obs_code
+                )));
+            }
+            code_bytes[..src.len()].copy_from_slice(src);
             Ok(empyrean_sys::EmpyreanObserver {
                 obs_code: code_bytes,
                 epoch_mjd_tdb: o.epoch.mjd_tdb()?,
@@ -339,5 +366,47 @@ pub(crate) fn marshal_ephemeris_result(
     EphemerisResult {
         entries,
         sensitivity,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::observers::Observer;
+
+    /// A 4-character observatory code must be a loud error at the FFI
+    /// boundary: clipped to 3 bytes it would silently alias a different
+    /// observatory (empyrean-agp9).
+    #[test]
+    fn four_char_obs_code_is_rejected() {
+        let observer = Observer {
+            obs_code: "W68a".to_string(),
+            epoch: crate::Epoch::from_mjd_tdb(61000.0),
+            position: [1.0, 0.0, 0.0],
+            velocity: [0.0, 0.01, 0.0],
+            observing_night: -1,
+        };
+        let err = observers_to_ffi(&[observer])
+            .expect_err("4-character observatory code must not marshal");
+        let msg = err.to_string();
+        assert!(msg.contains("W68a"), "error names the code: {msg}");
+        assert!(
+            msg.contains("longer than 3 bytes"),
+            "error states the contract: {msg}"
+        );
+    }
+
+    /// 3-character (and shorter) codes still marshal, NUL-padded.
+    #[test]
+    fn three_char_obs_code_marshals() {
+        let observer = Observer {
+            obs_code: "W68".to_string(),
+            epoch: crate::Epoch::from_mjd_tdb(61000.0),
+            position: [1.0, 0.0, 0.0],
+            velocity: [0.0, 0.01, 0.0],
+            observing_night: -1,
+        };
+        let ffi = observers_to_ffi(&[observer]).expect("3-character code marshals");
+        assert_eq!(&ffi[0].obs_code, b"W68\0");
     }
 }

@@ -60,6 +60,9 @@ class CovarianceKind(str, enum.Enum):
     """Adaptive Gaussian Mixture, moment-collapsed (code 3)."""
     MONTE_CARLO = "monte_carlo"
     """Monte Carlo sample covariance (code 4)."""
+    SIGMA_POINT = "sigma_point"
+    """Sigma-point sample covariance — the second moment of the
+    propagated canonical 2N+1 sigma-point set (code 5)."""
 
 
 class CovarianceQuality(str, enum.Enum):
@@ -96,6 +99,7 @@ _KIND_BY_CODE = {
     2: CovarianceKind.THIRD_ORDER,
     3: CovarianceKind.MIXTURE,
     4: CovarianceKind.MONTE_CARLO,
+    5: CovarianceKind.SIGMA_POINT,
 }
 _QUALITY_BY_CODE = {
     0: CovarianceQuality.POSITIVE_DEFINITE,

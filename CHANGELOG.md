@@ -4,6 +4,66 @@ Notable changes to the empyrean distribution — the `empyrean`, `empyrean-sys`,
 `empyrean-c`, and `empyrean-cli` crates and the `empyrean` Python package. This
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.8.0] — 2026-07-09
+
+Continuous-thrust inputs, a reusable force-model handle, one abi3 wheel per
+architecture across four platforms — and two covariance-accuracy fixes found
+by validating the release candidate, neither of which ever shipped in a
+stable release with wrong behavior.
+
+### Added
+
+- **Continuous-thrust inputs** across every channel: finite-burn arcs with
+  constant-RTN, velocity-tangent, and inertial-fixed steering laws, plus
+  Δv-targeting corrections whose covariances flow into the tagged
+  per-epoch covariance. Reaches the dynamics through propagation, ephemeris
+  generation, observation planning, impact analysis, and I/O.
+- **A reusable system handle**: `build_system` assembles the force model
+  once and reuses it across propagation and ephemeris calls — thread-safe,
+  with a `describe()` provenance record carrying the force-model
+  configuration and the SHA-256 identity of every loaded kernel. Every call
+  is validated against the handle's data and frozen key, erroring by axis
+  on any mismatch rather than silently rebuilding.
+- **Sigma-point provenance**: covariances produced by the sigma-point
+  method are now tagged `sigma_point` in the per-epoch tagged-covariance
+  readback (previously they read back as `linear`).
+- **Explicit kernel-load error categories**: I/O versus parse failures no
+  longer collapse into one variant.
+
+### Fixed
+
+- **B-plane uncertainty for element-space orbits.** `compute_b_planes`
+  projected the input covariance in its native representation through the
+  Cartesian state-transition matrix, skipping the element→Cartesian
+  Jacobian — for Cometary/Keplerian/Spherical inputs (the SBDB-query
+  common case) the projected 3σ ellipse inflated by orders of magnitude.
+  The projection now uses the propagated Cartesian covariance at each
+  close-approach epoch. Cartesian inputs, impact probabilities, and
+  propagation covariances were never affected.
+- **Sigma-point covariance normalization.** The sigma-point method now
+  uses the canonical 2N+1 unscented construction; the previous sampling
+  under-estimated recovered covariances by a factor of ~6. Degenerate
+  input covariances and non-default legacy sampling parameters now fail
+  loudly instead of silently degrading.
+- **Observatory-code validation.** A 4-character observatory code is now a
+  loud error at every input boundary instead of being silently truncated
+  to a 3-character prefix that names a different observatory. (4-character
+  MPC codes are not yet supported end-to-end.)
+
+### Changed
+
+- **Wheels are abi3.** One `cp310-abi3` wheel per architecture, installing
+  on CPython 3.10+.
+- **Four platforms.** Prebuilt engine, wheels, and CLI for macOS arm64,
+  macOS x86_64, Linux x86_64, and Linux aarch64; the macOS x86_64
+  artifacts are cross-compiled on arm64 runners.
+- **Documented ordering guarantees.** Propagation states are epoch-ordered
+  (forward ascending, then backward descending) — join on `epoch_mjd_tdb`;
+  ephemeris entries are orbit-major with within-orbit observer-input
+  order. Both are now stated in the API docs at every layer, along with
+  `mag_sigma` population conditions and the observation Jacobian's
+  light-time caveat.
+
 ## [0.7.0] — 2026-07-03
 
 First stable release of the empyrean distribution: uncertainty-first orbit

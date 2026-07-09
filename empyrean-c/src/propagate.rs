@@ -252,9 +252,10 @@ pub struct EmpyreanOrbit {
 /// Origin-switching configuration for trajectory splitting at body
 /// Laplace spheres of influence (Amato/Baù/Bombardelli 2017 §6).
 ///
-/// Default disabled (`enabled = 0`). When enabled, integration
-/// switches to a body-centric frame inside the SOI of each eligible
-/// body and back to SSB on exit.
+/// Default **enabled** (the `_DEFAULT` sentinel resolves to
+/// `enabled = 1`). When enabled, integration switches to a
+/// body-centric frame inside the SOI of each eligible body and back
+/// to SSB on exit. Set `enabled = 0` explicitly to opt out.
 ///
 /// At the C-ABI surface, the per-body opt-in list (`bodies` in
 /// villeneuve) is not yet exposed — `EMPYREAN_ORIGIN_SWITCHING_ON`
@@ -347,7 +348,7 @@ pub struct EmpyreanAdvancedIntegratorConfig {
     /// (default).
     pub cache_integrator_steps: u8,
     /// Origin-switching trajectory-splitting configuration. Default
-    /// disabled.
+    /// enabled.
     pub origin_switching: EmpyreanOriginSwitchingConfig,
 }
 
@@ -511,6 +512,10 @@ pub const EMPYREAN_COVARIANCE_KIND_MIXTURE: u8 = 3;
 /// Monte-Carlo request config ([`EmpyreanUncertaintyMethod::mc_seed`]),
 /// not in this per-row tag.
 pub const EMPYREAN_COVARIANCE_KIND_MONTE_CARLO: u8 = 4;
+/// Sigma-point sample covariance: the second moment of the propagated
+/// canonical 2N+1 sigma-point set. Deterministic and parameter-free —
+/// no per-row payload.
+pub const EMPYREAN_COVARIANCE_KIND_SIGMA_POINT: u8 = 5;
 
 // ── Covariance definiteness (TaggedCovariance.quality) ──────────────
 /// All eigenvalues positive within round-off; `quality_min_eig` is NaN.
@@ -551,6 +556,10 @@ pub const EMPYREAN_TAGGED_COV_TRANSFORM: i32 = -6;
 pub const EMPYREAN_TAGGED_COV_UNCERTAINTY: i32 = -7;
 /// `epoch_index` is out of range (point accessor only).
 pub const EMPYREAN_TAGGED_COV_EPOCH_INDEX_OUT_OF_RANGE: i32 = -8;
+/// A sample-based epoch (sigma-point) has no stored covariance on its
+/// propagated state — an internal bookkeeping error, surfaced rather
+/// than degraded.
+pub const EMPYREAN_TAGGED_COV_SAMPLE_COVARIANCE_MISSING: i32 = -9;
 /// A panic was caught at the boundary.
 pub const EMPYREAN_TAGGED_COV_PANIC: i32 = -99;
 
@@ -794,6 +803,7 @@ pub(crate) fn covariance_kind_to_u8(k: empyrean_core::propagation::CovarianceKin
         K::ThirdOrder => EMPYREAN_COVARIANCE_KIND_THIRD_ORDER,
         K::Mixture => EMPYREAN_COVARIANCE_KIND_MIXTURE,
         K::MonteCarlo { .. } => EMPYREAN_COVARIANCE_KIND_MONTE_CARLO,
+        K::SigmaPoint => EMPYREAN_COVARIANCE_KIND_SIGMA_POINT,
     }
 }
 
@@ -1155,6 +1165,11 @@ pub(crate) fn empyrean_orbit_thrust_params(
 /// Returns 0 on success, negative error code on failure.
 /// On success, `result_out` is populated with the propagated states.
 /// The caller must free the result with `empyrean_propagation_result_free()`.
+///
+/// States are flat in orbit-major order; within each orbit, rows are
+/// **epoch-ordered, not request-ordered** — forward epochs ascending,
+/// then backward epochs descending. Join rows to requested times on
+/// `epoch_mjd_tdb`, never by request position.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn empyrean_propagate(
     ctx: *const EmpyreanContext,
@@ -1774,6 +1789,7 @@ fn flatten_tagged_covariance(
         CovarianceKind::ThirdOrder => (EMPYREAN_COVARIANCE_KIND_THIRD_ORDER, 0, 0),
         CovarianceKind::Mixture => (EMPYREAN_COVARIANCE_KIND_MIXTURE, 0, 0),
         CovarianceKind::MonteCarlo { seed } => (EMPYREAN_COVARIANCE_KIND_MONTE_CARLO, seed, 1),
+        CovarianceKind::SigmaPoint => (EMPYREAN_COVARIANCE_KIND_SIGMA_POINT, 0, 0),
     };
 
     let (quality, quality_min_eig) = match tc.quality {
@@ -1851,6 +1867,7 @@ fn cov_series_err_code(e: &empyrean_core::propagation::CovarianceSeriesError) ->
         E::StateMissing { .. } => EMPYREAN_TAGGED_COV_STATE_MISSING,
         E::Transform(_) => EMPYREAN_TAGGED_COV_TRANSFORM,
         E::Uncertainty(_) => EMPYREAN_TAGGED_COV_UNCERTAINTY,
+        E::SampleCovarianceMissing { .. } => EMPYREAN_TAGGED_COV_SAMPLE_COVARIANCE_MISSING,
     }
 }
 

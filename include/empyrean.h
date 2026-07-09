@@ -421,6 +421,13 @@ typedef struct Session Session;
 #define EMPYREAN_COVARIANCE_KIND_MONTE_CARLO 4
 
 /**
+ * Sigma-point sample covariance: the second moment of the propagated
+ * canonical 2N+1 sigma-point set. Deterministic and parameter-free —
+ * no per-row payload.
+ */
+#define EMPYREAN_COVARIANCE_KIND_SIGMA_POINT 5
+
+/**
  * All eigenvalues positive within round-off; `quality_min_eig` is NaN.
  */
 #define EMPYREAN_COVARIANCE_QUALITY_POSITIVE_DEFINITE 0
@@ -495,6 +502,13 @@ typedef struct Session Session;
  * `epoch_index` is out of range (point accessor only).
  */
 #define EMPYREAN_TAGGED_COV_EPOCH_INDEX_OUT_OF_RANGE -8
+
+/**
+ * A sample-based epoch (sigma-point) has no stored covariance on its
+ * propagated state — an internal bookkeeping error, surfaced rather
+ * than degraded.
+ */
+#define EMPYREAN_TAGGED_COV_SAMPLE_COVARIANCE_MISSING -9
 
 /**
  * A panic was caught at the boundary.
@@ -953,9 +967,10 @@ struct EmpyreanDiagnosticsConfig {
  * Origin-switching configuration for trajectory splitting at body
  * Laplace spheres of influence (Amato/Baù/Bombardelli 2017 §6).
  *
- * Default disabled (`enabled = 0`). When enabled, integration
- * switches to a body-centric frame inside the SOI of each eligible
- * body and back to SSB on exit.
+ * Default **enabled** (the `_DEFAULT` sentinel resolves to
+ * `enabled = 1`). When enabled, integration switches to a
+ * body-centric frame inside the SOI of each eligible body and back
+ * to SSB on exit. Set `enabled = 0` explicitly to opt out.
  *
  * At the C-ABI surface, the per-body opt-in list (`bodies` in
  * villeneuve) is not yet exposed — `EMPYREAN_ORIGIN_SWITCHING_ON`
@@ -1041,7 +1056,7 @@ struct EmpyreanAdvancedIntegratorConfig {
     uint8_t cache_integrator_steps;
     /**
      * Origin-switching trajectory-splitting configuration. Default
-     * disabled.
+     * enabled.
      */
     struct EmpyreanOriginSwitchingConfig origin_switching;
 };
@@ -1513,7 +1528,11 @@ struct EmpyreanEphemerisEntry {
      */
     double mag;
     /**
-     * Magnitude uncertainty. NaN if unavailable.
+     * Magnitude uncertainty (1σ). Finite iff photometry is enabled AND
+     * the input orbit carried a state covariance; NaN otherwise. Today
+     * this reflects the state contribution only — an H-magnitude
+     * uncertainty is not yet an input, so `mag_sigma` under-reports σ_V
+     * when the H uncertainty is significant.
      */
     double mag_sigma;
     /**
@@ -1554,6 +1573,13 @@ struct EmpyreanEphemerisEntry {
  * `(orbit, observer, epoch)`. One row per observation epoch within each
  * `(orbit_id, obs_code)` chain. Owning struct: free
  * the whole result with [`empyrean_ephemeris_result_free`].
+ *
+ * The Jacobian composes d(obs)/d(state at t_obs) * Phi(t_obs, t0) and
+ * omits the light-time terms (the -v * dtau/dx partial; the STM is
+ * sampled at t_obs rather than emission t_obs - tau): both are O(tau),
+ * landing in the velocity columns of the angle rows with fractional
+ * error ~ tau/dt (tau ~ 0.006-0.017 d) — negligible for multi-night
+ * arcs, growing as the arc shrinks toward intra-night.
  */
 struct EmpyreanObservationSensitivity {
     /**
@@ -3580,7 +3606,11 @@ int32_t empyrean_builtsystem_describe(const struct EmpyreanBuiltSystem *handle,
  * Generate predicted ephemeris for orbits and observers.
  *
  * Returns 0 on success, negative error code on failure.
- * On success, `result_out` is populated with ephemeris entries.
+ * On success, `result_out` is populated with ephemeris entries:
+ * `num_orbits * num_observers` rows, orbit-major, and within each orbit
+ * in **observer-input order** (sensitivity rows follow the same order).
+ * Each observer carries its own epoch, so positional pairing against
+ * the input observers is safe within an orbit block.
  * The caller must free the result with `empyrean_ephemeris_result_free()`.
  */
 
@@ -3973,6 +4003,11 @@ int32_t empyrean_evaluate_plan(const EmpyreanContext *ctx,
  * Returns 0 on success, negative error code on failure.
  * On success, `result_out` is populated with the propagated states.
  * The caller must free the result with `empyrean_propagation_result_free()`.
+ *
+ * States are flat in orbit-major order; within each orbit, rows are
+ * **epoch-ordered, not request-ordered** — forward epochs ascending,
+ * then backward epochs descending. Join rows to requested times on
+ * `epoch_mjd_tdb`, never by request position.
  */
 
 int32_t empyrean_propagate(const EmpyreanContext *ctx,

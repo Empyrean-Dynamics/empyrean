@@ -277,8 +277,14 @@ class ObservationSensitivities(qv.Table):
 
     Holds ∂h/∂x₀ at every ephemeris epoch for each ``(orbit, observer)``
     pair, plus the observation Hessians when the underlying propagation
-    carried STTs. Filter to one chain via two ``select`` calls before
-    using the per-chain accessors::
+    carried STTs. The Jacobian composes ∂(obs)/∂(state at t_obs) ·
+    Φ(t_obs, t₀) and omits the light-time terms (the −v·∂τ/∂x partial;
+    the STM is sampled at t_obs rather than emission t_obs − τ): both
+    are O(τ), landing in the velocity columns of the angle rows with
+    fractional error ≈ τ/Δt (τ ≈ 0.006–0.017 d) — negligible for
+    multi-night arcs, growing as the arc shrinks toward intra-night.
+    Filter to one chain via two ``select`` calls before using the
+    per-chain accessors::
 
         chain = obs.select("orbit_id", oid).select("obs_code", "F51")
         H = chain.jacobians_array()[chain.index_at(60750.0)]

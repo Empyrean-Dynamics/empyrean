@@ -168,6 +168,15 @@ def propagate(
         Propagated states, detected events, and per-orbit state
         sensitivity chains.
 
+    Notes
+    -----
+    Within each orbit, states are **epoch-ordered, not request-ordered**:
+    forward epochs first in ascending order, then backward epochs in
+    descending order. When ``epochs`` is not already in that order,
+    pairing states to requests by position silently associates them with
+    the wrong epochs — join on the result's ``epoch_mjd_tdb`` column
+    instead.
+
     Examples
     --------
     Defaults (Standard force model, FirstOrder uncertainty):

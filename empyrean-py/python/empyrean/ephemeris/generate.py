@@ -88,6 +88,10 @@ def generate_ephemeris(
         Wraps the :class:`~empyrean.types.Ephemeris` table and, when
         input covariance is carried, the observation-partials
         :class:`~empyrean.types.ObservationSensitivity` container.
+        Rows are orbit-major and, within each orbit, follow the
+        **observer-input order** (sensitivity rows too). Each observer
+        carries its own epoch, so positional pairing against the input
+        observers is safe within an orbit block.
 
     Examples
     --------

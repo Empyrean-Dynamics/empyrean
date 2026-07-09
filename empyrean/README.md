@@ -23,7 +23,7 @@ raw FFI pointers.
 
 ```toml
 [dependencies]
-empyrean = "0.7"
+empyrean = "0.8"
 ```
 
 ## What it does

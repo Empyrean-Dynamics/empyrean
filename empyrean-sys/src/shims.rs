@@ -82,7 +82,7 @@ pub unsafe fn empyrean_context_free(ctx: *mut EmpyreanContext) {
 /** Return the platform XDG-compliant default data directory as a
 heap-allocated, NUL-terminated UTF-8 string.
 
-Mirrors villeneuve's [`DataManager::new`] resolution: honors
+Mirrors villeneuve's `DataManager::new` resolution: honors
 `EMPYREAN_DATA_DIR` first, then falls back to `dirs::data_dir()` —
 `~/.local/share/empyrean/data/` on Linux, `~/Library/Application
 Support/empyrean/data/` on macOS, `%APPDATA%\empyrean\data\` on
@@ -108,7 +108,7 @@ pub unsafe fn empyrean_string_free(s: *mut ::std::os::raw::c_char) {
 }
 /** Multi-line version report — `empyrean-core <ver>\nvilleneuve <ver>\n…`.
 
-Mirrors [`empyrean_core::version_string`]. Useful for `--version`-style
+Mirrors `empyrean_core::version_string`. Useful for `--version`-style
 output and for verifying the build provenance of a deployed cdylib.
 Returns null on allocation failure (extremely unlikely — the strings
 are short and `&'static` underneath); call `empyrean_last_error()` if
@@ -176,15 +176,15 @@ pub unsafe fn empyrean_generate_ephemeris(
 pub unsafe fn empyrean_ephemeris_result_free(result: *mut EmpyreanEphemerisResult) {
     unsafe { lib().empyrean_ephemeris_result_free(result) }
 }
-/** Run [`empyrean_core::impact::compute_impact_probabilities`] over a
-caller-supplied set of [`UncertaintyMethod`] variants and return
+/** Run `empyrean_core::impact::compute_impact_probabilities` over a
+caller-supplied set of `UncertaintyMethod` variants and return
 the flattened IP records tagged by method.
 
 Caller is responsible for freeing the result via
 [`empyrean_compute_impact_probabilities_result_free`].
 
 # Returns
-`0` on success, negative on failure (see [`crate::set_last_error`]).
+`0` on success, negative on failure (see `crate::set_last_error`).
 
 # Safety
 All non-null pointer arguments must point to valid arrays of the
@@ -226,8 +226,8 @@ pub unsafe fn empyrean_compute_impact_probabilities_result_free(
 ) {
     unsafe { lib().empyrean_compute_impact_probabilities_result_free(result) }
 }
-/** Run [`empyrean_core::impact::compute_b_planes`] over a caller-
-supplied set of [`UncertaintyMethod`] variants and return the
+/** Run `empyrean_core::impact::compute_b_planes` over a caller-
+supplied set of `UncertaintyMethod` variants and return the
 flattened B-plane records tagged by method.
 
 Caller is responsible for freeing the result via
@@ -750,7 +750,7 @@ designations / names / SPK IDs (e.g. `"apophis"`, `"99942"`,
 a directory path where SBDB JSON responses are cached on disk.
 
 On success the populated [`EmpyreanOrbitBatch`] must be released with
-[`empyrean_orbits_batch_free`](crate::io::empyrean_orbits_batch_free).*/
+`empyrean_orbits_batch_free`.*/
 #[inline]
 pub unsafe fn empyrean_query_sbdb(
     object_ids: *const *const ::std::os::raw::c_char,
@@ -769,7 +769,7 @@ code as a null-terminated string. `times_mjd_tdb` carries
 
 On success populates an [`EmpyreanEphemerisResult`] with one entry
 per `(object_id × epoch)`. Free with
-[`empyrean_ephemeris_result_free`](crate::ephemeris::empyrean_ephemeris_result_free).
+`empyrean_ephemeris_result_free`.
 
 All angular values are converted to **degrees** at the FFI boundary
 (Horizons natively returns radians).*/
@@ -831,7 +831,7 @@ present in the JSON.
 
 On success `*out_ptr` carries a heap-allocated array of length
 `*out_num`. Free with
-[`empyrean_observations_free`](crate::od::empyrean_observations_free).*/
+`empyrean_observations_free`.*/
 #[inline]
 pub unsafe fn empyrean_query_observations(
     designations: *const *const ::std::os::raw::c_char,
@@ -861,7 +861,7 @@ records), so radar ships as its own live-query entry point. JPL
 `sb_radar` JSON records are converted to ADES-native scott
 `RadarObservation`s and packed into the C-ABI
 [`EmpyreanRadarObservation`] struct (the same layout
-[`empyrean_read_ades`](crate::od::empyrean_read_ades) emits): the delay
+`empyrean_read_ades` emits): the delay
 value is in seconds, its σ in microseconds, Doppler in Hz, frequency in
 MHz, and the `com` flag is a tri-state i8. `cache_dir` may be null to
 skip caching, or a directory path where `sb_radar` JSON responses are
@@ -874,7 +874,7 @@ dropped — the whole call fails so no radar quietly goes missing.
 
 On success `*out_ptr` carries a heap-allocated array of length
 `*out_num`. Free with
-[`empyrean_radar_observations_free`](crate::od::empyrean_radar_observations_free).*/
+`empyrean_radar_observations_free`.*/
 #[inline]
 pub unsafe fn empyrean_query_radar(
     designations: *const *const ::std::os::raw::c_char,
@@ -953,7 +953,7 @@ calls, uses the previously-fit orbit as the IOD seed (skipping the
 IOD step). Pushes the new fit onto the session's history.
 
 On success populates `result_out` with the latest fit. The caller
-must free `result_out` with [`empyrean_od_result_free`](crate::od::empyrean_od_result_free).*/
+must free `result_out` with `empyrean_od_result_free`.*/
 #[inline]
 pub unsafe fn empyrean_session_refine(
     session: *mut EmpyreanSession,
@@ -969,7 +969,7 @@ pub unsafe fn empyrean_session_history_len(session: *const EmpyreanSession) -> u
 }
 /** Copy the i-th history entry into `result_out`. Returns 0 on
 success, -1 on null/out-of-bounds. Caller frees `result_out` with
-[`empyrean_od_result_free`](crate::od::empyrean_od_result_free).*/
+`empyrean_od_result_free`.*/
 #[inline]
 pub unsafe fn empyrean_session_get_history(
     session: *const EmpyreanSession,
@@ -1030,7 +1030,7 @@ to MJD in the requested target scale.
 
 On success writes the MJD value to `*out_mjd` and returns 0.
 On failure returns a negative code; consult
-[`empyrean_last_error`](crate::empyrean_last_error).*/
+`empyrean_last_error`.*/
 #[inline]
 pub unsafe fn empyrean_iso_to_mjd(
     iso: *const ::std::os::raw::c_char,

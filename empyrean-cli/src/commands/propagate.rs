@@ -187,6 +187,7 @@ fn print_tagged_covariance_series(input: &OrbitBatch, result: &PropagationResult
             CovarianceKind::ThirdOrder => "ThirdOrder",
             CovarianceKind::Mixture => "Mixture",
             CovarianceKind::MonteCarlo => "MonteCarlo",
+            CovarianceKind::SigmaPoint => "SigmaPoint",
         }
     }
 

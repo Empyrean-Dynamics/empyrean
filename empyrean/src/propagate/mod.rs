@@ -87,6 +87,16 @@ impl Context {
     /// the object IDs (matched to the orbits input), and any detected
     /// events (close approach, periapsis, SOI entry, etc.) along each
     /// trajectory.
+    ///
+    /// # State ordering
+    ///
+    /// Within each orbit, states are **epoch-ordered, not request-ordered**:
+    /// forward epochs first in ascending order, then backward epochs in
+    /// descending order. When the requested `epochs` are not already in that
+    /// order, pairing states to requests by position silently associates
+    /// them with the wrong epochs — join on
+    /// [`PropagatedState::epoch`](crate::propagate::PropagatedState::epoch)
+    /// instead.
     pub fn propagate(
         &self,
         orbits: &[Orbit],

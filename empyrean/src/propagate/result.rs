@@ -26,6 +26,9 @@ pub enum CovarianceKind {
     Mixture,
     /// Monte Carlo sample covariance.
     MonteCarlo,
+    /// Sigma-point sample covariance: the second moment of the propagated
+    /// canonical 2N+1 sigma-point set. Deterministic and parameter-free.
+    SigmaPoint,
 }
 
 impl CovarianceKind {
@@ -38,6 +41,7 @@ impl CovarianceKind {
             empyrean_sys::EMPYREAN_COVARIANCE_KIND_THIRD_ORDER => Self::ThirdOrder,
             empyrean_sys::EMPYREAN_COVARIANCE_KIND_MIXTURE => Self::Mixture,
             empyrean_sys::EMPYREAN_COVARIANCE_KIND_MONTE_CARLO => Self::MonteCarlo,
+            empyrean_sys::EMPYREAN_COVARIANCE_KIND_SIGMA_POINT => Self::SigmaPoint,
             other => {
                 return Err(Error::invalid_input(format!(
                     "C ABI returned unknown covariance kind tag: {other}"
@@ -54,6 +58,7 @@ impl CovarianceKind {
             Self::ThirdOrder => empyrean_sys::EMPYREAN_COVARIANCE_KIND_THIRD_ORDER,
             Self::Mixture => empyrean_sys::EMPYREAN_COVARIANCE_KIND_MIXTURE,
             Self::MonteCarlo => empyrean_sys::EMPYREAN_COVARIANCE_KIND_MONTE_CARLO,
+            Self::SigmaPoint => empyrean_sys::EMPYREAN_COVARIANCE_KIND_SIGMA_POINT,
         };
         tag as u8
     }
@@ -437,7 +442,11 @@ impl Event {
 /// recompute the resolved-kind readback; it is freed on drop.
 #[derive(Debug)]
 pub struct PropagationResult {
-    /// Propagated states (flat, orbit-major order).
+    /// Propagated states (flat, orbit-major order). Within each orbit,
+    /// rows are **epoch-ordered** — forward epochs ascending, then
+    /// backward epochs descending — not request-ordered: join rows to
+    /// requested epochs on each state's `epoch`, never by request
+    /// position.
     pub states: Vec<PropagatedState>,
     /// Object identifiers aligned with the orbits input.
     pub object_ids: Vec<String>,
@@ -643,5 +652,32 @@ mod order_lock_tests {
             );
             assert_eq!(tagged.kind, CovarianceKind::Linear);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CovarianceKind;
+
+    /// Every covariance kind round-trips through its C-ABI tag, and the
+    /// new sample-based kinds map to the tags the engine emits
+    /// (empyrean-2hza).
+    #[test]
+    fn covariance_kind_round_trips_c_tags() {
+        for kind in [
+            CovarianceKind::Linear,
+            CovarianceKind::SecondOrder,
+            CovarianceKind::ThirdOrder,
+            CovarianceKind::Mixture,
+            CovarianceKind::MonteCarlo,
+            CovarianceKind::SigmaPoint,
+        ] {
+            assert_eq!(CovarianceKind::from_u8(kind.to_u8()).unwrap(), kind);
+        }
+        assert_eq!(
+            CovarianceKind::from_u8(5).unwrap(),
+            CovarianceKind::SigmaPoint
+        );
+        assert!(CovarianceKind::from_u8(6).is_err(), "unknown tags reject");
     }
 }

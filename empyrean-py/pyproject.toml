@@ -211,6 +211,13 @@ exclude = [
 module = "empyrean._empyrean_rs"
 ignore_missing_imports = true
 
+# pyarrow's private modules ship no stubs / py.typed marker; newer mypy
+# releases flag the `pyarrow._compute` import (import-untyped) that the
+# sensitivity accessors need for call_function.
+[[tool.mypy.overrides]]
+module = "pyarrow.*"
+ignore_missing_imports = true
+
 # Third-party SPICE / observatory-code data packages we vendor at install
 # time but don't ship type stubs for. We only touch one module-level
 # attribute on each (the file path) and never call any of their functions,

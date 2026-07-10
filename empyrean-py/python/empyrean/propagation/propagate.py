@@ -171,12 +171,11 @@ def propagate(
 
     Notes
     -----
-    Within each orbit, states are **epoch-ordered, not request-ordered**:
-    forward epochs first in ascending order, then backward epochs in
-    descending order. When ``epochs`` is not already in that order,
-    pairing states to requests by position silently associates them with
-    the wrong epochs — join on the result's ``epoch_mjd_tdb`` column
-    instead.
+    Within each orbit, states come back in **ascending epoch order,
+    always**, regardless of the order the epochs were requested in.
+    Positional pairing against an ascending, duplicate-free request grid
+    is therefore exact; for any other request shape, join on the
+    result's ``epoch_mjd_tdb`` column.
 
     Examples
     --------

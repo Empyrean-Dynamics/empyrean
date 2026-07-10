@@ -74,6 +74,15 @@ int main(void) {
 Link against `libempyrean` and the OS-default C runtime; no further
 dependencies are required at the C ABI boundary.
 
+```sh
+# Linux
+cc main.c -I include -L <libdir> -lempyrean -Wl,-rpath,<libdir>
+
+# macOS — the released dylib's install name is @rpath/libempyrean.dylib,
+# so pass an rpath pointing at the directory holding the dylib:
+cc main.c -I include -L <libdir> -lempyrean -Wl,-rpath,<libdir>
+```
+
 ## Closed-source posture
 
 The internal Rust API (`empyrean-core` and its transitive deps —

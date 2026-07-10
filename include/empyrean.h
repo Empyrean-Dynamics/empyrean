@@ -4004,10 +4004,11 @@ int32_t empyrean_evaluate_plan(const EmpyreanContext *ctx,
  * On success, `result_out` is populated with the propagated states.
  * The caller must free the result with `empyrean_propagation_result_free()`.
  *
- * States are flat in orbit-major order; within each orbit, rows are
- * **epoch-ordered, not request-ordered** — forward epochs ascending,
- * then backward epochs descending. Join rows to requested times on
- * `epoch_mjd_tdb`, never by request position.
+ * States are flat in orbit-major order; within each orbit, rows are in
+ * **ascending epoch order, always** (engine guarantee since villeneuve
+ * v1.18.0), regardless of request order. Positional pairing against an
+ * ascending, duplicate-free request grid is exact; for any other
+ * request shape, join on `epoch_mjd_tdb`.
  */
 
 int32_t empyrean_propagate(const EmpyreanContext *ctx,

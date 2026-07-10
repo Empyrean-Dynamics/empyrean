@@ -16,6 +16,7 @@ from empyrean._convert import (
     _COORD_TYPE_MAP,
     AnyOrbits,
     coordinates_to_arrays,
+    extract_non_grav_covariance,
     extract_photometry,
     int_to_frame,
     naif_to_origin,
@@ -170,12 +171,11 @@ def propagate(
 
     Notes
     -----
-    Within each orbit, states are **epoch-ordered, not request-ordered**:
-    forward epochs first in ascending order, then backward epochs in
-    descending order. When ``epochs`` is not already in that order,
-    pairing states to requests by position silently associates them with
-    the wrong epochs — join on the result's ``epoch_mjd_tdb`` column
-    instead.
+    Within each orbit, states come back in **ascending epoch order,
+    always**, regardless of the order the epochs were requested in.
+    Positional pairing against an ascending, duplicate-free request grid
+    is therefore exact; for any other request shape, join on the
+    result's ``epoch_mjd_tdb`` column.
 
     Examples
     --------
@@ -324,6 +324,14 @@ def propagate(
     # Photometric parameters
     phot_h, phot_g, phot_model = extract_photometry(orbits)
 
+    # Fitted non-grav covariance — passed through only when a row carries one
+    # (mirrors the OD output path) so a StateAndNonGrav-fitted orbit re-fed
+    # into propagate keeps its prior. Gated like the other optional non-grav
+    # arrays so the common no-cov case skips the FFI marshal.
+    has_ng_cov_arr, ng_cov_arr = extract_non_grav_covariance(orbits)
+    has_non_grav_cov: np.ndarray | None = has_ng_cov_arr if has_ng_cov_arr.any() else None
+    non_grav_cov: np.ndarray | None = ng_cov_arr if has_ng_cov_arr.any() else None
+
     # ── Extract times ────────────────────────────────────────
     if isinstance(epochs, Epochs):
         # Convert to TDB if needed
@@ -419,6 +427,8 @@ def propagate(
         epsilon=epsilon,
         thrust_arcs=thrust_arg,
         non_grav_dts=non_grav_dts,
+        has_non_grav_cov=has_non_grav_cov,
+        non_grav_cov=non_grav_cov,
         ng_alphas=ng_alphas,
         ng_r0s=ng_r0s,
         ng_ms=ng_ms,

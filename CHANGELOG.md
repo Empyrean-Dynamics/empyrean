@@ -4,6 +4,47 @@ Notable changes to the empyrean distribution — the `empyrean`, `empyrean-sys`,
 `empyrean-c`, and `empyrean-cli` crates and the `empyrean` Python package. This
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.8.1] — 2026-07-10
+
+### Fixed
+
+- **Fitted non-grav covariance reaches every Python forward model.** The
+  Python bindings silently dropped the non-grav 3×3 covariance from
+  orbit-determination fits when marshaling into `propagate`,
+  `generate_ephemeris`, `compute_impact_probabilities`, and
+  `compute_b_planes` — understating propagated σ for non-grav-solved
+  orbits (~2,800 km in quadrature at Apophis's 2029 close approach).
+  The Rust channel always forwarded it; the two channels now agree.
+- **Observing nights for western observatories.** MPC east-of-Greenwich
+  longitudes are wrapped to signed values before the local-noon fold, so
+  Chilean (and all western) nights are stamped with the local observing
+  night instead of the UTC date (via villeneuve v1.18.1).
+- **Observation sensitivities without an input covariance.** Requesting
+  STM tracing now populates the observation Jacobians whether or not the
+  orbit carries a covariance; only the projected sky covariance still
+  requires one (via villeneuve v1.18.1).
+- **macOS C-ABI tarball is linkable as shipped.** The released
+  `libempyrean.dylib` now carries an `@rpath` install name instead of the
+  build machine's absolute path; C consumers link with `-Wl,-rpath`.
+  `dlopen`-based consumers (the Rust crate and the wheels) were never
+  affected.
+
+### Changed
+
+- **Propagation output is in ascending epoch order, always** (villeneuve
+  v1.18.0): within each orbit, rows come back chronologically regardless
+  of request order, so positional pairing against an ascending,
+  duplicate-free request grid is exact. Previously rows were emitted
+  forward-then-backward with non-chronological blocks possible around
+  encounters. Ephemeris entries keep their (deliberately different)
+  observer-input order — now also an engine-tested guarantee.
+- **Input-marshal drop-proofing.** All Python-extension orbit builders
+  route through a single exhaustive construction site, so future orbit
+  fields cannot be silently dropped at the FFI boundary, and the
+  no-silent-drops contract suite now exercises the non-grav covariance
+  input channel end to end.
+- Binds empyrean-core v0.8.2 (villeneuve v1.18.1, scott v1.13.3).
+
 ## [0.8.0] — 2026-07-09
 
 Continuous-thrust inputs, a reusable force-model handle, one abi3 wheel per

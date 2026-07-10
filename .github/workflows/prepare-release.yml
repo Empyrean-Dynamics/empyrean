@@ -158,6 +158,16 @@ jobs:
         run: |
           mkdir -p dist
           cp ${{ matrix.lib }} dist/
+          # macOS: the cdylib bakes the runner's absolute build path as its
+          # install name, so a C consumer that links the tarball directly
+          # fails at load ("Library not loaded: /Users/runner/..."). Re-id
+          # to @rpath before hashing/packaging; consumers resolve it with
+          # -Wl,-rpath. dlopen-based consumers (empyrean-sys, the wheels)
+          # never read the install name and are unaffected.
+          case "${{ matrix.artifact }}" in
+            *macos*) install_name_tool -id @rpath/libempyrean.dylib dist/libempyrean.dylib
+                     otool -D dist/libempyrean.dylib ;;
+          esac
           cp include/empyrean.h dist/
           cp LICENSE dist/
           cd dist && tar czf ../${{ matrix.artifact }}.tar.gz *

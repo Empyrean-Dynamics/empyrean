@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "empyrean"
-version = "0.8.0"
+version = "0.8.1"
 description = "Uncertainty-first orbit propagation, ephemeris, orbit determination, and event detection for asteroids and comets, powered by automatic differentiation"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -209,6 +209,13 @@ exclude = [
 # pyo3 module is dynamically generated; mypy can't see the .so symbols.
 [[tool.mypy.overrides]]
 module = "empyrean._empyrean_rs"
+ignore_missing_imports = true
+
+# pyarrow's private modules ship no stubs / py.typed marker; newer mypy
+# releases flag the `pyarrow._compute` import (import-untyped) that the
+# sensitivity accessors need for call_function.
+[[tool.mypy.overrides]]
+module = "pyarrow.*"
 ignore_missing_imports = true
 
 # Third-party SPICE / observatory-code data packages we vendor at install

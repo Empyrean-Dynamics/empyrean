@@ -90,13 +90,12 @@ impl Context {
     ///
     /// # State ordering
     ///
-    /// Within each orbit, states are **epoch-ordered, not request-ordered**:
-    /// forward epochs first in ascending order, then backward epochs in
-    /// descending order. When the requested `epochs` are not already in that
-    /// order, pairing states to requests by position silently associates
-    /// them with the wrong epochs — join on
-    /// [`PropagatedState::epoch`](crate::propagate::PropagatedState::epoch)
-    /// instead.
+    /// Within each orbit, states come back in **ascending epoch order,
+    /// always** (engine guarantee since villeneuve v1.18.0), regardless of
+    /// the order the epochs were requested in. Positional pairing against
+    /// an ascending, duplicate-free request grid is therefore exact; for
+    /// any other request shape, join on
+    /// [`PropagatedState::epoch`](crate::propagate::PropagatedState::epoch).
     pub fn propagate(
         &self,
         orbits: &[Orbit],

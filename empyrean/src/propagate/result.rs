@@ -443,10 +443,9 @@ impl Event {
 #[derive(Debug)]
 pub struct PropagationResult {
     /// Propagated states (flat, orbit-major order). Within each orbit,
-    /// rows are **epoch-ordered** — forward epochs ascending, then
-    /// backward epochs descending — not request-ordered: join rows to
-    /// requested epochs on each state's `epoch`, never by request
-    /// position.
+    /// rows are in **ascending epoch order, always** — positional pairing
+    /// against an ascending, duplicate-free request grid is exact; for
+    /// any other request shape, join on each state's `epoch`.
     pub states: Vec<PropagatedState>,
     /// Object identifiers aligned with the orbits input.
     pub object_ids: Vec<String>,

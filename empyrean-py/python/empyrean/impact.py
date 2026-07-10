@@ -30,6 +30,7 @@ import quivr as qv
 from empyrean._convert import (
     AnyOrbits,
     coordinates_to_arrays,
+    extract_non_grav_covariance,
 )
 from empyrean.coordinates.enums import Origin
 from empyrean.coordinates.epoch import Epochs
@@ -331,6 +332,15 @@ def _common_orbit_args(orbits: AnyOrbits) -> dict[str, _OrbitArg]:
             ng_ms = _col("m")
             ng_ns = _col("n")
             ng_ks = _col("k")
+    # Fitted non-grav covariance — passed through only when a row carries one
+    # (mirrors the OD output path) so a StateAndNonGrav-fitted orbit re-fed
+    # into the IP / B-plane input path keeps its prior. Gated like the other
+    # optional non-grav arrays so the common no-cov case skips the FFI marshal.
+    has_ng_cov_arr, ng_cov_arr = extract_non_grav_covariance(orbits)
+    has_non_grav_cov: FloatArray | npt.NDArray[np.bool_] | None = (
+        has_ng_cov_arr if has_ng_cov_arr.any() else None
+    )
+    non_grav_cov: FloatArray | None = ng_cov_arr if has_ng_cov_arr.any() else None
     return {
         "epochs": epochs_arr,
         "elements": elements_arr,
@@ -343,6 +353,8 @@ def _common_orbit_args(orbits: AnyOrbits) -> dict[str, _OrbitArg]:
         "a2s": a2s,
         "a3s": a3s,
         "non_grav_dts": non_grav_dts,
+        "has_non_grav_cov": has_non_grav_cov,
+        "non_grav_cov": non_grav_cov,
         "ng_alphas": ng_alphas,
         "ng_r0s": ng_r0s,
         "ng_ms": ng_ms,
@@ -480,6 +492,8 @@ def compute_impact_probabilities(
         method_tags=method_tags,
         body_filter_naif=filter_arg,
         non_grav_dts=args["non_grav_dts"],
+        has_non_grav_cov=args["has_non_grav_cov"],
+        non_grav_cov=args["non_grav_cov"],
         ng_alphas=args["ng_alphas"],
         ng_r0s=args["ng_r0s"],
         ng_ms=args["ng_ms"],
@@ -563,6 +577,8 @@ def compute_b_planes(
         method_tags=method_tags,
         body_filter_naif=filter_arg,
         non_grav_dts=args["non_grav_dts"],
+        has_non_grav_cov=args["has_non_grav_cov"],
+        non_grav_cov=args["non_grav_cov"],
         ng_alphas=args["ng_alphas"],
         ng_r0s=args["ng_r0s"],
         ng_ms=args["ng_ms"],

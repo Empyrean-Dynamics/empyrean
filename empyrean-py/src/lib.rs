@@ -634,6 +634,8 @@ fn _query_radar<'py>(
     ng_ns = None,
     ng_ks = None,
     non_grav_dts = None,
+    has_non_grav_cov = None,
+    non_grav_cov = None,
     gm_threshold = 1.0,
     gm_max_depth = 3,
     gm_components_per_split = 3,
@@ -684,6 +686,11 @@ fn _propagate<'py>(
     // SBDB non-grav time delay (days). NaN entries → no delay; whole
     // array None → no DT for any orbit.
     non_grav_dts: Option<PyReadonlyArray1<'py, f64>>,
+    // Fitted non-grav 3×3 covariance (nullable per-row mask + (n,3,3) values).
+    // Threaded so a fitted orbit re-fed into propagate keeps its
+    // StateAndNonGrav prior instead of silently dropping it.
+    has_non_grav_cov: Option<PyReadonlyArray1<'py, bool>>,
+    non_grav_cov: Option<PyReadonlyArray3<'py, f64>>,
     gm_threshold: f64,
     gm_max_depth: usize,
     gm_components_per_split: usize,
@@ -739,6 +746,8 @@ fn _propagate<'py>(
     let ng_n_arr = ng_ns.as_ref().map(|a| a.as_array().to_owned());
     let ng_k_arr = ng_ks.as_ref().map(|a| a.as_array().to_owned());
     let dt_arr = non_grav_dts.as_ref().map(|a| a.as_array().to_owned());
+    let has_ng_cov_arr = has_non_grav_cov.as_ref().map(|a| a.as_array().to_owned());
+    let ng_cov_arr = non_grav_cov.as_ref().map(|a| a.as_array().to_owned());
 
     let n = epochs_arr.len();
 
@@ -790,30 +799,26 @@ fn _propagate<'py>(
             frame: empyrean::int_to_frame(frames_arr[i]).map_err(to_pyerr)?,
             origin: origin_from_naif(origins_arr[i])?,
         };
-        let mut orbit = empyrean::Orbit::new(state);
-        orbit = orbit.with_nongrav(a1s_arr[i], a2s_arr[i], a3s_arr[i]);
         // Optional g(r) overrides — when not provided, the C ABI
         // defaults to inverse_square (asteroid Yarkovsky / SRP).
-        if let (Some(a), Some(r), Some(m), Some(n), Some(k)) =
-            (&ng_alpha_arr, &ng_r0_arr, &ng_m_arr, &ng_n_arr, &ng_k_arr)
-        {
-            orbit = orbit.with_g_function(a[i], r[i], m[i], n[i], k[i]);
-        }
+        let g_function = match (&ng_alpha_arr, &ng_r0_arr, &ng_m_arr, &ng_n_arr, &ng_k_arr) {
+            (Some(a), Some(r), Some(m), Some(n), Some(k)) => Some((a[i], r[i], m[i], n[i], k[i])),
+            _ => None,
+        };
         // Optional SBDB non-grav DT (days). NaN cells mean "no delay";
         // a `None` array means no DT for any orbit.
-        if let Some(dts) = &dt_arr {
-            let dt = dts[i];
-            if dt.is_finite() {
-                orbit = orbit.with_non_grav_dt(Some(dt));
-            }
-        }
+        let non_grav_dt = dt_arr
+            .as_ref()
+            .and_then(|dts| dts[i].is_finite().then_some(dts[i]));
+        // Fitted non-grav 3×3 covariance (optional, nullable per row).
+        let ng_cov = ng_covariance_at(has_ng_cov_arr.as_ref(), ng_cov_arr.as_ref(), i);
         // Photometry: ephemeris generation downstream consumes (H, slope1,
         // slope2) per the chosen phase function. NaN H or model = -1 leaves
         // photometry unset and the row's mag = NaN.
         let pf_int = phot_system_arr[i];
         let h = phot_h_arr[i];
         let g = phot_slope1_arr[i];
-        if h.is_finite() && pf_int >= 0 {
+        let photometry = if h.is_finite() && pf_int >= 0 {
             let pf = match pf_int {
                 0 => empyrean::PhaseFunction::HG,
                 1 => empyrean::PhaseFunction::HG1G2,
@@ -826,17 +831,27 @@ fn _propagate<'py>(
             // and a wrong-but-non-crashing fallback for HG1G2 — file
             // a clear array if HG1G2 fits matter).
             let s2 = phot_slope2_arr.as_ref().map_or(0.0, |a| a[i]);
-            orbit = orbit.with_photometry(pf, h, g, s2);
-        }
+            Some((pf, h, g, s2))
+        } else {
+            None
+        };
         // Continuous-thrust parameters (parity with
         // `Orbits::set_thrust_params`). Attached per orbit; a `None` entry
         // leaves the orbit gravity / non-grav only.
-        if let Some(tp) = &thrust_params
-            && let Some(params) = &tp[i]
-        {
-            orbit = orbit.with_thrust(Some(params.clone()));
-        }
-        orbits.push(orbit);
+        let thrust = thrust_params.as_ref().and_then(|tp| tp[i].clone());
+        orbits.push(assemble_orbit(
+            None,
+            None,
+            state,
+            a1s_arr[i],
+            a2s_arr[i],
+            a3s_arr[i],
+            g_function,
+            non_grav_dt,
+            ng_cov,
+            photometry,
+            thrust,
+        ));
     }
 
     let force_model_tier = match force_model {
@@ -1450,6 +1465,81 @@ fn parse_fabricated_orbit_index(orbit_id: &str) -> Option<usize> {
 /// Build a `Vec<empyrean::Orbit>` from the same flat-arrays input
 /// shape `_propagate` already accepts. Factored out so the IP /
 /// B-plane wrappers don't duplicate ~50 lines of orbit assembly.
+/// Single construction chokepoint for every wrapper [`empyrean::Orbit`] the
+/// Python extension marshals from arrays/dicts. The body ends in an
+/// exhaustive `Orbit { .. }` literal with NO `..` rest pattern, so adding a
+/// field to the wrapper `Orbit` becomes a compile error here — at the marshal
+/// boundary — instead of a silent per-field drop (the empyrean-3qoe failure
+/// class). Every orbit builder routes its final construction through this fn;
+/// each keeps its own array-extraction logic and passes the per-orbit values.
+/// Optional inputs carry the wrapper's own "absent" convention (g(r) → the
+/// all-zero inverse-square sentinel, photometry → magnitude disabled).
+#[allow(clippy::too_many_arguments)]
+fn assemble_orbit(
+    orbit_id: Option<String>,
+    object_id: Option<String>,
+    state: empyrean::CoordinateState,
+    a1: f64,
+    a2: f64,
+    a3: f64,
+    g_function: Option<(f64, f64, f64, f64, f64)>,
+    non_grav_dt: Option<f64>,
+    ng_covariance: Option<[[f64; 3]; 3]>,
+    photometry: Option<(empyrean::PhaseFunction, f64, f64, f64)>,
+    thrust: Option<empyrean::ThrustParams>,
+) -> empyrean::Orbit {
+    // Absent g(r) → the all-zero (alpha, r0, m, n, k) inverse-square sentinel
+    // `Orbit::new` uses; the C ABI reads all-zeros as "inverse-square".
+    let (ng_alpha, ng_r0, ng_m, ng_n, ng_k) = g_function.unwrap_or((0.0, 0.0, 0.0, 0.0, 0.0));
+    // Absent photometry → the `Orbit::new` defaults (mag computation disabled).
+    let (phot_system, h_mag, slope1, slope2) = match photometry {
+        Some((pf, h, s1, s2)) => (Some(pf), h, s1, s2),
+        None => (None, f64::NAN, 0.0, 0.0),
+    };
+    empyrean::Orbit {
+        orbit_id,
+        object_id,
+        state,
+        a1,
+        a2,
+        a3,
+        ng_alpha,
+        ng_r0,
+        ng_m,
+        ng_n,
+        ng_k,
+        non_grav_dt,
+        ng_covariance,
+        phot_system,
+        h_mag,
+        slope1,
+        slope2,
+        thrust,
+    }
+}
+
+/// Copy orbit `i`'s fitted non-grav 3×3 covariance out of the marshaled
+/// `(has, cov)` arrays, honoring the per-row presence mask. `None` when the
+/// caller passed no arrays or the row's mask is false — the same nullable
+/// `(n,) bool` + `(n,3,3) f64` shape the OD output path uses.
+fn ng_covariance_at(
+    has: Option<&numpy::ndarray::Array1<bool>>,
+    cov: Option<&numpy::ndarray::Array3<f64>>,
+    i: usize,
+) -> Option<[[f64; 3]; 3]> {
+    let (has, cov) = (has?, cov?);
+    if !has[i] {
+        return None;
+    }
+    let mut m = [[0.0f64; 3]; 3];
+    for r in 0..3 {
+        for c in 0..3 {
+            m[r][c] = cov[[i, r, c]];
+        }
+    }
+    Some(m)
+}
+
 fn build_orbits_from_arrays(
     epochs: &numpy::ndarray::Array1<f64>,
     elements: &numpy::ndarray::Array2<f64>,
@@ -1467,6 +1557,8 @@ fn build_orbits_from_arrays(
     ng_ns: Option<&numpy::ndarray::Array1<f64>>,
     ng_ks: Option<&numpy::ndarray::Array1<f64>>,
     non_grav_dts: Option<&numpy::ndarray::Array1<f64>>,
+    has_non_grav_cov: Option<&numpy::ndarray::Array1<bool>>,
+    non_grav_cov: Option<&numpy::ndarray::Array3<f64>>,
 ) -> PyResult<Vec<empyrean::Orbit>> {
     let n = epochs.len();
     let mut orbits: Vec<empyrean::Orbit> = Vec::with_capacity(n);
@@ -1494,20 +1586,25 @@ fn build_orbits_from_arrays(
             frame: empyrean::int_to_frame(frames[i]).map_err(to_pyerr)?,
             origin: origin_from_naif(origins[i])?,
         };
-        let mut orbit = empyrean::Orbit::new(state);
-        orbit = orbit.with_nongrav(a1s[i], a2s[i], a3s[i]);
-        if let (Some(a), Some(r), Some(m), Some(n_), Some(k)) =
-            (ng_alphas, ng_r0s, ng_ms, ng_ns, ng_ks)
-        {
-            orbit = orbit.with_g_function(a[i], r[i], m[i], n_[i], k[i]);
-        }
-        if let Some(dts) = non_grav_dts {
-            let dt = dts[i];
-            if dt.is_finite() {
-                orbit = orbit.with_non_grav_dt(Some(dt));
-            }
-        }
-        orbits.push(orbit);
+        let g_function = match (ng_alphas, ng_r0s, ng_ms, ng_ns, ng_ks) {
+            (Some(a), Some(r), Some(m), Some(n_), Some(k)) => Some((a[i], r[i], m[i], n_[i], k[i])),
+            _ => None,
+        };
+        let non_grav_dt = non_grav_dts.and_then(|dts| dts[i].is_finite().then_some(dts[i]));
+        let ng_cov = ng_covariance_at(has_non_grav_cov, non_grav_cov, i);
+        orbits.push(assemble_orbit(
+            None,
+            None,
+            state,
+            a1s[i],
+            a2s[i],
+            a3s[i],
+            g_function,
+            non_grav_dt,
+            ng_cov,
+            None,
+            None,
+        ));
     }
     Ok(orbits)
 }
@@ -1540,6 +1637,7 @@ fn methods_from_tags(tags: &[i32]) -> PyResult<Vec<empyrean::UncertaintyMethod>>
     body_filter_naif=None,
     ng_alphas=None, ng_r0s=None, ng_ms=None, ng_ns=None, ng_ks=None,
     non_grav_dts=None,
+    has_non_grav_cov=None, non_grav_cov=None,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn _compute_impact_probabilities<'py>(
@@ -1563,6 +1661,11 @@ fn _compute_impact_probabilities<'py>(
     ng_ns: Option<PyReadonlyArray1<'py, f64>>,
     ng_ks: Option<PyReadonlyArray1<'py, f64>>,
     non_grav_dts: Option<PyReadonlyArray1<'py, f64>>,
+    // Fitted non-grav 3×3 covariance (nullable per-row mask + (n,3,3) values),
+    // threaded so an OD-solved orbit re-fed into the IP / B-plane input path
+    // keeps its StateAndNonGrav prior instead of silently dropping it.
+    has_non_grav_cov: Option<PyReadonlyArray1<'py, bool>>,
+    non_grav_cov: Option<PyReadonlyArray3<'py, f64>>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let ctx = get_context()?;
 
@@ -1583,6 +1686,14 @@ fn _compute_impact_probabilities<'py>(
         ng_ns.as_ref().map(|a| a.as_array().to_owned()).as_ref(),
         ng_ks.as_ref().map(|a| a.as_array().to_owned()).as_ref(),
         non_grav_dts
+            .as_ref()
+            .map(|a| a.as_array().to_owned())
+            .as_ref(),
+        has_non_grav_cov
+            .as_ref()
+            .map(|a| a.as_array().to_owned())
+            .as_ref(),
+        non_grav_cov
             .as_ref()
             .map(|a| a.as_array().to_owned())
             .as_ref(),
@@ -1685,6 +1796,7 @@ fn _compute_impact_probabilities<'py>(
     body_filter_naif=None,
     ng_alphas=None, ng_r0s=None, ng_ms=None, ng_ns=None, ng_ks=None,
     non_grav_dts=None,
+    has_non_grav_cov=None, non_grav_cov=None,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn _compute_b_planes<'py>(
@@ -1708,6 +1820,11 @@ fn _compute_b_planes<'py>(
     ng_ns: Option<PyReadonlyArray1<'py, f64>>,
     ng_ks: Option<PyReadonlyArray1<'py, f64>>,
     non_grav_dts: Option<PyReadonlyArray1<'py, f64>>,
+    // Fitted non-grav 3×3 covariance (nullable per-row mask + (n,3,3) values),
+    // threaded so an OD-solved orbit re-fed into the IP / B-plane input path
+    // keeps its StateAndNonGrav prior instead of silently dropping it.
+    has_non_grav_cov: Option<PyReadonlyArray1<'py, bool>>,
+    non_grav_cov: Option<PyReadonlyArray3<'py, f64>>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let ctx = get_context()?;
 
@@ -1728,6 +1845,14 @@ fn _compute_b_planes<'py>(
         ng_ns.as_ref().map(|a| a.as_array().to_owned()).as_ref(),
         ng_ks.as_ref().map(|a| a.as_array().to_owned()).as_ref(),
         non_grav_dts
+            .as_ref()
+            .map(|a| a.as_array().to_owned())
+            .as_ref(),
+        has_non_grav_cov
+            .as_ref()
+            .map(|a| a.as_array().to_owned())
+            .as_ref(),
+        non_grav_cov
             .as_ref()
             .map(|a| a.as_array().to_owned())
             .as_ref(),
@@ -1904,6 +2029,8 @@ fn _get_observers<'py>(
     ng_ns = None,
     ng_ks = None,
     non_grav_dts = None,
+    has_non_grav_cov = None,
+    non_grav_cov = None,
     phot_slope2 = None,
     gm_threshold = 1.0,
     gm_max_depth = 3,
@@ -1949,6 +2076,11 @@ fn _generate_ephemeris<'py>(
     ng_ns: Option<PyReadonlyArray1<'py, f64>>,
     ng_ks: Option<PyReadonlyArray1<'py, f64>>,
     non_grav_dts: Option<PyReadonlyArray1<'py, f64>>,
+    // Fitted non-grav 3×3 covariance (nullable per-row mask + (n,3,3) values).
+    // Threaded so a fitted orbit re-fed into ephemeris generation keeps its
+    // StateAndNonGrav prior instead of silently dropping it.
+    has_non_grav_cov: Option<PyReadonlyArray1<'py, bool>>,
+    non_grav_cov: Option<PyReadonlyArray3<'py, f64>>,
     phot_slope2: Option<PyReadonlyArray1<'py, f64>>,
     gm_threshold: f64,
     gm_max_depth: usize,
@@ -1998,6 +2130,8 @@ fn _generate_ephemeris<'py>(
     let ng_n_arr = ng_ns.as_ref().map(|a| a.as_array().to_owned());
     let ng_k_arr = ng_ks.as_ref().map(|a| a.as_array().to_owned());
     let dt_arr = non_grav_dts.as_ref().map(|a| a.as_array().to_owned());
+    let has_ng_cov_arr = has_non_grav_cov.as_ref().map(|a| a.as_array().to_owned());
+    let ng_cov_arr = non_grav_cov.as_ref().map(|a| a.as_array().to_owned());
 
     let obs_epochs_arr = obs_epochs.as_array().to_owned();
     let obs_x_arr = obs_x.as_array().to_owned();
@@ -2033,19 +2167,15 @@ fn _generate_ephemeris<'py>(
             frame: empyrean::int_to_frame(frames_arr[i]).map_err(to_pyerr)?,
             origin: origin_from_naif(origins_arr[i])?,
         };
-        let mut orbit =
-            empyrean::Orbit::new(state).with_nongrav(a1s_arr[i], a2s_arr[i], a3s_arr[i]);
-        if let (Some(a), Some(r), Some(m), Some(n), Some(k)) =
-            (&ng_alpha_arr, &ng_r0_arr, &ng_m_arr, &ng_n_arr, &ng_k_arr)
-        {
-            orbit = orbit.with_g_function(a[i], r[i], m[i], n[i], k[i]);
-        }
-        if let Some(dts) = &dt_arr {
-            let dt = dts[i];
-            if dt.is_finite() {
-                orbit = orbit.with_non_grav_dt(Some(dt));
-            }
-        }
+        let g_function = match (&ng_alpha_arr, &ng_r0_arr, &ng_m_arr, &ng_n_arr, &ng_k_arr) {
+            (Some(a), Some(r), Some(m), Some(n), Some(k)) => Some((a[i], r[i], m[i], n[i], k[i])),
+            _ => None,
+        };
+        let non_grav_dt = dt_arr
+            .as_ref()
+            .and_then(|dts| dts[i].is_finite().then_some(dts[i]));
+        // Fitted non-grav 3×3 covariance (optional, nullable per row).
+        let ng_cov = ng_covariance_at(has_ng_cov_arr.as_ref(), ng_cov_arr.as_ref(), i);
         // Photometry — when phot_system[i] is one of {0, 1, 2} the
         // ephemeris pipeline produces apparent magnitude from H +
         // slope params. -1 (the absent sentinel) leaves
@@ -2053,7 +2183,7 @@ fn _generate_ephemeris<'py>(
         let pf_int = phot_system_arr[i];
         let h = phot_h_arr[i];
         let g = phot_slope1_arr[i];
-        if h.is_finite() && pf_int >= 0 {
+        let photometry = if h.is_finite() && pf_int >= 0 {
             let pf = match pf_int {
                 0 => empyrean::PhaseFunction::HG,
                 1 => empyrean::PhaseFunction::HG1G2,
@@ -2070,9 +2200,23 @@ fn _generate_ephemeris<'py>(
             // and a wrong-but-non-crashing fallback for HG1G2 — file
             // a clear array if HG1G2 fits matter).
             let s2 = phot_slope2_arr.as_ref().map_or(0.0, |a| a[i]);
-            orbit = orbit.with_photometry(pf, h, g, s2);
-        }
-        orbits.push(orbit);
+            Some((pf, h, g, s2))
+        } else {
+            None
+        };
+        orbits.push(assemble_orbit(
+            None,
+            None,
+            state,
+            a1s_arr[i],
+            a2s_arr[i],
+            a3s_arr[i],
+            g_function,
+            non_grav_dt,
+            ng_cov,
+            photometry,
+            None,
+        ));
     }
 
     let n_obs = obs_epochs_arr.len();
@@ -2720,8 +2864,6 @@ fn build_orbit_from_dict<'py>(orbit_dict: &Bound<'py, PyDict>) -> PyResult<empyr
         frame: empyrean::int_to_frame(frames[0]).map_err(to_pyerr)?,
         origin: origin_from_naif(origins[0])?,
     };
-    let mut orbit = empyrean::Orbit::new(state);
-
     // Non-grav (optional): thread the seed orbit's force model so evaluate /
     // refine operate on the actual non-grav (not silently gravity-only), and
     // so a StateAndNonGrav refine keeps its fitted non-grav prior.
@@ -2736,10 +2878,21 @@ fn build_orbit_from_dict<'py>(orbit_dict: &Bound<'py, PyDict>) -> PyResult<empyr
             None => Ok(None),
         }
     };
-    if let (Some(a1), Some(a2), Some(a3)) = (arr1("a1s")?, arr1("a2s")?, arr1("a3s")?)
-        && (a1[0] != 0.0 || a2[0] != 0.0 || a3[0] != 0.0)
+    // Accumulate the per-orbit non-grav inputs, then hand the whole orbit to
+    // the single `assemble_orbit` chokepoint. Gravity-only by default; the
+    // coefficients only engage when a1/a2/a3 are present and non-zero.
+    let mut a1 = 0.0;
+    let mut a2 = 0.0;
+    let mut a3 = 0.0;
+    let mut g_function = None;
+    let mut non_grav_dt = None;
+    let mut ng_covariance = None;
+    if let (Some(a1s), Some(a2s), Some(a3s)) = (arr1("a1s")?, arr1("a2s")?, arr1("a3s")?)
+        && (a1s[0] != 0.0 || a2s[0] != 0.0 || a3s[0] != 0.0)
     {
-        orbit = orbit.with_nongrav(a1[0], a2[0], a3[0]);
+        a1 = a1s[0];
+        a2 = a2s[0];
+        a3 = a3s[0];
         // g(r) exponents (optional; all-zero = inverse-square default).
         if let (Some(al), Some(r0), Some(m), Some(n), Some(k)) = (
             arr1("ng_alphas")?,
@@ -2749,13 +2902,13 @@ fn build_orbit_from_dict<'py>(orbit_dict: &Bound<'py, PyDict>) -> PyResult<empyr
             arr1("ng_ks")?,
         ) && (al[0] != 0.0 || r0[0] != 0.0 || m[0] != 0.0 || n[0] != 0.0 || k[0] != 0.0)
         {
-            orbit = orbit.with_g_function(al[0], r0[0], m[0], n[0], k[0]);
+            g_function = Some((al[0], r0[0], m[0], n[0], k[0]));
         }
         // Thermal-lag dt (optional; NaN sentinel = no delay).
         if let Some(dt) = arr1("non_grav_dts")?
             && dt[0].is_finite()
         {
-            orbit = orbit.with_non_grav_dt(Some(dt[0]));
+            non_grav_dt = Some(dt[0]);
         }
         // Fitted non-grav covariance (optional).
         if let Some(has) = orbit_dict.get_item("has_non_grav_cov")? {
@@ -2771,11 +2924,23 @@ fn build_orbit_from_dict<'py>(orbit_dict: &Bound<'py, PyDict>) -> PyResult<empyr
                         cov[i][j] = c[[0, i, j]];
                     }
                 }
-                orbit = orbit.with_nongrav_covariance(Some(cov));
+                ng_covariance = Some(cov);
             }
         }
     }
-    Ok(orbit)
+    Ok(assemble_orbit(
+        None,
+        None,
+        state,
+        a1,
+        a2,
+        a3,
+        g_function,
+        non_grav_dt,
+        ng_covariance,
+        None,
+        None,
+    ))
 }
 
 /// Map a [`empyrean::RejectionReason`] to a stable wire string for the
@@ -4426,40 +4591,39 @@ fn pydict_to_orbit_batch<'py>(dict: &Bound<'py, PyDict>) -> PyResult<empyrean::O
             }
             state.covariance = Some(m);
         }
-        orbits.push(empyrean::Orbit {
+        orbits.push(assemble_orbit(
             // Read-orbits IO path doesn't currently expose orbit_id /
             // object_id at this in-memory call site. Leave unset.
-            orbit_id: None,
-            object_id: None,
+            None,
+            None,
             state,
-            a1: a1_view[i],
-            a2: a2_view[i],
-            a3: a3_view[i],
-            ng_alpha: g_alpha_view[i],
-            ng_r0: g_r0_view[i],
-            ng_m: g_m_view[i],
-            ng_n: g_n_view[i],
-            ng_k: g_k_view[i],
+            a1_view[i],
+            a2_view[i],
+            a3_view[i],
+            // Carry the full g(r) the batch schema stored; all-zero exponents
+            // are the inverse-square sentinel `assemble_orbit` also maps None
+            // to, so a gravity-only row round-trips identically either way.
+            Some((
+                g_alpha_view[i],
+                g_r0_view[i],
+                g_m_view[i],
+                g_n_view[i],
+                g_k_view[i],
+            )),
             // Finite = real thermal-lag delay (incl. a meaningful 0.0);
             // NaN / absent column = no delay (None).
-            non_grav_dt: dt_view[i].is_finite().then_some(dt_view[i]),
+            dt_view[i].is_finite().then_some(dt_view[i]),
             // Non-grav covariance is an OD-output concept; the OrbitBatch I/O
             // surface doesn't carry it.
-            ng_covariance: None,
-            // OrbitBatch I/O surface (parquet/JSON/CSV) does not yet
-            // carry photometry — round-tripped orbits come back without
-            // it. Use `Orbit::with_photometry` directly when populating
-            // batches via the in-process API.
-            phot_system: None,
-            h_mag: f64::NAN,
-            slope1: 0.0,
-            slope2: 0.0,
-            // Continuous-thrust is input-only and variable-length per
-            // orbit; the OrbitBatch I/O schema doesn't carry it (same as
-            // photometry above). Supply thrust via `propagate`'s
-            // `thrust_arcs` when needed.
-            thrust: None,
-        });
+            None,
+            // OrbitBatch I/O surface (parquet/JSON/CSV) does not yet carry
+            // photometry — round-tripped orbits come back without it. Use
+            // `Orbit::with_photometry` directly when populating batches via
+            // the in-process API. Continuous-thrust is likewise input-only
+            // and variable-length; supply it via `propagate`'s `thrust_arcs`.
+            None,
+            None,
+        ));
     }
     empyrean::OrbitBatch::new(orbits, orbit_ids, object_ids).map_err(to_pyerr)
 }

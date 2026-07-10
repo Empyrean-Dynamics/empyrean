@@ -245,11 +245,19 @@ def _full_feature_orbit() -> CartesianOrbits:
         frame="ecliptic_j2000",
         origin=[str(Origin.SUN)],
     )
+    # Fitted non-grav 3x3 (A1, A2, A3) covariance, row-major flattened, so the
+    # full-feature input exercises the ng_covariance marshal channel too (the
+    # OD-output field the forward-model paths historically dropped). The A
+    # coefficients are zero here, so this covariance is inert on the output
+    # (it only inflates the propagated covariance when the non-grav force term
+    # is active) — the load-bearing DIFFERENCE check lives in
+    # test_ng_covariance_reaches_propagated_covariance with an active fixture.
     non_grav = NonGravParams.from_kwargs(
         a1=[0.0],
         a2=[0.0],
         a3=[0.0],
         model=["inverse_square"],
+        covariance=[np.diag([1e-20, 1e-20, 1e-20]).reshape(9).tolist()],
     )
     photometric = PhotometricParams.from_kwargs(
         model=["hg"],
@@ -1000,3 +1008,167 @@ def test_b_planes_no_silent_drops() -> None:
 
     bad_null, bad_not_null = _check_no_silent_drops(bps, "BPlanes")
     assert not (bad_null or bad_not_null), _format_failures("BPlanes", bad_null, bad_not_null)
+
+
+# ── Non-grav covariance reaches the engine (empyrean-3qoe) ────────────
+#
+# The forward-model marshals (propagate / generate_ephemeris / impact) used to
+# silently drop the fitted non-grav 3x3 covariance (`ng_covariance`) that the
+# OD path already threaded — only the OD determine→refine loop carried it. The
+# fix routes every builder through one exhaustive `assemble_orbit` chokepoint
+# and adds the (has_non_grav_cov, non_grav_cov) kwargs to each entry point. The
+# load-bearing assertion below is a DIFFERENCE, not a magnitude: an orbit with
+# a fitted non-grav covariance must propagate to a LARGER per-state covariance
+# than the otherwise-identical orbit without one, because the non-grav
+# parameter uncertainty maps into state uncertainty through the STM's non-grav
+# partials. That only happens when the non-grav force term is active, so this
+# fixture carries a real (transverse Yarkovsky) A2 — unlike the all-zero-coef
+# `_full_feature_orbit`, where the covariance is inert.
+
+
+def _non_grav_solved_orbit(with_cov: bool) -> CartesianOrbits:
+    """Apophis with an ACTIVE transverse non-grav (Yarkovsky A2) and,
+    when ``with_cov``, a fitted 3x3 non-grav covariance attached.
+
+    The two variants are byte-identical except for the presence of the
+    non-grav covariance, so any difference in the propagated per-state
+    covariance is attributable solely to ``ng_covariance`` reaching the
+    engine.
+    """
+    s = APOPHIS_STATE
+    cov_matrix = np.diag([1e-16, 1e-16, 1e-16, 1e-20, 1e-20, 1e-20])[None, :, :]
+    coords = CartesianCoordinates.from_kwargs(
+        epoch=[s["epoch"]],
+        x=[s["x"]],
+        y=[s["y"]],
+        z=[s["z"]],
+        vx=[s["vx"]],
+        vy=[s["vy"]],
+        vz=[s["vz"]],
+        covariance=CartesianCovariance.from_matrix(cov_matrix),
+        frame="ecliptic_j2000",
+        origin=[str(Origin.SUN)],
+    )
+    ng_kwargs: dict[str, object] = dict(
+        a1=[0.0],
+        a2=[1.0e-14],  # transverse Yarkovsky (AU/day^2) — activates the non-grav term
+        a3=[0.0],
+        model=["inverse_square"],
+    )
+    if with_cov:
+        # Fitted (A1, A2, A3) covariance, row-major flattened (9 values).
+        ng_kwargs["covariance"] = [np.diag([1.0e-20, 1.0e-20, 1.0e-20]).reshape(9).tolist()]
+    non_grav = NonGravParams.from_kwargs(**ng_kwargs)
+    return CartesianOrbits.from_kwargs(
+        orbit_id=["NG_COV_TEST"],
+        object_id=["99942 Apophis"],
+        coordinates=coords,
+        non_grav=non_grav,
+    )
+
+
+def _position_sigma(states: CartesianOrbits) -> np.ndarray:
+    """Per-state 1σ position magnitude (AU) from the propagated 6x6 covariance."""
+    from empyrean._convert import _covariance_to_matrix
+
+    m = _covariance_to_matrix(states.coordinates.covariance)  # (n, 6, 6)
+    return np.sqrt(m[:, 0, 0] + m[:, 1, 1] + m[:, 2, 2])
+
+
+def test_ng_covariance_reaches_propagated_covariance() -> None:
+    """A fitted non-grav covariance must inflate the propagated per-state
+    covariance — the direct empyrean-3qoe reproduction.
+
+    Propagates two orbits identical except for the presence of ``ng_covariance``
+    and asserts (1) the per-state position sigma is strictly larger with the
+    covariance present (proving it reached the engine — the bug dropped it and
+    the two runs were bit-identical), and (2) the no-covariance run is
+    deterministic (control: re-running it reproduces the covariance exactly, so
+    the difference in (1) is attributable to ``ng_covariance``, not noise).
+    """
+    target_epochs = np.array([61000.0 + 30.0 * i for i in range(6)])
+
+    with_cov = empyrean.propagate(
+        _non_grav_solved_orbit(with_cov=True),
+        target_epochs,
+        uncertainty_method=UncertaintyMethod.SECOND_ORDER,
+    )
+    without_cov = empyrean.propagate(
+        _non_grav_solved_orbit(with_cov=False),
+        target_epochs,
+        uncertainty_method=UncertaintyMethod.SECOND_ORDER,
+    )
+
+    sig_with = _position_sigma(with_cov.states)
+    sig_without = _position_sigma(without_cov.states)
+
+    # Later states must be strictly inflated by the non-grav prior. (The first
+    # state is at the epoch, where the covariance is the input 6x6 for both.)
+    assert np.all(sig_with[1:] > sig_without[1:] * (1.0 + 1.0e-6)), (
+        "ng_covariance did not inflate the propagated covariance — it was "
+        f"dropped before reaching the engine.\n  with cov: {sig_with}\n"
+        f"  without:  {sig_without}"
+    )
+
+    # Control: the no-cov run is deterministic, so the inflation above is the
+    # covariance's doing, not run-to-run noise.
+    without_cov_again = empyrean.propagate(
+        _non_grav_solved_orbit(with_cov=False),
+        target_epochs,
+        uncertainty_method=UncertaintyMethod.SECOND_ORDER,
+    )
+    sig_without_again = _position_sigma(without_cov_again.states)
+    np.testing.assert_array_equal(
+        sig_without,
+        sig_without_again,
+        err_msg="no-covariance propagation is non-deterministic; control invalid",
+    )
+
+
+def test_ng_covariance_threads_through_ephemeris_and_impact() -> None:
+    """The ephemeris / impact entry points accept and thread ``ng_covariance``.
+
+    Both marshals now route through the same ``assemble_orbit`` chokepoint and
+    accept the ``(has_non_grav_cov, non_grav_cov)`` kwargs, so a fitted orbit
+    reaches these paths without a marshal-time drop or crash. This test drives
+    both with a covariance-bearing orbit and asserts they produce valid output.
+
+    A numeric DIFFERENCE assertion is deliberately NOT made here — it is not
+    observable in this distribution:
+
+    * generate_ephemeris — the sky (spherical) covariance is dropped at the C
+      ABI (see the ``Ephemeris.coordinates.covariance.*`` allow-list entries
+      above), so the non-grav contribution cannot be read back from Python.
+    * compute_impact_probabilities / compute_b_planes — the engine's IP /
+      B-plane uncertainty is built from the 6x6 state covariance only; it does
+      not fold in the non-grav 3x3, so ``sigma_distance`` is unchanged by
+      ``ng_covariance`` (verified: unchanged even with a 1e-12 covariance).
+
+    The load-bearing DIFFERENCE gate is
+    :func:`test_ng_covariance_reaches_propagated_covariance` (propagate path).
+    """
+    orbits = _non_grav_solved_orbit(with_cov=True)
+
+    observers = Observers.from_code("500", [61000.5, 61010.5, 61020.5])
+    eph = generate_ephemeris(orbits, observers)
+    assert len(eph.ephemeris) > 0, "ephemeris path produced no rows with ng_covariance present"
+
+    ips = compute_impact_probabilities(
+        orbits,
+        end_epoch=62300.0,
+        methods=[UncertaintyMethod.FIRST_ORDER],
+        body_filter=[Origin.EARTH],
+    )
+    bps = compute_b_planes(
+        orbits,
+        end_epoch=62300.0,
+        methods=[UncertaintyMethod.FIRST_ORDER],
+        body_filter=[Origin.EARTH],
+    )
+    # The Apophis 2029 flyby fires a close approach, so both channels return a
+    # row; a finite sigma confirms the covariance-bearing orbit propagated
+    # through without a marshal-time failure.
+    assert len(ips) > 0 and np.all(
+        np.isfinite(ips.sigma_distance_km.to_numpy(zero_copy_only=False))
+    )
+    assert len(bps) > 0

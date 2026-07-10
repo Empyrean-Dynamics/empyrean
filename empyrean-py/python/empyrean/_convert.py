@@ -728,3 +728,27 @@ def extract_photometry(
         g = np.full(n, np.nan, dtype=np.float64)
         model_ints = np.full(n, -1, dtype=np.int32)
     return h, g, model_ints
+
+
+def extract_non_grav_covariance(
+    orbits: AnyOrbits,
+) -> tuple[npt.NDArray[np.bool_], FloatArray]:
+    """Extract the fitted non-grav 3x3 covariance from orbits.
+
+    Returns ``(has_non_grav_cov, non_grav_cov)`` — a ``(n,)`` bool mask and a
+    ``(n, 3, 3)`` float64 array (row-major, zeros where absent). Mirrors the OD
+    output path's marshal (``empyrean.od.determine._orbits_to_dict``) so a
+    ``StateAndNonGrav``-fitted orbit re-fed into the forward model
+    (propagate / generate_ephemeris / impact) keeps its non-grav prior instead
+    of silently dropping it. All-False + zeros when the orbit has no
+    ``non_grav`` sub-table or no row carries a fitted covariance.
+    """
+    n = len(orbits)
+    has_non_grav_cov = np.zeros(n, dtype=bool)
+    non_grav_cov = np.zeros((n, 3, 3), dtype=np.float64)
+    if orbits.non_grav is not None:
+        for i, c in enumerate(orbits.non_grav.covariance.to_pylist()):
+            if c is not None:
+                non_grav_cov[i] = np.asarray(c, dtype=np.float64).reshape(3, 3)
+                has_non_grav_cov[i] = True
+    return has_non_grav_cov, non_grav_cov

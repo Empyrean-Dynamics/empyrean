@@ -10,6 +10,7 @@ from empyrean._convert import (
     _COORD_TYPE_MAP,
     AnyOrbits,
     coordinates_to_arrays,
+    extract_non_grav_covariance,
     extract_photometry,
 )
 
@@ -195,6 +196,14 @@ def generate_ephemeris(
     # Photometric parameters
     phot_h, phot_g, phot_model = extract_photometry(orbits)
 
+    # Fitted non-grav covariance — passed through only when a row carries one
+    # (mirrors the OD output path) so a StateAndNonGrav-fitted orbit re-fed
+    # into ephemeris generation keeps its prior. Gated like non_grav_dts so
+    # the common no-cov case skips the FFI marshal.
+    has_ng_cov_arr, ng_cov_arr = extract_non_grav_covariance(orbits)
+    has_non_grav_cov: np.ndarray | None = has_ng_cov_arr if has_ng_cov_arr.any() else None
+    non_grav_cov: np.ndarray | None = ng_cov_arr if has_ng_cov_arr.any() else None
+
     # ── Extract observer arrays ──────────────────────────────
     obs_codes = observers.obs_code.to_pylist()
     oc = observers.coordinates
@@ -285,6 +294,8 @@ def generate_ephemeris(
         epsilon,
         uncertainty_method=um_int,
         non_grav_dts=non_grav_dts,
+        has_non_grav_cov=has_non_grav_cov,
+        non_grav_cov=non_grav_cov,
         gm_threshold=gm_threshold,
         gm_max_depth=gm_max_depth,
         gm_components_per_split=gm_components_per_split,

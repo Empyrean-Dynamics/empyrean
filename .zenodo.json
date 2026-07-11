@@ -3,7 +3,8 @@
   "description": "Uncertainty-first orbit propagation, ephemeris generation, orbit determination, and dynamical event detection for asteroids and comets, powered by automatic differentiation. Empyrean propagates full state covariance through close approaches and encounters (linear, second-order, sigma-point, and Monte Carlo methods), detects close approaches, impacts, captures, and occultation events inline during integration, and fits orbits from optical and radar astrometry.",
   "creators": [
     {
-      "name": "Moeyens, Joachim"
+      "name": "Moeyens, Joachim",
+      "orcid": "0000-0001-5820-3925"
     }
   ],
   "license": "BSD-3-Clause",

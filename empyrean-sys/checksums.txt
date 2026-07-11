@@ -9,10 +9,10 @@
 # release serves. in-tree development links the local ../target/release build
 # and never reads this file.
 #
-# Pinned for v0.8.1.
+# Pinned for v0.8.2.
 #
 # Format: <asset-stem> <sha256>
-libempyrean-linux-aarch64 783d18f6fd252203ca8ddde62547193d407d29711967dcf9ee9dcc09513e6669
-libempyrean-linux-x86_64 787a52aaf2c97d106008f74b500f80fb1a6809818531ce868bf36dac7bc1364f
-libempyrean-macos-aarch64 fea1a4dd4ffab55e6f0507e1e48f8cb7f7290894ae0cc62e9770fbd45ff20788
-libempyrean-macos-x86_64 e0af51e4d16c8e4bf1001378b5b03dc85d1b5ba5a4fe53b0803512fd451ceab5
+libempyrean-linux-aarch64 c2d7c17336a26cd5371344b3be77d8e7e096b10656da418d2e77f17a4f39abe9
+libempyrean-linux-x86_64 84ac88e4d667f47d9069d61575e8516d710d7e11d552e7b7560bf94dd03be4d4
+libempyrean-macos-aarch64 615aff364d0898994198bdc3a122afce00c405771093fc006404dc502b36c25e
+libempyrean-macos-x86_64 d14f4fbbdcbfae1ad0dbb3063ffc93e3b9fa17fb30918611d04f8225a813977b

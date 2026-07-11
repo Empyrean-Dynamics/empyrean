@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "empyrean: uncertainty-first orbit propagation, ephemeris, orbit determination, and event detection for asteroids and comets"
+authors:
+  - family-names: Moeyens
+    given-names: Joachim
+    orcid: "https://orcid.org/0000-0001-5820-3925"
+version: 0.8.1
+date-released: 2026-07-10
+url: "https://github.com/Empyrean-Dynamics/empyrean"
+repository-code: "https://github.com/Empyrean-Dynamics/empyrean"
+license: BSD-3-Clause
+keywords:
+  - astrodynamics
+  - orbit propagation
+  - orbit determination
+  - ephemeris
+  - asteroids
+  - comets
+  - planetary science
+  - uncertainty quantification
+  - automatic differentiation

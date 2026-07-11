@@ -12,6 +12,7 @@ High-fidelity ephemeris generation, orbit propagation, and orbit determination p
 <a href="https://pypi.org/project/empyrean/"><img src="https://img.shields.io/pypi/pyversions/empyrean.svg?style=flat-square&label=python" alt="Python versions"></a>
 <a href="LICENSE-BSD"><img src="https://img.shields.io/badge/source-BSD--3--Clause-blue.svg?style=flat-square" alt="Source license"></a>
 <a href="LICENSE-BINARY"><img src="https://img.shields.io/badge/binary-proprietary-lightgrey.svg?style=flat-square" alt="Binary license"></a>
+<a href="https://zenodo.org/badge/latestdoi/1278090652"><img src="https://zenodo.org/badge/1278090652.svg" alt="DOI"></a>
 <a href="Cargo.toml"><img src="https://img.shields.io/badge/rustc-1.90%2B-orange?style=flat-square&logo=rust" alt="MSRV 1.90"></a>
 <br>
 <a href="https://claude.ai"><img src="https://img.shields.io/badge/Built%20with-Claude%20Code-D97757?logo=anthropic&logoColor=white&style=flat-square" alt="Built with Claude Code"></a>
@@ -322,12 +323,8 @@ If you use empyrean in your research, please cite it. Citation
 metadata ships in [`CITATION.cff`](CITATION.cff) (GitHub's "Cite this
 repository" button renders it), and every GitHub release is archived
 on Zenodo with a version-specific DOI — prefer citing the DOI of the
-exact version you used.
-
-<!-- TODO(release): replace with the Zenodo concept-DOI badge once the
-     first release is archived:
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.XXXXXXX.svg)](https://doi.org/10.5281/zenodo.XXXXXXX)
--->
+exact version you used. The DOI badge at the top of this page always
+resolves to the latest release's DOI.
 
 ## License
 

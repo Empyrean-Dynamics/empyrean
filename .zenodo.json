@@ -1,0 +1,35 @@
+{
+  "title": "empyrean",
+  "description": "Uncertainty-first orbit propagation, ephemeris generation, orbit determination, and dynamical event detection for asteroids and comets, powered by automatic differentiation. Empyrean propagates full state covariance through close approaches and encounters (linear, second-order, sigma-point, and Monte Carlo methods), detects close approaches, impacts, captures, and occultation events inline during integration, and fits orbits from optical and radar astrometry.",
+  "creators": [
+    {
+      "name": "Moeyens, Joachim"
+    }
+  ],
+  "license": "BSD-3-Clause",
+  "upload_type": "software",
+  "access_right": "open",
+  "keywords": [
+    "astrodynamics",
+    "orbit propagation",
+    "orbit determination",
+    "ephemeris",
+    "asteroids",
+    "comets",
+    "planetary science",
+    "uncertainty quantification",
+    "automatic differentiation"
+  ],
+  "related_identifiers": [
+    {
+      "identifier": "https://github.com/Empyrean-Dynamics/empyrean",
+      "relation": "isSupplementTo",
+      "scheme": "url"
+    },
+    {
+      "identifier": "https://pypi.org/project/empyrean/",
+      "relation": "isSupplementTo",
+      "scheme": "url"
+    }
+  ]
+}

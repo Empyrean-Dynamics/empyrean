@@ -1,0 +1,42 @@
+# Citation metadata for the empyrean toolkit (Citation File Format 1.2.0).
+# GitHub renders this as "Cite this repository"; Zenodo reads it when
+# minting the release DOI. Keep `version` and `date-released` in sync
+# with each tagged release.
+cff-version: 1.2.0
+message: >-
+  If you use empyrean in your research, please cite it using the
+  metadata below. A version-specific DOI is minted for every GitHub
+  release via Zenodo; prefer citing the DOI of the exact version you
+  used.
+type: software
+title: "empyrean"
+abstract: >-
+  Uncertainty-first orbit propagation, ephemeris generation, orbit
+  determination, and dynamical event detection for asteroids and
+  comets, powered by automatic differentiation. Empyrean propagates
+  full state covariance through close approaches and encounters
+  (linear, second-order, sigma-point, and Monte Carlo methods),
+  detects close approaches, impacts, captures, and occultation events
+  inline during integration, and fits orbits from optical and radar
+  astrometry.
+authors:
+  - family-names: "Moeyens"
+    given-names: "Joachim"
+    email: "moeyensj@gmail.com"
+    # TODO(owner): add your ORCID before the first Zenodo-minted
+    # release, e.g.  orcid: "https://orcid.org/XXXX-XXXX-XXXX-XXXX"
+version: "0.8.1"
+date-released: "2026-07-10"
+license: "BSD-3-Clause"
+repository-code: "https://github.com/Empyrean-Dynamics/empyrean"
+url: "https://www.empyrean-dynamics.com"
+keywords:
+  - astrodynamics
+  - orbit propagation
+  - orbit determination
+  - ephemeris
+  - asteroids
+  - comets
+  - planetary science
+  - uncertainty quantification
+  - automatic differentiation

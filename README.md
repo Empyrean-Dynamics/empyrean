@@ -316,6 +316,19 @@ determination results are cross-checked against `find_orb` fits and
 JPL SBDB solutions. Per-release changes are tracked in the
 [CHANGELOG](CHANGELOG.md).
 
+## Citing
+
+If you use empyrean in your research, please cite it. Citation
+metadata ships in [`CITATION.cff`](CITATION.cff) (GitHub's "Cite this
+repository" button renders it), and every GitHub release is archived
+on Zenodo with a version-specific DOI — prefer citing the DOI of the
+exact version you used.
+
+<!-- TODO(release): replace with the Zenodo concept-DOI badge once the
+     first release is archived:
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.XXXXXXX.svg)](https://doi.org/10.5281/zenodo.XXXXXXX)
+-->
+
 ## License
 
 empyrean is **dual-licensed**:

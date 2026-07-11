@@ -4,6 +4,45 @@ Notable changes to the empyrean distribution — the `empyrean`, `empyrean-sys`,
 `empyrean-c`, and `empyrean-cli` crates and the `empyrean` Python package. This
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.8.2] — 2026-07-11
+
+Engine release (empyrean-core v0.8.3, villeneuve v1.18.2, scott
+v1.13.4). No API changes in any channel — every fix below arrives
+through the same functions with the same signatures.
+
+### Fixed
+
+- **Backward propagation arcs from encounter epochs.** Propagating
+  backward from an epoch inside a close encounter (the natural epoch
+  for an impactor fit — e.g. 2008 TC3, determined hours before entry)
+  produced a pre-epoch arc displaced by the encounter body's position
+  (~1 au). Forward/backward legs and their seed accelerations are now
+  frame-consistent throughout.
+- **Captured objects no longer report per-revolution close
+  approaches.** A temporarily captured object (a minimoon such as
+  2020 CD3) emitted a "close approach" — and a meaningless linear
+  impact probability — for every perigee of its bound orbit. Perigees
+  during a capture are now reported as structure nested inside the
+  capture event; close-approach and impact-probability records cover
+  genuine flybys only.
+- **Impact ground tracks end at the entry point.** The ground-track
+  summary for an impacting trajectory previously reported the
+  sub-surface minimum of a straight-line extrapolation (hundreds of
+  kilometers underground and off-site); it now reports the impact's
+  own surface coordinates.
+- **Stop conditions truncate output at the trigger.** An opted-in stop
+  (e.g. stop-at-impact) no longer emits states past the trigger epoch
+  in either time direction.
+- **Ephemeris validation gate restored.** The ephemeris-vs-reference
+  acceptance test compares in consistent units again and is back in
+  the release gate (the engine output itself was always correct).
+
+### Added
+
+- **Citable releases.** Every GitHub release is archived on Zenodo
+  with a version DOI; `CITATION.cff` and the DOI badge ship with this
+  release.
+
 ## [0.8.1] — 2026-07-10
 
 ### Fixed

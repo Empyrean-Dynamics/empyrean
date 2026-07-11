@@ -56,7 +56,7 @@ bodies like asteroids and comets, with plans to extend to cislunar space.
 | CLI    | `cargo install empyrean-cli` (or grab a binary from [Releases](https://github.com/Empyrean-Dynamics/empyrean/releases)) |
 | C      | download `libempyrean-<target>.tar.gz` from [Releases](https://github.com/Empyrean-Dynamics/empyrean/releases) — ships the shared library, `empyrean.h`, and LICENSE |
 
-Current release: **0.8.1** — see the [CHANGELOG](CHANGELOG.md).
+Current release: **0.8.2** — see the [CHANGELOG](CHANGELOG.md).
 
 Prebuilt binaries — the engine cdylib, the CLI, and the Python wheels —
 target four platforms: macOS arm64 (`macos-aarch64`), macOS x86_64

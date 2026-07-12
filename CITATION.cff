@@ -7,6 +7,10 @@ authors:
     orcid: "https://orcid.org/0000-0001-5820-3925"
 version: 0.8.2
 date-released: 2026-07-11
+identifiers:
+  - type: doi
+    value: 10.5281/zenodo.21318471
+    description: "Concept DOI — resolves to the latest archived release"
 url: "https://github.com/Empyrean-Dynamics/empyrean"
 repository-code: "https://github.com/Empyrean-Dynamics/empyrean"
 license: BSD-3-Clause

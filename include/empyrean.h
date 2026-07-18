@@ -274,6 +274,47 @@ typedef struct Session Session;
 #define EMPYREAN_SOLVE_FOR_EXPLICIT 3
 
 /**
+ * Frozen storage width of the solved-parameter covariance matrix. Set
+ * once at v0.9.0-rc.0 and never widened — there is no runtime
+ * `abi_version` negotiation, so the inline `matrix[W][W]` is baked into
+ * the struct size. `20` is scott's STRUCTURAL maximum (6 state + 3
+ * Marsden + 1 DT + 1 AMRAT + 3 thrust segments × 3). scott v1.14.0 today
+ * caps the actually-producible width at 17 (`MAX_SOLVE_WIDTH`; its solve
+ * guard rejects anything wider), so columns 17..20 are RESERVE — held for
+ * whatever axis combination scott may later admit past width 17, and zero
+ * until then. (A 3-segment thrust solve already fits below 17; the reserve
+ * is for the widest joint solves, not a specific axis.) A parameter beyond
+ * this structural max (e.g. a drag axis) takes a fresh
+ * `EMPYREAN_ABI_VERSION`-guarded break, not a silent widening.
+ */
+#define EMPYREAN_SOLVE_WIDTH 20
+
+/**
+ * `u32` sentinel for an absent slot tag (C has no `Option`). Consumers
+ * MUST read the slot tags — a width alone is ambiguous (width 9 is
+ * Marsden OR one-segment thrust).
+ */
+#define EMPYREAN_SLOT_NONE 4294967295
+
+#define EMPYREAN_PHOTOMETRY_MODEL_AUTO 0
+
+#define EMPYREAN_PHOTOMETRY_MODEL_HONLY 1
+
+#define EMPYREAN_PHOTOMETRY_MODEL_HG 2
+
+#define EMPYREAN_PHOTOMETRY_MODEL_HG12 3
+
+#define EMPYREAN_PHOTOMETRY_MODEL_HG1G2 4
+
+/**
+ * Integer handshake on the frozen-ABI shape contract, distinct from the
+ * per-crate semver strings in `EmpyreanVersions` (which are provenance).
+ * Consumers compiled against a given `EMPYREAN_SOLVE_WIDTH` check this at
+ * load; any additive change to the frozen structs bumps it.
+ */
+#define EMPYREAN_ABI_VERSION 1
+
+/**
  * Auto: selects the central body (heliocentric vs Earth-centric)
  * automatically. Default for `EmpyreanODConfig::origin`.
  */
@@ -2527,6 +2568,63 @@ struct EmpyreanRejectionConfig {
 };
 
 /**
+ * Result of orbit determination (determine or refine).
+ *
+ * Per-axis solve-for flags (mirrors scott's `SolveFor`). Read only when
+ * [`EmpyreanODConfig::solve_for`] is [`EMPYREAN_SOLVE_FOR_EXPLICIT`]; the
+ * three coarse `EMPYREAN_SOLVE_FOR_*` codes cover the common shapes
+ * without it. Each flag turns on a wide-STM axis, subject to its own
+ * precondition (a declared prior on the orbit) enforced by scott.
+ */
+struct EmpyreanSolveFor {
+    /**
+     * Solve the Marsden A1/A2/A3 block (requires a non-grav covariance).
+     */
+    uint8_t marsden;
+    /**
+     * Solve the non-grav time delay DT (requires `marsden` + a DT prior).
+     */
+    uint8_t dt;
+    /**
+     * Solve the SRP AMRAT (requires an SRP AMRAT prior).
+     */
+    uint8_t amrat;
+    /**
+     * Number of thrust Δv segments to solve (3 columns each; 0 = none).
+     */
+    uint32_t thrust_segments;
+};
+
+/**
+ * Post-OD photometric-fit request (mirrors scott's `PhotometryConfig`).
+ * Enabled by [`EmpyreanODConfig::has_photometry`]; the fit runs after the
+ * orbit is solved and never touches the state (photometry has no
+ * astrometric partials). Zero-init reproduces scott's defaults.
+ */
+struct EmpyreanPhotometryConfig {
+    /**
+     * Model to fit (`EMPYREAN_PHOTOMETRY_MODEL_*`). Default = Auto (0).
+     */
+    int32_t model;
+    /**
+     * 1σ lightcurve scatter floor (mag). 0.0 → upstream default (0.2).
+     */
+    double sigma_lightcurve;
+    /**
+     * Include astrometrically-rejected observations' magnitudes. 0 = off.
+     */
+    uint8_t include_rejected;
+    /**
+     * Max Huber-IRLS iterations. 0 → upstream default (30).
+     */
+    uint32_t max_irls_iterations;
+    /**
+     * Huber tuning constant. 0.0 → upstream default (1.5).
+     */
+    double huber_k;
+};
+
+/**
  * Orbit-determination configuration.
  *
  * Drives `empyrean_determine`, `empyrean_evaluate`, and `empyrean_refine`.
@@ -2641,6 +2739,29 @@ struct EmpyreanODConfig {
      * (`EMPYREAN_REPRESENTATION_*`). Default = Cartesian.
      */
     int32_t output_representation;
+    /**
+     * Per-axis solve-for flags, read ONLY when
+     * [`solve_for`](EmpyreanODConfig::solve_for) is
+     * [`EMPYREAN_SOLVE_FOR_EXPLICIT`]. The three coarse `solve_for` codes
+     * ignore this field.
+     */
+    struct EmpyreanSolveFor solve_for_flags;
+    /**
+     * Permit solving a thrust Δv segment whose burn window is not
+     * bracketed by observations (degenerate with the state; the Gates
+     * prior then carries it). 0 = refuse loudly (default).
+     */
+    uint8_t allow_unbracketed_maneuvers;
+    /**
+     * 1 to run the post-OD photometric fit; 0 = off (default). When 0,
+     * [`photometry`](EmpyreanODConfig::photometry) is ignored.
+     */
+    uint8_t has_photometry;
+    /**
+     * Post-OD photometric-fit configuration. Honored only when
+     * [`has_photometry`](EmpyreanODConfig::has_photometry) is non-zero.
+     */
+    struct EmpyreanPhotometryConfig photometry;
 };
 
 /**
@@ -2807,8 +2928,173 @@ struct EmpyreanStationBias {
 };
 
 /**
- * Result of orbit determination (determine or refine).
- *
+ * Full solved-parameter covariance at the ABI-frozen width
+ * [`EMPYREAN_SOLVE_WIDTH`] (mirrors scott's `SolvedCovariance`
+ * tag-for-tag). The leading `width × width` block is meaningful; rows and
+ * columns beyond `width` are zero (RESERVED, not defaulted covariance).
+ * Consumers MUST read the slot tags to locate a parameter — the width
+ * alone is ambiguous (width 9 is Marsden OR a one-segment thrust). An
+ * absent tag carries [`EMPYREAN_SLOT_NONE`].
+ */
+struct EmpyreanSolvedCovariance {
+    /**
+     * Covariance at fixed storage width; leading `width×width` meaningful.
+     */
+    double matrix[EMPYREAN_SOLVE_WIDTH][EMPYREAN_SOLVE_WIDTH];
+    /**
+     * Real solved width — 6..=17 under scott v1.14.0 (`MAX_SOLVE_WIDTH`);
+     * the struct reserves storage to 20. The leading `width × width`
+     * block is meaningful.
+     */
+    uint32_t width;
+    /**
+     * Slot of the first Marsden coefficient, or [`EMPYREAN_SLOT_NONE`].
+     */
+    uint32_t marsden_slot;
+    /**
+     * Slot of the DT scalar, or [`EMPYREAN_SLOT_NONE`].
+     */
+    uint32_t dt_slot;
+    /**
+     * Slot of the AMRAT scalar, or [`EMPYREAN_SLOT_NONE`].
+     */
+    uint32_t amrat_slot;
+    /**
+     * Slots of each fitted thrust Δv segment (3 wide each); entries
+     * `0..thrust_count` meaningful. Δv axes are INTEGRATION-frame
+     * components (see [`EmpyreanODResult::dv_frame`]).
+     */
+    uint32_t thrust_slots[3][3];
+    /**
+     * Number of fitted thrust segments (0..=3).
+     */
+    uint32_t thrust_count;
+};
+
+/**
+ * Per-band photometric statistics (mirrors scott's `BandStat`). Owned
+ * heap entry, freed by [`empyrean_od_result_free`].
+ */
+struct EmpyreanBandStat {
+    /**
+     * Photometric band tag (owned C string).
+     */
+    char *band;
+    /**
+     * Number of observations in this band.
+     */
+    uintptr_t n;
+    /**
+     * Band→V offset applied (mag).
+     */
+    double offset_applied;
+    /**
+     * Mean residual in V (mag).
+     */
+    double mean_residual;
+    /**
+     * RMS residual in V (mag).
+     */
+    double rms;
+};
+
+/**
+ * One model-ladder gate decision (mirrors scott's `GateRecord`). Owned
+ * heap entry, freed by [`empyrean_od_result_free`].
+ */
+struct EmpyreanGateRecord {
+    /**
+     * Model the gate evaluated (`EMPYREAN_PHOTOMETRY_MODEL_*`, fitted).
+     */
+    int32_t model;
+    /**
+     * 1 if the model was admitted.
+     */
+    uint8_t passed;
+    /**
+     * Human-readable gate reason (owned C string).
+     */
+    char *reason;
+};
+
+/**
+ * Post-OD photometric solution (mirrors scott's `PhotometryResult`).
+ * Present only when photometry was requested and ran
+ * ([`EmpyreanODResult::has_photometry`]). H carries honest σ via the
+ * [`covariance`](EmpyreanODPhotometryResult::covariance) block.
+ */
+struct EmpyreanODPhotometryResult {
+    /**
+     * Fitted absolute magnitude H (mag).
+     */
+    double h;
+    /**
+     * First slope parameter (G / G12 / G1 by model).
+     */
+    double slope1;
+    /**
+     * Second slope parameter (G2 for HG1G2; unused otherwise).
+     */
+    double slope2;
+    /**
+     * 1 when [`covariance`](EmpyreanODPhotometryResult::covariance) is populated.
+     */
+    uint8_t has_covariance;
+    /**
+     * Parameter covariance (H, slope1, slope2 order).
+     */
+    double covariance[3][3];
+    /**
+     * Model actually fitted (`EMPYREAN_PHOTOMETRY_MODEL_*`; never Auto).
+     */
+    int32_t model_used;
+    /**
+     * Reduced χ² of the photometric fit over its used magnitudes.
+     */
+    double reduced_chi2;
+    /**
+     * 1 when a simplex constraint was active on the fitted slopes.
+     */
+    uint8_t constraint_active;
+    /**
+     * Magnitudes used in the fit.
+     */
+    uintptr_t n_mags_used;
+    /**
+     * Magnitudes rejected by the photometric outlier pass.
+     */
+    uintptr_t n_mags_rejected_photometric;
+    /**
+     * Observations carrying no magnitude.
+     */
+    uintptr_t n_obs_without_mags;
+    /**
+     * Magnitudes drawn from astrometrically-selected observations.
+     */
+    uintptr_t n_mags_from_astrometric_selected;
+    /**
+     * Magnitudes drawn from astrometrically-rejected observations.
+     */
+    uintptr_t n_mags_from_astrometric_rejected;
+    /**
+     * Phase-angle coverage of the fitted magnitudes (deg).
+     */
+    double alpha_min_deg;
+    double alpha_max_deg;
+    double alpha_span_deg;
+    /**
+     * Owned per-band statistics array; freed by [`empyrean_od_result_free`].
+     */
+    struct EmpyreanBandStat *per_band;
+    uintptr_t num_per_band;
+    /**
+     * Owned model-ladder gate records; freed by [`empyrean_od_result_free`].
+     */
+    struct EmpyreanGateRecord *gates;
+    uintptr_t num_gates;
+};
+
+/**
  * Mirrors scott's [`ODResult`](scott::od::ODResult). Carries the fitted
  * orbit, the 6×6 (or 9×9 when non-grav was solved) formal covariance,
  * the per-observation result array, the summary, the structured
@@ -2906,6 +3192,57 @@ struct EmpyreanODResult {
      */
     struct EmpyreanStationBias *station_biases;
     uintptr_t num_station_biases;
+    /**
+     * 1 when [`solved_covariance`](EmpyreanODResult::solved_covariance)
+     * is populated (any solved width > 6). 0 for a pure state-only fit.
+     */
+    uint8_t has_solved_covariance;
+    /**
+     * Full tagged solved-parameter covariance at the frozen width. The
+     * go-forward field for ALL solved widths (including 9); the legacy
+     * `covariance_9x9` remains for one deprecation window.
+     */
+    struct EmpyreanSolvedCovariance solved_covariance;
+    /**
+     * 1 when [`dt_delta`](EmpyreanODResult::dt_delta) is populated (DT solved).
+     */
+    uint8_t has_dt_delta;
+    /**
+     * Cumulative non-grav time-delay correction ΔDT (days).
+     */
+    double dt_delta;
+    /**
+     * 1 when [`amrat_delta`](EmpyreanODResult::amrat_delta) is populated (AMRAT solved).
+     */
+    uint8_t has_amrat_delta;
+    /**
+     * Cumulative SRP AMRAT correction (m²/kg).
+     */
+    double amrat_delta;
+    /**
+     * Number of fitted thrust Δv segments (0..=3); 0 = no thrust solve.
+     */
+    uint32_t thrust_delta_count;
+    /**
+     * Per-segment fitted Δv in m/s, expressed in
+     * [`dv_frame`](EmpyreanODResult::dv_frame). Entries
+     * `0..thrust_delta_count` meaningful.
+     */
+    double thrust_delta_m_per_s[3][3];
+    /**
+     * Integration frame the Δv components are expressed in (0=ICRF,
+     * 1=EclipticJ2000). Only meaningful when `thrust_delta_count > 0`.
+     */
+    int32_t dv_frame;
+    /**
+     * 1 when [`photometry`](EmpyreanODResult::photometry) carries a fitted H/G solution.
+     */
+    uint8_t has_photometry;
+    /**
+     * Post-OD photometric solution when photometry was requested + ran.
+     * Owns its per-band / gate arrays (freed by `empyrean_od_result_free`).
+     */
+    struct EmpyreanODPhotometryResult photometry;
 };
 
 /**
@@ -3857,6 +4194,13 @@ int32_t empyrean_get_observers(const EmpyreanContext *ctx,
  * Passing a zeroed/null result is a no-op.
  */
  void empyrean_observer_result_free(struct EmpyreanObserverResult *result);
+
+/**
+ * Runtime accessor for [`EMPYREAN_ABI_VERSION`] — lets a dynamically
+ * linked consumer confirm the loaded library's frozen-shape contract
+ * matches what it compiled against.
+ */
+ uint32_t empyrean_abi_version(void);
 
 /**
  * Read ADES PSV / MPC80 data from a string and pack into the C array.

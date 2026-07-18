@@ -8,11 +8,14 @@ use empyrean_core::coordinates::{AU, CoordinateRepresentation, Coordinates, Orig
 use empyrean_core::determination::{
     AcceptabilityReport, AdaptiveRejectionConfig, BiasKind, BiasScope, CMC2003Config, ODConfig,
     ODResult, ObservationResidualSummary, ObservationResult, Observations, OriginPolicy,
-    OutputEpoch, RadarMeasurement, RadarObservation, RejectionReason, SolveForParams,
-    UpstreamForceModelTier, determine, evaluate_single, refine_single,
+    OutputEpoch, RadarMeasurement, RadarObservation, RejectionReason, SolveFor, SolveForParams,
+    SolvedCovariance, UpstreamForceModelTier, determine, evaluate_single, refine_single,
 };
 use empyrean_core::io::{ADESObservations, parse_ades};
 use empyrean_core::nongrav::NonGravModel;
+use empyrean_core::photometry::{
+    FittedPhotometryModel, PhotometryConfig, PhotometryModel, PhotometryResult,
+};
 use empyrean_core::orbits::Orbits;
 
 use crate::propagate::{EmpyreanOrbit, EmpyreanPropagatedState, int_to_force_model};
@@ -383,6 +386,49 @@ pub const EMPYREAN_SOLVE_FOR_AUTO: i32 = 2;
 /// exact axes travel in the `EmpyreanSolveFor` flag struct.
 pub const EMPYREAN_SOLVE_FOR_EXPLICIT: i32 = 3;
 
+// ── Wide solved-covariance freeze (ABI-FROZEN; NEVER grows) ────────
+/// Frozen storage width of the solved-parameter covariance matrix. Set
+/// once at v0.9.0-rc.0 and never widened — there is no runtime
+/// `abi_version` negotiation, so the inline `matrix[W][W]` is baked into
+/// the struct size. `20` is scott's STRUCTURAL maximum (6 state + 3
+/// Marsden + 1 DT + 1 AMRAT + 3 thrust segments × 3). scott v1.14.0 today
+/// caps the actually-producible width at 17 (`MAX_SOLVE_WIDTH`; its solve
+/// guard rejects anything wider), so columns 17..20 are RESERVE — held for
+/// whatever axis combination scott may later admit past width 17, and zero
+/// until then. (A 3-segment thrust solve already fits below 17; the reserve
+/// is for the widest joint solves, not a specific axis.) A parameter beyond
+/// this structural max (e.g. a drag axis) takes a fresh
+/// `EMPYREAN_ABI_VERSION`-guarded break, not a silent widening.
+pub const EMPYREAN_SOLVE_WIDTH: usize = 20;
+/// `u32` sentinel for an absent slot tag (C has no `Option`). Consumers
+/// MUST read the slot tags — a width alone is ambiguous (width 9 is
+/// Marsden OR one-segment thrust).
+pub const EMPYREAN_SLOT_NONE: u32 = 0xFFFF_FFFF;
+// The frozen width can never silently fall below scott's own maximum.
+const _: () =
+    assert!(EMPYREAN_SOLVE_WIDTH >= empyrean_core::determination::MAX_SOLVE_WIDTH);
+
+// ── Photometry fit-model codes (config request + result report) ────
+pub const EMPYREAN_PHOTOMETRY_MODEL_AUTO: i32 = 0;
+pub const EMPYREAN_PHOTOMETRY_MODEL_HONLY: i32 = 1;
+pub const EMPYREAN_PHOTOMETRY_MODEL_HG: i32 = 2;
+pub const EMPYREAN_PHOTOMETRY_MODEL_HG12: i32 = 3;
+pub const EMPYREAN_PHOTOMETRY_MODEL_HG1G2: i32 = 4;
+
+/// Integer handshake on the frozen-ABI shape contract, distinct from the
+/// per-crate semver strings in `EmpyreanVersions` (which are provenance).
+/// Consumers compiled against a given `EMPYREAN_SOLVE_WIDTH` check this at
+/// load; any additive change to the frozen structs bumps it.
+pub const EMPYREAN_ABI_VERSION: u32 = 1;
+
+/// Runtime accessor for [`EMPYREAN_ABI_VERSION`] — lets a dynamically
+/// linked consumer confirm the loaded library's frozen-shape contract
+/// matches what it compiled against.
+#[unsafe(no_mangle)]
+pub extern "C" fn empyrean_abi_version() -> u32 {
+    EMPYREAN_ABI_VERSION
+}
+
 // ── Origin-policy modes ───────────────────────────────────────────
 /// Auto: selects the central body (heliocentric vs Earth-centric)
 /// automatically. Default for `EmpyreanODConfig::origin`.
@@ -615,6 +661,144 @@ pub struct EmpyreanNonGravParams {
 
 /// Result of orbit determination (determine or refine).
 ///
+/// Per-axis solve-for flags (mirrors scott's `SolveFor`). Read only when
+/// [`EmpyreanODConfig::solve_for`] is [`EMPYREAN_SOLVE_FOR_EXPLICIT`]; the
+/// three coarse `EMPYREAN_SOLVE_FOR_*` codes cover the common shapes
+/// without it. Each flag turns on a wide-STM axis, subject to its own
+/// precondition (a declared prior on the orbit) enforced by scott.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct EmpyreanSolveFor {
+    /// Solve the Marsden A1/A2/A3 block (requires a non-grav covariance).
+    pub marsden: u8,
+    /// Solve the non-grav time delay DT (requires `marsden` + a DT prior).
+    pub dt: u8,
+    /// Solve the SRP AMRAT (requires an SRP AMRAT prior).
+    pub amrat: u8,
+    /// Number of thrust Δv segments to solve (3 columns each; 0 = none).
+    pub thrust_segments: u32,
+}
+
+/// Full solved-parameter covariance at the ABI-frozen width
+/// [`EMPYREAN_SOLVE_WIDTH`] (mirrors scott's `SolvedCovariance`
+/// tag-for-tag). The leading `width × width` block is meaningful; rows and
+/// columns beyond `width` are zero (RESERVED, not defaulted covariance).
+/// Consumers MUST read the slot tags to locate a parameter — the width
+/// alone is ambiguous (width 9 is Marsden OR a one-segment thrust). An
+/// absent tag carries [`EMPYREAN_SLOT_NONE`].
+#[repr(C)]
+pub struct EmpyreanSolvedCovariance {
+    /// Covariance at fixed storage width; leading `width×width` meaningful.
+    pub matrix: [[f64; EMPYREAN_SOLVE_WIDTH]; EMPYREAN_SOLVE_WIDTH],
+    /// Real solved width — 6..=17 under scott v1.14.0 (`MAX_SOLVE_WIDTH`);
+    /// the struct reserves storage to 20. The leading `width × width`
+    /// block is meaningful.
+    pub width: u32,
+    /// Slot of the first Marsden coefficient, or [`EMPYREAN_SLOT_NONE`].
+    pub marsden_slot: u32,
+    /// Slot of the DT scalar, or [`EMPYREAN_SLOT_NONE`].
+    pub dt_slot: u32,
+    /// Slot of the AMRAT scalar, or [`EMPYREAN_SLOT_NONE`].
+    pub amrat_slot: u32,
+    /// Slots of each fitted thrust Δv segment (3 wide each); entries
+    /// `0..thrust_count` meaningful. Δv axes are INTEGRATION-frame
+    /// components (see [`EmpyreanODResult::dv_frame`]).
+    pub thrust_slots: [[u32; 3]; 3],
+    /// Number of fitted thrust segments (0..=3).
+    pub thrust_count: u32,
+}
+
+/// Post-OD photometric-fit request (mirrors scott's `PhotometryConfig`).
+/// Enabled by [`EmpyreanODConfig::has_photometry`]; the fit runs after the
+/// orbit is solved and never touches the state (photometry has no
+/// astrometric partials). Zero-init reproduces scott's defaults.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct EmpyreanPhotometryConfig {
+    /// Model to fit (`EMPYREAN_PHOTOMETRY_MODEL_*`). Default = Auto (0).
+    pub model: i32,
+    /// 1σ lightcurve scatter floor (mag). 0.0 → upstream default (0.2).
+    pub sigma_lightcurve: f64,
+    /// Include astrometrically-rejected observations' magnitudes. 0 = off.
+    pub include_rejected: u8,
+    /// Max Huber-IRLS iterations. 0 → upstream default (30).
+    pub max_irls_iterations: u32,
+    /// Huber tuning constant. 0.0 → upstream default (1.5).
+    pub huber_k: f64,
+}
+
+/// Per-band photometric statistics (mirrors scott's `BandStat`). Owned
+/// heap entry, freed by [`empyrean_od_result_free`].
+#[repr(C)]
+pub struct EmpyreanBandStat {
+    /// Photometric band tag (owned C string).
+    pub band: *mut c_char,
+    /// Number of observations in this band.
+    pub n: usize,
+    /// Band→V offset applied (mag).
+    pub offset_applied: f64,
+    /// Mean residual in V (mag).
+    pub mean_residual: f64,
+    /// RMS residual in V (mag).
+    pub rms: f64,
+}
+
+/// One model-ladder gate decision (mirrors scott's `GateRecord`). Owned
+/// heap entry, freed by [`empyrean_od_result_free`].
+#[repr(C)]
+pub struct EmpyreanGateRecord {
+    /// Model the gate evaluated (`EMPYREAN_PHOTOMETRY_MODEL_*`, fitted).
+    pub model: i32,
+    /// 1 if the model was admitted.
+    pub passed: u8,
+    /// Human-readable gate reason (owned C string).
+    pub reason: *mut c_char,
+}
+
+/// Post-OD photometric solution (mirrors scott's `PhotometryResult`).
+/// Present only when photometry was requested and ran
+/// ([`EmpyreanODResult::has_photometry`]). H carries honest σ via the
+/// [`covariance`](EmpyreanODPhotometryResult::covariance) block.
+#[repr(C)]
+pub struct EmpyreanODPhotometryResult {
+    /// Fitted absolute magnitude H (mag).
+    pub h: f64,
+    /// First slope parameter (G / G12 / G1 by model).
+    pub slope1: f64,
+    /// Second slope parameter (G2 for HG1G2; unused otherwise).
+    pub slope2: f64,
+    /// 1 when [`covariance`](EmpyreanODPhotometryResult::covariance) is populated.
+    pub has_covariance: u8,
+    /// Parameter covariance (H, slope1, slope2 order).
+    pub covariance: [[f64; 3]; 3],
+    /// Model actually fitted (`EMPYREAN_PHOTOMETRY_MODEL_*`; never Auto).
+    pub model_used: i32,
+    /// Reduced χ² of the photometric fit over its used magnitudes.
+    pub reduced_chi2: f64,
+    /// 1 when a simplex constraint was active on the fitted slopes.
+    pub constraint_active: u8,
+    /// Magnitudes used in the fit.
+    pub n_mags_used: usize,
+    /// Magnitudes rejected by the photometric outlier pass.
+    pub n_mags_rejected_photometric: usize,
+    /// Observations carrying no magnitude.
+    pub n_obs_without_mags: usize,
+    /// Magnitudes drawn from astrometrically-selected observations.
+    pub n_mags_from_astrometric_selected: usize,
+    /// Magnitudes drawn from astrometrically-rejected observations.
+    pub n_mags_from_astrometric_rejected: usize,
+    /// Phase-angle coverage of the fitted magnitudes (deg).
+    pub alpha_min_deg: f64,
+    pub alpha_max_deg: f64,
+    pub alpha_span_deg: f64,
+    /// Owned per-band statistics array; freed by [`empyrean_od_result_free`].
+    pub per_band: *mut EmpyreanBandStat,
+    pub num_per_band: usize,
+    /// Owned model-ladder gate records; freed by [`empyrean_od_result_free`].
+    pub gates: *mut EmpyreanGateRecord,
+    pub num_gates: usize,
+}
+
 /// Mirrors scott's [`ODResult`](scott::od::ODResult). Carries the fitted
 /// orbit, the 6×6 (or 9×9 when non-grav was solved) formal covariance,
 /// the per-observation result array, the summary, the structured
@@ -680,6 +864,37 @@ pub struct EmpyreanODResult {
     /// Null + `num_station_biases = 0` when no bias fit was configured.
     pub station_biases: *mut EmpyreanStationBias,
     pub num_station_biases: usize,
+
+    // ── Wide fitting surface (v0.9.0) ───────────────────────────────
+    /// 1 when [`solved_covariance`](EmpyreanODResult::solved_covariance)
+    /// is populated (any solved width > 6). 0 for a pure state-only fit.
+    pub has_solved_covariance: u8,
+    /// Full tagged solved-parameter covariance at the frozen width. The
+    /// go-forward field for ALL solved widths (including 9); the legacy
+    /// `covariance_9x9` remains for one deprecation window.
+    pub solved_covariance: EmpyreanSolvedCovariance,
+    /// 1 when [`dt_delta`](EmpyreanODResult::dt_delta) is populated (DT solved).
+    pub has_dt_delta: u8,
+    /// Cumulative non-grav time-delay correction ΔDT (days).
+    pub dt_delta: f64,
+    /// 1 when [`amrat_delta`](EmpyreanODResult::amrat_delta) is populated (AMRAT solved).
+    pub has_amrat_delta: u8,
+    /// Cumulative SRP AMRAT correction (m²/kg).
+    pub amrat_delta: f64,
+    /// Number of fitted thrust Δv segments (0..=3); 0 = no thrust solve.
+    pub thrust_delta_count: u32,
+    /// Per-segment fitted Δv in m/s, expressed in
+    /// [`dv_frame`](EmpyreanODResult::dv_frame). Entries
+    /// `0..thrust_delta_count` meaningful.
+    pub thrust_delta_m_per_s: [[f64; 3]; 3],
+    /// Integration frame the Δv components are expressed in (0=ICRF,
+    /// 1=EclipticJ2000). Only meaningful when `thrust_delta_count > 0`.
+    pub dv_frame: i32,
+    /// 1 when [`photometry`](EmpyreanODResult::photometry) carries a fitted H/G solution.
+    pub has_photometry: u8,
+    /// Post-OD photometric solution when photometry was requested + ran.
+    /// Owns its per-band / gate arrays (freed by `empyrean_od_result_free`).
+    pub photometry: EmpyreanODPhotometryResult,
 }
 
 /// Result of orbit evaluation (residuals without fitting).
@@ -900,6 +1115,23 @@ pub struct EmpyreanODConfig {
     /// Output coordinate representation for the fitted orbit + covariance
     /// (`EMPYREAN_REPRESENTATION_*`). Default = Cartesian.
     pub output_representation: i32,
+
+    // ── Wide fitting surface (v0.9.0) ───────────────────────────────
+    /// Per-axis solve-for flags, read ONLY when
+    /// [`solve_for`](EmpyreanODConfig::solve_for) is
+    /// [`EMPYREAN_SOLVE_FOR_EXPLICIT`]. The three coarse `solve_for` codes
+    /// ignore this field.
+    pub solve_for_flags: EmpyreanSolveFor,
+    /// Permit solving a thrust Δv segment whose burn window is not
+    /// bracketed by observations (degenerate with the state; the Gates
+    /// prior then carries it). 0 = refuse loudly (default).
+    pub allow_unbracketed_maneuvers: u8,
+    /// 1 to run the post-OD photometric fit; 0 = off (default). When 0,
+    /// [`photometry`](EmpyreanODConfig::photometry) is ignored.
+    pub has_photometry: u8,
+    /// Post-OD photometric-fit configuration. Honored only when
+    /// [`has_photometry`](EmpyreanODConfig::has_photometry) is non-zero.
+    pub photometry: EmpyreanPhotometryConfig,
 }
 
 // ── Helpers ─────────────────────────────────────────────────
@@ -1399,6 +1631,279 @@ unsafe fn free_station_biases(ptr: *mut EmpyreanStationBias, n: usize) {
     }
 }
 
+// ── Wide-fitting marshaling (v0.9.0) ────────────────────────────────
+
+/// `FittedPhotometryModel` → an `EMPYREAN_PHOTOMETRY_MODEL_*` code
+/// (never Auto — Auto is a request, not a result).
+fn fitted_photometry_model_to_int(m: &FittedPhotometryModel) -> i32 {
+    match m {
+        FittedPhotometryModel::HOnly => EMPYREAN_PHOTOMETRY_MODEL_HONLY,
+        FittedPhotometryModel::HG => EMPYREAN_PHOTOMETRY_MODEL_HG,
+        FittedPhotometryModel::HG12 => EMPYREAN_PHOTOMETRY_MODEL_HG12,
+        FittedPhotometryModel::HG1G2 => EMPYREAN_PHOTOMETRY_MODEL_HG1G2,
+    }
+}
+
+/// `Option<usize>` slot tag → `u32` with the [`EMPYREAN_SLOT_NONE`] sentinel.
+fn slot_to_c(s: Option<usize>) -> u32 {
+    s.map(|v| v as u32).unwrap_or(EMPYREAN_SLOT_NONE)
+}
+
+/// Copy scott's `SolvedCovariance` into the ABI-frozen struct: the leading
+/// scott-width block into the frozen `W×W` matrix (scott's `MAX_SOLVE_WIDTH`
+/// ≤ `EMPYREAN_SOLVE_WIDTH`, so the whole scott block fits and rows beyond
+/// the solved width are already zero), slot tags with sentinels.
+fn solved_covariance_to_c(sc: &SolvedCovariance) -> EmpyreanSolvedCovariance {
+    let mut matrix = [[0.0_f64; EMPYREAN_SOLVE_WIDTH]; EMPYREAN_SOLVE_WIDTH];
+    // scott's MAX_SOLVE_WIDTH (17) ≤ EMPYREAN_SOLVE_WIDTH (20): zip copies
+    // the whole scott block into the leading frozen block; rows / cols
+    // beyond scott's stored width are already zero.
+    for (dst_row, src_row) in matrix.iter_mut().zip(sc.matrix.iter()) {
+        for (dst, src) in dst_row.iter_mut().zip(src_row.iter()) {
+            *dst = *src;
+        }
+    }
+    // Unused thrust rows (i >= thrust_count) carry the SLOT_NONE sentinel
+    // rather than scott's raw [0, 0, 0]: slot 0 is a valid STATE slot, so a
+    // consumer that forgets to gate on thrust_count must not be able to
+    // misread an unused row as "thrust at state slots 0,1,2".
+    let mut thrust_slots = [[EMPYREAN_SLOT_NONE; 3]; 3];
+    for (i, seg) in sc.thrust_slots.iter().enumerate().take(sc.thrust_count) {
+        for (j, &slot) in seg.iter().enumerate() {
+            thrust_slots[i][j] = slot as u32;
+        }
+    }
+    EmpyreanSolvedCovariance {
+        matrix,
+        width: sc.width as u32,
+        marsden_slot: slot_to_c(sc.marsden_slot),
+        dt_slot: slot_to_c(sc.dt_slot),
+        amrat_slot: slot_to_c(sc.amrat_slot),
+        thrust_slots,
+        thrust_count: sc.thrust_count as u32,
+    }
+}
+
+fn zeroed_solved_covariance() -> EmpyreanSolvedCovariance {
+    EmpyreanSolvedCovariance {
+        matrix: [[0.0; EMPYREAN_SOLVE_WIDTH]; EMPYREAN_SOLVE_WIDTH],
+        width: 0,
+        marsden_slot: EMPYREAN_SLOT_NONE,
+        dt_slot: EMPYREAN_SLOT_NONE,
+        amrat_slot: EMPYREAN_SLOT_NONE,
+        thrust_slots: [[EMPYREAN_SLOT_NONE; 3]; 3],
+        thrust_count: 0,
+    }
+}
+
+fn band_stats_to_c(
+    list: &[empyrean_core::photometry::BandStat],
+) -> (*mut EmpyreanBandStat, usize) {
+    let n = list.len();
+    if n == 0 {
+        return (std::ptr::null_mut(), 0);
+    }
+    let layout = std::alloc::Layout::array::<EmpyreanBandStat>(n)
+        .unwrap_or(std::alloc::Layout::new::<EmpyreanBandStat>());
+    let ptr = unsafe { std::alloc::alloc(layout) } as *mut EmpyreanBandStat;
+    if ptr.is_null() {
+        return (std::ptr::null_mut(), 0);
+    }
+    for (i, b) in list.iter().enumerate() {
+        let entry = EmpyreanBandStat {
+            band: alloc_cstring(&b.band),
+            n: b.n,
+            offset_applied: b.offset_applied,
+            mean_residual: b.mean_residual,
+            rms: b.rms,
+        };
+        unsafe {
+            ptr.add(i).write(entry);
+        }
+    }
+    (ptr, n)
+}
+
+unsafe fn free_band_stats(ptr: *mut EmpyreanBandStat, n: usize) {
+    if ptr.is_null() || n == 0 {
+        return;
+    }
+    for i in 0..n {
+        let entry = unsafe { &mut *ptr.add(i) };
+        unsafe {
+            free_cstring(entry.band);
+        }
+        entry.band = std::ptr::null_mut();
+    }
+    let layout = std::alloc::Layout::array::<EmpyreanBandStat>(n)
+        .unwrap_or(std::alloc::Layout::new::<EmpyreanBandStat>());
+    unsafe {
+        std::alloc::dealloc(ptr as *mut u8, layout);
+    }
+}
+
+fn gate_records_to_c(
+    list: &[empyrean_core::photometry::GateRecord],
+) -> (*mut EmpyreanGateRecord, usize) {
+    let n = list.len();
+    if n == 0 {
+        return (std::ptr::null_mut(), 0);
+    }
+    let layout = std::alloc::Layout::array::<EmpyreanGateRecord>(n)
+        .unwrap_or(std::alloc::Layout::new::<EmpyreanGateRecord>());
+    let ptr = unsafe { std::alloc::alloc(layout) } as *mut EmpyreanGateRecord;
+    if ptr.is_null() {
+        return (std::ptr::null_mut(), 0);
+    }
+    for (i, g) in list.iter().enumerate() {
+        let entry = EmpyreanGateRecord {
+            model: fitted_photometry_model_to_int(&g.model),
+            passed: g.passed as u8,
+            reason: alloc_cstring(&g.reason),
+        };
+        unsafe {
+            ptr.add(i).write(entry);
+        }
+    }
+    (ptr, n)
+}
+
+unsafe fn free_gate_records(ptr: *mut EmpyreanGateRecord, n: usize) {
+    if ptr.is_null() || n == 0 {
+        return;
+    }
+    for i in 0..n {
+        let entry = unsafe { &mut *ptr.add(i) };
+        unsafe {
+            free_cstring(entry.reason);
+        }
+        entry.reason = std::ptr::null_mut();
+    }
+    let layout = std::alloc::Layout::array::<EmpyreanGateRecord>(n)
+        .unwrap_or(std::alloc::Layout::new::<EmpyreanGateRecord>());
+    unsafe {
+        std::alloc::dealloc(ptr as *mut u8, layout);
+    }
+}
+
+fn photometry_result_to_c(p: &PhotometryResult) -> EmpyreanODPhotometryResult {
+    let (has_covariance, covariance) = match p.params.covariance {
+        Some(c) => (1u8, c),
+        None => (0u8, [[0.0; 3]; 3]),
+    };
+    let (per_band, num_per_band) = band_stats_to_c(&p.per_band);
+    let (gates, num_gates) = gate_records_to_c(&p.gates);
+    EmpyreanODPhotometryResult {
+        h: p.params.p1,
+        slope1: p.params.p2,
+        slope2: p.params.p3,
+        has_covariance,
+        covariance,
+        model_used: fitted_photometry_model_to_int(&p.model_used),
+        reduced_chi2: p.reduced_chi2,
+        constraint_active: p.constraint_active as u8,
+        n_mags_used: p.n_mags_used,
+        n_mags_rejected_photometric: p.n_mags_rejected_photometric,
+        n_obs_without_mags: p.n_obs_without_mags,
+        n_mags_from_astrometric_selected: p.n_mags_from_astrometric_selected,
+        n_mags_from_astrometric_rejected: p.n_mags_from_astrometric_rejected,
+        alpha_min_deg: p.phase_coverage.alpha_min_deg,
+        alpha_max_deg: p.phase_coverage.alpha_max_deg,
+        alpha_span_deg: p.phase_coverage.span_deg,
+        per_band,
+        num_per_band,
+        gates,
+        num_gates,
+    }
+}
+
+fn zeroed_photometry_result() -> EmpyreanODPhotometryResult {
+    EmpyreanODPhotometryResult {
+        h: 0.0,
+        slope1: 0.0,
+        slope2: 0.0,
+        has_covariance: 0,
+        covariance: [[0.0; 3]; 3],
+        model_used: EMPYREAN_PHOTOMETRY_MODEL_AUTO,
+        reduced_chi2: 0.0,
+        constraint_active: 0,
+        n_mags_used: 0,
+        n_mags_rejected_photometric: 0,
+        n_obs_without_mags: 0,
+        n_mags_from_astrometric_selected: 0,
+        n_mags_from_astrometric_rejected: 0,
+        alpha_min_deg: 0.0,
+        alpha_max_deg: 0.0,
+        alpha_span_deg: 0.0,
+        per_band: std::ptr::null_mut(),
+        num_per_band: 0,
+        gates: std::ptr::null_mut(),
+        num_gates: 0,
+    }
+}
+
+/// Populate the v0.9.0 wide-fitting fields on a result out-pointer from
+/// scott's `ODResult`. ALWAYS writes every field (zeros / sentinels when
+/// an axis was not solved) — no defaulted covariance presented as real,
+/// per the full-population contract.
+unsafe fn populate_wide_fitting_fields(result_out: *mut EmpyreanODResult, od: &ODResult) {
+    unsafe {
+        match &od.solved_covariance {
+            Some(sc) => {
+                (*result_out).has_solved_covariance = 1;
+                (*result_out).solved_covariance = solved_covariance_to_c(sc);
+            }
+            None => {
+                (*result_out).has_solved_covariance = 0;
+                (*result_out).solved_covariance = zeroed_solved_covariance();
+            }
+        }
+        match od.dt_delta {
+            Some(d) => {
+                (*result_out).has_dt_delta = 1;
+                (*result_out).dt_delta = d;
+            }
+            None => {
+                (*result_out).has_dt_delta = 0;
+                (*result_out).dt_delta = 0.0;
+            }
+        }
+        match od.amrat_delta {
+            Some(a) => {
+                (*result_out).has_amrat_delta = 1;
+                (*result_out).amrat_delta = a;
+            }
+            None => {
+                (*result_out).has_amrat_delta = 0;
+                (*result_out).amrat_delta = 0.0;
+            }
+        }
+        let mut thrust = [[0.0_f64; 3]; 3];
+        let count = match od.thrust_delta_m_per_s() {
+            Some(dvs) => {
+                for (i, dv) in dvs.iter().take(3).enumerate() {
+                    thrust[i] = *dv;
+                }
+                dvs.len().min(3) as u32
+            }
+            None => 0,
+        };
+        (*result_out).thrust_delta_count = count;
+        (*result_out).thrust_delta_m_per_s = thrust;
+        (*result_out).dv_frame = od.dv_frame.map(frame_to_int).unwrap_or(0);
+        match &od.photometry {
+            Some(p) => {
+                (*result_out).has_photometry = 1;
+                (*result_out).photometry = photometry_result_to_c(p);
+            }
+            None => {
+                (*result_out).has_photometry = 0;
+                (*result_out).photometry = zeroed_photometry_result();
+            }
+        }
+    }
+}
+
 pub(crate) fn acceptability_to_c(r: &AcceptabilityReport) -> EmpyreanAcceptabilityReport {
     EmpyreanAcceptabilityReport {
         fit_acceptable: u8::from(r.fit_acceptable),
@@ -1588,6 +2093,39 @@ fn int_to_solve_for(v: i32) -> Result<SolveForParams, String> {
         ),
         other => Err(format!("unknown solve_for code: {other}")),
     }
+}
+
+/// Map the config photometry-model code (`EMPYREAN_PHOTOMETRY_MODEL_*`)
+/// to scott's [`PhotometryModel`].
+fn photometry_model_from_int(v: i32) -> Result<PhotometryModel, String> {
+    match v {
+        EMPYREAN_PHOTOMETRY_MODEL_AUTO => Ok(PhotometryModel::Auto),
+        EMPYREAN_PHOTOMETRY_MODEL_HONLY => Ok(PhotometryModel::HOnly),
+        EMPYREAN_PHOTOMETRY_MODEL_HG => Ok(PhotometryModel::HG),
+        EMPYREAN_PHOTOMETRY_MODEL_HG12 => Ok(PhotometryModel::HG12),
+        EMPYREAN_PHOTOMETRY_MODEL_HG1G2 => Ok(PhotometryModel::HG1G2),
+        other => Err(format!("unknown photometry model code: {other}")),
+    }
+}
+
+/// Build a scott [`PhotometryConfig`] from the C request. Sentinel rule:
+/// `0` / `0.0` on a tuning field requests the upstream default.
+fn photometry_config_from_c(c: &EmpyreanPhotometryConfig) -> Result<PhotometryConfig, String> {
+    let mut pc = PhotometryConfig {
+        model: photometry_model_from_int(c.model)?,
+        ..PhotometryConfig::default()
+    };
+    if c.sigma_lightcurve > 0.0 {
+        pc.sigma_lightcurve = c.sigma_lightcurve;
+    }
+    pc.include_rejected = c.include_rejected != 0;
+    if c.max_irls_iterations > 0 {
+        pc.max_irls_iterations = c.max_irls_iterations as usize;
+    }
+    if c.huber_k > 0.0 {
+        pc.huber_k = c.huber_k;
+    }
+    Ok(pc)
 }
 
 fn int_to_coord_rep(v: i32) -> Result<CoordinateRepresentation, String> {
@@ -1915,7 +2453,25 @@ fn build_od_config_from_c(c: &EmpyreanODConfig) -> Result<ODConfig, String> {
         cfg.convergence_tol = c.convergence_tol;
     }
     cfg.use_stm_cache = c.use_stm_cache != 0;
-    cfg.solve_for = int_to_solve_for(c.solve_for)?;
+    cfg.solve_for = if c.solve_for == EMPYREAN_SOLVE_FOR_EXPLICIT {
+        // Explicit multi-axis request — the coarse code can't name it, so
+        // read the per-axis flag struct.
+        let f = &c.solve_for_flags;
+        SolveForParams::Explicit(SolveFor {
+            marsden: f.marsden != 0,
+            dt: f.dt != 0,
+            amrat: f.amrat != 0,
+            thrust_segments: f.thrust_segments as usize,
+        })
+    } else {
+        int_to_solve_for(c.solve_for)?
+    };
+    cfg.allow_unbracketed_maneuvers = c.allow_unbracketed_maneuvers != 0;
+    cfg.photometry = if c.has_photometry != 0 {
+        Some(photometry_config_from_c(&c.photometry)?)
+    } else {
+        None
+    };
 
     // ── Auto-escalation ───────────────────────────────────────────
     let ae = &c.auto_escalation;
@@ -2635,6 +3191,7 @@ pub unsafe extern "C" fn empyrean_determine(
             (*result_out).acceptability = acceptability;
             (*result_out).station_biases = sb_ptr;
             (*result_out).num_station_biases = sb_n;
+            populate_wide_fitting_fields(result_out, od);
         }
         0
     }));
@@ -2661,10 +3218,17 @@ pub unsafe extern "C" fn empyrean_od_result_free(result: *mut EmpyreanODResult) 
         unsafe {
             free_observation_results(res.observations, n);
             free_station_biases(res.station_biases, sb_n);
+            // Photometry owned arrays (null / 0 when no photometry ran).
+            free_band_stats(res.photometry.per_band, res.photometry.num_per_band);
+            free_gate_records(res.photometry.gates, res.photometry.num_gates);
             (*result).observations = std::ptr::null_mut();
             (*result).num_observations = 0;
             (*result).station_biases = std::ptr::null_mut();
             (*result).num_station_biases = 0;
+            (*result).photometry.per_band = std::ptr::null_mut();
+            (*result).photometry.num_per_band = 0;
+            (*result).photometry.gates = std::ptr::null_mut();
+            (*result).photometry.num_gates = 0;
         }
     }));
 }
@@ -2879,6 +3443,7 @@ pub unsafe extern "C" fn empyrean_refine(
             (*result_out).acceptability = acceptability;
             (*result_out).station_biases = sb_ptr;
             (*result_out).num_station_biases = sb_n;
+            populate_wide_fitting_fields(result_out, &od_result);
         }
         0
     }));

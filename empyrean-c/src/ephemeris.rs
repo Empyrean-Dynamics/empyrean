@@ -480,9 +480,11 @@ pub(crate) fn marshal_ephemeris_result(
         for (i, &epoch_mjd_tdb) in epochs.iter().enumerate() {
             let (jac, n_params) = if let Some((jw, active_width)) = chain.jacobian_wide(i) {
                 // v1.20.0: jacobian_wide is width-tagged — the wide STM
-                // spans 7..=17 columns now (DT / AMRAT / thrust), no
-                // longer a fixed 9. Report the real active width.
-                (flatten_2d(&jw.matrix), active_width as u8)
+                // spans 7..=17 meaningful columns now (DT / AMRAT / thrust),
+                // no longer a fixed 9, and is STORED at the MAX_WIDE stride.
+                // Emit exactly the active_width columns so the buffer length
+                // stays 6 * n_params.
+                (flatten_2d_active(&jw.matrix, active_width), active_width as u8)
             } else if let Some(j) = chain.jacobian(i) {
                 (flatten_2d(&j.matrix), 6u8)
             } else {
@@ -607,6 +609,21 @@ fn flatten_2d<const N: usize>(m: &[[f64; N]; 6]) -> Vec<f64> {
     let mut v = Vec::with_capacity(6 * N);
     for row in m {
         v.extend_from_slice(row);
+    }
+    v
+}
+
+/// Row-major flatten of the leading `active_width` columns of the `6`
+/// state rows. The width-tagged wide Jacobian is STORED at the `MAX_WIDE`
+/// stride but only its first `active_width` columns are meaningful, so
+/// emitting the full stride while reporting `n_params = active_width`
+/// would misalign every non-`MAX_WIDE` Jacobian. Slicing to `active_width`
+/// keeps the buffer at `6 * active_width`, matching the reported count.
+fn flatten_2d_active<const N: usize>(m: &[[f64; N]; 6], active_width: usize) -> Vec<f64> {
+    let w = active_width.min(N);
+    let mut v = Vec::with_capacity(6 * w);
+    for row in m {
+        v.extend_from_slice(&row[..w]);
     }
     v
 }

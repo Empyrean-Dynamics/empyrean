@@ -21,11 +21,11 @@ crate-type = ["cdylib", "staticlib"]
 [dependencies]
 # C ABI is a thin shell over empyrean-core. The internal Rust API is
 # never re-exported through this crate — only the C symbols are.
-# Pinned to the tagged empyrean-core release, fetched from GitHub — the
-# same release-pinning empyrean-core itself uses for villeneuve / scott.
-# To co-develop a local empyrean-core against this workspace, add a
-# `[patch."ssh://…empyrean-core.git"]` path override at the workspace root.
-empyrean-core = { git = "ssh://git@github.com/Empyrean-Dynamics/empyrean-core.git", tag = "v0.8.3", features = ["parquet"] }
+# TEMP(v0.9.0-fitting): path-dep to the local empyrean-core v0.9.0 fitting
+# branch (feature/od-shared-handle, unreleased). A workspace-root [patch]
+# can't bridge this because 0.8.3 → 0.9.0 is a semver-incompatible 0.x
+# minor. Swap back to { git = ..., tag = "v0.9.0" } when core is cut.
+empyrean-core = { path = "../../empyrean-core", features = ["parquet"] }
 arrow = "58"
 parquet = "58"
 serde = { version = "1", features = ["derive"] }

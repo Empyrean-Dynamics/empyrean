@@ -158,6 +158,7 @@ fn build_orbits_from_c(
                 model: NonGravModel::MarsdenSekanina(g_func),
                 covariance: None,
                 dt: None,
+                dt_variance: None,
             };
             orbits.set_non_grav_params(i, Some(params));
         }

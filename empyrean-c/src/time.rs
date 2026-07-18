@@ -123,10 +123,25 @@ pub unsafe extern "C" fn empyrean_mjd_to_iso(
             }
         };
         let epoch = match source {
-            Scale::Utc => Epoch::from_mjd_utc(mjd),
+            // v1.20.0 deprecated the panicking forms; the fallible forms
+            // surface an undefined UTC conversion as a clean error return
+            // instead of unwinding across the FFI boundary.
+            Scale::Utc => match Epoch::try_from_mjd_utc(mjd) {
+                Ok(e) => e,
+                Err(err) => {
+                    set_last_error(&err.to_string());
+                    return -1;
+                }
+            },
             Scale::Tdb => Epoch::from_mjd_tdb(mjd),
         };
-        let iso = epoch.to_iso_utc();
+        let iso = match epoch.try_to_iso_utc() {
+            Ok(s) => s,
+            Err(err) => {
+                set_last_error(&err.to_string());
+                return -1;
+            }
+        };
         let bytes = iso.as_bytes();
         if bytes.len() + 1 > buf_len {
             set_last_error(&format!(

@@ -378,6 +378,10 @@ pub struct EmpyreanDebiasingConfig {
 pub const EMPYREAN_SOLVE_FOR_STATE_ONLY: i32 = 0;
 pub const EMPYREAN_SOLVE_FOR_STATE_AND_NONGRAV: i32 = 1;
 pub const EMPYREAN_SOLVE_FOR_AUTO: i32 = 2;
+/// An explicit multi-axis solve (any of DT / AMRAT / thrust, or a
+/// combination) that the three coarse codes above cannot name. The
+/// exact axes travel in the `EmpyreanSolveFor` flag struct.
+pub const EMPYREAN_SOLVE_FOR_EXPLICIT: i32 = 3;
 
 // ── Origin-policy modes ───────────────────────────────────────────
 /// Auto: selects the central body (heliocentric vs Earth-centric)
@@ -1443,9 +1447,21 @@ fn v_force_model_tier_to_int(t: UpstreamForceModelTier) -> i32 {
 
 fn solve_for_to_int(s: &SolveForParams) -> i32 {
     match s {
-        SolveForParams::StateOnly => EMPYREAN_SOLVE_FOR_STATE_ONLY,
-        SolveForParams::StateAndNonGrav => EMPYREAN_SOLVE_FOR_STATE_AND_NONGRAV,
         SolveForParams::Auto => EMPYREAN_SOLVE_FOR_AUTO,
+        SolveForParams::Explicit(sf) => {
+            let state_only = !sf.marsden && !sf.dt && !sf.amrat && sf.thrust_segments == 0;
+            let non_grav_only = sf.marsden && !sf.dt && !sf.amrat && sf.thrust_segments == 0;
+            if state_only {
+                EMPYREAN_SOLVE_FOR_STATE_ONLY
+            } else if non_grav_only {
+                EMPYREAN_SOLVE_FOR_STATE_AND_NONGRAV
+            } else {
+                // DT / AMRAT / thrust (or a combination) — not nameable
+                // by the coarse codes; the EmpyreanSolveFor flag struct
+                // carries the exact axes.
+                EMPYREAN_SOLVE_FOR_EXPLICIT
+            }
+        }
     }
 }
 
@@ -1463,8 +1479,9 @@ fn coord_rep_to_int(r: CoordinateRepresentation) -> i32 {
 /// Read the fitted orbit's **absolute** non-gravitational model off an
 /// [`ODResult`] and flatten it for the C ABI. Returns `(0, default)` for a
 /// gravity-only orbit. The g(r) exponents are pulled straight off the
-/// `GFunction` (its fields are public); SRP models (not yet surfaced at the
-/// C ABI) emit a zeroed g(r) so downstream treats it as inverse-square.
+/// `GFunction` (its fields are public). `NonGravModel` is Marsden-only in
+/// v1.20.0 — SRP is a separate first-class slot (`SRPForceParams`), no
+/// longer a non-grav model variant.
 fn od_result_non_grav_to_c(od: &ODResult) -> (u8, EmpyreanNonGravParams) {
     match od.orbit.non_grav_params(0) {
         Some(ng) => {
@@ -1479,7 +1496,6 @@ fn od_result_non_grav_to_c(od: &ODResult) -> (u8, EmpyreanNonGravParams) {
                     (0.0, 0.0, 0.0, 0.0, 0.0)
                 }
                 NonGravModel::MarsdenSekanina(g) => (g.alpha, g.r0, g.m, g.n, g.k),
-                _ => (0.0, 0.0, 0.0, 0.0, 0.0),
             };
             let (has_dt, non_grav_dt) = match ng.dt {
                 Some(d) => (1u8, d),
@@ -1561,9 +1577,15 @@ fn od_orbit_to_propagated(
 
 fn int_to_solve_for(v: i32) -> Result<SolveForParams, String> {
     match v {
-        EMPYREAN_SOLVE_FOR_STATE_ONLY => Ok(SolveForParams::StateOnly),
-        EMPYREAN_SOLVE_FOR_STATE_AND_NONGRAV => Ok(SolveForParams::StateAndNonGrav),
+        EMPYREAN_SOLVE_FOR_STATE_ONLY => Ok(SolveForParams::state_only()),
+        EMPYREAN_SOLVE_FOR_STATE_AND_NONGRAV => Ok(SolveForParams::state_and_non_grav()),
         EMPYREAN_SOLVE_FOR_AUTO => Ok(SolveForParams::Auto),
+        EMPYREAN_SOLVE_FOR_EXPLICIT => Err(
+            "solve_for = EXPLICIT (3) requires the per-axis solve_for flags \
+             (marsden / dt / amrat / thrust_segments); pass them via the \
+             EmpyreanSolveFor flag struct on EmpyreanODConfig"
+                .to_string(),
+        ),
         other => Err(format!("unknown solve_for code: {other}")),
     }
 }

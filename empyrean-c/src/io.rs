@@ -400,6 +400,9 @@ pub(crate) fn batch_to_orbits(batch: &EmpyreanOrbitBatch) -> Result<Orbits<AU>, 
                 } else {
                     None
                 },
+                // DT is a fittable axis in v1.20.0; this forward
+                // orbit-construction path carries no DT prior.
+                dt_variance: None,
             };
             out.set_non_grav_params(i, Some(params));
         }
@@ -482,13 +485,13 @@ pub(crate) fn orbits_to_batch(orbits: &Orbits<AU>) -> Result<EmpyreanOrbitBatch,
             orbit.a2 = ng.a2;
             orbit.a3 = ng.a3;
             orbit.non_grav_dt = ng.dt.unwrap_or(f64::NAN);
-            if let NonGravModel::MarsdenSekanina(g) = &ng.model {
-                orbit.ng_alpha = g.alpha;
-                orbit.ng_r0 = g.r0;
-                orbit.ng_m = g.m;
-                orbit.ng_n = g.n;
-                orbit.ng_k = g.k;
-            }
+            // NonGravModel is Marsden-only in v1.20.0 — irrefutable.
+            let NonGravModel::MarsdenSekanina(g) = &ng.model;
+            orbit.ng_alpha = g.alpha;
+            orbit.ng_r0 = g.r0;
+            orbit.ng_m = g.m;
+            orbit.ng_n = g.n;
+            orbit.ng_k = g.k;
         }
         unsafe { orbits_ptr.add(i).write(orbit) };
         let id_c =

@@ -267,6 +267,13 @@ typedef struct Session Session;
 #define EMPYREAN_SOLVE_FOR_AUTO 2
 
 /**
+ * An explicit multi-axis solve (any of DT / AMRAT / thrust, or a
+ * combination) that the three coarse codes above cannot name. The
+ * exact axes travel in the `EmpyreanSolveFor` flag struct.
+ */
+#define EMPYREAN_SOLVE_FOR_EXPLICIT 3
+
+/**
  * Auto: selects the central body (heliocentric vs Earth-centric)
  * automatically. Default for `EmpyreanODConfig::origin`.
  */

@@ -1028,6 +1028,9 @@ pub(crate) fn empyrean_orbit_non_grav_params(orbit: &EmpyreanOrbit) -> Option<No
         } else {
             None
         },
+        // DT is a fittable axis in v1.20.0; propagation input carries
+        // the DT value (above) but no fit prior.
+        dt_variance: None,
     })
 }
 

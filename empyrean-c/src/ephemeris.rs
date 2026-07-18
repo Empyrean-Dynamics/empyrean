@@ -276,6 +276,9 @@ pub(crate) fn build_orbits_for_ephemeris(
                 } else {
                     None
                 },
+                // DT is a fittable axis in v1.20.0; this forward
+                // orbit-construction path carries no DT prior.
+                dt_variance: None,
             };
             orbits.set_non_grav_params(i, Some(params));
         }
@@ -475,8 +478,11 @@ pub(crate) fn marshal_ephemeris_result(
         let origin = chain.origin().naif_id();
         let epochs = chain.epochs();
         for (i, &epoch_mjd_tdb) in epochs.iter().enumerate() {
-            let (jac, n_params) = if let Some(jw) = chain.jacobian_wide(i) {
-                (flatten_2d(&jw.matrix), 9u8)
+            let (jac, n_params) = if let Some((jw, active_width)) = chain.jacobian_wide(i) {
+                // v1.20.0: jacobian_wide is width-tagged — the wide STM
+                // spans 7..=17 columns now (DT / AMRAT / thrust), no
+                // longer a fixed 9. Report the real active width.
+                (flatten_2d(&jw.matrix), active_width as u8)
             } else if let Some(j) = chain.jacobian(i) {
                 (flatten_2d(&j.matrix), 6u8)
             } else {

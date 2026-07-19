@@ -48,15 +48,17 @@ mod rejection;
 mod result;
 mod weighting;
 
-pub use config::{AcceptabilityThresholds, AutoEscalationPolicy, IODConfig, ODConfig};
+pub use config::{
+    AcceptabilityThresholds, AutoEscalationPolicy, IODConfig, ODConfig, PhotometryConfig,
+};
 pub use debiasing::{DebiasingConfig, DebiasingResolution};
 pub use nuisance::StationRaDecConfig;
 pub use observation::{Observation, Observations, RadarMeasurement, RadarObservation};
 pub use rejection::{RejectionConfig, RejectionKind};
 pub use result::{
-    AcceptabilityReport, CovarianceRepresentation, DetermineResult, EvaluateResult,
-    ObservationResidual, OriginPolicy, OutputEpoch, RejectionReason, ResidualSummary,
-    SolveForParams, StationBias,
+    AcceptabilityReport, BandStat, CovarianceRepresentation, DetermineResult, EvaluateResult,
+    GateRecord, ObservationResidual, OriginPolicy, OutputEpoch, PhotometryModel, PhotometryResult,
+    RejectionReason, ResidualSummary, SolveFor, SolveForParams, SolvedCovariance, StationBias,
 };
 pub use weighting::{SigmaPolicy, WeightingConfig, WeightingLayer, WeightingPreset};
 
@@ -257,6 +259,17 @@ fn ffi_od_result_to_rust(
                     .collect()
             }
         };
+    let solved_covariance = (result.has_solved_covariance != 0)
+        .then(|| SolvedCovariance::from_ffi(&result.solved_covariance));
+    let thrust_delta_m_per_s: Vec<[f64; 3]> = result.thrust_delta_m_per_s
+        [..result.thrust_delta_count as usize]
+        .to_vec();
+    // dv_frame is only meaningful when a thrust segment was solved.
+    let dv_frame = (result.thrust_delta_count > 0)
+        .then(|| crate::coordinate::int_to_frame(result.dv_frame).ok())
+        .flatten();
+    let photometry =
+        (result.has_photometry != 0).then(|| PhotometryResult::from_ffi(&result.photometry));
     Ok(DetermineResult {
         orbit,
         residuals,
@@ -273,9 +286,20 @@ fn ffi_od_result_to_rust(
         rejection_passes: result.rejection_passes,
         num_oppositions_fit: result.num_oppositions_fit,
         force_model_used,
-        solve_for_used: SolveForParams::from_int(result.solve_for_used),
+        // Reconstruct the solved axes: an Explicit fit's exact set is
+        // recovered from the covariance slot tags, not the coarse code.
+        solve_for_used: SolveForParams::from_result(
+            result.solve_for_used,
+            solved_covariance.as_ref(),
+        ),
         acceptability,
         station_biases,
+        solved_covariance,
+        dt_delta: (result.has_dt_delta != 0).then_some(result.dt_delta),
+        amrat_delta: (result.has_amrat_delta != 0).then_some(result.amrat_delta),
+        thrust_delta_m_per_s,
+        dv_frame,
+        photometry,
     })
 }
 

@@ -29,7 +29,16 @@ from empyrean.od.residuals import (
     ResidualSummary,
     StationBiases,
 )
-from empyrean.od.result import DetermineResult, EvaluateResult, ODConfig
+from empyrean.od.result import (
+    BandStat,
+    DetermineResult,
+    EvaluateResult,
+    GateRecord,
+    ODConfig,
+    PhotometryModel,
+    PhotometryResult,
+    SolvedCovariance,
+)
 from empyrean.orbits.orbits import CartesianOrbits
 from empyrean.propagation.config import _FORCE_MODEL_TO_INT, ForceModelTier
 
@@ -744,6 +753,97 @@ def refine(
     return _build_determine_result(result)
 
 
+def _build_solved_covariance(d: ResultDict | None) -> SolvedCovariance | None:
+    """Build a :class:`SolvedCovariance` from the nested ``solved_covariance``
+    dict, or ``None`` when the fit solved only the 6-element state.
+
+    The slot fields are read with ``.get`` so an unsolved axis reads as
+    ``None`` (never 0) — a slot of 0 would be a bug since the state
+    always occupies columns 0..5.
+    """
+    if d is None:
+        return None
+    width = int(d["width"])
+    matrix = np.asarray(d["matrix"], dtype=np.float64).reshape(width, width)
+
+    def _slot(key: str) -> int | None:
+        v = d.get(key)
+        return int(v) if v is not None else None
+
+    thrust_slots = [tuple(int(i) for i in s) for s in d.get("thrust_slots", [])]
+    return SolvedCovariance(
+        matrix=matrix,
+        width=width,
+        marsden_slot=_slot("marsden_slot"),
+        dt_slot=_slot("dt_slot"),
+        amrat_slot=_slot("amrat_slot"),
+        thrust_slots=thrust_slots,
+    )
+
+
+def _build_photometry_result(d: ResultDict | None) -> PhotometryResult | None:
+    """Build a :class:`PhotometryResult` from the nested ``photometry``
+    dict, or ``None`` when photometry did not run.
+
+    Per-band / gate arrays arrive as parallel struct-of-arrays and are
+    zipped back into :class:`BandStat` / :class:`GateRecord` rows.
+    """
+    if d is None:
+        return None
+
+    cov_flat = d.get("covariance")
+    covariance = (
+        np.asarray(cov_flat, dtype=np.float64).reshape(3, 3) if cov_flat is not None else None
+    )
+
+    per_band = [
+        BandStat(
+            band=band,
+            n=int(n),
+            offset_applied=float(offset),
+            mean_residual=float(mean),
+            rms=float(rms),
+        )
+        for band, n, offset, mean, rms in zip(
+            d.get("band", []),
+            d.get("band_n", []),
+            np.asarray(d.get("band_offset_applied", []), dtype=np.float64),
+            np.asarray(d.get("band_mean_residual", []), dtype=np.float64),
+            np.asarray(d.get("band_rms", []), dtype=np.float64),
+            strict=True,
+        )
+    ]
+    gates = [
+        GateRecord(model=PhotometryModel(model), passed=bool(passed), reason=reason)
+        for model, passed, reason in zip(
+            d.get("gate_model", []),
+            d.get("gate_passed", []),
+            d.get("gate_reason", []),
+            strict=True,
+        )
+    ]
+
+    return PhotometryResult(
+        h=float(d["h"]),
+        slope1=float(d["slope1"]),
+        slope2=float(d["slope2"]),
+        covariance=covariance,
+        model_used=PhotometryModel(d["model_used"]),
+        reduced_chi2=float(d["reduced_chi2"]),
+        constraint_active=bool(d["constraint_active"]),
+        n_mags_used=int(d["n_mags_used"]),
+        n_mags_rejected_photometric=int(d["n_mags_rejected_photometric"]),
+        n_obs_without_mags=int(d["n_obs_without_mags"]),
+        n_mags_from_astrometric_selected=int(d["n_mags_from_astrometric_selected"]),
+        n_mags_from_astrometric_rejected=int(d["n_mags_from_astrometric_rejected"]),
+        alpha_min_deg=float(d["alpha_min_deg"]),
+        alpha_max_deg=float(d["alpha_max_deg"]),
+        alpha_span_deg=float(d["alpha_span_deg"]),
+        per_band=per_band,
+        gates=gates,
+    )
+
+
 def _build_determine_result(result: ResultDict) -> DetermineResult:
     """Assemble a :class:`DetermineResult` from a Rust _determine /
     _refine result dict."""
@@ -787,6 +887,23 @@ def _build_determine_result(result: ResultDict) -> DetermineResult:
     else:
         station_biases = StationBiases.empty()
 
+    # ── Wide fitting surface (v0.9.0) ───────────────────────────────
+    # Every key is read with `.get` so a dropped / unsolved axis reads
+    # as None (never 0 / NaN) — the loud-None contract.
+    solved_covariance = _build_solved_covariance(result.get("solved_covariance"))
+    dt_delta = result.get("dt_delta")
+    dt_delta = float(dt_delta) if dt_delta is not None else None
+    amrat_delta = result.get("amrat_delta")
+    amrat_delta = float(amrat_delta) if amrat_delta is not None else None
+    thrust_delta = result.get("thrust_delta_m_per_s")
+    thrust_delta_arr = (
+        np.asarray(thrust_delta, dtype=np.float64).reshape(-1, 3)
+        if thrust_delta is not None
+        else None
+    )
+    dv_frame = result.get("dv_frame")
+    photometry = _build_photometry_result(result.get("photometry"))
+
     return DetermineResult(
         orbit=orbit,
         observations=obs_results,
@@ -804,4 +921,10 @@ def _build_determine_result(result: ResultDict) -> DetermineResult:
         solve_for_used=_SFP(result["solve_for_used"]),
         acceptability=acceptability,
         station_biases=station_biases,
+        solved_covariance=solved_covariance,
+        dt_delta=dt_delta,
+        amrat_delta=amrat_delta,
+        thrust_delta_m_per_s=thrust_delta_arr,
+        dv_frame=dv_frame,
+        photometry=photometry,
     )

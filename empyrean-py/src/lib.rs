@@ -3840,6 +3840,48 @@ fn build_od_config_from_dict(d: &Bound<'_, PyDict>) -> PyResult<empyrean::ODConf
             }
         };
     }
+    // Explicit per-axis solve request (overrides the coarse `solve_for`).
+    if let Some(sf) = get_dict(d, "solve_for_flags")? {
+        cfg.solve_for = empyrean::SolveForParams::Explicit(empyrean::SolveFor {
+            marsden: get_bool(&sf, "marsden")?.unwrap_or(false),
+            dt: get_bool(&sf, "dt")?.unwrap_or(false),
+            amrat: get_bool(&sf, "amrat")?.unwrap_or(false),
+            thrust_segments: get_u32(&sf, "thrust_segments")?.unwrap_or(0),
+        });
+    }
+    if let Some(v) = get_bool(d, "allow_unbracketed_maneuvers")? {
+        cfg.allow_unbracketed_maneuvers = v;
+    }
+    if let Some(ph) = get_dict(d, "photometry")? {
+        let mut pc = empyrean::PhotometryConfig::default();
+        if let Some(m) = get_str(&ph, "model")? {
+            pc.model = match m.to_ascii_lowercase().as_str() {
+                "auto" => empyrean::PhotometryModel::Auto,
+                "honly" | "h_only" | "h" => empyrean::PhotometryModel::HOnly,
+                "hg" => empyrean::PhotometryModel::HG,
+                "hg12" => empyrean::PhotometryModel::HG12,
+                "hg1g2" => empyrean::PhotometryModel::HG1G2,
+                other => {
+                    return Err(PyValueError::new_err(format!(
+                        "unknown photometry model: {other}"
+                    )));
+                }
+            };
+        }
+        if let Some(v) = get_f64(&ph, "sigma_lightcurve")? {
+            pc.sigma_lightcurve = v;
+        }
+        if let Some(v) = get_bool(&ph, "include_rejected")? {
+            pc.include_rejected = v;
+        }
+        if let Some(v) = get_u32(&ph, "max_irls_iterations")? {
+            pc.max_irls_iterations = v;
+        }
+        if let Some(v) = get_f64(&ph, "huber_k")? {
+            pc.huber_k = v;
+        }
+        cfg.photometry = Some(pc);
+    }
 
     if let Some(ae) = get_dict(d, "auto_escalation")? {
         if let Some(v) = get_f64(&ae, "reduced_chi2")? {
@@ -5388,6 +5430,103 @@ impl PyBuiltSystem {
     }
 }
 
+fn photometry_model_str(m: empyrean::PhotometryModel) -> &'static str {
+    match m {
+        empyrean::PhotometryModel::Auto => "auto",
+        empyrean::PhotometryModel::HOnly => "honly",
+        empyrean::PhotometryModel::HG => "hg",
+        empyrean::PhotometryModel::HG12 => "hg12",
+        empyrean::PhotometryModel::HG1G2 => "hg1g2",
+    }
+}
+
+/// Tagged solved-parameter covariance → nested dict. `matrix` is
+/// row-major `width × width`; parameters are located by the slot fields.
+fn solved_covariance_to_dict<'py>(
+    py: Python<'py>,
+    cov: &empyrean::SolvedCovariance,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    let flat: Vec<f64> = cov.matrix.iter().flatten().copied().collect();
+    d.set_item("matrix", flat)?;
+    d.set_item("width", cov.width)?;
+    if let Some(s) = cov.marsden_slot {
+        d.set_item("marsden_slot", s)?;
+    }
+    if let Some(s) = cov.dt_slot {
+        d.set_item("dt_slot", s)?;
+    }
+    if let Some(s) = cov.amrat_slot {
+        d.set_item("amrat_slot", s)?;
+    }
+    let thrust: Vec<Vec<usize>> = cov.thrust_slots.iter().map(|s| s.to_vec()).collect();
+    d.set_item("thrust_slots", thrust)?;
+    Ok(d)
+}
+
+/// Post-OD photometric solution → nested dict. Per-band / gate arrays use
+/// the struct-of-arrays convention (parallel keys), matching the rest of
+/// the OD result surface.
+fn photometry_to_dict<'py>(
+    py: Python<'py>,
+    p: &empyrean::PhotometryResult,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("h", p.h)?;
+    d.set_item("slope1", p.slope1)?;
+    d.set_item("slope2", p.slope2)?;
+    if let Some(c) = &p.covariance {
+        let flat: Vec<f64> = c.iter().flatten().copied().collect();
+        d.set_item("covariance", flat)?;
+    }
+    d.set_item("model_used", photometry_model_str(p.model_used))?;
+    d.set_item("reduced_chi2", p.reduced_chi2)?;
+    d.set_item("constraint_active", p.constraint_active)?;
+    d.set_item("n_mags_used", p.n_mags_used)?;
+    d.set_item("n_mags_rejected_photometric", p.n_mags_rejected_photometric)?;
+    d.set_item("n_obs_without_mags", p.n_obs_without_mags)?;
+    d.set_item(
+        "n_mags_from_astrometric_selected",
+        p.n_mags_from_astrometric_selected,
+    )?;
+    d.set_item(
+        "n_mags_from_astrometric_rejected",
+        p.n_mags_from_astrometric_rejected,
+    )?;
+    d.set_item("alpha_min_deg", p.alpha_min_deg)?;
+    d.set_item("alpha_max_deg", p.alpha_max_deg)?;
+    d.set_item("alpha_span_deg", p.alpha_span_deg)?;
+    // Per-band statistics (struct-of-arrays).
+    let bands: Vec<String> = p.per_band.iter().map(|b| b.band.clone()).collect();
+    let band_n: Vec<usize> = p.per_band.iter().map(|b| b.n).collect();
+    d.set_item("band", bands)?;
+    d.set_item("band_n", band_n)?;
+    d.set_item(
+        "band_offset_applied",
+        PyArray1::from_vec(py, p.per_band.iter().map(|b| b.offset_applied).collect()),
+    )?;
+    d.set_item(
+        "band_mean_residual",
+        PyArray1::from_vec(py, p.per_band.iter().map(|b| b.mean_residual).collect()),
+    )?;
+    d.set_item(
+        "band_rms",
+        PyArray1::from_vec(py, p.per_band.iter().map(|b| b.rms).collect()),
+    )?;
+    // Model-ladder gate records (struct-of-arrays).
+    let gate_model: Vec<&str> = p
+        .gates
+        .iter()
+        .map(|g| photometry_model_str(g.model))
+        .collect();
+    let gate_passed: Vec<bool> = p.gates.iter().map(|g| g.passed).collect();
+    let gate_reason: Vec<String> = p.gates.iter().map(|g| g.reason.clone()).collect();
+    d.set_item("gate_model", gate_model)?;
+    d.set_item("gate_passed", gate_passed)?;
+    d.set_item("gate_reason", gate_reason)?;
+    Ok(d)
+}
+
 fn add_station_biases_to_dict(
     dict: &Bound<'_, PyDict>,
     biases: &[empyrean::StationBias],
@@ -5515,10 +5654,42 @@ fn determine_result_to_pydict<'py>(
         empyrean::SolveForParams::StateOnly => "state_only",
         empyrean::SolveForParams::StateAndNonGrav => "state_and_nongrav",
         empyrean::SolveForParams::Auto => "auto",
+        // The exact axes are carried on `solved_covariance` (slot tags).
+        empyrean::SolveForParams::Explicit(_) => "explicit",
     };
     dict.set_item("solve_for_used", solve_for_str)?;
 
     add_station_biases_to_dict(&dict, &result.station_biases)?;
+
+    // ── Wide fitting surface (v0.9.0) ───────────────────────────────
+    if let Some(cov) = &result.solved_covariance {
+        dict.set_item("solved_covariance", solved_covariance_to_dict(py, cov)?)?;
+    }
+    if let Some(d) = result.dt_delta {
+        dict.set_item("dt_delta", d)?;
+    }
+    if let Some(a) = result.amrat_delta {
+        dict.set_item("amrat_delta", a)?;
+    }
+    if !result.thrust_delta_m_per_s.is_empty() {
+        let thrust: Vec<Vec<f64>> = result
+            .thrust_delta_m_per_s
+            .iter()
+            .map(|d| d.to_vec())
+            .collect();
+        dict.set_item("thrust_delta_m_per_s", thrust)?;
+    }
+    if let Some(f) = result.dv_frame {
+        let fs = match f {
+            empyrean::Frame::ICRF => "icrf",
+            empyrean::Frame::EclipticJ2000 => "eclipticj2000",
+            empyrean::Frame::ITRF93 => "itrf93",
+        };
+        dict.set_item("dv_frame", fs)?;
+    }
+    if let Some(p) = &result.photometry {
+        dict.set_item("photometry", photometry_to_dict(py, p)?)?;
+    }
 
     Ok(dict)
 }

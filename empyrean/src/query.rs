@@ -104,6 +104,13 @@ fn ffi_batch_to_owned(batch: &empyrean_sys::EmpyreanOrbitBatch) -> Result<OrbitB
             } else {
                 None
             },
+            non_grav_dt_variance: if ffi_orbit.non_grav_dt_variance.is_finite()
+                && ffi_orbit.non_grav_dt_variance > 0.0
+            {
+                Some(ffi_orbit.non_grav_dt_variance)
+            } else {
+                None
+            },
             // Non-grav covariance is an OD-output concept; SBDB/query orbits
             // don't carry it.
             ng_covariance: None,

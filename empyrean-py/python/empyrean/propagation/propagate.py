@@ -264,6 +264,7 @@ def propagate(
     # Non-grav parameters
     n = len(orbits)
     non_grav_dts: np.ndarray | None = None
+    non_grav_dt_variances: np.ndarray | None = None
     # g(r) Marsden–Sekanina exponents. Passed only when a non-default g(r)
     # is present (any non-zero α/r0/m/n/k); all-zero is the inverse-square
     # asteroid default that the engine applies without a marshal.
@@ -287,6 +288,12 @@ def propagate(
         dt_col = np.asarray(ng.dt.to_numpy(zero_copy_only=False), dtype=np.float64)
         if np.isfinite(dt_col).any():
             non_grav_dts = dt_col
+        # DT prior variance — opens the DT column in a StateAndNonGravAndDT
+        # solve. Gated like non_grav_dts (finite positive) so the no-prior
+        # asteroid-only case avoids an FFI marshal.
+        dtv_col = np.asarray(ng.dt_variance.to_numpy(zero_copy_only=False), dtype=np.float64)
+        if (np.isfinite(dtv_col) & (dtv_col > 0.0)).any():
+            non_grav_dt_variances = dtv_col
         # g(r) exponents — carry the comet Marsden–Sekanina g(r) so a fitted
         # or SBDB comet orbit isn't silently propagated with inverse-square.
         alpha_col = np.nan_to_num(
@@ -427,6 +434,7 @@ def propagate(
         epsilon=epsilon,
         thrust_arcs=thrust_arg,
         non_grav_dts=non_grav_dts,
+        non_grav_dt_variances=non_grav_dt_variances,
         has_non_grav_cov=has_non_grav_cov,
         non_grav_cov=non_grav_cov,
         ng_alphas=ng_alphas,

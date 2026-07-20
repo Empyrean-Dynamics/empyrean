@@ -261,9 +261,8 @@ fn ffi_od_result_to_rust(
         };
     let solved_covariance = (result.has_solved_covariance != 0)
         .then(|| SolvedCovariance::from_ffi(&result.solved_covariance));
-    let thrust_delta_m_per_s: Vec<[f64; 3]> = result.thrust_delta_m_per_s
-        [..result.thrust_delta_count as usize]
-        .to_vec();
+    let thrust_delta_m_per_s: Vec<[f64; 3]> =
+        result.thrust_delta_m_per_s[..result.thrust_delta_count as usize].to_vec();
     // dv_frame is only meaningful when a thrust segment was solved.
     let dv_frame = (result.thrust_delta_count > 0)
         .then(|| crate::coordinate::int_to_frame(result.dv_frame).ok())

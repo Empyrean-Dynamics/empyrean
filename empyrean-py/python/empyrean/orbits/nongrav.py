@@ -34,6 +34,10 @@ class NonGravParams(qv.Table):
     # Time delay for g(r) evaluation (days)
     dt = qv.Float64Column(nullable=True)  # outgassing peak offset from perihelion
 
+    # Prior variance on DT (days^2); set to open + prior the DT column in a
+    # StateAndNonGravAndDT refine. Null / <=0 = no prior (DT column stays closed).
+    dt_variance = qv.Float64Column(nullable=True)
+
     # Fitted non-grav 3x3 covariance for (A1, A2, A3), row-major flattened
     # (9 values). Populated by orbit determination (StateAndNonGrav fits) so a
     # fitted orbit re-feeds into a StateAndNonGrav refine without losing its

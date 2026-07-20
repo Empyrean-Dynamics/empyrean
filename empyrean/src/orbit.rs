@@ -76,6 +76,10 @@ pub struct Orbit {
     /// `None` is the asteroid default (no time delay); SBDB populates
     /// this for some Jupiter-family comets and 2I/Borisov.
     pub non_grav_dt: Option<f64>,
+    /// Prior variance on the non-grav time delay DT (days²). `None` = no
+    /// prior (the DT column stays closed); `Some(v)` with `v > 0` opens and
+    /// priors the DT column in a `StateAndNonGravAndDT` refine.
+    pub non_grav_dt_variance: Option<f64>,
     /// Fitted non-grav 3×3 covariance for (A1, A2, A3), row-major. Set by
     /// the OD output path (a fitted orbit) so the orbit re-feeds into a
     /// `StateAndNonGrav` refine without losing its non-grav prior.
@@ -115,6 +119,7 @@ impl Orbit {
             ng_n: 0.0,
             ng_k: 0.0,
             non_grav_dt: None,
+            non_grav_dt_variance: None,
             ng_covariance: None,
             phot_system: None,
             h_mag: f64::NAN,
@@ -171,6 +176,15 @@ impl Orbit {
     /// (+12d), and 2I/Borisov (−65d) are the common cases.
     pub fn with_non_grav_dt(mut self, dt: Option<f64>) -> Self {
         self.non_grav_dt = dt;
+        self
+    }
+
+    /// Set the prior variance on the non-grav time delay DT (days²). Pass
+    /// `None` (the default) to leave the DT column closed; pass `Some(v)`
+    /// with `v > 0` to open and prior the DT column in a
+    /// `StateAndNonGravAndDT` refine.
+    pub fn with_non_grav_dt_variance(mut self, v: Option<f64>) -> Self {
+        self.non_grav_dt_variance = v;
         self
     }
 
@@ -293,6 +307,10 @@ impl Orbit {
             // struct can't carry an Option directly. The C side checks
             // is_finite() to decide whether to populate NonGravParams.dt.
             non_grav_dt: self.non_grav_dt.unwrap_or(f64::NAN),
+            // C ABI uses NaN as the "no DT prior" sentinel; the C side checks
+            // is_finite() && > 0 to decide whether to open + prior the DT
+            // column in a StateAndNonGravAndDT fit.
+            non_grav_dt_variance: self.non_grav_dt_variance.unwrap_or(f64::NAN),
             // Carry the fitted non-grav prior covariance into the FFI so a
             // fitted orbit re-feeds into a StateAndNonGrav refine.
             has_non_grav_covariance: u8::from(self.ng_covariance.is_some()),

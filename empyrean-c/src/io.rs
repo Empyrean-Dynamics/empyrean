@@ -207,6 +207,9 @@ fn row_to_orbit(row: &OrbitRow) -> Result<(EmpyreanOrbit, String, Option<String>
         // non-grav DT yet; round-trip restores NaN (no delay) until
         // villeneuve::io::orbit_row gets a `non_grav_dt` field.
         non_grav_dt: f64::NAN,
+        // OrbitRow JSON/parquet schema does not carry the DT prior variance
+        // either; round-trip restores NaN (no prior).
+        non_grav_dt_variance: f64::NAN,
         // Non-grav covariance is an OD-output concept (a fitted prior); the
         // orbit-read paths don't carry it.
         has_non_grav_covariance: 0,
@@ -400,9 +403,16 @@ pub(crate) fn batch_to_orbits(batch: &EmpyreanOrbitBatch) -> Result<Orbits<AU>, 
                 } else {
                     None
                 },
-                // DT is a fittable axis in v1.20.0; this forward
-                // orbit-construction path carries no DT prior.
-                dt_variance: None,
+                // DT is a fittable axis in v1.20.0; carry the DT prior variance
+                // when the input orbit supplies one so it opens the DT column
+                // downstream.
+                dt_variance: if orbit.non_grav_dt_variance.is_finite()
+                    && orbit.non_grav_dt_variance > 0.0
+                {
+                    Some(orbit.non_grav_dt_variance)
+                } else {
+                    None
+                },
             };
             out.set_non_grav_params(i, Some(params));
         }
@@ -449,6 +459,7 @@ pub(crate) fn orbits_to_batch(orbits: &Orbits<AU>) -> Result<EmpyreanOrbitBatch,
             ng_n: 0.0,
             ng_k: 0.0,
             non_grav_dt: f64::NAN,
+            non_grav_dt_variance: f64::NAN,
             // Non-grav covariance is an OD-output concept; the read-orbits
             // path doesn't carry it.
             has_non_grav_covariance: 0,
@@ -485,6 +496,7 @@ pub(crate) fn orbits_to_batch(orbits: &Orbits<AU>) -> Result<EmpyreanOrbitBatch,
             orbit.a2 = ng.a2;
             orbit.a3 = ng.a3;
             orbit.non_grav_dt = ng.dt.unwrap_or(f64::NAN);
+            orbit.non_grav_dt_variance = ng.dt_variance.unwrap_or(f64::NAN);
             // NonGravModel is Marsden-only in v1.20.0 — irrefutable.
             let NonGravModel::MarsdenSekanina(g) = &ng.model;
             orbit.ng_alpha = g.alpha;

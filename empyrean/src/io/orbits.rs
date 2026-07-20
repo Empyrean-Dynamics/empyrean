@@ -189,6 +189,12 @@ fn ffi_orbit_to_owned(o: &empyrean_sys::EmpyreanOrbit) -> Result<Orbit> {
         } else {
             None
         },
+        non_grav_dt_variance: if o.non_grav_dt_variance.is_finite() && o.non_grav_dt_variance > 0.0
+        {
+            Some(o.non_grav_dt_variance)
+        } else {
+            None
+        },
         // Non-grav covariance is an OD-output concept; orbit reads don't carry it.
         ng_covariance: None,
         phot_system,

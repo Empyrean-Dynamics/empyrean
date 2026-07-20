@@ -270,6 +270,8 @@ pub struct EmpyreanOrbit {
     pub ng_k: f64,
     #[doc = " SBDB non-grav time delay in days. Use NaN for no delay (the\n asteroid default and the Marsden water-ice default for comets\n SBDB doesn't fit a delay for). Set to a finite value (positive\n or negative) when SBDB's `model_pars[]` exposes a `DT` field —\n e.g. 67P (+45.7d), 46P/Wirtanen (−14.1d), 2I/Borisov (−65.1d)."]
     pub non_grav_dt: f64,
+    #[doc = " Prior variance on the non-grav time delay DT (days²). NaN or ≤0 = no\n prior; a finite positive value opens + priors the DT column in a\n StateAndNonGravAndDT fit."]
+    pub non_grav_dt_variance: f64,
     #[doc = " 1 when `non_grav_covariance` carries a non-grav prior covariance; 0\n otherwise. Set by the OD output path (a fitted orbit) so it re-feeds\n into a StateAndNonGrav refine without losing its non-grav prior;\n leave 0 for hand-built / SBDB / propagate inputs."]
     pub has_non_grav_covariance: u8,
     #[doc = " Non-grav 3×3 covariance for (A1, A2, A3), row-major. Only read when\n `has_non_grav_covariance = 1`."]
@@ -297,7 +299,7 @@ pub struct EmpyreanOrbit {
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of EmpyreanOrbit"][::std::mem::size_of::<EmpyreanOrbit>() - 608usize];
+    ["Size of EmpyreanOrbit"][::std::mem::size_of::<EmpyreanOrbit>() - 616usize];
     ["Alignment of EmpyreanOrbit"][::std::mem::align_of::<EmpyreanOrbit>() - 8usize];
     ["Offset of field: EmpyreanOrbit::state"]
         [::std::mem::offset_of!(EmpyreanOrbit, state) - 0usize];
@@ -320,30 +322,32 @@ const _: () = {
         [::std::mem::offset_of!(EmpyreanOrbit, ng_k) - 432usize];
     ["Offset of field: EmpyreanOrbit::non_grav_dt"]
         [::std::mem::offset_of!(EmpyreanOrbit, non_grav_dt) - 440usize];
+    ["Offset of field: EmpyreanOrbit::non_grav_dt_variance"]
+        [::std::mem::offset_of!(EmpyreanOrbit, non_grav_dt_variance) - 448usize];
     ["Offset of field: EmpyreanOrbit::has_non_grav_covariance"]
-        [::std::mem::offset_of!(EmpyreanOrbit, has_non_grav_covariance) - 448usize];
+        [::std::mem::offset_of!(EmpyreanOrbit, has_non_grav_covariance) - 456usize];
     ["Offset of field: EmpyreanOrbit::non_grav_covariance"]
-        [::std::mem::offset_of!(EmpyreanOrbit, non_grav_covariance) - 456usize];
+        [::std::mem::offset_of!(EmpyreanOrbit, non_grav_covariance) - 464usize];
     ["Offset of field: EmpyreanOrbit::phot_system"]
-        [::std::mem::offset_of!(EmpyreanOrbit, phot_system) - 528usize];
+        [::std::mem::offset_of!(EmpyreanOrbit, phot_system) - 536usize];
     ["Offset of field: EmpyreanOrbit::h_mag"]
-        [::std::mem::offset_of!(EmpyreanOrbit, h_mag) - 536usize];
+        [::std::mem::offset_of!(EmpyreanOrbit, h_mag) - 544usize];
     ["Offset of field: EmpyreanOrbit::slope1"]
-        [::std::mem::offset_of!(EmpyreanOrbit, slope1) - 544usize];
+        [::std::mem::offset_of!(EmpyreanOrbit, slope1) - 552usize];
     ["Offset of field: EmpyreanOrbit::slope2"]
-        [::std::mem::offset_of!(EmpyreanOrbit, slope2) - 552usize];
+        [::std::mem::offset_of!(EmpyreanOrbit, slope2) - 560usize];
     ["Offset of field: EmpyreanOrbit::thrust_arcs"]
-        [::std::mem::offset_of!(EmpyreanOrbit, thrust_arcs) - 560usize];
+        [::std::mem::offset_of!(EmpyreanOrbit, thrust_arcs) - 568usize];
     ["Offset of field: EmpyreanOrbit::n_thrust_arcs"]
-        [::std::mem::offset_of!(EmpyreanOrbit, n_thrust_arcs) - 568usize];
+        [::std::mem::offset_of!(EmpyreanOrbit, n_thrust_arcs) - 576usize];
     ["Offset of field: EmpyreanOrbit::dv_corrections"]
-        [::std::mem::offset_of!(EmpyreanOrbit, dv_corrections) - 576usize];
+        [::std::mem::offset_of!(EmpyreanOrbit, dv_corrections) - 584usize];
     ["Offset of field: EmpyreanOrbit::n_dv_corrections"]
-        [::std::mem::offset_of!(EmpyreanOrbit, n_dv_corrections) - 584usize];
+        [::std::mem::offset_of!(EmpyreanOrbit, n_dv_corrections) - 592usize];
     ["Offset of field: EmpyreanOrbit::correction_covariances"]
-        [::std::mem::offset_of!(EmpyreanOrbit, correction_covariances) - 592usize];
+        [::std::mem::offset_of!(EmpyreanOrbit, correction_covariances) - 600usize];
     ["Offset of field: EmpyreanOrbit::n_correction_covariances"]
-        [::std::mem::offset_of!(EmpyreanOrbit, n_correction_covariances) - 600usize];
+        [::std::mem::offset_of!(EmpyreanOrbit, n_correction_covariances) - 608usize];
 };
 impl Default for EmpyreanOrbit {
     fn default() -> Self {

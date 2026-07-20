@@ -790,6 +790,12 @@ struct EmpyreanOrbit {
      */
     double non_grav_dt;
     /**
+     * Prior variance on the non-grav time delay DT (days²). NaN or ≤0 = no
+     * prior; a finite positive value opens + priors the DT column in a
+     * StateAndNonGravAndDT fit.
+     */
+    double non_grav_dt_variance;
+    /**
      * 1 when `non_grav_covariance` carries a non-grav prior covariance; 0
      * otherwise. Set by the OD output path (a fitted orbit) so it re-feeds
      * into a StateAndNonGrav refine without losing its non-grav prior;
@@ -2604,6 +2610,11 @@ struct EmpyreanSolveFor {
 struct EmpyreanPhotometryConfig {
     /**
      * Model to fit (`EMPYREAN_PHOTOMETRY_MODEL_*`). Default = Auto (0).
+     * In Auto the fit climbs a ladder — H-only → HG12 → HG1G2 —
+     * admitting the richest model the arc's phase-angle coverage and
+     * magnitude count support, and reports the one it fit via
+     * `model_used` (never Auto). An explicit code pins a model. HG12 /
+     * HG1G2 follow Muinonen et al. (2010); H-only holds the slope fixed.
      */
     int32_t model;
     /**

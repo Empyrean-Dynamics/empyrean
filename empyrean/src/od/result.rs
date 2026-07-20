@@ -603,21 +603,26 @@ impl SolvedCovariance {
     }
 }
 
-/// Photometric model — a fit request ([`Auto`](Self::Auto) picks the
-/// richest model the phase coverage supports) and the model a
-/// [`PhotometryResult`] actually fitted (never `Auto`).
+/// Photometric model for the post-OD phase-function fit.
+///
+/// In [`Auto`](Self::Auto) the fit climbs a model ladder —
+/// H-only → HG12 → HG1G2 — admitting the richest model the arc's
+/// phase-angle coverage and magnitude count support, and reports the
+/// one it actually fit on [`PhotometryResult::model_used`] (never
+/// `Auto`). An explicit value pins a specific model. HG12 / HG1G2
+/// follow Muinonen et al. (2010); H-only holds the slope fixed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PhotometryModel {
-    /// Choose the richest model the phase coverage supports.
+    /// Auto-select up the ladder (H-only → HG12 → HG1G2) by data richness.
     #[default]
     Auto,
     /// Fit only the absolute magnitude H (fixed slope).
     HOnly,
     /// Two-parameter H, G.
     HG,
-    /// Two-parameter H, G12.
+    /// Two-parameter H, G12 (Muinonen et al. 2010).
     HG12,
-    /// Three-parameter H, G1, G2.
+    /// Three-parameter H, G1, G2 (Muinonen et al. 2010).
     HG1G2,
 }
 

@@ -13,10 +13,10 @@ use empyrean_core::determination::{
 };
 use empyrean_core::io::{ADESObservations, parse_ades};
 use empyrean_core::nongrav::NonGravModel;
+use empyrean_core::orbits::Orbits;
 use empyrean_core::photometry::{
     FittedPhotometryModel, PhotometryConfig, PhotometryModel, PhotometryResult,
 };
-use empyrean_core::orbits::Orbits;
 
 use crate::propagate::{EmpyreanOrbit, EmpyreanPropagatedState, int_to_force_model};
 use crate::{EmpyreanContext, set_last_error};
@@ -405,10 +405,15 @@ pub const EMPYREAN_SOLVE_WIDTH: usize = 20;
 /// Marsden OR one-segment thrust).
 pub const EMPYREAN_SLOT_NONE: u32 = 0xFFFF_FFFF;
 // The frozen width can never silently fall below scott's own maximum.
-const _: () =
-    assert!(EMPYREAN_SOLVE_WIDTH >= empyrean_core::determination::MAX_SOLVE_WIDTH);
+const _: () = assert!(EMPYREAN_SOLVE_WIDTH >= empyrean_core::determination::MAX_SOLVE_WIDTH);
 
 // ── Photometry fit-model codes (config request + result report) ────
+// In AUTO the post-OD fit climbs a model ladder — H-only → HG12 → HG1G2
+// — admitting the richest model the arc's phase-angle coverage and
+// magnitude count support, and reports the one it fit via
+// `model_used` (never AUTO). An explicit code pins a specific model.
+// HG12 / HG1G2 follow Muinonen et al. (2010); H-only holds the slope
+// fixed at G = 0.15.
 pub const EMPYREAN_PHOTOMETRY_MODEL_AUTO: i32 = 0;
 pub const EMPYREAN_PHOTOMETRY_MODEL_HONLY: i32 = 1;
 pub const EMPYREAN_PHOTOMETRY_MODEL_HG: i32 = 2;
@@ -716,6 +721,11 @@ pub struct EmpyreanSolvedCovariance {
 #[derive(Clone, Copy, Default)]
 pub struct EmpyreanPhotometryConfig {
     /// Model to fit (`EMPYREAN_PHOTOMETRY_MODEL_*`). Default = Auto (0).
+    /// In Auto the fit climbs a ladder — H-only → HG12 → HG1G2 —
+    /// admitting the richest model the arc's phase-angle coverage and
+    /// magnitude count support, and reports the one it fit via
+    /// `model_used` (never Auto). An explicit code pins a model. HG12 /
+    /// HG1G2 follow Muinonen et al. (2010); H-only holds the slope fixed.
     pub model: i32,
     /// 1σ lightcurve scatter floor (mag). 0.0 → upstream default (0.2).
     pub sigma_lightcurve: f64,
@@ -1696,9 +1706,7 @@ fn zeroed_solved_covariance() -> EmpyreanSolvedCovariance {
     }
 }
 
-fn band_stats_to_c(
-    list: &[empyrean_core::photometry::BandStat],
-) -> (*mut EmpyreanBandStat, usize) {
+fn band_stats_to_c(list: &[empyrean_core::photometry::BandStat]) -> (*mut EmpyreanBandStat, usize) {
     let n = list.len();
     if n == 0 {
         return (std::ptr::null_mut(), 0);
@@ -3736,6 +3744,8 @@ mod tests {
             ng_k: 0.0,
             // NaN ⇒ no thermal-lag delay (asteroid default).
             non_grav_dt: f64::NAN,
+            // NaN ⇒ no DT prior (DT column stays closed).
+            non_grav_dt_variance: f64::NAN,
             has_non_grav_covariance: 0,
             non_grav_covariance: [[0.0; 3]; 3],
             phot_system: 0,
@@ -3887,6 +3897,7 @@ mod tests {
             ng_n: 0.0,
             ng_k: 0.0,
             non_grav_dt: f64::NAN,
+            non_grav_dt_variance: f64::NAN,
             has_non_grav_covariance: 0,
             non_grav_covariance: [[0.0; 3]; 3],
             phot_system: 0,

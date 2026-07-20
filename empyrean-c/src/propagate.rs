@@ -194,6 +194,10 @@ pub struct EmpyreanOrbit {
     /// or negative) when SBDB's `model_pars[]` exposes a `DT` field —
     /// e.g. 67P (+45.7d), 46P/Wirtanen (−14.1d), 2I/Borisov (−65.1d).
     pub non_grav_dt: f64,
+    /// Prior variance on the non-grav time delay DT (days²). NaN or ≤0 = no
+    /// prior; a finite positive value opens + priors the DT column in a
+    /// StateAndNonGravAndDT fit.
+    pub non_grav_dt_variance: f64,
     /// 1 when `non_grav_covariance` carries a non-grav prior covariance; 0
     /// otherwise. Set by the OD output path (a fitted orbit) so it re-feeds
     /// into a StateAndNonGrav refine without losing its non-grav prior;
@@ -1028,9 +1032,15 @@ pub(crate) fn empyrean_orbit_non_grav_params(orbit: &EmpyreanOrbit) -> Option<No
         } else {
             None
         },
-        // DT is a fittable axis in v1.20.0; propagation input carries
-        // the DT value (above) but no fit prior.
-        dt_variance: None,
+        // DT is a fittable axis in v1.20.0; propagation input carries the DT
+        // value (above); carry its prior variance too when supplied so a
+        // re-fed orbit opens + priors the DT column in a StateAndNonGravAndDT
+        // refine.
+        dt_variance: if orbit.non_grav_dt_variance.is_finite() && orbit.non_grav_dt_variance > 0.0 {
+            Some(orbit.non_grav_dt_variance)
+        } else {
+            None
+        },
     })
 }
 
@@ -2752,6 +2762,7 @@ mod thrust_input_tests {
             ng_n: 0.0,
             ng_k: 0.0,
             non_grav_dt: f64::NAN,
+            non_grav_dt_variance: f64::NAN,
             has_non_grav_covariance: 0,
             non_grav_covariance: [[0.0; 3]; 3],
             phot_system: -1,

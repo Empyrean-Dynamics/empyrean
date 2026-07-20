@@ -226,6 +226,7 @@ def _orbits_to_dict(orbits: AnyOrbits) -> dict[str, list[Any] | np.ndarray]:
     ng_ns = np.zeros(n, dtype=np.float64)
     ng_ks = np.zeros(n, dtype=np.float64)
     non_grav_dts = np.full(n, np.nan, dtype=np.float64)  # NaN = no thermal-lag delay
+    non_grav_dt_variances = np.full(n, np.nan, dtype=np.float64)  # NaN/<=0 = no DT prior
     has_non_grav_cov = np.zeros(n, dtype=bool)
     non_grav_cov = np.zeros((n, 3, 3), dtype=np.float64)
     if orbits.non_grav is not None:
@@ -241,6 +242,11 @@ def _orbits_to_dict(orbits: AnyOrbits) -> dict[str, list[Any] | np.ndarray]:
         ng_alphas, ng_r0s = _col("alpha"), _col("r0")
         ng_ms, ng_ns, ng_ks = _col("m"), _col("n"), _col("k")
         non_grav_dts = np.asarray(ng.dt.to_numpy(zero_copy_only=False), dtype=np.float64)
+        # DT prior variance (opens the DT column in a StateAndNonGravAndDT
+        # solve). Mirror ng.dt exactly: nulls come back as NaN = no prior.
+        non_grav_dt_variances = np.asarray(
+            ng.dt_variance.to_numpy(zero_copy_only=False), dtype=np.float64
+        )
         for i, c in enumerate(ng.covariance.to_pylist()):
             if c is not None:
                 non_grav_cov[i] = np.asarray(c, dtype=np.float64).reshape(3, 3)
@@ -265,6 +271,7 @@ def _orbits_to_dict(orbits: AnyOrbits) -> dict[str, list[Any] | np.ndarray]:
         "ng_ns": ng_ns,
         "ng_ks": ng_ks,
         "non_grav_dts": non_grav_dts,
+        "non_grav_dt_variances": non_grav_dt_variances,
         "has_non_grav_cov": has_non_grav_cov,
         "non_grav_cov": non_grav_cov,
     }

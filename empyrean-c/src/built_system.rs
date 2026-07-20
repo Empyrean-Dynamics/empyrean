@@ -826,6 +826,7 @@ mod tests {
             ng_n: 0.0,
             ng_k: 0.0,
             non_grav_dt: f64::NAN,
+            non_grav_dt_variance: f64::NAN,
             has_non_grav_covariance: 0,
             non_grav_covariance: [[0.0; 3]; 3],
             phot_system: -1,

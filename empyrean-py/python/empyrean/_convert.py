@@ -506,6 +506,9 @@ def orbit_batch_dict_to_orbits(result: dict[str, Any]) -> AnyOrbits:
         ng_n = np.asarray(result.get("ng_n", np.zeros(n)), dtype=np.float64)
         ng_k = np.asarray(result.get("ng_k", np.zeros(n)), dtype=np.float64)
         ng_dt = np.asarray(result.get("non_grav_dt", np.full(n, np.nan)), dtype=np.float64)
+        ng_dt_variance = np.asarray(
+            result.get("non_grav_dt_variance", np.full(n, np.nan)), dtype=np.float64
+        )
         models: list[str] = []
         for i in range(n):
             if ng_alpha[i] != 0.0:
@@ -533,6 +536,7 @@ def orbit_batch_dict_to_orbits(result: dict[str, Any]) -> AnyOrbits:
             n=ng_n,
             k=ng_k,
             dt=ng_dt,
+            dt_variance=ng_dt_variance,
         )
 
     # Photometry — populated when the upstream source (e.g. SBDB's
@@ -658,6 +662,7 @@ def orbits_to_orbit_batch_dict(orbits: AnyOrbits) -> dict[str, Any]:
     ng_n = np.zeros(n)
     ng_k = np.zeros(n)
     ng_dt = np.full(n, np.nan)
+    ng_dt_variance = np.full(n, np.nan)
     if orbits.non_grav is not None:
         ng = orbits.non_grav
         a1 = np.nan_to_num(_column_to_numpy(ng.a1), nan=0.0)
@@ -674,6 +679,9 @@ def orbits_to_orbit_batch_dict(orbits: AnyOrbits) -> dict[str, Any]:
         # Preserve NaN as "no thermal-lag delay" — 0.0 is a real delay,
         # so do NOT nan_to_num this one.
         ng_dt = _column_to_numpy(ng.dt)
+        # DT prior variance (opens the DT column in a StateAndNonGravAndDT
+        # solve). Preserve NaN as "no prior" — do NOT nan_to_num.
+        ng_dt_variance = _column_to_numpy(ng.dt_variance)
 
     object_ids = [s if s else "" for s in orbits.object_id.to_pylist()]
     return {
@@ -695,6 +703,7 @@ def orbits_to_orbit_batch_dict(orbits: AnyOrbits) -> dict[str, Any]:
         "ng_n": ng_n,
         "ng_k": ng_k,
         "non_grav_dt": ng_dt,
+        "non_grav_dt_variance": ng_dt_variance,
     }
 
 

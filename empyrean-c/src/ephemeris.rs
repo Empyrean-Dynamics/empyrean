@@ -276,9 +276,16 @@ pub(crate) fn build_orbits_for_ephemeris(
                 } else {
                     None
                 },
-                // DT is a fittable axis in v1.20.0; this forward
-                // orbit-construction path carries no DT prior.
-                dt_variance: None,
+                // DT is a fittable axis in v1.20.0; carry the DT prior variance
+                // when the input orbit supplies one so it opens the DT column
+                // downstream.
+                dt_variance: if orbit.non_grav_dt_variance.is_finite()
+                    && orbit.non_grav_dt_variance > 0.0
+                {
+                    Some(orbit.non_grav_dt_variance)
+                } else {
+                    None
+                },
             };
             orbits.set_non_grav_params(i, Some(params));
         }
@@ -484,7 +491,10 @@ pub(crate) fn marshal_ephemeris_result(
                 // no longer a fixed 9, and is STORED at the MAX_WIDE stride.
                 // Emit exactly the active_width columns so the buffer length
                 // stays 6 * n_params.
-                (flatten_2d_active(&jw.matrix, active_width), active_width as u8)
+                (
+                    flatten_2d_active(&jw.matrix, active_width),
+                    active_width as u8,
+                )
             } else if let Some(j) = chain.jacobian(i) {
                 (flatten_2d(&j.matrix), 6u8)
             } else {

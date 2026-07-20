@@ -634,6 +634,7 @@ fn _query_radar<'py>(
     ng_ns = None,
     ng_ks = None,
     non_grav_dts = None,
+    non_grav_dt_variances = None,
     has_non_grav_cov = None,
     non_grav_cov = None,
     gm_threshold = 1.0,
@@ -686,6 +687,10 @@ fn _propagate<'py>(
     // SBDB non-grav time delay (days). NaN entries → no delay; whole
     // array None → no DT for any orbit.
     non_grav_dts: Option<PyReadonlyArray1<'py, f64>>,
+    // Prior variance on the non-grav DT (days²), parallel to `non_grav_dts`.
+    // NaN / ≤0 entries → no prior; whole array None → no DT prior for any
+    // orbit. A finite positive value opens + priors the DT fit column.
+    non_grav_dt_variances: Option<PyReadonlyArray1<'py, f64>>,
     // Fitted non-grav 3×3 covariance (nullable per-row mask + (n,3,3) values).
     // Threaded so a fitted orbit re-fed into propagate keeps its
     // StateAndNonGrav prior instead of silently dropping it.
@@ -746,6 +751,9 @@ fn _propagate<'py>(
     let ng_n_arr = ng_ns.as_ref().map(|a| a.as_array().to_owned());
     let ng_k_arr = ng_ks.as_ref().map(|a| a.as_array().to_owned());
     let dt_arr = non_grav_dts.as_ref().map(|a| a.as_array().to_owned());
+    let dtv_arr = non_grav_dt_variances
+        .as_ref()
+        .map(|a| a.as_array().to_owned());
     let has_ng_cov_arr = has_non_grav_cov.as_ref().map(|a| a.as_array().to_owned());
     let ng_cov_arr = non_grav_cov.as_ref().map(|a| a.as_array().to_owned());
 
@@ -810,6 +818,10 @@ fn _propagate<'py>(
         let non_grav_dt = dt_arr
             .as_ref()
             .and_then(|dts| dts[i].is_finite().then_some(dts[i]));
+        // Prior variance on the DT (days²); NaN / ≤0 = no prior.
+        let non_grav_dt_variance = dtv_arr
+            .as_ref()
+            .and_then(|v| (v[i].is_finite() && v[i] > 0.0).then_some(v[i]));
         // Fitted non-grav 3×3 covariance (optional, nullable per row).
         let ng_cov = ng_covariance_at(has_ng_cov_arr.as_ref(), ng_cov_arr.as_ref(), i);
         // Photometry: ephemeris generation downstream consumes (H, slope1,
@@ -848,6 +860,7 @@ fn _propagate<'py>(
             a3s_arr[i],
             g_function,
             non_grav_dt,
+            non_grav_dt_variance,
             ng_cov,
             photometry,
             thrust,
@@ -1484,6 +1497,7 @@ fn assemble_orbit(
     a3: f64,
     g_function: Option<(f64, f64, f64, f64, f64)>,
     non_grav_dt: Option<f64>,
+    non_grav_dt_variance: Option<f64>,
     ng_covariance: Option<[[f64; 3]; 3]>,
     photometry: Option<(empyrean::PhaseFunction, f64, f64, f64)>,
     thrust: Option<empyrean::ThrustParams>,
@@ -1509,6 +1523,7 @@ fn assemble_orbit(
         ng_n,
         ng_k,
         non_grav_dt,
+        non_grav_dt_variance,
         ng_covariance,
         phot_system,
         h_mag,
@@ -1557,6 +1572,7 @@ fn build_orbits_from_arrays(
     ng_ns: Option<&numpy::ndarray::Array1<f64>>,
     ng_ks: Option<&numpy::ndarray::Array1<f64>>,
     non_grav_dts: Option<&numpy::ndarray::Array1<f64>>,
+    non_grav_dt_variances: Option<&numpy::ndarray::Array1<f64>>,
     has_non_grav_cov: Option<&numpy::ndarray::Array1<bool>>,
     non_grav_cov: Option<&numpy::ndarray::Array3<f64>>,
 ) -> PyResult<Vec<empyrean::Orbit>> {
@@ -1591,6 +1607,8 @@ fn build_orbits_from_arrays(
             _ => None,
         };
         let non_grav_dt = non_grav_dts.and_then(|dts| dts[i].is_finite().then_some(dts[i]));
+        let non_grav_dt_variance =
+            non_grav_dt_variances.and_then(|v| (v[i].is_finite() && v[i] > 0.0).then_some(v[i]));
         let ng_cov = ng_covariance_at(has_non_grav_cov, non_grav_cov, i);
         orbits.push(assemble_orbit(
             None,
@@ -1601,6 +1619,7 @@ fn build_orbits_from_arrays(
             a3s[i],
             g_function,
             non_grav_dt,
+            non_grav_dt_variance,
             ng_cov,
             None,
             None,
@@ -1637,6 +1656,7 @@ fn methods_from_tags(tags: &[i32]) -> PyResult<Vec<empyrean::UncertaintyMethod>>
     body_filter_naif=None,
     ng_alphas=None, ng_r0s=None, ng_ms=None, ng_ns=None, ng_ks=None,
     non_grav_dts=None,
+    non_grav_dt_variances=None,
     has_non_grav_cov=None, non_grav_cov=None,
 ))]
 #[allow(clippy::too_many_arguments)]
@@ -1661,6 +1681,10 @@ fn _compute_impact_probabilities<'py>(
     ng_ns: Option<PyReadonlyArray1<'py, f64>>,
     ng_ks: Option<PyReadonlyArray1<'py, f64>>,
     non_grav_dts: Option<PyReadonlyArray1<'py, f64>>,
+    // Prior variance on the non-grav DT (days²), parallel to `non_grav_dts`.
+    // NaN / ≤0 = no prior; a finite positive value opens + priors the DT fit
+    // column when the IP / B-plane input orbit is re-fed into a DT solve.
+    non_grav_dt_variances: Option<PyReadonlyArray1<'py, f64>>,
     // Fitted non-grav 3×3 covariance (nullable per-row mask + (n,3,3) values),
     // threaded so an OD-solved orbit re-fed into the IP / B-plane input path
     // keeps its StateAndNonGrav prior instead of silently dropping it.
@@ -1686,6 +1710,10 @@ fn _compute_impact_probabilities<'py>(
         ng_ns.as_ref().map(|a| a.as_array().to_owned()).as_ref(),
         ng_ks.as_ref().map(|a| a.as_array().to_owned()).as_ref(),
         non_grav_dts
+            .as_ref()
+            .map(|a| a.as_array().to_owned())
+            .as_ref(),
+        non_grav_dt_variances
             .as_ref()
             .map(|a| a.as_array().to_owned())
             .as_ref(),
@@ -1796,6 +1824,7 @@ fn _compute_impact_probabilities<'py>(
     body_filter_naif=None,
     ng_alphas=None, ng_r0s=None, ng_ms=None, ng_ns=None, ng_ks=None,
     non_grav_dts=None,
+    non_grav_dt_variances=None,
     has_non_grav_cov=None, non_grav_cov=None,
 ))]
 #[allow(clippy::too_many_arguments)]
@@ -1820,6 +1849,10 @@ fn _compute_b_planes<'py>(
     ng_ns: Option<PyReadonlyArray1<'py, f64>>,
     ng_ks: Option<PyReadonlyArray1<'py, f64>>,
     non_grav_dts: Option<PyReadonlyArray1<'py, f64>>,
+    // Prior variance on the non-grav DT (days²), parallel to `non_grav_dts`.
+    // NaN / ≤0 = no prior; a finite positive value opens + priors the DT fit
+    // column when the IP / B-plane input orbit is re-fed into a DT solve.
+    non_grav_dt_variances: Option<PyReadonlyArray1<'py, f64>>,
     // Fitted non-grav 3×3 covariance (nullable per-row mask + (n,3,3) values),
     // threaded so an OD-solved orbit re-fed into the IP / B-plane input path
     // keeps its StateAndNonGrav prior instead of silently dropping it.
@@ -1845,6 +1878,10 @@ fn _compute_b_planes<'py>(
         ng_ns.as_ref().map(|a| a.as_array().to_owned()).as_ref(),
         ng_ks.as_ref().map(|a| a.as_array().to_owned()).as_ref(),
         non_grav_dts
+            .as_ref()
+            .map(|a| a.as_array().to_owned())
+            .as_ref(),
+        non_grav_dt_variances
             .as_ref()
             .map(|a| a.as_array().to_owned())
             .as_ref(),
@@ -2029,6 +2066,7 @@ fn _get_observers<'py>(
     ng_ns = None,
     ng_ks = None,
     non_grav_dts = None,
+    non_grav_dt_variances = None,
     has_non_grav_cov = None,
     non_grav_cov = None,
     phot_slope2 = None,
@@ -2076,6 +2114,10 @@ fn _generate_ephemeris<'py>(
     ng_ns: Option<PyReadonlyArray1<'py, f64>>,
     ng_ks: Option<PyReadonlyArray1<'py, f64>>,
     non_grav_dts: Option<PyReadonlyArray1<'py, f64>>,
+    // Prior variance on the non-grav DT (days²), parallel to `non_grav_dts`.
+    // NaN / ≤0 = no prior; a finite positive value opens + priors the DT fit
+    // column when the orbit is re-fed into a DT solve.
+    non_grav_dt_variances: Option<PyReadonlyArray1<'py, f64>>,
     // Fitted non-grav 3×3 covariance (nullable per-row mask + (n,3,3) values).
     // Threaded so a fitted orbit re-fed into ephemeris generation keeps its
     // StateAndNonGrav prior instead of silently dropping it.
@@ -2130,6 +2172,9 @@ fn _generate_ephemeris<'py>(
     let ng_n_arr = ng_ns.as_ref().map(|a| a.as_array().to_owned());
     let ng_k_arr = ng_ks.as_ref().map(|a| a.as_array().to_owned());
     let dt_arr = non_grav_dts.as_ref().map(|a| a.as_array().to_owned());
+    let dtv_arr = non_grav_dt_variances
+        .as_ref()
+        .map(|a| a.as_array().to_owned());
     let has_ng_cov_arr = has_non_grav_cov.as_ref().map(|a| a.as_array().to_owned());
     let ng_cov_arr = non_grav_cov.as_ref().map(|a| a.as_array().to_owned());
 
@@ -2174,6 +2219,10 @@ fn _generate_ephemeris<'py>(
         let non_grav_dt = dt_arr
             .as_ref()
             .and_then(|dts| dts[i].is_finite().then_some(dts[i]));
+        // Prior variance on the DT (days²); NaN / ≤0 = no prior.
+        let non_grav_dt_variance = dtv_arr
+            .as_ref()
+            .and_then(|v| (v[i].is_finite() && v[i] > 0.0).then_some(v[i]));
         // Fitted non-grav 3×3 covariance (optional, nullable per row).
         let ng_cov = ng_covariance_at(has_ng_cov_arr.as_ref(), ng_cov_arr.as_ref(), i);
         // Photometry — when phot_system[i] is one of {0, 1, 2} the
@@ -2213,6 +2262,7 @@ fn _generate_ephemeris<'py>(
             a3s_arr[i],
             g_function,
             non_grav_dt,
+            non_grav_dt_variance,
             ng_cov,
             photometry,
             None,
@@ -2886,6 +2936,7 @@ fn build_orbit_from_dict<'py>(orbit_dict: &Bound<'py, PyDict>) -> PyResult<empyr
     let mut a3 = 0.0;
     let mut g_function = None;
     let mut non_grav_dt = None;
+    let mut non_grav_dt_variance = None;
     let mut ng_covariance = None;
     if let (Some(a1s), Some(a2s), Some(a3s)) = (arr1("a1s")?, arr1("a2s")?, arr1("a3s")?)
         && (a1s[0] != 0.0 || a2s[0] != 0.0 || a3s[0] != 0.0)
@@ -2909,6 +2960,15 @@ fn build_orbit_from_dict<'py>(orbit_dict: &Bound<'py, PyDict>) -> PyResult<empyr
             && dt[0].is_finite()
         {
             non_grav_dt = Some(dt[0]);
+        }
+        // DT prior variance (optional; NaN / ≤0 sentinel = no prior). A finite
+        // positive value opens + priors the DT column in a StateAndNonGravAndDT
+        // refine — this is the seam that unblocks DT fitting through the API.
+        if let Some(v) = arr1("non_grav_dt_variances")?
+            && v[0].is_finite()
+            && v[0] > 0.0
+        {
+            non_grav_dt_variance = Some(v[0]);
         }
         // Fitted non-grav covariance (optional).
         if let Some(has) = orbit_dict.get_item("has_non_grav_cov")? {
@@ -2937,6 +2997,7 @@ fn build_orbit_from_dict<'py>(orbit_dict: &Bound<'py, PyDict>) -> PyResult<empyr
         a3,
         g_function,
         non_grav_dt,
+        non_grav_dt_variance,
         ng_covariance,
         None,
         None,
@@ -4432,6 +4493,8 @@ fn orbit_batch_to_pydict<'py>(
     let mut ng_k = Array1::<f64>::zeros(n);
     // NaN = "no thermal-lag delay" (distinct from a real 0.0-day delay).
     let mut non_grav_dt = Array1::<f64>::from_elem(n, f64::NAN);
+    // NaN = "no DT prior" (distinct from a real variance value).
+    let mut non_grav_dt_variance = Array1::<f64>::from_elem(n, f64::NAN);
     let mut phot_h = Array1::<f64>::from_elem(n, f64::NAN);
     let mut phot_slope1 = Array1::<f64>::zeros(n);
     let mut phot_slope2 = Array1::<f64>::zeros(n);
@@ -4476,6 +4539,7 @@ fn orbit_batch_to_pydict<'py>(
         ng_n[i] = orbit.ng_n;
         ng_k[i] = orbit.ng_k;
         non_grav_dt[i] = orbit.non_grav_dt.unwrap_or(f64::NAN);
+        non_grav_dt_variance[i] = orbit.non_grav_dt_variance.unwrap_or(f64::NAN);
         match orbit.phot_system {
             Some(empyrean::PhaseFunction::HG) => {
                 phot_h[i] = orbit.h_mag;
@@ -4522,6 +4586,10 @@ fn orbit_batch_to_pydict<'py>(
     dict.set_item("ng_n", PyArray1::from_owned_array(py, ng_n))?;
     dict.set_item("ng_k", PyArray1::from_owned_array(py, ng_k))?;
     dict.set_item("non_grav_dt", PyArray1::from_owned_array(py, non_grav_dt))?;
+    dict.set_item(
+        "non_grav_dt_variance",
+        PyArray1::from_owned_array(py, non_grav_dt_variance),
+    )?;
     dict.set_item("phot_h", PyArray1::from_owned_array(py, phot_h))?;
     dict.set_item("phot_slope1", PyArray1::from_owned_array(py, phot_slope1))?;
     dict.set_item("phot_slope2", PyArray1::from_owned_array(py, phot_slope2))?;
@@ -4587,6 +4655,7 @@ fn pydict_to_orbit_batch<'py>(dict: &Bound<'py, PyDict>) -> PyResult<empyrean::O
     let g_n_view = read_array_or_zero(dict, "ng_n", n)?;
     let g_k_view = read_array_or_zero(dict, "ng_k", n)?;
     let dt_view = read_array_or_nan(dict, "non_grav_dt", n)?;
+    let dtv_view = read_array_or_nan(dict, "non_grav_dt_variance", n)?;
 
     let mut orbits = Vec::with_capacity(n);
     for i in 0..n {
@@ -4655,6 +4724,9 @@ fn pydict_to_orbit_batch<'py>(dict: &Bound<'py, PyDict>) -> PyResult<empyrean::O
             // Finite = real thermal-lag delay (incl. a meaningful 0.0);
             // NaN / absent column = no delay (None).
             dt_view[i].is_finite().then_some(dt_view[i]),
+            // Finite positive = DT prior variance (opens the DT fit column);
+            // NaN / ≤0 / absent column = no prior (None).
+            (dtv_view[i].is_finite() && dtv_view[i] > 0.0).then_some(dtv_view[i]),
             // Non-grav covariance is an OD-output concept; the OrbitBatch I/O
             // surface doesn't carry it.
             None,

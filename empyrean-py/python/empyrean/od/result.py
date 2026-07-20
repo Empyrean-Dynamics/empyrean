@@ -71,22 +71,25 @@ class CovarianceRepresentation(str, Enum):
 class PhotometryModel(str, Enum):
     """Photometric model for the post-OD phase-function fit.
 
-    Mirrors ``empyrean::PhotometryModel``. ``AUTO`` requests the
-    richest model the arc's phase-angle coverage supports; a
-    :class:`PhotometryResult` reports the model it actually fitted
-    (never ``AUTO``).
+    Mirrors ``empyrean::PhotometryModel``. In ``AUTO`` the fit climbs a
+    model ladder -- H-only -> HG12 -> HG1G2 -- admitting the richest
+    model the arc's phase-angle coverage and magnitude count support,
+    and a :class:`PhotometryResult` reports the model it actually fitted
+    on ``model_used`` (never ``AUTO``). An explicit value pins a
+    specific model. HG12 / HG1G2 follow Muinonen et al. (2010); H-only
+    holds the slope fixed.
     """
 
     AUTO = "auto"
-    """Choose the richest model the phase coverage supports."""
+    """Auto-select up the ladder (H-only -> HG12 -> HG1G2) by data richness."""
     HONLY = "honly"
     """Fit only the absolute magnitude H (fixed slope)."""
     HG = "hg"
     """Two-parameter H, G."""
     HG12 = "hg12"
-    """Two-parameter H, G12."""
+    """Two-parameter H, G12 (Muinonen et al. 2010)."""
     HG1G2 = "hg1g2"
-    """Three-parameter H, G1, G2."""
+    """Three-parameter H, G1, G2 (Muinonen et al. 2010)."""
 
 
 # ── Output epoch (tagged-union dataclass) ────────────────────

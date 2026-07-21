@@ -207,6 +207,9 @@ fn row_to_orbit(row: &OrbitRow) -> Result<(EmpyreanOrbit, String, Option<String>
         // non-grav DT yet; round-trip restores NaN (no delay) until
         // villeneuve::io::orbit_row gets a `non_grav_dt` field.
         non_grav_dt: f64::NAN,
+        // OrbitRow JSON/parquet schema does not carry the DT prior variance
+        // either; round-trip restores NaN (no prior).
+        non_grav_dt_variance: f64::NAN,
         // Non-grav covariance is an OD-output concept (a fitted prior); the
         // orbit-read paths don't carry it.
         has_non_grav_covariance: 0,
@@ -227,6 +230,13 @@ fn row_to_orbit(row: &OrbitRow) -> Result<(EmpyreanOrbit, String, Option<String>
         n_dv_corrections: 0,
         correction_covariances: std::ptr::null(),
         n_correction_covariances: 0,
+        // OrbitRow JSON/parquet schema does not carry the SRP slot yet (same
+        // documented limitation as DT / thrust / photometry above); round-trip
+        // restores no SRP. Tracked for a unified lossless-orbit-file follow-up.
+        has_srp: 0,
+        srp_amrat: 0.0,
+        srp_cr: 0.0,
+        srp_amrat_variance: f64::NAN,
     };
     Ok((orbit, row.orbit_id.clone(), row.object_id.clone()))
 }
@@ -400,6 +410,16 @@ pub(crate) fn batch_to_orbits(batch: &EmpyreanOrbitBatch) -> Result<Orbits<AU>, 
                 } else {
                     None
                 },
+                // DT is a fittable axis in v1.20.0; carry the DT prior variance
+                // when the input orbit supplies one so it opens the DT column
+                // downstream.
+                dt_variance: if orbit.non_grav_dt_variance.is_finite()
+                    && orbit.non_grav_dt_variance > 0.0
+                {
+                    Some(orbit.non_grav_dt_variance)
+                } else {
+                    None
+                },
             };
             out.set_non_grav_params(i, Some(params));
         }
@@ -407,6 +427,11 @@ pub(crate) fn batch_to_orbits(batch: &EmpyreanOrbitBatch) -> Result<Orbits<AU>, 
             .map_err(|e| format!("orbit {i}: {e}"))?
         {
             out.set_thrust_params(i, Some(tp));
+        }
+        if let Some(srp) = crate::propagate::empyrean_orbit_srp_params(orbit)
+            .map_err(|e| format!("orbit {i}: {e}"))?
+        {
+            out.set_srp_params(i, Some(srp));
         }
     }
     Ok(out)
@@ -446,6 +471,7 @@ pub(crate) fn orbits_to_batch(orbits: &Orbits<AU>) -> Result<EmpyreanOrbitBatch,
             ng_n: 0.0,
             ng_k: 0.0,
             non_grav_dt: f64::NAN,
+            non_grav_dt_variance: f64::NAN,
             // Non-grav covariance is an OD-output concept; the read-orbits
             // path doesn't carry it.
             has_non_grav_covariance: 0,
@@ -466,6 +492,12 @@ pub(crate) fn orbits_to_batch(orbits: &Orbits<AU>) -> Result<EmpyreanOrbitBatch,
             n_dv_corrections: 0,
             correction_covariances: std::ptr::null(),
             n_correction_covariances: 0,
+            // SRP slot carried from the villeneuve orbit below (parity with
+            // non-grav / photometry), when present.
+            has_srp: 0,
+            srp_amrat: 0.0,
+            srp_cr: 0.0,
+            srp_amrat_variance: f64::NAN,
         };
         if let Some(ph) = orbits.photometric_params(i) {
             orbit.h_mag = ph.h();
@@ -482,13 +514,20 @@ pub(crate) fn orbits_to_batch(orbits: &Orbits<AU>) -> Result<EmpyreanOrbitBatch,
             orbit.a2 = ng.a2;
             orbit.a3 = ng.a3;
             orbit.non_grav_dt = ng.dt.unwrap_or(f64::NAN);
-            if let NonGravModel::MarsdenSekanina(g) = &ng.model {
-                orbit.ng_alpha = g.alpha;
-                orbit.ng_r0 = g.r0;
-                orbit.ng_m = g.m;
-                orbit.ng_n = g.n;
-                orbit.ng_k = g.k;
-            }
+            orbit.non_grav_dt_variance = ng.dt_variance.unwrap_or(f64::NAN);
+            // NonGravModel is Marsden-only in v1.20.0 — irrefutable.
+            let NonGravModel::MarsdenSekanina(g) = &ng.model;
+            orbit.ng_alpha = g.alpha;
+            orbit.ng_r0 = g.r0;
+            orbit.ng_m = g.m;
+            orbit.ng_n = g.n;
+            orbit.ng_k = g.k;
+        }
+        if let Some(srp) = orbits.srp_params(i) {
+            orbit.has_srp = 1;
+            orbit.srp_amrat = srp.amrat;
+            orbit.srp_cr = srp.cr;
+            orbit.srp_amrat_variance = srp.amrat_variance.unwrap_or(f64::NAN);
         }
         unsafe { orbits_ptr.add(i).write(orbit) };
         let id_c =

@@ -104,6 +104,13 @@ fn ffi_batch_to_owned(batch: &empyrean_sys::EmpyreanOrbitBatch) -> Result<OrbitB
             } else {
                 None
             },
+            non_grav_dt_variance: if ffi_orbit.non_grav_dt_variance.is_finite()
+                && ffi_orbit.non_grav_dt_variance > 0.0
+            {
+                Some(ffi_orbit.non_grav_dt_variance)
+            } else {
+                None
+            },
             // Non-grav covariance is an OD-output concept; SBDB/query orbits
             // don't carry it.
             ng_covariance: None,
@@ -114,6 +121,14 @@ fn ffi_batch_to_owned(batch: &empyrean_sys::EmpyreanOrbitBatch) -> Result<OrbitB
             // SBDB / Horizons queries return ballistic orbits; thrust is a
             // caller-supplied input, never reconstructed from a query.
             thrust: None,
+            // SBDB populates an SRP AMR slot for objects it fits area-to-mass
+            // for; carry it through when the engine set it.
+            srp: crate::orbit::SrpParams::from_ffi(
+                ffi_orbit.srp_amrat,
+                ffi_orbit.srp_cr,
+                ffi_orbit.has_srp,
+                ffi_orbit.srp_amrat_variance,
+            ),
         });
         let id_ptr = unsafe { *batch.orbit_ids.add(i) };
         let id = if id_ptr.is_null() {

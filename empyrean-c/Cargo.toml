@@ -1,6 +1,6 @@
 [package]
 name = "empyrean-c"
-version = "0.8.2"
+version = "0.9.0-rc.0"
 edition = "2024"
 rust-version = "1.90.0"
 authors = ["Joachim Moeyens <joachim@empyrean-dynamics.com>", "Empyrean Dynamics"]
@@ -21,11 +21,7 @@ crate-type = ["cdylib", "staticlib"]
 [dependencies]
 # C ABI is a thin shell over empyrean-core. The internal Rust API is
 # never re-exported through this crate — only the C symbols are.
-# Pinned to the tagged empyrean-core release, fetched from GitHub — the
-# same release-pinning empyrean-core itself uses for villeneuve / scott.
-# To co-develop a local empyrean-core against this workspace, add a
-# `[patch."ssh://…empyrean-core.git"]` path override at the workspace root.
-empyrean-core = { git = "ssh://git@github.com/Empyrean-Dynamics/empyrean-core.git", tag = "v0.8.3", features = ["parquet"] }
+empyrean-core = { git = "ssh://git@github.com/Empyrean-Dynamics/empyrean-core.git", tag = "v0.9.1", features = ["parquet"] }
 arrow = "58"
 parquet = "58"
 serde = { version = "1", features = ["derive"] }

@@ -189,6 +189,12 @@ fn ffi_orbit_to_owned(o: &empyrean_sys::EmpyreanOrbit) -> Result<Orbit> {
         } else {
             None
         },
+        non_grav_dt_variance: if o.non_grav_dt_variance.is_finite() && o.non_grav_dt_variance > 0.0
+        {
+            Some(o.non_grav_dt_variance)
+        } else {
+            None
+        },
         // Non-grav covariance is an OD-output concept; orbit reads don't carry it.
         ng_covariance: None,
         phot_system,
@@ -198,6 +204,13 @@ fn ffi_orbit_to_owned(o: &empyrean_sys::EmpyreanOrbit) -> Result<Orbit> {
         // Thrust is a caller-owned input side array; the OrbitRow schema
         // doesn't carry it, so orbit reads never reconstruct it.
         thrust: None,
+        // SRP slot carried through from the C EmpyreanOrbit when present.
+        srp: crate::orbit::SrpParams::from_ffi(
+            o.srp_amrat,
+            o.srp_cr,
+            o.has_srp,
+            o.srp_amrat_variance,
+        ),
     })
 }
 

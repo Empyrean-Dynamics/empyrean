@@ -18,10 +18,12 @@ Uncertainty-first orbit propagation, ephemeris, orbit determination, and event d
 ---
 
 ```bash
-pip install empyrean
+pip install --pre empyrean
 ```
 
-A plain install pulls empyrean together with the B612 Foundation's
+`0.9.0rc0` is a release candidate, so `pip install` needs the `--pre`
+flag to resolve a pre-release from PyPI. A plain install pulls empyrean
+together with the B612 Foundation's
 pre-packaged SPICE kernels (~740 MB — see the table below). After
 installation, the first call to `empyrean.initialize()` downloads a
 small remainder (the
@@ -32,8 +34,8 @@ Wheels are published for CPython >= 3.10 as a single abi3 stable-ABI
 wheel per architecture — one wheel covers CPython 3.10 and every newer
 version — across four platforms: macOS arm64, macOS x86_64,
 manylinux_2_28 x86_64, and manylinux_2_28 aarch64. There is no source
-distribution, so `pip install empyrean` on other platforms will not
-resolve — use the
+distribution, so `pip install --pre empyrean` on other platforms will
+not resolve — use the
 [other distribution channels](https://github.com/Empyrean-Dynamics/empyrean#install)
 in the meantime.
 
@@ -42,7 +44,7 @@ in the meantime.
 - **Propagation** — N-body (Sun, planets, Moon, Pluto) with EIH general relativity, Sun J2 and Earth J2–J4 zonal harmonics, 16 asteroid perturbers, and the Marsden non-gravitational model — selectable across Approximate / Basic / Standard force-model tiers (Standard is the default). GR15 and DOP853 integrators. Optional finite-burn thrust arcs — constant-RTN, velocity-tangent, or inertial-fixed steering, with per-arc Δv targeting corrections — layer on as a continuous-thrust force input.
 - **Uncertainty** — First-order (Jet1) state transition matrices; second-order (Jet2) state transition tensors; unscented sigma-point and Monte Carlo sampling; an adaptive Auto mode that escalates the method automatically through close approaches and relaxes it elsewhere. Optional per-epoch tagged-covariance readback.
 - **Ephemeris** — RA/Dec, rates, photometry (H–G, H–G₁G₂, H–G₁₂), light time, phase angle, solar elongation, local horizon.
-- **Orbit determination** — Gauss, Herget, and systematic-ranging (admissible region + Manifold of Variations) IOD → N-body differential correction over optical and radar (delay / Doppler) observations, with STM caching and outlier rejection. Validated against `find_orb` and JPL SBDB.
+- **Orbit determination** — Gauss, Herget, and systematic-ranging (admissible region + Manifold of Variations) IOD → N-body differential correction over optical and radar (delay / Doppler) observations, with STM caching and outlier rejection. Solves the state — escalating to the Marsden A1/A2/A3 non-gravitational coefficients on a poor fit — plus, on the refine path, the cometary outgassing time delay DT, SRP area-to-mass, and continuous-thrust Δv corrections, all differentiated analytically, returned in a tagged solved covariance. Optional post-OD H–G photometry fit recovers absolute magnitude H with an honest σ. Validated against `find_orb` and JPL SBDB.
 - **Events** — Close approach (start/end), periapsis, gravitational capture (start/end), shadow entry/exit, atmospheric entry/exit, impact, and possible impact.
 
 ## Quick start
@@ -77,6 +79,76 @@ print(
     f"RMS={result.summary.rms_ra_arcsec:.2f}\" RA / "
     f"{result.summary.rms_dec_arcsec:.2f}\" Dec"
 )
+```
+
+### Wide-parameter fitting
+
+A fit solves the 6-element state by default, escalating to the Marsden
+A1/A2/A3 non-gravitational coefficients on a poor fit. `SolveFor` on
+`ODConfig.solve_for_flags` requests an explicit wider solve: beyond
+state + Marsden, `determine` and `refine` can also solve for the
+cometary outgassing time delay `dt`, the solar-radiation-pressure
+area-to-mass ratio `amrat`, and thrust Δv-correction segments
+(`thrust_segments`) — each differentiated analytically by the same
+hyperdual integrator that drives the dynamics.
+
+`dt`, `amrat`, and thrust are refine-path solves: the seed orbit must
+carry the prior that opens each axis, so run them through `refine`. The
+DT prior is `NonGravParams.dt_variance` (days²) on the orbit's non-grav
+block; Marsden needs a non-grav covariance; AMRAT needs an SRP AMRAT
+prior. Requesting an axis whose prior is absent is rejected loudly —
+the fit never returns a zeroed or defaulted column.
+
+```python
+from empyrean import ODConfig, SolveFor
+
+# Solve state + Marsden A1/A2/A3 + the outgassing time delay DT. The
+# seed orbit carries a non-grav covariance (opens Marsden) and a DT
+# prior variance (opens DT), e.g. its non-grav block was built with
+#   NonGravParams.from_kwargs(..., dt=[<days>], dt_variance=[<days**2>])
+config = ODConfig(solve_for_flags=SolveFor(marsden=True, dt=True))
+result = empyrean.refine(orbit, obs, config=config)
+
+print(result.dt_delta)      # fitted ΔDT (days); None if DT was not solved
+print(result.amrat_delta)   # fitted ΔAMRAT (m²/kg); None if not solved
+```
+
+### Tagged solved covariance
+
+A wide fit returns a `SolvedCovariance` on `result.solved_covariance`
+whose fitted-parameter identities travel with the matrix. Read a
+parameter's variance by its slot — never by guessing column order:
+
+```python
+sc = result.solved_covariance          # None for a state-only fit
+if sc is not None and sc.dt_slot is not None:
+    dt_var = sc.matrix[sc.dt_slot, sc.dt_slot]   # DT variance (days²)
+    print(f"σ(DT) = {dt_var ** 0.5:.4f} days")
+# sc.marsden_slot / sc.amrat_slot / sc.thrust_slots locate the rest;
+# canonical layout is [state 6 | Marsden 3 | DT 1 | AMRAT 1 | thrust 3×k].
+```
+
+### Post-OD photometry
+
+Attach a `PhotometryConfig` to recover the absolute magnitude *H* and a
+phase-function slope from the observation magnitudes after the orbit is
+solved — the fit has no astrometric partials, so it never touches the
+state. In `AUTO` it climbs a model ladder — H-only → HG12 → HG1G2
+(Muinonen et al. 2010) — admitting the richest model the arc's
+phase-angle coverage supports, and reports the model it actually fitted
+on `model_used`. *H* comes back with an honest 1σ from the fit
+covariance.
+
+```python
+from empyrean import ODConfig, PhotometryConfig
+
+config = ODConfig(photometry=PhotometryConfig())   # AUTO ladder
+result = empyrean.determine(obs, config=config)
+
+phot = result.photometry               # None if photometry was not requested
+if phot is not None and phot.covariance is not None:
+    sigma_h = phot.covariance[0, 0] ** 0.5
+    print(f"H = {phot.h:.2f} ± {sigma_h:.2f} mag  (model {phot.model_used.value})")
 ```
 
 ## Ephemeris
@@ -160,7 +232,8 @@ system = empyrean.build_system(ForceModelTier.STANDARD, Frame.ECLIPTICJ2000)
 result = system.propagate(orbits, epochs)
 
 # describe() is the reproducibility record: the force-model menu plus the
-# identity (SHA-256) of every loaded kernel.
+# identity of every loaded kernel (SHA-256 for file-backed kernels; the
+# model name for built-in fields).
 desc = system.describe()
 print(len(desc.perturber_origins), "perturbers,", len(desc.kernels), "kernels")
 ```
@@ -226,12 +299,12 @@ platform data directory (`~/.local/share/empyrean/data/` on Linux,
 | `bias.dat` | 35 MB | first `initialize()` | Star-catalog debiasing table (Eggl et al. 2020) |
 | `jwst_rec.bsp` | 121 MB | on demand, for JWST observers | NAIF — JWST ephemeris |
 
-Any of these can be relocated with `EMPYREAN_DATA_DIR`, and individual
-files can be preset with `VILLENEUVE_*_PATH` environment variables.
+Any of these can be relocated by pointing `EMPYREAN_DATA_DIR` at a
+directory holding them.
 
 ## Accuracy
 
-Validated against JPL Horizons, ASSIST (reboundx), and `find_orb` on
+Validated against JPL Horizons, ASSIST, and `find_orb` on
 43 objects across 13 dynamical populations (NEOs, MBAs, Trojans, TNOs,
 comets, etc.). Sub-meter propagation accuracy on bounded timescales.
 See [the validation notes](https://github.com/Empyrean-Dynamics/empyrean#validation).

@@ -12,6 +12,8 @@ from empyrean._convert import (
     coordinates_to_arrays,
     extract_non_grav_covariance,
     extract_photometry,
+    extract_srp,
+    validate_non_grav_marsden_only,
 )
 
 if TYPE_CHECKING:
@@ -174,7 +176,12 @@ def generate_ephemeris(
 
     # Non-grav parameters
     n = len(orbits)
+    # NonGravParams is Marsden-only; reject a stray model='srp' / cr before
+    # marshaling (SRP rides its own slot, extracted below).
+    validate_non_grav_marsden_only(orbits)
+    has_srp, srp_amrat, srp_cr, srp_amrat_variance = extract_srp(orbits)
     non_grav_dts: np.ndarray | None = None
+    non_grav_dt_variances: np.ndarray | None = None
     if orbits.non_grav is not None:
         ng = orbits.non_grav
         a1s = np.asarray(ng.a1.to_numpy(zero_copy_only=False), dtype=np.float64)
@@ -188,6 +195,12 @@ def generate_ephemeris(
         dt_col = np.asarray(ng.dt.to_numpy(zero_copy_only=False), dtype=np.float64)
         if np.isfinite(dt_col).any():
             non_grav_dts = dt_col
+        # DT prior variance — opens the DT column in a StateAndNonGravAndDT
+        # solve. Gated like non_grav_dts (finite positive) so the no-prior
+        # case skips the FFI marshal.
+        dtv_col = np.asarray(ng.dt_variance.to_numpy(zero_copy_only=False), dtype=np.float64)
+        if (np.isfinite(dtv_col) & (dtv_col > 0.0)).any():
+            non_grav_dt_variances = dtv_col
     else:
         a1s = np.zeros(n, dtype=np.float64)
         a2s = np.zeros(n, dtype=np.float64)
@@ -294,6 +307,11 @@ def generate_ephemeris(
         epsilon,
         uncertainty_method=um_int,
         non_grav_dts=non_grav_dts,
+        non_grav_dt_variances=non_grav_dt_variances,
+        has_srp=has_srp,
+        srp_amrat=srp_amrat,
+        srp_cr=srp_cr,
+        srp_amrat_variance=srp_amrat_variance,
         has_non_grav_cov=has_non_grav_cov,
         non_grav_cov=non_grav_cov,
         gm_threshold=gm_threshold,

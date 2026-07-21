@@ -158,6 +158,15 @@ fn build_orbits_from_c(
                 model: NonGravModel::MarsdenSekanina(g_func),
                 covariance: None,
                 dt: None,
+                // DT is a fittable axis; carry the DT prior variance when the
+                // input orbit supplies one so it opens the DT column downstream.
+                dt_variance: if orbit.non_grav_dt_variance.is_finite()
+                    && orbit.non_grav_dt_variance > 0.0
+                {
+                    Some(orbit.non_grav_dt_variance)
+                } else {
+                    None
+                },
             };
             orbits.set_non_grav_params(i, Some(params));
         }
@@ -165,6 +174,11 @@ fn build_orbits_from_c(
             .map_err(|e| format!("orbit {i}: {e}"))?
         {
             orbits.set_thrust_params(i, Some(tp));
+        }
+        if let Some(srp) = crate::propagate::empyrean_orbit_srp_params(orbit)
+            .map_err(|e| format!("orbit {i}: {e}"))?
+        {
+            orbits.set_srp_params(i, Some(srp));
         }
     }
     Ok(orbits)

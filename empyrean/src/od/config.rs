@@ -12,7 +12,7 @@ pub use crate::propagate::ForceModelTier;
 use super::debiasing::{DebiasingConfig, DebiasingResolution};
 use super::nuisance::StationRaDecConfig;
 use super::rejection::{RejectionConfig, RejectionKind};
-use super::result::{OriginPolicy, OutputEpoch, SolveForParams};
+use super::result::{OriginPolicy, OutputEpoch, PhotometryModel, SolveForParams};
 use super::weighting::{SigmaPolicy, WeightingConfig, WeightingPreset, weighting_layer_to_ffi};
 
 /// IOD ranging tuning.
@@ -198,6 +198,55 @@ pub struct ODConfig {
     pub auto_force_model: bool,
     /// Output coordinate representation for the fitted orbit + covariance.
     pub output_representation: crate::coordinate::Representation,
+    /// Permit solving a thrust Δv segment whose burn window is not
+    /// bracketed by observations (the state absorbs it otherwise; the
+    /// Gates prior then carries it). Default `false` — refuse loudly.
+    pub allow_unbracketed_maneuvers: bool,
+    /// Post-OD photometric fit. `None` (default) disables it; the fit
+    /// runs after the orbit is solved and never touches the state.
+    pub photometry: Option<PhotometryConfig>,
+}
+
+/// Post-OD photometric-fit configuration (mirrors the engine's
+/// photometry config). Attach via [`ODConfig::photometry`]. Sentinel
+/// rule: `0` / `0.0` on a tuning field requests the engine default.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PhotometryConfig {
+    /// Model to fit. Default [`PhotometryModel::Auto`].
+    pub model: PhotometryModel,
+    /// 1σ lightcurve scatter floor (mag). 0.0 → engine default (0.2).
+    pub sigma_lightcurve: f64,
+    /// Include astrometrically-rejected observations' magnitudes.
+    /// Default `false`.
+    pub include_rejected: bool,
+    /// Max Huber-IRLS iterations. 0 → engine default (30).
+    pub max_irls_iterations: u32,
+    /// Huber tuning constant. 0.0 → engine default (1.5).
+    pub huber_k: f64,
+}
+
+impl Default for PhotometryConfig {
+    fn default() -> Self {
+        Self {
+            model: PhotometryModel::Auto,
+            sigma_lightcurve: 0.0,
+            include_rejected: false,
+            max_irls_iterations: 0,
+            huber_k: 0.0,
+        }
+    }
+}
+
+impl PhotometryConfig {
+    fn to_ffi(self) -> empyrean_sys::EmpyreanPhotometryConfig {
+        empyrean_sys::EmpyreanPhotometryConfig {
+            model: self.model.to_int(),
+            sigma_lightcurve: self.sigma_lightcurve,
+            include_rejected: u8::from(self.include_rejected),
+            max_irls_iterations: self.max_irls_iterations,
+            huber_k: self.huber_k,
+        }
+    }
 }
 
 impl Default for ODConfig {
@@ -235,6 +284,8 @@ impl Default for ODConfig {
             rejection: RejectionConfig::default(),
             auto_force_model: false,
             output_representation: crate::coordinate::Representation::Cartesian,
+            allow_unbracketed_maneuvers: false,
+            photometry: None,
         }
     }
 }
@@ -394,6 +445,20 @@ impl ODConfig {
             },
             auto_force_model: u8::from(self.auto_force_model),
             output_representation: self.output_representation as i32,
+            // Per-axis flags — read by the C ABI only when solve_for == 3
+            // (EXPLICIT); harmless for the coarse codes.
+            solve_for_flags: {
+                let f = self.solve_for.flags();
+                empyrean_sys::EmpyreanSolveFor {
+                    marsden: u8::from(f.marsden),
+                    dt: u8::from(f.dt),
+                    amrat: u8::from(f.amrat),
+                    thrust_segments: f.thrust_segments,
+                }
+            },
+            allow_unbracketed_maneuvers: u8::from(self.allow_unbracketed_maneuvers),
+            has_photometry: u8::from(self.photometry.is_some()),
+            photometry: self.photometry.map(|p| p.to_ffi()).unwrap_or_default(),
         };
         let keep = ODConfigKeepalive {
             perturbers,

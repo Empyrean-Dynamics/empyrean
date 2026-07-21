@@ -24,7 +24,7 @@ type-check, or RAII-manage the underlying handles.
 
 ```toml
 [dependencies]
-empyrean-sys = "0.8"
+empyrean-sys = "0.9.0-rc.0"
 ```
 
 ```rust
@@ -46,6 +46,36 @@ unsafe {
 [`empyrean`](https://crates.io/crates/empyrean) crate, which builds on
 empyrean-sys to provide typed handles, `Result`-returning entry points,
 and Rust-native lifetime management.
+
+## What the bindings cover
+
+The declarations track the full C ABI at `EMPYREAN_ABI_VERSION`
+(currently `1`), including the v0.9.0 wide-parameter fitting surface.
+Each type below maps 1:1 onto a C struct; consult `include/empyrean.h`
+at the repository root for field-level semantics.
+
+- **Wide-parameter OD.** `empyrean_determine` / `empyrean_refine` solve
+  beyond the 6-parameter state and the Marsden A1/A2/A3 non-gravitational
+  block for the cometary outgassing time delay DT, the SRP area-to-mass
+  ratio AMRAT, and per-segment thrust Δv corrections on continuous-thrust
+  arcs — each partial produced analytically by the hyperdual integrator. The per-axis `EmpyreanSolveFor`
+  (`marsden` / `dt` / `amrat` / `thrust_segments`) is read under
+  `EMPYREAN_SOLVE_FOR_EXPLICIT`. DT / AMRAT / thrust are refine-path solves:
+  the input orbit must carry the corresponding prior (its declared variance)
+  to open the axis, and requesting an axis without its prior errors out
+  rather than returning a zeroed or defaulted column.
+- **Tagged solved covariance.** `EmpyreanSolvedCovariance` carries the
+  fitted-parameter identities alongside the matrix: `marsden_slot`,
+  `dt_slot`, `amrat_slot`, and `thrust_slots` locate each parameter's
+  row/column, with `EMPYREAN_SLOT_NONE` marking an axis that was not solved.
+  Read a parameter's variance by its slot — the `width` alone is ambiguous.
+- **Post-OD photometry.** With `EmpyreanODConfig::has_photometry` set,
+  `EmpyreanPhotometryConfig` requests a fit recovering absolute magnitude
+  `H` and the phase-function slopes from the observation magnitudes,
+  climbing the H-only → HG12 → HG1G2 ladder (Muinonen et al. 2010) to the
+  richest model the arc's phase coverage supports. `EmpyreanODPhotometryResult`
+  reports the fitted `h` / `slope1` / `slope2`, the `model_used`, and a 3×3
+  `covariance` giving an honest 1σ on `h`.
 
 ## Runtime requirement
 

@@ -57,6 +57,11 @@ class SolveForParams(str, Enum):
     AUTO = "auto"
     """Start with state-only, escalate to 9-param on poor fit. Tuned
     via :class:`AutoEscalationPolicy`."""
+    EXPLICIT = "explicit"
+    """An explicit per-axis solve requested via ``solve_for_flags``
+    (:class:`SolveFor`) — e.g. Marsden + DT, or state + AMRAT. Reported
+    on :attr:`DetermineResult.solve_for_used` when the fit used the
+    explicit flag surface rather than one of the coarse presets above."""
 
 
 class CovarianceRepresentation(str, Enum):
@@ -66,6 +71,30 @@ class CovarianceRepresentation(str, Enum):
     KEPLERIAN = "keplerian"
     COMETARY = "cometary"
     SPHERICAL = "spherical"
+
+
+class PhotometryModel(str, Enum):
+    """Photometric model for the post-OD phase-function fit.
+
+    Mirrors ``empyrean::PhotometryModel``. In ``AUTO`` the fit climbs a
+    model ladder -- H-only -> HG12 -> HG1G2 -- admitting the richest
+    model the arc's phase-angle coverage and magnitude count support,
+    and a :class:`PhotometryResult` reports the model it actually fitted
+    on ``model_used`` (never ``AUTO``). An explicit value pins a
+    specific model. HG12 / HG1G2 follow Muinonen et al. (2010); H-only
+    holds the slope fixed.
+    """
+
+    AUTO = "auto"
+    """Auto-select up the ladder (H-only -> HG12 -> HG1G2) by data richness."""
+    HONLY = "honly"
+    """Fit only the absolute magnitude H (fixed slope)."""
+    HG = "hg"
+    """Two-parameter H, G."""
+    HG12 = "hg12"
+    """Two-parameter H, G12 (Muinonen et al. 2010)."""
+    HG1G2 = "hg1g2"
+    """Three-parameter H, G1, G2 (Muinonen et al. 2010)."""
 
 
 # ── Output epoch (tagged-union dataclass) ────────────────────
@@ -395,6 +424,53 @@ class StationRaDecConfig:
     min_obs_per_station: int = 5
 
 
+# ── Wide solve-for + photometry request (mirrors empyrean::SolveFor /
+#    empyrean::PhotometryConfig) ─────────────────────────────────
+
+
+@dataclass
+class SolveFor:
+    """Per-axis wide solve-for selection. Mirrors ``empyrean::SolveFor``.
+
+    Set on :attr:`ODConfig.solve_for_flags` to request an explicit
+    multi-axis fit that the coarse :class:`SolveForParams` variants
+    can't name. Each flag turns on one wide-STM axis, subject to its
+    own precondition (a declared prior on the orbit) enforced by the
+    engine.
+    """
+
+    marsden: bool = False
+    """Solve the Marsden A1/A2/A3 block (requires a non-grav covariance)."""
+    dt: bool = False
+    """Solve the non-grav time delay DT (requires ``marsden`` + a DT prior)."""
+    amrat: bool = False
+    """Solve the SRP AMRAT (requires an SRP AMRAT prior)."""
+    thrust_segments: int = 0
+    """Number of thrust Δv segments to solve (3 columns each; 0 = none)."""
+
+
+@dataclass
+class PhotometryConfig:
+    """Post-OD photometric-fit configuration. Mirrors
+    ``empyrean::PhotometryConfig``.
+
+    Attach via :attr:`ODConfig.photometry`. The fit runs after the
+    orbit is solved and never touches the state. Sentinel rule:
+    ``0`` / ``0.0`` on a tuning field requests the engine default.
+    """
+
+    model: PhotometryModel = PhotometryModel.AUTO
+    """Model to fit. Default :attr:`PhotometryModel.AUTO`."""
+    sigma_lightcurve: float = 0.0
+    """1σ lightcurve scatter floor (mag). ``0.0`` → engine default (0.2)."""
+    include_rejected: bool = False
+    """Include astrometrically-rejected observations' magnitudes."""
+    max_irls_iterations: int = 0
+    """Max Huber-IRLS iterations. ``0`` → engine default (30)."""
+    huber_k: float = 0.0
+    """Huber tuning constant. ``0.0`` → engine default (1.5)."""
+
+
 # ── Top-level config ─────────────────────────────────────────
 
 
@@ -460,6 +536,18 @@ class ODConfig:
     auto_force_model: bool = False
     """Auto-select force-model tier from IOD orbital elements."""
     output_representation: CovarianceRepresentation = CovarianceRepresentation.CARTESIAN
+    solve_for_flags: SolveFor | None = None
+    """Explicit per-axis wide solve request. When set, overrides the
+    coarse :attr:`solve_for` and asks the engine for an ``Explicit``
+    fit over the requested axes (Marsden / DT / AMRAT / thrust).
+    ``None`` = use :attr:`solve_for`."""
+    allow_unbracketed_maneuvers: bool = False
+    """Permit solving a thrust Δv segment whose burn window is not
+    bracketed by observations (the state absorbs it otherwise). Default
+    ``False`` — refuse loudly."""
+    photometry: PhotometryConfig | None = None
+    """Post-OD photometric fit. ``None`` (default) disables it; the fit
+    runs after the orbit is solved and never touches the state."""
 
     def _to_wire_dict(self) -> dict[str, WireValue]:
         """Serialize to the nested dict shape the binding consumes.
@@ -470,7 +558,7 @@ class ODConfig:
         serialization (saving config to JSON, displaying it in a
         notebook, etc.), use :func:`dataclasses.asdict`.
         """
-        return {
+        wire: dict[str, WireValue] = {
             "force_model": _enum_value(self.force_model),
             "epsilon": self.epsilon,
             "max_light_time_iterations": self.max_light_time_iterations,
@@ -535,7 +623,28 @@ class ODConfig:
             },
             "auto_force_model": self.auto_force_model,
             "output_representation": _enum_value(self.output_representation),
+            "allow_unbracketed_maneuvers": self.allow_unbracketed_maneuvers,
         }
+        # Explicit per-axis solve request and photometry config are only
+        # emitted when set — the Rust parser reads these keys only when
+        # present, so their absence leaves the coarse `solve_for` /
+        # photometry-off defaults untouched.
+        if self.solve_for_flags is not None:
+            wire["solve_for_flags"] = {
+                "marsden": self.solve_for_flags.marsden,
+                "dt": self.solve_for_flags.dt,
+                "amrat": self.solve_for_flags.amrat,
+                "thrust_segments": self.solve_for_flags.thrust_segments,
+            }
+        if self.photometry is not None:
+            wire["photometry"] = {
+                "model": _enum_value(self.photometry.model),
+                "sigma_lightcurve": self.photometry.sigma_lightcurve,
+                "include_rejected": self.photometry.include_rejected,
+                "max_irls_iterations": self.photometry.max_irls_iterations,
+                "huber_k": self.photometry.huber_k,
+            }
+        return wire
 
 
 def _weighting_to_dict(w: WeightingConfig) -> dict[str, WireValue]:
@@ -603,6 +712,111 @@ class EvaluateResult:
 
 
 @dataclass
+class SolvedCovariance:
+    """Full tagged solved-parameter covariance from a wide OD fit.
+    Mirrors ``empyrean::SolvedCovariance``.
+
+    :attr:`matrix` is the real solved covariance, sized
+    ``width × width``; parameters are located by the slot fields, never
+    by width (width 9 is Marsden-only OR one thrust segment). Canonical
+    order is ``[state 6 | Marsden 3 | DT 1 | AMRAT 1 | thrust 3×k]``. The
+    Δv axes are integration-frame components (see
+    :attr:`DetermineResult.dv_frame`).
+    """
+
+    matrix: np.ndarray
+    """The solved covariance, shaped ``(width, width)``."""
+    width: int
+    """Solved width (6..=17 under the current engine)."""
+    marsden_slot: int | None
+    """Column of the first Marsden coefficient, when Marsden was solved."""
+    dt_slot: int | None
+    """Column of the DT scalar, when DT was solved."""
+    amrat_slot: int | None
+    """Column of the AMRAT scalar, when AMRAT was solved."""
+    thrust_slots: list[tuple[int, int, int]]
+    """Column triples of each fitted thrust Δv segment (one
+    ``(i, i+1, i+2)`` per solved segment). Empty when no thrust was
+    solved."""
+
+
+@dataclass
+class BandStat:
+    """Per-band photometric fit statistics. Mirrors ``empyrean::BandStat``."""
+
+    band: str
+    """Photometric band tag."""
+    n: int
+    """Number of observations in this band."""
+    offset_applied: float
+    """Band→V offset applied (mag)."""
+    mean_residual: float
+    """Mean residual in V (mag)."""
+    rms: float
+    """RMS residual in V (mag)."""
+
+
+@dataclass
+class GateRecord:
+    """One model-ladder gate decision from the photometric fit. Mirrors
+    ``empyrean::GateRecord``."""
+
+    model: PhotometryModel
+    """Model the gate evaluated."""
+    passed: bool
+    """Whether the model was admitted."""
+    reason: str
+    """Human-readable gate reason."""
+
+
+@dataclass
+class PhotometryResult:
+    """Post-OD photometric solution — an H/G fit over the arc's
+    magnitudes, run after the orbit is solved. Mirrors
+    ``empyrean::PhotometryResult``.
+
+    Photometry has no astrometric partials, so it never touches the
+    state. H carries honest σ via :attr:`covariance`.
+    """
+
+    h: float
+    """Fitted absolute magnitude H (mag)."""
+    slope1: float
+    """First slope parameter (G / G12 / G1 by model)."""
+    slope2: float
+    """Second slope parameter (G2 for HG1G2; unused otherwise)."""
+    covariance: np.ndarray | None
+    """Parameter covariance over (H, slope1, slope2), shaped ``(3, 3)``
+    when available. ``None`` otherwise."""
+    model_used: PhotometryModel
+    """Model actually fitted (never :attr:`PhotometryModel.AUTO`)."""
+    reduced_chi2: float
+    """Reduced χ² of the photometric fit over its used magnitudes."""
+    constraint_active: bool
+    """Whether a simplex constraint was active on the fitted slopes."""
+    n_mags_used: int
+    """Magnitudes used in the fit."""
+    n_mags_rejected_photometric: int
+    """Magnitudes rejected by the photometric outlier pass."""
+    n_obs_without_mags: int
+    """Observations carrying no magnitude."""
+    n_mags_from_astrometric_selected: int
+    """Magnitudes drawn from astrometrically-selected observations."""
+    n_mags_from_astrometric_rejected: int
+    """Magnitudes drawn from astrometrically-rejected observations."""
+    alpha_min_deg: float
+    """Minimum phase angle of the fitted magnitudes (deg)."""
+    alpha_max_deg: float
+    """Maximum phase angle of the fitted magnitudes (deg)."""
+    alpha_span_deg: float
+    """Phase-angle span of the fitted magnitudes (deg)."""
+    per_band: list[BandStat]
+    """Per-band statistics."""
+    gates: list[GateRecord]
+    """Model-ladder gate records."""
+
+
+@dataclass
 class DetermineResult:
     """Result of orbit determination — returned by both
     :func:`~empyrean.od.determine.determine` (full IOD + DC pipeline)
@@ -637,3 +851,23 @@ class DetermineResult:
     """Per-station fitted nuisance biases when
     :attr:`ODConfig.fit_station_biases` was active. Empty quivr table
     otherwise."""
+    solved_covariance: SolvedCovariance | None
+    """Full tagged solved-parameter covariance when the fit solved any
+    wide axis (Marsden / DT / AMRAT / thrust). ``None`` for a state-only
+    fit — read it, not the width, to locate solved parameters."""
+    dt_delta: float | None
+    """Cumulative non-grav time-delay correction ΔDT (days), when DT was
+    solved. ``None`` otherwise."""
+    amrat_delta: float | None
+    """Cumulative SRP AMRAT correction (m²/kg), when AMRAT was solved.
+    ``None`` otherwise."""
+    thrust_delta_m_per_s: np.ndarray | None
+    """Per-segment fitted thrust Δv (m/s), shaped ``(k, 3)`` and
+    expressed in :attr:`dv_frame`. ``None`` when no thrust was solved."""
+    dv_frame: str | None
+    """Integration frame the thrust Δv components are expressed in
+    (``"icrf"`` / ``"eclipticj2000"`` / ``"itrf93"``). ``None`` when no
+    thrust was solved."""
+    photometry: PhotometryResult | None
+    """Post-OD photometric solution when photometry was requested and
+    ran. ``None`` otherwise."""

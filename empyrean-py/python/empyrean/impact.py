@@ -31,6 +31,8 @@ from empyrean._convert import (
     AnyOrbits,
     coordinates_to_arrays,
     extract_non_grav_covariance,
+    extract_srp,
+    validate_non_grav_marsden_only,
 )
 from empyrean.coordinates.enums import Origin
 from empyrean.coordinates.epoch import Epochs
@@ -49,7 +51,9 @@ FloatArray = np.ndarray[Any, np.dtype[np.float64]]
 # float64 element/covariance/non-grav arrays, a bool `has_covariance`
 # mask, int32 representation/frame/origin tag arrays — plus an
 # optional float64 `non_grav_dts` (None when no row carries a DT).
-_OrbitArg = FloatArray | npt.NDArray[np.bool_] | npt.NDArray[np.int32] | None
+_OrbitArg = (
+    FloatArray | npt.NDArray[np.bool_] | npt.NDArray[np.int32] | npt.NDArray[np.uint8] | None
+)
 
 # ── Method-name canonical strings ────────────────────────────
 #
@@ -271,10 +275,14 @@ def _common_orbit_args(orbits: AnyOrbits) -> dict[str, _OrbitArg]:
     ) = coordinates_to_arrays(orbits.coordinates)
 
     n = len(orbits)
+    # NonGravParams is Marsden-only; reject a stray model='srp' / cr before
+    # marshaling (SRP rides its own slot, extracted below).
+    validate_non_grav_marsden_only(orbits)
     a1s = np.zeros(n, dtype=np.float64)
     a2s = np.zeros(n, dtype=np.float64)
     a3s = np.zeros(n, dtype=np.float64)
     non_grav_dts: FloatArray | None = None
+    non_grav_dt_variances: FloatArray | None = None
     ng_alphas: FloatArray | None = None
     ng_r0s: FloatArray | None = None
     ng_ms: FloatArray | None = None
@@ -307,6 +315,12 @@ def _common_orbit_args(orbits: AnyOrbits) -> dict[str, _OrbitArg]:
         dt_col = np.asarray(ng.dt.to_numpy(zero_copy_only=False), dtype=np.float64)
         if np.isfinite(dt_col).any():
             non_grav_dts = dt_col
+        # DT prior variance — opens the DT column in a StateAndNonGravAndDT
+        # solve when the orbit is re-fed into a DT fit. Gated like non_grav_dts
+        # (finite positive), so the no-prior common case skips the FFI marshal.
+        dtv_col = np.asarray(ng.dt_variance.to_numpy(zero_copy_only=False), dtype=np.float64)
+        if (np.isfinite(dtv_col) & (dtv_col > 0.0)).any():
+            non_grav_dt_variances = dtv_col
         # Marsden g(r) exponents. Without them, a comet's custom g(r)
         # silently collapses to inverse-square on the IP / B-plane input
         # path (same class as the c37m propagate-input fix). Surface all
@@ -341,6 +355,16 @@ def _common_orbit_args(orbits: AnyOrbits) -> dict[str, _OrbitArg]:
         has_ng_cov_arr if has_ng_cov_arr.any() else None
     )
     non_grav_cov: FloatArray | None = ng_cov_arr if has_ng_cov_arr.any() else None
+    # SRP force slot — passed through only when a row carries one, so a
+    # State+AMRAT-fitted (or SRP-primed) orbit re-fed into the IP / B-plane
+    # input path keeps its slot. Gated like the other optional arrays so the
+    # common no-SRP case skips the FFI marshal.
+    srp_has, srp_amrat_arr, srp_cr_arr, srp_var_arr = extract_srp(orbits)
+    srp_present = bool(srp_has.any())
+    has_srp: npt.NDArray[np.uint8] | None = srp_has if srp_present else None
+    srp_amrat: FloatArray | None = srp_amrat_arr if srp_present else None
+    srp_cr: FloatArray | None = srp_cr_arr if srp_present else None
+    srp_amrat_variance: FloatArray | None = srp_var_arr if srp_present else None
     return {
         "epochs": epochs_arr,
         "elements": elements_arr,
@@ -353,6 +377,11 @@ def _common_orbit_args(orbits: AnyOrbits) -> dict[str, _OrbitArg]:
         "a2s": a2s,
         "a3s": a3s,
         "non_grav_dts": non_grav_dts,
+        "non_grav_dt_variances": non_grav_dt_variances,
+        "has_srp": has_srp,
+        "srp_amrat": srp_amrat,
+        "srp_cr": srp_cr,
+        "srp_amrat_variance": srp_amrat_variance,
         "has_non_grav_cov": has_non_grav_cov,
         "non_grav_cov": non_grav_cov,
         "ng_alphas": ng_alphas,
@@ -492,6 +521,11 @@ def compute_impact_probabilities(
         method_tags=method_tags,
         body_filter_naif=filter_arg,
         non_grav_dts=args["non_grav_dts"],
+        non_grav_dt_variances=args["non_grav_dt_variances"],
+        has_srp=args["has_srp"],
+        srp_amrat=args["srp_amrat"],
+        srp_cr=args["srp_cr"],
+        srp_amrat_variance=args["srp_amrat_variance"],
         has_non_grav_cov=args["has_non_grav_cov"],
         non_grav_cov=args["non_grav_cov"],
         ng_alphas=args["ng_alphas"],
@@ -577,6 +611,11 @@ def compute_b_planes(
         method_tags=method_tags,
         body_filter_naif=filter_arg,
         non_grav_dts=args["non_grav_dts"],
+        non_grav_dt_variances=args["non_grav_dt_variances"],
+        has_srp=args["has_srp"],
+        srp_amrat=args["srp_amrat"],
+        srp_cr=args["srp_cr"],
+        srp_amrat_variance=args["srp_amrat_variance"],
         has_non_grav_cov=args["has_non_grav_cov"],
         non_grav_cov=args["non_grav_cov"],
         ng_alphas=args["ng_alphas"],

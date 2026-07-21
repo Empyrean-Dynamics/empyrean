@@ -27,6 +27,7 @@ from empyrean.orbits.orbits import (
     KeplerianOrbits,
     SphericalOrbits,
 )
+from empyrean.orbits.srp import SRPParams
 
 # Float64 numpy array alias used throughout this module.
 FloatArray = npt.NDArray[np.float64]
@@ -506,6 +507,9 @@ def orbit_batch_dict_to_orbits(result: dict[str, Any]) -> AnyOrbits:
         ng_n = np.asarray(result.get("ng_n", np.zeros(n)), dtype=np.float64)
         ng_k = np.asarray(result.get("ng_k", np.zeros(n)), dtype=np.float64)
         ng_dt = np.asarray(result.get("non_grav_dt", np.full(n, np.nan)), dtype=np.float64)
+        ng_dt_variance = np.asarray(
+            result.get("non_grav_dt_variance", np.full(n, np.nan)), dtype=np.float64
+        )
         models: list[str] = []
         for i in range(n):
             if ng_alpha[i] != 0.0:
@@ -533,6 +537,24 @@ def orbit_batch_dict_to_orbits(result: dict[str, Any]) -> AnyOrbits:
             n=ng_n,
             k=ng_k,
             dt=ng_dt,
+            dt_variance=ng_dt_variance,
+        )
+
+    # SRP force slot — reconstruct ``orbits.srp`` when any row carries an SRP
+    # force (has_srp == 1). Additive with, and independent of, the Marsden
+    # non-grav above (a State+AMRAT fit has no Marsden coefficients), so this
+    # is deliberately outside the non-grav block. Absent rows get a NaN
+    # amrat/cr sentinel that :func:`extract_srp` reads back as "no slot".
+    has_srp = np.asarray(result.get("has_srp", np.zeros(n, dtype=np.uint8)), dtype=np.uint8)
+    if has_srp.any():
+        srp_amrat = np.asarray(result.get("srp_amrat", np.full(n, np.nan)), dtype=np.float64)
+        srp_cr = np.asarray(result.get("srp_cr", np.full(n, np.nan)), dtype=np.float64)
+        srp_var = np.asarray(result.get("srp_amrat_variance", np.full(n, np.nan)), dtype=np.float64)
+        present = has_srp != 0
+        orbits_kwargs["srp"] = SRPParams.from_kwargs(
+            amrat=np.where(present, srp_amrat, np.nan),
+            cr=np.where(present, srp_cr, np.nan),
+            amrat_variance=np.where(present, srp_var, np.nan),
         )
 
     # Photometry — populated when the upstream source (e.g. SBDB's
@@ -616,6 +638,10 @@ def orbits_to_orbit_batch_dict(orbits: AnyOrbits) -> dict[str, Any]:
         raise TypeError(f"unsupported coordinate type: {coord_type}")
     rep, col_names = _COORD_TYPE_MAP[coord_type]
 
+    # NonGravParams is Marsden-only; reject a stray model='srp' / cr before
+    # marshaling (SRP rides its own slot below).
+    validate_non_grav_marsden_only(orbits)
+
     n = len(orbits)
     epochs = _column_to_numpy(orbits.coordinates.epoch)
     elements = np.column_stack(
@@ -658,6 +684,7 @@ def orbits_to_orbit_batch_dict(orbits: AnyOrbits) -> dict[str, Any]:
     ng_n = np.zeros(n)
     ng_k = np.zeros(n)
     ng_dt = np.full(n, np.nan)
+    ng_dt_variance = np.full(n, np.nan)
     if orbits.non_grav is not None:
         ng = orbits.non_grav
         a1 = np.nan_to_num(_column_to_numpy(ng.a1), nan=0.0)
@@ -674,6 +701,13 @@ def orbits_to_orbit_batch_dict(orbits: AnyOrbits) -> dict[str, Any]:
         # Preserve NaN as "no thermal-lag delay" — 0.0 is a real delay,
         # so do NOT nan_to_num this one.
         ng_dt = _column_to_numpy(ng.dt)
+        # DT prior variance (opens the DT column in a StateAndNonGravAndDT
+        # solve). Preserve NaN as "no prior" — do NOT nan_to_num.
+        ng_dt_variance = _column_to_numpy(ng.dt_variance)
+
+    # SRP force slot (has_srp explicit switch + amrat/cr/variance). Additive
+    # with the Marsden non-grav above; validated + gated in extract_srp.
+    has_srp, srp_amrat, srp_cr, srp_amrat_variance = extract_srp(orbits)
 
     object_ids = [s if s else "" for s in orbits.object_id.to_pylist()]
     return {
@@ -695,6 +729,11 @@ def orbits_to_orbit_batch_dict(orbits: AnyOrbits) -> dict[str, Any]:
         "ng_n": ng_n,
         "ng_k": ng_k,
         "non_grav_dt": ng_dt,
+        "non_grav_dt_variance": ng_dt_variance,
+        "has_srp": has_srp,
+        "srp_amrat": srp_amrat,
+        "srp_cr": srp_cr,
+        "srp_amrat_variance": srp_amrat_variance,
     }
 
 
@@ -752,3 +791,132 @@ def extract_non_grav_covariance(
                 non_grav_cov[i] = np.asarray(c, dtype=np.float64).reshape(3, 3)
                 has_non_grav_cov[i] = True
     return has_non_grav_cov, non_grav_cov
+
+
+# ── SRP force slot (shared marshal helpers) ──────────────────────────
+#
+# SRP is a first-class, additive force slot carried on ``orbits.srp``
+# (:class:`~empyrean.orbits.srp.SRPParams`) — NOT a NonGravParams model.
+# These two helpers are shared by every orbit-marshaling entry point
+# (propagate / generate_ephemeris / impact / od.determine / io) so none of
+# them silently drops the caller's SRP slot or silently applies the old,
+# physically-wrong ``model="srp"`` Marsden path.
+
+# The Marsden g(r) models NonGravParams may carry. SRP is deliberately NOT in
+# this set — it moved to its own force slot. The reverse-marshal paths emit
+# "marsden", "marsden_sekanina", "inverse_square", and "" (a gravity-only row
+# in a mixed batch), so all four round-trip cleanly.
+_VALID_NON_GRAV_MODELS = frozenset(
+    {"marsden_water", "inverse_square", "marsden", "marsden_sekanina", ""}
+)
+
+
+def validate_non_grav_marsden_only(orbits: AnyOrbits) -> None:
+    """Reject a ``NonGravParams`` that is not a pure Marsden non-grav.
+
+    Shared by every orbit-marshaling entry point. NonGravParams is
+    Marsden-only; solar radiation pressure is a separate additive slot on
+    ``orbits.srp`` (:class:`~empyrean.orbits.srp.SRPParams`). This raises
+    :class:`ValueError` when:
+
+    - ``model == "srp"`` — the old in-band SRP tag, which the forward model
+      silently applied as a *radial Marsden* acceleration (``a1`` treated as
+      A1, not AMRAT). Any orbit fit or propagated under it was wrong.
+    - a non-null ``cr`` appears on ``NonGravParams`` — Cr belongs on
+      ``SRPParams`` now.
+    - an unknown ``model`` string.
+
+    A no-op when ``orbits.srp`` alone is set (that is the correct surface).
+    """
+    if orbits.non_grav is None:
+        return
+    ng = orbits.non_grav
+
+    # Cr moved to SRPParams. Reject any lingering non-null cr loudly (old data
+    # or a caller still setting it on the wrong table).
+    if "cr" in ng.table.column_names:
+        cr_col = ng.column("cr")
+        if cr_col.null_count < len(cr_col):
+            raise ValueError(
+                "NonGravParams carries a non-null `cr` — the radiation-pressure "
+                "coefficient moved to SRPParams. Set `orbits.srp = "
+                "SRPParams(amrat=..., cr=...)` instead of a `cr` on NonGravParams."
+            )
+
+    models = ng.model.to_pylist()
+    for model in models:
+        tag = (model or "").lower()
+        if tag == "srp":
+            raise ValueError(
+                "NonGravParams model='srp' is no longer supported: solar "
+                "radiation pressure is a separate additive force slot. Use "
+                "`orbits.srp = SRPParams(amrat=<m^2/kg>, cr=<coefficient>)` "
+                "instead. NOTE: any orbit previously fit or propagated with "
+                "model='srp' was computed as a radial Marsden acceleration "
+                "(a1 treated as A1, not AMRAT) and is INVALID — re-run it with "
+                "the SRPParams slot."
+            )
+        if tag not in _VALID_NON_GRAV_MODELS:
+            raise ValueError(
+                f"unknown NonGravParams model={model!r}; expected one of "
+                f"{sorted(_VALID_NON_GRAV_MODELS)} (SRP now lives on orbits.srp)"
+            )
+
+
+def extract_srp(
+    orbits: AnyOrbits,
+) -> tuple[npt.NDArray[np.uint8], FloatArray, FloatArray, FloatArray]:
+    """Extract the SRP force slot from ``orbits.srp`` as parallel arrays.
+
+    Returns ``(has_srp, srp_amrat, srp_cr, srp_amrat_variance)`` — a ``(n,)``
+    ``uint8`` switch and three ``(n,)`` float64 arrays. ``has_srp[i] == 1``
+    only where the ``srp`` sub-table is present for row ``i`` (a finite
+    ``amrat``); SRP is never value-inferred. Absent rows read
+    ``has_srp = 0`` with ``amrat = cr = 0`` and ``amrat_variance = NaN``.
+
+    Validates loudly (mirrors the C-ABI ``empyrean_orbit_srp_params`` rules):
+    a present row must have a finite ``amrat`` and ``cr`` both ``> 0``, and a
+    finite ``amrat_variance`` must be ``> 0`` (NaN / null = no prior).
+    """
+    n = len(orbits)
+    has_srp = np.zeros(n, dtype=np.uint8)
+    srp_amrat = np.zeros(n, dtype=np.float64)
+    srp_cr = np.zeros(n, dtype=np.float64)
+    srp_amrat_variance = np.full(n, np.nan, dtype=np.float64)
+    if orbits.srp is None:
+        return has_srp, srp_amrat, srp_cr, srp_amrat_variance
+
+    srp = orbits.srp
+    amrat = np.asarray(srp.amrat.to_numpy(zero_copy_only=False), dtype=np.float64)
+    cr = np.asarray(srp.cr.to_numpy(zero_copy_only=False), dtype=np.float64)
+    # Nullable column: nulls come back as NaN = "no prior".
+    variance = np.asarray(srp.amrat_variance.to_numpy(zero_copy_only=False), dtype=np.float64)
+
+    # A row is present exactly when its (non-nullable) amrat is non-null. quivr
+    # returns NaN for a null sub-table row (and an all-null SRPParams even when
+    # the caller never set `srp`), so a non-NaN amrat is the "real slot" gate.
+    # Gating on non-NaN rather than finiteness means an explicit Inf amrat is
+    # still "present" and gets rejected loudly below (never a silent drop).
+    present = ~np.isnan(amrat)
+    for i in np.nonzero(present)[0]:
+        if not (np.isfinite(amrat[i]) and amrat[i] > 0.0):
+            raise ValueError(
+                f"orbits.srp.amrat[{i}] must be finite and > 0 (area-to-mass "
+                f"ratio, m^2/kg); got {amrat[i]}"
+            )
+        if not (np.isfinite(cr[i]) and cr[i] > 0.0):
+            raise ValueError(
+                f"orbits.srp.cr[{i}] must be finite and > 0 (radiation-pressure "
+                f"coefficient); got {cr[i]}"
+            )
+        if np.isfinite(variance[i]) and variance[i] <= 0.0:
+            raise ValueError(
+                f"orbits.srp.amrat_variance[{i}] must be > 0 when set (AMRAT "
+                f"prior variance, (m^2/kg)^2); got {variance[i]} — use null for "
+                f"no prior"
+            )
+        has_srp[i] = 1
+        srp_amrat[i] = amrat[i]
+        srp_cr[i] = cr[i]
+        srp_amrat_variance[i] = variance[i]
+    return has_srp, srp_amrat, srp_cr, srp_amrat_variance

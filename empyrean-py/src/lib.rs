@@ -634,6 +634,11 @@ fn _query_radar<'py>(
     ng_ns = None,
     ng_ks = None,
     non_grav_dts = None,
+    non_grav_dt_variances = None,
+    has_srp = None,
+    srp_amrat = None,
+    srp_cr = None,
+    srp_amrat_variance = None,
     has_non_grav_cov = None,
     non_grav_cov = None,
     gm_threshold = 1.0,
@@ -686,6 +691,18 @@ fn _propagate<'py>(
     // SBDB non-grav time delay (days). NaN entries → no delay; whole
     // array None → no DT for any orbit.
     non_grav_dts: Option<PyReadonlyArray1<'py, f64>>,
+    // Prior variance on the non-grav DT (days²), parallel to `non_grav_dts`.
+    // NaN / ≤0 entries → no prior; whole array None → no DT prior for any
+    // orbit. A finite positive value opens + priors the DT fit column.
+    non_grav_dt_variances: Option<PyReadonlyArray1<'py, f64>>,
+    // SRP force slot (explicit `has_srp` switch + amrat/cr and an optional
+    // AMRAT prior variance), parallel per-orbit arrays. SRP is never
+    // value-inferred: a row is applied only where `has_srp == 1`. A finite
+    // positive `srp_amrat_variance` opens + priors the AMRAT fit column.
+    has_srp: Option<PyReadonlyArray1<'py, u8>>,
+    srp_amrat: Option<PyReadonlyArray1<'py, f64>>,
+    srp_cr: Option<PyReadonlyArray1<'py, f64>>,
+    srp_amrat_variance: Option<PyReadonlyArray1<'py, f64>>,
     // Fitted non-grav 3×3 covariance (nullable per-row mask + (n,3,3) values).
     // Threaded so a fitted orbit re-fed into propagate keeps its
     // StateAndNonGrav prior instead of silently dropping it.
@@ -746,6 +763,13 @@ fn _propagate<'py>(
     let ng_n_arr = ng_ns.as_ref().map(|a| a.as_array().to_owned());
     let ng_k_arr = ng_ks.as_ref().map(|a| a.as_array().to_owned());
     let dt_arr = non_grav_dts.as_ref().map(|a| a.as_array().to_owned());
+    let dtv_arr = non_grav_dt_variances
+        .as_ref()
+        .map(|a| a.as_array().to_owned());
+    let srp_has_arr = has_srp.as_ref().map(|a| a.as_array().to_owned());
+    let srp_amrat_arr = srp_amrat.as_ref().map(|a| a.as_array().to_owned());
+    let srp_cr_arr = srp_cr.as_ref().map(|a| a.as_array().to_owned());
+    let srp_var_arr = srp_amrat_variance.as_ref().map(|a| a.as_array().to_owned());
     let has_ng_cov_arr = has_non_grav_cov.as_ref().map(|a| a.as_array().to_owned());
     let ng_cov_arr = non_grav_cov.as_ref().map(|a| a.as_array().to_owned());
 
@@ -810,6 +834,18 @@ fn _propagate<'py>(
         let non_grav_dt = dt_arr
             .as_ref()
             .and_then(|dts| dts[i].is_finite().then_some(dts[i]));
+        // Prior variance on the DT (days²); NaN / ≤0 = no prior.
+        let non_grav_dt_variance = dtv_arr
+            .as_ref()
+            .and_then(|v| (v[i].is_finite() && v[i] > 0.0).then_some(v[i]));
+        // SRP force slot (explicit `has_srp` switch; independent of Marsden).
+        let srp = srp_at(
+            srp_has_arr.as_ref(),
+            srp_amrat_arr.as_ref(),
+            srp_cr_arr.as_ref(),
+            srp_var_arr.as_ref(),
+            i,
+        );
         // Fitted non-grav 3×3 covariance (optional, nullable per row).
         let ng_cov = ng_covariance_at(has_ng_cov_arr.as_ref(), ng_cov_arr.as_ref(), i);
         // Photometry: ephemeris generation downstream consumes (H, slope1,
@@ -848,9 +884,11 @@ fn _propagate<'py>(
             a3s_arr[i],
             g_function,
             non_grav_dt,
+            non_grav_dt_variance,
             ng_cov,
             photometry,
             thrust,
+            srp,
         ));
     }
 
@@ -1484,9 +1522,14 @@ fn assemble_orbit(
     a3: f64,
     g_function: Option<(f64, f64, f64, f64, f64)>,
     non_grav_dt: Option<f64>,
+    non_grav_dt_variance: Option<f64>,
     ng_covariance: Option<[[f64; 3]; 3]>,
     photometry: Option<(empyrean::PhaseFunction, f64, f64, f64)>,
     thrust: Option<empyrean::ThrustParams>,
+    // SRP force slot: `(amrat, cr, amrat_variance)`. `None` = no SRP (the
+    // explicit `has_srp` switch was 0). A `Some(_, _, Some(v))` opens the
+    // AMRAT fit column; `Some(_, _, None)` applies SRP as a fixed force.
+    srp: Option<(f64, f64, Option<f64>)>,
 ) -> empyrean::Orbit {
     // Absent g(r) → the all-zero (alpha, r0, m, n, k) inverse-square sentinel
     // `Orbit::new` uses; the C ABI reads all-zeros as "inverse-square".
@@ -1496,7 +1539,7 @@ fn assemble_orbit(
         Some((pf, h, s1, s2)) => (Some(pf), h, s1, s2),
         None => (None, f64::NAN, 0.0, 0.0),
     };
-    empyrean::Orbit {
+    let orbit = empyrean::Orbit {
         orbit_id,
         object_id,
         state,
@@ -1509,13 +1552,48 @@ fn assemble_orbit(
         ng_n,
         ng_k,
         non_grav_dt,
+        non_grav_dt_variance,
         ng_covariance,
         phot_system,
         h_mag,
         slope1,
         slope2,
         thrust,
+        srp: None,
+    };
+    // Attach the SRP slot through the public builders so `has_srp` (the
+    // explicit switch) and the AMRAT prior are set exactly as the wrapper /
+    // C ABI expect; field validation (amrat/cr > 0) surfaces loudly at the
+    // C ABI. `None` leaves the orbit SRP-free.
+    match srp {
+        Some((amrat, cr, amrat_variance)) => orbit
+            .with_srp(amrat, cr)
+            .with_srp_amrat_variance(amrat_variance),
+        None => orbit,
     }
+}
+
+/// Build orbit `i`'s SRP force slot from the marshaled arrays, or `None` when
+/// no arrays were passed or the row's explicit `has_srp` switch is 0 — SRP is
+/// never value-inferred, the switch is the sole trigger. A finite positive
+/// `srp_amrat_variance` opens the AMRAT fit column; otherwise SRP is a fixed
+/// force. `amrat` / `cr` validation (finite, > 0) is enforced at the C ABI
+/// and surfaces loudly through the FFI.
+fn srp_at(
+    has_srp: Option<&numpy::ndarray::Array1<u8>>,
+    srp_amrat: Option<&numpy::ndarray::Array1<f64>>,
+    srp_cr: Option<&numpy::ndarray::Array1<f64>>,
+    srp_amrat_variance: Option<&numpy::ndarray::Array1<f64>>,
+    i: usize,
+) -> Option<(f64, f64, Option<f64>)> {
+    if has_srp?[i] == 0 {
+        return None;
+    }
+    let amrat = srp_amrat.map(|a| a[i]).unwrap_or(0.0);
+    let cr = srp_cr.map(|a| a[i]).unwrap_or(0.0);
+    let amrat_variance =
+        srp_amrat_variance.and_then(|v| (v[i].is_finite() && v[i] > 0.0).then_some(v[i]));
+    Some((amrat, cr, amrat_variance))
 }
 
 /// Copy orbit `i`'s fitted non-grav 3×3 covariance out of the marshaled
@@ -1557,6 +1635,11 @@ fn build_orbits_from_arrays(
     ng_ns: Option<&numpy::ndarray::Array1<f64>>,
     ng_ks: Option<&numpy::ndarray::Array1<f64>>,
     non_grav_dts: Option<&numpy::ndarray::Array1<f64>>,
+    non_grav_dt_variances: Option<&numpy::ndarray::Array1<f64>>,
+    has_srp: Option<&numpy::ndarray::Array1<u8>>,
+    srp_amrat: Option<&numpy::ndarray::Array1<f64>>,
+    srp_cr: Option<&numpy::ndarray::Array1<f64>>,
+    srp_amrat_variance: Option<&numpy::ndarray::Array1<f64>>,
     has_non_grav_cov: Option<&numpy::ndarray::Array1<bool>>,
     non_grav_cov: Option<&numpy::ndarray::Array3<f64>>,
 ) -> PyResult<Vec<empyrean::Orbit>> {
@@ -1591,7 +1674,10 @@ fn build_orbits_from_arrays(
             _ => None,
         };
         let non_grav_dt = non_grav_dts.and_then(|dts| dts[i].is_finite().then_some(dts[i]));
+        let non_grav_dt_variance =
+            non_grav_dt_variances.and_then(|v| (v[i].is_finite() && v[i] > 0.0).then_some(v[i]));
         let ng_cov = ng_covariance_at(has_non_grav_cov, non_grav_cov, i);
+        let srp = srp_at(has_srp, srp_amrat, srp_cr, srp_amrat_variance, i);
         orbits.push(assemble_orbit(
             None,
             None,
@@ -1601,9 +1687,11 @@ fn build_orbits_from_arrays(
             a3s[i],
             g_function,
             non_grav_dt,
+            non_grav_dt_variance,
             ng_cov,
             None,
             None,
+            srp,
         ));
     }
     Ok(orbits)
@@ -1637,6 +1725,11 @@ fn methods_from_tags(tags: &[i32]) -> PyResult<Vec<empyrean::UncertaintyMethod>>
     body_filter_naif=None,
     ng_alphas=None, ng_r0s=None, ng_ms=None, ng_ns=None, ng_ks=None,
     non_grav_dts=None,
+    non_grav_dt_variances=None,
+    has_srp=None,
+    srp_amrat=None,
+    srp_cr=None,
+    srp_amrat_variance=None,
     has_non_grav_cov=None, non_grav_cov=None,
 ))]
 #[allow(clippy::too_many_arguments)]
@@ -1661,6 +1754,18 @@ fn _compute_impact_probabilities<'py>(
     ng_ns: Option<PyReadonlyArray1<'py, f64>>,
     ng_ks: Option<PyReadonlyArray1<'py, f64>>,
     non_grav_dts: Option<PyReadonlyArray1<'py, f64>>,
+    // Prior variance on the non-grav DT (days²), parallel to `non_grav_dts`.
+    // NaN / ≤0 = no prior; a finite positive value opens + priors the DT fit
+    // column when the IP / B-plane input orbit is re-fed into a DT solve.
+    non_grav_dt_variances: Option<PyReadonlyArray1<'py, f64>>,
+    // SRP force slot (explicit `has_srp` switch + amrat/cr and an optional
+    // AMRAT prior variance), parallel per-orbit arrays. SRP is never
+    // value-inferred: a row is applied only where `has_srp == 1`. A finite
+    // positive `srp_amrat_variance` opens + priors the AMRAT fit column.
+    has_srp: Option<PyReadonlyArray1<'py, u8>>,
+    srp_amrat: Option<PyReadonlyArray1<'py, f64>>,
+    srp_cr: Option<PyReadonlyArray1<'py, f64>>,
+    srp_amrat_variance: Option<PyReadonlyArray1<'py, f64>>,
     // Fitted non-grav 3×3 covariance (nullable per-row mask + (n,3,3) values),
     // threaded so an OD-solved orbit re-fed into the IP / B-plane input path
     // keeps its StateAndNonGrav prior instead of silently dropping it.
@@ -1686,6 +1791,17 @@ fn _compute_impact_probabilities<'py>(
         ng_ns.as_ref().map(|a| a.as_array().to_owned()).as_ref(),
         ng_ks.as_ref().map(|a| a.as_array().to_owned()).as_ref(),
         non_grav_dts
+            .as_ref()
+            .map(|a| a.as_array().to_owned())
+            .as_ref(),
+        non_grav_dt_variances
+            .as_ref()
+            .map(|a| a.as_array().to_owned())
+            .as_ref(),
+        has_srp.as_ref().map(|a| a.as_array().to_owned()).as_ref(),
+        srp_amrat.as_ref().map(|a| a.as_array().to_owned()).as_ref(),
+        srp_cr.as_ref().map(|a| a.as_array().to_owned()).as_ref(),
+        srp_amrat_variance
             .as_ref()
             .map(|a| a.as_array().to_owned())
             .as_ref(),
@@ -1796,6 +1912,11 @@ fn _compute_impact_probabilities<'py>(
     body_filter_naif=None,
     ng_alphas=None, ng_r0s=None, ng_ms=None, ng_ns=None, ng_ks=None,
     non_grav_dts=None,
+    non_grav_dt_variances=None,
+    has_srp=None,
+    srp_amrat=None,
+    srp_cr=None,
+    srp_amrat_variance=None,
     has_non_grav_cov=None, non_grav_cov=None,
 ))]
 #[allow(clippy::too_many_arguments)]
@@ -1820,6 +1941,18 @@ fn _compute_b_planes<'py>(
     ng_ns: Option<PyReadonlyArray1<'py, f64>>,
     ng_ks: Option<PyReadonlyArray1<'py, f64>>,
     non_grav_dts: Option<PyReadonlyArray1<'py, f64>>,
+    // Prior variance on the non-grav DT (days²), parallel to `non_grav_dts`.
+    // NaN / ≤0 = no prior; a finite positive value opens + priors the DT fit
+    // column when the IP / B-plane input orbit is re-fed into a DT solve.
+    non_grav_dt_variances: Option<PyReadonlyArray1<'py, f64>>,
+    // SRP force slot (explicit `has_srp` switch + amrat/cr and an optional
+    // AMRAT prior variance), parallel per-orbit arrays. SRP is never
+    // value-inferred: a row is applied only where `has_srp == 1`. A finite
+    // positive `srp_amrat_variance` opens + priors the AMRAT fit column.
+    has_srp: Option<PyReadonlyArray1<'py, u8>>,
+    srp_amrat: Option<PyReadonlyArray1<'py, f64>>,
+    srp_cr: Option<PyReadonlyArray1<'py, f64>>,
+    srp_amrat_variance: Option<PyReadonlyArray1<'py, f64>>,
     // Fitted non-grav 3×3 covariance (nullable per-row mask + (n,3,3) values),
     // threaded so an OD-solved orbit re-fed into the IP / B-plane input path
     // keeps its StateAndNonGrav prior instead of silently dropping it.
@@ -1845,6 +1978,17 @@ fn _compute_b_planes<'py>(
         ng_ns.as_ref().map(|a| a.as_array().to_owned()).as_ref(),
         ng_ks.as_ref().map(|a| a.as_array().to_owned()).as_ref(),
         non_grav_dts
+            .as_ref()
+            .map(|a| a.as_array().to_owned())
+            .as_ref(),
+        non_grav_dt_variances
+            .as_ref()
+            .map(|a| a.as_array().to_owned())
+            .as_ref(),
+        has_srp.as_ref().map(|a| a.as_array().to_owned()).as_ref(),
+        srp_amrat.as_ref().map(|a| a.as_array().to_owned()).as_ref(),
+        srp_cr.as_ref().map(|a| a.as_array().to_owned()).as_ref(),
+        srp_amrat_variance
             .as_ref()
             .map(|a| a.as_array().to_owned())
             .as_ref(),
@@ -2029,6 +2173,11 @@ fn _get_observers<'py>(
     ng_ns = None,
     ng_ks = None,
     non_grav_dts = None,
+    non_grav_dt_variances = None,
+    has_srp = None,
+    srp_amrat = None,
+    srp_cr = None,
+    srp_amrat_variance = None,
     has_non_grav_cov = None,
     non_grav_cov = None,
     phot_slope2 = None,
@@ -2076,6 +2225,18 @@ fn _generate_ephemeris<'py>(
     ng_ns: Option<PyReadonlyArray1<'py, f64>>,
     ng_ks: Option<PyReadonlyArray1<'py, f64>>,
     non_grav_dts: Option<PyReadonlyArray1<'py, f64>>,
+    // Prior variance on the non-grav DT (days²), parallel to `non_grav_dts`.
+    // NaN / ≤0 = no prior; a finite positive value opens + priors the DT fit
+    // column when the orbit is re-fed into a DT solve.
+    non_grav_dt_variances: Option<PyReadonlyArray1<'py, f64>>,
+    // SRP force slot (explicit `has_srp` switch + amrat/cr and an optional
+    // AMRAT prior variance), parallel per-orbit arrays. SRP is never
+    // value-inferred: a row is applied only where `has_srp == 1`. A finite
+    // positive `srp_amrat_variance` opens + priors the AMRAT fit column.
+    has_srp: Option<PyReadonlyArray1<'py, u8>>,
+    srp_amrat: Option<PyReadonlyArray1<'py, f64>>,
+    srp_cr: Option<PyReadonlyArray1<'py, f64>>,
+    srp_amrat_variance: Option<PyReadonlyArray1<'py, f64>>,
     // Fitted non-grav 3×3 covariance (nullable per-row mask + (n,3,3) values).
     // Threaded so a fitted orbit re-fed into ephemeris generation keeps its
     // StateAndNonGrav prior instead of silently dropping it.
@@ -2130,6 +2291,13 @@ fn _generate_ephemeris<'py>(
     let ng_n_arr = ng_ns.as_ref().map(|a| a.as_array().to_owned());
     let ng_k_arr = ng_ks.as_ref().map(|a| a.as_array().to_owned());
     let dt_arr = non_grav_dts.as_ref().map(|a| a.as_array().to_owned());
+    let dtv_arr = non_grav_dt_variances
+        .as_ref()
+        .map(|a| a.as_array().to_owned());
+    let srp_has_arr = has_srp.as_ref().map(|a| a.as_array().to_owned());
+    let srp_amrat_arr = srp_amrat.as_ref().map(|a| a.as_array().to_owned());
+    let srp_cr_arr = srp_cr.as_ref().map(|a| a.as_array().to_owned());
+    let srp_var_arr = srp_amrat_variance.as_ref().map(|a| a.as_array().to_owned());
     let has_ng_cov_arr = has_non_grav_cov.as_ref().map(|a| a.as_array().to_owned());
     let ng_cov_arr = non_grav_cov.as_ref().map(|a| a.as_array().to_owned());
 
@@ -2174,6 +2342,18 @@ fn _generate_ephemeris<'py>(
         let non_grav_dt = dt_arr
             .as_ref()
             .and_then(|dts| dts[i].is_finite().then_some(dts[i]));
+        // Prior variance on the DT (days²); NaN / ≤0 = no prior.
+        let non_grav_dt_variance = dtv_arr
+            .as_ref()
+            .and_then(|v| (v[i].is_finite() && v[i] > 0.0).then_some(v[i]));
+        // SRP force slot (explicit `has_srp` switch; independent of Marsden).
+        let srp = srp_at(
+            srp_has_arr.as_ref(),
+            srp_amrat_arr.as_ref(),
+            srp_cr_arr.as_ref(),
+            srp_var_arr.as_ref(),
+            i,
+        );
         // Fitted non-grav 3×3 covariance (optional, nullable per row).
         let ng_cov = ng_covariance_at(has_ng_cov_arr.as_ref(), ng_cov_arr.as_ref(), i);
         // Photometry — when phot_system[i] is one of {0, 1, 2} the
@@ -2213,9 +2393,11 @@ fn _generate_ephemeris<'py>(
             a3s_arr[i],
             g_function,
             non_grav_dt,
+            non_grav_dt_variance,
             ng_cov,
             photometry,
             None,
+            srp,
         ));
     }
 
@@ -2879,17 +3061,20 @@ fn build_orbit_from_dict<'py>(orbit_dict: &Bound<'py, PyDict>) -> PyResult<empyr
         }
     };
     // Accumulate the per-orbit non-grav inputs, then hand the whole orbit to
-    // the single `assemble_orbit` chokepoint. Gravity-only by default; the
-    // coefficients only engage when a1/a2/a3 are present and non-zero.
+    // the single `assemble_orbit` chokepoint. Gravity-only by default. The
+    // coefficient VALUES + their g(r) shape engage when non-zero (the apply
+    // case); the fit PRIORS (a declared non-grav covariance or DT
+    // value/variance) are read on their own explicit presence so a Marsden /
+    // DT solve can be seeded from A1=A2=A3=0. The C ABI then decides non-grav
+    // presence via `has_non_grav_covariance` / DT — never value-inferred away.
     let mut a1 = 0.0;
     let mut a2 = 0.0;
     let mut a3 = 0.0;
     let mut g_function = None;
     let mut non_grav_dt = None;
+    let mut non_grav_dt_variance = None;
     let mut ng_covariance = None;
-    if let (Some(a1s), Some(a2s), Some(a3s)) = (arr1("a1s")?, arr1("a2s")?, arr1("a3s")?)
-        && (a1s[0] != 0.0 || a2s[0] != 0.0 || a3s[0] != 0.0)
-    {
+    if let (Some(a1s), Some(a2s), Some(a3s)) = (arr1("a1s")?, arr1("a2s")?, arr1("a3s")?) {
         a1 = a1s[0];
         a2 = a2s[0];
         a3 = a3s[0];
@@ -2910,6 +3095,15 @@ fn build_orbit_from_dict<'py>(orbit_dict: &Bound<'py, PyDict>) -> PyResult<empyr
         {
             non_grav_dt = Some(dt[0]);
         }
+        // DT prior variance (optional; NaN / ≤0 sentinel = no prior). A finite
+        // positive value opens + priors the DT column in a StateAndNonGravAndDT
+        // refine — this is the seam that unblocks DT fitting through the API.
+        if let Some(v) = arr1("non_grav_dt_variances")?
+            && v[0].is_finite()
+            && v[0] > 0.0
+        {
+            non_grav_dt_variance = Some(v[0]);
+        }
         // Fitted non-grav covariance (optional).
         if let Some(has) = orbit_dict.get_item("has_non_grav_cov")? {
             let has_arr: PyReadonlyArray1<'_, bool> = has.extract()?;
@@ -2928,6 +3122,22 @@ fn build_orbit_from_dict<'py>(orbit_dict: &Bound<'py, PyDict>) -> PyResult<empyr
             }
         }
     }
+    // SRP force slot (optional, independent of the Marsden non-grav above — a
+    // State+AMRAT fit has no A1/A2/A3). `has_srp` is the explicit switch; the
+    // amrat/cr/variance are read only when it is 1.
+    let mut srp = None;
+    if let Some(has) = orbit_dict.get_item("has_srp")? {
+        let has_arr: PyReadonlyArray1<'_, u8> = has.extract()?;
+        if has_arr.as_array()[0] != 0 {
+            let amrat = arr1("srp_amrat")?.map_or(0.0, |v| v[0]);
+            let cr = arr1("srp_cr")?.map_or(0.0, |v| v[0]);
+            // Finite positive = AMRAT prior (opens the AMRAT fit column);
+            // NaN / ≤0 / absent = no prior (fixed-force SRP).
+            let amrat_variance = arr1("srp_amrat_variance")?
+                .and_then(|v| (v[0].is_finite() && v[0] > 0.0).then_some(v[0]));
+            srp = Some((amrat, cr, amrat_variance));
+        }
+    }
     Ok(assemble_orbit(
         None,
         None,
@@ -2937,9 +3147,11 @@ fn build_orbit_from_dict<'py>(orbit_dict: &Bound<'py, PyDict>) -> PyResult<empyr
         a3,
         g_function,
         non_grav_dt,
+        non_grav_dt_variance,
         ng_covariance,
         None,
         None,
+        srp,
     ))
 }
 
@@ -3840,6 +4052,48 @@ fn build_od_config_from_dict(d: &Bound<'_, PyDict>) -> PyResult<empyrean::ODConf
             }
         };
     }
+    // Explicit per-axis solve request (overrides the coarse `solve_for`).
+    if let Some(sf) = get_dict(d, "solve_for_flags")? {
+        cfg.solve_for = empyrean::SolveForParams::Explicit(empyrean::SolveFor {
+            marsden: get_bool(&sf, "marsden")?.unwrap_or(false),
+            dt: get_bool(&sf, "dt")?.unwrap_or(false),
+            amrat: get_bool(&sf, "amrat")?.unwrap_or(false),
+            thrust_segments: get_u32(&sf, "thrust_segments")?.unwrap_or(0),
+        });
+    }
+    if let Some(v) = get_bool(d, "allow_unbracketed_maneuvers")? {
+        cfg.allow_unbracketed_maneuvers = v;
+    }
+    if let Some(ph) = get_dict(d, "photometry")? {
+        let mut pc = empyrean::PhotometryConfig::default();
+        if let Some(m) = get_str(&ph, "model")? {
+            pc.model = match m.to_ascii_lowercase().as_str() {
+                "auto" => empyrean::PhotometryModel::Auto,
+                "honly" | "h_only" | "h" => empyrean::PhotometryModel::HOnly,
+                "hg" => empyrean::PhotometryModel::HG,
+                "hg12" => empyrean::PhotometryModel::HG12,
+                "hg1g2" => empyrean::PhotometryModel::HG1G2,
+                other => {
+                    return Err(PyValueError::new_err(format!(
+                        "unknown photometry model: {other}"
+                    )));
+                }
+            };
+        }
+        if let Some(v) = get_f64(&ph, "sigma_lightcurve")? {
+            pc.sigma_lightcurve = v;
+        }
+        if let Some(v) = get_bool(&ph, "include_rejected")? {
+            pc.include_rejected = v;
+        }
+        if let Some(v) = get_u32(&ph, "max_irls_iterations")? {
+            pc.max_irls_iterations = v;
+        }
+        if let Some(v) = get_f64(&ph, "huber_k")? {
+            pc.huber_k = v;
+        }
+        cfg.photometry = Some(pc);
+    }
 
     if let Some(ae) = get_dict(d, "auto_escalation")? {
         if let Some(v) = get_f64(&ae, "reduced_chi2")? {
@@ -4390,6 +4644,14 @@ fn orbit_batch_to_pydict<'py>(
     let mut ng_k = Array1::<f64>::zeros(n);
     // NaN = "no thermal-lag delay" (distinct from a real 0.0-day delay).
     let mut non_grav_dt = Array1::<f64>::from_elem(n, f64::NAN);
+    // NaN = "no DT prior" (distinct from a real variance value).
+    let mut non_grav_dt_variance = Array1::<f64>::from_elem(n, f64::NAN);
+    // SRP force slot. has_srp = 0 = "no SRP" (amrat/cr then NaN sentinels);
+    // amrat_variance NaN = "no AMRAT prior".
+    let mut has_srp = Array1::<u8>::zeros(n);
+    let mut srp_amrat = Array1::<f64>::from_elem(n, f64::NAN);
+    let mut srp_cr = Array1::<f64>::from_elem(n, f64::NAN);
+    let mut srp_amrat_variance = Array1::<f64>::from_elem(n, f64::NAN);
     let mut phot_h = Array1::<f64>::from_elem(n, f64::NAN);
     let mut phot_slope1 = Array1::<f64>::zeros(n);
     let mut phot_slope2 = Array1::<f64>::zeros(n);
@@ -4434,6 +4696,13 @@ fn orbit_batch_to_pydict<'py>(
         ng_n[i] = orbit.ng_n;
         ng_k[i] = orbit.ng_k;
         non_grav_dt[i] = orbit.non_grav_dt.unwrap_or(f64::NAN);
+        non_grav_dt_variance[i] = orbit.non_grav_dt_variance.unwrap_or(f64::NAN);
+        if let Some(s) = orbit.srp {
+            has_srp[i] = 1;
+            srp_amrat[i] = s.amrat;
+            srp_cr[i] = s.cr;
+            srp_amrat_variance[i] = s.amrat_variance.unwrap_or(f64::NAN);
+        }
         match orbit.phot_system {
             Some(empyrean::PhaseFunction::HG) => {
                 phot_h[i] = orbit.h_mag;
@@ -4480,6 +4749,17 @@ fn orbit_batch_to_pydict<'py>(
     dict.set_item("ng_n", PyArray1::from_owned_array(py, ng_n))?;
     dict.set_item("ng_k", PyArray1::from_owned_array(py, ng_k))?;
     dict.set_item("non_grav_dt", PyArray1::from_owned_array(py, non_grav_dt))?;
+    dict.set_item(
+        "non_grav_dt_variance",
+        PyArray1::from_owned_array(py, non_grav_dt_variance),
+    )?;
+    dict.set_item("has_srp", PyArray1::from_owned_array(py, has_srp))?;
+    dict.set_item("srp_amrat", PyArray1::from_owned_array(py, srp_amrat))?;
+    dict.set_item("srp_cr", PyArray1::from_owned_array(py, srp_cr))?;
+    dict.set_item(
+        "srp_amrat_variance",
+        PyArray1::from_owned_array(py, srp_amrat_variance),
+    )?;
     dict.set_item("phot_h", PyArray1::from_owned_array(py, phot_h))?;
     dict.set_item("phot_slope1", PyArray1::from_owned_array(py, phot_slope1))?;
     dict.set_item("phot_slope2", PyArray1::from_owned_array(py, phot_slope2))?;
@@ -4545,6 +4825,11 @@ fn pydict_to_orbit_batch<'py>(dict: &Bound<'py, PyDict>) -> PyResult<empyrean::O
     let g_n_view = read_array_or_zero(dict, "ng_n", n)?;
     let g_k_view = read_array_or_zero(dict, "ng_k", n)?;
     let dt_view = read_array_or_nan(dict, "non_grav_dt", n)?;
+    let dtv_view = read_array_or_nan(dict, "non_grav_dt_variance", n)?;
+    let srp_has_view = read_u8_array_or_zero(dict, "has_srp", n)?;
+    let srp_amrat_view = read_array_or_nan(dict, "srp_amrat", n)?;
+    let srp_cr_view = read_array_or_nan(dict, "srp_cr", n)?;
+    let srp_var_view = read_array_or_nan(dict, "srp_amrat_variance", n)?;
 
     let mut orbits = Vec::with_capacity(n);
     for i in 0..n {
@@ -4613,6 +4898,9 @@ fn pydict_to_orbit_batch<'py>(dict: &Bound<'py, PyDict>) -> PyResult<empyrean::O
             // Finite = real thermal-lag delay (incl. a meaningful 0.0);
             // NaN / absent column = no delay (None).
             dt_view[i].is_finite().then_some(dt_view[i]),
+            // Finite positive = DT prior variance (opens the DT fit column);
+            // NaN / ≤0 / absent column = no prior (None).
+            (dtv_view[i].is_finite() && dtv_view[i] > 0.0).then_some(dtv_view[i]),
             // Non-grav covariance is an OD-output concept; the OrbitBatch I/O
             // surface doesn't carry it.
             None,
@@ -4623,6 +4911,16 @@ fn pydict_to_orbit_batch<'py>(dict: &Bound<'py, PyDict>) -> PyResult<empyrean::O
             // and variable-length; supply it via `propagate`'s `thrust_arcs`.
             None,
             None,
+            // SRP force slot — carried through the OrbitBatch I/O surface via
+            // the explicit `has_srp` switch (never value-inferred).
+            (srp_has_view[i] != 0).then(|| {
+                (
+                    srp_amrat_view[i],
+                    srp_cr_view[i],
+                    (srp_var_view[i].is_finite() && srp_var_view[i] > 0.0)
+                        .then_some(srp_var_view[i]),
+                )
+            }),
         ));
     }
     empyrean::OrbitBatch::new(orbits, orbit_ids, object_ids).map_err(to_pyerr)
@@ -4642,6 +4940,25 @@ fn read_array_or_zero(dict: &Bound<'_, PyDict>, key: &str, n: usize) -> PyResult
             Ok(v)
         }
         None => Ok(vec![0.0; n]),
+    }
+}
+
+/// Read a `uint8` per-orbit array (e.g. the `has_srp` explicit switch) from
+/// the batch dict, defaulting to all-zeros when the key is absent.
+fn read_u8_array_or_zero(dict: &Bound<'_, PyDict>, key: &str, n: usize) -> PyResult<Vec<u8>> {
+    match dict.get_item(key)? {
+        Some(obj) => {
+            let arr: PyReadonlyArray1<u8> = obj.extract()?;
+            let v = arr.as_array().to_vec();
+            if v.len() != n {
+                return Err(PyValueError::new_err(format!(
+                    "'{key}' length {} != orbit count {n}",
+                    v.len()
+                )));
+            }
+            Ok(v)
+        }
+        None => Ok(vec![0u8; n]),
     }
 }
 
@@ -5388,6 +5705,103 @@ impl PyBuiltSystem {
     }
 }
 
+fn photometry_model_str(m: empyrean::PhotometryModel) -> &'static str {
+    match m {
+        empyrean::PhotometryModel::Auto => "auto",
+        empyrean::PhotometryModel::HOnly => "honly",
+        empyrean::PhotometryModel::HG => "hg",
+        empyrean::PhotometryModel::HG12 => "hg12",
+        empyrean::PhotometryModel::HG1G2 => "hg1g2",
+    }
+}
+
+/// Tagged solved-parameter covariance → nested dict. `matrix` is
+/// row-major `width × width`; parameters are located by the slot fields.
+fn solved_covariance_to_dict<'py>(
+    py: Python<'py>,
+    cov: &empyrean::SolvedCovariance,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    let flat: Vec<f64> = cov.matrix.iter().flatten().copied().collect();
+    d.set_item("matrix", flat)?;
+    d.set_item("width", cov.width)?;
+    if let Some(s) = cov.marsden_slot {
+        d.set_item("marsden_slot", s)?;
+    }
+    if let Some(s) = cov.dt_slot {
+        d.set_item("dt_slot", s)?;
+    }
+    if let Some(s) = cov.amrat_slot {
+        d.set_item("amrat_slot", s)?;
+    }
+    let thrust: Vec<Vec<usize>> = cov.thrust_slots.iter().map(|s| s.to_vec()).collect();
+    d.set_item("thrust_slots", thrust)?;
+    Ok(d)
+}
+
+/// Post-OD photometric solution → nested dict. Per-band / gate arrays use
+/// the struct-of-arrays convention (parallel keys), matching the rest of
+/// the OD result surface.
+fn photometry_to_dict<'py>(
+    py: Python<'py>,
+    p: &empyrean::PhotometryResult,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("h", p.h)?;
+    d.set_item("slope1", p.slope1)?;
+    d.set_item("slope2", p.slope2)?;
+    if let Some(c) = &p.covariance {
+        let flat: Vec<f64> = c.iter().flatten().copied().collect();
+        d.set_item("covariance", flat)?;
+    }
+    d.set_item("model_used", photometry_model_str(p.model_used))?;
+    d.set_item("reduced_chi2", p.reduced_chi2)?;
+    d.set_item("constraint_active", p.constraint_active)?;
+    d.set_item("n_mags_used", p.n_mags_used)?;
+    d.set_item("n_mags_rejected_photometric", p.n_mags_rejected_photometric)?;
+    d.set_item("n_obs_without_mags", p.n_obs_without_mags)?;
+    d.set_item(
+        "n_mags_from_astrometric_selected",
+        p.n_mags_from_astrometric_selected,
+    )?;
+    d.set_item(
+        "n_mags_from_astrometric_rejected",
+        p.n_mags_from_astrometric_rejected,
+    )?;
+    d.set_item("alpha_min_deg", p.alpha_min_deg)?;
+    d.set_item("alpha_max_deg", p.alpha_max_deg)?;
+    d.set_item("alpha_span_deg", p.alpha_span_deg)?;
+    // Per-band statistics (struct-of-arrays).
+    let bands: Vec<String> = p.per_band.iter().map(|b| b.band.clone()).collect();
+    let band_n: Vec<usize> = p.per_band.iter().map(|b| b.n).collect();
+    d.set_item("band", bands)?;
+    d.set_item("band_n", band_n)?;
+    d.set_item(
+        "band_offset_applied",
+        PyArray1::from_vec(py, p.per_band.iter().map(|b| b.offset_applied).collect()),
+    )?;
+    d.set_item(
+        "band_mean_residual",
+        PyArray1::from_vec(py, p.per_band.iter().map(|b| b.mean_residual).collect()),
+    )?;
+    d.set_item(
+        "band_rms",
+        PyArray1::from_vec(py, p.per_band.iter().map(|b| b.rms).collect()),
+    )?;
+    // Model-ladder gate records (struct-of-arrays).
+    let gate_model: Vec<&str> = p
+        .gates
+        .iter()
+        .map(|g| photometry_model_str(g.model))
+        .collect();
+    let gate_passed: Vec<bool> = p.gates.iter().map(|g| g.passed).collect();
+    let gate_reason: Vec<String> = p.gates.iter().map(|g| g.reason.clone()).collect();
+    d.set_item("gate_model", gate_model)?;
+    d.set_item("gate_passed", gate_passed)?;
+    d.set_item("gate_reason", gate_reason)?;
+    Ok(d)
+}
+
 fn add_station_biases_to_dict(
     dict: &Bound<'_, PyDict>,
     biases: &[empyrean::StationBias],
@@ -5466,6 +5880,18 @@ fn determine_result_to_pydict<'py>(
                 dict.set_item("orbit_non_grav_cov", flat)?;
             }
         }
+        // Fitted / carried SRP slot — absolute AMRAT + fixed Cr, plus the
+        // fitted AMRAT posterior variance when AMRAT was solved. Independent of
+        // the Marsden non-grav above (a State+AMRAT fit has no A1/A2/A3), so
+        // this is deliberately outside that block: a solved-AMRAT orbit
+        // re-feeds its SRP slot into propagate / refine.
+        if let Some(srp) = o.srp {
+            dict.set_item("orbit_srp_amrat", srp.amrat)?;
+            dict.set_item("orbit_srp_cr", srp.cr)?;
+            if let Some(v) = srp.amrat_variance {
+                dict.set_item("orbit_srp_amrat_variance", v)?;
+            }
+        }
     }
     add_residuals_to_dict(&dict, &result.residuals)?;
     add_summary_to_dict(&dict, &result.summary, "summary_")?;
@@ -5515,10 +5941,42 @@ fn determine_result_to_pydict<'py>(
         empyrean::SolveForParams::StateOnly => "state_only",
         empyrean::SolveForParams::StateAndNonGrav => "state_and_nongrav",
         empyrean::SolveForParams::Auto => "auto",
+        // The exact axes are carried on `solved_covariance` (slot tags).
+        empyrean::SolveForParams::Explicit(_) => "explicit",
     };
     dict.set_item("solve_for_used", solve_for_str)?;
 
     add_station_biases_to_dict(&dict, &result.station_biases)?;
+
+    // ── Wide fitting surface (v0.9.0) ───────────────────────────────
+    if let Some(cov) = &result.solved_covariance {
+        dict.set_item("solved_covariance", solved_covariance_to_dict(py, cov)?)?;
+    }
+    if let Some(d) = result.dt_delta {
+        dict.set_item("dt_delta", d)?;
+    }
+    if let Some(a) = result.amrat_delta {
+        dict.set_item("amrat_delta", a)?;
+    }
+    if !result.thrust_delta_m_per_s.is_empty() {
+        let thrust: Vec<Vec<f64>> = result
+            .thrust_delta_m_per_s
+            .iter()
+            .map(|d| d.to_vec())
+            .collect();
+        dict.set_item("thrust_delta_m_per_s", thrust)?;
+    }
+    if let Some(f) = result.dv_frame {
+        let fs = match f {
+            empyrean::Frame::ICRF => "icrf",
+            empyrean::Frame::EclipticJ2000 => "eclipticj2000",
+            empyrean::Frame::ITRF93 => "itrf93",
+        };
+        dict.set_item("dv_frame", fs)?;
+    }
+    if let Some(p) = &result.photometry {
+        dict.set_item("photometry", photometry_to_dict(py, p)?)?;
+    }
 
     Ok(dict)
 }

@@ -88,9 +88,16 @@ ALLOWED_ALL_NULL: dict[str, str] = {
     "PropagatedStates.non_grav.m": "schema-artifact (input fields on output table)",
     "PropagatedStates.non_grav.n": "schema-artifact (input fields on output table)",
     "PropagatedStates.non_grav.k": "schema-artifact (input fields on output table)",
-    "PropagatedStates.non_grav.cr": "schema-artifact (input fields on output table)",
     "PropagatedStates.non_grav.dt": "schema-artifact (input fields on output table)",
+    "PropagatedStates.non_grav.dt_variance": "schema-artifact (input fields on output table)",
     "PropagatedStates.non_grav.covariance": "schema-artifact (input fields on output table)",
+    # SRP is a first-class, additive input force slot (orbits.srp); like the
+    # non_grav sub-table above it rides on the CartesianOrbits schema and is
+    # not repopulated on a propagation OUTPUT.
+    "PropagatedStates.srp": "schema-artifact (input fields on output table)",
+    "PropagatedStates.srp.amrat": "schema-artifact (input fields on output table)",
+    "PropagatedStates.srp.cr": "schema-artifact (input fields on output table)",
+    "PropagatedStates.srp.amrat_variance": "schema-artifact (input fields on output table)",
     "PropagatedStates.photometric": "schema-artifact (input fields on output table)",
     "PropagatedStates.photometric.model": "schema-artifact (input fields on output table)",
     "PropagatedStates.photometric.h": "schema-artifact (input fields on output table)",

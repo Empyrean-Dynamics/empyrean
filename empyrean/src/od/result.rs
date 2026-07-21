@@ -267,6 +267,38 @@ impl CovarianceRepresentation {
     }
 }
 
+/// Per-axis wide solve-for selection (mirrors the engine's `SolveFor`).
+///
+/// Each flag turns on one wide-STM axis, subject to its own precondition
+/// (a declared prior on the orbit) enforced by the engine. Used to
+/// request an explicit multi-axis fit via
+/// [`SolveForParams::Explicit`], and reported back on the result for
+/// fits the coarse variants can't name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SolveFor {
+    /// Solve the Marsden A1/A2/A3 block (requires a non-grav covariance).
+    pub marsden: bool,
+    /// Solve the non-grav time delay DT (requires `marsden` + a DT prior).
+    pub dt: bool,
+    /// Solve the SRP AMRAT (requires an SRP AMRAT prior).
+    pub amrat: bool,
+    /// Number of thrust Δv segments to solve (3 columns each; 0 = none).
+    pub thrust_segments: u32,
+}
+
+impl SolveFor {
+    /// Recover the solved axes from a tagged [`SolvedCovariance`] — the
+    /// authoritative record of what the fit actually solved.
+    fn from_covariance(cov: &SolvedCovariance) -> Self {
+        Self {
+            marsden: cov.marsden_slot.is_some(),
+            dt: cov.dt_slot.is_some(),
+            amrat: cov.amrat_slot.is_some(),
+            thrust_segments: cov.thrust_slots.len() as u32,
+        }
+    }
+}
+
 /// Solve-for parameter set used by differential correction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SolveForParams {
@@ -277,13 +309,22 @@ pub enum SolveForParams {
     /// Start with state-only and escalate to the 9-parameter set
     /// automatically (see [`AutoEscalationPolicy`](super::AutoEscalationPolicy)).
     Auto,
+    /// Solve an explicit multi-axis set (any of Marsden / DT / AMRAT /
+    /// thrust) that the coarse variants can't name. On the config it
+    /// carries the requested axes; on a result it is reconstructed from
+    /// the solved covariance's slot tags.
+    Explicit(SolveFor),
 }
 
 impl SolveForParams {
-    pub(super) fn from_int(v: i32) -> Self {
-        match v {
+    /// Reconstruct the solve-for set that produced a fit. The C ABI
+    /// reports a coarse integer code; an `Explicit` fit's exact axes are
+    /// recovered from the solved covariance's slot tags.
+    pub(super) fn from_result(code: i32, cov: Option<&SolvedCovariance>) -> Self {
+        match code {
             0 => Self::StateOnly,
             1 => Self::StateAndNonGrav,
+            3 => Self::Explicit(cov.map(SolveFor::from_covariance).unwrap_or_default()),
             _ => Self::Auto,
         }
     }
@@ -292,6 +333,19 @@ impl SolveForParams {
             Self::StateOnly => 0,
             Self::StateAndNonGrav => 1,
             Self::Auto => 2,
+            Self::Explicit(_) => 3,
+        }
+    }
+    /// The per-axis flags this request implies — set on the C config's
+    /// `solve_for_flags` (read only when `to_int() == 3`).
+    pub(super) fn flags(self) -> SolveFor {
+        match self {
+            Self::StateOnly | Self::Auto => SolveFor::default(),
+            Self::StateAndNonGrav => SolveFor {
+                marsden: true,
+                ..SolveFor::default()
+            },
+            Self::Explicit(sf) => sf,
         }
     }
 }
@@ -500,6 +554,248 @@ impl StationBias {
     }
 }
 
+/// Full tagged solved-parameter covariance from a wide OD fit.
+///
+/// The `matrix` is the real solved covariance, sized `width × width`
+/// (row-major); parameters are located by the slot fields, never by
+/// width (width 9 is Marsden-only OR one thrust segment). Canonical
+/// order is `[state 6 | Marsden 3 | DT 1 | AMRAT 1 | thrust 3×k]`. The Δv
+/// axes are integration-frame components (see
+/// [`DetermineResult::dv_frame`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SolvedCovariance {
+    /// The solved covariance, sized `width × width` (row-major).
+    pub matrix: Vec<Vec<f64>>,
+    /// Solved width (6..=17 under the current engine).
+    pub width: usize,
+    /// Column of the first Marsden coefficient, when Marsden was solved.
+    pub marsden_slot: Option<usize>,
+    /// Column of the DT scalar, when DT was solved.
+    pub dt_slot: Option<usize>,
+    /// Column of the AMRAT scalar, when AMRAT was solved.
+    pub amrat_slot: Option<usize>,
+    /// Column triples of each fitted thrust Δv segment (one `[i,i+1,i+2]`
+    /// per solved segment).
+    pub thrust_slots: Vec<[usize; 3]>,
+}
+
+impl SolvedCovariance {
+    pub(super) fn from_ffi(c: &empyrean_sys::EmpyreanSolvedCovariance) -> Self {
+        let width = c.width as usize;
+        let matrix = (0..width)
+            .map(|i| (0..width).map(|j| c.matrix[i][j]).collect())
+            .collect();
+        let slot = |v: u32| (v != empyrean_sys::EMPYREAN_SLOT_NONE).then_some(v as usize);
+        let thrust_slots = (0..c.thrust_count as usize)
+            .map(|i| {
+                let r = c.thrust_slots[i];
+                [r[0] as usize, r[1] as usize, r[2] as usize]
+            })
+            .collect();
+        Self {
+            matrix,
+            width,
+            marsden_slot: slot(c.marsden_slot),
+            dt_slot: slot(c.dt_slot),
+            amrat_slot: slot(c.amrat_slot),
+            thrust_slots,
+        }
+    }
+}
+
+/// Photometric model for the post-OD phase-function fit.
+///
+/// In [`Auto`](Self::Auto) the fit climbs a model ladder —
+/// H-only → HG12 → HG1G2 — admitting the richest model the arc's
+/// phase-angle coverage and magnitude count support, and reports the
+/// one it actually fit on [`PhotometryResult::model_used`] (never
+/// `Auto`). An explicit value pins a specific model. HG12 / HG1G2
+/// follow Muinonen et al. (2010); H-only holds the slope fixed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PhotometryModel {
+    /// Auto-select up the ladder (H-only → HG12 → HG1G2) by data richness.
+    #[default]
+    Auto,
+    /// Fit only the absolute magnitude H (fixed slope).
+    HOnly,
+    /// Two-parameter H, G.
+    HG,
+    /// Two-parameter H, G12 (Muinonen et al. 2010).
+    HG12,
+    /// Three-parameter H, G1, G2 (Muinonen et al. 2010).
+    HG1G2,
+}
+
+impl PhotometryModel {
+    pub(super) fn to_int(self) -> i32 {
+        (match self {
+            Self::Auto => empyrean_sys::EMPYREAN_PHOTOMETRY_MODEL_AUTO,
+            Self::HOnly => empyrean_sys::EMPYREAN_PHOTOMETRY_MODEL_HONLY,
+            Self::HG => empyrean_sys::EMPYREAN_PHOTOMETRY_MODEL_HG,
+            Self::HG12 => empyrean_sys::EMPYREAN_PHOTOMETRY_MODEL_HG12,
+            Self::HG1G2 => empyrean_sys::EMPYREAN_PHOTOMETRY_MODEL_HG1G2,
+        }) as i32
+    }
+    fn from_int(v: i32) -> Self {
+        match v as u32 {
+            empyrean_sys::EMPYREAN_PHOTOMETRY_MODEL_HONLY => Self::HOnly,
+            empyrean_sys::EMPYREAN_PHOTOMETRY_MODEL_HG => Self::HG,
+            empyrean_sys::EMPYREAN_PHOTOMETRY_MODEL_HG12 => Self::HG12,
+            empyrean_sys::EMPYREAN_PHOTOMETRY_MODEL_HG1G2 => Self::HG1G2,
+            _ => Self::Auto,
+        }
+    }
+}
+
+/// Per-band photometric fit statistics.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BandStat {
+    /// Photometric band tag.
+    pub band: String,
+    /// Number of observations in this band.
+    pub n: usize,
+    /// Band→V offset applied (mag).
+    pub offset_applied: f64,
+    /// Mean residual in V (mag).
+    pub mean_residual: f64,
+    /// RMS residual in V (mag).
+    pub rms: f64,
+}
+
+impl BandStat {
+    fn from_ffi(b: &empyrean_sys::EmpyreanBandStat) -> Self {
+        let band = if b.band.is_null() {
+            String::new()
+        } else {
+            unsafe { CStr::from_ptr(b.band) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        Self {
+            band,
+            n: b.n,
+            offset_applied: b.offset_applied,
+            mean_residual: b.mean_residual,
+            rms: b.rms,
+        }
+    }
+}
+
+/// One model-ladder gate decision from the photometric fit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GateRecord {
+    /// Model the gate evaluated.
+    pub model: PhotometryModel,
+    /// Whether the model was admitted.
+    pub passed: bool,
+    /// Human-readable gate reason.
+    pub reason: String,
+}
+
+impl GateRecord {
+    fn from_ffi(g: &empyrean_sys::EmpyreanGateRecord) -> Self {
+        let reason = if g.reason.is_null() {
+            String::new()
+        } else {
+            unsafe { CStr::from_ptr(g.reason) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        Self {
+            model: PhotometryModel::from_int(g.model),
+            passed: g.passed != 0,
+            reason,
+        }
+    }
+}
+
+/// Post-OD photometric solution — an H/G fit over the arc's magnitudes,
+/// run after the orbit is solved (photometry has no astrometric
+/// partials, so it never touches the state). H carries honest σ via
+/// [`covariance`](Self::covariance).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PhotometryResult {
+    /// Fitted absolute magnitude H (mag).
+    pub h: f64,
+    /// First slope parameter (G / G12 / G1 by model).
+    pub slope1: f64,
+    /// Second slope parameter (G2 for HG1G2; unused otherwise).
+    pub slope2: f64,
+    /// Parameter covariance (H, slope1, slope2), when available.
+    pub covariance: Option<[[f64; 3]; 3]>,
+    /// Model actually fitted (never [`PhotometryModel::Auto`]).
+    pub model_used: PhotometryModel,
+    /// Reduced χ² of the photometric fit over its used magnitudes.
+    pub reduced_chi2: f64,
+    /// Whether a simplex constraint was active on the fitted slopes.
+    pub constraint_active: bool,
+    /// Magnitudes used in the fit.
+    pub n_mags_used: usize,
+    /// Magnitudes rejected by the photometric outlier pass.
+    pub n_mags_rejected_photometric: usize,
+    /// Observations carrying no magnitude.
+    pub n_obs_without_mags: usize,
+    /// Magnitudes drawn from astrometrically-selected observations.
+    pub n_mags_from_astrometric_selected: usize,
+    /// Magnitudes drawn from astrometrically-rejected observations.
+    pub n_mags_from_astrometric_rejected: usize,
+    /// Minimum phase angle of the fitted magnitudes (deg).
+    pub alpha_min_deg: f64,
+    /// Maximum phase angle of the fitted magnitudes (deg).
+    pub alpha_max_deg: f64,
+    /// Phase-angle span of the fitted magnitudes (deg).
+    pub alpha_span_deg: f64,
+    /// Per-band statistics.
+    pub per_band: Vec<BandStat>,
+    /// Model-ladder gate records.
+    pub gates: Vec<GateRecord>,
+}
+
+impl PhotometryResult {
+    pub(super) fn from_ffi(p: &empyrean_sys::EmpyreanODPhotometryResult) -> Self {
+        let covariance = (p.has_covariance != 0).then_some(p.covariance);
+        let per_band = if p.per_band.is_null() || p.num_per_band == 0 {
+            Vec::new()
+        } else {
+            unsafe {
+                std::slice::from_raw_parts(p.per_band, p.num_per_band)
+                    .iter()
+                    .map(BandStat::from_ffi)
+                    .collect()
+            }
+        };
+        let gates = if p.gates.is_null() || p.num_gates == 0 {
+            Vec::new()
+        } else {
+            unsafe {
+                std::slice::from_raw_parts(p.gates, p.num_gates)
+                    .iter()
+                    .map(GateRecord::from_ffi)
+                    .collect()
+            }
+        };
+        Self {
+            h: p.h,
+            slope1: p.slope1,
+            slope2: p.slope2,
+            covariance,
+            model_used: PhotometryModel::from_int(p.model_used),
+            reduced_chi2: p.reduced_chi2,
+            constraint_active: p.constraint_active != 0,
+            n_mags_used: p.n_mags_used,
+            n_mags_rejected_photometric: p.n_mags_rejected_photometric,
+            n_obs_without_mags: p.n_obs_without_mags,
+            n_mags_from_astrometric_selected: p.n_mags_from_astrometric_selected,
+            n_mags_from_astrometric_rejected: p.n_mags_from_astrometric_rejected,
+            alpha_min_deg: p.alpha_min_deg,
+            alpha_max_deg: p.alpha_max_deg,
+            alpha_span_deg: p.alpha_span_deg,
+            per_band,
+            gates,
+        }
+    }
+}
+
 /// Result of a differential-correction orbit determination.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DetermineResult {
@@ -545,6 +841,23 @@ pub struct DetermineResult {
     /// Per-station fitted RA/Dec biases when `fit_station_biases` was
     /// active. Empty otherwise.
     pub station_biases: Vec<StationBias>,
+    /// Full tagged solved-parameter covariance when the fit solved any
+    /// wide axis (Marsden / DT / AMRAT / thrust). `None` for a state-only
+    /// fit. The go-forward covariance for all solved widths; the legacy
+    /// [`covariance_9x9`](Self::covariance_9x9) is kept for one window.
+    pub solved_covariance: Option<SolvedCovariance>,
+    /// Cumulative non-grav time-delay correction ΔDT (days), when DT was solved.
+    pub dt_delta: Option<f64>,
+    /// Cumulative SRP AMRAT correction (m²/kg), when AMRAT was solved.
+    pub amrat_delta: Option<f64>,
+    /// Per-segment fitted thrust Δv (m/s), expressed in
+    /// [`dv_frame`](Self::dv_frame). Empty when no thrust was solved.
+    pub thrust_delta_m_per_s: Vec<[f64; 3]>,
+    /// Integration frame the thrust Δv components are expressed in.
+    /// `None` when no thrust was solved.
+    pub dv_frame: Option<crate::coordinate::Frame>,
+    /// Post-OD photometric solution when photometry was requested and ran.
+    pub photometry: Option<PhotometryResult>,
 }
 
 impl DetermineResult {

@@ -826,6 +826,7 @@ mod tests {
             ng_n: 0.0,
             ng_k: 0.0,
             non_grav_dt: f64::NAN,
+            non_grav_dt_variance: f64::NAN,
             has_non_grav_covariance: 0,
             non_grav_covariance: [[0.0; 3]; 3],
             phot_system: -1,
@@ -838,6 +839,10 @@ mod tests {
             n_dv_corrections: 0,
             correction_covariances: std::ptr::null(),
             n_correction_covariances: 0,
+            has_srp: 0,
+            srp_amrat: 0.0,
+            srp_cr: 0.0,
+            srp_amrat_variance: f64::NAN,
         }
     }
 

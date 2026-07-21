@@ -13,8 +13,10 @@ from empyrean._convert import (
     _COORD_TYPE_MAP,
     AnyOrbits,
     coordinates_to_arrays,
+    extract_srp,
     int_to_frame,
     naif_to_origin,
+    validate_non_grav_marsden_only,
 )
 from empyrean.coordinates.coordinates import CartesianCoordinates
 from empyrean.coordinates.covariance import (
@@ -29,7 +31,16 @@ from empyrean.od.residuals import (
     ResidualSummary,
     StationBiases,
 )
-from empyrean.od.result import DetermineResult, EvaluateResult, ODConfig
+from empyrean.od.result import (
+    BandStat,
+    DetermineResult,
+    EvaluateResult,
+    GateRecord,
+    ODConfig,
+    PhotometryModel,
+    PhotometryResult,
+    SolvedCovariance,
+)
 from empyrean.orbits.orbits import CartesianOrbits
 from empyrean.propagation.config import _FORCE_MODEL_TO_INT, ForceModelTier
 
@@ -208,6 +219,10 @@ def _orbits_to_dict(orbits: AnyOrbits) -> dict[str, list[Any] | np.ndarray]:
     # rather than silently gravity-only, and carry the fitted non-grav
     # covariance so a StateAndNonGrav refine keeps its prior.
     n = len(orbits)
+    # NonGravParams is Marsden-only; reject a stray model='srp' / cr before
+    # marshaling (SRP rides its own slot, extracted below).
+    validate_non_grav_marsden_only(orbits)
+    has_srp, srp_amrat, srp_cr, srp_amrat_variance = extract_srp(orbits)
     a1s = np.zeros(n, dtype=np.float64)
     a2s = np.zeros(n, dtype=np.float64)
     a3s = np.zeros(n, dtype=np.float64)
@@ -217,6 +232,7 @@ def _orbits_to_dict(orbits: AnyOrbits) -> dict[str, list[Any] | np.ndarray]:
     ng_ns = np.zeros(n, dtype=np.float64)
     ng_ks = np.zeros(n, dtype=np.float64)
     non_grav_dts = np.full(n, np.nan, dtype=np.float64)  # NaN = no thermal-lag delay
+    non_grav_dt_variances = np.full(n, np.nan, dtype=np.float64)  # NaN/<=0 = no DT prior
     has_non_grav_cov = np.zeros(n, dtype=bool)
     non_grav_cov = np.zeros((n, 3, 3), dtype=np.float64)
     if orbits.non_grav is not None:
@@ -232,6 +248,11 @@ def _orbits_to_dict(orbits: AnyOrbits) -> dict[str, list[Any] | np.ndarray]:
         ng_alphas, ng_r0s = _col("alpha"), _col("r0")
         ng_ms, ng_ns, ng_ks = _col("m"), _col("n"), _col("k")
         non_grav_dts = np.asarray(ng.dt.to_numpy(zero_copy_only=False), dtype=np.float64)
+        # DT prior variance (opens the DT column in a StateAndNonGravAndDT
+        # solve). Mirror ng.dt exactly: nulls come back as NaN = no prior.
+        non_grav_dt_variances = np.asarray(
+            ng.dt_variance.to_numpy(zero_copy_only=False), dtype=np.float64
+        )
         for i, c in enumerate(ng.covariance.to_pylist()):
             if c is not None:
                 non_grav_cov[i] = np.asarray(c, dtype=np.float64).reshape(3, 3)
@@ -256,6 +277,11 @@ def _orbits_to_dict(orbits: AnyOrbits) -> dict[str, list[Any] | np.ndarray]:
         "ng_ns": ng_ns,
         "ng_ks": ng_ks,
         "non_grav_dts": non_grav_dts,
+        "non_grav_dt_variances": non_grav_dt_variances,
+        "has_srp": has_srp,
+        "srp_amrat": srp_amrat,
+        "srp_cr": srp_cr,
+        "srp_amrat_variance": srp_amrat_variance,
         "has_non_grav_cov": has_non_grav_cov,
         "non_grav_cov": non_grav_cov,
     }
@@ -459,6 +485,21 @@ def _build_cartesian_orbits_single(result: ResultDict, prefix: str = "") -> Cart
             k=[k],
             dt=[dt],
             covariance=[list(ng_cov) if ng_cov is not None else None],
+        )
+
+    # Fitted / carried SRP slot — absolute AMRAT + fixed Cr, and the fitted
+    # AMRAT posterior variance when AMRAT was solved. Independent of the
+    # Marsden non-grav above (a State+AMRAT fit has no A1/A2/A3), so a solved
+    # AMRAT orbit re-feeds its SRP slot into propagate / refine.
+    srp_amrat = result.get(f"{p}srp_amrat")
+    if srp_amrat is not None:
+        from empyrean.orbits.srp import SRPParams
+
+        srp_variance = result.get(f"{p}srp_amrat_variance")
+        orbits_kwargs["srp"] = SRPParams.from_kwargs(
+            amrat=[srp_amrat],
+            cr=[result[f"{p}srp_cr"]],
+            amrat_variance=[srp_variance],
         )
 
     return CartesianOrbits.from_kwargs(validate=True, permit_nulls=False, **orbits_kwargs)
@@ -744,6 +785,97 @@ def refine(
     return _build_determine_result(result)
 
 
+def _build_solved_covariance(d: ResultDict | None) -> SolvedCovariance | None:
+    """Build a :class:`SolvedCovariance` from the nested ``solved_covariance``
+    dict, or ``None`` when the fit solved only the 6-element state.
+
+    The slot fields are read with ``.get`` so an unsolved axis reads as
+    ``None`` (never 0) — a slot of 0 would be a bug since the state
+    always occupies columns 0..5.
+    """
+    if d is None:
+        return None
+    width = int(d["width"])
+    matrix = np.asarray(d["matrix"], dtype=np.float64).reshape(width, width)
+
+    def _slot(key: str) -> int | None:
+        v = d.get(key)
+        return int(v) if v is not None else None
+
+    thrust_slots = [(int(s[0]), int(s[1]), int(s[2])) for s in d.get("thrust_slots", [])]
+    return SolvedCovariance(
+        matrix=matrix,
+        width=width,
+        marsden_slot=_slot("marsden_slot"),
+        dt_slot=_slot("dt_slot"),
+        amrat_slot=_slot("amrat_slot"),
+        thrust_slots=thrust_slots,
+    )
+
+
+def _build_photometry_result(d: ResultDict | None) -> PhotometryResult | None:
+    """Build a :class:`PhotometryResult` from the nested ``photometry``
+    dict, or ``None`` when photometry did not run.
+
+    Per-band / gate arrays arrive as parallel struct-of-arrays and are
+    zipped back into :class:`BandStat` / :class:`GateRecord` rows.
+    """
+    if d is None:
+        return None
+
+    cov_flat = d.get("covariance")
+    covariance = (
+        np.asarray(cov_flat, dtype=np.float64).reshape(3, 3) if cov_flat is not None else None
+    )
+
+    per_band = [
+        BandStat(
+            band=band,
+            n=int(n),
+            offset_applied=float(offset),
+            mean_residual=float(mean),
+            rms=float(rms),
+        )
+        for band, n, offset, mean, rms in zip(
+            d.get("band", []),
+            d.get("band_n", []),
+            np.asarray(d.get("band_offset_applied", []), dtype=np.float64),
+            np.asarray(d.get("band_mean_residual", []), dtype=np.float64),
+            np.asarray(d.get("band_rms", []), dtype=np.float64),
+            strict=True,
+        )
+    ]
+    gates = [
+        GateRecord(model=PhotometryModel(model), passed=bool(passed), reason=reason)
+        for model, passed, reason in zip(
+            d.get("gate_model", []),
+            d.get("gate_passed", []),
+            d.get("gate_reason", []),
+            strict=True,
+        )
+    ]
+
+    return PhotometryResult(
+        h=float(d["h"]),
+        slope1=float(d["slope1"]),
+        slope2=float(d["slope2"]),
+        covariance=covariance,
+        model_used=PhotometryModel(d["model_used"]),
+        reduced_chi2=float(d["reduced_chi2"]),
+        constraint_active=bool(d["constraint_active"]),
+        n_mags_used=int(d["n_mags_used"]),
+        n_mags_rejected_photometric=int(d["n_mags_rejected_photometric"]),
+        n_obs_without_mags=int(d["n_obs_without_mags"]),
+        n_mags_from_astrometric_selected=int(d["n_mags_from_astrometric_selected"]),
+        n_mags_from_astrometric_rejected=int(d["n_mags_from_astrometric_rejected"]),
+        alpha_min_deg=float(d["alpha_min_deg"]),
+        alpha_max_deg=float(d["alpha_max_deg"]),
+        alpha_span_deg=float(d["alpha_span_deg"]),
+        per_band=per_band,
+        gates=gates,
+    )
+
+
 def _build_determine_result(result: ResultDict) -> DetermineResult:
     """Assemble a :class:`DetermineResult` from a Rust _determine /
     _refine result dict."""
@@ -787,6 +919,23 @@ def _build_determine_result(result: ResultDict) -> DetermineResult:
     else:
         station_biases = StationBiases.empty()
 
+    # ── Wide fitting surface (v0.9.0) ───────────────────────────────
+    # Every key is read with `.get` so a dropped / unsolved axis reads
+    # as None (never 0 / NaN) — the loud-None contract.
+    solved_covariance = _build_solved_covariance(result.get("solved_covariance"))
+    dt_delta = result.get("dt_delta")
+    dt_delta = float(dt_delta) if dt_delta is not None else None
+    amrat_delta = result.get("amrat_delta")
+    amrat_delta = float(amrat_delta) if amrat_delta is not None else None
+    thrust_delta = result.get("thrust_delta_m_per_s")
+    thrust_delta_arr = (
+        np.asarray(thrust_delta, dtype=np.float64).reshape(-1, 3)
+        if thrust_delta is not None
+        else None
+    )
+    dv_frame = result.get("dv_frame")
+    photometry = _build_photometry_result(result.get("photometry"))
+
     return DetermineResult(
         orbit=orbit,
         observations=obs_results,
@@ -804,4 +953,10 @@ def _build_determine_result(result: ResultDict) -> DetermineResult:
         solve_for_used=_SFP(result["solve_for_used"]),
         acceptability=acceptability,
         station_biases=station_biases,
+        solved_covariance=solved_covariance,
+        dt_delta=dt_delta,
+        amrat_delta=amrat_delta,
+        thrust_delta_m_per_s=thrust_delta_arr,
+        dv_frame=dv_frame,
+        photometry=photometry,
     )

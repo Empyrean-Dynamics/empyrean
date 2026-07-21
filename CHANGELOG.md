@@ -4,6 +4,65 @@ Notable changes to the empyrean distribution — the `empyrean`, `empyrean-sys`,
 `empyrean-c`, and `empyrean-cli` crates and the `empyrean` Python package. This
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.9.0-rc.0] — 2026-07-20
+
+Wide-parameter orbit determination and post-OD photometry, at API parity
+across every channel (empyrean-core v0.9.1, villeneuve v1.20.1, scott
+v1.14.1).
+
+### Added
+
+- **Wide-parameter OD fitting.** `determine` / `refine` can solve a wider
+  parameter vector than the state plus Marsden non-grav: the cometary
+  outgassing time delay **DT**, SRP **area-to-mass**, and impulsive
+  **thrust Δv** segments, each differentiated analytically by the
+  hyperdual integrator. Requested through the wide solve-for surface on
+  every channel. DT / AMRAT / thrust are refine-path solves — the input
+  orbit carries the prior that opens the parameter, and a requested
+  parameter with no prior errors loudly rather than returning a zeroed
+  column.
+- **SRP area-to-mass (AMRAT) force slot on the input orbit.** A first-class
+  solar-radiation-pressure slot — additive with the Marsden non-grav — is
+  now carried on every input path (the C `EmpyreanOrbit`'s `has_srp` /
+  `srp_amrat` / `srp_cr` / `srp_amrat_variance`, the Rust wrapper's
+  `Orbit.srp`, the Python `orbits.srp` `SRPParams` table, and the CLI's
+  `--amrat` / `--cr` / `--amrat-variance`). SRP is never value-inferred —
+  an explicit switch enables it — and a finite `amrat_variance` both opens
+  and priors the AMRAT column in a `StateAndAMRAT` /
+  `StateAndNonGravAndAMRAT` refine. A fitted orbit carries its absolute
+  AMRAT (and fitted posterior variance) back out for a lossless re-feed.
+- **SBDB queries carry SRP.** `query_sbdb` now populates `orbits.srp.amrat`
+  from JPL's fitted area-to-mass, so an SBDB-sourced orbit round-trips its
+  area-to-mass into propagation and re-feed. Previously the fitted SRP force
+  was dropped (`srp.amrat` came back null) for the objects JPL fits an
+  area-to-mass for — e.g. 101955 Bennu (2.636e-6 ± 1.908e-7 m²/kg).
+- **Tagged solved covariance.** OD results carry a solved covariance whose
+  parameter identities travel with the matrix, so a caller reads a fitted
+  parameter's variance by its slot (DT, AMRAT, each thrust component)
+  instead of guessing column order. Populated identically across the Rust,
+  C, Python, and CLI channels.
+- **Post-OD photometry.** An optional photometric fit recovers the
+  absolute magnitude H and phase-function slope from the observation
+  magnitudes once the orbit is solved, climbing a model ladder (H-only →
+  HG12 → HG1G2) to the richest model the arc's phase-angle coverage
+  supports, with an honest 1σ on H from its parameter covariance.
+
+### Changed
+
+- **Python `model='srp'` is rejected loudly.** The SRP force now lives on
+  its own `orbits.srp` `SRPParams` table (area-to-mass + `Cr` + prior
+  variance); `NonGravParams` is Marsden-only. Passing `model='srp'` (or a
+  non-null `cr`) on `NonGravParams` now raises with a migration pointer
+  rather than being silently reinterpreted as an inverse-square radial
+  force — any prior `model='srp'` results were computed as Marsden-radial
+  and are invalid.
+- **C ABI grew (recompile required).** `EmpyreanOrbit` and `EmpyreanODResult`
+  gained the SRP input / re-feed fields, so their `sizeof` changed; C
+  consumers and `empyrean-sys` callers must recompile against the
+  v0.9.0-rc.0 header (ABI version 1). `empyrean_abi_version()` reports 1.
+- **Engine.** Binds empyrean-core v0.9.1 (villeneuve v1.20.1, scott
+  v1.14.1), which shares one force-model system across every batch OD call.
+
 ## [0.8.2] — 2026-07-11
 
 Engine release (empyrean-core v0.8.3, villeneuve v1.18.2, scott
@@ -82,7 +141,8 @@ through the same functions with the same signatures.
   fields cannot be silently dropped at the FFI boundary, and the
   no-silent-drops contract suite now exercises the non-grav covariance
   input channel end to end.
-- Binds empyrean-core v0.8.2 (villeneuve v1.18.1, scott v1.13.3).
+- **Engine.** Binds empyrean-core v0.8.2 (villeneuve v1.18.1, scott
+  v1.13.3).
 
 ## [0.8.0] — 2026-07-09
 
@@ -188,7 +248,6 @@ below.
   were built at once, surfacing as a path-less `I/O error: … (os error 2)`.
   Concurrent *use* of a built context (propagation, ephemeris, OD) is unaffected
   and stays unserialized — no hot-path or single-threaded regression.
-
 - **`download_data` actually provisions the data directory.** It was a no-op that
   returned a path without fetching anything. It now downloads the complete
   Standard-tier kernel set into the target (or default) directory — idempotent
@@ -197,7 +256,6 @@ below.
   with no further downloads. In Python, installed B612 Foundation data packages
   (`naif-de440`, `jpl-small-bodies-de441-n16`, `naif-eop-*`, `mpc-obscodes`) are
   staged from the wheels with no network access and only the remainder is fetched.
-
 - **Actionable missing-data errors.** A failed `from_data_dir` now names the
   missing kernel and the data directory and hints the remedy (run `download_data`
   or set `EMPYREAN_DATA_DIR`), instead of a path-less message. The doubled
@@ -206,5 +264,9 @@ below.
 Earlier release candidates (rc.0–rc.3) are documented in their tagged GitHub
 releases.
 
+[0.9.0-rc.0]: https://github.com/Empyrean-Dynamics/empyrean/releases/tag/v0.9.0-rc.0
+[0.8.2]: https://github.com/Empyrean-Dynamics/empyrean/releases/tag/v0.8.2
+[0.8.1]: https://github.com/Empyrean-Dynamics/empyrean/releases/tag/v0.8.1
+[0.8.0]: https://github.com/Empyrean-Dynamics/empyrean/releases/tag/v0.8.0
 [0.7.0]: https://github.com/Empyrean-Dynamics/empyrean/releases/tag/v0.7.0
 [0.7.0-rc.4]: https://github.com/Empyrean-Dynamics/empyrean/releases/tag/v0.7.0-rc.4

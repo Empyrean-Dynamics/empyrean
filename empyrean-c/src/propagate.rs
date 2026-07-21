@@ -7,7 +7,7 @@ use empyrean_core::convert::{
     coordinate_state_to_coordinates, frame_to_int, representation_to_int,
 };
 use empyrean_core::nongrav::{
-    GFunction, NonGravModel, NonGravParams, SteeringLaw, ThrustArc, ThrustParams,
+    GFunction, NonGravModel, NonGravParams, SRPForceParams, SteeringLaw, ThrustArc, ThrustParams,
 };
 use empyrean_core::orbits::Orbits;
 use empyrean_core::photometry::PhotometricParams;
@@ -194,6 +194,10 @@ pub struct EmpyreanOrbit {
     /// or negative) when SBDB's `model_pars[]` exposes a `DT` field —
     /// e.g. 67P (+45.7d), 46P/Wirtanen (−14.1d), 2I/Borisov (−65.1d).
     pub non_grav_dt: f64,
+    /// Prior variance on the non-grav time delay DT (days²). NaN or ≤0 = no
+    /// prior; a finite positive value opens + priors the DT column in a
+    /// StateAndNonGravAndDT fit.
+    pub non_grav_dt_variance: f64,
     /// 1 when `non_grav_covariance` carries a non-grav prior covariance; 0
     /// otherwise. Set by the OD output path (a fitted orbit) so it re-feeds
     /// into a StateAndNonGrav refine without losing its non-grav prior;
@@ -247,6 +251,28 @@ pub struct EmpyreanOrbit {
     /// Number of entries in
     /// [`correction_covariances`](Self::correction_covariances).
     pub n_correction_covariances: usize,
+    /// 1 when this orbit carries a solar-radiation-pressure force slot
+    /// (`srp_amrat` + `srp_cr`); 0 otherwise. SRP is **never** value-inferred
+    /// — this explicit switch is the only trigger, so a zero-init orbit
+    /// carries no SRP even if `srp_amrat` happens to be non-zero, and a
+    /// non-zero `srp_amrat` with `has_srp == 0` is a loud argument error
+    /// rather than a silent apply. SRP is an additive slot, combinable with
+    /// the Marsden A1/A2/A3 non-grav on the same orbit.
+    pub has_srp: u8,
+    /// Area-to-mass ratio AMRAT (m²/kg) — the SRP-effective, fittable
+    /// parameter (Cr and reflectivity are absorbed into it, per the JPL AMR
+    /// convention). Only read when `has_srp == 1`; must be finite and > 0.
+    pub srp_amrat: f64,
+    /// Radiation-pressure coefficient Cr (typically 1.0–2.0; 1.0 = total
+    /// absorption). Fixed, never fitted — only the product Cr·AMRAT enters the
+    /// dynamics, so a fitted AMRAT absorbs Cr. Only read when `has_srp == 1`;
+    /// must be finite and > 0.
+    pub srp_cr: f64,
+    /// Prior variance on AMRAT ((m²/kg)²). NaN or ≤0 = no prior (the AMRAT
+    /// column stays closed; SRP is applied as a fixed force). A finite
+    /// positive value opens + priors the AMRAT column in a StateAndAMRAT /
+    /// StateAndNonGravAndAMRAT fit. Only read when `has_srp == 1`.
+    pub srp_amrat_variance: f64,
 }
 
 /// Origin-switching configuration for trajectory splitting at body
@@ -992,7 +1018,22 @@ pub(crate) fn build_propagation_config_from_c(
 /// Yarkovsky); any non-zero value selects the explicit SBDB Marsden–Sekanina
 /// g(r). A non-finite `non_grav_dt` means "no thermal-lag delay".
 pub(crate) fn empyrean_orbit_non_grav_params(orbit: &EmpyreanOrbit) -> Option<NonGravParams> {
-    if orbit.a1 == 0.0 && orbit.a2 == 0.0 && orbit.a3 == 0.0 {
+    // Non-grav is present when the caller supplies Marsden *values* (non-zero
+    // A1/A2/A3 — the apply case) OR declares a fit prior on the block: a
+    // non-grav covariance (to solve A1/A2/A3 from a zero start) or a DT
+    // value/variance. Value-inferring presence from the coefficients alone
+    // would drop the covariance that a zero-seeded Marsden solve needs to open
+    // its column (villeneuve emits the Marsden Jacobian only when the
+    // covariance is declared) — the same "explicit switch, don't infer" rule
+    // `has_srp` uses.
+    let has_dt = orbit.non_grav_dt.is_finite()
+        || (orbit.non_grav_dt_variance.is_finite() && orbit.non_grav_dt_variance > 0.0);
+    if orbit.a1 == 0.0
+        && orbit.a2 == 0.0
+        && orbit.a3 == 0.0
+        && orbit.has_non_grav_covariance == 0
+        && !has_dt
+    {
         return None;
     }
     let g_func = if orbit.ng_alpha == 0.0
@@ -1028,7 +1069,85 @@ pub(crate) fn empyrean_orbit_non_grav_params(orbit: &EmpyreanOrbit) -> Option<No
         } else {
             None
         },
+        // DT is a fittable axis in v1.20.0; propagation input carries the DT
+        // value (above); carry its prior variance too when supplied so a
+        // re-fed orbit opens + priors the DT column in a StateAndNonGravAndDT
+        // refine.
+        dt_variance: if orbit.non_grav_dt_variance.is_finite() && orbit.non_grav_dt_variance > 0.0 {
+            Some(orbit.non_grav_dt_variance)
+        } else {
+            None
+        },
     })
+}
+
+/// Build the solar-radiation-pressure force slot carried by an
+/// [`EmpyreanOrbit`], or `None` when the orbit enables no SRP
+/// (`has_srp == 0`).
+///
+/// Shared by every C-ABI path that turns an `EmpyreanOrbit` into an
+/// `Orbits<AU>` (propagation, orbit determination, ephemeris, impact, IO
+/// round-trip) so none of them silently drops the caller's SRP slot. SRP is
+/// an additive force slot — combinable with the Marsden A1/A2/A3 non-grav on
+/// the same orbit — and, unlike Marsden, is **never value-inferred**:
+/// `has_srp` is the sole trigger. `srp_amrat_variance` finite and > 0 seeds
+/// AMRAT as a fittable parameter (the trigger + Bayesian prior that opens the
+/// AMRAT column in a StateAndAMRAT / StateAndNonGravAndAMRAT fit); NaN or ≤0
+/// leaves the AMRAT column closed and applies SRP as a fixed force.
+///
+/// Validates loudly rather than silently degrading:
+/// - SRP value fields set with `has_srp == 0` (a caller who forgot the
+///   switch — never a silent apply nor a silent drop),
+/// - a non-finite or non-positive `srp_amrat` or `srp_cr`,
+/// - a non-positive (but finite) `srp_amrat_variance`.
+pub(crate) fn empyrean_orbit_srp_params(
+    orbit: &EmpyreanOrbit,
+) -> Result<Option<SRPForceParams>, String> {
+    if orbit.has_srp == 0 {
+        // Zero-init = absent. But value fields set without the switch is a
+        // caller mistake, not a silent drop: surface it loudly.
+        if orbit.srp_amrat != 0.0 || orbit.srp_cr != 0.0 || orbit.srp_amrat_variance.is_finite() {
+            return Err(
+                "has_srp = 0 but SRP fields (srp_amrat / srp_cr / srp_amrat_variance) are set — \
+                 set has_srp = 1 to apply the SRP slot, or clear the fields"
+                    .to_string(),
+            );
+        }
+        return Ok(None);
+    }
+
+    if !orbit.srp_amrat.is_finite() || orbit.srp_amrat <= 0.0 {
+        return Err(format!(
+            "srp_amrat must be finite and > 0 (area-to-mass ratio, m^2/kg); got {}",
+            orbit.srp_amrat
+        ));
+    }
+    if !orbit.srp_cr.is_finite() || orbit.srp_cr <= 0.0 {
+        return Err(format!(
+            "srp_cr must be finite and > 0 (radiation-pressure coefficient); got {}",
+            orbit.srp_cr
+        ));
+    }
+    // Finite & > 0 ⇒ AMRAT is fittable (prior variance). NaN / ≤0 ⇒ no prior
+    // (fixed-force SRP). A finite but non-positive variance is a loud error.
+    let amrat_variance = if orbit.srp_amrat_variance.is_finite() {
+        if orbit.srp_amrat_variance <= 0.0 {
+            return Err(format!(
+                "srp_amrat_variance must be > 0 when finite (AMRAT prior variance, (m^2/kg)^2); \
+                 got {} — use NaN or ≤0 for no prior",
+                orbit.srp_amrat_variance
+            ));
+        }
+        Some(orbit.srp_amrat_variance)
+    } else {
+        None
+    };
+
+    Ok(Some(SRPForceParams {
+        amrat: orbit.srp_amrat,
+        cr: orbit.srp_cr,
+        amrat_variance,
+    }))
 }
 
 /// Validate a caller-owned side-array pointer/length pair: a non-zero
@@ -1301,6 +1420,11 @@ pub(crate) fn build_orbits_for_propagation(
         }
         match empyrean_orbit_thrust_params(orbit) {
             Ok(Some(tp)) => orbits.set_thrust_params(i, Some(tp)),
+            Ok(None) => {}
+            Err(e) => return Err(format!("orbit {i}: {e}")),
+        }
+        match empyrean_orbit_srp_params(orbit) {
+            Ok(Some(srp)) => orbits.set_srp_params(i, Some(srp)),
             Ok(None) => {}
             Err(e) => return Err(format!("orbit {i}: {e}")),
         }
@@ -2749,6 +2873,7 @@ mod thrust_input_tests {
             ng_n: 0.0,
             ng_k: 0.0,
             non_grav_dt: f64::NAN,
+            non_grav_dt_variance: f64::NAN,
             has_non_grav_covariance: 0,
             non_grav_covariance: [[0.0; 3]; 3],
             phot_system: -1,
@@ -2761,6 +2886,10 @@ mod thrust_input_tests {
             n_dv_corrections: 0,
             correction_covariances: std::ptr::null(),
             n_correction_covariances: 0,
+            has_srp: 0,
+            srp_amrat: 0.0,
+            srp_cr: 0.0,
+            srp_amrat_variance: f64::NAN,
         }
     }
 
@@ -3043,5 +3172,210 @@ mod thrust_input_tests {
             dr > 1.0e-3,
             "thrust arc must perturb the trajectory (Δposition = {dr} AU)"
         );
+    }
+}
+
+#[cfg(test)]
+mod srp_input_tests {
+    use super::*;
+
+    /// A gravity-only heliocentric Cartesian orbit with no SRP slot. Tests
+    /// enable / populate SRP by overwriting the `has_srp` + `srp_*` fields.
+    fn base_orbit() -> EmpyreanOrbit {
+        EmpyreanOrbit {
+            state: crate::CoordinateState {
+                epoch_mjd_tdb: 59000.0,
+                elements: [1.0, 0.1, 0.05, -0.005, 0.015, 0.001],
+                covariance: [[0.0; 6]; 6],
+                has_covariance: 0,
+                representation: 0,
+                frame: 0,
+                origin: 10,
+            },
+            orbit_id: std::ptr::null(),
+            object_id: std::ptr::null(),
+            a1: 0.0,
+            a2: 0.0,
+            a3: 0.0,
+            ng_alpha: 0.0,
+            ng_r0: 0.0,
+            ng_m: 0.0,
+            ng_n: 0.0,
+            ng_k: 0.0,
+            non_grav_dt: f64::NAN,
+            non_grav_dt_variance: f64::NAN,
+            has_non_grav_covariance: 0,
+            non_grav_covariance: [[0.0; 3]; 3],
+            phot_system: -1,
+            h_mag: f64::NAN,
+            slope1: 0.0,
+            slope2: 0.0,
+            thrust_arcs: std::ptr::null(),
+            n_thrust_arcs: 0,
+            dv_corrections: std::ptr::null(),
+            n_dv_corrections: 0,
+            correction_covariances: std::ptr::null(),
+            n_correction_covariances: 0,
+            has_srp: 0,
+            srp_amrat: 0.0,
+            srp_cr: 0.0,
+            srp_amrat_variance: f64::NAN,
+        }
+    }
+
+    #[test]
+    fn no_srp_is_absent() {
+        assert!(empyrean_orbit_srp_params(&base_orbit()).unwrap().is_none());
+    }
+
+    #[test]
+    fn fixed_force_srp_no_prior() {
+        let mut o = base_orbit();
+        o.has_srp = 1;
+        o.srp_amrat = 3.0e-3;
+        o.srp_cr = 1.2;
+        // NaN variance ⇒ SRP applied as a fixed force, AMRAT column closed.
+        let srp = empyrean_orbit_srp_params(&o).unwrap().unwrap();
+        assert_eq!(srp.amrat, 3.0e-3);
+        assert_eq!(srp.cr, 1.2);
+        assert!(srp.amrat_variance.is_none());
+    }
+
+    #[test]
+    fn fittable_srp_opens_amrat_column() {
+        let mut o = base_orbit();
+        o.has_srp = 1;
+        o.srp_amrat = 3.0e-3;
+        o.srp_cr = 1.0;
+        o.srp_amrat_variance = 1.0e-8;
+        let srp = empyrean_orbit_srp_params(&o).unwrap().unwrap();
+        assert_eq!(srp.amrat_variance, Some(1.0e-8));
+    }
+
+    #[test]
+    fn fields_without_enable_are_loud() {
+        // A caller who set srp_amrat but forgot has_srp gets a loud error,
+        // never a silent drop nor a silent apply.
+        let mut o = base_orbit();
+        o.srp_amrat = 3.0e-3;
+        assert!(empyrean_orbit_srp_params(&o).is_err());
+    }
+
+    #[test]
+    fn invalid_amrat_is_loud() {
+        let mut o = base_orbit();
+        o.has_srp = 1;
+        o.srp_amrat = -1.0; // area-to-mass must be > 0
+        o.srp_cr = 1.0;
+        assert!(empyrean_orbit_srp_params(&o).is_err());
+    }
+
+    #[test]
+    fn invalid_cr_is_loud() {
+        let mut o = base_orbit();
+        o.has_srp = 1;
+        o.srp_amrat = 3.0e-3;
+        o.srp_cr = 0.0; // Cr must be > 0
+        assert!(empyrean_orbit_srp_params(&o).is_err());
+    }
+
+    #[test]
+    fn nonpositive_finite_variance_is_loud() {
+        let mut o = base_orbit();
+        o.has_srp = 1;
+        o.srp_amrat = 3.0e-3;
+        o.srp_cr = 1.0;
+        o.srp_amrat_variance = -1.0e-8; // finite but ≤0 is an error, not "no prior"
+        assert!(empyrean_orbit_srp_params(&o).is_err());
+    }
+}
+
+#[cfg(test)]
+mod non_grav_input_tests {
+    use super::*;
+
+    /// A gravity-only heliocentric Cartesian orbit: no Marsden coefficients,
+    /// no covariance, no DT. Tests flip individual fields to exercise the
+    /// presence gate.
+    fn base_orbit() -> EmpyreanOrbit {
+        EmpyreanOrbit {
+            state: crate::CoordinateState {
+                epoch_mjd_tdb: 59000.0,
+                elements: [1.0, 0.1, 0.05, -0.005, 0.015, 0.001],
+                covariance: [[0.0; 6]; 6],
+                has_covariance: 0,
+                representation: 0,
+                frame: 0,
+                origin: 10,
+            },
+            orbit_id: std::ptr::null(),
+            object_id: std::ptr::null(),
+            a1: 0.0,
+            a2: 0.0,
+            a3: 0.0,
+            ng_alpha: 0.0,
+            ng_r0: 0.0,
+            ng_m: 0.0,
+            ng_n: 0.0,
+            ng_k: 0.0,
+            non_grav_dt: f64::NAN,
+            non_grav_dt_variance: f64::NAN,
+            has_non_grav_covariance: 0,
+            non_grav_covariance: [[0.0; 3]; 3],
+            phot_system: -1,
+            h_mag: f64::NAN,
+            slope1: 0.0,
+            slope2: 0.0,
+            thrust_arcs: std::ptr::null(),
+            n_thrust_arcs: 0,
+            dv_corrections: std::ptr::null(),
+            n_dv_corrections: 0,
+            correction_covariances: std::ptr::null(),
+            n_correction_covariances: 0,
+            has_srp: 0,
+            srp_amrat: 0.0,
+            srp_cr: 0.0,
+            srp_amrat_variance: f64::NAN,
+        }
+    }
+
+    #[test]
+    fn gravity_only_is_absent() {
+        // Zero coefficients, no covariance, no DT ⇒ genuinely no non-grav.
+        assert!(empyrean_orbit_non_grav_params(&base_orbit()).is_none());
+    }
+
+    #[test]
+    fn zero_coeffs_with_covariance_opens_marsden() {
+        // A Marsden solve seeded from A1=A2=A3=0 declares its column via the
+        // covariance prior — the presence gate must NOT drop it (villeneuve
+        // opens the Marsden Jacobian only when the covariance is declared).
+        let mut o = base_orbit();
+        o.has_non_grav_covariance = 1;
+        let mut c = [[0.0; 3]; 3];
+        for (i, row) in c.iter_mut().enumerate() {
+            row[i] = 1.0e-24;
+        }
+        o.non_grav_covariance = c;
+        let ng = empyrean_orbit_non_grav_params(&o).expect("covariance opens the Marsden column");
+        assert_eq!(ng.a1, 0.0);
+        assert_eq!(ng.covariance, Some(c));
+    }
+
+    #[test]
+    fn zero_coeffs_with_dt_is_present() {
+        // A declared DT (value or prior) must survive too, even at zero A's.
+        let mut o = base_orbit();
+        o.non_grav_dt = 45.7;
+        let ng = empyrean_orbit_non_grav_params(&o).expect("DT keeps the non-grav present");
+        assert_eq!(ng.dt, Some(45.7));
+    }
+
+    #[test]
+    fn nonzero_coeffs_present() {
+        // The apply case is unchanged: non-zero coefficients ⇒ present.
+        let mut o = base_orbit();
+        o.a2 = -3.0e-14;
+        assert!(empyrean_orbit_non_grav_params(&o).is_some());
     }
 }

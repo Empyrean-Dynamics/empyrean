@@ -56,7 +56,10 @@ bodies like asteroids and comets, with plans to extend to cislunar space.
 | CLI    | `cargo install empyrean-cli` (or grab a binary from [Releases](https://github.com/Empyrean-Dynamics/empyrean/releases)) |
 | C      | download `libempyrean-<target>.tar.gz` from [Releases](https://github.com/Empyrean-Dynamics/empyrean/releases) — ships the shared library, `empyrean.h`, and LICENSE |
 
-Current release: **0.8.2** — see the [CHANGELOG](CHANGELOG.md).
+Current release: **0.9.0-rc.0** — a release candidate; see the
+[CHANGELOG](CHANGELOG.md). Pre-release builds are opt-in:
+`pip install --pre empyrean` for the wheel, `cargo add empyrean@0.9.0-rc.0`
+for the crate.
 
 Prebuilt binaries — the engine cdylib, the CLI, and the Python wheels —
 target four platforms: macOS arm64 (`macos-aarch64`), macOS x86_64
@@ -84,7 +87,8 @@ each shown end-to-end in Python, Rust, and CLI.
 > **Defaults.** Each example uses the production hot-path: Standard
 > force-model tier (Sun + planets + Moon + EIH GR + 16 SB441-N16 asteroid perturbers
 > + Sun J2 + Earth J2-J4 + Marsden non-grav), GR15 integrator, `FirstOrder` (linear-
-> covariance) uncertainty propagation, ICRF frame. Finite-burn thrust
+> covariance) uncertainty propagation, EclipticJ2000 frame (the
+> integration frame; set the frame to ICRF for ICRF output). Finite-burn thrust
 > arcs (constant-RTN / velocity-tangent / inertial-fixed steering, with
 > per-arc Δv targeting corrections) are available as an optional
 > continuous-thrust force input on top of this model. See
@@ -308,9 +312,32 @@ per-observation residuals — that you can join in
 pandas / Polars / DuckDB the same way you would the propagation /
 ephemeris outputs.
 
+Beyond the six-element state, `determine` and `refine` solve a wider
+parameter set — the Marsden A1/A2/A3 non-gravitational coefficients,
+the (cometary outgassing) time delay DT, the solar-radiation-pressure
+area-to-mass ratio (AMRAT), and thrust Δv-correction segments — each
+carried through the fit with the exact derivatives the propagator
+already computes. DT, AMRAT, and the thrust segments are refine-path
+solves: the orbit you pass in must already carry a prior (a declared
+variance) on the parameter, and that prior is what opens it to the
+fit. Ask for a parameter the orbit has no prior for and the call
+errors loudly — it never returns a zeroed or silently defaulted
+column.
+
+The result carries a tagged solved covariance: the identities of the
+fitted parameters travel with the matrix, so you read a parameter's
+variance from its slot — the DT slot, the AMRAT slot, a thrust
+component — rather than guessing at column order.
+
+An optional post-OD photometry fit recovers the absolute magnitude H
+and a phase-function slope from the arc's observation magnitudes. It
+runs after the orbit is solved, climbing a model ladder — H-only →
+HG₁₂ → HG₁G₂ (Muinonen et al. 2010) — to the richest model the arc's
+phase-angle coverage supports, and reports H with an honest 1σ.
+
 ## Validation
 
-Every release is validated against JPL Horizons, ASSIST (reboundx),
+Every release is validated against JPL Horizons, ASSIST,
 and `find_orb` on 43 objects across 13 dynamical populations (NEOs,
 MBAs, Trojans, TNOs, comets, and more). Propagated states agree with
 JPL Horizons at the sub-meter level on bounded timescales, and orbit

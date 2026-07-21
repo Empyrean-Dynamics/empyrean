@@ -26,7 +26,11 @@ DuckDB.
 ## Install
 
 ```sh
+# Latest stable release.
 cargo install empyrean-cli
+
+# This pre-release (v0.9.0-rc.0) — cargo needs the explicit version.
+cargo install empyrean-cli --version 0.9.0-rc.0
 ```
 
 `cargo install` fetches the closed-source `libempyrean` engine
@@ -71,8 +75,9 @@ empyrean determine apophis.psv --out-dir ./out
 empyrean version
 ```
 
-All commands emit Parquet tables under `--out-dir` by default
-(`--format json` / `--format csv` are also available). The schemas
+The pipeline commands (`propagate` / `ephemeris` / `determine`) emit
+Parquet tables under `--out-dir` by default (`--format json` /
+`--format csv` are also available). The schemas
 match the Python and Rust API outputs exactly — same `orbit_id` /
 `object_id` join keys, same time scales, same physical units — so you
 can mix-and-match channels for the same workflow.
@@ -120,6 +125,104 @@ is never silently dropped.
 
 ```sh
 empyrean propagate --object-id 99942 --epoch 64922.0 --thrust-arcs burn.json --out-dir ./out
+```
+
+## Orbit determination
+
+`determine` fits an orbit from an ADES PSV and writes the fitted orbit
+(`fitted_orbit.<ext>`) plus per-observation residuals (`residuals.<ext>`)
+under `--out-dir`. The fitted orbit is fully re-feedable — its state,
+covariance, and non-gravitational model carry straight into a follow-on
+`empyrean propagate` / `empyrean ephemeris` with no reconstruction.
+
+```sh
+# 6-parameter fit. The default `--solve-for auto` starts state-only and
+# escalates to non-grav automatically on a poor fit.
+empyrean determine apophis.psv --out-dir ./out
+```
+
+### Solving for more than the state
+
+`--solve-for` chooses which parameters differential correction recovers,
+beyond the 6-element state:
+
+- `state-only` — the 6-element Cartesian state.
+- `non-grav` — state + Marsden A1/A2/A3 radial/transverse/normal coefficients.
+- `dt` — state + Marsden + the cometary outgassing **time delay DT** (days).
+- `amrat` — state + **SRP area-to-mass ratio AMRAT** (m²/kg).
+- `non-grav-amrat` — state + Marsden + AMRAT.
+- `auto` (default) — state-only, escalating to non-grav automatically on a poor fit.
+
+`--thrust-segments <N>` additionally solves `N` impulsive **thrust Δv
+segments** (0 = none). Each solved segment is a 3-vector in the integration
+frame; its burn window must be bracketed by observations, or empyrean
+refuses the fit rather than letting the state quietly absorb the maneuver.
+
+DT and AMRAT are refine-path axes: each is opened only when a prior
+variance is supplied for it (`--dt-variance` / `--amrat-variance`).
+`determine` runs a seed solve, attaches the prior to the fitted orbit,
+then refines — so `--solve-for dt` / `amrat` require their prior flags,
+and a requested axis with no prior errors loudly rather than handing back
+a zeroed column. Thrust segments (`--thrust-segments`) are opened instead
+by bracketing the burn window with observations. Every solved axis is
+differentiated analytically by the hyperdual integrator, so the partials
+are exact rather than finite-differenced.
+
+```sh
+# State + Marsden + the cometary outgassing time delay. --dt-variance (days²)
+# opens + priors the DT column; --dt sets the value, else the seed's is kept.
+empyrean determine comet.psv --solve-for dt --dt-variance 400 --out-dir ./out
+
+# State + SRP area-to-mass ratio. --amrat (m²/kg) seeds the SRP slot,
+# --amrat-variance ((m²/kg)²) opens + priors the AMRAT column; --cr defaults to 1.0.
+empyrean determine object.psv --solve-for amrat --amrat 3.0e-3 --amrat-variance 1e-8 --out-dir ./out
+
+# State + Marsden + two solved thrust Δv-correction segments.
+empyrean determine maneuvering.psv --solve-for non-grav --thrust-segments 2 --out-dir ./out
+```
+
+Each fit prints a convergence summary and a readback of exactly the wide
+axes it recovered. A line for an axis appears only when that axis was
+actually solved, so a missing line reads as "not recovered", never a zero:
+
+```text
+  Converged  Iter  RMS_RA"  RMS_Dec"   Obs
+  ----------------------------------------
+  yes           11     0.32      0.28    128
+  Solved covariance width: 10
+  Non-grav time delay  ΔDT = 0.0142 d
+```
+
+### Tagged solved covariance
+
+A wide fit carries a **tagged solved covariance**: the fitted-parameter
+identities travel with the matrix, so you read a parameter's variance by
+its slot — DT, AMRAT, or a thrust component — rather than guessing at
+column order. The canonical layout is
+`[state 6 | Marsden 3 | DT 1 | AMRAT 1 | thrust 3×k]`, but the width alone
+is ambiguous (a width-9 solve is Marsden-only *or* one thrust segment), so
+each solved axis is located by its tag and reported by name in the
+readback above. The fitted state covariance rides along in
+`fitted_orbit.<ext>`.
+
+### Post-OD photometry
+
+`--photometry` runs an optional photometric fit after the orbit is solved,
+recovering the absolute magnitude **H** and phase-function slope from the
+observation magnitudes. Photometry has no astrometric partials, so it
+never perturbs the fitted state.
+
+The fit climbs a model ladder — **H-only → HG12 → HG1G2** (Muinonen et al.
+2010) — admitting the richest model the arc's phase-angle coverage
+supports, and reports the model it actually fit alongside an honest 1σ on
+H:
+
+```sh
+empyrean determine apophis.psv --photometry --out-dir ./out
+```
+
+```text
+  Photometry: H = 19.234 ± 0.041  G1 = 0.150  (model HG12, chi2_r 1.02)
 ```
 
 ## Runtime requirement

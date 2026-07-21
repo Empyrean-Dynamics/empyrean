@@ -25,7 +25,7 @@ raw FFI pointers.
 
 ```toml
 [dependencies]
-empyrean = "0.8"
+empyrean = "0.9.0-rc.0"
 ```
 
 ## What it does
@@ -33,7 +33,7 @@ empyrean = "0.8"
 - **Propagation** — N-body (Sun, planets, Moon, Pluto) with EIH general relativity, Sun J2 and Earth J2–J4 zonal harmonics, 16 asteroid perturbers, and the Marsden non-gravitational model — selectable across Approximate / Basic / Standard force-model tiers (Standard is the default). GR15 and DOP853 integrators. Optional finite-burn thrust arcs — constant-RTN, velocity-tangent, or inertial-fixed steering, with per-arc Δv targeting corrections — layer on as a continuous-thrust force input.
 - **Uncertainty** — First-order (Jet1) state transition matrices; second-order (Jet2) state transition tensors; unscented sigma-point and Monte Carlo sampling; an adaptive Auto mode that escalates the method automatically through close approaches and relaxes it elsewhere. Optional per-epoch tagged-covariance readback.
 - **Ephemeris** — RA/Dec, rates, photometry (H–G, H–G₁G₂, H–G₁₂), light time, phase angle, solar elongation, local horizon.
-- **Orbit determination** — Gauss, Herget, and systematic-ranging (admissible region + Manifold of Variations) IOD → N-body differential correction over optical and radar (delay / Doppler) observations, with STM caching and outlier rejection. Validated against `find_orb` and JPL SBDB.
+- **Orbit determination** — Gauss, Herget, and systematic-ranging (admissible region + Manifold of Variations) IOD → N-body differential correction over optical and radar (delay / Doppler) observations, with STM caching and outlier rejection. Solves beyond the six-element state for the Marsden A1/A2/A3 non-gravitational block, the cometary outgassing time delay DT, the SRP area-to-mass ratio AMRAT, and thrust Δv-correction segments — each partial supplied analytically by the hyperdual integrator — and returns a tagged solved covariance that names every fitted parameter. Optional post-fit photometry recovers H and the phase-function slope. Validated against `find_orb` and JPL SBDB.
 - **Events** — Close approach (start/end), periapsis, gravitational capture (start/end), shadow entry/exit, atmospheric entry/exit, impact, and possible impact.
 
 ## Quick start
@@ -54,10 +54,12 @@ println!("{} states, {} events", result.states.len(), result.events.len());
 
 ## Orbit determination
 
-`determine` runs a full IOD (Gauss / Herget / systematic ranging) → N-body differential correction. The
-fitted `result.orbit` is a re-feedable [`Orbit`] carrying state, covariance,
-and any fitted non-gravitational parameters — pass it straight back into
-`propagate`, `generate_ephemeris`, or `compute_impact_probabilities`.
+`determine` runs a full IOD (Gauss / Herget / systematic ranging) → N-body
+differential correction; `refine` is a Bayesian update against a prior orbit;
+`evaluate` returns residuals without fitting. The fitted `result.orbit` is a
+re-feedable [`Orbit`] carrying state, covariance, and any fitted
+non-gravitational parameters — pass it straight back into `propagate`,
+`generate_ephemeris`, or `compute_impact_probabilities`.
 
 ```rust,no_run
 # use empyrean::{Context, ODConfig};
@@ -71,6 +73,105 @@ println!(
     result.summary.rms_ra_arcsec,
     result.summary.rms_dec_arcsec,
 );
+# Ok::<(), empyrean::Error>(())
+```
+
+## Wide-parameter fitting
+
+Beyond the six-element state, `determine` and `refine` can solve for the
+Marsden A1/A2/A3 non-gravitational block, the cometary outgassing time delay
+DT, the SRP area-to-mass ratio AMRAT, and thrust Δv-correction segments — every
+partial derivative supplied analytically by the hyperdual integrator rather
+than finite differences. Choose the axes with `SolveForParams`: `StateOnly`,
+`StateAndNonGrav`, `Auto` (starts state-only and escalates the non-grav block
+automatically on a poor fit), or `Explicit(SolveFor { .. })` for the wider
+axes the coarse variants can't name.
+
+DT, AMRAT, and thrust are refine-path solves: the input orbit must carry a
+prior — the variance that *opens* the parameter. Request an axis without its
+prior and the fit errors loudly; it never hands back a zeroed or defaulted
+column.
+
+Every wide fit reports a `SolvedCovariance` whose fitted-parameter identities
+travel with the matrix. Read a parameter's variance by its slot (`marsden_slot`,
+`dt_slot`, `amrat_slot`, `thrust_slots`) rather than by guessing column order —
+`width` alone is ambiguous (a 9×9 is Marsden-only *or* one thrust segment).
+
+```rust,no_run
+use empyrean::{Context, ODConfig, SolveFor, SolveForParams};
+
+let ctx = Context::from_data_dir(None)?;
+let obs = ctx.read_ades("comet_67p.psv")?;
+
+// First solve state + Marsden A1/A2/A3.
+let fit = ctx.determine(&obs, None, &ODConfig {
+    solve_for: SolveForParams::StateAndNonGrav,
+    ..Default::default()
+})?;
+
+// Refine, additionally solving the outgassing time delay DT. Opening DT
+// requires a prior on it — its variance (days²) — carried on the orbit.
+// Ask for DT without the prior and refine errors, never a zeroed column.
+let prior = fit.orbit
+    .with_non_grav_dt(Some(30.0))
+    .with_non_grav_dt_variance(Some(100.0));
+let refined = ctx.refine(&prior, &obs, &ODConfig {
+    solve_for: SolveForParams::Explicit(SolveFor {
+        marsden: true,
+        dt: true,
+        ..Default::default()
+    }),
+    ..Default::default()
+})?;
+
+// The solved covariance names its columns — read σ(DT) by slot.
+if let Some(cov) = &refined.solved_covariance {
+    if let Some(k) = cov.dt_slot {
+        println!(
+            "ΔDT = {:?} d,  σ(DT) = {:.3} d",
+            refined.dt_delta,
+            cov.matrix[k][k].sqrt(),
+        );
+    }
+}
+# Ok::<(), empyrean::Error>(())
+```
+
+## Post-fit photometry
+
+Attach a `PhotometryConfig` to `ODConfig::photometry` and the pipeline recovers
+absolute magnitude H and the phase-function slope from the observation
+magnitudes after the orbit is solved. The photometric fit has no astrometric
+partials, so it never touches the state. In `Auto` it climbs a model ladder —
+H-only → HG12 → HG1G2 (Muinonen et al. 2010) — admitting the richest model the
+arc's phase-angle coverage supports and reporting the one it actually fit on
+`model_used` (never `Auto`). H carries an honest 1σ through the fitted
+`covariance`; the per-model gate decisions come back in `gates`.
+
+```rust,no_run
+use empyrean::{Context, ODConfig, PhotometryConfig};
+
+let ctx = Context::from_data_dir(None)?;
+let obs = ctx.read_ades("observations.psv")?;
+
+// Fit the orbit, then fit H/G from the magnitudes (Auto ladder:
+// H-only -> HG12 -> HG1G2).
+let fit = ctx.determine(&obs, None, &ODConfig {
+    photometry: Some(PhotometryConfig::default()),
+    ..Default::default()
+})?;
+
+if let Some(phot) = &fit.photometry {
+    let sigma_h = phot.covariance.map(|c| c[0][0].sqrt());
+    println!(
+        "H = {:.2} ± {:.2}  ({:?}, {} mags, α span {:.1}°)",
+        phot.h,
+        sigma_h.unwrap_or(f64::NAN),
+        phot.model_used,
+        phot.n_mags_used,
+        phot.alpha_span_deg,
+    );
+}
 # Ok::<(), empyrean::Error>(())
 ```
 
@@ -233,7 +334,7 @@ see its README for installation paths and the cross-channel quickstart.
 
 ## Accuracy
 
-Validated against JPL Horizons, ASSIST (reboundx), and `find_orb` on
+Validated against JPL Horizons, ASSIST, and `find_orb` on
 43 objects across 13 dynamical populations (NEOs, MBAs, Trojans, TNOs,
 comets, and more). Sub-meter propagation accuracy on bounded timescales;
 see the [validation notes](https://github.com/Empyrean-Dynamics/empyrean#validation)

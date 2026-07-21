@@ -36,6 +36,8 @@ import numpy as np
 import pytest
 from empyrean import (
     Origin,
+    SolveFor,
+    SRPParams,
     compute_impact_probabilities,
     determine,
     evaluate,
@@ -338,3 +340,64 @@ def test_evaluate_uses_seed_non_grav_not_gravity_only(apophis_fit, apophis_obser
     assert abs(ev_ng.summary.rms_combined_arcsec - ev_grav.summary.rms_combined_arcsec) > 1e-3, (
         "seed non-grav was not threaded into evaluate"
     )
+
+
+def test_explicit_flag_solve_result_unwraps(apophis_fit, apophis_observations):
+    """An explicit-flag AMRAT solve must round-trip through the result unwrap.
+
+    An AMRAT (or DT) axis has no coarse ``SolveForParams`` equivalent, so
+    the C ABI reports ``solve_for_used = 'explicit'`` (a Marsden-only solve,
+    by contrast, is normalized to ``state_and_nongrav``). ``SolveForParams``
+    must accept ``'explicit'`` — regression: the ``EXPLICIT`` variant was
+    missing, so ``refine`` raised
+    ``ValueError('explicit' is not a valid SolveForParams)`` in
+    ``_build_determine_result`` *after* the differential correction had
+    already converged. This guards every ``SolveFor(amrat=…)`` / ``dt=…``
+    fit through the high-level API.
+    """
+    # Attach a loose AMRAT prior so SolveFor(amrat=True) opens the SRP column.
+    primed = CartesianOrbits.from_kwargs(
+        orbit_id=apophis_fit.orbit.orbit_id.to_pylist(),
+        object_id=apophis_fit.orbit.object_id.to_pylist(),
+        coordinates=apophis_fit.orbit.coordinates,
+        srp=SRPParams.from_kwargs(amrat=[1.0e-4], cr=[1.0], amrat_variance=[(1.0e-3) ** 2]),
+    )
+    config = ODConfig(solve_for_flags=SolveFor(amrat=True))
+    result = refine(primed, apophis_observations, config=config)
+    assert result.solve_for_used == SolveForParams.EXPLICIT
+    # The explicit AMRAT axis opened its column.
+    assert result.solved_covariance is not None
+    assert result.solved_covariance.amrat_slot is not None
+
+
+def test_marsden_solve_seeds_from_zero_coefficients(apophis_fit, apophis_observations):
+    """A Marsden solve seeded from A1=A2=A3=0 opens its column via the prior.
+
+    The Marsden column is declared by a non-grav *covariance* on the input
+    orbit (villeneuve emits the Jacobian block only when the covariance is
+    present). Regression: the C-ABI and pyo3 orbit marshals value-inferred
+    "no non-grav" from all-zero A1/A2/A3 and dropped that covariance, so a
+    Marsden/Yarkovsky fit could not be seeded from scratch — ``refine``
+    raised "a Marsden solve requires NonGravParams with a covariance". Both
+    marshals now read the fit prior on its explicit presence.
+    """
+    prior = 1.0e-24  # (1e-12 AU/d²)² per component — loose, data-driven.
+    zeroed = CartesianOrbits.from_kwargs(
+        orbit_id=apophis_fit.orbit.orbit_id.to_pylist(),
+        object_id=apophis_fit.orbit.object_id.to_pylist(),
+        # Re-use the fitted Cartesian state + covariance (refine's state prior).
+        coordinates=apophis_fit.orbit.coordinates,
+        non_grav=NonGravParams.from_kwargs(
+            a1=[0.0],
+            a2=[0.0],
+            a3=[0.0],
+            model=["marsden"],
+            covariance=[[prior, 0.0, 0.0, 0.0, prior, 0.0, 0.0, 0.0, prior]],
+        ),
+    )
+    # Must not raise "requires a covariance"; the zero-seeded column opens.
+    result = refine(
+        zeroed, apophis_observations, config=ODConfig(solve_for_flags=SolveFor(marsden=True))
+    )
+    assert result.solved_covariance is not None
+    assert result.solved_covariance.marsden_slot is not None

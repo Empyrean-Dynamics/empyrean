@@ -15,6 +15,7 @@ from empyrean.coordinates.coordinates import (
 )
 from empyrean.orbits.nongrav import NonGravParams
 from empyrean.orbits.photometry import PhotometricParams
+from empyrean.orbits.srp import SRPParams
 
 T = TypeVar("T", bound=qv.Table)
 
@@ -64,6 +65,7 @@ class CartesianOrbits(qv.Table):
     object_id = qv.LargeStringColumn(nullable=True)
     coordinates = CartesianCoordinates.as_column()
     non_grav = NonGravParams.as_column(nullable=True)
+    srp = SRPParams.as_column(nullable=True)
     photometric = PhotometricParams.as_column(nullable=True)
 
     def select_by_orbit_id(self, orbit_ids: Iterable[str]) -> "CartesianOrbits":
@@ -82,6 +84,7 @@ class KeplerianOrbits(qv.Table):
     object_id = qv.LargeStringColumn(nullable=True)
     coordinates = KeplerianCoordinates.as_column()
     non_grav = NonGravParams.as_column(nullable=True)
+    srp = SRPParams.as_column(nullable=True)
     photometric = PhotometricParams.as_column(nullable=True)
 
     def select_by_orbit_id(self, orbit_ids: Iterable[str]) -> "KeplerianOrbits":
@@ -100,6 +103,7 @@ class CometaryOrbits(qv.Table):
     object_id = qv.LargeStringColumn(nullable=True)
     coordinates = CometaryCoordinates.as_column()
     non_grav = NonGravParams.as_column(nullable=True)
+    srp = SRPParams.as_column(nullable=True)
     photometric = PhotometricParams.as_column(nullable=True)
 
     def select_by_orbit_id(self, orbit_ids: Iterable[str]) -> "CometaryOrbits":
@@ -118,6 +122,7 @@ class SphericalOrbits(qv.Table):
     object_id = qv.LargeStringColumn(nullable=True)
     coordinates = SphericalCoordinates.as_column()
     non_grav = NonGravParams.as_column(nullable=True)
+    srp = SRPParams.as_column(nullable=True)
     photometric = PhotometricParams.as_column(nullable=True)
 
     def select_by_orbit_id(self, orbit_ids: Iterable[str]) -> "SphericalOrbits":

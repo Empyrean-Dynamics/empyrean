@@ -664,6 +664,33 @@ pub struct EmpyreanNonGravParams {
     pub covariance: [[f64; 3]; 3],
 }
 
+/// The fitted orbit's **absolute** solar-radiation-pressure slot, flattened
+/// for the C ABI.
+///
+/// Mirrors the SRP fields the input [`EmpyreanOrbit`] carries (`srp_amrat`,
+/// `srp_cr`, `srp_amrat_variance`) so a fitted orbit's SRP force can be read
+/// back off [`EmpyreanODResult::srp`] and re-applied to an `EmpyreanOrbit`
+/// (`has_srp = 1`) with no loss — whether the AMRAT was solved (fitted value +
+/// posterior variance) or merely carried through the fit as a fixed force.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct EmpyreanSRPParams {
+    /// Absolute area-to-mass ratio AMRAT (m²/kg) — the input prior plus any
+    /// fitted correction.
+    pub amrat: f64,
+    /// Radiation-pressure coefficient Cr, carried through unchanged (fixed,
+    /// never fitted).
+    pub cr: f64,
+    /// 1 when `amrat_variance` carries a meaningful AMRAT variance (the fitted
+    /// posterior when AMRAT was solved, else the carried-through prior); 0
+    /// otherwise.
+    pub has_amrat_variance: u8,
+    /// AMRAT variance ((m²/kg)²). Only meaningful when `has_amrat_variance = 1`.
+    /// Re-feeding it opens + priors the AMRAT column in a follow-on
+    /// StateAndAMRAT / StateAndNonGravAndAMRAT refine.
+    pub amrat_variance: f64,
+}
+
 /// Result of orbit determination (determine or refine).
 ///
 /// Per-axis solve-for flags (mirrors scott's `SolveFor`). Read only when
@@ -905,6 +932,13 @@ pub struct EmpyreanODResult {
     /// Post-OD photometric solution when photometry was requested + ran.
     /// Owns its per-band / gate arrays (freed by `empyrean_od_result_free`).
     pub photometry: EmpyreanODPhotometryResult,
+    /// 1 when [`srp`] carries a fitted/carried absolute SRP slot.
+    pub has_srp: u8,
+    /// The fitted orbit's **absolute** SRP slot (AMRAT + Cr + optional AMRAT
+    /// variance). Re-feed this onto the orbit (`has_srp = 1`) for propagation /
+    /// evaluate / refine so a fitted orbit never silently drops its SRP force.
+    /// Zeroed when the orbit carries no SRP (`has_srp = 0`).
+    pub srp: EmpyreanSRPParams,
 }
 
 /// Result of orbit evaluation (residuals without fitting).
@@ -1886,6 +1920,12 @@ unsafe fn populate_wide_fitting_fields(result_out: *mut EmpyreanODResult, od: &O
                 (*result_out).amrat_delta = 0.0;
             }
         }
+        // Absolute fitted/carried SRP slot for lossless re-feed (parity with
+        // `non_grav` above — the SRP force must survive a fitted-orbit round
+        // trip, not just its correction `amrat_delta`).
+        let (has_srp, srp) = od_result_srp_to_c(od);
+        (*result_out).has_srp = has_srp;
+        (*result_out).srp = srp;
         let mut thrust = [[0.0_f64; 3]; 3];
         let count = match od.thrust_delta_m_per_s() {
             Some(dvs) => {
@@ -2052,6 +2092,38 @@ fn od_result_non_grav_to_c(od: &ODResult) -> (u8, EmpyreanNonGravParams) {
             )
         }
         None => (0, EmpyreanNonGravParams::default()),
+    }
+}
+
+/// Read the fitted orbit's **absolute** SRP slot off an [`ODResult`] and
+/// flatten it for the C ABI. Returns `(0, default)` when the orbit carries no
+/// SRP. The AMRAT variance prefers the fitted **posterior** from the tagged
+/// solved covariance (`amrat_slot`, when AMRAT was solved) over the orbit's
+/// carried-through prior — mirroring how [`od_result_non_grav_to_c`] sources
+/// the Marsden covariance from the 9×9 posterior — so a re-fed orbit chains
+/// the correct Bayesian prior into a follow-on StateAndAMRAT refine.
+fn od_result_srp_to_c(od: &ODResult) -> (u8, EmpyreanSRPParams) {
+    match od.orbit.srp_params(0) {
+        Some(srp) => {
+            let posterior = od
+                .solved_covariance
+                .as_ref()
+                .and_then(|sc| sc.amrat_slot.map(|s| sc.matrix[s][s]));
+            let (has_amrat_variance, amrat_variance) = match posterior.or(srp.amrat_variance) {
+                Some(v) => (1u8, v),
+                None => (0u8, f64::NAN),
+            };
+            (
+                1,
+                EmpyreanSRPParams {
+                    amrat: srp.amrat,
+                    cr: srp.cr,
+                    has_amrat_variance,
+                    amrat_variance,
+                },
+            )
+        }
+        None => (0, EmpyreanSRPParams::default()),
     }
 }
 
@@ -2577,6 +2649,15 @@ pub(crate) fn empyrean_orbit_to_orbits(
     // single-orbit paths never silently discard thrust arcs + corrections.
     if let Some(tp) = crate::propagate::empyrean_orbit_thrust_params(orbit)? {
         out.set_thrust_params(0, Some(tp));
+    }
+    // Carry the caller's SRP slot onto the orbit so refine / evaluate never
+    // silently drop the AMRAT prior. `srp_amrat_variance` (finite, > 0) is the
+    // trigger + Bayesian prior that opens the AMRAT column in a StateAndAMRAT /
+    // StateAndNonGravAndAMRAT fit; without this the AMRAT solve errors loudly
+    // upstream (SRPParamsMissing / AMRATPriorMissing) rather than fitting a
+    // gravity-only orbit.
+    if let Some(srp) = crate::propagate::empyrean_orbit_srp_params(orbit)? {
+        out.set_srp_params(0, Some(srp));
     }
     Ok(out)
 }
@@ -3759,6 +3840,10 @@ mod tests {
             n_dv_corrections: 0,
             correction_covariances: std::ptr::null(),
             n_correction_covariances: 0,
+            has_srp: 0,
+            srp_amrat: 0.0,
+            srp_cr: 0.0,
+            srp_amrat_variance: f64::NAN,
         }
     }
 
@@ -3788,16 +3873,13 @@ mod tests {
 
         // The model must be Marsden-Sekanina with the inverse-square g(r)
         // (α=1, r0=1, m=2, n=0, k=0) selected by the all-zero g-fields.
-        match &ng.model {
-            NonGravModel::MarsdenSekanina(g) => {
-                assert_eq!(g.alpha, 1.0, "inverse-square α");
-                assert_eq!(g.r0, 1.0, "inverse-square r0");
-                assert_eq!(g.m, 2.0, "inverse-square m");
-                assert_eq!(g.n, 0.0, "inverse-square n");
-                assert_eq!(g.k, 0.0, "inverse-square k");
-            }
-            other => panic!("expected MarsdenSekanina(inverse_square), got {other:?}"),
-        }
+        // NonGravModel is Marsden-only in v1.20.0 — irrefutable binding.
+        let NonGravModel::MarsdenSekanina(g) = &ng.model;
+        assert_eq!(g.alpha, 1.0, "inverse-square α");
+        assert_eq!(g.r0, 1.0, "inverse-square r0");
+        assert_eq!(g.m, 2.0, "inverse-square m");
+        assert_eq!(g.n, 0.0, "inverse-square n");
+        assert_eq!(g.k, 0.0, "inverse-square k");
 
         // No thermal-lag delay was requested (NaN input).
         assert!(ng.dt.is_none(), "non_grav_dt=NaN must map to dt=None");
@@ -3911,6 +3993,10 @@ mod tests {
             n_dv_corrections: 0,
             correction_covariances: std::ptr::null(),
             n_correction_covariances: 0,
+            has_srp: 0,
+            srp_amrat: 0.0,
+            srp_cr: 0.0,
+            srp_amrat_variance: f64::NAN,
         }
     }
 

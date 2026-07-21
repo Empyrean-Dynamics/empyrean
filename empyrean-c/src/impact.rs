@@ -175,6 +175,11 @@ fn build_orbits_from_c(
         {
             orbits.set_thrust_params(i, Some(tp));
         }
+        if let Some(srp) = crate::propagate::empyrean_orbit_srp_params(orbit)
+            .map_err(|e| format!("orbit {i}: {e}"))?
+        {
+            orbits.set_srp_params(i, Some(srp));
+        }
     }
     Ok(orbits)
 }

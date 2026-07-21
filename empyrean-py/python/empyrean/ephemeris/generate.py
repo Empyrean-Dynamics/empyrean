@@ -12,6 +12,8 @@ from empyrean._convert import (
     coordinates_to_arrays,
     extract_non_grav_covariance,
     extract_photometry,
+    extract_srp,
+    validate_non_grav_marsden_only,
 )
 
 if TYPE_CHECKING:
@@ -174,6 +176,10 @@ def generate_ephemeris(
 
     # Non-grav parameters
     n = len(orbits)
+    # NonGravParams is Marsden-only; reject a stray model='srp' / cr before
+    # marshaling (SRP rides its own slot, extracted below).
+    validate_non_grav_marsden_only(orbits)
+    has_srp, srp_amrat, srp_cr, srp_amrat_variance = extract_srp(orbits)
     non_grav_dts: np.ndarray | None = None
     non_grav_dt_variances: np.ndarray | None = None
     if orbits.non_grav is not None:
@@ -302,6 +308,10 @@ def generate_ephemeris(
         uncertainty_method=um_int,
         non_grav_dts=non_grav_dts,
         non_grav_dt_variances=non_grav_dt_variances,
+        has_srp=has_srp,
+        srp_amrat=srp_amrat,
+        srp_cr=srp_cr,
+        srp_amrat_variance=srp_amrat_variance,
         has_non_grav_cov=has_non_grav_cov,
         non_grav_cov=non_grav_cov,
         gm_threshold=gm_threshold,

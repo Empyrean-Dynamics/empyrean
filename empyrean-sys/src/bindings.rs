@@ -296,10 +296,18 @@ pub struct EmpyreanOrbit {
     pub correction_covariances: *const [[f64; 3usize]; 3usize],
     #[doc = " Number of entries in\n [`correction_covariances`](Self::correction_covariances)."]
     pub n_correction_covariances: usize,
+    #[doc = " 1 when this orbit carries a solar-radiation-pressure force slot\n (`srp_amrat` + `srp_cr`); 0 otherwise. SRP is **never** value-inferred\n — this explicit switch is the only trigger."]
+    pub has_srp: u8,
+    #[doc = " Area-to-mass ratio AMRAT (m²/kg) — the SRP-effective, fittable\n parameter. Only read when `has_srp == 1`; must be finite and > 0."]
+    pub srp_amrat: f64,
+    #[doc = " Radiation-pressure coefficient Cr. Fixed, never fitted. Only read\n when `has_srp == 1`; must be finite and > 0."]
+    pub srp_cr: f64,
+    #[doc = " Prior variance on AMRAT ((m²/kg)²). NaN or ≤0 = no prior; a finite\n positive value opens + priors the AMRAT column in a StateAndAMRAT /\n StateAndNonGravAndAMRAT fit. Only read when `has_srp == 1`."]
+    pub srp_amrat_variance: f64,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of EmpyreanOrbit"][::std::mem::size_of::<EmpyreanOrbit>() - 616usize];
+    ["Size of EmpyreanOrbit"][::std::mem::size_of::<EmpyreanOrbit>() - 648usize];
     ["Alignment of EmpyreanOrbit"][::std::mem::align_of::<EmpyreanOrbit>() - 8usize];
     ["Offset of field: EmpyreanOrbit::state"]
         [::std::mem::offset_of!(EmpyreanOrbit, state) - 0usize];
@@ -348,6 +356,14 @@ const _: () = {
         [::std::mem::offset_of!(EmpyreanOrbit, correction_covariances) - 600usize];
     ["Offset of field: EmpyreanOrbit::n_correction_covariances"]
         [::std::mem::offset_of!(EmpyreanOrbit, n_correction_covariances) - 608usize];
+    ["Offset of field: EmpyreanOrbit::has_srp"]
+        [::std::mem::offset_of!(EmpyreanOrbit, has_srp) - 616usize];
+    ["Offset of field: EmpyreanOrbit::srp_amrat"]
+        [::std::mem::offset_of!(EmpyreanOrbit, srp_amrat) - 624usize];
+    ["Offset of field: EmpyreanOrbit::srp_cr"]
+        [::std::mem::offset_of!(EmpyreanOrbit, srp_cr) - 632usize];
+    ["Offset of field: EmpyreanOrbit::srp_amrat_variance"]
+        [::std::mem::offset_of!(EmpyreanOrbit, srp_amrat_variance) - 640usize];
 };
 impl Default for EmpyreanOrbit {
     fn default() -> Self {
@@ -2540,6 +2556,31 @@ const _: () = {
     ["Offset of field: EmpyreanResidualSummary::rms_cross_track_arcsec"]
         [::std::mem::offset_of!(EmpyreanResidualSummary, rms_cross_track_arcsec) - 136usize];
 };
+#[doc = " The fitted orbit's absolute solar-radiation-pressure slot, flattened\n for the C ABI. Mirrors the SRP fields the input `EmpyreanOrbit` carries\n so a fitted orbit's SRP force re-feeds off [`EmpyreanODResult::srp`] with\n no loss."]
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct EmpyreanSRPParams {
+    #[doc = " Absolute area-to-mass ratio AMRAT (m²/kg) — the input prior plus any\n fitted correction."]
+    pub amrat: f64,
+    #[doc = " Radiation-pressure coefficient Cr, carried through unchanged."]
+    pub cr: f64,
+    #[doc = " 1 when `amrat_variance` carries a meaningful AMRAT variance; 0 otherwise."]
+    pub has_amrat_variance: u8,
+    #[doc = " AMRAT variance ((m²/kg)²). Only meaningful when `has_amrat_variance = 1`."]
+    pub amrat_variance: f64,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of EmpyreanSRPParams"][::std::mem::size_of::<EmpyreanSRPParams>() - 32usize];
+    ["Alignment of EmpyreanSRPParams"][::std::mem::align_of::<EmpyreanSRPParams>() - 8usize];
+    ["Offset of field: EmpyreanSRPParams::amrat"]
+        [::std::mem::offset_of!(EmpyreanSRPParams, amrat) - 0usize];
+    ["Offset of field: EmpyreanSRPParams::cr"][::std::mem::offset_of!(EmpyreanSRPParams, cr) - 8usize];
+    ["Offset of field: EmpyreanSRPParams::has_amrat_variance"]
+        [::std::mem::offset_of!(EmpyreanSRPParams, has_amrat_variance) - 16usize];
+    ["Offset of field: EmpyreanSRPParams::amrat_variance"]
+        [::std::mem::offset_of!(EmpyreanSRPParams, amrat_variance) - 24usize];
+};
 #[doc = " A complete non-gravitational acceleration model, flattened for the C ABI.\n\n Mirrors the fields the input [`EmpyreanOrbit`] carries, so a fitted orbit's\n non-grav can be read back off [`EmpyreanODResult::non_grav`] and re-applied\n to an `EmpyreanOrbit` with no loss: the radial/transverse/normal\n coefficients (A1/A2/A3, AU/day²), the Marsden–Sekanina g(r) exponents\n (`ng_alpha`..`ng_k`; all-zero = inverse-square default), and the optional\n thermal-lag delay `non_grav_dt` (days, valid only when `has_dt = 1`)."]
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
@@ -2990,10 +3031,14 @@ pub struct EmpyreanODResult {
     pub has_photometry: u8,
     #[doc = " Post-OD photometric solution when photometry was requested + ran.\n Owns its per-band / gate arrays (freed by `empyrean_od_result_free`)."]
     pub photometry: EmpyreanODPhotometryResult,
+    #[doc = " 1 when [`srp`] carries a fitted/carried absolute SRP slot."]
+    pub has_srp: u8,
+    #[doc = " The fitted orbit's absolute SRP slot (AMRAT + Cr + optional AMRAT\n variance). Re-feed this onto the orbit (`has_srp = 1`) so a fitted orbit\n never silently drops its SRP force. Zeroed when `has_srp = 0`."]
+    pub srp: EmpyreanSRPParams,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of EmpyreanODResult"][::std::mem::size_of::<EmpyreanODResult>() - 7480usize];
+    ["Size of EmpyreanODResult"][::std::mem::size_of::<EmpyreanODResult>() - 7520usize];
     ["Alignment of EmpyreanODResult"][::std::mem::align_of::<EmpyreanODResult>() - 8usize];
     ["Offset of field: EmpyreanODResult::orbit"]
         [::std::mem::offset_of!(EmpyreanODResult, orbit) - 0usize];
@@ -3061,6 +3106,10 @@ const _: () = {
         [::std::mem::offset_of!(EmpyreanODResult, has_photometry) - 7252usize];
     ["Offset of field: EmpyreanODResult::photometry"]
         [::std::mem::offset_of!(EmpyreanODResult, photometry) - 7256usize];
+    ["Offset of field: EmpyreanODResult::has_srp"]
+        [::std::mem::offset_of!(EmpyreanODResult, has_srp) - 7480usize];
+    ["Offset of field: EmpyreanODResult::srp"]
+        [::std::mem::offset_of!(EmpyreanODResult, srp) - 7488usize];
 };
 impl Default for EmpyreanODResult {
     fn default() -> Self {

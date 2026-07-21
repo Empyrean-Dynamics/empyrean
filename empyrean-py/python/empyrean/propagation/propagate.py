@@ -18,8 +18,10 @@ from empyrean._convert import (
     coordinates_to_arrays,
     extract_non_grav_covariance,
     extract_photometry,
+    extract_srp,
     int_to_frame,
     naif_to_origin,
+    validate_non_grav_marsden_only,
 )
 from empyrean.coordinates.coordinates import CartesianCoordinates
 from empyrean.coordinates.covariance import (
@@ -263,6 +265,10 @@ def propagate(
 
     # Non-grav parameters
     n = len(orbits)
+    # NonGravParams is Marsden-only; reject a stray model='srp' / cr before
+    # marshaling (SRP rides its own slot, extracted below).
+    validate_non_grav_marsden_only(orbits)
+    has_srp, srp_amrat, srp_cr, srp_amrat_variance = extract_srp(orbits)
     non_grav_dts: np.ndarray | None = None
     non_grav_dt_variances: np.ndarray | None = None
     # g(r) Marsden–Sekanina exponents. Passed only when a non-default g(r)
@@ -435,6 +441,10 @@ def propagate(
         thrust_arcs=thrust_arg,
         non_grav_dts=non_grav_dts,
         non_grav_dt_variances=non_grav_dt_variances,
+        has_srp=has_srp,
+        srp_amrat=srp_amrat,
+        srp_cr=srp_cr,
+        srp_amrat_variance=srp_amrat_variance,
         has_non_grav_cov=has_non_grav_cov,
         non_grav_cov=non_grav_cov,
         ng_alphas=ng_alphas,

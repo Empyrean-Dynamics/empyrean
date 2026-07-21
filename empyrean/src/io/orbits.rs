@@ -204,6 +204,13 @@ fn ffi_orbit_to_owned(o: &empyrean_sys::EmpyreanOrbit) -> Result<Orbit> {
         // Thrust is a caller-owned input side array; the OrbitRow schema
         // doesn't carry it, so orbit reads never reconstruct it.
         thrust: None,
+        // SRP slot carried through from the C EmpyreanOrbit when present.
+        srp: crate::orbit::SrpParams::from_ffi(
+            o.srp_amrat,
+            o.srp_cr,
+            o.has_srp,
+            o.srp_amrat_variance,
+        ),
     })
 }
 

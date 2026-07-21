@@ -872,6 +872,36 @@ struct EmpyreanOrbit {
      * [`correction_covariances`](Self::correction_covariances).
      */
     uintptr_t n_correction_covariances;
+    /**
+     * 1 when this orbit carries a solar-radiation-pressure force slot
+     * (`srp_amrat` + `srp_cr`); 0 otherwise. SRP is **never** value-inferred
+     * — this explicit switch is the only trigger, so a zero-init orbit
+     * carries no SRP even if `srp_amrat` happens to be non-zero, and a
+     * non-zero `srp_amrat` with `has_srp == 0` is a loud argument error
+     * rather than a silent apply. SRP is an additive slot, combinable with
+     * the Marsden A1/A2/A3 non-grav on the same orbit.
+     */
+    uint8_t has_srp;
+    /**
+     * Area-to-mass ratio AMRAT (m²/kg) — the SRP-effective, fittable
+     * parameter (Cr and reflectivity are absorbed into it, per the JPL AMR
+     * convention). Only read when `has_srp == 1`; must be finite and > 0.
+     */
+    double srp_amrat;
+    /**
+     * Radiation-pressure coefficient Cr (typically 1.0–2.0; 1.0 = total
+     * absorption). Fixed, never fitted — only the product Cr·AMRAT enters the
+     * dynamics, so a fitted AMRAT absorbs Cr. Only read when `has_srp == 1`;
+     * must be finite and > 0.
+     */
+    double srp_cr;
+    /**
+     * Prior variance on AMRAT ((m²/kg)²). NaN or ≤0 = no prior (the AMRAT
+     * column stays closed; SRP is applied as a fixed force). A finite
+     * positive value opens + priors the AMRAT column in a StateAndAMRAT /
+     * StateAndNonGravAndAMRAT fit. Only read when `has_srp == 1`.
+     */
+    double srp_amrat_variance;
 };
 
 /**
@@ -3106,6 +3136,41 @@ struct EmpyreanODPhotometryResult {
 };
 
 /**
+ * The fitted orbit's **absolute** solar-radiation-pressure slot, flattened
+ * for the C ABI.
+ *
+ * Mirrors the SRP fields the input [`EmpyreanOrbit`] carries (`srp_amrat`,
+ * `srp_cr`, `srp_amrat_variance`) so a fitted orbit's SRP force can be read
+ * back off [`EmpyreanODResult::srp`] and re-applied to an `EmpyreanOrbit`
+ * (`has_srp = 1`) with no loss — whether the AMRAT was solved (fitted value +
+ * posterior variance) or merely carried through the fit as a fixed force.
+ */
+struct EmpyreanSRPParams {
+    /**
+     * Absolute area-to-mass ratio AMRAT (m²/kg) — the input prior plus any
+     * fitted correction.
+     */
+    double amrat;
+    /**
+     * Radiation-pressure coefficient Cr, carried through unchanged (fixed,
+     * never fitted).
+     */
+    double cr;
+    /**
+     * 1 when `amrat_variance` carries a meaningful AMRAT variance (the fitted
+     * posterior when AMRAT was solved, else the carried-through prior); 0
+     * otherwise.
+     */
+    uint8_t has_amrat_variance;
+    /**
+     * AMRAT variance ((m²/kg)²). Only meaningful when `has_amrat_variance = 1`.
+     * Re-feeding it opens + priors the AMRAT column in a follow-on
+     * StateAndAMRAT / StateAndNonGravAndAMRAT refine.
+     */
+    double amrat_variance;
+};
+
+/**
  * Mirrors scott's [`ODResult`](scott::od::ODResult). Carries the fitted
  * orbit, the 6×6 (or 9×9 when non-grav was solved) formal covariance,
  * the per-observation result array, the summary, the structured
@@ -3254,6 +3319,17 @@ struct EmpyreanODResult {
      * Owns its per-band / gate arrays (freed by `empyrean_od_result_free`).
      */
     struct EmpyreanODPhotometryResult photometry;
+    /**
+     * 1 when [`srp`] carries a fitted/carried absolute SRP slot.
+     */
+    uint8_t has_srp;
+    /**
+     * The fitted orbit's **absolute** SRP slot (AMRAT + Cr + optional AMRAT
+     * variance). Re-feed this onto the orbit (`has_srp = 1`) for propagation /
+     * evaluate / refine so a fitted orbit never silently drops its SRP force.
+     * Zeroed when the orbit carries no SRP (`has_srp = 0`).
+     */
+    struct EmpyreanSRPParams srp;
 };
 
 /**

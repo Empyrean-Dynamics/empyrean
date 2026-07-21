@@ -89,6 +89,7 @@ from empyrean.orbits.orbits import (
     SphericalOrbits,
 )
 from empyrean.orbits.photometry import PhotometricParams
+from empyrean.orbits.srp import SRPParams
 from empyrean.orbits.thrust import (
     ConstantRTN,
     InertialFixed,

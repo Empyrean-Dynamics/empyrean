@@ -18,6 +18,48 @@ pub enum PhaseFunction {
     HG12 = 2,
 }
 
+/// Solar-radiation-pressure force slot: an area-to-mass ratio (the fittable
+/// AMRAT), a fixed radiation-pressure coefficient Cr, and an optional prior
+/// variance that makes AMRAT a fittable parameter. An additive force slot —
+/// combinable with the Marsden non-grav on the same orbit.
+///
+/// Only the product \\(C_r \cdot \text{AMRAT}\\) enters the dynamics, so a
+/// fitted AMRAT absorbs Cr (the JPL AMR convention); Cr is fixed, never fitted.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SrpParams {
+    /// Area-to-mass ratio AMRAT (m²/kg) — the SRP-effective, fittable
+    /// parameter. Must be finite and > 0.
+    pub amrat: f64,
+    /// Radiation-pressure coefficient Cr (typically 1.0–2.0). Fixed, never
+    /// fitted. Must be finite and > 0.
+    pub cr: f64,
+    /// Prior variance on AMRAT ((m²/kg)²). `Some(v)` with `v > 0` opens and
+    /// priors the AMRAT column in a `StateAndAMRAT` / `StateAndNonGravAndAMRAT`
+    /// refine; `None` applies SRP as a fixed force.
+    pub amrat_variance: Option<f64>,
+}
+
+impl SrpParams {
+    /// Reconstruct an SRP slot from a C-ABI orbit's SRP fields (`has_srp` +
+    /// `srp_amrat` / `srp_cr` / `srp_amrat_variance`). `has_srp == 0` ⇒ `None`;
+    /// a finite positive variance ⇒ AMRAT carries a fittable prior, else the
+    /// SRP is a fixed force. Shared by every C→`Orbit` reverse-marshal path.
+    pub(crate) fn from_ffi(amrat: f64, cr: f64, has_srp: u8, amrat_variance: f64) -> Option<Self> {
+        if has_srp == 0 {
+            return None;
+        }
+        Some(Self {
+            amrat,
+            cr,
+            amrat_variance: if amrat_variance.is_finite() && amrat_variance > 0.0 {
+                Some(amrat_variance)
+            } else {
+                None
+            },
+        })
+    }
+}
+
 /// Orbit to propagate: coordinate state plus optional Marsden non-grav
 /// coefficients (A1, A2, A3), a configurable g(r) distance scaling, and
 /// optional photometric parameters.
@@ -100,6 +142,10 @@ pub struct Orbit {
     /// resulting burn-sensitivity segments surface in the propagated
     /// [`TaggedCovariance::thrust_segments`](crate::TaggedCovariance).
     pub thrust: Option<ThrustParams>,
+    /// Solar-radiation-pressure slot. `None` = no SRP. Additive with the
+    /// Marsden non-grav above; a `Some` with `amrat_variance` set opens the
+    /// AMRAT column in a `StateAndAMRAT` / `StateAndNonGravAndAMRAT` refine.
+    pub srp: Option<SrpParams>,
 }
 
 impl Orbit {
@@ -126,6 +172,7 @@ impl Orbit {
             slope1: 0.0,
             slope2: 0.0,
             thrust: None,
+            srp: None,
         }
     }
 
@@ -227,6 +274,31 @@ impl Orbit {
         self
     }
 
+    /// Attach a solar-radiation-pressure slot (a fixed force) with the given
+    /// area-to-mass ratio AMRAT (m²/kg) and radiation coefficient Cr. Combine
+    /// with a Marsden non-grav on the same orbit via [`Orbit::with_nongrav`].
+    /// Make AMRAT fittable with [`Orbit::with_srp_amrat_variance`].
+    pub fn with_srp(mut self, amrat: f64, cr: f64) -> Self {
+        let amrat_variance = self.srp.and_then(|s| s.amrat_variance);
+        self.srp = Some(SrpParams {
+            amrat,
+            cr,
+            amrat_variance,
+        });
+        self
+    }
+
+    /// Make the SRP AMRAT a fittable parameter by attaching a prior variance
+    /// ((m²/kg)²) — the trigger + Bayesian prior that opens the AMRAT column in
+    /// a `StateAndAMRAT` / `StateAndNonGravAndAMRAT` refine. Requires an SRP
+    /// slot first ([`Orbit::with_srp`]); a no-op if none is set.
+    pub fn with_srp_amrat_variance(mut self, v: Option<f64>) -> Self {
+        if let Some(srp) = self.srp.as_mut() {
+            srp.amrat_variance = v;
+        }
+        self
+    }
+
     /// Convert to an FFI struct, returning the C struct alongside a
     /// keepalive bag that owns the heap-allocated identifier strings.
     ///
@@ -325,6 +397,14 @@ impl Orbit {
             n_dv_corrections: dv_corrections.len(),
             correction_covariances: correction_covariances_ptr,
             n_correction_covariances: correction_covariances.len(),
+            // SRP slot. `has_srp` is the explicit switch (SRP is never
+            // value-inferred); the C side reads the amrat/cr/variance only
+            // when it is 1. NaN variance = fixed-force SRP (AMRAT column
+            // closed); finite > 0 opens + priors the AMRAT column.
+            has_srp: u8::from(self.srp.is_some()),
+            srp_amrat: self.srp.map(|s| s.amrat).unwrap_or(0.0),
+            srp_cr: self.srp.map(|s| s.cr).unwrap_or(0.0),
+            srp_amrat_variance: self.srp.and_then(|s| s.amrat_variance).unwrap_or(f64::NAN),
         };
         let keep = OrbitFfiKeep {
             _orbit_id: orbit_id_cstr,
@@ -373,4 +453,85 @@ pub(crate) fn orbits_to_ffi(
         })
         .collect::<crate::error::Result<Vec<_>>>()?;
     Ok((ffi, keep))
+}
+
+#[cfg(test)]
+mod srp_tests {
+    use super::*;
+    use crate::Epoch;
+    use crate::coordinate::{CoordinateState, Frame, Origin};
+
+    fn cartesian_orbit() -> Orbit {
+        Orbit::new(CoordinateState::cartesian(
+            Epoch::from_mjd_tdb(59000.0),
+            [1.0, 0.1, 0.05, -0.005, 0.015, 0.001],
+            Frame::EclipticJ2000,
+            Origin::Sun,
+        ))
+    }
+
+    #[test]
+    fn no_srp_marshals_absent() {
+        let (ffi, _keep) = cartesian_orbit().to_ffi_with_keep().unwrap();
+        assert_eq!(ffi.has_srp, 0);
+        assert!(
+            SrpParams::from_ffi(
+                ffi.srp_amrat,
+                ffi.srp_cr,
+                ffi.has_srp,
+                ffi.srp_amrat_variance
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn fixed_force_srp_round_trips() {
+        let o = cartesian_orbit().with_srp(3.0e-3, 1.2);
+        let (ffi, _keep) = o.to_ffi_with_keep().unwrap();
+        assert_eq!(ffi.has_srp, 1);
+        assert_eq!(ffi.srp_amrat, 3.0e-3);
+        assert_eq!(ffi.srp_cr, 1.2);
+        assert!(ffi.srp_amrat_variance.is_nan()); // no prior ⇒ fixed force
+        let back = SrpParams::from_ffi(
+            ffi.srp_amrat,
+            ffi.srp_cr,
+            ffi.has_srp,
+            ffi.srp_amrat_variance,
+        )
+        .unwrap();
+        assert_eq!(
+            back,
+            SrpParams {
+                amrat: 3.0e-3,
+                cr: 1.2,
+                amrat_variance: None
+            }
+        );
+    }
+
+    #[test]
+    fn fittable_srp_round_trips() {
+        let o = cartesian_orbit()
+            .with_srp(3.0e-3, 1.0)
+            .with_srp_amrat_variance(Some(1.0e-8));
+        let (ffi, _keep) = o.to_ffi_with_keep().unwrap();
+        assert_eq!(ffi.srp_amrat_variance, 1.0e-8);
+        let back = SrpParams::from_ffi(
+            ffi.srp_amrat,
+            ffi.srp_cr,
+            ffi.has_srp,
+            ffi.srp_amrat_variance,
+        )
+        .unwrap();
+        assert_eq!(back.amrat_variance, Some(1.0e-8));
+    }
+
+    #[test]
+    fn amrat_variance_without_srp_is_noop() {
+        // The variance builder requires an SRP slot; without one it's a no-op
+        // (never fabricates a slot).
+        let o = cartesian_orbit().with_srp_amrat_variance(Some(1.0e-8));
+        assert!(o.srp.is_none());
+    }
 }

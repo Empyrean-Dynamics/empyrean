@@ -839,6 +839,10 @@ mod tests {
             n_dv_corrections: 0,
             correction_covariances: std::ptr::null(),
             n_correction_covariances: 0,
+            has_srp: 0,
+            srp_amrat: 0.0,
+            srp_cr: 0.0,
+            srp_amrat_variance: f64::NAN,
         }
     }
 

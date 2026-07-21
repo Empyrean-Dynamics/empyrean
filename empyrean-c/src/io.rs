@@ -230,6 +230,13 @@ fn row_to_orbit(row: &OrbitRow) -> Result<(EmpyreanOrbit, String, Option<String>
         n_dv_corrections: 0,
         correction_covariances: std::ptr::null(),
         n_correction_covariances: 0,
+        // OrbitRow JSON/parquet schema does not carry the SRP slot yet (same
+        // documented limitation as DT / thrust / photometry above); round-trip
+        // restores no SRP. Tracked for a unified lossless-orbit-file follow-up.
+        has_srp: 0,
+        srp_amrat: 0.0,
+        srp_cr: 0.0,
+        srp_amrat_variance: f64::NAN,
     };
     Ok((orbit, row.orbit_id.clone(), row.object_id.clone()))
 }
@@ -421,6 +428,11 @@ pub(crate) fn batch_to_orbits(batch: &EmpyreanOrbitBatch) -> Result<Orbits<AU>, 
         {
             out.set_thrust_params(i, Some(tp));
         }
+        if let Some(srp) = crate::propagate::empyrean_orbit_srp_params(orbit)
+            .map_err(|e| format!("orbit {i}: {e}"))?
+        {
+            out.set_srp_params(i, Some(srp));
+        }
     }
     Ok(out)
 }
@@ -480,6 +492,12 @@ pub(crate) fn orbits_to_batch(orbits: &Orbits<AU>) -> Result<EmpyreanOrbitBatch,
             n_dv_corrections: 0,
             correction_covariances: std::ptr::null(),
             n_correction_covariances: 0,
+            // SRP slot carried from the villeneuve orbit below (parity with
+            // non-grav / photometry), when present.
+            has_srp: 0,
+            srp_amrat: 0.0,
+            srp_cr: 0.0,
+            srp_amrat_variance: f64::NAN,
         };
         if let Some(ph) = orbits.photometric_params(i) {
             orbit.h_mag = ph.h();
@@ -504,6 +522,12 @@ pub(crate) fn orbits_to_batch(orbits: &Orbits<AU>) -> Result<EmpyreanOrbitBatch,
             orbit.ng_m = g.m;
             orbit.ng_n = g.n;
             orbit.ng_k = g.k;
+        }
+        if let Some(srp) = orbits.srp_params(i) {
+            orbit.has_srp = 1;
+            orbit.srp_amrat = srp.amrat;
+            orbit.srp_cr = srp.cr;
+            orbit.srp_amrat_variance = srp.amrat_variance.unwrap_or(f64::NAN);
         }
         unsafe { orbits_ptr.add(i).write(orbit) };
         let id_c =

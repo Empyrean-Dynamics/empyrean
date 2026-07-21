@@ -15,7 +15,7 @@ use empyrean_core::time::Epoch;
 use crate::observers::EmpyreanObserver;
 use crate::propagate::{
     EmpyreanOrbit, EmpyreanPropagationConfig, empyrean_orbit_photometric_params,
-    empyrean_orbit_thrust_params, int_to_force_model,
+    empyrean_orbit_srp_params, empyrean_orbit_thrust_params, int_to_force_model,
 };
 use crate::{EmpyreanContext, set_last_error};
 
@@ -294,6 +294,11 @@ pub(crate) fn build_orbits_for_ephemeris(
         }
         match empyrean_orbit_thrust_params(orbit) {
             Ok(Some(tp)) => orbits.set_thrust_params(i, Some(tp)),
+            Ok(None) => {}
+            Err(e) => return Err(format!("orbit {i}: {e}")),
+        }
+        match empyrean_orbit_srp_params(orbit) {
+            Ok(Some(srp)) => orbits.set_srp_params(i, Some(srp)),
             Ok(None) => {}
             Err(e) => return Err(format!("orbit {i}: {e}")),
         }

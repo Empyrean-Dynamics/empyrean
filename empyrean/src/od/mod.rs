@@ -350,5 +350,16 @@ fn ffi_od_result_orbit(result: &empyrean_sys::EmpyreanODResult) -> crate::error:
             orbit = orbit.with_nongrav_covariance(Some(ng.covariance));
         }
     }
+    // Carry the fitted/absolute SRP slot so a solved AMRAT orbit re-feeds into
+    // propagate / refine without silently dropping its SRP force. When the
+    // AMRAT was solved, `amrat_variance` is the fitted posterior — chaining the
+    // correct prior into a follow-on StateAndAMRAT refine.
+    if result.has_srp != 0 {
+        let srp = &result.srp;
+        orbit = orbit.with_srp(srp.amrat, srp.cr);
+        if srp.has_amrat_variance != 0 {
+            orbit = orbit.with_srp_amrat_variance(Some(srp.amrat_variance));
+        }
+    }
     Ok(orbit)
 }

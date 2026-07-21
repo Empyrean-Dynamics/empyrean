@@ -13,8 +13,10 @@ from empyrean._convert import (
     _COORD_TYPE_MAP,
     AnyOrbits,
     coordinates_to_arrays,
+    extract_srp,
     int_to_frame,
     naif_to_origin,
+    validate_non_grav_marsden_only,
 )
 from empyrean.coordinates.coordinates import CartesianCoordinates
 from empyrean.coordinates.covariance import (
@@ -217,6 +219,10 @@ def _orbits_to_dict(orbits: AnyOrbits) -> dict[str, list[Any] | np.ndarray]:
     # rather than silently gravity-only, and carry the fitted non-grav
     # covariance so a StateAndNonGrav refine keeps its prior.
     n = len(orbits)
+    # NonGravParams is Marsden-only; reject a stray model='srp' / cr before
+    # marshaling (SRP rides its own slot, extracted below).
+    validate_non_grav_marsden_only(orbits)
+    has_srp, srp_amrat, srp_cr, srp_amrat_variance = extract_srp(orbits)
     a1s = np.zeros(n, dtype=np.float64)
     a2s = np.zeros(n, dtype=np.float64)
     a3s = np.zeros(n, dtype=np.float64)
@@ -272,6 +278,10 @@ def _orbits_to_dict(orbits: AnyOrbits) -> dict[str, list[Any] | np.ndarray]:
         "ng_ks": ng_ks,
         "non_grav_dts": non_grav_dts,
         "non_grav_dt_variances": non_grav_dt_variances,
+        "has_srp": has_srp,
+        "srp_amrat": srp_amrat,
+        "srp_cr": srp_cr,
+        "srp_amrat_variance": srp_amrat_variance,
         "has_non_grav_cov": has_non_grav_cov,
         "non_grav_cov": non_grav_cov,
     }
@@ -475,6 +485,21 @@ def _build_cartesian_orbits_single(result: ResultDict, prefix: str = "") -> Cart
             k=[k],
             dt=[dt],
             covariance=[list(ng_cov) if ng_cov is not None else None],
+        )
+
+    # Fitted / carried SRP slot — absolute AMRAT + fixed Cr, and the fitted
+    # AMRAT posterior variance when AMRAT was solved. Independent of the
+    # Marsden non-grav above (a State+AMRAT fit has no A1/A2/A3), so a solved
+    # AMRAT orbit re-feeds its SRP slot into propagate / refine.
+    srp_amrat = result.get(f"{p}srp_amrat")
+    if srp_amrat is not None:
+        from empyrean.orbits.srp import SRPParams
+
+        srp_variance = result.get(f"{p}srp_amrat_variance")
+        orbits_kwargs["srp"] = SRPParams.from_kwargs(
+            amrat=[srp_amrat],
+            cr=[result[f"{p}srp_cr"]],
+            amrat_variance=[srp_variance],
         )
 
     return CartesianOrbits.from_kwargs(validate=True, permit_nulls=False, **orbits_kwargs)
@@ -777,7 +802,7 @@ def _build_solved_covariance(d: ResultDict | None) -> SolvedCovariance | None:
         v = d.get(key)
         return int(v) if v is not None else None
 
-    thrust_slots = [tuple(int(i) for i in s) for s in d.get("thrust_slots", [])]
+    thrust_slots = [(int(s[0]), int(s[1]), int(s[2])) for s in d.get("thrust_slots", [])]
     return SolvedCovariance(
         matrix=matrix,
         width=width,

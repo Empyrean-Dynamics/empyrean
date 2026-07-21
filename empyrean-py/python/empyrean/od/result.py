@@ -57,6 +57,11 @@ class SolveForParams(str, Enum):
     AUTO = "auto"
     """Start with state-only, escalate to 9-param on poor fit. Tuned
     via :class:`AutoEscalationPolicy`."""
+    EXPLICIT = "explicit"
+    """An explicit per-axis solve requested via ``solve_for_flags``
+    (:class:`SolveFor`) — e.g. Marsden + DT, or state + AMRAT. Reported
+    on :attr:`DetermineResult.solve_for_used` when the fit used the
+    explicit flag surface rather than one of the coarse presets above."""
 
 
 class CovarianceRepresentation(str, Enum):

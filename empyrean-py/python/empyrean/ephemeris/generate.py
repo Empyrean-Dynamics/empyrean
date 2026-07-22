@@ -376,7 +376,9 @@ def generate_ephemeris(
     # (mirrors `propagate`'s covariance handling).
     has_cov = np.asarray(result["has_covariance"], dtype=bool)
     sky_cov = (
-        SphericalCovariance.from_matrix(np.asarray(result["covariance"])) if has_cov.any() else None
+        _cov_from_matrix_masked(SphericalCovariance, np.asarray(result["covariance"]), has_cov)
+        if has_cov.any()
+        else None
     )
 
     spherical_kwargs: dict[str, Any] = dict(

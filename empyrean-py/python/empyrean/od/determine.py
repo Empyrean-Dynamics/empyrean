@@ -893,7 +893,7 @@ def _build_photometry_result(d: ResultDict | None) -> PhotometryResult | None:
     )
 
 
-def _build_covariance_trust(d: dict | None) -> CovarianceTrust | None:
+def _build_covariance_trust(d: dict[str, Any] | None) -> CovarianceTrust | None:
     """Assemble a :class:`CovarianceTrust` from the nested trust dict.
 
     ``None`` in → ``None`` out: the binding omits the key entirely when

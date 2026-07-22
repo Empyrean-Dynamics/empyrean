@@ -6,6 +6,7 @@ the observable table plus a per-``(orbit, observer)`` sensitivity container.
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 from typing import Any
@@ -132,17 +133,34 @@ class EphemerisResult:
         Flat per-``(orbit_id, obs_code, epoch)`` sensitivity table —
         observation Jacobians + optional Hessians. ``None`` when no
         input covariance was supplied.
+    warnings : list[str]
+        Non-fatal generation warnings, in engine emission order. Empty
+        when the run had nothing to report. Messages name the affected
+        orbit / observatory / epoch where applicable (e.g.
+        Earth-orientation kernel coverage gaps handled by an analytic
+        fallback, or rows whose sensitivity chain was skipped).
     """
 
     ephemeris: Ephemeris
     sensitivity: ObservationSensitivities | None = None
+    warnings: list[str] = field(default_factory=list)
 
     def to_dir(self, path: str) -> None:
-        """Persist to ``<path>/ephemeris.parquet`` + ``<path>/sensitivity.parquet``."""
+        """Persist to ``<path>/ephemeris.parquet`` +
+        ``<path>/sensitivity.parquet`` (+ ``<path>/warnings.json`` when
+        the run produced warnings)."""
         os.makedirs(path, exist_ok=True)
         self.ephemeris.to_parquet(os.path.join(path, "ephemeris.parquet"))
         if self.sensitivity is not None and len(self.sensitivity) > 0:
             self.sensitivity.to_parquet(os.path.join(path, "sensitivity.parquet"))
+        warn_path = os.path.join(path, "warnings.json")
+        if self.warnings:
+            with open(warn_path, "w") as f:
+                json.dump(self.warnings, f)
+        elif os.path.exists(warn_path):
+            # A clean re-save into a reused directory must not leave a
+            # stale warnings file attributed to the new data.
+            os.remove(warn_path)
 
     @classmethod
     def from_dir(cls, path: str) -> EphemerisResult:
@@ -151,4 +169,10 @@ class EphemerisResult:
         sensitivity = (
             ObservationSensitivities.from_parquet(sens_path) if os.path.exists(sens_path) else None
         )
-        return cls(ephemeris=ephemeris, sensitivity=sensitivity)
+        warn_path = os.path.join(path, "warnings.json")
+        if os.path.exists(warn_path):
+            with open(warn_path) as f:
+                warnings = json.load(f)
+        else:
+            warnings = []
+        return cls(ephemeris=ephemeris, sensitivity=sensitivity, warnings=warnings)

@@ -814,6 +814,64 @@ class PhotometryResult:
     """Per-band statistics."""
     gates: list[GateRecord]
     """Model-ladder gate records."""
+    n_mags_dropped_unconvertible: int
+    """Magnitudes excluded from the fit because their photometric band
+    has no adopted V-band conversion (unknown/unspecified band codes,
+    comet total/nuclear magnitudes). Never silent: each exclusion is
+    counted here and the distinct offending band codes are listed in
+    :attr:`dropped_bands`. The observations' astrometry is
+    unaffected."""
+    dropped_bands: list[str]
+    """Distinct band codes that were dropped, sorted."""
+
+
+@dataclass
+class TrustGateEvent:
+    """The intervening event named by an ``encounter_intervenes``
+    covariance-trust verdict."""
+
+    kind: str
+    """``"close_approach"`` or ``"high_nonlinearity"``."""
+    epoch_mjd_tdb: float
+    """Epoch of the event (MJD TDB)."""
+    body: str | None = None
+    """Name of the approached body (close-approach events only)."""
+    distance_au: float | None = None
+    """Approach distance at the signal (AU; close-approach only)."""
+    nonlinearity: float | None = None
+    """Nonlinearity ratio at the crossing (high-nonlinearity only)."""
+    threshold: float | None = None
+    """Threshold the nonlinearity exceeded (high-nonlinearity only)."""
+
+
+@dataclass
+class CovarianceTrust:
+    """Event-aware trust verdict on the delivered covariance, evaluated
+    over its validity window on the converged orbit.
+
+    ``trusted``: no intervening close approach and a 6-state solve — the
+    linear covariance may be used as delivered. ``encounter_intervenes``:
+    a close approach (or high-nonlinearity crossing) lies inside the
+    window; do not extrapolate the linear covariance across it —
+    escalate to nonlinear uncertainty propagation (second-order when
+    :attr:`second_order_recoverable`, otherwise sampling).
+    ``weakly_determined_high_n``: the fit solved more than the 6-state,
+    so the delivered 6×6 is a marginal of a wider fit (conservative
+    flag). A ``DetermineResult.covariance_trust`` of ``None`` means the
+    call path ran no gate — absence of a verdict is not trust."""
+
+    verdict: str
+    """``"trusted"`` / ``"encounter_intervenes"`` /
+    ``"weakly_determined_high_n"``."""
+    solved_width: int | None = None
+    """Solved-for width of the fit the verdict refers to (absent for
+    ``trusted``)."""
+    second_order_recoverable: bool | None = None
+    """Whether a second-order state-only correction can recover the
+    encounter (``encounter_intervenes`` only)."""
+    event: TrustGateEvent | None = None
+    """The earliest intervening event (``encounter_intervenes``
+    only)."""
 
 
 @dataclass
@@ -871,3 +929,7 @@ class DetermineResult:
     photometry: PhotometryResult | None
     """Post-OD photometric solution when photometry was requested and
     ran. ``None`` otherwise."""
+    covariance_trust: CovarianceTrust | None
+    """Event-aware trust verdict on the delivered covariance. ``None``
+    when the call path ran no trust gate — absence of a verdict is not
+    trust."""

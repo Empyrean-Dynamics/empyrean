@@ -21,6 +21,13 @@ pub const EMPYREAN_KERNEL_PROVENANCE_IN_MEMORY: u32 = 1;
 pub const EMPYREAN_KERNEL_PROVENANCE_BUILT_IN: u32 = 2;
 pub const EMPYREAN_RADAR_KIND_DELAY: u32 = 0;
 pub const EMPYREAN_RADAR_KIND_DOPPLER: u32 = 1;
+pub const EMPYREAN_COVARIANCE_TRUST_NOT_EVALUATED: i32 = 0;
+pub const EMPYREAN_COVARIANCE_TRUST_TRUSTED: i32 = 1;
+pub const EMPYREAN_COVARIANCE_TRUST_ENCOUNTER_INTERVENES: i32 = 2;
+pub const EMPYREAN_COVARIANCE_TRUST_WEAKLY_DETERMINED_HIGH_N: i32 = 3;
+pub const EMPYREAN_TRUST_EVENT_NONE: i32 = 0;
+pub const EMPYREAN_TRUST_EVENT_CLOSE_APPROACH: i32 = 1;
+pub const EMPYREAN_TRUST_EVENT_HIGH_NONLINEARITY: i32 = 2;
 pub const EMPYREAN_REJECTION_ACCEPTED: u32 = 0;
 pub const EMPYREAN_REJECTION_CHI_SQUARED: u32 = 1;
 pub const EMPYREAN_REJECTION_SIGMA_CLIP: u32 = 2;
@@ -55,7 +62,7 @@ pub const EMPYREAN_PHOTOMETRY_MODEL_HONLY: u32 = 1;
 pub const EMPYREAN_PHOTOMETRY_MODEL_HG: u32 = 2;
 pub const EMPYREAN_PHOTOMETRY_MODEL_HG12: u32 = 3;
 pub const EMPYREAN_PHOTOMETRY_MODEL_HG1G2: u32 = 4;
-pub const EMPYREAN_ABI_VERSION: u32 = 1;
+pub const EMPYREAN_ABI_VERSION: u32 = 2;
 pub const EMPYREAN_ORIGIN_POLICY_AUTO: u32 = 0;
 pub const EMPYREAN_ORIGIN_POLICY_EXPLICIT: u32 = 1;
 pub const EMPYREAN_OUTPUT_EPOCH_MID_ARC: u32 = 0;
@@ -884,18 +891,22 @@ impl Default for EmpyreanEvent {
         }
     }
 }
-#[doc = " One Gaussian sub-component of an AGM mixture decomposition.\n\n Mirrors\n [`empyrean_core::propagation::MixtureComponent`]. The mean carries\n the *propagated* sub-Gaussian centroid at the CA epoch (f64 from\n the Jet2 integrator); the covariance is the linearly-mapped\n \\\\(\\Phi \\, \\Sigma_k \\, \\Phi^\\top\\\\) over the same propagation\n segment. A consumer can evaluate\n \\\\(\\sum_k w_k \\\\, \\mathcal{N}(x \\mid \\mu_k, \\Sigma_k)\\\\) directly\n at the CA epoch."]
+#[doc = " One Gaussian sub-component of an AGM mixture decomposition.\n\n Mirrors\n [`empyrean_core::propagation::MixtureComponent`]. The mean carries\n the *propagated* sub-Gaussian centroid at the CA epoch (f64 from\n the Jet2 integrator); the covariance is the linearly-mapped\n \\\\(\\Phi \\, \\Sigma_k \\, \\Phi^\\top\\\\) over the same propagation\n segment. A consumer can evaluate\n \\\\(\\sum_k w_k \\\\, \\mathcal{N}(x \\mid \\mu_k, \\Sigma_k)\\\\) directly\n at the CA epoch.\n\n Each component is basis-tagged: `frame` / `origin` give the\n reference frame and center body its `mean` and `covariance` are\n expressed in, so the mixture is self-describing rather than relying\n on positional alignment with the propagated states."]
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
 pub struct EmpyreanMixtureComponent {
     pub weight: f64,
     pub mean: [f64; 6usize],
     pub covariance: [[f64; 6usize]; 6usize],
+    #[doc = " Reference frame `mean` / `covariance` are expressed in — the\n integration frame of the run. Same integer encoding as\n `EmpyreanPropagatedState.frame` (0 = ICRF, 1 = ecliptic J2000,\n 2 = ITRF93)."]
+    pub frame: i32,
+    #[doc = " Origin (center body) `mean` is expressed relative to, as a NAIF\n id — same encoding as `EmpyreanPropagatedState.origin`\n (e.g. 10 = Sun, 399 = Earth). Matches the propagation origin at\n the split's close-approach epoch, so it can differ between CA\n epochs of the same chain when origin switching occurred."]
+    pub origin: i32,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of EmpyreanMixtureComponent"]
-        [::std::mem::size_of::<EmpyreanMixtureComponent>() - 344usize];
+        [::std::mem::size_of::<EmpyreanMixtureComponent>() - 352usize];
     ["Alignment of EmpyreanMixtureComponent"]
         [::std::mem::align_of::<EmpyreanMixtureComponent>() - 8usize];
     ["Offset of field: EmpyreanMixtureComponent::weight"]
@@ -904,6 +915,10 @@ const _: () = {
         [::std::mem::offset_of!(EmpyreanMixtureComponent, mean) - 8usize];
     ["Offset of field: EmpyreanMixtureComponent::covariance"]
         [::std::mem::offset_of!(EmpyreanMixtureComponent, covariance) - 56usize];
+    ["Offset of field: EmpyreanMixtureComponent::frame"]
+        [::std::mem::offset_of!(EmpyreanMixtureComponent, frame) - 344usize];
+    ["Offset of field: EmpyreanMixtureComponent::origin"]
+        [::std::mem::offset_of!(EmpyreanMixtureComponent, origin) - 348usize];
 };
 #[doc = " Per-orbit AGM mixture decomposition retained by Auto / Mixture.\n\n Mirrors [`empyrean_core::propagation::MixtureChain`] in flat form.\n `ca_epochs_mjd_tdb` and `components_per_epoch` are\n `num_ca_epochs`-length parallel arrays. Components are flattened\n into a single `components` array — for CA index `k`, the slice is\n `components[components_offset[k] .. components_offset[k] +\n components_per_epoch[k]]`. `components_offset[k]` is the\n prefix-sum of `components_per_epoch[0..k]` (so\n `components_offset[0] == 0`).\n\n Only orbits whose AGM splits actually fired carry a chain;\n non-mixture orbits get one entry whose `num_ca_epochs == 0` and\n whose pointers are null."]
 #[repr(C)]
@@ -1119,10 +1134,20 @@ pub struct EmpyreanEphemerisEntry {
     pub sky_rate_deg_day: f64,
     #[doc = " Observer code, null-terminated (4 bytes)."]
     pub obs_code: [u8; 4usize],
+    #[doc = " 1 when `covariance` / `aberrated_state` / `aberrated_covariance`\n below are populated — i.e. the input orbit carried a state\n covariance and the STM/uncertainty path ran; 0 otherwise."]
+    pub has_covariance: u8,
+    #[doc = " 6×6 sky-plane covariance over (rho, RA, Dec, vrho, vRA, vDec) in\n (AU, deg) units, row-major. All-NaN when `has_covariance == 0`."]
+    pub covariance: [[f64; 6usize]; 6usize],
+    #[doc = " Aberrated (light-time corrected) barycentric ICRF Cartesian state\n `[x, y, z, vx, vy, vz]` (AU, AU/day) at the photon-emission epoch\n (`epoch_mjd_tdb - light_time_days`). Populated independently of\n covariance; NaN-filled in the (never-observed-today) case where\n the engine produced no aberrated state for the row."]
+    pub aberrated_state: [f64; 6usize],
+    #[doc = " 1 when `aberrated_covariance` is populated; 0 otherwise."]
+    pub has_aberrated_covariance: u8,
+    #[doc = " 6×6 Cartesian covariance of the aberrated state, row-major.\n All-NaN when `has_aberrated_covariance == 0`."]
+    pub aberrated_covariance: [[f64; 6usize]; 6usize],
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of EmpyreanEphemerisEntry"][::std::mem::size_of::<EmpyreanEphemerisEntry>() - 168usize];
+    ["Size of EmpyreanEphemerisEntry"][::std::mem::size_of::<EmpyreanEphemerisEntry>() - 800usize];
     ["Alignment of EmpyreanEphemerisEntry"]
         [::std::mem::align_of::<EmpyreanEphemerisEntry>() - 8usize];
     ["Offset of field: EmpyreanEphemerisEntry::orbit_id"]
@@ -1167,6 +1192,16 @@ const _: () = {
         [::std::mem::offset_of!(EmpyreanEphemerisEntry, sky_rate_deg_day) - 152usize];
     ["Offset of field: EmpyreanEphemerisEntry::obs_code"]
         [::std::mem::offset_of!(EmpyreanEphemerisEntry, obs_code) - 160usize];
+    ["Offset of field: EmpyreanEphemerisEntry::has_covariance"]
+        [::std::mem::offset_of!(EmpyreanEphemerisEntry, has_covariance) - 164usize];
+    ["Offset of field: EmpyreanEphemerisEntry::covariance"]
+        [::std::mem::offset_of!(EmpyreanEphemerisEntry, covariance) - 168usize];
+    ["Offset of field: EmpyreanEphemerisEntry::aberrated_state"]
+        [::std::mem::offset_of!(EmpyreanEphemerisEntry, aberrated_state) - 456usize];
+    ["Offset of field: EmpyreanEphemerisEntry::has_aberrated_covariance"]
+        [::std::mem::offset_of!(EmpyreanEphemerisEntry, has_aberrated_covariance) - 504usize];
+    ["Offset of field: EmpyreanEphemerisEntry::aberrated_covariance"]
+        [::std::mem::offset_of!(EmpyreanEphemerisEntry, aberrated_covariance) - 512usize];
 };
 impl Default for EmpyreanEphemerisEntry {
     fn default() -> Self {
@@ -1251,10 +1286,14 @@ pub struct EmpyreanEphemerisResult {
     #[doc = " Per-`(orbit, observer, epoch)` sensitivity rows. Null / 0 when no\n STM was traced (e.g. an f64-only path)."]
     pub sensitivity: *mut EmpyreanObservationSensitivity,
     pub num_sensitivity: usize,
+    #[doc = " Non-fatal generation warnings: heap array of `num_warnings`\n NUL-terminated UTF-8 strings. Null when `num_warnings == 0` (a\n clean run). One list per call, not per row; each message names the\n affected orbit id, observatory code, and epoch (MJD TDB) where\n applicable. Freed by `empyrean_ephemeris_result_free`."]
+    pub warnings: *mut *mut ::std::os::raw::c_char,
+    #[doc = " Number of warning strings. 0 when the run had nothing to report."]
+    pub num_warnings: usize,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of EmpyreanEphemerisResult"][::std::mem::size_of::<EmpyreanEphemerisResult>() - 32usize];
+    ["Size of EmpyreanEphemerisResult"][::std::mem::size_of::<EmpyreanEphemerisResult>() - 48usize];
     ["Alignment of EmpyreanEphemerisResult"]
         [::std::mem::align_of::<EmpyreanEphemerisResult>() - 8usize];
     ["Offset of field: EmpyreanEphemerisResult::entries"]
@@ -1265,6 +1304,10 @@ const _: () = {
         [::std::mem::offset_of!(EmpyreanEphemerisResult, sensitivity) - 16usize];
     ["Offset of field: EmpyreanEphemerisResult::num_sensitivity"]
         [::std::mem::offset_of!(EmpyreanEphemerisResult, num_sensitivity) - 24usize];
+    ["Offset of field: EmpyreanEphemerisResult::warnings"]
+        [::std::mem::offset_of!(EmpyreanEphemerisResult, warnings) - 32usize];
+    ["Offset of field: EmpyreanEphemerisResult::num_warnings"]
+        [::std::mem::offset_of!(EmpyreanEphemerisResult, num_warnings) - 40usize];
 };
 impl Default for EmpyreanEphemerisResult {
     fn default() -> Self {
@@ -1411,11 +1454,31 @@ pub struct EmpyreanImpactProbability {
     pub mc_n_samples: u64,
     #[doc = " Number of MC samples that impacted (0 when MC was not used)."]
     pub mc_n_impacts: u64,
+    #[doc = " Geodetic latitude of the closest-approach surface point on the\n body's reference ellipsoid (degrees, north positive). NaN when no\n surface projection is available for this encounter."]
+    pub impact_latitude_deg: f64,
+    #[doc = " Geodetic longitude of the closest-approach surface point\n (degrees, east positive, [-180, 180]). NaN when unavailable."]
+    pub impact_longitude_deg: f64,
+    #[doc = " Altitude of the closest-approach point above the reference\n ellipsoid (km). NaN when unavailable."]
+    pub impact_altitude_km: f64,
+    #[doc = " Half-width of the 95% binomial confidence interval on `ip_mc`.\n The interval is `ip_mc ± mc_confidence_interval`. NaN when the\n producing method was not Monte Carlo."]
+    pub mc_confidence_interval: f64,
+    #[doc = " Second-order corrected mean miss distance (AU). On Monte-Carlo\n rows carries the sample-mean miss distance instead. NaN when the\n producing method computed neither."]
+    pub mean_distance_second_order_au: f64,
+    #[doc = " Second-order corrected 1σ miss-distance uncertainty (AU). NaN\n when the producing method carried no second-order derivatives."]
+    pub sigma_distance_second_order_au: f64,
+    #[doc = " Skewness γ₁ of the miss-distance distribution under the\n second-order expansion (dimensionless). NaN when not computed."]
+    pub skewness: f64,
+    #[doc = " Gradient ∂d/∂x₀ of the closest-approach distance w.r.t. the\n initial Cartesian state. All-zero on Monte-Carlo rows and on\n degenerate zero-miss encounters."]
+    pub gradient: [f64; 6usize],
+    #[doc = " Second derivatives ∂²d/∂x₀ᵢ∂x₀ⱼ of the closest-approach distance\n (6×6 symmetric). Every entry NaN when the producing method carried\n no second-order derivatives."]
+    pub distance_hessian: [[f64; 6usize]; 6usize],
+    #[doc = " Number of mixture components used by the adaptive\n Gaussian-mixture IP refinement. 0 when the refinement did not run\n (matches `ip_agm` = NaN)."]
+    pub agm_components: u64,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of EmpyreanImpactProbability"]
-        [::std::mem::size_of::<EmpyreanImpactProbability>() - 160usize];
+        [::std::mem::size_of::<EmpyreanImpactProbability>() - 560usize];
     ["Alignment of EmpyreanImpactProbability"]
         [::std::mem::align_of::<EmpyreanImpactProbability>() - 8usize];
     ["Offset of field: EmpyreanImpactProbability::method_tag"]
@@ -1458,6 +1521,28 @@ const _: () = {
         [::std::mem::offset_of!(EmpyreanImpactProbability, mc_n_samples) - 144usize];
     ["Offset of field: EmpyreanImpactProbability::mc_n_impacts"]
         [::std::mem::offset_of!(EmpyreanImpactProbability, mc_n_impacts) - 152usize];
+    ["Offset of field: EmpyreanImpactProbability::impact_latitude_deg"]
+        [::std::mem::offset_of!(EmpyreanImpactProbability, impact_latitude_deg) - 160usize];
+    ["Offset of field: EmpyreanImpactProbability::impact_longitude_deg"]
+        [::std::mem::offset_of!(EmpyreanImpactProbability, impact_longitude_deg) - 168usize];
+    ["Offset of field: EmpyreanImpactProbability::impact_altitude_km"]
+        [::std::mem::offset_of!(EmpyreanImpactProbability, impact_altitude_km) - 176usize];
+    ["Offset of field: EmpyreanImpactProbability::mc_confidence_interval"]
+        [::std::mem::offset_of!(EmpyreanImpactProbability, mc_confidence_interval) - 184usize];
+    ["Offset of field: EmpyreanImpactProbability::mean_distance_second_order_au"]
+        [::std::mem::offset_of!(EmpyreanImpactProbability, mean_distance_second_order_au)
+            - 192usize];
+    ["Offset of field: EmpyreanImpactProbability::sigma_distance_second_order_au"]
+        [::std::mem::offset_of!(EmpyreanImpactProbability, sigma_distance_second_order_au)
+            - 200usize];
+    ["Offset of field: EmpyreanImpactProbability::skewness"]
+        [::std::mem::offset_of!(EmpyreanImpactProbability, skewness) - 208usize];
+    ["Offset of field: EmpyreanImpactProbability::gradient"]
+        [::std::mem::offset_of!(EmpyreanImpactProbability, gradient) - 216usize];
+    ["Offset of field: EmpyreanImpactProbability::distance_hessian"]
+        [::std::mem::offset_of!(EmpyreanImpactProbability, distance_hessian) - 264usize];
+    ["Offset of field: EmpyreanImpactProbability::agm_components"]
+        [::std::mem::offset_of!(EmpyreanImpactProbability, agm_components) - 552usize];
 };
 impl Default for EmpyreanImpactProbability {
     fn default() -> Self {
@@ -1674,11 +1759,44 @@ pub struct EmpyreanObservationResult {
     pub cross_track_error_arcsec: f64,
     #[doc = " Position angle of sky motion (degrees, East of North). NaN if unavailable."]
     pub track_position_angle_deg: f64,
+    #[doc = " D-optimality information loss on removal, from the influence
+ pass: logdet(N) − logdet(N − I_i). NaN if no influence pass was
+ run, or if removing this observation makes the normal matrix
+ singular (the observation is indispensable)."]
+    pub influence_information_loss: f64,
+    #[doc = " Off-diagonal covariance of the (along-track, cross-track)
+ residual pair (arcsec²). Symmetric 2×2: the diagonal is
+ `along_track_error_arcsec`² / `cross_track_error_arcsec`².
+ NaN when the AT/CT covariance is unavailable."]
+    pub along_cross_covariance_arcsec2: f64,
+    #[doc = " Radar (delay/Doppler) residual: observed − predicted. Seconds
+ for delay, hertz for Doppler (see `radar_kind`). NaN when
+ `has_radar == 0`."]
+    pub radar_residual: f64,
+    #[doc = " χ² of the radar residual. NaN when `has_radar == 0`."]
+    pub radar_chi2: f64,
+    #[doc = " χ² survival probability of the radar residual. NaN when
+ `has_radar == 0`."]
+    pub radar_probability: f64,
+    #[doc = " Combined observed+predicted radar residual variance (s² for
+ delay, Hz² for Doppler). NaN when unavailable or
+ `has_radar == 0`."]
+    pub radar_variance: f64,
+    #[doc = " Degrees of freedom of the radar residual (1 for radar). 0 when
+ `has_radar == 0`."]
+    pub radar_dof: u32,
+    #[doc = " 1 when this row is a radar observation and the `radar_*` fields
+ are live. The optical RA/Dec residual fields are NaN on radar
+ rows."]
+    pub has_radar: u8,
+    #[doc = " `EMPYREAN_RADAR_KIND_DELAY` (0) or `EMPYREAN_RADAR_KIND_DOPPLER`
+ (1). Only meaningful when `has_radar == 1`."]
+    pub radar_kind: u8,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of EmpyreanObservationResult"]
-        [::std::mem::size_of::<EmpyreanObservationResult>() - 208usize];
+        [::std::mem::size_of::<EmpyreanObservationResult>() - 264usize];
     ["Alignment of EmpyreanObservationResult"]
         [::std::mem::align_of::<EmpyreanObservationResult>() - 8usize];
     ["Offset of field: EmpyreanObservationResult::obs_id"]
@@ -1735,6 +1853,25 @@ const _: () = {
         [::std::mem::offset_of!(EmpyreanObservationResult, cross_track_error_arcsec) - 192usize];
     ["Offset of field: EmpyreanObservationResult::track_position_angle_deg"]
         [::std::mem::offset_of!(EmpyreanObservationResult, track_position_angle_deg) - 200usize];
+    ["Offset of field: EmpyreanObservationResult::influence_information_loss"]
+        [::std::mem::offset_of!(EmpyreanObservationResult, influence_information_loss) - 208usize];
+    ["Offset of field: EmpyreanObservationResult::along_cross_covariance_arcsec2"]
+        [::std::mem::offset_of!(EmpyreanObservationResult, along_cross_covariance_arcsec2)
+            - 216usize];
+    ["Offset of field: EmpyreanObservationResult::radar_residual"]
+        [::std::mem::offset_of!(EmpyreanObservationResult, radar_residual) - 224usize];
+    ["Offset of field: EmpyreanObservationResult::radar_chi2"]
+        [::std::mem::offset_of!(EmpyreanObservationResult, radar_chi2) - 232usize];
+    ["Offset of field: EmpyreanObservationResult::radar_probability"]
+        [::std::mem::offset_of!(EmpyreanObservationResult, radar_probability) - 240usize];
+    ["Offset of field: EmpyreanObservationResult::radar_variance"]
+        [::std::mem::offset_of!(EmpyreanObservationResult, radar_variance) - 248usize];
+    ["Offset of field: EmpyreanObservationResult::radar_dof"]
+        [::std::mem::offset_of!(EmpyreanObservationResult, radar_dof) - 256usize];
+    ["Offset of field: EmpyreanObservationResult::has_radar"]
+        [::std::mem::offset_of!(EmpyreanObservationResult, has_radar) - 260usize];
+    ["Offset of field: EmpyreanObservationResult::radar_kind"]
+        [::std::mem::offset_of!(EmpyreanObservationResult, radar_kind) - 261usize];
 };
 impl Default for EmpyreanObservationResult {
     fn default() -> Self {
@@ -2904,11 +3041,24 @@ pub struct EmpyreanODPhotometryResult {
     #[doc = " Owned model-ladder gate records; freed by [`empyrean_od_result_free`]."]
     pub gates: *mut EmpyreanGateRecord,
     pub num_gates: usize,
+    #[doc = " Magnitudes excluded from the fit because their photometric band
+ has no adopted V-band conversion (unknown/unspecified band
+ codes, comet total/nuclear magnitudes). Never silent: each
+ exclusion is counted here and the distinct offending band codes
+ are listed in `dropped_bands`. The observations' astrometry is
+ unaffected."]
+    pub n_mags_dropped_unconvertible: usize,
+    #[doc = " Distinct band codes that were dropped (owned array of owned C
+ strings, sorted). Freed by `empyrean_od_result_free`. Null when
+ `num_dropped_bands == 0`."]
+    pub dropped_bands: *mut *mut ::std::os::raw::c_char,
+    #[doc = " Number of entries in `dropped_bands` (0 when null)."]
+    pub num_dropped_bands: usize,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of EmpyreanODPhotometryResult"]
-        [::std::mem::size_of::<EmpyreanODPhotometryResult>() - 224usize];
+        [::std::mem::size_of::<EmpyreanODPhotometryResult>() - 248usize];
     ["Alignment of EmpyreanODPhotometryResult"]
         [::std::mem::align_of::<EmpyreanODPhotometryResult>() - 8usize];
     ["Offset of field: EmpyreanODPhotometryResult::h"]
@@ -2957,6 +3107,13 @@ const _: () = {
         [::std::mem::offset_of!(EmpyreanODPhotometryResult, gates) - 208usize];
     ["Offset of field: EmpyreanODPhotometryResult::num_gates"]
         [::std::mem::offset_of!(EmpyreanODPhotometryResult, num_gates) - 216usize];
+    ["Offset of field: EmpyreanODPhotometryResult::n_mags_dropped_unconvertible"]
+        [::std::mem::offset_of!(EmpyreanODPhotometryResult, n_mags_dropped_unconvertible)
+            - 224usize];
+    ["Offset of field: EmpyreanODPhotometryResult::dropped_bands"]
+        [::std::mem::offset_of!(EmpyreanODPhotometryResult, dropped_bands) - 232usize];
+    ["Offset of field: EmpyreanODPhotometryResult::num_dropped_bands"]
+        [::std::mem::offset_of!(EmpyreanODPhotometryResult, num_dropped_bands) - 240usize];
 };
 impl Default for EmpyreanODPhotometryResult {
     fn default() -> Self {
@@ -3035,10 +3192,39 @@ pub struct EmpyreanODResult {
     pub has_srp: u8,
     #[doc = " The fitted orbit's absolute SRP slot (AMRAT + Cr + optional AMRAT\n variance). Re-feed this onto the orbit (`has_srp = 1`) so a fitted orbit\n never silently drops its SRP force. Zeroed when `has_srp = 0`."]
     pub srp: EmpyreanSRPParams,
+    #[doc = " Event-aware trust verdict on the delivered covariance
+ (`EMPYREAN_COVARIANCE_TRUST_*`). `NOT_EVALUATED` (0) means the
+ call path ran no gate — absence of a verdict is not trust."]
+    pub covariance_trust: i32,
+    #[doc = " Intervening-event kind (`EMPYREAN_TRUST_EVENT_*`); `NONE` unless
+ `covariance_trust == ENCOUNTER_INTERVENES`."]
+    pub trust_event_kind: i32,
+    #[doc = " Event epoch (MJD TDB). NaN when no event."]
+    pub trust_event_epoch_mjd_tdb: f64,
+    #[doc = " Close-approach distance (AU). NaN unless
+ `trust_event_kind == CLOSE_APPROACH`."]
+    pub trust_event_distance_au: f64,
+    #[doc = " Nonlinearity ratio at the crossing. NaN unless
+ `trust_event_kind == HIGH_NONLINEARITY`."]
+    pub trust_event_nonlinearity: f64,
+    #[doc = " Threshold the nonlinearity exceeded. NaN unless
+ `trust_event_kind == HIGH_NONLINEARITY`."]
+    pub trust_event_threshold: f64,
+    #[doc = " Name of the approached body (owned C string; freed by
+ `empyrean_od_result_free`). Null unless
+ `trust_event_kind == CLOSE_APPROACH`."]
+    pub trust_event_body: *mut ::std::os::raw::c_char,
+    #[doc = " Solved-for width N of the fit the verdict refers to. 0 when the
+ verdict carries no width (`TRUSTED` / `NOT_EVALUATED`)."]
+    pub trust_solved_width: u32,
+    #[doc = " 1 when a second-order (state-only) correction can recover the
+ encounter (solved width 6); 0 otherwise. Meaningful only for
+ `ENCOUNTER_INTERVENES`."]
+    pub trust_second_order_recoverable: u8,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of EmpyreanODResult"][::std::mem::size_of::<EmpyreanODResult>() - 7520usize];
+    ["Size of EmpyreanODResult"][::std::mem::size_of::<EmpyreanODResult>() - 7600usize];
     ["Alignment of EmpyreanODResult"][::std::mem::align_of::<EmpyreanODResult>() - 8usize];
     ["Offset of field: EmpyreanODResult::orbit"]
         [::std::mem::offset_of!(EmpyreanODResult, orbit) - 0usize];
@@ -3107,9 +3293,27 @@ const _: () = {
     ["Offset of field: EmpyreanODResult::photometry"]
         [::std::mem::offset_of!(EmpyreanODResult, photometry) - 7256usize];
     ["Offset of field: EmpyreanODResult::has_srp"]
-        [::std::mem::offset_of!(EmpyreanODResult, has_srp) - 7480usize];
+        [::std::mem::offset_of!(EmpyreanODResult, has_srp) - 7504usize];
     ["Offset of field: EmpyreanODResult::srp"]
-        [::std::mem::offset_of!(EmpyreanODResult, srp) - 7488usize];
+        [::std::mem::offset_of!(EmpyreanODResult, srp) - 7512usize];
+    ["Offset of field: EmpyreanODResult::covariance_trust"]
+        [::std::mem::offset_of!(EmpyreanODResult, covariance_trust) - 7544usize];
+    ["Offset of field: EmpyreanODResult::trust_event_kind"]
+        [::std::mem::offset_of!(EmpyreanODResult, trust_event_kind) - 7548usize];
+    ["Offset of field: EmpyreanODResult::trust_event_epoch_mjd_tdb"]
+        [::std::mem::offset_of!(EmpyreanODResult, trust_event_epoch_mjd_tdb) - 7552usize];
+    ["Offset of field: EmpyreanODResult::trust_event_distance_au"]
+        [::std::mem::offset_of!(EmpyreanODResult, trust_event_distance_au) - 7560usize];
+    ["Offset of field: EmpyreanODResult::trust_event_nonlinearity"]
+        [::std::mem::offset_of!(EmpyreanODResult, trust_event_nonlinearity) - 7568usize];
+    ["Offset of field: EmpyreanODResult::trust_event_threshold"]
+        [::std::mem::offset_of!(EmpyreanODResult, trust_event_threshold) - 7576usize];
+    ["Offset of field: EmpyreanODResult::trust_event_body"]
+        [::std::mem::offset_of!(EmpyreanODResult, trust_event_body) - 7584usize];
+    ["Offset of field: EmpyreanODResult::trust_solved_width"]
+        [::std::mem::offset_of!(EmpyreanODResult, trust_solved_width) - 7592usize];
+    ["Offset of field: EmpyreanODResult::trust_second_order_recoverable"]
+        [::std::mem::offset_of!(EmpyreanODResult, trust_second_order_recoverable) - 7596usize];
 };
 impl Default for EmpyreanODResult {
     fn default() -> Self {
@@ -3353,6 +3557,30 @@ const _: () = {
     ["Offset of field: EmpyreanCovarianceMetrics::log_det"]
         [::std::mem::offset_of!(EmpyreanCovarianceMetrics, log_det) - 32usize];
 };
+#[doc = " One predicted sky-plane point of the plan's optical ephemeris: the\n target's predicted topocentric right ascension and declination\n (degrees, ICRF) at an optical candidate's epoch (MJD, TDB)."]
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct EmpyreanPlanEphemerisPoint {
+    #[doc = " Epoch — MJD, TDB."]
+    pub epoch_mjd_tdb: f64,
+    #[doc = " Predicted topocentric right ascension (degrees, ICRF)."]
+    pub ra_deg: f64,
+    #[doc = " Predicted topocentric declination (degrees, ICRF)."]
+    pub dec_deg: f64,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of EmpyreanPlanEphemerisPoint"]
+        [::std::mem::size_of::<EmpyreanPlanEphemerisPoint>() - 24usize];
+    ["Alignment of EmpyreanPlanEphemerisPoint"]
+        [::std::mem::align_of::<EmpyreanPlanEphemerisPoint>() - 8usize];
+    ["Offset of field: EmpyreanPlanEphemerisPoint::epoch_mjd_tdb"]
+        [::std::mem::offset_of!(EmpyreanPlanEphemerisPoint, epoch_mjd_tdb) - 0usize];
+    ["Offset of field: EmpyreanPlanEphemerisPoint::ra_deg"]
+        [::std::mem::offset_of!(EmpyreanPlanEphemerisPoint, ra_deg) - 8usize];
+    ["Offset of field: EmpyreanPlanEphemerisPoint::dec_deg"]
+        [::std::mem::offset_of!(EmpyreanPlanEphemerisPoint, dec_deg) - 16usize];
+};
 #[doc = " Per-candidate information-gain analysis."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -3387,10 +3615,20 @@ pub struct EmpyreanPlanCandidate {
     pub cumulative: EmpyreanCovarianceMetrics,
     #[doc = " Active solve-for width (6 = state-only)."]
     pub active_width: usize,
+    #[doc = " Radar only: effective signal-to-noise ratio used for the\n delay/Doppler measurement uncertainty (linear power ratio, not\n dB). Always finite and positive for a radar candidate; NaN for\n an optical candidate."]
+    pub radar_snr: f64,
+    #[doc = " Radar only: one-way topocentric range to the target at the\n receive epoch (km), derived from the predicted round-trip delay.\n NaN for an optical candidate."]
+    pub radar_range_km: f64,
+    #[doc = " Radar only: human-readable notes recording assumptions made\n while deriving the SNR from the link budget. Owned,\n null-terminated UTF-8 strings, freed by\n `empyrean_plan_result_free`. Null/0 when there are no notes."]
+    pub radar_provenance: *mut *mut ::std::os::raw::c_char,
+    #[doc = " Number of entries in `radar_provenance` (0 when null)."]
+    pub num_radar_provenance: usize,
+    #[doc = " Radar only: measurement mode — 0 = delay, 1 = Doppler,\n 2 = both. -1 for an optical candidate."]
+    pub radar_mode: i32,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of EmpyreanPlanCandidate"][::std::mem::size_of::<EmpyreanPlanCandidate>() - 144usize];
+    ["Size of EmpyreanPlanCandidate"][::std::mem::size_of::<EmpyreanPlanCandidate>() - 184usize];
     ["Alignment of EmpyreanPlanCandidate"]
         [::std::mem::align_of::<EmpyreanPlanCandidate>() - 8usize];
     ["Offset of field: EmpyreanPlanCandidate::index"]
@@ -3423,6 +3661,16 @@ const _: () = {
         [::std::mem::offset_of!(EmpyreanPlanCandidate, cumulative) - 96usize];
     ["Offset of field: EmpyreanPlanCandidate::active_width"]
         [::std::mem::offset_of!(EmpyreanPlanCandidate, active_width) - 136usize];
+    ["Offset of field: EmpyreanPlanCandidate::radar_snr"]
+        [::std::mem::offset_of!(EmpyreanPlanCandidate, radar_snr) - 144usize];
+    ["Offset of field: EmpyreanPlanCandidate::radar_range_km"]
+        [::std::mem::offset_of!(EmpyreanPlanCandidate, radar_range_km) - 152usize];
+    ["Offset of field: EmpyreanPlanCandidate::radar_provenance"]
+        [::std::mem::offset_of!(EmpyreanPlanCandidate, radar_provenance) - 160usize];
+    ["Offset of field: EmpyreanPlanCandidate::num_radar_provenance"]
+        [::std::mem::offset_of!(EmpyreanPlanCandidate, num_radar_provenance) - 168usize];
+    ["Offset of field: EmpyreanPlanCandidate::radar_mode"]
+        [::std::mem::offset_of!(EmpyreanPlanCandidate, radar_mode) - 176usize];
 };
 impl Default for EmpyreanPlanCandidate {
     fn default() -> Self {
@@ -3449,10 +3697,14 @@ pub struct EmpyreanPlanResult {
     pub num_candidates: usize,
     #[doc = " Active solve-for width (6 = state-only)."]
     pub active_width: usize,
+    #[doc = " Predicted optical ephemeris, one point per optical candidate in\n chronological order; an optical candidate's `index` field gives\n its row in this array (radar candidates carry no sky-plane\n prediction). Owned; freed by `empyrean_plan_result_free`. Null\n with count 0 for a radar-only plan."]
+    pub ephemeris: *mut EmpyreanPlanEphemerisPoint,
+    #[doc = " Number of entries in `ephemeris` (0 when null)."]
+    pub num_ephemeris: usize,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of EmpyreanPlanResult"][::std::mem::size_of::<EmpyreanPlanResult>() - 112usize];
+    ["Size of EmpyreanPlanResult"][::std::mem::size_of::<EmpyreanPlanResult>() - 128usize];
     ["Alignment of EmpyreanPlanResult"][::std::mem::align_of::<EmpyreanPlanResult>() - 8usize];
     ["Offset of field: EmpyreanPlanResult::orbit_id"]
         [::std::mem::offset_of!(EmpyreanPlanResult, orbit_id) - 0usize];
@@ -3466,6 +3718,10 @@ const _: () = {
         [::std::mem::offset_of!(EmpyreanPlanResult, num_candidates) - 96usize];
     ["Offset of field: EmpyreanPlanResult::active_width"]
         [::std::mem::offset_of!(EmpyreanPlanResult, active_width) - 104usize];
+    ["Offset of field: EmpyreanPlanResult::ephemeris"]
+        [::std::mem::offset_of!(EmpyreanPlanResult, ephemeris) - 112usize];
+    ["Offset of field: EmpyreanPlanResult::num_ephemeris"]
+        [::std::mem::offset_of!(EmpyreanPlanResult, num_ephemeris) - 120usize];
 };
 impl Default for EmpyreanPlanResult {
     fn default() -> Self {

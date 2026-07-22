@@ -140,12 +140,13 @@ pub use math::{MixtureComponent, eigenvector_max_6x6, split_gaussian};
 pub use observers::Observer;
 pub use od::{
     AcceptabilityReport, AcceptabilityThresholds, AutoEscalationPolicy, BandStat,
-    CovarianceRepresentation, DebiasingConfig, DebiasingResolution, DetermineResult,
-    EvaluateResult, GateRecord, IODConfig, ODConfig, Observation, ObservationResidual,
-    Observations, OriginPolicy, OutputEpoch, PhotometryConfig, PhotometryModel, PhotometryResult,
-    RadarMeasurement, RadarObservation, RejectionConfig, RejectionKind, RejectionReason,
-    ResidualSummary, SigmaPolicy, SolveFor, SolveForParams, SolvedCovariance, StationBias,
-    StationRaDecConfig, WeightingConfig, WeightingLayer, WeightingPreset,
+    CovarianceRepresentation, CovarianceTrust, DebiasingConfig, DebiasingResolution,
+    DetermineResult, EvaluateResult, GateRecord, IODConfig, ODConfig, Observation,
+    ObservationResidual, Observations, OriginPolicy, OutputEpoch, PhotometryConfig,
+    PhotometryModel, PhotometryResult, RadarMeasurement, RadarObservation, RadarResidual,
+    RadarResidualKind, RejectionConfig, RejectionKind, RejectionReason, ResidualSummary,
+    SigmaPolicy, SolveFor, SolveForParams, SolvedCovariance, StationBias, StationRaDecConfig,
+    TrustGateEvent, WeightingConfig, WeightingLayer, WeightingPreset,
 };
 pub use orbit::{Orbit, PhaseFunction};
 pub use propagate::{

@@ -43,7 +43,7 @@ in the meantime.
 
 - **Propagation** — N-body (Sun, planets, Moon, Pluto) with EIH general relativity, Sun J2 and Earth J2–J4 zonal harmonics, 16 asteroid perturbers, and the Marsden non-gravitational model — selectable across Approximate / Basic / Standard force-model tiers (Standard is the default). GR15 and DOP853 integrators. Optional finite-burn thrust arcs — constant-RTN, velocity-tangent, or inertial-fixed steering, with per-arc Δv targeting corrections — layer on as a continuous-thrust force input.
 - **Uncertainty** — First-order (Jet1) state transition matrices; second-order (Jet2) state transition tensors; unscented sigma-point and Monte Carlo sampling; an adaptive Auto mode that escalates the method automatically through close approaches and relaxes it elsewhere. Optional per-epoch tagged-covariance readback.
-- **Ephemeris** — RA/Dec, rates, photometry (H–G, H–G₁G₂, H–G₁₂), light time, phase angle, solar elongation, local horizon.
+- **Ephemeris** — RA/Dec, rates, photometry (H–G, H–G₁G₂, H–G₁₂), light time, phase angle, solar elongation, local horizon, and the aberrated (light-time corrected) barycentric state per row — with sky-plane and aberrated-state covariances when the input orbit carries one.
 - **Orbit determination** — Gauss, Herget, and systematic-ranging (admissible region + Manifold of Variations) IOD → N-body differential correction over optical and radar (delay / Doppler) observations, with STM caching and outlier rejection. Solves the state — escalating to the Marsden A1/A2/A3 non-gravitational coefficients on a poor fit — plus, on the refine path, the cometary outgassing time delay DT, SRP area-to-mass, and continuous-thrust Δv corrections, all differentiated analytically, returned in a tagged solved covariance. Optional post-OD H–G photometry fit recovers absolute magnitude H with an honest σ. Validated against `find_orb` and JPL SBDB.
 - **Events** — Close approach (start/end), periapsis, gravitational capture (start/end), shadow entry/exit, atmospheric entry/exit, impact, and possible impact.
 
@@ -80,6 +80,19 @@ print(
     f"{result.summary.rms_dec_arcsec:.2f}\" Dec"
 )
 ```
+
+`result.observations` carries per-observation diagnostics: RA/Dec
+residuals (radar rows instead carry the delay / Doppler residual,
+observed − predicted in seconds / hertz, with its χ², dof, survival
+probability, and combined variance), the along/cross-track
+decomposition with its full 2×2 covariance, and the D-optimality
+information loss on removal (`influence_information_loss` — +inf marks
+an indispensable observation). `result.covariance_trust` is an
+event-aware verdict on the delivered covariance: `trusted`,
+`encounter_intervenes` (naming the intervening close-approach or
+high-nonlinearity event and whether a second-order state-only
+correction can recover it), or `weakly_determined_high_n`. It is
+`None` when no trust gate ran — absence of a verdict is not trust.
 
 ### Wide-parameter fitting
 
@@ -137,7 +150,10 @@ state. In `AUTO` it climbs a model ladder — H-only → HG12 → HG1G2
 (Muinonen et al. 2010) — admitting the richest model the arc's
 phase-angle coverage supports, and reports the model it actually fitted
 on `model_used`. *H* comes back with an honest 1σ from the fit
-covariance.
+covariance. Magnitudes whose band has no adopted V-band conversion are
+never silently used: the report counts them
+(`n_mags_dropped_unconvertible`) and lists the distinct offending band
+codes (`dropped_bands`) — the observations' astrometry is unaffected.
 
 ```python
 from empyrean import ODConfig, PhotometryConfig
@@ -160,7 +176,20 @@ eph = empyrean.generate_ephemeris(orbits, observers)
 print(eph.ephemeris.coordinates.lon.to_numpy())   # RA (degrees)
 print(eph.ephemeris.coordinates.lat.to_numpy())   # Dec (degrees)
 print(eph.ephemeris.mag.to_numpy())               # apparent V magnitude
+
+# Orbits carrying a covariance also get, per row, the 6×6 sky-plane
+# covariance over (rho, RA, Dec + rates) in AU / degree units, and the
+# aberrated (light-time corrected) barycentric ICRF state at the
+# photon-emission epoch with its own 6×6 covariance:
+print(eph.ephemeris.coordinates.covariance.to_matrix().shape)      # (N, 6, 6)
+print(eph.ephemeris.aberrated_state.covariance.to_matrix().shape)  # (N, 6, 6)
 ```
+
+`eph.warnings` lists non-fatal generation warnings — e.g. an
+Earth-orientation kernel coverage gap handled by the analytic IAU 2006
+fallback, or rows whose sensitivity chain was skipped — naming the
+affected orbit / observatory / epoch. Empty when the run had nothing
+to report.
 
 ## Uncertainty
 
@@ -268,6 +297,14 @@ Returns typed `ImpactProbabilities` and `BPlanes` quivr tables — one
 row per (method × orbit × body) encounter, with the closest-approach
 time as an embedded `Epochs` sub-table so `.to_utc()` / `.to_tdb()`
 just works.
+
+Each `ImpactProbabilities` row also carries the geodetic impact point
+(latitude / longitude / altitude on the body's reference ellipsoid;
+null when no surface projection is available), the 95% binomial
+confidence half-width on `ip_mc`, the second-order corrected mean miss
+distance, 1σ miss-distance uncertainty, and skewness, the
+closest-approach distance gradient and 6×6 Hessian with respect to the
+initial state, and the adaptive Gaussian-mixture component count.
 
 ## Data files
 

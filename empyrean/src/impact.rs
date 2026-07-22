@@ -115,6 +115,48 @@ pub struct ImpactProbability {
     pub mc_n_samples: u64,
     /// Of those samples, how many impacted (0 on non-MC rows).
     pub mc_n_impacts: u64,
+    /// Geodetic latitude of the closest-approach surface point on the
+    /// body's reference ellipsoid (degrees, north positive). NaN when no
+    /// surface projection is available for this encounter (no
+    /// body-orientation coverage, unmatched close approach, or the body
+    /// has no registered ellipsoid).
+    pub impact_latitude_deg: f64,
+    /// Geodetic longitude of the closest-approach surface point
+    /// (degrees, east positive, \\([-180, 180]\\)). NaN when unavailable.
+    pub impact_longitude_deg: f64,
+    /// Altitude of the closest-approach point above the reference
+    /// ellipsoid (km). NaN when unavailable.
+    pub impact_altitude_km: f64,
+    /// Half-width of the 95% binomial (normal-approximation) confidence
+    /// interval on `ip_mc`: \\(1.96\sqrt{p(1-p)/n}\\). The interval is
+    /// `ip_mc ± mc_confidence_interval`. NaN on non-MC rows.
+    pub mc_confidence_interval: f64,
+    /// Second-order corrected mean miss distance (AU),
+    /// \\(\mu_d = d_0 + \tfrac{1}{2}\mathrm{Tr}(H_d \Sigma_0)\\). On
+    /// Monte-Carlo rows carries the sample-mean miss distance instead.
+    /// NaN when the producing method computed neither.
+    pub mean_distance_second_order_au: f64,
+    /// Second-order corrected 1σ miss-distance uncertainty (AU). NaN
+    /// when the producing method carried no second-order derivatives.
+    pub sigma_distance_second_order_au: f64,
+    /// Skewness \\(\gamma_1\\) of the miss-distance distribution under
+    /// the second-order expansion (dimensionless). NaN when not
+    /// computed.
+    pub skewness: f64,
+    /// Gradient \\(\partial d / \partial x_0\\) of the closest-approach
+    /// distance with respect to the initial Cartesian state (position
+    /// components dimensionless, velocity components in days). All-zero
+    /// on Monte-Carlo rows and on degenerate zero-miss encounters.
+    pub gradient: [f64; 6],
+    /// Second derivatives \\(\partial^2 d / \partial x_{0i} \partial
+    /// x_{0j}\\) of the closest-approach distance (6×6 symmetric, same
+    /// initial-state units as `gradient`). Every entry NaN when the
+    /// producing method carried no second-order derivatives.
+    pub distance_hessian: [[f64; 6]; 6],
+    /// Number of mixture components used by the adaptive
+    /// Gaussian-mixture IP refinement. 0 when the refinement did not run
+    /// (matches `ip_agm` = NaN).
+    pub agm_components: u64,
 }
 
 /// One B-plane breakdown for a single close approach.
@@ -312,6 +354,16 @@ impl Context {
                     ip_mc: rec.ip_mc,
                     mc_n_samples: rec.mc_n_samples,
                     mc_n_impacts: rec.mc_n_impacts,
+                    impact_latitude_deg: rec.impact_latitude_deg,
+                    impact_longitude_deg: rec.impact_longitude_deg,
+                    impact_altitude_km: rec.impact_altitude_km,
+                    mc_confidence_interval: rec.mc_confidence_interval,
+                    mean_distance_second_order_au: rec.mean_distance_second_order_au,
+                    sigma_distance_second_order_au: rec.sigma_distance_second_order_au,
+                    skewness: rec.skewness,
+                    gradient: rec.gradient,
+                    distance_hessian: rec.distance_hessian,
+                    agm_components: rec.agm_components,
                 });
             }
         }

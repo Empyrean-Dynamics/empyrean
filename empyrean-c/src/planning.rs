@@ -130,10 +130,26 @@ pub struct EmpyreanCovarianceMetrics {
     pub log_det: f64,
 }
 
+/// One predicted sky-plane point of the plan's optical ephemeris: the
+/// target's predicted topocentric right ascension and declination
+/// (degrees, ICRF) at an optical candidate's epoch (MJD, TDB).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct EmpyreanPlanEphemerisPoint {
+    /// Epoch — MJD, TDB.
+    pub epoch_mjd_tdb: f64,
+    /// Predicted topocentric right ascension (degrees, ICRF).
+    pub ra_deg: f64,
+    /// Predicted topocentric declination (degrees, ICRF).
+    pub dec_deg: f64,
+}
+
 /// Per-candidate information-gain analysis.
 #[repr(C)]
 pub struct EmpyreanPlanCandidate {
-    /// Index into the planned-observation list.
+    /// Row in the plan's optical `ephemeris` array for an optical
+    /// candidate; position in the radar sub-sequence for a radar
+    /// candidate.
     pub index: usize,
     /// Observatory / receive-station code (owned; freed by
     /// `empyrean_plan_result_free`).
@@ -164,11 +180,36 @@ pub struct EmpyreanPlanCandidate {
     pub cumulative: EmpyreanCovarianceMetrics,
     /// Active solve-for width (6 = state-only).
     pub active_width: usize,
+    /// Radar only: effective signal-to-noise ratio used for the
+    /// delay/Doppler measurement uncertainty (linear power ratio, not
+    /// dB). Always finite and positive for a radar candidate; NaN for
+    /// an optical candidate.
+    pub radar_snr: f64,
+    /// Radar only: one-way topocentric range to the target at the
+    /// receive epoch (km), derived from the predicted round-trip delay.
+    /// NaN for an optical candidate.
+    pub radar_range_km: f64,
+    /// Radar only: human-readable notes recording assumptions made
+    /// while deriving the SNR from the link budget (for example, a
+    /// diameter derived from the absolute magnitude and visual albedo,
+    /// or coherent integration left uncapped because the spin period is
+    /// unknown). Owned, null-terminated UTF-8 strings, freed by
+    /// `empyrean_plan_result_free`. Null/0 when there are no notes:
+    /// optical candidates, a caller-supplied SNR, or a fully specified
+    /// link budget.
+    pub radar_provenance: *mut *mut c_char,
+    /// Number of entries in `radar_provenance` (0 when null).
+    pub num_radar_provenance: usize,
+    /// Radar only: measurement mode — 0 = delay, 1 = Doppler,
+    /// 2 = both (same encoding as the planned-observation input).
+    /// -1 for an optical candidate.
+    pub radar_mode: i32,
 }
 
 /// Result of a plan evaluation. The caller allocates the struct; the
-/// `orbit_id` string and the `candidates` array (with their `obs_code`
-/// strings) are heap-allocated here and must be released with
+/// `orbit_id` string, the `candidates` array (with their `obs_code`
+/// and `radar_provenance` strings), and the `ephemeris` array are
+/// heap-allocated here and must be released with
 /// [`empyrean_plan_result_free`].
 #[repr(C)]
 pub struct EmpyreanPlanResult {
@@ -184,6 +225,14 @@ pub struct EmpyreanPlanResult {
     pub num_candidates: usize,
     /// Active solve-for width (6 = state-only).
     pub active_width: usize,
+    /// Predicted optical ephemeris, one point per optical candidate in
+    /// chronological order; an optical candidate's `index` field gives
+    /// its row in this array (radar candidates carry no sky-plane
+    /// prediction). Owned; freed by `empyrean_plan_result_free`. Null
+    /// with count 0 for a radar-only plan.
+    pub ephemeris: *mut EmpyreanPlanEphemerisPoint,
+    /// Number of entries in `ephemeris` (0 when null).
+    pub num_ephemeris: usize,
 }
 
 // ── Conversions ─────────────────────────────────────────────────────
@@ -326,9 +375,33 @@ fn owned_cstr(s: &str) -> *mut c_char {
 }
 
 fn candidate_to_c(c: &CandidateInfo) -> EmpyreanPlanCandidate {
-    let kind = match c.kind {
-        CandidateKind::Optical => 0u8,
-        CandidateKind::Radar { .. } => 1u8,
+    // Radar candidates carry the link-budget outputs the fit's
+    // measurement σ was derived from; pass them through verbatim
+    // (provenance notes as owned strings — a C-side code mapping would
+    // silently drop future engine notes).
+    let (kind, radar_snr, radar_range_km, radar_mode, prov) = match &c.kind {
+        CandidateKind::Optical => (0u8, f64::NAN, f64::NAN, -1i32, None),
+        CandidateKind::Radar {
+            mode,
+            snr,
+            range_km,
+            provenance,
+        } => {
+            let mode_int = match mode {
+                RadarMode::Delay => 0i32,
+                RadarMode::Doppler => 1i32,
+                RadarMode::Both => 2i32,
+            };
+            (1u8, *snr, *range_km, mode_int, Some(provenance))
+        }
+    };
+    let (radar_provenance, num_radar_provenance) = match prov {
+        Some(p) if !p.is_empty() => {
+            let v: Vec<*mut c_char> = p.iter().map(|s| owned_cstr(s)).collect();
+            let n = v.len();
+            (Box::into_raw(v.into_boxed_slice()) as *mut *mut c_char, n)
+        }
+        _ => (std::ptr::null_mut(), 0),
     };
     EmpyreanPlanCandidate {
         index: c.index,
@@ -346,6 +419,11 @@ fn candidate_to_c(c: &CandidateInfo) -> EmpyreanPlanCandidate {
         post_cross_track_sigma_arcsec: c.post_cross_track_sigma_arcsec,
         cumulative: metrics_to_c(&c.cumulative),
         active_width: c.active_width,
+        radar_snr,
+        radar_range_km,
+        radar_provenance,
+        num_radar_provenance,
+        radar_mode,
     }
 }
 
@@ -358,6 +436,29 @@ fn plan_result_to_c(plan: &PlanResult, out: *mut EmpyreanPlanResult) {
     } else {
         Box::into_raw(candidates.into_boxed_slice()) as *mut EmpyreanPlanCandidate
     };
+    // Predicted optical ephemeris: one (epoch, RA, Dec) point per
+    // optical candidate, chronological. Absent (radar-only plan) →
+    // null / 0.
+    let eph_points: Vec<EmpyreanPlanEphemerisPoint> = plan
+        .ephemeris
+        .as_ref()
+        .map(|e| {
+            e.coordinates()
+                .iter()
+                .map(|c| EmpyreanPlanEphemerisPoint {
+                    epoch_mjd_tdb: c.t.mjd_tdb(),
+                    ra_deg: c.lon,
+                    dec_deg: c.lat,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let num_ephemeris = eph_points.len();
+    let eph_ptr = if num_ephemeris == 0 {
+        std::ptr::null_mut()
+    } else {
+        Box::into_raw(eph_points.into_boxed_slice()) as *mut EmpyreanPlanEphemerisPoint
+    };
     unsafe {
         (*out).orbit_id = owned_cstr(&plan.orbit_id);
         (*out).prior = metrics_to_c(&plan.prior);
@@ -365,6 +466,8 @@ fn plan_result_to_c(plan: &PlanResult, out: *mut EmpyreanPlanResult) {
         (*out).candidates = cand_ptr;
         (*out).num_candidates = num_candidates;
         (*out).active_width = plan.active_width;
+        (*out).ephemeris = eph_ptr;
+        (*out).num_ephemeris = num_ephemeris;
     }
 }
 
@@ -488,13 +591,34 @@ pub unsafe extern "C" fn empyrean_plan_result_free(result: *mut EmpyreanPlanResu
                 if !c.obs_code.is_null() {
                     drop(unsafe { CString::from_raw(c.obs_code) });
                 }
+                if !c.radar_provenance.is_null() && c.num_radar_provenance > 0 {
+                    let strs = unsafe {
+                        Vec::from_raw_parts(
+                            c.radar_provenance,
+                            c.num_radar_provenance,
+                            c.num_radar_provenance,
+                        )
+                    };
+                    for s in strs {
+                        if !s.is_null() {
+                            drop(unsafe { CString::from_raw(s) });
+                        }
+                    }
+                }
             }
             drop(cands);
+        }
+        if !res.ephemeris.is_null() && res.num_ephemeris > 0 {
+            drop(unsafe {
+                Vec::from_raw_parts(res.ephemeris, res.num_ephemeris, res.num_ephemeris)
+            });
         }
         unsafe {
             (*result).orbit_id = std::ptr::null_mut();
             (*result).candidates = std::ptr::null_mut();
             (*result).num_candidates = 0;
+            (*result).ephemeris = std::ptr::null_mut();
+            (*result).num_ephemeris = 0;
         }
     }));
 }

@@ -33,6 +33,7 @@ from empyrean.od.residuals import (
 )
 from empyrean.od.result import (
     BandStat,
+    CovarianceTrust,
     DetermineResult,
     EvaluateResult,
     GateRecord,
@@ -40,6 +41,7 @@ from empyrean.od.result import (
     PhotometryModel,
     PhotometryResult,
     SolvedCovariance,
+    TrustGateEvent,
 )
 from empyrean.orbits.orbits import CartesianOrbits
 from empyrean.propagation.config import _FORCE_MODEL_TO_INT, ForceModelTier
@@ -341,6 +343,19 @@ def _build_observation_results(result: ResultDict) -> ObservationResults:
         along_track_error=_nullable_float(np.asarray(result["along_track_errors"])),
         cross_track_error=_nullable_float(np.asarray(result["cross_track_errors"])),
         track_position_angle_deg=_nullable_float(np.asarray(result["track_position_angles"])),
+        influence_information_loss=_nullable_float(
+            np.asarray(result["influence_information_losses"])
+        ),
+        along_cross_covariance_arcsec2=_nullable_float(
+            np.asarray(result["along_cross_covariances"])
+        ),
+        # Radar residual block (null on optical rows)
+        radar_kind=list(result["radar_kinds"]),
+        radar_residual=_nullable_float(np.asarray(result["radar_residuals"])),
+        radar_chi2=_nullable_float(np.asarray(result["radar_chi2s"])),
+        radar_dof=result["radar_dofs"],
+        radar_probability=_nullable_float(np.asarray(result["radar_probabilities"])),
+        radar_variance=_nullable_float(np.asarray(result["radar_variances"])),
     )
 
 
@@ -873,6 +888,38 @@ def _build_photometry_result(d: ResultDict | None) -> PhotometryResult | None:
         alpha_span_deg=float(d["alpha_span_deg"]),
         per_band=per_band,
         gates=gates,
+        n_mags_dropped_unconvertible=int(d["n_mags_dropped_unconvertible"]),
+        dropped_bands=list(d["dropped_bands"]),
+    )
+
+
+def _build_covariance_trust(d: dict | None) -> CovarianceTrust | None:
+    """Assemble a :class:`CovarianceTrust` from the nested trust dict.
+
+    ``None`` in → ``None`` out: the binding omits the key entirely when
+    the call path ran no trust gate (absence of a verdict is not
+    trust)."""
+    if d is None:
+        return None
+    event_d = d.get("event")
+    event = (
+        TrustGateEvent(
+            kind=str(event_d["kind"]),
+            epoch_mjd_tdb=float(event_d["epoch_mjd_tdb"]),
+            body=event_d.get("body"),
+            distance_au=event_d.get("distance_au"),
+            nonlinearity=event_d.get("nonlinearity"),
+            threshold=event_d.get("threshold"),
+        )
+        if event_d is not None
+        else None
+    )
+    solved_width = d.get("solved_width")
+    return CovarianceTrust(
+        verdict=str(d["verdict"]),
+        solved_width=int(solved_width) if solved_width is not None else None,
+        second_order_recoverable=d.get("second_order_recoverable"),
+        event=event,
     )
 
 
@@ -935,6 +982,7 @@ def _build_determine_result(result: ResultDict) -> DetermineResult:
     )
     dv_frame = result.get("dv_frame")
     photometry = _build_photometry_result(result.get("photometry"))
+    covariance_trust = _build_covariance_trust(result.get("covariance_trust"))
 
     return DetermineResult(
         orbit=orbit,
@@ -959,4 +1007,5 @@ def _build_determine_result(result: ResultDict) -> DetermineResult:
         thrust_delta_m_per_s=thrust_delta_arr,
         dv_frame=dv_frame,
         photometry=photometry,
+        covariance_trust=covariance_trust,
     )

@@ -48,6 +48,11 @@ fn ephemeris_to_ffi_array(
                 position_angle_deg: e.position_angle_deg,
                 sky_rate_deg_day: e.sky_rate_deg_day,
                 obs_code,
+                has_covariance: u8::from(e.covariance.is_some()),
+                covariance: e.covariance.unwrap_or([[f64::NAN; 6]; 6]),
+                aberrated_state: e.aberrated_state,
+                has_aberrated_covariance: u8::from(e.aberrated_covariance.is_some()),
+                aberrated_covariance: e.aberrated_covariance.unwrap_or([[f64::NAN; 6]; 6]),
             })
         })
         .collect::<Result<Vec<_>>>()?;

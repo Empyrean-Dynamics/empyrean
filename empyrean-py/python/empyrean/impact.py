@@ -150,8 +150,10 @@ class ImpactProbabilities(qv.Table):
     values indicate :attr:`ip_linear` may disagree with sample-based
     estimates."""
     ip_agm = qv.Float64Column(nullable=True)
-    """Reserved; not populated by any uncertainty method exposed in
-    this release."""
+    """Adaptive Gaussian-mixture impact probability. Populated when the
+    requested method enables the AGM refinement (``"auto"``, or an
+    explicit Gaussian-mixture request) AND the encounter's nonlinearity
+    exceeded the mixture threshold; null otherwise."""
     ip_mc = qv.Float64Column(nullable=True)
     """Monte-Carlo impact probability —
     :attr:`mc_n_impacts` / :attr:`mc_n_samples`. Populated only when
@@ -161,6 +163,46 @@ class ImpactProbabilities(qv.Table):
     mc_n_impacts = qv.UInt64Column(nullable=True)
     """Sample count that intersected the effective-radius sphere
     (MC rows only)."""
+    impact_latitude_deg = qv.Float64Column(nullable=True)
+    """Geodetic latitude of the closest-approach surface point on the
+    body's reference ellipsoid (degrees, north positive). Null when no
+    surface projection was available for this encounter (no
+    body-orientation coverage, unmatched close approach, or the body
+    has no registered ellipsoid)."""
+    impact_longitude_deg = qv.Float64Column(nullable=True)
+    """Geodetic longitude of the closest-approach surface point
+    (degrees, east positive, [-180, 180]). Null when unavailable."""
+    impact_altitude_km = qv.Float64Column(nullable=True)
+    """Altitude of the closest-approach point above the reference
+    ellipsoid (km). Null when unavailable."""
+    mc_confidence_interval = qv.Float64Column(nullable=True)
+    """Half-width of the 95% binomial (normal-approximation) confidence
+    interval on :attr:`ip_mc`: the interval is
+    ``ip_mc ± mc_confidence_interval``. Null on non-MC rows."""
+    mean_distance_second_order_au = qv.Float64Column(nullable=True)
+    """Second-order corrected mean miss distance (AU). On Monte-Carlo
+    rows carries the sample-mean miss distance instead. Null when the
+    producing method computed neither."""
+    sigma_distance_second_order_au = qv.Float64Column(nullable=True)
+    """Second-order corrected 1σ miss-distance uncertainty (AU). Null
+    when the producing method carried no second-order derivatives."""
+    skewness = qv.Float64Column(nullable=True)
+    """Skewness γ₁ of the miss-distance distribution under the
+    second-order expansion (dimensionless). Null when not computed."""
+    gradient = qv.LargeListColumn(qv.Float64Column())
+    """Gradient ∂d/∂x₀ of the closest-approach distance with respect to
+    the initial Cartesian state — a length-6 list per row (position
+    components dimensionless, velocity components in days). All-zero on
+    Monte-Carlo rows and on degenerate zero-miss encounters."""
+    distance_hessian = qv.LargeListColumn(qv.Float64Column(), nullable=True)
+    """Second derivatives ∂²d/∂x₀ᵢ∂x₀ⱼ of the closest-approach distance —
+    a length-36 row-major flattened 6×6 symmetric matrix per row (same
+    initial-state units as :attr:`gradient`). Null when the producing
+    method carried no second-order derivatives."""
+    agm_components = qv.UInt64Column(nullable=True)
+    """Number of mixture components used by the adaptive
+    Gaussian-mixture IP refinement. Null when the refinement did not
+    run (matches :attr:`ip_agm` null)."""
 
 
 class BPlanes(qv.Table):
@@ -419,6 +461,20 @@ def _zero_to_null(arr: npt.NDArray[np.uint64]) -> pa.Array:
     return pa.array(arr, mask=mask)
 
 
+def _matrix_rows_to_null(arr: FloatArray) -> pa.Array:
+    """(n, 6, 6) float array -> nullable large_list<float64> of
+    length-36 row-major rows; a row is null when every entry is NaN
+    (the FFI absent sentinel)."""
+    if arr.shape[0] == 0:
+        return pa.array([], type=pa.large_list(pa.float64()))
+    flat = arr.reshape(arr.shape[0], -1)
+    mask = np.isnan(flat).all(axis=1)
+    return pa.array(
+        [None if m else row.tolist() for m, row in zip(mask, flat, strict=True)],
+        type=pa.large_list(pa.float64()),
+    )
+
+
 # ── Public API ────────────────────────────────────────────────
 
 
@@ -565,6 +621,16 @@ def compute_impact_probabilities(
         ip_mc=_nan_to_null(out["ip_mc"]),
         mc_n_samples=_zero_to_null(out["mc_n_samples"]),
         mc_n_impacts=_zero_to_null(out["mc_n_impacts"]),
+        impact_latitude_deg=_nan_to_null(out["impact_latitude_deg"]),
+        impact_longitude_deg=_nan_to_null(out["impact_longitude_deg"]),
+        impact_altitude_km=_nan_to_null(out["impact_altitude_km"]),
+        mc_confidence_interval=_nan_to_null(out["mc_confidence_interval"]),
+        mean_distance_second_order_au=_nan_to_null(out["mean_distance_second_order_au"]),
+        sigma_distance_second_order_au=_nan_to_null(out["sigma_distance_second_order_au"]),
+        skewness=_nan_to_null(out["skewness"]),
+        gradient=np.asarray(out["gradient"]).tolist(),
+        distance_hessian=_matrix_rows_to_null(np.asarray(out["distance_hessian"])),
+        agm_components=_zero_to_null(out["agm_components"]),
     )
 
 

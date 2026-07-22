@@ -1847,6 +1847,16 @@ fn _compute_impact_probabilities<'py>(
     let mut out_ip_mc = Array1::<f64>::from_elem(n, f64::NAN);
     let mut out_mc_n = Array1::<u64>::zeros(n);
     let mut out_mc_imp = Array1::<u64>::zeros(n);
+    let mut out_impact_lat = Array1::<f64>::from_elem(n, f64::NAN);
+    let mut out_impact_lon = Array1::<f64>::from_elem(n, f64::NAN);
+    let mut out_impact_alt = Array1::<f64>::from_elem(n, f64::NAN);
+    let mut out_mc_ci = Array1::<f64>::from_elem(n, f64::NAN);
+    let mut out_mean_d2 = Array1::<f64>::from_elem(n, f64::NAN);
+    let mut out_sigma_d2 = Array1::<f64>::from_elem(n, f64::NAN);
+    let mut out_skew = Array1::<f64>::from_elem(n, f64::NAN);
+    let mut out_gradient = Array2::<f64>::zeros((n, 6));
+    let mut out_hessian = Array3::<f64>::from_elem((n, 6, 6), f64::NAN);
+    let mut out_agm_n = Array1::<u64>::zeros(n);
     for (i, r) in records.iter().enumerate() {
         out_method[i] = match &r.method {
             empyrean::UncertaintyMethod::FirstOrder => 0,
@@ -1877,6 +1887,20 @@ fn _compute_impact_probabilities<'py>(
         out_ip_mc[i] = r.ip_mc;
         out_mc_n[i] = r.mc_n_samples;
         out_mc_imp[i] = r.mc_n_impacts;
+        out_impact_lat[i] = r.impact_latitude_deg;
+        out_impact_lon[i] = r.impact_longitude_deg;
+        out_impact_alt[i] = r.impact_altitude_km;
+        out_mc_ci[i] = r.mc_confidence_interval;
+        out_mean_d2[i] = r.mean_distance_second_order_au;
+        out_sigma_d2[i] = r.sigma_distance_second_order_au;
+        out_skew[i] = r.skewness;
+        for j in 0..6 {
+            out_gradient[[i, j]] = r.gradient[j];
+            for k in 0..6 {
+                out_hessian[[i, j, k]] = r.distance_hessian[j][k];
+            }
+        }
+        out_agm_n[i] = r.agm_components;
     }
 
     let dict = PyDict::new(py);
@@ -1900,6 +1924,25 @@ fn _compute_impact_probabilities<'py>(
     dict.set_item("ip_mc", out_ip_mc.into_pyarray(py))?;
     dict.set_item("mc_n_samples", out_mc_n.into_pyarray(py))?;
     dict.set_item("mc_n_impacts", out_mc_imp.into_pyarray(py))?;
+    dict.set_item("impact_latitude_deg", out_impact_lat.into_pyarray(py))?;
+    dict.set_item("impact_longitude_deg", out_impact_lon.into_pyarray(py))?;
+    dict.set_item("impact_altitude_km", out_impact_alt.into_pyarray(py))?;
+    dict.set_item("mc_confidence_interval", out_mc_ci.into_pyarray(py))?;
+    dict.set_item(
+        "mean_distance_second_order_au",
+        out_mean_d2.into_pyarray(py),
+    )?;
+    dict.set_item(
+        "sigma_distance_second_order_au",
+        out_sigma_d2.into_pyarray(py),
+    )?;
+    dict.set_item("skewness", out_skew.into_pyarray(py))?;
+    dict.set_item("gradient", PyArray2::from_owned_array(py, out_gradient))?;
+    dict.set_item(
+        "distance_hessian",
+        PyArray3::from_owned_array(py, out_hessian),
+    )?;
+    dict.set_item("agm_components", out_agm_n.into_pyarray(py))?;
     Ok(dict)
 }
 
@@ -2487,6 +2530,14 @@ fn _generate_ephemeris<'py>(
     let mut out_position_angle = Array1::<f64>::zeros(m);
     let mut out_sky_rate = Array1::<f64>::zeros(m);
     let mut out_obs_codes_v: Vec<String> = Vec::with_capacity(m);
+    // Sky-plane covariance + aberrated state/covariance:
+    // NaN-filled rows where absent, with explicit per-row presence flags —
+    // same contract as `_propagate`'s covariances/has_covariance pair.
+    let mut out_covariance = Array3::<f64>::from_elem((m, 6, 6), f64::NAN);
+    let mut out_has_cov: Vec<bool> = Vec::with_capacity(m);
+    let mut out_aberrated_state = Array2::<f64>::from_elem((m, 6), f64::NAN);
+    let mut out_aberrated_cov = Array3::<f64>::from_elem((m, 6, 6), f64::NAN);
+    let mut out_has_aberrated_cov: Vec<bool> = Vec::with_capacity(m);
 
     // Same mechanism as in `_propagate`'s events output: the C ABI
     // fabricates per-entry `orbit_id` as `"orbit_{i}"` because
@@ -2524,6 +2575,25 @@ fn _generate_ephemeris<'py>(
         out_position_angle[i] = e.position_angle_deg;
         out_sky_rate[i] = e.sky_rate_deg_day;
         out_obs_codes_v.push(e.obs_code.clone());
+        if let Some(cov) = &e.covariance {
+            for r in 0..6 {
+                for c in 0..6 {
+                    out_covariance[[i, r, c]] = cov[r][c];
+                }
+            }
+        }
+        out_has_cov.push(e.covariance.is_some());
+        for k in 0..6 {
+            out_aberrated_state[[i, k]] = e.aberrated_state[k];
+        }
+        if let Some(cov) = &e.aberrated_covariance {
+            for r in 0..6 {
+                for c in 0..6 {
+                    out_aberrated_cov[[i, r, c]] = cov[r][c];
+                }
+            }
+        }
+        out_has_aberrated_cov.push(e.aberrated_covariance.is_some());
     }
 
     let dict = PyDict::new(py);
@@ -2561,6 +2631,17 @@ fn _generate_ephemeris<'py>(
     )?;
     dict.set_item("sky_rate", PyArray1::from_owned_array(py, out_sky_rate))?;
     dict.set_item("obs_code", out_obs_codes_v)?;
+    dict.set_item("covariance", PyArray3::from_owned_array(py, out_covariance))?;
+    dict.set_item("has_covariance", out_has_cov)?;
+    dict.set_item(
+        "aberrated_state",
+        PyArray2::from_owned_array(py, out_aberrated_state),
+    )?;
+    dict.set_item(
+        "aberrated_covariance",
+        PyArray3::from_owned_array(py, out_aberrated_cov),
+    )?;
+    dict.set_item("has_aberrated_covariance", out_has_aberrated_cov)?;
 
     // ── Observation sensitivities — one row per
     // (orbit, observer, epoch). jacobian/hessian are row-major-flattened
@@ -2591,6 +2672,9 @@ fn _generate_ephemeris<'py>(
     dict.set_item("sensitivity_n_params", s_n_params)?;
     dict.set_item("sensitivity_jacobian", s_jacobian)?;
     dict.set_item("sensitivity_hessian", s_hessian)?;
+
+    // Run-level generation warnings, engine emission order (list[str]).
+    dict.set_item("warnings", eph_result.warnings.clone())?;
 
     Ok(dict)
 }
@@ -3214,6 +3298,15 @@ fn add_residuals_to_dict(
     let mut along_track_errors = Vec::with_capacity(n);
     let mut cross_track_errors = Vec::with_capacity(n);
     let mut track_position_angles = Vec::with_capacity(n);
+    let mut influence_information_losses = Vec::with_capacity(n);
+    let mut along_cross_covariances = Vec::with_capacity(n);
+    // Radar residual block (None on optical rows)
+    let mut radar_kinds: Vec<Option<&'static str>> = Vec::with_capacity(n);
+    let mut radar_residuals = Vec::with_capacity(n);
+    let mut radar_chi2s = Vec::with_capacity(n);
+    let mut radar_dofs: Vec<Option<u32>> = Vec::with_capacity(n);
+    let mut radar_probabilities = Vec::with_capacity(n);
+    let mut radar_variances = Vec::with_capacity(n);
 
     for r in residuals {
         obs_ids.push(r.obs_id.clone());
@@ -3242,6 +3335,22 @@ fn add_residuals_to_dict(
         along_track_errors.push(r.along_track_error_arcsec);
         cross_track_errors.push(r.cross_track_error_arcsec);
         track_position_angles.push(r.track_position_angle_deg);
+        influence_information_losses.push(r.influence_information_loss);
+        along_cross_covariances.push(r.along_cross_covariance_arcsec2);
+        radar_kinds.push(r.radar.as_ref().map(|x| match x.kind {
+            empyrean::RadarResidualKind::Delay => "delay",
+            empyrean::RadarResidualKind::Doppler => "doppler",
+        }));
+        radar_residuals.push(r.radar.as_ref().map(|x| x.residual).unwrap_or(f64::NAN));
+        radar_chi2s.push(r.radar.as_ref().map(|x| x.chi2).unwrap_or(f64::NAN));
+        radar_dofs.push(r.radar.as_ref().map(|x| x.dof));
+        radar_probabilities.push(r.radar.as_ref().map(|x| x.probability).unwrap_or(f64::NAN));
+        radar_variances.push(
+            r.radar
+                .as_ref()
+                .and_then(|x| x.variance)
+                .unwrap_or(f64::NAN),
+        );
     }
 
     dict.set_item("obs_ids", obs_ids)?;
@@ -3300,6 +3409,23 @@ fn add_residuals_to_dict(
         "track_position_angles",
         PyArray1::from_vec(py, track_position_angles),
     )?;
+    dict.set_item(
+        "influence_information_losses",
+        PyArray1::from_vec(py, influence_information_losses),
+    )?;
+    dict.set_item(
+        "along_cross_covariances",
+        PyArray1::from_vec(py, along_cross_covariances),
+    )?;
+    dict.set_item("radar_kinds", radar_kinds)?;
+    dict.set_item("radar_residuals", PyArray1::from_vec(py, radar_residuals))?;
+    dict.set_item("radar_chi2s", PyArray1::from_vec(py, radar_chi2s))?;
+    dict.set_item("radar_dofs", radar_dofs)?;
+    dict.set_item(
+        "radar_probabilities",
+        PyArray1::from_vec(py, radar_probabilities),
+    )?;
+    dict.set_item("radar_variances", PyArray1::from_vec(py, radar_variances))?;
     Ok(())
 }
 
@@ -5088,6 +5214,12 @@ fn pydict_to_ephemeris(dict: &Bound<'_, PyDict>) -> PyResult<Vec<empyrean::Ephem
             position_angle_deg: position_angle[i],
             sky_rate_deg_day: sky_rate[i],
             obs_code: obs_codes[i].clone(),
+            // The ephemeris file writers (parquet/JSON/CSV) don't carry
+            // covariance columns — these fields exist for the in-memory
+            // FFI result path, not the file-I/O schema.
+            covariance: None,
+            aberrated_state: [f64::NAN; 6],
+            aberrated_covariance: None,
         });
     }
     Ok(out)
@@ -5341,6 +5473,9 @@ fn pydict_to_residuals(dict: &Bound<'_, PyDict>) -> PyResult<Vec<empyrean::Obser
             along_track_error_arcsec: f64::NAN,
             cross_track_error_arcsec: f64::NAN,
             track_position_angle_deg: f64::NAN,
+            influence_information_loss: f64::NAN,
+            along_cross_covariance_arcsec2: f64::NAN,
+            radar: None,
         });
     }
     Ok(out)
@@ -5771,6 +5906,11 @@ fn photometry_to_dict<'py>(
     d.set_item("alpha_min_deg", p.alpha_min_deg)?;
     d.set_item("alpha_max_deg", p.alpha_max_deg)?;
     d.set_item("alpha_span_deg", p.alpha_span_deg)?;
+    d.set_item(
+        "n_mags_dropped_unconvertible",
+        p.n_mags_dropped_unconvertible,
+    )?;
+    d.set_item("dropped_bands", p.dropped_bands.clone())?;
     // Per-band statistics (struct-of-arrays).
     let bands: Vec<String> = p.per_band.iter().map(|b| b.band.clone()).collect();
     let band_n: Vec<usize> = p.per_band.iter().map(|b| b.n).collect();
@@ -5976,6 +6116,54 @@ fn determine_result_to_pydict<'py>(
     }
     if let Some(p) = &result.photometry {
         dict.set_item("photometry", photometry_to_dict(py, p)?)?;
+    }
+    // Covariance-trust verdict — key omitted entirely when the call path
+    // ran no trust gate (absence of a verdict is not trust).
+    if let Some(trust) = &result.covariance_trust {
+        let t = PyDict::new(py);
+        match trust {
+            empyrean::CovarianceTrust::Trusted => {
+                t.set_item("verdict", "trusted")?;
+            }
+            empyrean::CovarianceTrust::EncounterIntervenes {
+                event,
+                solved_width,
+                second_order_recoverable,
+            } => {
+                t.set_item("verdict", "encounter_intervenes")?;
+                t.set_item("solved_width", *solved_width)?;
+                t.set_item("second_order_recoverable", *second_order_recoverable)?;
+                let e = PyDict::new(py);
+                match event {
+                    empyrean::TrustGateEvent::CloseApproach {
+                        body,
+                        epoch,
+                        distance_au,
+                    } => {
+                        e.set_item("kind", "close_approach")?;
+                        e.set_item("body", body)?;
+                        e.set_item("epoch_mjd_tdb", epoch.mjd_tdb().map_err(to_pyerr)?)?;
+                        e.set_item("distance_au", *distance_au)?;
+                    }
+                    empyrean::TrustGateEvent::HighNonlinearity {
+                        epoch,
+                        nonlinearity,
+                        threshold,
+                    } => {
+                        e.set_item("kind", "high_nonlinearity")?;
+                        e.set_item("epoch_mjd_tdb", epoch.mjd_tdb().map_err(to_pyerr)?)?;
+                        e.set_item("nonlinearity", *nonlinearity)?;
+                        e.set_item("threshold", *threshold)?;
+                    }
+                }
+                t.set_item("event", e)?;
+            }
+            empyrean::CovarianceTrust::WeaklyDeterminedHighN { solved_width } => {
+                t.set_item("verdict", "weakly_determined_high_n")?;
+                t.set_item("solved_width", *solved_width)?;
+            }
+        }
+        dict.set_item("covariance_trust", t)?;
     }
 
     Ok(dict)

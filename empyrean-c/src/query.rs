@@ -205,6 +205,8 @@ pub unsafe extern "C" fn empyrean_query_horizons(
             unsafe {
                 (*out).entries = std::ptr::null_mut();
                 (*out).num_entries = 0;
+                (*out).warnings = std::ptr::null_mut();
+                (*out).num_warnings = 0;
             }
             return 0;
         }
@@ -250,12 +252,23 @@ pub unsafe extern "C" fn empyrean_query_horizons(
                 position_angle_deg: f64::NAN,
                 sky_rate_deg_day: f64::NAN,
                 obs_code: obs_code_bytes,
+                // The Horizons observer-table record carries no sky
+                // covariance or aberrated state — honestly absent here.
+                has_covariance: 0,
+                covariance: [[f64::NAN; 6]; 6],
+                aberrated_state: [f64::NAN; 6],
+                has_aberrated_covariance: 0,
+                aberrated_covariance: [[f64::NAN; 6]; 6],
             };
             unsafe { ptr.add(i).write(entry) };
         }
         unsafe {
             (*out).entries = ptr;
             (*out).num_entries = n;
+            // Horizons observer-table records carry no generation
+            // warnings — honestly absent, empty list.
+            (*out).warnings = std::ptr::null_mut();
+            (*out).num_warnings = 0;
         }
         0
     }));

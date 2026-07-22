@@ -84,6 +84,24 @@ fn residuals_to_ffi_array(
                 along_track_error_arcsec: r.along_track_error_arcsec,
                 cross_track_error_arcsec: r.cross_track_error_arcsec,
                 track_position_angle_deg: r.track_position_angle_deg,
+                influence_information_loss: r.influence_information_loss,
+                along_cross_covariance_arcsec2: r.along_cross_covariance_arcsec2,
+                radar_residual: r.radar.as_ref().map(|x| x.residual).unwrap_or(f64::NAN),
+                radar_chi2: r.radar.as_ref().map(|x| x.chi2).unwrap_or(f64::NAN),
+                radar_probability: r.radar.as_ref().map(|x| x.probability).unwrap_or(f64::NAN),
+                radar_variance: r
+                    .radar
+                    .as_ref()
+                    .and_then(|x| x.variance)
+                    .unwrap_or(f64::NAN),
+                radar_dof: r.radar.as_ref().map(|x| x.dof).unwrap_or(0),
+                has_radar: u8::from(r.radar.is_some()),
+                radar_kind: match r.radar.as_ref().map(|x| x.kind) {
+                    Some(crate::od::RadarResidualKind::Doppler) => {
+                        empyrean_sys::EMPYREAN_RADAR_KIND_DOPPLER as u8
+                    }
+                    _ => empyrean_sys::EMPYREAN_RADAR_KIND_DELAY as u8,
+                },
             })
         })
         .collect()

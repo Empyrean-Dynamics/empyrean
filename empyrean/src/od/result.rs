@@ -125,6 +125,46 @@ pub struct ObservationResidual {
     pub cross_track_error_arcsec: f64,
     /// Position angle of sky motion (deg, East of North). NaN if unavailable.
     pub track_position_angle_deg: f64,
+    /// D-optimality information loss on removal, from the influence
+    /// pass: \\(\Delta_i = \log\det N - \log\det(N - I_i)\\). NaN if
+    /// no influence pass was run; +∞ when removing this observation
+    /// makes the normal matrix singular (the observation is
+    /// indispensable).
+    pub influence_information_loss: f64,
+    /// Off-diagonal covariance of the (along-track, cross-track)
+    /// residual pair (arcsec²). Together with the AT/CT 1σ fields this
+    /// reconstructs the full symmetric 2×2. NaN when unavailable.
+    pub along_cross_covariance_arcsec2: f64,
+    /// Radar (delay/Doppler) residual block. `None` for optical
+    /// observations; on radar rows the optical RA/Dec residual fields
+    /// are NaN.
+    pub radar: Option<RadarResidual>,
+}
+
+/// Which radar observable a [`RadarResidual`] refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RadarResidualKind {
+    /// Round-trip delay (seconds).
+    Delay,
+    /// Two-way Doppler shift (hertz).
+    Doppler,
+}
+
+/// Radar residual block on an [`ObservationResidual`] row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RadarResidual {
+    /// Which observable the residual refers to (sets the units).
+    pub kind: RadarResidualKind,
+    /// Observed − predicted: seconds for delay, hertz for Doppler.
+    pub residual: f64,
+    /// χ² of the radar residual.
+    pub chi2: f64,
+    /// Degrees of freedom (1 for radar).
+    pub dof: u32,
+    /// χ² survival probability.
+    pub probability: f64,
+    /// Combined observed+predicted variance (s² / Hz²), when available.
+    pub variance: Option<f64>,
 }
 
 impl ObservationResidual {
@@ -171,6 +211,20 @@ impl ObservationResidual {
             along_track_error_arcsec: r.along_track_error_arcsec,
             cross_track_error_arcsec: r.cross_track_error_arcsec,
             track_position_angle_deg: r.track_position_angle_deg,
+            influence_information_loss: r.influence_information_loss,
+            along_cross_covariance_arcsec2: r.along_cross_covariance_arcsec2,
+            radar: (r.has_radar != 0).then(|| RadarResidual {
+                kind: if r.radar_kind == empyrean_sys::EMPYREAN_RADAR_KIND_DOPPLER as u8 {
+                    RadarResidualKind::Doppler
+                } else {
+                    RadarResidualKind::Delay
+                },
+                residual: r.radar_residual,
+                chi2: r.radar_chi2,
+                dof: r.radar_dof,
+                probability: r.radar_probability,
+                variance: r.radar_variance.is_finite().then_some(r.radar_variance),
+            }),
         }
     }
 }
@@ -749,6 +803,13 @@ pub struct PhotometryResult {
     pub per_band: Vec<BandStat>,
     /// Model-ladder gate records.
     pub gates: Vec<GateRecord>,
+    /// Magnitudes excluded from the fit because their photometric band
+    /// has no adopted V-band conversion (unknown/unspecified band
+    /// codes, comet total/nuclear magnitudes). The observations'
+    /// astrometry is unaffected.
+    pub n_mags_dropped_unconvertible: usize,
+    /// Distinct band codes that were dropped, sorted.
+    pub dropped_bands: Vec<String>,
 }
 
 impl PhotometryResult {
@@ -792,6 +853,121 @@ impl PhotometryResult {
             alpha_span_deg: p.alpha_span_deg,
             per_band,
             gates,
+            n_mags_dropped_unconvertible: p.n_mags_dropped_unconvertible,
+            dropped_bands: if p.dropped_bands.is_null() || p.num_dropped_bands == 0 {
+                Vec::new()
+            } else {
+                unsafe {
+                    std::slice::from_raw_parts(p.dropped_bands, p.num_dropped_bands)
+                        .iter()
+                        .map(|&b| {
+                            if b.is_null() {
+                                String::new()
+                            } else {
+                                CStr::from_ptr(b).to_string_lossy().into_owned()
+                            }
+                        })
+                        .collect()
+                }
+            },
+        }
+    }
+}
+
+/// The intervening event named by a
+/// [`CovarianceTrust::EncounterIntervenes`] verdict.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TrustGateEvent {
+    /// A close approach to a massive body lies inside the covariance
+    /// validity window.
+    CloseApproach {
+        /// Name of the body approached (e.g. `"Earth"`).
+        body: String,
+        /// Epoch of the close-approach signal.
+        epoch: crate::Epoch,
+        /// Approach distance at the signal (AU).
+        distance_au: f64,
+    },
+    /// The nonlinearity ratio exceeded its threshold — the second
+    /// moment is no longer well-described by the linear map.
+    HighNonlinearity {
+        /// Epoch of the threshold crossing.
+        epoch: crate::Epoch,
+        /// The nonlinearity ratio at the crossing.
+        nonlinearity: f64,
+        /// The threshold it exceeded.
+        threshold: f64,
+    },
+}
+
+/// Event-aware trust verdict on the delivered covariance, evaluated
+/// over its validity window on the converged orbit. Absence
+/// (`DetermineResult::covariance_trust == None`) means the call path
+/// ran no gate — absence of a verdict is not trust.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CovarianceTrust {
+    /// No intervening close approach and a 6-state solve — the linear
+    /// covariance may be used as delivered.
+    Trusted,
+    /// A close approach (or high-nonlinearity crossing) lies inside the
+    /// window; do not extrapolate the linear covariance across it —
+    /// escalate to nonlinear uncertainty propagation (second-order when
+    /// `second_order_recoverable`, otherwise sampling).
+    EncounterIntervenes {
+        /// The earliest intervening event in the window.
+        event: TrustGateEvent,
+        /// The fit's solved-for width.
+        solved_width: u32,
+        /// Whether a second-order state-only correction can recover the
+        /// encounter (solved width 6).
+        second_order_recoverable: bool,
+    },
+    /// The fit solved more than the 6-state, so the delivered 6×6 is a
+    /// marginal of a wider fit — a conservative flag.
+    WeaklyDeterminedHighN {
+        /// The fit's solved-for width (> 6).
+        solved_width: u32,
+    },
+}
+
+impl CovarianceTrust {
+    /// Decode the C-ABI trust field group. `None` ⇔ `NOT_EVALUATED`.
+    pub(super) fn from_ffi(r: &empyrean_sys::EmpyreanODResult) -> Option<Self> {
+        match r.covariance_trust {
+            empyrean_sys::EMPYREAN_COVARIANCE_TRUST_TRUSTED => Some(CovarianceTrust::Trusted),
+            empyrean_sys::EMPYREAN_COVARIANCE_TRUST_ENCOUNTER_INTERVENES => {
+                let event =
+                    if r.trust_event_kind == empyrean_sys::EMPYREAN_TRUST_EVENT_HIGH_NONLINEARITY {
+                        TrustGateEvent::HighNonlinearity {
+                            epoch: crate::Epoch::from_mjd_tdb(r.trust_event_epoch_mjd_tdb),
+                            nonlinearity: r.trust_event_nonlinearity,
+                            threshold: r.trust_event_threshold,
+                        }
+                    } else {
+                        TrustGateEvent::CloseApproach {
+                            body: if r.trust_event_body.is_null() {
+                                String::new()
+                            } else {
+                                unsafe { CStr::from_ptr(r.trust_event_body) }
+                                    .to_string_lossy()
+                                    .into_owned()
+                            },
+                            epoch: crate::Epoch::from_mjd_tdb(r.trust_event_epoch_mjd_tdb),
+                            distance_au: r.trust_event_distance_au,
+                        }
+                    };
+                Some(CovarianceTrust::EncounterIntervenes {
+                    event,
+                    solved_width: r.trust_solved_width,
+                    second_order_recoverable: r.trust_second_order_recoverable != 0,
+                })
+            }
+            empyrean_sys::EMPYREAN_COVARIANCE_TRUST_WEAKLY_DETERMINED_HIGH_N => {
+                Some(CovarianceTrust::WeaklyDeterminedHighN {
+                    solved_width: r.trust_solved_width,
+                })
+            }
+            _ => None,
         }
     }
 }
@@ -858,6 +1034,10 @@ pub struct DetermineResult {
     pub dv_frame: Option<crate::coordinate::Frame>,
     /// Post-OD photometric solution when photometry was requested and ran.
     pub photometry: Option<PhotometryResult>,
+    /// Event-aware trust verdict on the delivered covariance. `None`
+    /// when the call path ran no trust gate — absence of a verdict is
+    /// not trust.
+    pub covariance_trust: Option<CovarianceTrust>,
 }
 
 impl DetermineResult {

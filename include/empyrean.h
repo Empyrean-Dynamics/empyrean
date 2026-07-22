@@ -139,6 +139,46 @@ typedef struct Session Session;
 #define EMPYREAN_RADAR_KIND_DOPPLER 1
 
 /**
+ * Covariance-trust verdict: the call path ran no trust gate — absence
+ * of a verdict is NOT trust (e.g. `empyrean_refine`, session paths).
+ */
+#define EMPYREAN_COVARIANCE_TRUST_NOT_EVALUATED 0
+
+/**
+ * Covariance-trust verdict: no intervening close approach and a
+ * 6-state solve — the linear covariance may be used as delivered.
+ */
+#define EMPYREAN_COVARIANCE_TRUST_TRUSTED 1
+
+/**
+ * Covariance-trust verdict: a close approach (or high-nonlinearity
+ * crossing) lies inside the covariance validity window — do not
+ * extrapolate the linear covariance across it.
+ */
+#define EMPYREAN_COVARIANCE_TRUST_ENCOUNTER_INTERVENES 2
+
+/**
+ * Covariance-trust verdict: the fit solved more than the 6-state, so
+ * the delivered 6×6 is a marginal of a wider fit (conservative flag).
+ */
+#define EMPYREAN_COVARIANCE_TRUST_WEAKLY_DETERMINED_HIGH_N 3
+
+/**
+ * Intervening trust-gate event kind: none.
+ */
+#define EMPYREAN_TRUST_EVENT_NONE 0
+
+/**
+ * Intervening trust-gate event kind: close approach to a body.
+ */
+#define EMPYREAN_TRUST_EVENT_CLOSE_APPROACH 1
+
+/**
+ * Intervening trust-gate event kind: high-nonlinearity crossing.
+ */
+#define EMPYREAN_TRUST_EVENT_HIGH_NONLINEARITY 2
+
+/**
  * Observation passed all rejection criteria (or evaluate did not run rejection).
  */
 #define EMPYREAN_REJECTION_ACCEPTED 0
@@ -312,7 +352,7 @@ typedef struct Session Session;
  * Consumers compiled against a given `EMPYREAN_SOLVE_WIDTH` check this at
  * load; any additive change to the frozen structs bumps it.
  */
-#define EMPYREAN_ABI_VERSION 1
+#define EMPYREAN_ABI_VERSION 2
 
 /**
  * Auto: selects the central body (heliocentric vs Earth-centric)
@@ -1409,11 +1449,31 @@ struct EmpyreanEvent {
  * segment. A consumer can evaluate
  * \\(\sum_k w_k \\, \mathcal{N}(x \mid \mu_k, \Sigma_k)\\) directly
  * at the CA epoch.
+ *
+ * Each component is basis-tagged: `frame` / `origin` give the
+ * reference frame and center body its `mean` and `covariance` are
+ * expressed in, so the mixture is self-describing rather than relying
+ * on positional alignment with the propagated states.
  */
 struct EmpyreanMixtureComponent {
     double weight;
     double mean[6];
     double covariance[6][6];
+    /**
+     * Reference frame `mean` / `covariance` are expressed in — the
+     * integration frame of the run. Same integer encoding as
+     * `EmpyreanPropagatedState.frame` (0 = ICRF, 1 = ecliptic J2000,
+     * 2 = ITRF93).
+     */
+    int32_t frame;
+    /**
+     * Origin (center body) `mean` is expressed relative to, as a NAIF
+     * id — same encoding as `EmpyreanPropagatedState.origin`
+     * (e.g. 10 = Sun, 399 = Earth). Matches the propagation origin at
+     * the split's close-approach epoch, so it can differ between CA
+     * epochs of the same chain when origin switching occurred.
+     */
+    int32_t origin;
 };
 
 /**
@@ -1649,6 +1709,34 @@ struct EmpyreanEphemerisEntry {
      * Observer code, null-terminated (4 bytes).
      */
     uint8_t obs_code[4];
+    /**
+     * 1 when `covariance` / `aberrated_state` / `aberrated_covariance`
+     * below are populated — i.e. the input orbit carried a state
+     * covariance and the STM/uncertainty path ran; 0 otherwise.
+     */
+    uint8_t has_covariance;
+    /**
+     * 6×6 sky-plane covariance over (rho, RA, Dec, vrho, vRA, vDec) in
+     * (AU, deg) units, row-major. All-NaN when `has_covariance == 0`.
+     */
+    double covariance[6][6];
+    /**
+     * Aberrated (light-time corrected) barycentric ICRF Cartesian state
+     * `[x, y, z, vx, vy, vz]` (AU, AU/day) at the photon-emission epoch
+     * (`epoch_mjd_tdb - light_time_days`). Populated independently of
+     * covariance; NaN-filled in the (never-observed-today) case where
+     * the engine produced no aberrated state for the row.
+     */
+    double aberrated_state[6];
+    /**
+     * 1 when `aberrated_covariance` is populated; 0 otherwise.
+     */
+    uint8_t has_aberrated_covariance;
+    /**
+     * 6×6 Cartesian covariance of the aberrated state, row-major.
+     * All-NaN when `has_aberrated_covariance == 0`.
+     */
+    double aberrated_covariance[6][6];
 };
 
 /**
@@ -1728,6 +1816,24 @@ struct EmpyreanEphemerisResult {
      */
     struct EmpyreanObservationSensitivity *sensitivity;
     uintptr_t num_sensitivity;
+    /**
+     * Non-fatal generation warnings: conditions the generator handled
+     * but the caller should be aware of — e.g. Earth-orientation kernel
+     * coverage gaps at one or more requested epochs (the analytic
+     * IAU 2006 fallback was used), or ephemeris rows whose
+     * observation-sensitivity chain could not be built (the row's
+     * astrometry is still present; only its partials are missing).
+     * Heap array of `num_warnings` NUL-terminated UTF-8 strings; null
+     * when `num_warnings == 0` (a clean run). One list per call, not
+     * per row; each message names the affected orbit id, observatory
+     * code, and epoch (MJD TDB) where applicable. Freed by
+     * `empyrean_ephemeris_result_free`.
+     */
+    char **warnings;
+    /**
+     * Number of warning strings. 0 when the run had nothing to report.
+     */
+    uintptr_t num_warnings;
 };
 
 /**
@@ -1878,6 +1984,69 @@ struct EmpyreanImpactProbability {
      * Number of MC samples that impacted (0 when MC was not used).
      */
     uint64_t mc_n_impacts;
+    /**
+     * Geodetic latitude of the closest-approach surface point on the
+     * body's reference ellipsoid (degrees, north positive). NaN when no
+     * surface projection is available for this encounter (no
+     * body-orientation coverage, unmatched close approach, or the body
+     * has no registered ellipsoid).
+     */
+    double impact_latitude_deg;
+    /**
+     * Geodetic longitude of the closest-approach surface point
+     * (degrees, east positive, \\([-180, 180]\\)). NaN when unavailable.
+     */
+    double impact_longitude_deg;
+    /**
+     * Altitude of the closest-approach point above the reference
+     * ellipsoid (km). NaN when unavailable.
+     */
+    double impact_altitude_km;
+    /**
+     * Half-width of the 95% binomial (normal-approximation) confidence
+     * interval on `ip_mc`: \\(1.96\sqrt{p(1-p)/n}\\). The interval is
+     * `ip_mc ± mc_confidence_interval`. NaN when the producing method
+     * was not Monte Carlo.
+     */
+    double mc_confidence_interval;
+    /**
+     * Second-order corrected mean miss distance (AU),
+     * \\(\mu_d = d_0 + \tfrac{1}{2}\mathrm{Tr}(H_d \Sigma_0)\\). On
+     * Monte-Carlo rows carries the sample-mean miss distance instead.
+     * NaN when the producing method computed neither.
+     */
+    double mean_distance_second_order_au;
+    /**
+     * Second-order corrected 1σ miss-distance uncertainty (AU). NaN
+     * when the producing method carried no second-order derivatives.
+     */
+    double sigma_distance_second_order_au;
+    /**
+     * Skewness \\(\gamma_1\\) of the miss-distance distribution under
+     * the second-order expansion (dimensionless). NaN when not
+     * computed.
+     */
+    double skewness;
+    /**
+     * Gradient \\(\partial d / \partial x_0\\) of the closest-approach
+     * distance with respect to the initial Cartesian state (position
+     * components dimensionless, velocity components in days). All-zero
+     * on Monte-Carlo rows and on degenerate zero-miss encounters.
+     */
+    double gradient[6];
+    /**
+     * Second derivatives \\(\partial^2 d / \partial x_{0i} \partial
+     * x_{0j}\\) of the closest-approach distance (6×6 symmetric, same
+     * initial-state units as `gradient`). Every entry NaN when the
+     * producing method carried no second-order derivatives.
+     */
+    double distance_hessian[6][6];
+    /**
+     * Number of mixture components used by the adaptive
+     * Gaussian-mixture IP refinement. 0 when the refinement did not run
+     * (matches `ip_agm` = NaN).
+     */
+    uint64_t agm_components;
 };
 
 struct EmpyreanImpactProbabilitiesResult {
@@ -2077,6 +2246,58 @@ struct EmpyreanObservationResult {
      * Position angle of sky motion (degrees, East of North). NaN if unavailable.
      */
     double track_position_angle_deg;
+    /**
+     * D-optimality information loss on removal, from the influence
+     * pass: \\(\Delta_i = \log\det N - \log\det(N - I_i)\\). NaN
+     * if no influence pass was run; +∞ when removing this observation
+     * makes the normal matrix singular (the observation is
+     * indispensable).
+     */
+    double influence_information_loss;
+    /**
+     * Off-diagonal covariance of the (along-track, cross-track)
+     * residual pair (arcsec²). Symmetric 2×2: the diagonal is
+     * `along_track_error_arcsec`² / `cross_track_error_arcsec`².
+     * NaN when the AT/CT covariance is unavailable.
+     */
+    double along_cross_covariance_arcsec2;
+    /**
+     * Radar (delay/Doppler) residual: observed − predicted. Seconds
+     * for delay, hertz for Doppler (see `radar_kind`). NaN when
+     * `has_radar == 0`.
+     */
+    double radar_residual;
+    /**
+     * χ² of the radar residual. NaN when `has_radar == 0`.
+     */
+    double radar_chi2;
+    /**
+     * χ² survival probability of the radar residual. NaN when
+     * `has_radar == 0`.
+     */
+    double radar_probability;
+    /**
+     * Combined observed+predicted radar residual variance (s² for
+     * delay, Hz² for Doppler). NaN when unavailable or
+     * `has_radar == 0`.
+     */
+    double radar_variance;
+    /**
+     * Degrees of freedom of the radar residual (1 for radar). 0 when
+     * `has_radar == 0`.
+     */
+    uint32_t radar_dof;
+    /**
+     * 1 when this row is a radar observation and the `radar_*` fields
+     * are live. The optical RA/Dec residual fields are NaN on radar
+     * rows.
+     */
+    uint8_t has_radar;
+    /**
+     * `EMPYREAN_RADAR_KIND_DELAY` (0) or `EMPYREAN_RADAR_KIND_DOPPLER`
+     * (1). Only meaningful when `has_radar == 1`.
+     */
+    uint8_t radar_kind;
 };
 
 /**
@@ -3133,6 +3354,25 @@ struct EmpyreanODPhotometryResult {
      */
     struct EmpyreanGateRecord *gates;
     uintptr_t num_gates;
+    /**
+     * Magnitudes excluded from the fit because their photometric band
+     * has no adopted V-band conversion (unknown/unspecified band
+     * codes, comet total/nuclear magnitudes). Never silent: each
+     * exclusion is counted here and the distinct offending band codes
+     * are listed in `dropped_bands`. The observations' astrometry is
+     * unaffected.
+     */
+    uintptr_t n_mags_dropped_unconvertible;
+    /**
+     * Distinct band codes that were dropped (owned array of owned C
+     * strings, sorted). Freed by `empyrean_od_result_free`. Null when
+     * `num_dropped_bands == 0`.
+     */
+    char **dropped_bands;
+    /**
+     * Number of entries in `dropped_bands` (0 when null).
+     */
+    uintptr_t num_dropped_bands;
 };
 
 /**
@@ -3330,6 +3570,53 @@ struct EmpyreanODResult {
      * Zeroed when the orbit carries no SRP (`has_srp = 0`).
      */
     struct EmpyreanSRPParams srp;
+    /**
+     * Event-aware trust verdict on the delivered covariance
+     * (`EMPYREAN_COVARIANCE_TRUST_*`). `NOT_EVALUATED` (0) means the
+     * call path ran no gate — absence of a verdict is not trust.
+     */
+    int32_t covariance_trust;
+    /**
+     * Intervening-event kind (`EMPYREAN_TRUST_EVENT_*`); `NONE` unless
+     * `covariance_trust == ENCOUNTER_INTERVENES`.
+     */
+    int32_t trust_event_kind;
+    /**
+     * Event epoch (MJD TDB). NaN when no event.
+     */
+    double trust_event_epoch_mjd_tdb;
+    /**
+     * Close-approach distance (AU). NaN unless
+     * `trust_event_kind == CLOSE_APPROACH`.
+     */
+    double trust_event_distance_au;
+    /**
+     * Nonlinearity ratio at the crossing. NaN unless
+     * `trust_event_kind == HIGH_NONLINEARITY`.
+     */
+    double trust_event_nonlinearity;
+    /**
+     * Threshold the nonlinearity exceeded. NaN unless
+     * `trust_event_kind == HIGH_NONLINEARITY`.
+     */
+    double trust_event_threshold;
+    /**
+     * Name of the approached body (owned C string; freed by
+     * `empyrean_od_result_free`). Null unless
+     * `trust_event_kind == CLOSE_APPROACH`.
+     */
+    char *trust_event_body;
+    /**
+     * Solved-for width N of the fit the verdict refers to. 0 when the
+     * verdict carries no width (`TRUSTED` / `NOT_EVALUATED`).
+     */
+    uint32_t trust_solved_width;
+    /**
+     * 1 when a second-order (state-only) correction can recover the
+     * encounter (solved width 6); 0 otherwise. Meaningful only for
+     * `ENCOUNTER_INTERVENES`.
+     */
+    uint8_t trust_second_order_recoverable;
 };
 
 /**
@@ -3510,7 +3797,9 @@ struct EmpyreanCovarianceMetrics {
  */
 struct EmpyreanPlanCandidate {
     /**
-     * Index into the planned-observation list.
+     * Row in the plan's optical `ephemeris` array for an optical
+     * candidate; position in the radar sub-sequence for a radar
+     * candidate.
      */
     uintptr_t index;
     /**
@@ -3570,12 +3859,67 @@ struct EmpyreanPlanCandidate {
      * Active solve-for width (6 = state-only).
      */
     uintptr_t active_width;
+    /**
+     * Radar only: effective signal-to-noise ratio used for the
+     * delay/Doppler measurement uncertainty (linear power ratio, not
+     * dB). Always finite and positive for a radar candidate; NaN for
+     * an optical candidate.
+     */
+    double radar_snr;
+    /**
+     * Radar only: one-way topocentric range to the target at the
+     * receive epoch (km), derived from the predicted round-trip delay.
+     * NaN for an optical candidate.
+     */
+    double radar_range_km;
+    /**
+     * Radar only: human-readable notes recording assumptions made
+     * while deriving the SNR from the link budget (for example, a
+     * diameter derived from the absolute magnitude and visual albedo,
+     * or coherent integration left uncapped because the spin period is
+     * unknown). Owned, null-terminated UTF-8 strings, freed by
+     * `empyrean_plan_result_free`. Null/0 when there are no notes:
+     * optical candidates, a caller-supplied SNR, or a fully specified
+     * link budget.
+     */
+    char **radar_provenance;
+    /**
+     * Number of entries in `radar_provenance` (0 when null).
+     */
+    uintptr_t num_radar_provenance;
+    /**
+     * Radar only: measurement mode — 0 = delay, 1 = Doppler,
+     * 2 = both (same encoding as the planned-observation input).
+     * -1 for an optical candidate.
+     */
+    int32_t radar_mode;
+};
+
+/**
+ * One predicted sky-plane point of the plan's optical ephemeris: the
+ * target's predicted topocentric right ascension and declination
+ * (degrees, ICRF) at an optical candidate's epoch (MJD, TDB).
+ */
+struct EmpyreanPlanEphemerisPoint {
+    /**
+     * Epoch — MJD, TDB.
+     */
+    double epoch_mjd_tdb;
+    /**
+     * Predicted topocentric right ascension (degrees, ICRF).
+     */
+    double ra_deg;
+    /**
+     * Predicted topocentric declination (degrees, ICRF).
+     */
+    double dec_deg;
 };
 
 /**
  * Result of a plan evaluation. The caller allocates the struct; the
- * `orbit_id` string and the `candidates` array (with their `obs_code`
- * strings) are heap-allocated here and must be released with
+ * `orbit_id` string, the `candidates` array (with their `obs_code`
+ * and `radar_provenance` strings), and the `ephemeris` array are
+ * heap-allocated here and must be released with
  * [`empyrean_plan_result_free`].
  */
 struct EmpyreanPlanResult {
@@ -3603,6 +3947,18 @@ struct EmpyreanPlanResult {
      * Active solve-for width (6 = state-only).
      */
     uintptr_t active_width;
+    /**
+     * Predicted optical ephemeris, one point per optical candidate in
+     * chronological order; an optical candidate's `index` field gives
+     * its row in this array (radar candidates carry no sky-plane
+     * prediction). Owned; freed by `empyrean_plan_result_free`. Null
+     * with count 0 for a radar-only plan.
+     */
+    struct EmpyreanPlanEphemerisPoint *ephemeris;
+    /**
+     * Number of entries in `ephemeris` (0 when null).
+     */
+    uintptr_t num_ephemeris;
 };
 
 /**
@@ -3862,7 +4218,7 @@ struct EmpyreanStateResult {
  * Return the platform XDG-compliant default data directory as a
  * heap-allocated, NUL-terminated UTF-8 string.
  *
- * Mirrors villeneuve's [`DataManager::new`] resolution: honors
+ * Mirrors the engine's `DataManager::new` resolution: honors
  * `EMPYREAN_DATA_DIR` first, then falls back to `dirs::data_dir()` —
  * `~/.local/share/empyrean/data/` on Linux, `~/Library/Application
  * Support/empyrean/data/` on macOS, `%APPDATA%\empyrean\data\` on

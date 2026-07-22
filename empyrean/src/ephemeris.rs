@@ -58,6 +58,18 @@ pub struct EphemerisEntry {
     pub sky_rate_deg_day: f64,
     /// MPC observatory code.
     pub obs_code: String,
+    /// 6×6 sky-plane covariance over (rho, RA, Dec, vrho, vRA, vDec) in
+    /// (AU, deg) units, row-major. `None` when the input orbit carried no
+    /// state covariance (no uncertainty path ran).
+    pub covariance: Option<[[f64; 6]; 6]>,
+    /// Aberrated (light-time corrected) barycentric ICRF Cartesian state
+    /// `[x, y, z, vx, vy, vz]` (AU, AU/day) at the photon-emission epoch.
+    /// NaN-filled in the (never-observed-today) case where the engine
+    /// produced no aberrated state for the row.
+    pub aberrated_state: [f64; 6],
+    /// 6×6 Cartesian covariance of the aberrated state, row-major. `None`
+    /// when the input orbit carried no state covariance.
+    pub aberrated_covariance: Option<[[f64; 6]; 6]>,
 }
 
 impl EphemerisEntry {
@@ -89,6 +101,10 @@ impl EphemerisEntry {
             position_angle_deg: e.position_angle_deg,
             sky_rate_deg_day: e.sky_rate_deg_day,
             obs_code: obs_code_from_bytes(&e.obs_code),
+            covariance: (e.has_covariance != 0).then_some(e.covariance),
+            aberrated_state: e.aberrated_state,
+            aberrated_covariance: (e.has_aberrated_covariance != 0)
+                .then_some(e.aberrated_covariance),
         }
     }
 }
@@ -173,6 +189,14 @@ pub struct EphemerisResult {
     /// Observation-sensitivity rows (Jacobian/Hessian). Empty on the
     /// f64-only path.
     pub sensitivity: Vec<ObservationSensitivity>,
+    /// Non-fatal generation warnings, in the order the engine emitted
+    /// them. Empty when the run completed with nothing to report. Each
+    /// human-readable message names the affected orbit id / observatory
+    /// code / epoch (MJD TDB) where applicable — e.g. Earth-orientation
+    /// kernel coverage gaps handled by the analytic IAU 2006 fallback,
+    /// or rows whose observation-sensitivity chain was skipped
+    /// (astrometry present, partials absent).
+    pub warnings: Vec<String>,
 }
 
 /// Ephemeris-generation configuration.
@@ -274,6 +298,8 @@ impl Context {
             num_entries: 0,
             sensitivity: std::ptr::null_mut(),
             num_sensitivity: 0,
+            warnings: std::ptr::null_mut(),
+            num_warnings: 0,
         };
         let (ffi_config, _config_keep) = config.to_ffi_with();
         let code = unsafe {
@@ -362,10 +388,27 @@ pub(crate) fn marshal_ephemeris_result(
                 .collect()
         }
     };
+    let warnings: Vec<String> = if result.warnings.is_null() {
+        Vec::new()
+    } else {
+        unsafe {
+            std::slice::from_raw_parts(result.warnings, result.num_warnings)
+                .iter()
+                .map(|&p| {
+                    if p.is_null() {
+                        String::new()
+                    } else {
+                        CStr::from_ptr(p).to_string_lossy().into_owned()
+                    }
+                })
+                .collect()
+        }
+    };
     unsafe { empyrean_sys::empyrean_ephemeris_result_free(result) };
     EphemerisResult {
         entries,
         sensitivity,
+        warnings,
     }
 }
 

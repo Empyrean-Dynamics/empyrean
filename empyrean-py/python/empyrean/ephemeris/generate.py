@@ -337,20 +337,51 @@ def generate_ephemeris(
     # as of the parity extension — the local-horizon / sky-motion angles
     # zenith_angle, azimuth, hour_angle, lunar_elongation, position_angle,
     # sky_rate (all degrees; sky_rate is deg/day), NaN where the observer
-    # geometry made them unavailable.
-    #
-    # Aberrated state and per-row observation covariance are still NOT in
-    # the flat schema — those remain NaN / null placeholders here.
+    # geometry made them unavailable. As of v0.9.0 it also
+    # carries the per-row sky-plane covariance, the aberrated Cartesian
+    # state, and the aberrated covariance, with explicit presence flags,
+    # plus the run-level "warnings" list (generation warnings, engine
+    # emission order).
+    import pyarrow as pa
+
     from empyrean.coordinates.coordinates import (
         CartesianCoordinates,
         SphericalCoordinates,
     )
+    from empyrean.coordinates.covariance import (
+        CartesianCovariance,
+        SphericalCovariance,
+        _lower_tri_indices,
+    )
+
+    def _cov_from_matrix_masked(cls: Any, matrix: FloatArray, present: Any) -> Any:
+        # Build a covariance sub-table whose rows are genuinely NULL where
+        # the C ABI reported no covariance (present == False), rather than
+        # NaN-valued rows — mixed-presence batches stay honest per row.
+        mask = ~np.asarray(present, dtype=bool)
+        kwargs = {
+            name: pa.array(matrix[:, i, j], mask=mask)
+            for name, (i, j) in zip(cls._cov_names, _lower_tri_indices(6), strict=False)
+        }
+        return cls.from_kwargs(**kwargs)
+
     from empyrean.coordinates.enums import Frame, Origin
 
     m = len(result["epoch"])
     object_id_list = [s if s else None for s in result["object_id"]]
 
-    coordinates = SphericalCoordinates.from_kwargs(
+    # Sky-plane covariance over (rho, lon, lat, vrho, vlon, vlat) in
+    # (AU, deg) units. Rows without input covariance are NaN-filled by the
+    # C ABI; attach the column only when at least one row carries one
+    # (mirrors `propagate`'s covariance handling).
+    has_cov = np.asarray(result["has_covariance"], dtype=bool)
+    sky_cov = (
+        _cov_from_matrix_masked(SphericalCovariance, np.asarray(result["covariance"]), has_cov)
+        if has_cov.any()
+        else None
+    )
+
+    spherical_kwargs: dict[str, Any] = dict(
         epoch=np.asarray(result["epoch"]),
         rho=np.asarray(result["rho"]),
         lon=np.asarray(result["ra"]),
@@ -361,6 +392,9 @@ def generate_ephemeris(
         frame=Frame.ICRF.value,
         origin=result["obs_code"],
     )
+    if sky_cov is not None:
+        spherical_kwargs["covariance"] = sky_cov
+    coordinates = SphericalCoordinates.from_kwargs(**spherical_kwargs)
 
     def _nullable_float(key: str) -> pa.Array | FloatArray:
         arr: FloatArray = np.asarray(result[key], dtype=np.float64)
@@ -371,24 +405,39 @@ def generate_ephemeris(
             return pa.array(arr.tolist(), type=pa.float64(), mask=mask)
         return arr
 
-    nan_col = np.full(m, np.nan)
-    # `aberrated_state` is `nullable=True` but its inner CartesianCoordinates
-    # still requires its `frame` StringAttribute to be set during quivr
-    # validation, even when every row is null. Provide an all-NaN
-    # placeholder with `Frame.ICRF` to satisfy the schema; the C ABI
-    # doesn't carry aberrated state, so callers should treat these as
-    # absent rather than meaningful values.
-    aberrated_state = CartesianCoordinates.from_kwargs(
-        epoch=np.asarray(result["epoch"]),
-        x=nan_col,
-        y=nan_col,
-        z=nan_col,
-        vx=nan_col,
-        vy=nan_col,
-        vz=nan_col,
+    # Aberrated (light-time corrected) barycentric ICRF Cartesian state at
+    # the photon-emission epoch, with its covariance when the uncertainty
+    # path ran (NaN rows where the engine produced none).
+    aberrated_arr = np.asarray(result["aberrated_state"], dtype=np.float64)
+    has_ab_cov = np.asarray(result["has_aberrated_covariance"], dtype=bool)
+    aberrated_cov = (
+        _cov_from_matrix_masked(
+            CartesianCovariance, np.asarray(result["aberrated_covariance"]), has_ab_cov
+        )
+        if has_ab_cov.any()
+        else None
+    )
+    # The aberrated state is defined at the PHOTON-EMISSION epoch
+    # t_obs − τ, not the observation epoch — stamp it accordingly
+    # (rows without a light time keep the observation epoch; their
+    # aberrated state is NaN anyway).
+    _obs_epoch = np.asarray(result["epoch"], dtype=np.float64)
+    _lt = np.asarray(result["light_time"], dtype=np.float64)
+    emission_epoch = np.where(np.isfinite(_lt), _obs_epoch - _lt, _obs_epoch)
+    aberrated_kwargs: dict[str, Any] = dict(
+        epoch=emission_epoch,
+        x=aberrated_arr[:, 0],
+        y=aberrated_arr[:, 1],
+        z=aberrated_arr[:, 2],
+        vx=aberrated_arr[:, 3],
+        vy=aberrated_arr[:, 4],
+        vz=aberrated_arr[:, 5],
         frame=Frame.ICRF.value,
         origin=[str(Origin.SSB)] * m,
     )
+    if aberrated_cov is not None:
+        aberrated_kwargs["covariance"] = aberrated_cov
+    aberrated_state = CartesianCoordinates.from_kwargs(**aberrated_kwargs)
     ephemeris = Ephemeris.from_kwargs(
         orbit_id=result["orbit_id"],
         object_id=object_id_list,
@@ -427,4 +476,8 @@ def generate_ephemeris(
             hessian=result["sensitivity_hessian"],
         )
 
-    return EphemerisResult(ephemeris=ephemeris, sensitivity=sensitivity)
+    return EphemerisResult(
+        ephemeris=ephemeris,
+        sensitivity=sensitivity,
+        warnings=list(result["warnings"]),
+    )

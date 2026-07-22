@@ -427,6 +427,19 @@ fn write_od_result(od: &ODResult, result_out: *mut EmpyreanODResult) -> Result<(
         } else {
             0
         };
+        // Explicit trust verdict (None → NOT_EVALUATED on this path) so
+        // the caller never reads an uninitialized `trust_event_body`.
+        crate::od::write_covariance_trust(result_out, &od.covariance_trust);
+        // Explicitly zero every owned-pointer surface this path does not
+        // populate (photometry incl. its per_band/gates/dropped_bands
+        // arrays, station biases): `empyrean_od_result_free` frees them
+        // unconditionally, and a C caller is not required to
+        // zero-initialize the out-struct — leaving them unwritten would
+        // free() indeterminate garbage.
+        (*result_out).has_photometry = 0;
+        (*result_out).photometry = crate::od::zeroed_photometry_result();
+        (*result_out).station_biases = std::ptr::null_mut();
+        (*result_out).num_station_biases = 0;
     }
     Ok(())
 }

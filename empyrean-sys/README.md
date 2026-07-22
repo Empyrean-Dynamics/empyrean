@@ -24,7 +24,7 @@ type-check, or RAII-manage the underlying handles.
 
 ```toml
 [dependencies]
-empyrean-sys = "0.9.0-rc.0"
+empyrean-sys = "0.9.0"
 ```
 
 ```rust
@@ -50,8 +50,10 @@ and Rust-native lifetime management.
 ## What the bindings cover
 
 The declarations track the full C ABI at `EMPYREAN_ABI_VERSION`
-(currently `1`), including the v0.9.0 wide-parameter fitting surface.
-Each type below maps 1:1 onto a C struct; consult `include/empyrean.h`
+(currently `2`), including the v0.9.0 wide-parameter fitting surface
+and the ABI-2 output surface below. ABI 2 grew existing struct shapes
+by appending fields, so consumers must recompile against the matching
+header. Each type below maps 1:1 onto a C struct; consult `include/empyrean.h`
 at the repository root for field-level semantics.
 
 - **Wide-parameter OD.** `empyrean_determine` / `empyrean_refine` solve
@@ -74,8 +76,51 @@ at the repository root for field-level semantics.
   `H` and the phase-function slopes from the observation magnitudes,
   climbing the H-only → HG12 → HG1G2 ladder (Muinonen et al. 2010) to the
   richest model the arc's phase coverage supports. `EmpyreanODPhotometryResult`
-  reports the fitted `h` / `slope1` / `slope2`, the `model_used`, and a 3×3
-  `covariance` giving an honest 1σ on `h`.
+  reports the fitted `h` / `slope1` / `slope2`, the `model_used`, a 3×3
+  `covariance` giving an honest 1σ on `h`, plus
+  `n_mags_dropped_unconvertible` and the distinct offending band codes
+  in `dropped_bands` when magnitudes could not be converted to V — the
+  observations' astrometry is unaffected.
+- **Ephemeris covariances and warnings.** Each `EmpyreanEphemerisEntry`
+  carries a 6×6 sky-plane covariance over (rho, RA, Dec) and their rates
+  in (AU, deg) units, and the aberrated (light-time corrected)
+  barycentric ICRF Cartesian state at the photon-emission epoch with its
+  own 6×6 covariance — `has_covariance` / `has_aberrated_covariance`
+  gate each block (absent unless the input orbit carried a state
+  covariance). `EmpyreanEphemerisResult` returns run-level non-fatal
+  `warnings`, e.g. Earth-orientation kernel coverage gaps served by the
+  analytic IAU 2006 fallback, or rows whose sensitivity chain was
+  skipped.
+- **Per-observation diagnostics.** `EmpyreanObservationResult` carries
+  radar delay/Doppler residuals (observed − predicted, seconds / hertz,
+  with `radar_chi2`, `radar_dof`, `radar_probability`, and the combined
+  `radar_variance`), the D-optimality `influence_information_loss` on
+  removal (+∞ marks an indispensable observation), and
+  `along_cross_covariance_arcsec2` completing the 2×2 along/cross-track
+  covariance.
+- **Covariance trust verdict.** `EmpyreanODResult::covariance_trust`
+  reports an event-aware verdict on the delivered covariance
+  (`EMPYREAN_COVARIANCE_TRUST_*`): `TRUSTED`, `ENCOUNTER_INTERVENES`
+  (with the intervening close-approach or high-nonlinearity event and
+  whether a second-order state-only correction can recover it), or
+  `WEAKLY_DETERMINED_HIGH_N`. `NOT_EVALUATED` means no gate ran —
+  absence of a verdict is not trust.
+- **Impact-probability detail.** Each `EmpyreanImpactProbability` row
+  carries the geodetic impact point (latitude / longitude / altitude on
+  the body's reference ellipsoid, when the surface projection is
+  available), the Monte-Carlo 95% binomial confidence half-width on
+  `ip_mc`, the second-order corrected mean miss distance with its 1σ
+  uncertainty and skewness, the closest-approach distance `gradient`
+  (6-vector) and `distance_hessian` (6×6) with respect to the initial
+  state, and the adaptive Gaussian-mixture component count.
+- **Plan evaluation.** Radar candidates in `EmpyreanPlanCandidate`
+  carry the effective SNR (linear power ratio), one-way range (km),
+  link-budget provenance notes, and the measurement mode;
+  `EmpyreanPlanResult` carries the predicted optical ephemeris (epoch
+  MJD TDB, RA, Dec per optical candidate).
+- **Basis-tagged mixture components.** Each `EmpyreanMixtureComponent`
+  is tagged with the reference `frame` and center-body `origin` (NAIF
+  id) its mean and covariance are expressed in.
 
 ## Runtime requirement
 

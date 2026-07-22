@@ -72,6 +72,24 @@ pub struct EmpyreanEphemerisEntry {
     pub sky_rate_deg_day: f64,
     /// Observer code, null-terminated (4 bytes).
     pub obs_code: [u8; 4],
+    /// 1 when `covariance` / `aberrated_state` / `aberrated_covariance`
+    /// below are populated — i.e. the input orbit carried a state
+    /// covariance and the STM/uncertainty path ran; 0 otherwise.
+    pub has_covariance: u8,
+    /// 6×6 sky-plane covariance over (rho, RA, Dec, vrho, vRA, vDec) in
+    /// (AU, deg) units, row-major. All-NaN when `has_covariance == 0`.
+    pub covariance: [[f64; 6]; 6],
+    /// Aberrated (light-time corrected) barycentric ICRF Cartesian state
+    /// `[x, y, z, vx, vy, vz]` (AU, AU/day) at the photon-emission epoch
+    /// (`epoch_mjd_tdb - light_time_days`). Populated independently of
+    /// covariance; NaN-filled in the (never-observed-today) case where
+    /// the engine produced no aberrated state for the row.
+    pub aberrated_state: [f64; 6],
+    /// 1 when `aberrated_covariance` is populated; 0 otherwise.
+    pub has_aberrated_covariance: u8,
+    /// 6×6 Cartesian covariance of the aberrated state, row-major.
+    /// All-NaN when `has_aberrated_covariance == 0`.
+    pub aberrated_covariance: [[f64; 6]; 6],
 }
 
 /// One observation-sensitivity row — the partial derivatives of the
@@ -125,6 +143,20 @@ pub struct EmpyreanEphemerisResult {
     /// STM was traced (e.g. an f64-only path).
     pub sensitivity: *mut EmpyreanObservationSensitivity,
     pub num_sensitivity: usize,
+    /// Non-fatal generation warnings: conditions the generator handled
+    /// but the caller should be aware of — e.g. Earth-orientation kernel
+    /// coverage gaps at one or more requested epochs (the analytic
+    /// IAU 2006 fallback was used), or ephemeris rows whose
+    /// observation-sensitivity chain could not be built (the row's
+    /// astrometry is still present; only its partials are missing).
+    /// Heap array of `num_warnings` NUL-terminated UTF-8 strings; null
+    /// when `num_warnings == 0` (a clean run). One list per call, not
+    /// per row; each message names the affected orbit id, observatory
+    /// code, and epoch (MJD TDB) where applicable. Freed by
+    /// `empyrean_ephemeris_result_free`.
+    pub warnings: *mut *mut std::ffi::c_char,
+    /// Number of warning strings. 0 when the run had nothing to report.
+    pub num_warnings: usize,
 }
 
 /// Ephemeris-generation configuration.
@@ -401,6 +433,30 @@ pub(crate) fn marshal_ephemeris_result(
     let ephemeris = &eph_result.ephemeris;
     let n = ephemeris.iter().count();
 
+    // ── Generation warnings ──
+    // Run-level (one list per call, not per row); Display-serialized so
+    // the C ABI stays stable while the engine's warning taxonomy grows.
+    // Marshaled FIRST so its allocation-failure return leaks nothing.
+    let warn_src = &eph_result.diagnostics.warnings;
+    let (warn_ptr, num_warnings) = if warn_src.is_empty() {
+        (std::ptr::null_mut(), 0)
+    } else {
+        let nw = warn_src.len();
+        let layout = std::alloc::Layout::array::<*mut std::ffi::c_char>(nw).unwrap();
+        let ptr = unsafe { std::alloc::alloc(layout) } as *mut *mut std::ffi::c_char;
+        if ptr.is_null() {
+            set_last_error("allocation failed for warnings array");
+            return -5;
+        }
+        for (k, w) in warn_src.iter().enumerate() {
+            let s = CString::new(w.to_string()).unwrap_or_else(|_| CString::new("?").unwrap());
+            unsafe {
+                ptr.add(k).write(s.into_raw());
+            }
+        }
+        (ptr, nw)
+    };
+
     let out_ptr = if n > 0 {
         let layout = std::alloc::Layout::array::<EmpyreanEphemerisEntry>(n)
             .unwrap_or(std::alloc::Layout::new::<EmpyreanEphemerisEntry>());
@@ -414,9 +470,25 @@ pub(crate) fn marshal_ephemeris_result(
         std::ptr::null_mut()
     };
 
-    for (i, (orbit_id, coord, _cov, obs_opt, light_time, _aberrated)) in
-        ephemeris.iter().enumerate()
+    for (i, (orbit_id, coord, cov, obs_opt, light_time, aberrated)) in ephemeris.iter().enumerate()
     {
+        // Uncertainty outputs the engine computes but the C ABI previously
+        // dropped: the sky covariance, the aberrated
+        // Cartesian state, and its covariance. Populate them; NaN-fill the
+        // covariances when the input orbit carried none.
+        let (has_covariance, covariance) = match cov {
+            Some(c) => (1u8, c.matrix),
+            None => (0u8, [[f64::NAN; 6]; 6]),
+        };
+        let aberrated_state = match aberrated {
+            Some(a) => [a.x, a.y, a.z, a.vx, a.vy, a.vz],
+            None => [f64::NAN; 6],
+        };
+        let (has_aberrated_covariance, aberrated_covariance) =
+            match ephemeris.aberrated_covariance(i) {
+                Some(c) => (1u8, c.matrix),
+                None => (0u8, [[f64::NAN; 6]; 6]),
+            };
         // SphericalCoordinates: r, lon (= RA), lat (= Dec), vr, vlon, vlat.
         // The ephemeris is generated with `Degrees` angular unit at the
         // facade layer (`Ephemeris::to_degrees()`), which converts EVERY
@@ -458,6 +530,11 @@ pub(crate) fn marshal_ephemeris_result(
                 c[3] = 0;
                 c
             },
+            has_covariance,
+            covariance,
+            aberrated_state,
+            has_aberrated_covariance,
+            aberrated_covariance,
         };
         unsafe {
             out_ptr.add(i).write(entry);
@@ -559,6 +636,8 @@ pub(crate) fn marshal_ephemeris_result(
         (*result_out).num_entries = n;
         (*result_out).sensitivity = sens_ptr;
         (*result_out).num_sensitivity = num_sens;
+        (*result_out).warnings = warn_ptr;
+        (*result_out).num_warnings = num_warnings;
     }
 
     0
@@ -608,11 +687,27 @@ pub unsafe extern "C" fn empyrean_ephemeris_result_free(result: *mut EmpyreanEph
             }
         }
 
+        if !res.warnings.is_null() && res.num_warnings > 0 {
+            for i in 0..res.num_warnings {
+                let p = unsafe { *res.warnings.add(i) };
+                if !p.is_null() {
+                    drop(unsafe { CString::from_raw(p) });
+                }
+            }
+            let layout =
+                std::alloc::Layout::array::<*mut std::ffi::c_char>(res.num_warnings).unwrap();
+            unsafe {
+                std::alloc::dealloc(res.warnings as *mut u8, layout);
+            }
+        }
+
         unsafe {
             (*result).entries = std::ptr::null_mut();
             (*result).num_entries = 0;
             (*result).sensitivity = std::ptr::null_mut();
             (*result).num_sensitivity = 0;
+            (*result).warnings = std::ptr::null_mut();
+            (*result).num_warnings = 0;
         }
     }));
 }

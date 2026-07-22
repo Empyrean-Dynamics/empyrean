@@ -316,7 +316,7 @@ pub unsafe extern "C" fn empyrean_context_free(ctx: *mut EmpyreanContext) {
 /// Return the platform XDG-compliant default data directory as a
 /// heap-allocated, NUL-terminated UTF-8 string.
 ///
-/// Mirrors villeneuve's [`DataManager::new`] resolution: honors
+/// Mirrors the engine's `DataManager::new` resolution: honors
 /// `EMPYREAN_DATA_DIR` first, then falls back to `dirs::data_dir()` —
 /// `~/.local/share/empyrean/data/` on Linux, `~/Library/Application
 /// Support/empyrean/data/` on macOS, `%APPDATA%\empyrean\data\` on

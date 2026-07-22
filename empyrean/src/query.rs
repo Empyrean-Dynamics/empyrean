@@ -193,6 +193,8 @@ pub fn query_horizons(
         num_entries: 0,
         sensitivity: std::ptr::null_mut(),
         num_sensitivity: 0,
+        warnings: std::ptr::null_mut(),
+        num_warnings: 0,
     };
     let code = unsafe {
         empyrean_sys::empyrean_query_horizons(

@@ -56,10 +56,7 @@ bodies like asteroids and comets, with plans to extend to cislunar space.
 | CLI    | `cargo install empyrean-cli` (or grab a binary from [Releases](https://github.com/Empyrean-Dynamics/empyrean/releases)) |
 | C      | download `libempyrean-<target>.tar.gz` from [Releases](https://github.com/Empyrean-Dynamics/empyrean/releases) — ships the shared library, `empyrean.h`, and LICENSE |
 
-Current release: **0.9.0-rc.0** — a release candidate; see the
-[CHANGELOG](CHANGELOG.md). Pre-release builds are opt-in:
-`pip install --pre empyrean` for the wheel, `cargo add empyrean@0.9.0-rc.0`
-for the crate.
+Current release: **0.9.0** — see the [CHANGELOG](CHANGELOG.md).
 
 Prebuilt binaries — the engine cdylib, the CLI, and the Python wheels —
 target four platforms: macOS arm64 (`macos-aarch64`), macOS x86_64
@@ -224,6 +221,16 @@ empyrean ephemeris --object-id 99942 --observers 568 --epoch 64922.0 --out-dir .
 ls out/    # ephemeris.parquet
 ```
 
+Each ephemeris row also carries its uncertainty: the 6×6 sky-plane
+covariance over (ρ, RA, Dec) and their rates (AU / degree units),
+mapped from the orbit's state covariance — absent when the input orbit
+carries none, never zero-filled — plus the aberrated (light-time
+corrected) barycentric ICRF Cartesian state at the photon-emission
+epoch, with its own 6×6 covariance. A generate call additionally
+returns its non-fatal warnings — an Earth-orientation kernel coverage
+gap bridged by the analytic IAU 2006 fallback, a row whose sensitivity
+chain was skipped — so a silent run is a clean run.
+
 ### Orbit determination (with `Session`)
 
 Fit Apophis's orbit from its full MPC astrometric arc; iterate with
@@ -312,6 +319,14 @@ per-observation residuals — that you can join in
 pandas / Polars / DuckDB the same way you would the propagation /
 ephemeris outputs.
 
+Residual rows are typed by observable. Optical rows carry the RA / Dec
+and along / cross-track residuals with the track-frame pair's full
+2×2 covariance; radar rows carry the delay (seconds) or Doppler
+(hertz) observed − predicted residual with its χ², degrees of freedom,
+survival probability, and combined variance. Every row also reports
+its D-optimality information loss on removal — +∞ marks an
+observation the fit cannot do without.
+
 Beyond the six-element state, `determine` and `refine` solve a wider
 parameter set — the Marsden A1/A2/A3 non-gravitational coefficients,
 the (cometary outgassing) time delay DT, the solar-radiation-pressure
@@ -329,11 +344,21 @@ fitted parameters travel with the matrix, so you read a parameter's
 variance from its slot — the DT slot, the AMRAT slot, a thrust
 component — rather than guessing at column order.
 
+It also carries an event-aware trust verdict on that covariance:
+trusted; encounter-intervenes — naming the intervening close approach
+or high-nonlinearity crossing, and whether a second-order state-only
+correction can recover it; or weakly-determined for wider solves,
+where the delivered 6×6 is the marginal of a higher-dimensional fit.
+Absence of a verdict is not trust — it means no gate ran.
+
 An optional post-OD photometry fit recovers the absolute magnitude H
 and a phase-function slope from the arc's observation magnitudes. It
 runs after the orbit is solved, climbing a model ladder — H-only →
 HG₁₂ → HG₁G₂ (Muinonen et al. 2010) — to the richest model the arc's
 phase-angle coverage supports, and reports H with an honest 1σ.
+Magnitudes in bands with no adopted V-band conversion are excluded,
+counted, and their band codes listed — the observations' astrometry
+is unaffected.
 
 ## Validation
 

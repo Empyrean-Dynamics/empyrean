@@ -25,15 +25,15 @@ raw FFI pointers.
 
 ```toml
 [dependencies]
-empyrean = "0.9.0-rc.0"
+empyrean = "0.9.0"
 ```
 
 ## What it does
 
 - **Propagation** — N-body (Sun, planets, Moon, Pluto) with EIH general relativity, Sun J2 and Earth J2–J4 zonal harmonics, 16 asteroid perturbers, and the Marsden non-gravitational model — selectable across Approximate / Basic / Standard force-model tiers (Standard is the default). GR15 and DOP853 integrators. Optional finite-burn thrust arcs — constant-RTN, velocity-tangent, or inertial-fixed steering, with per-arc Δv targeting corrections — layer on as a continuous-thrust force input.
 - **Uncertainty** — First-order (Jet1) state transition matrices; second-order (Jet2) state transition tensors; unscented sigma-point and Monte Carlo sampling; an adaptive Auto mode that escalates the method automatically through close approaches and relaxes it elsewhere. Optional per-epoch tagged-covariance readback.
-- **Ephemeris** — RA/Dec, rates, photometry (H–G, H–G₁G₂, H–G₁₂), light time, phase angle, solar elongation, local horizon.
-- **Orbit determination** — Gauss, Herget, and systematic-ranging (admissible region + Manifold of Variations) IOD → N-body differential correction over optical and radar (delay / Doppler) observations, with STM caching and outlier rejection. Solves beyond the six-element state for the Marsden A1/A2/A3 non-gravitational block, the cometary outgassing time delay DT, the SRP area-to-mass ratio AMRAT, and thrust Δv-correction segments — each partial supplied analytically by the hyperdual integrator — and returns a tagged solved covariance that names every fitted parameter. Optional post-fit photometry recovers H and the phase-function slope. Validated against `find_orb` and JPL SBDB.
+- **Ephemeris** — RA/Dec, rates, photometry (H–G, H–G₁G₂, H–G₁₂), light time, phase angle, solar elongation, local horizon. Each row carries the 6×6 sky-plane covariance over (ρ, RA, Dec) and their rates, and the aberrated barycentric ICRF state at the photon-emission epoch with its own 6×6 covariance — both present when the input orbit carries a state covariance.
+- **Orbit determination** — Gauss, Herget, and systematic-ranging (admissible region + Manifold of Variations) IOD → N-body differential correction over optical and radar (delay / Doppler) observations, with STM caching and outlier rejection. Solves beyond the six-element state for the Marsden A1/A2/A3 non-gravitational block, the cometary outgassing time delay DT, the SRP area-to-mass ratio AMRAT, and thrust Δv-correction segments — each partial supplied analytically by the hyperdual integrator — and returns a tagged solved covariance that names every fitted parameter, plus an event-aware trust verdict on the delivered covariance. Optional post-fit photometry recovers H and the phase-function slope. Validated against `find_orb` and JPL SBDB.
 - **Events** — Close approach (start/end), periapsis, gravitational capture (start/end), shadow entry/exit, atmospheric entry/exit, impact, and possible impact.
 
 ## Quick start
@@ -75,6 +75,20 @@ println!(
 );
 # Ok::<(), empyrean::Error>(())
 ```
+
+Every residual row carries per-observation diagnostics: χ² with its
+survival probability, along/cross-track residuals with the full
+symmetric 2×2 covariance, and influence measures including the
+D-optimality information loss on removal (+∞ marks an observation whose
+removal makes the normal matrix singular). Radar rows carry a typed
+delay / Doppler block — observed − predicted in seconds / hertz, with
+χ², survival probability, and the combined observed+predicted variance.
+`result.covariance_trust` is an event-aware verdict on the delivered
+covariance: `Trusted`, `EncounterIntervenes` (naming the intervening
+close approach or high-nonlinearity crossing, and whether a
+second-order state-only correction can recover it), or
+`WeaklyDeterminedHighN` for wider-than-state fits. `None` means no
+trust gate ran — absence of a verdict is not trust.
 
 ## Wide-parameter fitting
 
@@ -146,7 +160,10 @@ partials, so it never touches the state. In `Auto` it climbs a model ladder —
 H-only → HG12 → HG1G2 (Muinonen et al. 2010) — admitting the richest model the
 arc's phase-angle coverage supports and reporting the one it actually fit on
 `model_used` (never `Auto`). H carries an honest 1σ through the fitted
-`covariance`; the per-model gate decisions come back in `gates`.
+`covariance`; the per-model gate decisions come back in `gates`. Magnitudes
+whose band has no adopted V-band conversion are excluded and counted —
+`n_mags_dropped_unconvertible`, with the distinct offending band codes in
+`dropped_bands` — and the observations' astrometry is unaffected.
 
 ```rust,no_run
 use empyrean::{Context, ODConfig, PhotometryConfig};
@@ -190,6 +207,16 @@ for entry in &eph.entries {
 }
 # Ok::<(), empyrean::Error>(())
 ```
+
+Beyond the printed astrometry, each `EphemerisEntry` carries the 6×6
+sky-plane covariance over (ρ, RA, Dec) and their rates (AU / degree
+units), and the aberrated — light-time corrected — barycentric ICRF
+Cartesian state at the photon-emission epoch with its own 6×6
+covariance; both covariances are `None` when the input orbit carried no
+state covariance. Non-fatal generation warnings (an Earth-orientation
+kernel coverage gap handled by the analytic IAU 2006 fallback, a row
+whose observation-sensitivity chain was skipped) come back on
+`EphemerisResult::warnings` — empty when the run had nothing to report.
 
 ## Uncertainty
 
@@ -285,6 +312,14 @@ For each detected close approach you can ask for an impact-probability
 assessment or a full B-plane breakdown, and run several uncertainty methods
 side-by-side on the same encounter. Each returns one record per
 (method × orbit × body), tagged with its method and closest-approach epoch.
+Each record also carries the geodetic impact point on the body's reference
+ellipsoid (latitude / longitude / altitude — NaN when no surface projection
+is available for the encounter), the 95% binomial confidence half-width on
+the Monte-Carlo fraction, the second-order corrected mean miss distance
+with its 1σ uncertainty and skewness, the closest-approach distance
+gradient and 6×6 Hessian with respect to the initial state, and the
+adaptive Gaussian-mixture component count — fields a given method didn't
+compute carry NaN / 0 sentinels.
 
 ```rust,no_run
 # use empyrean::{Context, Epoch, UncertaintyMethod, Origin};

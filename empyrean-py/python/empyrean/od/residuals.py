@@ -92,6 +92,12 @@ class ObservationResults(qv.Table):
     """Scalar leverage h_ii ∈ [0, 2]."""
     fractional_information = qv.Float64Column(nullable=True)
     """Fractional Fisher-information contribution f_i = tr(N⁻¹ I_i)."""
+    influence_information_loss = qv.Float64Column(nullable=True)
+    """D-optimality information loss from removing this observation:
+    Δ_i = logdet(N) − logdet(N − I_i). Large values mean removal
+    significantly degrades solution precision. +∞ when the observation
+    is indispensable (N − I_i singular). Null when no influence pass
+    was run (e.g. evaluate)."""
 
     # ── Along/cross-track decomposition ───────────────────
     along_track = qv.Float64Column(nullable=True)
@@ -104,6 +110,30 @@ class ObservationResults(qv.Table):
     """Cross-track 1-σ uncertainty (arcsec)."""
     track_position_angle_deg = qv.Float64Column(nullable=True)
     """Position angle of sky motion (deg, East of North)."""
+    along_cross_covariance_arcsec2 = qv.Float64Column(nullable=True)
+    """Off-diagonal element of the 2×2 along/cross-track residual
+    covariance (arcsec²). Together with the AT/CT 1σ fields this
+    reconstructs the full symmetric 2×2. Null when no sky-motion-rate
+    decomposition was available."""
+
+    # ── Radar residual block (null on optical rows) ───────
+    radar_kind = qv.LargeStringColumn(nullable=True)
+    """``"delay"`` or ``"doppler"`` for radar observations; null for
+    optical rows."""
+    radar_residual = qv.Float64Column(nullable=True)
+    """Radar residual, observed − predicted: round-trip delay in
+    seconds (``radar_kind = "delay"``) or two-way Doppler in hertz
+    (``radar_kind = "doppler"``). The optical RA/Dec residual columns
+    are null on radar rows."""
+    radar_chi2 = qv.Float64Column(nullable=True)
+    """χ² of the radar residual."""
+    radar_dof = qv.Int32Column(nullable=True)
+    """Degrees of freedom of the radar residual (1 for radar)."""
+    radar_probability = qv.Float64Column(nullable=True)
+    """χ² survival probability of the radar residual."""
+    radar_variance = qv.Float64Column(nullable=True)
+    """Combined observed+predicted radar residual variance (s² for
+    delay, Hz² for Doppler)."""
 
     # ── Selection helpers ─────────────────────────────────
 

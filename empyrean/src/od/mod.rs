@@ -56,9 +56,10 @@ pub use nuisance::StationRaDecConfig;
 pub use observation::{Observation, Observations, RadarMeasurement, RadarObservation};
 pub use rejection::{RejectionConfig, RejectionKind};
 pub use result::{
-    AcceptabilityReport, BandStat, CovarianceRepresentation, DetermineResult, EvaluateResult,
-    GateRecord, ObservationResidual, OriginPolicy, OutputEpoch, PhotometryModel, PhotometryResult,
-    RejectionReason, ResidualSummary, SolveFor, SolveForParams, SolvedCovariance, StationBias,
+    AcceptabilityReport, BandStat, CovarianceRepresentation, CovarianceTrust, DetermineResult,
+    EvaluateResult, GateRecord, ObservationResidual, OriginPolicy, OutputEpoch, PhotometryModel,
+    PhotometryResult, RadarResidual, RadarResidualKind, RejectionReason, ResidualSummary, SolveFor,
+    SolveForParams, SolvedCovariance, StationBias, TrustGateEvent,
 };
 pub use weighting::{SigmaPolicy, WeightingConfig, WeightingLayer, WeightingPreset};
 
@@ -269,6 +270,7 @@ fn ffi_od_result_to_rust(
         .flatten();
     let photometry =
         (result.has_photometry != 0).then(|| PhotometryResult::from_ffi(&result.photometry));
+    let covariance_trust = CovarianceTrust::from_ffi(result);
     Ok(DetermineResult {
         orbit,
         residuals,
@@ -299,6 +301,7 @@ fn ffi_od_result_to_rust(
         thrust_delta_m_per_s,
         dv_frame,
         photometry,
+        covariance_trust,
     })
 }
 

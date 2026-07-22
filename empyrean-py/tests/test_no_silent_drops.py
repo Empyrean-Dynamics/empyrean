@@ -105,77 +105,13 @@ ALLOWED_ALL_NULL: dict[str, str] = {
     "PropagatedStates.photometric.g1": "schema-artifact (input fields on output table)",
     "PropagatedStates.photometric.g2": "schema-artifact (input fields on output table)",
     "PropagatedStates.photometric.g12": "schema-artifact (input fields on output table)",
-    # ── Ephemeris aberrated state: still dropped (C ABI flat schema has
-    # no aberrated x/y/z/vx/vy/vz + frame/origin). The six local-horizon /
-    # sky-motion angles that used to live here (zenith_angle, azimuth,
-    # hour_angle, lunar_elongation, position_angle, sky_rate) are now
-    # populated and are deliberately NOT on this list, so
-    # this test re-fails if they ever regress to all-null. ──
-    "Ephemeris.aberrated_state": "known drop (not in the C ABI flat schema)",
-    "Ephemeris.aberrated_state.epoch.days": "known drop (not in the C ABI flat schema)",
-    "Ephemeris.aberrated_state.epoch.nanos": "known drop (not in the C ABI flat schema)",
-    "Ephemeris.aberrated_state.x": "known drop (not in the C ABI flat schema)",
-    "Ephemeris.aberrated_state.y": "known drop (not in the C ABI flat schema)",
-    "Ephemeris.aberrated_state.z": "known drop (not in the C ABI flat schema)",
-    "Ephemeris.aberrated_state.vx": "known drop (not in the C ABI flat schema)",
-    "Ephemeris.aberrated_state.vy": "known drop (not in the C ABI flat schema)",
-    "Ephemeris.aberrated_state.vz": "known drop (not in the C ABI flat schema)",
-    # ── Ephemeris coordinates / aberrated_state covariance: known drop ──
-    # 21 spherical-covariance off-diagonals + 21 Cartesian-covariance entries
-    # all all-NaN even with covariance-bearing input. C ABI doesn't carry
-    # them.
-    **{
-        f"Ephemeris.coordinates.covariance.{c}": "known drop (covariance not in the C ABI)"
-        for c in [
-            "cov_rho_rho",
-            "cov_rho_lon",
-            "cov_lon_lon",
-            "cov_rho_lat",
-            "cov_lon_lat",
-            "cov_lat_lat",
-            "cov_rho_vrho",
-            "cov_lon_vrho",
-            "cov_lat_vrho",
-            "cov_vrho_vrho",
-            "cov_rho_vlon",
-            "cov_lon_vlon",
-            "cov_lat_vlon",
-            "cov_vrho_vlon",
-            "cov_vlon_vlon",
-            "cov_rho_vlat",
-            "cov_lon_vlat",
-            "cov_lat_vlat",
-            "cov_vrho_vlat",
-            "cov_vlon_vlat",
-            "cov_vlat_vlat",
-        ]
-    },
-    **{
-        f"Ephemeris.aberrated_state.covariance.{c}": "known drop (covariance not in the C ABI)"
-        for c in [
-            "cov_x_x",
-            "cov_x_y",
-            "cov_y_y",
-            "cov_x_z",
-            "cov_y_z",
-            "cov_z_z",
-            "cov_x_vx",
-            "cov_y_vx",
-            "cov_z_vx",
-            "cov_vx_vx",
-            "cov_x_vy",
-            "cov_y_vy",
-            "cov_z_vy",
-            "cov_vx_vy",
-            "cov_vy_vy",
-            "cov_x_vz",
-            "cov_y_vz",
-            "cov_z_vz",
-            "cov_vx_vz",
-            "cov_vy_vz",
-            "cov_vz_vz",
-        ]
-    },
+    # ── Ephemeris aberrated state + both covariances: populated as of
+    # v0.9.0 — the C ABI carries the sky-plane covariance,
+    # the aberrated Cartesian state, and the aberrated covariance, so none
+    # of them are allow-listed: this test re-fails if any regress to
+    # all-null. Same for the six local-horizon / sky-motion angles
+    # (zenith_angle, azimuth, hour_angle, lunar_elongation,
+    # position_angle, sky_rate). ──
     # ── BPlanes ip_linear: known drop (still pending) ──
     # cov / ellipse fields below are now populated upstream (test
     # caught the stale entry) and have been removed; ip_linear stays
@@ -197,6 +133,15 @@ ALLOWED_ALL_NULL: dict[str, str] = {
     "ImpactProbabilities.ip_second_order": "by-design (Jet2 method only)",
     "ImpactProbabilities.nonlinearity": "by-design (Jet2 method only)",
     "ImpactProbabilities.ip_agm": "by-design (AGM method only)",
+    "ImpactProbabilities.mc_confidence_interval": "by-design (MC method only)",
+    "ImpactProbabilities.mean_distance_second_order_au": "by-design (Jet2 or MC method only)",
+    "ImpactProbabilities.sigma_distance_second_order_au": "by-design (Jet2 method only)",
+    "ImpactProbabilities.skewness": "by-design (Jet2 method only)",
+    "ImpactProbabilities.distance_hessian": "by-design (Jet2 method only)",
+    "ImpactProbabilities.agm_components": "by-design (AGM refinement only)",
+    # (impact_latitude_deg / impact_longitude_deg / impact_altitude_km are
+    # populated by the enrichment pass on the fixture — deliberately NOT
+    # allow-listed, so this test re-fails if they regress to all-null.)
     # (Periapses.relative_{x,y,z,vx,vy,vz} were once dropped here
     # but are now wired through the C ABI and populated — removed, so this
     # test re-fails if they ever regress to all-null.)

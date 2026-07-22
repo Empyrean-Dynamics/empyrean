@@ -93,7 +93,8 @@ Beyond propagation, the same cdylib fits orbits to astrometry through
 additionally accepts radar (delay / Doppler) observations;
 `empyrean_refine` / `empyrean_evaluate` operate on the optical astrometry
 plus the prior orbit. All three read a single `EmpyreanODConfig`. `empyrean_determine` / `empyrean_refine` return an
-`EmpyreanODResult` (fitted orbit + covariance + residuals);
+`EmpyreanODResult` (fitted orbit + covariance + residuals + a
+covariance-trust verdict);
 `empyrean_evaluate` returns an `EmpyreanEvaluateResult` (the same
 per-observation residual surface, with no fitted orbit). Zero-initialize
 the config and every axis defaults to its upstream value.
@@ -145,8 +146,36 @@ An axis that was not solved carries `EMPYREAN_SLOT_NONE`. The leading
 `width` are reserved (zero), not defaulted covariance. A consumer
 compiled against a given `EMPYREAN_SOLVE_WIDTH` should confirm the
 runtime library agrees by checking `empyrean_abi_version()` against
-`EMPYREAN_ABI_VERSION` at load — the v0.9.0-rc.0 release ships ABI
-version 1.
+`EMPYREAN_ABI_VERSION` at load — the v0.9.0 release ships ABI
+version 2. Version 2 grew several result structs — fields are only ever
+appended, never reordered or removed — so a consumer built against the
+version-1 header must recompile against the version-2 header.
+
+### Covariance trust & per-observation diagnostics
+
+`empyrean_determine` grades the covariance it delivers with an
+event-aware **trust verdict** (`covariance_trust`, an
+`EMPYREAN_COVARIANCE_TRUST_*` code): **trusted** (no intervening
+encounter, 6-state solve), **encounter-intervenes** (a close approach or
+high-nonlinearity crossing sits inside the covariance validity window —
+the result names the event via the `trust_event_*` fields, and
+`trust_second_order_recoverable` says whether a second-order state-only
+correction can recover it), or **weakly-determined** (the delivered 6×6
+is a marginal of a wider-than-6 fit). `NOT_EVALUATED` means the call
+path ran no gate (e.g. `empyrean_refine`) — absence of a verdict is not
+trust.
+
+Per-observation rows carry the full diagnostic surface: radar rows
+(`has_radar = 1`) report the delay / Doppler residual
+(observed − predicted, in seconds / hertz per `radar_kind`) with its own
+χ², degrees of freedom, survival probability, and combined
+observed+predicted variance; the influence pass reports each
+observation's D-optimality **information loss on removal**
+(`influence_information_loss`, +∞ when removal makes the normal matrix
+singular — the observation is indispensable); and the along/cross-track
+residual pair carries its off-diagonal covariance
+(`along_cross_covariance_arcsec2`), completing the 2×2. Each of these is
+NaN when its pass did not run — never silently zeroed.
 
 ### Post-OD photometry
 
@@ -161,6 +190,11 @@ HG12 and HG1G2 systems follow Muinonen et al. (2010). H comes back with
 an honest 1σ via the fit's `covariance` block (H, slope1, slope2
 order); the model can also be pinned with
 `EMPYREAN_PHOTOMETRY_MODEL_HONLY` / `_HG` / `_HG12` / `_HG1G2`.
+Magnitudes whose photometric band has no adopted V-band conversion are
+excluded from the photometric fit — the report counts them
+(`n_mags_dropped_unconvertible`) and lists the distinct offending band
+codes (`dropped_bands`); those observations' astrometry still
+participates in the orbit fit.
 
 ### Example: refine an orbit with a non-grav prior
 
@@ -233,6 +267,35 @@ if (radar) empyrean_radar_observations_free(radar, n_radar);
 initial-orbit seed array (pass `NULL, 0` to let IOD produce its own
 seeds) and the radar array; free either fit's result with
 `empyrean_od_result_free`.
+
+## Plan evaluation
+
+The same cdylib scores a planned follow-up campaign through
+`empyrean_evaluate_plan`: each optical / radar candidate comes back as
+an `EmpyreanPlanCandidate` carrying its sky-plane uncertainty geometry
+and marginal information gain, bracketed by prior / posterior covariance
+metrics. Radar candidates additionally report the effective **SNR** used
+for the delay/Doppler measurement uncertainty (a linear power ratio, not
+dB), the one-way topocentric **range** at the receive epoch (km), the
+**measurement mode** (delay / Doppler / both), and **link-budget
+provenance notes** — human-readable strings recording any assumption
+made while deriving the SNR from the link budget (absent for optical
+candidates, a caller-supplied SNR, or a fully specified link budget).
+The plan result also carries the predicted optical **ephemeris**
+(`EmpyreanPlanEphemerisPoint`: epoch in MJD TDB, topocentric RA / Dec in
+degrees, ICRF), one point per optical candidate — radar candidates carry
+no sky-plane prediction. Free the result with
+`empyrean_plan_result_free`.
+
+## Basis-tagged mixture components
+
+Gaussian-mixture uncertainty output is self-describing: each
+`EmpyreanMixtureComponent` carries the reference `frame` and center-body
+`origin` (NAIF id) its mean and covariance are expressed in, using the
+same integer encodings as `EmpyreanPropagatedState`. Read the tags
+rather than assuming a basis — with origin switching active, components
+at different close-approach epochs of the same chain can carry different
+origins.
 
 ## Closed-source posture
 

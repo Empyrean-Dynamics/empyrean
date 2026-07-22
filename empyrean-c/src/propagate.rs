@@ -740,11 +740,27 @@ pub struct EmpyreanEvent {
 /// segment. A consumer can evaluate
 /// \\(\sum_k w_k \\, \mathcal{N}(x \mid \mu_k, \Sigma_k)\\) directly
 /// at the CA epoch.
+///
+/// Each component is basis-tagged: `frame` / `origin` give the
+/// reference frame and center body its `mean` and `covariance` are
+/// expressed in, so the mixture is self-describing rather than relying
+/// on positional alignment with the propagated states.
 #[repr(C)]
 pub struct EmpyreanMixtureComponent {
     pub weight: f64,
     pub mean: [f64; 6],
     pub covariance: [[f64; 6]; 6],
+    /// Reference frame `mean` / `covariance` are expressed in — the
+    /// integration frame of the run. Same integer encoding as
+    /// `EmpyreanPropagatedState.frame` (0 = ICRF, 1 = ecliptic J2000,
+    /// 2 = ITRF93).
+    pub frame: i32,
+    /// Origin (center body) `mean` is expressed relative to, as a NAIF
+    /// id — same encoding as `EmpyreanPropagatedState.origin`
+    /// (e.g. 10 = Sun, 399 = Earth). Matches the propagation origin at
+    /// the split's close-approach epoch, so it can differ between CA
+    /// epochs of the same chain when origin switching occurred.
+    pub origin: i32,
 }
 
 /// Per-orbit AGM mixture decomposition retained by Auto / Mixture.
@@ -1655,6 +1671,8 @@ pub(crate) fn marshal_propagation_result(
                                 weight: comp.weight,
                                 mean: comp.mean,
                                 covariance: comp.covariance,
+                                frame: frame_to_int(comp.frame),
+                                origin: comp.origin.naif_id(),
                             });
                     }
                 }

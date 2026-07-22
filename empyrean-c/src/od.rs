@@ -6,10 +6,11 @@ use empyrean_core::ForceModelTier;
 use empyrean_core::convert::{coordinate_state_to_coordinates, frame_to_int};
 use empyrean_core::coordinates::{AU, CoordinateRepresentation, Coordinates, Origin};
 use empyrean_core::determination::{
-    AcceptabilityReport, AdaptiveRejectionConfig, BiasKind, BiasScope, CMC2003Config, ODConfig,
-    ODResult, ObservationResidualSummary, ObservationResult, Observations, OriginPolicy,
-    OutputEpoch, RadarMeasurement, RadarObservation, RejectionReason, SolveFor, SolveForParams,
-    SolvedCovariance, UpstreamForceModelTier, determine, evaluate_single, refine_single,
+    AcceptabilityReport, AdaptiveRejectionConfig, BiasKind, BiasScope, CMC2003Config,
+    CovarianceTrust, ODConfig, ODResult, ObservationResidualSummary, ObservationResult,
+    Observations, OriginPolicy, OutputEpoch, RadarMeasurement, RadarObservation, RadarResidual,
+    RejectionReason, SolveFor, SolveForParams, SolvedCovariance, TrustGateEvent,
+    UpstreamForceModelTier, determine, evaluate_single, refine_single,
 };
 use empyrean_core::io::{ADESObservations, parse_ades};
 use empyrean_core::nongrav::NonGravModel;
@@ -131,6 +132,27 @@ pub const EMPYREAN_RADAR_KIND_DELAY: u8 = 0;
 /// Doppler-shift measurement: `doppler_hz` / `rms_doppler_hz` are valid;
 /// the delay pair is `f64::NAN`.
 pub const EMPYREAN_RADAR_KIND_DOPPLER: u8 = 1;
+
+/// Covariance-trust verdict: the call path ran no trust gate — absence
+/// of a verdict is NOT trust (e.g. `empyrean_refine`, session paths).
+pub const EMPYREAN_COVARIANCE_TRUST_NOT_EVALUATED: i32 = 0;
+/// Covariance-trust verdict: no intervening close approach and a
+/// 6-state solve — the linear covariance may be used as delivered.
+pub const EMPYREAN_COVARIANCE_TRUST_TRUSTED: i32 = 1;
+/// Covariance-trust verdict: a close approach (or high-nonlinearity
+/// crossing) lies inside the covariance validity window — do not
+/// extrapolate the linear covariance across it.
+pub const EMPYREAN_COVARIANCE_TRUST_ENCOUNTER_INTERVENES: i32 = 2;
+/// Covariance-trust verdict: the fit solved more than the 6-state, so
+/// the delivered 6×6 is a marginal of a wider fit (conservative flag).
+pub const EMPYREAN_COVARIANCE_TRUST_WEAKLY_DETERMINED_HIGH_N: i32 = 3;
+
+/// Intervening trust-gate event kind: none.
+pub const EMPYREAN_TRUST_EVENT_NONE: i32 = 0;
+/// Intervening trust-gate event kind: close approach to a body.
+pub const EMPYREAN_TRUST_EVENT_CLOSE_APPROACH: i32 = 1;
+/// Intervening trust-gate event kind: high-nonlinearity crossing.
+pub const EMPYREAN_TRUST_EVENT_HIGH_NONLINEARITY: i32 = 2;
 
 /// A single radar (delay or Doppler) observation for orbit determination —
 /// the ADES `<radar>` schema.
@@ -424,7 +446,7 @@ pub const EMPYREAN_PHOTOMETRY_MODEL_HG1G2: i32 = 4;
 /// per-crate semver strings in `EmpyreanVersions` (which are provenance).
 /// Consumers compiled against a given `EMPYREAN_SOLVE_WIDTH` check this at
 /// load; any additive change to the frozen structs bumps it.
-pub const EMPYREAN_ABI_VERSION: u32 = 1;
+pub const EMPYREAN_ABI_VERSION: u32 = 2;
 
 /// Runtime accessor for [`EMPYREAN_ABI_VERSION`] — lets a dynamically
 /// linked consumer confirm the loaded library's frozen-shape contract
@@ -532,6 +554,40 @@ pub struct EmpyreanObservationResult {
     pub cross_track_error_arcsec: f64,
     /// Position angle of sky motion (degrees, East of North). NaN if unavailable.
     pub track_position_angle_deg: f64,
+    /// D-optimality information loss on removal, from the influence
+    /// pass: \\(\Delta_i = \log\det N - \log\det(N - I_i)\\). NaN
+    /// if no influence pass was run; +∞ when removing this observation
+    /// makes the normal matrix singular (the observation is
+    /// indispensable).
+    pub influence_information_loss: f64,
+    /// Off-diagonal covariance of the (along-track, cross-track)
+    /// residual pair (arcsec²). Symmetric 2×2: the diagonal is
+    /// `along_track_error_arcsec`² / `cross_track_error_arcsec`².
+    /// NaN when the AT/CT covariance is unavailable.
+    pub along_cross_covariance_arcsec2: f64,
+    /// Radar (delay/Doppler) residual: observed − predicted. Seconds
+    /// for delay, hertz for Doppler (see `radar_kind`). NaN when
+    /// `has_radar == 0`.
+    pub radar_residual: f64,
+    /// χ² of the radar residual. NaN when `has_radar == 0`.
+    pub radar_chi2: f64,
+    /// χ² survival probability of the radar residual. NaN when
+    /// `has_radar == 0`.
+    pub radar_probability: f64,
+    /// Combined observed+predicted radar residual variance (s² for
+    /// delay, Hz² for Doppler). NaN when unavailable or
+    /// `has_radar == 0`.
+    pub radar_variance: f64,
+    /// Degrees of freedom of the radar residual (1 for radar). 0 when
+    /// `has_radar == 0`.
+    pub radar_dof: u32,
+    /// 1 when this row is a radar observation and the `radar_*` fields
+    /// are live. The optical RA/Dec residual fields are NaN on radar
+    /// rows.
+    pub has_radar: u8,
+    /// `EMPYREAN_RADAR_KIND_DELAY` (0) or `EMPYREAN_RADAR_KIND_DOPPLER`
+    /// (1). Only meaningful when `has_radar == 1`.
+    pub radar_kind: u8,
 }
 
 /// Aggregate residual statistics.
@@ -834,6 +890,19 @@ pub struct EmpyreanODPhotometryResult {
     /// Owned model-ladder gate records; freed by [`empyrean_od_result_free`].
     pub gates: *mut EmpyreanGateRecord,
     pub num_gates: usize,
+    /// Magnitudes excluded from the fit because their photometric band
+    /// has no adopted V-band conversion (unknown/unspecified band
+    /// codes, comet total/nuclear magnitudes). Never silent: each
+    /// exclusion is counted here and the distinct offending band codes
+    /// are listed in `dropped_bands`. The observations' astrometry is
+    /// unaffected.
+    pub n_mags_dropped_unconvertible: usize,
+    /// Distinct band codes that were dropped (owned array of owned C
+    /// strings, sorted). Freed by `empyrean_od_result_free`. Null when
+    /// `num_dropped_bands == 0`.
+    pub dropped_bands: *mut *mut c_char,
+    /// Number of entries in `dropped_bands` (0 when null).
+    pub num_dropped_bands: usize,
 }
 
 /// Mirrors scott's [`ODResult`](scott::od::ODResult). Carries the fitted
@@ -939,6 +1008,35 @@ pub struct EmpyreanODResult {
     /// evaluate / refine so a fitted orbit never silently drops its SRP force.
     /// Zeroed when the orbit carries no SRP (`has_srp = 0`).
     pub srp: EmpyreanSRPParams,
+    /// Event-aware trust verdict on the delivered covariance
+    /// (`EMPYREAN_COVARIANCE_TRUST_*`). `NOT_EVALUATED` (0) means the
+    /// call path ran no gate — absence of a verdict is not trust.
+    pub covariance_trust: i32,
+    /// Intervening-event kind (`EMPYREAN_TRUST_EVENT_*`); `NONE` unless
+    /// `covariance_trust == ENCOUNTER_INTERVENES`.
+    pub trust_event_kind: i32,
+    /// Event epoch (MJD TDB). NaN when no event.
+    pub trust_event_epoch_mjd_tdb: f64,
+    /// Close-approach distance (AU). NaN unless
+    /// `trust_event_kind == CLOSE_APPROACH`.
+    pub trust_event_distance_au: f64,
+    /// Nonlinearity ratio at the crossing. NaN unless
+    /// `trust_event_kind == HIGH_NONLINEARITY`.
+    pub trust_event_nonlinearity: f64,
+    /// Threshold the nonlinearity exceeded. NaN unless
+    /// `trust_event_kind == HIGH_NONLINEARITY`.
+    pub trust_event_threshold: f64,
+    /// Name of the approached body (owned C string; freed by
+    /// `empyrean_od_result_free`). Null unless
+    /// `trust_event_kind == CLOSE_APPROACH`.
+    pub trust_event_body: *mut c_char,
+    /// Solved-for width N of the fit the verdict refers to. 0 when the
+    /// verdict carries no width (`TRUSTED` / `NOT_EVALUATED`).
+    pub trust_solved_width: u32,
+    /// 1 when a second-order (state-only) correction can recover the
+    /// encounter (solved width 6); 0 otherwise. Meaningful only for
+    /// `ENCOUNTER_INTERVENES`.
+    pub trust_second_order_recoverable: u8,
 }
 
 /// Result of orbit evaluation (residuals without fitting).
@@ -1513,22 +1611,46 @@ pub(crate) fn observation_results_to_c(
         };
 
         // Influence diagnostics (None on evaluate path).
-        let (cooks, lev, frac_info) = match &obs.influence {
-            Some(inf) => (inf.cooks_distance, inf.leverage, inf.fractional_information),
-            None => (f64::NAN, f64::NAN, f64::NAN),
+        let (cooks, lev, frac_info, info_loss) = match &obs.influence {
+            Some(inf) => (
+                inf.cooks_distance,
+                inf.leverage,
+                inf.fractional_information,
+                inf.information_loss,
+            ),
+            None => (f64::NAN, f64::NAN, f64::NAN, f64::NAN),
         };
 
         // Along/cross-track decomposition (None when no sky-motion rates).
-        let (at, ct, at_err, ct_err, pa) = match &obs.along_cross_track {
+        let (at, ct, at_err, ct_err, pa, at_ct_cov) = match &obs.along_cross_track {
             Some(act) => (
                 act.along_track,
                 act.cross_track,
                 act.along_track_error,
                 act.cross_track_error,
                 act.position_angle,
+                act.covariance.map(|c| c[0][1]).unwrap_or(f64::NAN),
             ),
-            None => (f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN),
+            None => (f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN),
         };
+
+        // Radar residual (delay/Doppler) — None for optical rows.
+        let (has_radar, radar_kind, radar_residual, radar_chi2, radar_dof, radar_prob, radar_var) =
+            match &obs.radar {
+                Some(r) => (
+                    1u8,
+                    match r {
+                        RadarResidual::Delay(_) => EMPYREAN_RADAR_KIND_DELAY,
+                        RadarResidual::Doppler(_) => EMPYREAN_RADAR_KIND_DOPPLER,
+                    },
+                    r.value(),
+                    r.chi2(),
+                    r.dof() as u32,
+                    r.probability(),
+                    r.variance().unwrap_or(f64::NAN),
+                ),
+                None => (0u8, 0u8, f64::NAN, f64::NAN, 0u32, f64::NAN, f64::NAN),
+            };
 
         let entry = EmpyreanObservationResult {
             obs_id: alloc_cstring(&obs.obs_id),
@@ -1557,6 +1679,15 @@ pub(crate) fn observation_results_to_c(
             along_track_error_arcsec: at_err,
             cross_track_error_arcsec: ct_err,
             track_position_angle_deg: pa,
+            influence_information_loss: info_loss,
+            along_cross_covariance_arcsec2: at_ct_cov,
+            radar_residual,
+            radar_chi2,
+            radar_probability: radar_prob,
+            radar_variance: radar_var,
+            radar_dof,
+            has_radar,
+            radar_kind,
         };
         unsafe {
             ptr.add(i).write(entry);
@@ -1828,6 +1959,37 @@ unsafe fn free_gate_records(ptr: *mut EmpyreanGateRecord, n: usize) {
     }
 }
 
+/// Marshal a string slice into an owned C array of owned C strings.
+/// Returns `(null, 0)` for an empty slice. Free with
+/// [`free_string_array`].
+fn string_vec_to_c(strings: &[String]) -> (*mut *mut c_char, usize) {
+    if strings.is_empty() {
+        return (std::ptr::null_mut(), 0);
+    }
+    let n = strings.len();
+    let layout = std::alloc::Layout::array::<*mut c_char>(n).unwrap();
+    let ptr = unsafe { std::alloc::alloc(layout) } as *mut *mut c_char;
+    if ptr.is_null() {
+        return (std::ptr::null_mut(), 0);
+    }
+    for (i, s) in strings.iter().enumerate() {
+        unsafe { ptr.add(i).write(alloc_cstring(s)) };
+    }
+    (ptr, n)
+}
+
+/// Free a string array previously produced by [`string_vec_to_c`].
+unsafe fn free_string_array(ptr: *mut *mut c_char, n: usize) {
+    if ptr.is_null() || n == 0 {
+        return;
+    }
+    for i in 0..n {
+        unsafe { free_cstring(*ptr.add(i)) };
+    }
+    let layout = std::alloc::Layout::array::<*mut c_char>(n).unwrap();
+    unsafe { std::alloc::dealloc(ptr as *mut u8, layout) };
+}
+
 fn photometry_result_to_c(p: &PhotometryResult) -> EmpyreanODPhotometryResult {
     let (has_covariance, covariance) = match p.params.covariance {
         Some(c) => (1u8, c),
@@ -1835,6 +1997,7 @@ fn photometry_result_to_c(p: &PhotometryResult) -> EmpyreanODPhotometryResult {
     };
     let (per_band, num_per_band) = band_stats_to_c(&p.per_band);
     let (gates, num_gates) = gate_records_to_c(&p.gates);
+    let (dropped_bands, num_dropped_bands) = string_vec_to_c(&p.dropped_bands);
     EmpyreanODPhotometryResult {
         h: p.params.p1,
         slope1: p.params.p2,
@@ -1856,10 +2019,13 @@ fn photometry_result_to_c(p: &PhotometryResult) -> EmpyreanODPhotometryResult {
         num_per_band,
         gates,
         num_gates,
+        n_mags_dropped_unconvertible: p.n_mags_dropped_unconvertible,
+        dropped_bands,
+        num_dropped_bands,
     }
 }
 
-fn zeroed_photometry_result() -> EmpyreanODPhotometryResult {
+pub(crate) fn zeroed_photometry_result() -> EmpyreanODPhotometryResult {
     EmpyreanODPhotometryResult {
         h: 0.0,
         slope1: 0.0,
@@ -1881,6 +2047,107 @@ fn zeroed_photometry_result() -> EmpyreanODPhotometryResult {
         num_per_band: 0,
         gates: std::ptr::null_mut(),
         num_gates: 0,
+        n_mags_dropped_unconvertible: 0,
+        dropped_bands: std::ptr::null_mut(),
+        num_dropped_bands: 0,
+    }
+}
+
+/// Write the covariance-trust verdict fields on a result out-pointer.
+/// `None` maps to `NOT_EVALUATED` — produced by call paths that run no
+/// trust gate; absence of a verdict is not trust.
+pub(crate) unsafe fn write_covariance_trust(
+    result_out: *mut EmpyreanODResult,
+    trust: &Option<CovarianceTrust>,
+) {
+    let (verdict, kind, epoch, dist, nonlin, thr, body, width, recoverable) = match trust {
+        None => (
+            EMPYREAN_COVARIANCE_TRUST_NOT_EVALUATED,
+            EMPYREAN_TRUST_EVENT_NONE,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            std::ptr::null_mut(),
+            0u32,
+            0u8,
+        ),
+        Some(CovarianceTrust::Trusted) => (
+            EMPYREAN_COVARIANCE_TRUST_TRUSTED,
+            EMPYREAN_TRUST_EVENT_NONE,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            std::ptr::null_mut(),
+            0u32,
+            0u8,
+        ),
+        Some(CovarianceTrust::EncounterIntervenes {
+            event,
+            solved_width,
+            second_order_recoverable,
+        }) => {
+            let (kind, epoch, dist, nonlin, thr, body) = match event {
+                TrustGateEvent::CloseApproach {
+                    body,
+                    epoch_mjd_tdb,
+                    distance_au,
+                } => (
+                    EMPYREAN_TRUST_EVENT_CLOSE_APPROACH,
+                    *epoch_mjd_tdb,
+                    *distance_au,
+                    f64::NAN,
+                    f64::NAN,
+                    alloc_cstring(body),
+                ),
+                TrustGateEvent::HighNonlinearity {
+                    epoch_mjd_tdb,
+                    nonlinearity,
+                    threshold,
+                } => (
+                    EMPYREAN_TRUST_EVENT_HIGH_NONLINEARITY,
+                    *epoch_mjd_tdb,
+                    f64::NAN,
+                    *nonlinearity,
+                    *threshold,
+                    std::ptr::null_mut(),
+                ),
+            };
+            (
+                EMPYREAN_COVARIANCE_TRUST_ENCOUNTER_INTERVENES,
+                kind,
+                epoch,
+                dist,
+                nonlin,
+                thr,
+                body,
+                *solved_width as u32,
+                u8::from(*second_order_recoverable),
+            )
+        }
+        Some(CovarianceTrust::WeaklyDeterminedHighN { solved_width }) => (
+            EMPYREAN_COVARIANCE_TRUST_WEAKLY_DETERMINED_HIGH_N,
+            EMPYREAN_TRUST_EVENT_NONE,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            std::ptr::null_mut(),
+            *solved_width as u32,
+            0u8,
+        ),
+    };
+    unsafe {
+        (*result_out).covariance_trust = verdict;
+        (*result_out).trust_event_kind = kind;
+        (*result_out).trust_event_epoch_mjd_tdb = epoch;
+        (*result_out).trust_event_distance_au = dist;
+        (*result_out).trust_event_nonlinearity = nonlin;
+        (*result_out).trust_event_threshold = thr;
+        (*result_out).trust_event_body = body;
+        (*result_out).trust_solved_width = width;
+        (*result_out).trust_second_order_recoverable = recoverable;
     }
 }
 
@@ -1890,6 +2157,7 @@ fn zeroed_photometry_result() -> EmpyreanODPhotometryResult {
 /// per the full-population contract.
 unsafe fn populate_wide_fitting_fields(result_out: *mut EmpyreanODResult, od: &ODResult) {
     unsafe {
+        write_covariance_trust(result_out, &od.covariance_trust);
         match &od.solved_covariance {
             Some(sc) => {
                 (*result_out).has_solved_covariance = 1;
@@ -3310,6 +3578,11 @@ pub unsafe extern "C" fn empyrean_od_result_free(result: *mut EmpyreanODResult) 
             // Photometry owned arrays (null / 0 when no photometry ran).
             free_band_stats(res.photometry.per_band, res.photometry.num_per_band);
             free_gate_records(res.photometry.gates, res.photometry.num_gates);
+            free_string_array(
+                res.photometry.dropped_bands,
+                res.photometry.num_dropped_bands,
+            );
+            free_cstring(res.trust_event_body);
             (*result).observations = std::ptr::null_mut();
             (*result).num_observations = 0;
             (*result).station_biases = std::ptr::null_mut();
@@ -3318,6 +3591,9 @@ pub unsafe extern "C" fn empyrean_od_result_free(result: *mut EmpyreanODResult) 
             (*result).photometry.num_per_band = 0;
             (*result).photometry.gates = std::ptr::null_mut();
             (*result).photometry.num_gates = 0;
+            (*result).photometry.dropped_bands = std::ptr::null_mut();
+            (*result).photometry.num_dropped_bands = 0;
+            (*result).trust_event_body = std::ptr::null_mut();
         }
     }));
 }

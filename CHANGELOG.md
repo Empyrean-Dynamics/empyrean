@@ -4,6 +4,84 @@ Notable changes to the empyrean distribution — the `empyrean`, `empyrean-sys`,
 `empyrean-c`, and `empyrean-cli` crates and the `empyrean` Python package. This
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.9.0] — 2026-07-21
+
+The complete output surface: every value the engine computes now crosses
+the C ABI (empyrean-core v0.9.2, villeneuve v1.20.2, scott v1.15.0).
+C ABI version 2 — struct shapes grew by appending fields, so ABI-1
+consumers must recompile against the version-2 header.
+
+### Added
+
+- **Ephemeris uncertainty outputs.** Each ephemeris row carries the 6×6
+  sky-plane covariance over (ρ, RA, Dec) and their rates (AU / degree
+  units), and the aberrated (light-time corrected) barycentric ICRF
+  Cartesian state at the photon-emission epoch with its own 6×6
+  covariance — populated whenever the input orbit carries a state
+  covariance, never zero-filled. A generate call also returns run-level
+  non-fatal **generation warnings** (e.g. an Earth-orientation kernel
+  coverage gap handled by the analytic IAU 2006 fallback, or a row
+  whose sensitivity chain was skipped), on both the one-shot and
+  handle-based paths.
+- **Per-observation OD diagnostics.** Residual rows carry radar
+  delay / Doppler residuals (observed − predicted in seconds / hertz,
+  with χ², degrees of freedom, survival probability, and combined
+  variance), the D-optimality information loss on removal (+∞ marks an
+  indispensable observation), and the along/cross-track covariance
+  off-diagonal completing the 2×2.
+- **Covariance trust verdict.** `determine` results carry an
+  event-aware verdict on the delivered covariance: trusted;
+  encounter-intervenes (naming the intervening close approach or
+  high-nonlinearity crossing, and whether a second-order state-only
+  correction can recover it); or weakly-determined for wider-than-state
+  fits. Absence of a verdict is not trust — it means no gate ran.
+- **Photometry drop report.** Magnitudes whose band has no adopted
+  V-band conversion are excluded from the photometric fit, counted
+  (`n_mags_dropped_unconvertible`), and their distinct band codes
+  listed (`dropped_bands`); the observations' astrometry is unaffected.
+  The band→V table itself gained the modern two-character ADES codes
+  (Johnson-Cousins, Sloan, Pan-STARRS, LSST, ATLAS).
+- **Impact-probability detail.** Each record carries the geodetic
+  impact point (latitude / longitude / altitude on the body's reference
+  ellipsoid, when a surface projection is available), the Monte-Carlo
+  95% binomial confidence half-width, the second-order corrected mean
+  miss distance with its 1σ uncertainty and skewness, the
+  closest-approach distance gradient and 6×6 Hessian with respect to
+  the initial state, and the adaptive Gaussian-mixture component count.
+- **Plan evaluation outputs (C ABI).** Radar candidates report the
+  effective SNR (linear power ratio), one-way range (km), measurement
+  mode, and link-budget provenance notes; plan results carry the
+  predicted optical ephemeris (epoch MJD TDB, RA, Dec per optical
+  candidate).
+- **Basis-tagged mixture components (C ABI).** Each Gaussian-mixture
+  component carries the reference frame and center-body origin its mean
+  and covariance are expressed in.
+- **Output-integrity tests.** New finiteness contracts assert that
+  analytic uncertainty outputs are populated with finite values — never
+  silently all-NaN — alongside the expanded no-silent-drops guards.
+
+### Changed
+
+- `EMPYREAN_ABI_VERSION` is now **2**. Fields are only ever appended,
+  never reordered or removed; recompile against the version-2 header.
+- The aberrated-state rows in the Python ephemeris table are stamped at
+  the photon-emission epoch (observation epoch − light time), matching
+  the state they carry.
+- Covariance sub-tables with mixed per-row presence now carry genuinely
+  null rows where no covariance exists, rather than NaN-valued rows.
+
+### Fixed
+
+- `generate_ephemeris` shipped an all-NaN sky covariance in
+  v0.9.0-rc.0 even when the input orbit carried a finite covariance —
+  the marshaling dropped it at the C boundary. Fixed end-to-end across
+  every channel.
+- Session OD paths now explicitly zero every owned-pointer surface they
+  do not populate, so freeing a session result never touches
+  uninitialized caller memory.
+- A clean ephemeris re-save into a reused directory removes a stale
+  `warnings.json` instead of attributing old warnings to new data.
+
 ## [0.9.0-rc.0] — 2026-07-20
 
 Wide-parameter orbit determination and post-OD photometry, at API parity
@@ -264,6 +342,7 @@ below.
 Earlier release candidates (rc.0–rc.3) are documented in their tagged GitHub
 releases.
 
+[0.9.0]: https://github.com/Empyrean-Dynamics/empyrean/releases/tag/v0.9.0
 [0.9.0-rc.0]: https://github.com/Empyrean-Dynamics/empyrean/releases/tag/v0.9.0-rc.0
 [0.8.2]: https://github.com/Empyrean-Dynamics/empyrean/releases/tag/v0.8.2
 [0.8.1]: https://github.com/Empyrean-Dynamics/empyrean/releases/tag/v0.8.1

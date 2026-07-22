@@ -26,11 +26,7 @@ DuckDB.
 ## Install
 
 ```sh
-# Latest stable release.
 cargo install empyrean-cli
-
-# This pre-release (v0.9.0-rc.0) — cargo needs the explicit version.
-cargo install empyrean-cli --version 0.9.0-rc.0
 ```
 
 `cargo install` fetches the closed-source `libempyrean` engine

@@ -146,7 +146,7 @@ An axis that was not solved carries `EMPYREAN_SLOT_NONE`. The leading
 `width` are reserved (zero), not defaulted covariance. A consumer
 compiled against a given `EMPYREAN_SOLVE_WIDTH` should confirm the
 runtime library agrees by checking `empyrean_abi_version()` against
-`EMPYREAN_ABI_VERSION` at load — the v0.9.0-rc.0 release ships ABI
+`EMPYREAN_ABI_VERSION` at load — the v0.9.0 release ships ABI
 version 2. Version 2 grew several result structs — fields are only ever
 appended, never reordered or removed — so a consumer built against the
 version-1 header must recompile against the version-2 header.

@@ -18,11 +18,10 @@ Uncertainty-first orbit propagation, ephemeris, orbit determination, and event d
 ---
 
 ```bash
-pip install --pre empyrean
+pip install empyrean
 ```
 
-`0.9.0rc0` is a release candidate, so `pip install` needs the `--pre`
-flag to resolve a pre-release from PyPI. A plain install pulls empyrean
+A plain install pulls empyrean
 together with the B612 Foundation's
 pre-packaged SPICE kernels (~740 MB — see the table below). After
 installation, the first call to `empyrean.initialize()` downloads a

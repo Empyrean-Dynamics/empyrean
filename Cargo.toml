@@ -48,10 +48,3 @@ lto = "fat"
 # against this workspace, re-add a `[patch."ssh://…git"] <crate> = { path =
 # "../<repo>" }` block here (cargo only honours [patch] at the workspace
 # root, not from a path-dep's manifest).
-#
-# TEMPORARY (v0.9.0 train — REMOVE BEFORE RELEASE): build against the local
-# in-flight engine chain. empyrean-core's own manifest TEMP path-deps the
-# villeneuve v1.20.2 / scott v1.15.0 worktrees, so this single patch pulls
-# in the whole unreleased chain.
-[patch."ssh://git@github.com/Empyrean-Dynamics/empyrean-core.git"]
-empyrean-core = { path = "../empyrean-core" }

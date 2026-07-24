@@ -156,7 +156,15 @@ class ImpactProbabilities(qv.Table):
     """Adaptive Gaussian-mixture impact probability. Populated when the
     requested method enables the AGM refinement (``"auto"``, or an
     explicit Gaussian-mixture request) AND the encounter's nonlinearity
-    exceeded the mixture threshold; null otherwise."""
+    exceeded the mixture threshold; null otherwise.
+
+    Coalescing contract: use :attr:`ip_agm` when finite, otherwise
+    :attr:`ip_linear`. A null here is **not** a failure — it means the AGM
+    splitter did not fire (the encounter's nonlinearity was below
+    threshold), so no mixture correction was warranted and the linear
+    estimate on the same row stands. Never back-fill this column with the
+    linear IP: a null is what lets a consumer tell "AGM ran" from "AGM was
+    a no-op"."""
     ip_mc = qv.Float64Column(nullable=True)
     """Monte-Carlo impact probability —
     :attr:`mc_n_impacts` / :attr:`mc_n_samples`. Populated only when

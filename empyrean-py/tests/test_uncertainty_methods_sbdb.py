@@ -22,7 +22,13 @@ from __future__ import annotations
 import empyrean
 import numpy as np
 import pytest
-from empyrean import MonteCarlo, UncertaintyMethod
+from empyrean import (
+    GaussianMixture,
+    MonteCarlo,
+    Origin,
+    UncertaintyMethod,
+    compute_impact_probabilities,
+)
 from empyrean.coordinates.coordinates import CartesianCoordinates
 from empyrean.coordinates.covariance import CartesianCovariance
 from empyrean.orbits.orbits import CartesianOrbits
@@ -115,6 +121,79 @@ def test_sbdb_cartesian_sigma_point_is_genuine(sbdb_orbit_cartesian, sbdb_grid) 
     )
     assert set(res_sp.tagged_covariance.kind.to_pylist()) == {"sigma_point"}
     assert set(res_fo.tagged_covariance.kind.to_pylist()) == {"linear"}
+
+
+def test_agm_impact_probability_fires_and_labels_correctly() -> None:
+    """GaussianMixture (AGM) in ``compute_impact_probabilities`` on REAL
+    data — the firing case the offline acceptance test in ``test_impact``
+    cannot reach (its heliocentric fixture has no encounter → empty
+    table). A short-arc (covariance-inflated) 2024 YR4 through its
+    2032-12-22 Earth encounter produces a tag-5 impact row that:
+
+    1. is labelled ``"gaussian_mixture"`` — NOT silently relabelled
+       ``"first_order"`` as it was before the ``method_from_tag`` readback
+       fix (``empyrean/src/impact.rs``); this is the exact assertion that
+       would have caught the pre-fix bug; and
+    2. carries a finite, mixture-corrected ``ip_agm`` (the AGM splitter
+       fires above its nonlinearity threshold at this inflation).
+
+    The paired ``first_order`` row with a distinct label proves the tag is
+    not collapsed anywhere in the round-trip. Network-gated (SBDB); slow
+    (AGM splitting through a multi-year propagation).
+    """
+    empyrean.initialize()
+    try:
+        orb = empyrean.query_sbdb(["2024 YR4"])
+    except Exception as e:  # noqa: BLE001 — any network/parse failure → skip
+        pytest.skip(f"SBDB query for 2024 YR4 unavailable: {type(e).__name__}: {e}")
+    if orb.coordinates.covariance is None:
+        pytest.skip("SBDB record for 2024 YR4 carries no covariance")
+
+    t0 = float(orb.coordinates.epoch.to_numpy(zero_copy_only=False)[0])
+    r0 = empyrean.propagate(orb, np.array([t0]), uncertainty_method=UncertaintyMethod.FIRST_ORDER)
+    c = r0.states.coordinates
+    cov0 = c.covariance.to_matrix()[0]
+
+    def col(name):
+        return float(getattr(c, name).to_numpy(zero_copy_only=False)[0])
+
+    frame = c.frame if isinstance(c.frame, str) else c.frame.to_pylist()[0]
+    # Inflate the covariance ×1e6 (σ×1000) to simulate an early short-arc
+    # solution — the large-covariance regime where the AGM splitter fires.
+    yr4 = CartesianOrbits.from_kwargs(
+        orbit_id=["yr4"],
+        object_id=["yr4"],
+        coordinates=CartesianCoordinates.from_kwargs(
+            epoch=np.array([t0]),
+            x=[col("x")],
+            y=[col("y")],
+            z=[col("z")],
+            vx=[col("vx")],
+            vy=[col("vy")],
+            vz=[col("vz")],
+            frame=frame,
+            origin=c.origin.to_pylist(),
+            covariance=CartesianCovariance.from_matrix((cov0 * 1e6)[None, :, :]),
+        ),
+    )
+    # 2032-12-22 encounter is ≈ MJD 63588.5; end a few days past it.
+    ips = compute_impact_probabilities(
+        yr4,
+        end_epoch=63594.0,
+        methods=[UncertaintyMethod.FIRST_ORDER, GaussianMixture()],
+        body_filter=[Origin.EARTH],
+    )
+    df = ips.to_dataframe()
+    labels = set(df["method"].tolist())
+    # Distinct, correct labels — the tag is not collapsed in the round-trip.
+    assert "gaussian_mixture" in labels, f"tag-5 row mislabelled; got {labels}"
+    assert "first_order" in labels, f"first_order row missing; got {labels}"
+
+    gm = df[df["method"] == "gaussian_mixture"].iloc[0]
+    # The AGM fired: the mixture-corrected IP is finite (a genuine payoff,
+    # not a NaN no-op), alongside the always-present linear IP.
+    assert np.isfinite(gm["ip_agm"]), "AGM did not fire (ip_agm NaN) at cov×1e6"
+    assert np.isfinite(gm["ip_linear"])
 
 
 @pytest.mark.xfail(

@@ -44,6 +44,7 @@ from empyrean.od.result import (
     TrustGateEvent,
 )
 from empyrean.orbits.orbits import CartesianOrbits
+from empyrean.orbits.photometry import PhotometricParams
 from empyrean.propagation.config import _FORCE_MODEL_TO_INT, ForceModelTier
 
 # ``CartesianCovariance`` is built dynamically by ``_make_covariance_class``,
@@ -712,6 +713,11 @@ def determine(
             initial_orbits_dict[oid] = _orbits_to_dict(orbit)
 
     result = _determine(obs_dict, config._to_wire_dict(), initial_orbits_dict, radar_dict)
+    # The C ABI hardcodes empty orbit/object ids on the fit; re-attach a real
+    # identity so it propagates to downstream propagate / ephemeris. Prefer the
+    # seed's object id (seeded fit), else derive it from the observations.
+    seed_id = next(iter(initial_orbits)) if initial_orbits else None
+    _inject_identity(result, seed_id or _object_id_from_observations(observations))
     return _build_determine_result(result)
 
 
@@ -797,6 +803,8 @@ def refine(
     obs_dict = _obs_to_dict(observations)
     result = _refine_single(orbit_dict, obs_dict, config._to_wire_dict())
 
+    # Carry the prior orbit's identity onto the refined fit (the C ABI drops it).
+    _inject_identity(result, _orbit_identity(orbit))
     return _build_determine_result(result)
 
 
@@ -893,6 +901,65 @@ def _build_photometry_result(d: ResultDict | None) -> PhotometryResult | None:
     )
 
 
+def _photometry_params_from_result(pr: PhotometryResult) -> PhotometricParams:
+    """Convert a post-OD :class:`PhotometryResult` into the orbit's
+    :class:`PhotometricParams` column so ephemeris generation can predict
+    apparent magnitudes.
+
+    ``model_used`` is the resolved model (never ``AUTO``). ``PhotometricParams``
+    has no ``honly`` model, so HONLY (H fit with a fixed slope, carried in
+    ``slope1``) is represented as classical HG.
+    """
+    model = pr.model_used.value
+    g = g1 = g2 = g12 = None
+    if model == "hg1g2":
+        g1, g2 = pr.slope1, pr.slope2
+    elif model == "hg12":
+        g12 = pr.slope1
+    else:  # "hg" and "honly" both reduce to classical H, G
+        model = "hg"
+        g = pr.slope1
+    return PhotometricParams.from_kwargs(
+        model=[model], h=[pr.h], g=[g], g1=[g1], g2=[g2], g12=[g12]
+    )
+
+
+def _object_id_from_observations(observations: ADESObservations) -> str | None:
+    """First available object identifier in an ADES table — perm_id, then
+    prov_id, then trk_sub. ``None`` if the table carries no identifier."""
+    for column in (observations.perm_id, observations.prov_id, observations.trk_sub):
+        for value in column.to_pylist():
+            if value:
+                return str(value)
+    return None
+
+
+def _orbit_identity(orbit: AnyOrbits) -> str | None:
+    """Object id of a single-entry orbit table, falling back to its orbit_id."""
+    if orbit.object_id is not None:
+        values = orbit.object_id.to_pylist()
+        if values and values[0]:
+            return str(values[0])
+    values = orbit.orbit_id.to_pylist()
+    return str(values[0]) if values and values[0] else None
+
+
+def _inject_identity(result: ResultDict, object_id: str | None) -> None:
+    """Fill the fitted orbit's identity when the C ABI left it empty.
+
+    determine/refine return the fit with empty orbit/object ids (the FFI
+    hardcodes them), so without this the resulting quivr orbit carries no
+    identity and it is lost for every downstream propagate / ephemeris. Only
+    fills empty values, so a real id from the engine is never clobbered.
+    """
+    if not object_id:
+        return
+    if not result.get("orbit_object_id"):
+        result["orbit_object_id"] = object_id
+    if not result.get("orbit_orbit_id"):
+        result["orbit_orbit_id"] = object_id
+
+
 def _build_covariance_trust(d: dict[str, Any] | None) -> CovarianceTrust | None:
     """Assemble a :class:`CovarianceTrust` from the nested trust dict.
 
@@ -983,6 +1050,14 @@ def _build_determine_result(result: ResultDict) -> DetermineResult:
     dv_frame = result.get("dv_frame")
     photometry = _build_photometry_result(result.get("photometry"))
     covariance_trust = _build_covariance_trust(result.get("covariance_trust"))
+
+    # Carry the post-OD photometric fit onto the fitted orbit so downstream
+    # ephemeris generation can predict apparent magnitudes. The C ABI returns
+    # the H/G solution only as a side-channel (`photometry`) and leaves the
+    # orbit's `photometric` column null; without this attach, generate_ephemeris
+    # on a fitted orbit silently yields mag=None.
+    if photometry is not None:
+        orbit = orbit.set_column("photometric", _photometry_params_from_result(photometry))
 
     return DetermineResult(
         orbit=orbit,

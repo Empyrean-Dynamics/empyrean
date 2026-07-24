@@ -90,6 +90,7 @@ pub const EMPYREAN_UNCERTAINTY_SECOND: u32 = 1;
 pub const EMPYREAN_UNCERTAINTY_SIGMA_POINT: u32 = 2;
 pub const EMPYREAN_UNCERTAINTY_MONTE_CARLO: u32 = 3;
 pub const EMPYREAN_UNCERTAINTY_AUTO: u32 = 4;
+pub const EMPYREAN_UNCERTAINTY_MIXTURE: u32 = 5;
 pub const EMPYREAN_COVARIANCE_KIND_LINEAR: u32 = 0;
 pub const EMPYREAN_COVARIANCE_KIND_SECOND_ORDER: u32 = 1;
 pub const EMPYREAN_COVARIANCE_KIND_THIRD_ORDER: u32 = 2;
@@ -381,7 +382,7 @@ impl Default for EmpyreanOrbit {
         }
     }
 }
-#[doc = " Uncertainty-propagation method, mirroring\n [`empyrean_core::propagation::UncertaintyMethod`] as a flat C struct.\n Fields outside the active variant are ignored — set them to zero /\n NaN.\n\n | tag | Variant | Active fields |\n |-----|---------|---------------|\n | 0   | First       | (none) |\n | 1   | Second      | (none) |\n | 2   | SigmaPoint  | `sp_n_sigma`, `sp_samples_per_plane` |\n | 3   | MonteCarlo  | `mc_n_samples`, `mc_seed_some` (1 = use `mc_seed`) |\n | 4   | Auto        | `auto_threshold_first`, `auto_threshold_mixture`, `auto_threshold_ip_skip`, `auto_gmm_max_depth`, `auto_gmm_components_per_split` |"]
+#[doc = " Uncertainty-propagation method, mirroring\n [`empyrean_core::propagation::UncertaintyMethod`] as a flat C struct.\n Fields outside the active variant are ignored — set them to zero /\n NaN.\n\n | tag | Variant | Active fields |\n |-----|---------|---------------|\n | 0   | First       | (none) |\n | 1   | Second      | (none) |\n | 2   | SigmaPoint  | `sp_n_sigma`, `sp_samples_per_plane` |\n | 3   | MonteCarlo  | `mc_n_samples`, `mc_seed_some` (1 = use `mc_seed`) |\n | 4   | Auto        | `auto_threshold_first`, `auto_threshold_mixture`, `auto_threshold_ip_skip`, `auto_gmm_max_depth`, `auto_gmm_components_per_split` |\n | 5   | Mixture     | `auto_threshold_mixture`, `auto_gmm_max_depth`, `auto_gmm_components_per_split` (reused AGM slots; `tag` disambiguates a top-level GaussianMixture from Auto) |"]
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
 pub struct EmpyreanUncertaintyMethod {

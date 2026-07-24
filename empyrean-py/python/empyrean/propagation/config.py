@@ -47,11 +47,12 @@ class UncertaintyMethod(str, enum.Enum):
     zero-arg / default-params cases.
 
     Controls how the input covariance is mapped through the dynamics.
-    For parameterized methods (``SIGMA_POINT``, ``MONTE_CARLO``),
-    passing the enum value selects the method with engine-default
-    parameters. To customize parameters, pass the corresponding
-    dataclass instance directly (:class:`SigmaPoint`, :class:`MonteCarlo`)
-    to :func:`~empyrean.propagate`.
+    For parameterized methods (``SIGMA_POINT``, ``MONTE_CARLO``,
+    ``GAUSSIAN_MIXTURE``), passing the enum value selects the method with
+    engine-default parameters. To customize parameters, pass the
+    corresponding dataclass instance directly (:class:`SigmaPoint`,
+    :class:`MonteCarlo`, :class:`GaussianMixture`) to
+    :func:`~empyrean.propagate`.
     """
 
     FIRST_ORDER = "first_order"
@@ -72,19 +73,36 @@ class UncertaintyMethod(str, enum.Enum):
     over close-approach windows, recording each transition as a
     ``CovarianceRegimeChange`` event."""
 
+    GAUSSIAN_MIXTURE = "gaussian_mixture"
+    """Adaptive Gaussian mixture (AGM). The engine recursively splits the
+    input Gaussian into a mixture wherever the local nonlinearity exceeds
+    a threshold, propagates each component, and recombines at the output.
+    Its distinctive product is the mixture-corrected impact probability at
+    close approaches; away from encounters the output-state covariance is
+    the linear ``Φ·Σ·Φᵀ`` mapping (like ``SECOND_ORDER``), so for a
+    well-determined object it reads back very close to ``FIRST_ORDER``.
+    Reference: DeMars-Bishop-Jah (JGCD 2013)."""
+
 
 @dataclass(frozen=True)
 class SigmaPoint:
     """Sigma-point (unscented) transform.
 
+    The engine uses the canonical Julier–Uhlmann 2N+1 unscented set,
+    which is **parameter-free**: ``n_sigma`` and ``samples_per_plane`` are
+    legacy knobs and only their default values are currently accepted. A
+    non-default value is rejected loudly by the engine
+    (``SigmaPointConstruction``) rather than silently reinterpreted — pass
+    ``SigmaPoint()`` and leave both at their defaults.
+
     Parameters
     ----------
     n_sigma : float
-        Number of standard deviations for the sigma-point spread.
-        Default 1.0.
+        Legacy sigma-point spread. Must be ``1.0`` (the default); any
+        other value raises.
     samples_per_plane : int
-        Points per coordinate-plane pair. Total = 15 × ``samples_per_plane``
-        for a 6D state. Default 8 (120 points).
+        Legacy points per coordinate-plane pair. Must be ``8`` (the
+        default); any other value raises.
     """
 
     n_sigma: float = 1.0
@@ -108,6 +126,36 @@ class MonteCarlo:
     seed: int | None = 42
 
 
+@dataclass(frozen=True)
+class GaussianMixture:
+    """Adaptive Gaussian mixture (AGM).
+
+    The engine recursively splits the input Gaussian into a mixture of
+    sub-Gaussians wherever the local nonlinearity exceeds ``threshold``,
+    propagates each component through the dynamics, and recombines them at
+    the output. Its distinctive product is the mixture-corrected impact
+    probability at close approaches; away from encounters the output-state
+    covariance is the linear ``Φ·Σ·Φᵀ`` mapping. Reference:
+    DeMars-Bishop-Jah (JGCD 2013).
+
+    Parameters
+    ----------
+    threshold : float
+        Nonlinearity threshold above which the splitter fires. Default
+        ``1.0``.
+    max_depth : int
+        Maximum recursion depth for nested splitting. Default ``3``.
+    components_per_split : int
+        Number of sub-Gaussians produced per split. The DeMars-Bishop-Jah
+        splitting tables are tabulated only for odd counts (``3`` or
+        ``5``). Default ``3``.
+    """
+
+    threshold: float = 1.0
+    max_depth: int = 3
+    components_per_split: int = 3
+
+
 # Tag space matches the engine's UncertaintyMethod enum exactly.
 _UNCERTAINTY_METHOD_TO_INT = {
     UncertaintyMethod.FIRST_ORDER: 0,
@@ -115,32 +163,41 @@ _UNCERTAINTY_METHOD_TO_INT = {
     UncertaintyMethod.SIGMA_POINT: 2,
     UncertaintyMethod.MONTE_CARLO: 3,
     UncertaintyMethod.AUTO: 4,
+    UncertaintyMethod.GAUSSIAN_MIXTURE: 5,
     "first_order": 0,
     "second_order": 1,
     "sigma_point": 2,
     "monte_carlo": 3,
     "auto": 4,
+    "gaussian_mixture": 5,
 }
 
 # Inverse tag map for serializing a raw-int ``uncertainty_method`` back to its
 # wire string. Without this, ``_to_wire_dict`` coerced every non-str/non-enum
 # method (i.e. any legacy int) to "first_order" — the same silent-downgrade
 # class of bug previously fixed for AUTO. Sigma-point / Monte-Carlo carry
-# their params via separate flat args, so they intentionally serialize to
-# "first_order" at the wrapper level (see apply_propagation_config_dict).
+# their per-variant params (n_sigma / samples_per_plane / n_samples / seed)
+# via separate flat args on ``_propagate`` / ``_generate_ephemeris``, which
+# are authoritative over this wire dict; the wire string here only names the
+# method so a config-dict-only consumer resolves the real variant (with
+# default params) rather than a silently substituted first-order covariance.
 _INT_TO_UNCERTAINTY_METHOD = {
     0: "first_order",
     1: "second_order",
+    2: "sigma_point",
+    3: "monte_carlo",
     4: "auto",
+    5: "gaussian_mixture",
 }
 
 _DATACLASS_TO_INT = {
     SigmaPoint: 2,
     MonteCarlo: 3,
+    GaussianMixture: 5,
 }
 
 
-UncertaintyMethodLike = UncertaintyMethod | SigmaPoint | MonteCarlo | str
+UncertaintyMethodLike = UncertaintyMethod | SigmaPoint | MonteCarlo | GaussianMixture | str
 """Type alias for inputs accepted by the ``uncertainty_method`` argument."""
 
 
@@ -253,10 +310,10 @@ class PropagationConfig:
         perturber — exclude it from its own perturber set so it does
         not self-attract. Pass :class:`Origin` instances (e.g.
         ``[Origin.asteroid(1)]``) or canonical names.
-    uncertainty_method : UncertaintyMethod | SigmaPoint | MonteCarlo | str
+    uncertainty_method : UncertaintyMethod | SigmaPoint | MonteCarlo | GaussianMixture | str
         Uncertainty propagation method. See :class:`UncertaintyMethod`
         and the parameterized variants
-        (:class:`SigmaPoint`, :class:`MonteCarlo`).
+        (:class:`SigmaPoint`, :class:`MonteCarlo`, :class:`GaussianMixture`).
     compute_stm : bool
         Produce STMs even when the input has no covariance.
     frame : Frame
@@ -319,12 +376,24 @@ class PropagationConfig:
         um_method = self.uncertainty_method
         if isinstance(um_method, enum.Enum):
             um: Any = um_method.value
+        elif isinstance(um_method, SigmaPoint):
+            # The wire string only names the method; the per-variant params
+            # (n_sigma / samples_per_plane) ride on the authoritative flat
+            # args, so serialize the method name rather than the old lossy
+            # "first_order".
+            um = "sigma_point"
+        elif isinstance(um_method, MonteCarlo):
+            um = "monte_carlo"
+        elif isinstance(um_method, GaussianMixture):
+            # The wire string only names the method; the per-variant params
+            # (threshold / max_depth / components_per_split) ride on the
+            # authoritative flat args, so serialize the method name.
+            um = "gaussian_mixture"
         elif isinstance(um_method, bool):
             um = um_method  # not a valid method; falls through to "first_order"
         elif isinstance(um_method, int):
-            # Legacy raw-int tag (0/1/4). Map back to the wire string instead
-            # of silently coercing to "first_order". Unknown ints (e.g. 2/3,
-            # whose params ride on flat args) fall through.
+            # Legacy raw-int tag (0..=5). Map back to the wire string instead
+            # of silently coercing to "first_order".
             um = _INT_TO_UNCERTAINTY_METHOD.get(um_method, um_method)
         else:
             um = um_method

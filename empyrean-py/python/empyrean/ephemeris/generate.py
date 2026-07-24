@@ -26,6 +26,7 @@ from empyrean.propagation.config import (
     _FORCE_MODEL_TO_INT,
     _UNCERTAINTY_METHOD_TO_INT,
     ForceModelTier,
+    GaussianMixture,
     MonteCarlo,
     PropagationConfig,
     SigmaPoint,
@@ -33,7 +34,7 @@ from empyrean.propagation.config import (
 )
 
 FloatArray = np.ndarray[Any, np.dtype[np.float64]]
-UncertaintyMethodLike = UncertaintyMethod | SigmaPoint | MonteCarlo | str
+UncertaintyMethodLike = UncertaintyMethod | SigmaPoint | MonteCarlo | GaussianMixture | str
 
 
 def generate_ephemeris(
@@ -79,11 +80,24 @@ def generate_ephemeris(
     force_model : ForceModelTier or str, optional
         Quick override for ``config.propagation.force_model``. Ignored
         if ``config`` is given.
-    uncertainty_method : UncertaintyMethod | SigmaPoint | MonteCarlo | str, optional
-        Quick override for ``config.propagation.uncertainty_method``.
-        ``SECOND_ORDER`` is what populates observation Hessians on the
-        resulting :class:`~empyrean.types.ObservationSensitivity`.
-        Ignored if ``config`` is given.
+    uncertainty_method : UncertaintyMethod | SigmaPoint | MonteCarlo | GaussianMixture | str
+        Optional quick override for ``config.propagation.uncertainty_method``.
+        Only the analytic methods are supported for ephemeris:
+        ``FIRST_ORDER``, ``SECOND_ORDER``, ``AUTO``, and
+        ``GAUSSIAN_MIXTURE`` (``SECOND_ORDER`` additionally populates
+        observation Hessians on the resulting
+        :class:`~empyrean.types.ObservationSensitivity`;
+        ``GAUSSIAN_MIXTURE`` is an adaptive-Gaussian-mixture method that is
+        likewise analytic on this path). The sky-plane covariance is a
+        first-order STM projection (``J·Φ·Σ·Φᵀ·Jᵀ``) that does not consume
+        a sampled ensemble, so the sampling methods ``SIGMA_POINT`` and
+        ``MONTE_CARLO`` are **rejected with a** :class:`ValueError`
+        rather than silently downgraded to first order. For a sampled
+        state covariance use
+        :func:`~empyrean.propagate` with ``SIGMA_POINT``; for Monte-Carlo
+        impact probability use
+        :func:`~empyrean.compute_impact_probabilities`. Ignored if
+        ``config`` is given.
 
     Returns
     -------
@@ -254,14 +268,18 @@ def generate_ephemeris(
     gm_max_depth = 3
     gm_components_per_split = 3
 
-    if isinstance(uncertainty_method, (SigmaPoint, MonteCarlo)):
+    if isinstance(uncertainty_method, (SigmaPoint, MonteCarlo, GaussianMixture)):
         um_int = _DATACLASS_TO_INT[type(uncertainty_method)]
         if isinstance(uncertainty_method, SigmaPoint):
             sigma_n_sigma = uncertainty_method.n_sigma
             sigma_samples_per_plane = uncertainty_method.samples_per_plane
-        else:  # MonteCarlo
+        elif isinstance(uncertainty_method, MonteCarlo):
             mc_n_samples = uncertainty_method.n_samples
             mc_seed = uncertainty_method.seed
+        else:  # GaussianMixture — analytic, honored on the ephemeris path
+            gm_threshold = uncertainty_method.threshold
+            gm_max_depth = uncertainty_method.max_depth
+            gm_components_per_split = uncertainty_method.components_per_split
     elif isinstance(uncertainty_method, str):
         um_lookup = _UNCERTAINTY_METHOD_TO_INT.get(uncertainty_method.lower())
         if um_lookup is None:
@@ -274,7 +292,7 @@ def generate_ephemeris(
     else:
         raise TypeError(
             "uncertainty_method must be UncertaintyMethod, a SigmaPoint / "
-            "MonteCarlo dataclass, str, or int; got "
+            "MonteCarlo / GaussianMixture dataclass, str, or int; got "
             f"{type(uncertainty_method).__name__}"
         )
 

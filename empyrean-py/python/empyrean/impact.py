@@ -39,6 +39,7 @@ from empyrean.coordinates.epoch import Epochs
 from empyrean.propagation.config import (
     _DATACLASS_TO_INT,
     _UNCERTAINTY_METHOD_TO_INT,
+    GaussianMixture,
     MonteCarlo,
     SigmaPoint,
     UncertaintyMethod,
@@ -68,6 +69,7 @@ METHOD_SECOND_ORDER = "second_order"
 METHOD_SIGMA_POINT = "sigma_point"
 METHOD_MONTE_CARLO = "monte_carlo"
 METHOD_AUTO = "auto"
+METHOD_GAUSSIAN_MIXTURE = "gaussian_mixture"
 
 # Internal: maps the Rust-side integer tag returned by
 # `_compute_impact_probabilities` / `_compute_b_planes` to the
@@ -81,6 +83,7 @@ _TAG_TO_METHOD = {
     2: METHOD_SIGMA_POINT,
     3: METHOD_MONTE_CARLO,
     4: METHOD_AUTO,
+    5: METHOD_GAUSSIAN_MIXTURE,
 }
 
 
@@ -270,12 +273,12 @@ class BPlanes(qv.Table):
 
 # ── Helpers ───────────────────────────────────────────────────
 
-UncertaintyMethodLike = UncertaintyMethod | SigmaPoint | MonteCarlo | str | int
+UncertaintyMethodLike = UncertaintyMethod | SigmaPoint | MonteCarlo | GaussianMixture | str | int
 
 
 def _method_to_tag(m: UncertaintyMethodLike) -> int:
     """Map a Python-level method spec to the int tag the Rust side expects."""
-    if isinstance(m, (SigmaPoint, MonteCarlo)):
+    if isinstance(m, (SigmaPoint, MonteCarlo, GaussianMixture)):
         return _DATACLASS_TO_INT[type(m)]
     if isinstance(m, str):
         tag = _UNCERTAINTY_METHOD_TO_INT.get(m.lower())

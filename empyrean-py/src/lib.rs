@@ -582,20 +582,75 @@ fn _query_radar<'py>(
     radar_table_to_pydict(py, &radar)
 }
 
+/// Build a wrapper [`empyrean::UncertaintyMethod`] from the flat integer
+/// tag + sampling parameters marshaled across the Python boundary.
+///
+/// Mirrors the C ABI decoder (`empyrean-c`'s `flat_to_uncertainty_method`)
+/// so every distribution channel maps the same tag to the same method with
+/// the same per-variant parameters: `SIGMA_POINT` (2) carries
+/// `sigma_n_sigma` / `sigma_samples_per_plane`, `MONTE_CARLO` (3) carries
+/// `mc_n_samples` / `mc_seed`, and `GAUSSIAN_MIXTURE` (5) carries
+/// `gm_threshold` / `gm_max_depth` / `gm_components_per_split`. An unknown
+/// tag is a typed `ValueError` naming the supported set — never a silent
+/// downgrade to a different method.
+#[allow(clippy::too_many_arguments)]
+fn build_uncertainty_method(
+    tag: i32,
+    sigma_n_sigma: f64,
+    sigma_samples_per_plane: usize,
+    mc_n_samples: usize,
+    mc_seed: Option<u64>,
+    gm_threshold: f64,
+    gm_max_depth: usize,
+    gm_components_per_split: usize,
+) -> PyResult<empyrean::UncertaintyMethod> {
+    match tag {
+        0 => Ok(empyrean::UncertaintyMethod::FirstOrder),
+        1 => Ok(empyrean::UncertaintyMethod::SecondOrder),
+        2 => Ok(empyrean::UncertaintyMethod::SigmaPoint {
+            n_sigma: sigma_n_sigma,
+            samples_per_plane: sigma_samples_per_plane,
+        }),
+        3 => Ok(empyrean::UncertaintyMethod::MonteCarlo {
+            n_samples: mc_n_samples,
+            seed: mc_seed,
+        }),
+        4 => Ok(empyrean::UncertaintyMethod::auto()),
+        5 => Ok(empyrean::UncertaintyMethod::Mixture {
+            threshold: gm_threshold,
+            max_depth: gm_max_depth,
+            components_per_split: gm_components_per_split,
+        }),
+        other => Err(PyValueError::new_err(format!(
+            "unsupported uncertainty_method {other}; expected 0 (FIRST_ORDER), \
+             1 (SECOND_ORDER), 2 (SIGMA_POINT), 3 (MONTE_CARLO), 4 (AUTO), or \
+             5 (GAUSSIAN_MIXTURE)"
+        ))),
+    }
+}
+
 // ══════════════════════════════════════════════════════════
 //  _propagate
 // ══════════════════════════════════════════════════════════
 
 /// Propagate orbits to target epochs.
 ///
-/// Drops MonteCarlo / SigmaPoint / GaussianMixture uncertainty methods,
-/// ForceModelTier::Full, and num_threads. Those unused kwargs are
-/// accepted for ABI compatibility with older Python callers and rejected
-/// with a clear error if used. Photometric params (`phot_h`,
-/// `phot_slope1`, `phot_slope2`, `phot_system`) ARE wired — propagation
-/// is agnostic to V-magnitude, but the photometry attached here flows
-/// downstream to ephemeris generation. `Auto` uncertainty (tag 4) is
-/// wired.
+/// Wires every uncertainty method the C ABI exposes: FirstOrder (0),
+/// SecondOrder (1), SigmaPoint (2), MonteCarlo (3), and Auto (4). The
+/// sampling methods carry their flat params — SigmaPoint reads
+/// `sigma_n_sigma` / `sigma_samples_per_plane`; MonteCarlo reads
+/// `mc_n_samples` / `mc_seed`. SigmaPoint reconstructs a genuine
+/// sample-based per-epoch state covariance (read back tagged
+/// `SigmaPoint`). MonteCarlo's deliverable is the Monte-Carlo impact
+/// probability surfaced on `events.ip_mc` (plus, opt-in, retained
+/// samples); it does NOT reconstruct a per-epoch state covariance, so
+/// covariance-bearing rows come back without a state covariance under
+/// MonteCarlo — matching the engine and C ABI contract. The `gm_*`
+/// GaussianMixture knobs and `ForceModelTier::Full` remain unsupported in
+/// this distribution and an unknown method tag is a typed `ValueError`.
+/// Photometric params (`phot_h`, `phot_slope1`, `phot_slope2`,
+/// `phot_system`) ARE wired — propagation is agnostic to V-magnitude, but
+/// the photometry attached here flows downstream to ephemeris generation.
 ///
 /// `thrust_arcs` carries structured continuous-thrust input — one Python
 /// `ThrustParams` (or `None`) per orbit, positionally aligned with the
@@ -730,16 +785,10 @@ fn _propagate<'py>(
     // marshaling below.
     builtsystem: Option<Py<PyBuiltSystem>>,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let _ = (
-        num_threads,
-        gm_threshold,
-        gm_max_depth,
-        gm_components_per_split,
-        sigma_n_sigma,
-        sigma_samples_per_plane,
-        mc_n_samples,
-        mc_seed,
-    );
+    // Every uncertainty knob is now consumed: the sampling params
+    // (`sigma_*` / `mc_*`) and the GaussianMixture params (`gm_*`) are
+    // threaded into the uncertainty method below, and `num_threads` is
+    // applied to the config, so none of them are discarded here.
     let ctx = get_context()?;
 
     let epochs_arr = epochs.as_array().to_owned();
@@ -903,21 +952,20 @@ fn _propagate<'py>(
         }
     };
 
-    let uncertainty = match uncertainty_method {
-        0 => empyrean::UncertaintyMethod::FirstOrder,
-        1 => empyrean::UncertaintyMethod::SecondOrder,
-        4 => empyrean::UncertaintyMethod::auto(),
-        _ => {
-            return Err(PyRuntimeError::new_err(format!(
-                "uncertainty method {uncertainty_method} is not supported \
-                 (FirstOrder=0, SecondOrder=1, Auto=4)"
-            )));
-        }
-    };
+    let uncertainty = build_uncertainty_method(
+        uncertainty_method,
+        sigma_n_sigma,
+        sigma_samples_per_plane,
+        mc_n_samples,
+        mc_seed,
+        gm_threshold,
+        gm_max_depth,
+        gm_components_per_split,
+    )?;
 
     let mut config = empyrean::PropagationConfig {
         force_model: force_model_tier,
-        uncertainty_method: uncertainty,
+        uncertainty_method: uncertainty.clone(),
         frame: empyrean::Frame::ICRF,
         ..empyrean::PropagationConfig::default()
     };
@@ -935,6 +983,16 @@ fn _propagate<'py>(
     if let Some(d) = propagation_config_dict {
         apply_propagation_config_dict(&mut config, d)?;
     }
+    // The flat uncertainty args are the authoritative, param-carrying
+    // channel. The wire dict cannot represent SigmaPoint's / MonteCarlo's
+    // per-variant parameters (n_sigma / samples_per_plane / n_samples /
+    // seed), so it serializes them lossily (a sampling method collapses to
+    // a param-free string or to first_order). Re-assert the method built
+    // from the flat args AFTER the dict so a parametric sampling request is
+    // never silently downgraded by the dict round-trip. For FirstOrder /
+    // SecondOrder / Auto this is a no-op: the dict and the flat args are
+    // both derived from the same Python config, so they already agree.
+    config.uncertainty_method = uncertainty;
 
     let times_slice: Vec<empyrean::Epoch> = times_arr
         .iter()
@@ -1706,9 +1764,15 @@ fn methods_from_tags(tags: &[i32]) -> PyResult<Vec<empyrean::UncertaintyMethod>>
             2 => empyrean::UncertaintyMethod::sigma_point(),
             3 => empyrean::UncertaintyMethod::monte_carlo(1000),
             4 => empyrean::UncertaintyMethod::auto(),
+            // GaussianMixture (tag 5): the impact-probability comparison
+            // harness runs AGM splitting at close approaches and reports
+            // the mixture-corrected impact probability on `ip_agm`. Built
+            // with the engine-default AGM parameters, matching the other
+            // parameter-free tags here (sigma_point() / monte_carlo(1000)).
+            5 => empyrean::UncertaintyMethod::gaussian_mixture(),
             other => {
-                return Err(PyRuntimeError::new_err(format!(
-                    "unknown uncertainty method tag: {other} (expected 0..=4)"
+                return Err(PyValueError::new_err(format!(
+                    "unknown uncertainty method tag: {other} (expected 0..=5)"
                 )));
             }
         });
@@ -1864,6 +1928,7 @@ fn _compute_impact_probabilities<'py>(
             empyrean::UncertaintyMethod::SigmaPoint { .. } => 2,
             empyrean::UncertaintyMethod::MonteCarlo { .. } => 3,
             empyrean::UncertaintyMethod::Auto { .. } => 4,
+            empyrean::UncertaintyMethod::Mixture { .. } => 5,
         };
         out_orbit_id.push(r.orbit_id.clone());
         out_object_id.push(r.object_id.clone());
@@ -2080,6 +2145,7 @@ fn _compute_b_planes<'py>(
             empyrean::UncertaintyMethod::SigmaPoint { .. } => 2,
             empyrean::UncertaintyMethod::MonteCarlo { .. } => 3,
             empyrean::UncertaintyMethod::Auto { .. } => 4,
+            empyrean::UncertaintyMethod::Mixture { .. } => 5,
         };
         out_body.push(r.body.to_string());
         out_epoch[i] = r.epoch.mjd_tdb().map_err(to_pyerr)?;
@@ -2301,17 +2367,14 @@ fn _generate_ephemeris<'py>(
     // by the identity guard rather than served under the wrong dynamics.
     builtsystem: Option<Py<PyBuiltSystem>>,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let _ = (
-        epsilon,
-        uncertainty_method,
-        gm_threshold,
-        gm_max_depth,
-        gm_components_per_split,
-        sigma_n_sigma,
-        sigma_samples_per_plane,
-        mc_n_samples,
-        mc_seed,
-    );
+    // `epsilon` is accepted for ABI compatibility but unused on the
+    // ephemeris path in this distribution. `uncertainty_method`, the
+    // `sigma_*` / `mc_*` sampling params, and the `gm_*` GaussianMixture
+    // params are all consumed below (built into the method and validated)
+    // rather than silently discarded. GaussianMixture is analytic (an
+    // AD/Jet2 method, honorable in ephemeris) so it flows onto the config
+    // normally — only the sampling methods are rejected below.
+    let _ = epsilon;
     let ctx = get_context()?;
 
     let epochs_arr = epochs.as_array().to_owned();
@@ -2493,6 +2556,47 @@ fn _generate_ephemeris<'py>(
         eph_config.propagation.force_model = force_model_tier;
         eph_config.propagation.frame = empyrean::Frame::EclipticJ2000;
     }
+    // Thread the uncertainty method from the flat args and make it
+    // authoritative over the (lossy) wire dict, exactly as `_propagate`
+    // does. generate_ephemeris previously discarded the flat
+    // `uncertainty_method` entirely and let the wire dict decide, silently
+    // downgrading SIGMA_POINT / MONTE_CARLO to FirstOrder — a hidden
+    // fallback. Build the method explicitly instead.
+    let uncertainty = build_uncertainty_method(
+        uncertainty_method,
+        sigma_n_sigma,
+        sigma_samples_per_plane,
+        mc_n_samples,
+        mc_seed,
+        gm_threshold,
+        gm_max_depth,
+        gm_components_per_split,
+    )?;
+    // Sampling methods cannot be honored on the ephemeris path: villeneuve
+    // derives the sky-plane covariance from a first-order STM projection
+    // (J·Φ·Σ·Φᵀ·Jᵀ) and does not consume a sampled ensemble. SigmaPoint
+    // would silently collapse to that first-order sky covariance (it is
+    // not dispatched below the ephemeris propagate seam), and MonteCarlo
+    // would fail the dense-trajectory-cache requirement with an opaque
+    // integrator error.
+    // Rather than silently degrade or surface a confusing failure, reject
+    // them here with a typed, descriptive error (no hidden fallback).
+    if matches!(
+        uncertainty,
+        empyrean::UncertaintyMethod::SigmaPoint { .. }
+            | empyrean::UncertaintyMethod::MonteCarlo { .. }
+    ) {
+        return Err(PyValueError::new_err(
+            "sampling uncertainty methods (SIGMA_POINT, MONTE_CARLO) are not \
+             supported for generate_ephemeris: the sky-plane covariance is a \
+             first-order STM projection and does not consume a sampled \
+             ensemble. Use FIRST_ORDER, SECOND_ORDER, or AUTO for ephemeris \
+             uncertainty; for a sampled state covariance use \
+             propagate(uncertainty_method=SIGMA_POINT), and for Monte-Carlo \
+             impact probability use compute_impact_probabilities.",
+        ));
+    }
+    eph_config.propagation.uncertainty_method = uncertainty;
     // Dispatch through the reusable handle when supplied, else one-shot.
     // Both release the GIL around the native call; the handle path runs
     // the identity guard first (loud, distinct error on any mismatch).
@@ -4407,15 +4511,27 @@ fn apply_propagation_config_dict(
             // wire dict silently overrode the flat-arg auto() with
             // first_order.
             "auto" => empyrean::UncertaintyMethod::auto(),
-            // Sigma-point / Monte Carlo / Gaussian Mixture map onto
-            // FirstOrder at the wrapper level; their per-method params
-            // travel via separate flat args on `_propagate`. The
-            // wrapper's UncertaintyMethod enum only carries
-            // First/Second; villeneuve's parametric variants are
-            // selected at integration-time from those flat args.
-            "sigma_point" | "monte_carlo" | "gaussian_mixture" => {
-                empyrean::UncertaintyMethod::FirstOrder
-            }
+            // Sigma-point / Monte Carlo build the real wrapper variants
+            // with their DEFAULT parameters. The wire dict cannot carry the
+            // per-variant params (n_sigma / samples_per_plane / n_samples /
+            // seed) — those travel on the flat `_propagate` /
+            // `_generate_ephemeris` args, which are re-applied AFTER this
+            // dict so a parametric request is never lost. Mapping to the
+            // real variant here (instead of the old silent downgrade to
+            // FirstOrder) keeps a config-dict-only caller honest: a dict
+            // asking for sigma_point / monte_carlo resolves to
+            // sigma-point / Monte-Carlo, not a silently substituted
+            // first-order covariance.
+            "sigma_point" => empyrean::UncertaintyMethod::sigma_point(),
+            "monte_carlo" => empyrean::UncertaintyMethod::monte_carlo(1000),
+            // Adaptive Gaussian mixture (AGM) with its DEFAULT parameters.
+            // The wire dict cannot carry the per-variant params (threshold /
+            // max_depth / components_per_split) — those travel on the flat
+            // `gm_*` args, which are re-applied AFTER this dict so a
+            // parametric request is never lost. Mapping to the real variant
+            // here (instead of a silent downgrade to FirstOrder) keeps a
+            // config-dict-only caller honest.
+            "gaussian_mixture" => empyrean::UncertaintyMethod::gaussian_mixture(),
             other => {
                 return Err(PyValueError::new_err(format!(
                     "unknown uncertainty_method: {other}"

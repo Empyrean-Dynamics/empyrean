@@ -247,6 +247,11 @@ fn method_from_tag(tag: u8) -> UncertaintyMethod {
         // FirstOrder on readback — the IP value was correct but the
         // reported method was wrong.
         4 => UncertaintyMethod::auto(),
+        // Tag 5 = GaussianMixture (AGM). Without this arm, a mixture IP /
+        // B-plane row was silently relabelled FirstOrder on readback (the
+        // `ip_agm` value was correct but the reported method was wrong) —
+        // the same mislabel the Auto arm above fixes.
+        5 => UncertaintyMethod::gaussian_mixture(),
         _ => UncertaintyMethod::FirstOrder,
     }
 }

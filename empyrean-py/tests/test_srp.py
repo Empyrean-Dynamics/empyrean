@@ -44,7 +44,7 @@ from empyrean.observers.observers import Observers
 
 # A benign heliocentric Cartesian state; SRP magnitude is irrelevant to the
 # marshal-identity tests, only that the values round-trip.
-_STATE = dict(epoch=60000.0, x=1.2, y=-0.3, z=0.05, vx=0.004, vy=0.014, vz=-0.001)
+_STATE = {"epoch": 60000.0, "x": 1.2, "y": -0.3, "z": 0.05, "vx": 0.004, "vy": 0.014, "vz": -0.001}
 
 
 def _coords(n: int = 1) -> CartesianCoordinates:
@@ -260,9 +260,8 @@ def test_model_srp_rejected_by_od_marshal() -> None:
 
 
 def test_model_srp_rejected_by_io_write() -> None:
-    with pytest.raises(ValueError, match=r"orbits\.srp"):
-        with tempfile.TemporaryDirectory() as d:
-            write_orbits_parquet(os.path.join(d, "o.parquet"), _orbit_with_srp_model())
+    with pytest.raises(ValueError, match=r"orbits\.srp"), tempfile.TemporaryDirectory() as d:
+        write_orbits_parquet(os.path.join(d, "o.parquet"), _orbit_with_srp_model())
 
 
 # ── Fitted-orbit re-feed (OD result -> orbits.srp) ───────────────────

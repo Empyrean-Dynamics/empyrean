@@ -35,6 +35,7 @@ from empyrean.propagation.config import (
     _FORCE_MODEL_TO_INT,
     _UNCERTAINTY_METHOD_TO_INT,
     ForceModelTier,
+    GaussianMixture,
     MonteCarlo,
     PropagationConfig,
     SigmaPoint,
@@ -72,7 +73,7 @@ _EventTableT = TypeVar("_EventTableT", bound=qv.Table)
 # sites below. The runtime object is unchanged.
 CartesianCovariance: type[_CovarianceTable] = _CartesianCovariance
 
-UncertaintyMethodLike = UncertaintyMethod | SigmaPoint | MonteCarlo | str
+UncertaintyMethodLike = UncertaintyMethod | SigmaPoint | MonteCarlo | GaussianMixture | str
 
 
 def propagate(
@@ -124,11 +125,37 @@ def propagate(
     force_model : ForceModelTier or str, optional
         Quick override for ``config.force_model``. Ignored if ``config``
         is given.
-    uncertainty_method : UncertaintyMethod | SigmaPoint | MonteCarlo | str, optional
-        Quick override for ``config.uncertainty_method``. Accepts either
+    uncertainty_method : UncertaintyMethod | SigmaPoint | MonteCarlo | GaussianMixture | str
+        Optional quick override for ``config.uncertainty_method``. Accepts either
         an enum / string (default parameters) or a parameterized
-        dataclass (:class:`SigmaPoint(n_sigma=2.0)` etc.). Ignored if
-        ``config`` is given.
+        dataclass (:class:`SigmaPoint`, :class:`MonteCarlo`,
+        :class:`GaussianMixture`). Ignored if ``config`` is given.
+
+        All six methods run in :func:`propagate`:
+
+        * ``FIRST_ORDER`` / ``SECOND_ORDER`` / ``AUTO`` attach the
+          STM-based state covariance (``AUTO`` escalating to a
+          second-order ellipsoid over close-approach windows).
+        * ``SIGMA_POINT`` reconstructs a genuine sample-based state
+          covariance (the second moment of the propagated canonical
+          2N+1 sigma-point set), read back tagged ``sigma_point``.
+        * ``MONTE_CARLO`` draws ``n_samples`` from the input covariance
+          (reproducibly, for a fixed ``seed``) and reports the
+          Monte-Carlo impact probability on the
+          :attr:`~empyrean.PossibleImpacts.ip_mc` column of any
+          possible-impact event. It does **not** reconstruct a per-epoch
+          state covariance — the propagated states carry no state
+          covariance under ``MONTE_CARLO`` (use ``SIGMA_POINT`` for a
+          sampled state covariance, or
+          :func:`~empyrean.compute_impact_probabilities` for the
+          full Monte-Carlo impact-probability workflow).
+        * ``GAUSSIAN_MIXTURE`` splits the input Gaussian into an adaptive
+          mixture at close approaches; its distinctive product is the
+          mixture-corrected impact probability. Away from encounters the
+          output-state covariance is the linear ``Φ·Σ·Φᵀ`` mapping (like
+          ``SECOND_ORDER``), so for a well-determined object it reads back
+          very close to ``FIRST_ORDER`` (tagged ``linear``) — that is
+          expected, not a bug.
     num_threads : int, optional
         Threads for multi-orbit propagation. ``None`` (default) and
         ``0`` both use all available cores; ``n`` > 0 pins exactly
@@ -189,7 +216,7 @@ def propagate(
 
     >>> cfg = PropagationConfig(
     ...     force_model=ForceModelTier.STANDARD,
-    ...     uncertainty_method=SigmaPoint(n_sigma=2.0),
+    ...     uncertainty_method=SigmaPoint(),
     ...     num_threads=8,
     ... )
     >>> result = empyrean.propagate(orbits, times, cfg)
@@ -369,21 +396,28 @@ def propagate(
     #
     # Three input shapes:
     #   1. str / UncertaintyMethod enum → default parameters
-    #   2. SigmaPoint / MonteCarlo dataclass → method + params
+    #   2. SigmaPoint / MonteCarlo / GaussianMixture dataclass → method + params
     #   3. int (legacy) → default parameters
     sigma_n_sigma = 1.0
     sigma_samples_per_plane = 8
     mc_n_samples = 1000
     mc_seed: int | None = 42
+    gm_threshold = 1.0
+    gm_max_depth = 3
+    gm_components_per_split = 3
 
-    if isinstance(uncertainty_method, (SigmaPoint, MonteCarlo)):
+    if isinstance(uncertainty_method, (SigmaPoint, MonteCarlo, GaussianMixture)):
         um_int = _DATACLASS_TO_INT[type(uncertainty_method)]
         if isinstance(uncertainty_method, SigmaPoint):
             sigma_n_sigma = uncertainty_method.n_sigma
             sigma_samples_per_plane = uncertainty_method.samples_per_plane
-        else:  # MonteCarlo
+        elif isinstance(uncertainty_method, MonteCarlo):
             mc_n_samples = uncertainty_method.n_samples
             mc_seed = uncertainty_method.seed
+        else:  # GaussianMixture
+            gm_threshold = uncertainty_method.threshold
+            gm_max_depth = uncertainty_method.max_depth
+            gm_components_per_split = uncertainty_method.components_per_split
     elif isinstance(uncertainty_method, str):
         um_int_opt = _UNCERTAINTY_METHOD_TO_INT.get(uncertainty_method.lower())
         if um_int_opt is None:
@@ -396,7 +430,7 @@ def propagate(
     else:
         raise TypeError(
             "uncertainty_method must be UncertaintyMethod, a SigmaPoint / "
-            "MonteCarlo dataclass, str, or int; got "
+            "MonteCarlo / GaussianMixture dataclass, str, or int; got "
             f"{type(uncertainty_method).__name__}"
         )
 
@@ -452,12 +486,12 @@ def propagate(
         ng_ms=ng_ms,
         ng_ns=ng_ns,
         ng_ks=ng_ks,
-        # These mixture kwargs are accepted by the binding for ABI
-        # compatibility but ignored in this distribution. Pass benign
-        # placeholders.
-        gm_threshold=1.0,
-        gm_max_depth=3,
-        gm_components_per_split=3,
+        # GaussianMixture (AGM) parameters — honored by the binding when
+        # uncertainty_method resolves to GAUSSIAN_MIXTURE (tag 5); benign
+        # defaults otherwise.
+        gm_threshold=gm_threshold,
+        gm_max_depth=gm_max_depth,
+        gm_components_per_split=gm_components_per_split,
         sigma_n_sigma=sigma_n_sigma,
         sigma_samples_per_plane=sigma_samples_per_plane,
         mc_n_samples=mc_n_samples,
@@ -873,20 +907,20 @@ def _build_events(result: dict[str, Any]) -> Events:
         idx = _idx(tag)
         if not idx:
             return cls.empty()
-        kwargs: dict[str, Any] = dict(
-            orbit_id=_str(orbit_ids, idx),
-            object_id=_str_opt(object_ids, idx),
-            body=_str(bodies, idx),
-            epoch=_arr(epochs, idx),
-            distance_au=_arr(distance_au, idx),
-            distance_km=_arr(distance_km, idx),
-            relative_velocity_au_day=_arr(rel_v, idx),
-            two_body_energy=_arr(two_body_energy, idx),
-            jacobi_constant=_nullable_float(_arr(jacobi, idx)),
-            jacobi_constant_sigma=_nullable_float(_arr(jacobi_sigma, idx)),
-            jacobi_constant_l1=_nullable_float(_arr(jacobi_l1, idx)),
-            jacobi_constant_l2=_nullable_float(_arr(jacobi_l2, idx)),
-        )
+        kwargs: dict[str, Any] = {
+            "orbit_id": _str(orbit_ids, idx),
+            "object_id": _str_opt(object_ids, idx),
+            "body": _str(bodies, idx),
+            "epoch": _arr(epochs, idx),
+            "distance_au": _arr(distance_au, idx),
+            "distance_km": _arr(distance_km, idx),
+            "relative_velocity_au_day": _arr(rel_v, idx),
+            "two_body_energy": _arr(two_body_energy, idx),
+            "jacobi_constant": _nullable_float(_arr(jacobi, idx)),
+            "jacobi_constant_sigma": _nullable_float(_arr(jacobi_sigma, idx)),
+            "jacobi_constant_l1": _nullable_float(_arr(jacobi_l1, idx)),
+            "jacobi_constant_l2": _nullable_float(_arr(jacobi_l2, idx)),
+        }
         if with_n_periapses:
             kwargs["n_periapses"] = _arr(n_periapses, idx)
         return cls.from_kwargs(**kwargs)

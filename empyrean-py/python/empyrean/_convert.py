@@ -307,7 +307,7 @@ def coordinates_to_arrays(
             cov_matrices = _covariance_to_matrix(coords.covariance)
             has_cov = ~np.isnan(cov_matrices[:, 0, 0])
             cov_matrices = np.nan_to_num(cov_matrices, nan=0.0)
-        except Exception:
+        except Exception:  # noqa: BLE001 — bd empyrean-ekqe (deferred)
             cov_matrices = np.zeros((n, 6, 6))
             has_cov = np.zeros(n, dtype=bool)
     else:
@@ -654,7 +654,7 @@ def orbits_to_orbit_batch_dict(orbits: AnyOrbits) -> dict[str, Any]:
             cov_matrices = cov.to_matrix()
             has_cov = (~np.isnan(cov_matrices[:, 0, 0])).astype(np.uint8)
             cov_matrices = np.nan_to_num(cov_matrices, nan=0.0)
-        except Exception:
+        except Exception:  # noqa: BLE001 — bd empyrean-ekqe (deferred)
             cov_matrices = np.zeros((n, 6, 6))
             has_cov = np.zeros(n, dtype=np.uint8)
     else:

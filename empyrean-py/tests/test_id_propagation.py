@@ -44,28 +44,28 @@ from empyrean.observers.observers import Observers
 # triggers Earth close approaches on year-scale propagation (notably the
 # well-known 2029 flyby at MJD ~62239), so the events table is non-empty
 # and the ID-plumbing assertions actually run.
-APOPHIS_STATE = dict(
-    epoch=61000.0,
-    x=-7.85264914906904643e-02,
-    y=-8.19748051902064567e-01,
-    z=4.18939515323390882e-02,
-    vx=1.98751024968884596e-02,
-    vy=1.32208844536140196e-03,
-    vz=3.99496044422352188e-04,
-)
+APOPHIS_STATE = {
+    "epoch": 61000.0,
+    "x": -7.85264914906904643e-02,
+    "y": -8.19748051902064567e-01,
+    "z": 4.18939515323390882e-02,
+    "vx": 1.98751024968884596e-02,
+    "vy": 1.32208844536140196e-03,
+    "vz": 3.99496044422352188e-04,
+}
 # Bennu state at the same epoch (also ECLIPJ2000 heliocentric). Bennu's
 # 2135 Earth approach is far past our test window, but the state-vector
 # tagging path (multi-orbit batch → events table) runs on Apophis alone;
 # Bennu rides along to confirm orbit_id ↔ object_id pairing isn't swapped.
-BENNU_STATE = dict(
-    epoch=61000.0,
-    x=-1.06185,
-    y=0.36085,
-    z=0.04553,
-    vx=-0.00578,
-    vy=-0.01413,
-    vz=-0.00103,
-)
+BENNU_STATE = {
+    "epoch": 61000.0,
+    "x": -1.06185,
+    "y": 0.36085,
+    "z": 0.04553,
+    "vx": -0.00578,
+    "vy": -0.01413,
+    "vz": -0.00103,
+}
 
 
 def _earth_crosser_orbit(orbit_id: str, object_id: str) -> CartesianOrbits:

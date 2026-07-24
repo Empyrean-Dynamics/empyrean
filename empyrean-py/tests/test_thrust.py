@@ -48,17 +48,17 @@ def _diag_cov() -> np.ndarray:
 def _orbit(orbit_id: str, with_cov: bool = True) -> CartesianOrbits:
     """A heliocentric Cartesian state with a tight diagonal covariance so
     the burn-sensitivity path can engage."""
-    kwargs = dict(
-        epoch=[_T0],
-        x=[1.0],
-        y=[0.1],
-        z=[0.05],
-        vx=[-0.005],
-        vy=[0.015],
-        vz=[0.001],
-        frame="icrf",
-        origin=["Sun"],
-    )
+    kwargs = {
+        "epoch": [_T0],
+        "x": [1.0],
+        "y": [0.1],
+        "z": [0.05],
+        "vx": [-0.005],
+        "vy": [0.015],
+        "vz": [0.001],
+        "frame": "icrf",
+        "origin": ["Sun"],
+    }
     if with_cov:
         kwargs["covariance"] = CartesianCovariance.from_matrix(_diag_cov()[np.newaxis, :, :])
     coords = CartesianCoordinates.from_kwargs(**kwargs)

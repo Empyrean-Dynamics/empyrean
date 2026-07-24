@@ -907,20 +907,20 @@ def _build_events(result: dict[str, Any]) -> Events:
         idx = _idx(tag)
         if not idx:
             return cls.empty()
-        kwargs: dict[str, Any] = dict(
-            orbit_id=_str(orbit_ids, idx),
-            object_id=_str_opt(object_ids, idx),
-            body=_str(bodies, idx),
-            epoch=_arr(epochs, idx),
-            distance_au=_arr(distance_au, idx),
-            distance_km=_arr(distance_km, idx),
-            relative_velocity_au_day=_arr(rel_v, idx),
-            two_body_energy=_arr(two_body_energy, idx),
-            jacobi_constant=_nullable_float(_arr(jacobi, idx)),
-            jacobi_constant_sigma=_nullable_float(_arr(jacobi_sigma, idx)),
-            jacobi_constant_l1=_nullable_float(_arr(jacobi_l1, idx)),
-            jacobi_constant_l2=_nullable_float(_arr(jacobi_l2, idx)),
-        )
+        kwargs: dict[str, Any] = {
+            "orbit_id": _str(orbit_ids, idx),
+            "object_id": _str_opt(object_ids, idx),
+            "body": _str(bodies, idx),
+            "epoch": _arr(epochs, idx),
+            "distance_au": _arr(distance_au, idx),
+            "distance_km": _arr(distance_km, idx),
+            "relative_velocity_au_day": _arr(rel_v, idx),
+            "two_body_energy": _arr(two_body_energy, idx),
+            "jacobi_constant": _nullable_float(_arr(jacobi, idx)),
+            "jacobi_constant_sigma": _nullable_float(_arr(jacobi_sigma, idx)),
+            "jacobi_constant_l1": _nullable_float(_arr(jacobi_l1, idx)),
+            "jacobi_constant_l2": _nullable_float(_arr(jacobi_l2, idx)),
+        }
         if with_n_periapses:
             kwargs["n_periapses"] = _arr(n_periapses, idx)
         return cls.from_kwargs(**kwargs)

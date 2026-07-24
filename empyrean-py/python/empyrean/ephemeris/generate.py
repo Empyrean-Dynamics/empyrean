@@ -399,17 +399,17 @@ def generate_ephemeris(
         else None
     )
 
-    spherical_kwargs: dict[str, Any] = dict(
-        epoch=np.asarray(result["epoch"]),
-        rho=np.asarray(result["rho"]),
-        lon=np.asarray(result["ra"]),
-        lat=np.asarray(result["dec"]),
-        vrho=np.asarray(result["vrho"]),
-        vlon=np.asarray(result["vra"]),
-        vlat=np.asarray(result["vdec"]),
-        frame=Frame.ICRF.value,
-        origin=result["obs_code"],
-    )
+    spherical_kwargs: dict[str, Any] = {
+        "epoch": np.asarray(result["epoch"]),
+        "rho": np.asarray(result["rho"]),
+        "lon": np.asarray(result["ra"]),
+        "lat": np.asarray(result["dec"]),
+        "vrho": np.asarray(result["vrho"]),
+        "vlon": np.asarray(result["vra"]),
+        "vlat": np.asarray(result["vdec"]),
+        "frame": Frame.ICRF.value,
+        "origin": result["obs_code"],
+    }
     if sky_cov is not None:
         spherical_kwargs["covariance"] = sky_cov
     coordinates = SphericalCoordinates.from_kwargs(**spherical_kwargs)
@@ -442,17 +442,17 @@ def generate_ephemeris(
     _obs_epoch = np.asarray(result["epoch"], dtype=np.float64)
     _lt = np.asarray(result["light_time"], dtype=np.float64)
     emission_epoch = np.where(np.isfinite(_lt), _obs_epoch - _lt, _obs_epoch)
-    aberrated_kwargs: dict[str, Any] = dict(
-        epoch=emission_epoch,
-        x=aberrated_arr[:, 0],
-        y=aberrated_arr[:, 1],
-        z=aberrated_arr[:, 2],
-        vx=aberrated_arr[:, 3],
-        vy=aberrated_arr[:, 4],
-        vz=aberrated_arr[:, 5],
-        frame=Frame.ICRF.value,
-        origin=[str(Origin.SSB)] * m,
-    )
+    aberrated_kwargs: dict[str, Any] = {
+        "epoch": emission_epoch,
+        "x": aberrated_arr[:, 0],
+        "y": aberrated_arr[:, 1],
+        "z": aberrated_arr[:, 2],
+        "vx": aberrated_arr[:, 3],
+        "vy": aberrated_arr[:, 4],
+        "vz": aberrated_arr[:, 5],
+        "frame": Frame.ICRF.value,
+        "origin": [str(Origin.SSB)] * m,
+    }
     if aberrated_cov is not None:
         aberrated_kwargs["covariance"] = aberrated_cov
     aberrated_state = CartesianCoordinates.from_kwargs(**aberrated_kwargs)

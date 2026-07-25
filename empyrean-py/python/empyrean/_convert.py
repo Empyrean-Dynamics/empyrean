@@ -79,6 +79,152 @@ def _covariance_to_matrix(covariance: qv.Table) -> FloatArray:
     return matrix
 
 
+def _covariance_row_reference(index: int, orbit_ids: list[str] | None) -> str:
+    """Name one covariance row in an error message.
+
+    Includes the ``orbit_id`` when the caller has one (the orbit entry point),
+    so a user with a large batch can find the offending record without
+    re-deriving the row order.
+    """
+    if orbit_ids is not None and index < len(orbit_ids) and orbit_ids[index]:
+        return f"row {index} (orbit_id={orbit_ids[index]!r})"
+    return f"row {index}"
+
+
+def _covariance_state_labels(covariance: qv.Table) -> list[str]:
+    """The six state-variable labels of a covariance table, for error text."""
+    return list(cast("_CovarianceTable", covariance)._state_labels)
+
+
+def _covariance_matrices_and_presence(
+    covariance: qv.Table,
+    *,
+    entry_point: str,
+    n_rows: int,
+    orbit_ids: list[str] | None = None,
+) -> tuple[FloatArray, npt.NDArray[np.bool_]]:
+    """Marshal a covariance sub-table to ``(n, 6, 6)`` matrices + presence mask.
+
+    Single chokepoint for every covariance the wrapper hands to the engine.
+    A covariance that cannot be marshaled is **raised**, never replaced: this
+    helper has no fallback path, no zero-fill for malformed input, and no
+    ``has_covariance = False`` consolation prize. A caller who asked for a
+    covariance-bearing run and got a silently zeroed covariance would get
+    confidently wrong uncertainties out the far end.
+
+    Absence versus corruption
+    -------------------------
+    ``from_matrix`` writes NaN *values* for an absent covariance, and an unset
+    nullable column reads back as NaN too, so "null" and "NaN" are the same
+    signal here and a row can be fully non-null yet fully NaN. A row whose 36
+    entries are all null or NaN is genuinely absent: it is zero-filled and
+    reported as ``has_covariance = False``. Anything else must be complete
+    enough to use.
+
+    Partial rows
+    ------------
+    A row is rejected when any of its **six diagonal** entries is null or NaN
+    while the row is not fully absent. Null **off-diagonal** entries are
+    accepted and filled with zero, which is an explicit statement that those
+    state variables are uncorrelated — the standard reading of an omitted
+    off-diagonal, and the natural result of building a covariance from only
+    the six ``cov_<a>_<a>`` columns. A zero *diagonal* entry is different in
+    kind: it asserts zero variance on that state variable, a delta function
+    the caller never supplied.
+
+    Parameters
+    ----------
+    covariance : qv.Table
+        The covariance sub-table to marshal.
+    entry_point : str
+        Name of the calling entry point, quoted verbatim in every error. Both
+        entry points see the same coordinate classes, so the class name alone
+        would not tell a user which call failed.
+    n_rows : int
+        Expected row count — the length of the parent coordinate table.
+    orbit_ids : list of str, optional
+        Per-row orbit identifiers, quoted in the error when available so the
+        offending record is findable in a large batch.
+
+    Returns
+    -------
+    (matrices, has_covariance)
+        ``(n, 6, 6)`` float64 matrices with absent rows and null off-diagonals
+        zero-filled, and the per-row presence mask.
+
+    Raises
+    ------
+    ValueError
+        If the sub-table cannot be converted, is not shaped ``(n, 6, 6)``,
+        carries a non-finite entry, or carries a null/NaN diagonal entry on a
+        row that is not fully absent.
+    """
+    try:
+        matrices = _covariance_to_matrix(covariance)
+    except Exception as exc:
+        raise ValueError(
+            f"{entry_point}: could not convert the covariance sub-table to "
+            f"(n, 6, 6) matrices ({type(exc).__name__}: {exc})"
+        ) from exc
+
+    expected_shape = (n_rows, 6, 6)
+    if matrices.shape != expected_shape:
+        raise ValueError(
+            f"{entry_point}: covariance must be shaped {expected_shape} "
+            f"(one 6x6 per coordinate row), got {matrices.shape}"
+        )
+
+    matrices = np.asarray(matrices, dtype=np.float64)
+    if n_rows == 0:
+        return matrices, np.zeros(0, dtype=bool)
+
+    # NaN marks absence; +/-inf marks corruption. Separate the two before
+    # anything is zero-filled — `np.nan_to_num(x, nan=0.0)` leaves
+    # `posinf` alone at its default, which would turn +inf into 1.797e308
+    # and hand the engine a finite-looking variance.
+    is_nan = np.isnan(matrices)
+    is_inf = np.isinf(matrices)
+    if is_inf.any():
+        bad_rows = np.flatnonzero(is_inf.any(axis=(1, 2)))
+        first = int(bad_rows[0])
+        raise ValueError(
+            f"{entry_point}: covariance {_covariance_row_reference(first, orbit_ids)} "
+            f"contains a non-finite (+/-inf) entry; "
+            f"{len(bad_rows)} of {n_rows} row(s) affected. A covariance must be "
+            "finite — fix the input rather than letting an infinite variance "
+            "reach the engine."
+        )
+
+    absent = is_nan.all(axis=(1, 2))
+    diagonal = np.diagonal(matrices, axis1=1, axis2=2)
+    partial = np.isnan(diagonal).any(axis=1) & ~absent
+    if partial.any():
+        bad_rows = np.flatnonzero(partial)
+        first = int(bad_rows[0])
+        labels = _covariance_state_labels(covariance)
+        missing = [labels[k] for k in np.flatnonzero(np.isnan(diagonal[first]))]
+        raise ValueError(
+            f"{entry_point}: covariance {_covariance_row_reference(first, orbit_ids)} "
+            f"has a null or NaN variance on {missing} but is not fully absent; "
+            f"{len(bad_rows)} of {n_rows} row(s) affected. Supply every "
+            "cov_<a>_<a> diagonal entry, or leave the whole row null/NaN to "
+            "declare the row has no covariance. A missing diagonal entry "
+            "cannot be filled with zero: that would assert zero variance on "
+            "that state variable. (Null off-diagonal entries are accepted and "
+            "read as uncorrelated.) If this covariance came from "
+            "transform_coordinates, the element is undefined at that geometry "
+            "rather than missing from your input — an angular element loses "
+            "its definition as the orbit degenerates (argument of perihelion "
+            "for a circular orbit, node and inclination for an equatorial "
+            "one), so its variance is genuinely NaN and the transform, not "
+            "this call, is where the degeneracy arose."
+        )
+
+    # Every surviving NaN is either a fully-absent row or an off-diagonal
+    # zero-correlation fill; no infinities remain past the check above.
+    return np.nan_to_num(matrices, nan=0.0), ~absent
+
+
 # ── Representation / frame / origin mappings ─────────────────
 
 _REP_TO_INT = {
@@ -301,18 +447,18 @@ def coordinates_to_arrays(
 
     representations = np.full(n, rep_int, dtype=np.int32)
 
-    # Covariance
-    if hasattr(coords, "covariance") and coords.covariance is not None:
-        try:
-            cov_matrices = _covariance_to_matrix(coords.covariance)
-            has_cov = ~np.isnan(cov_matrices[:, 0, 0])
-            cov_matrices = np.nan_to_num(cov_matrices, nan=0.0)
-        except Exception:  # noqa: BLE001 — bd empyrean-ekqe (deferred)
-            cov_matrices = np.zeros((n, 6, 6))
-            has_cov = np.zeros(n, dtype=bool)
-    else:
-        cov_matrices = np.zeros((n, 6, 6))
-        has_cov = np.zeros(n, dtype=bool)
+    # Covariance. Every class in `_COORD_TYPE_MAP` declares a
+    # `covariance = <Rep>Covariance.as_column(nullable=True)` column, and quivr
+    # materialises an all-null sub-table rather than `None` when the caller
+    # never supplied one — so there is no "no covariance column" branch to
+    # take. If a fifth representation is ever added, give it a covariance
+    # column too, or reinstate a guard here that raises rather than
+    # substituting zeros.
+    cov_matrices, has_cov = _covariance_matrices_and_presence(
+        coords.covariance,
+        entry_point="coordinates_to_arrays",
+        n_rows=n,
+    )
 
     return (
         epochs,
@@ -648,18 +794,19 @@ def orbits_to_orbit_batch_dict(orbits: AnyOrbits) -> dict[str, Any]:
         [_column_to_numpy(getattr(orbits.coordinates, c)) for c in col_names]
     )
 
-    cov = getattr(orbits.coordinates, "covariance", None)
-    if cov is not None:
-        try:
-            cov_matrices = cov.to_matrix()
-            has_cov = (~np.isnan(cov_matrices[:, 0, 0])).astype(np.uint8)
-            cov_matrices = np.nan_to_num(cov_matrices, nan=0.0)
-        except Exception:  # noqa: BLE001 — bd empyrean-ekqe (deferred)
-            cov_matrices = np.zeros((n, 6, 6))
-            has_cov = np.zeros(n, dtype=np.uint8)
-    else:
-        cov_matrices = np.zeros((n, 6, 6))
-        has_cov = np.zeros(n, dtype=np.uint8)
+    # Same contract as `coordinates_to_arrays`: every class in
+    # `_COORD_TYPE_MAP` declares a nullable `covariance` sub-table column and
+    # quivr materialises it as all-null rather than `None`, so there is no
+    # "no covariance column" branch. A fifth representation must declare one
+    # too, or gain a guard here that raises rather than substituting zeros.
+    orbit_ids = orbits.orbit_id.to_pylist()
+    cov_matrices, cov_present = _covariance_matrices_and_presence(
+        orbits.coordinates.covariance,
+        entry_point="orbits_to_orbit_batch_dict",
+        n_rows=n,
+        orbit_ids=orbit_ids,
+    )
+    has_cov = cov_present.astype(np.uint8)
 
     # ``orbits.coordinates.frame`` is the stored string (``Frame`` is a
     # ``str`` enum, so its value serialises directly). Key by those value
@@ -711,7 +858,7 @@ def orbits_to_orbit_batch_dict(orbits: AnyOrbits) -> dict[str, Any]:
 
     object_ids = [s if s else "" for s in orbits.object_id.to_pylist()]
     return {
-        "orbit_ids": orbits.orbit_id.to_pylist(),
+        "orbit_ids": orbit_ids,
         "object_ids": object_ids,
         "epoch_mjd_tdb": epochs,
         "elements": elements,

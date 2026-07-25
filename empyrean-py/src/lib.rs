@@ -1547,7 +1547,15 @@ fn fill_tagged_covariance(
 //  compute_b_planes (which mirrors empyrean_core::impact). Method
 //  tags use the same integer encoding as `_propagate`'s
 //  `uncertainty_method` argument: 0 = FirstOrder, 1 = SecondOrder,
-//  2 = SigmaPoint (default params), 3 = MonteCarlo (default params).
+//  2 = SigmaPoint, 3 = MonteCarlo, 4 = Auto, 5 = GaussianMixture.
+//
+//  Each tag is accompanied by the same flat per-variant parameter slots
+//  `_propagate` takes, supplied as seven columns positionally aligned with
+//  the tag column, and decoded per element through the shared
+//  `build_uncertainty_method`. Every method therefore reaches the engine
+//  with the parameters the caller asked for; the columns are required, not
+//  optional, because an omittable parameter channel is a silent-default
+//  channel.
 // ══════════════════════════════════════════════════════════
 
 /// Parse an index out of the fabricated `"orbit_N"` strings that the
@@ -1755,27 +1763,70 @@ fn build_orbits_from_arrays(
     Ok(orbits)
 }
 
-fn methods_from_tags(tags: &[i32]) -> PyResult<Vec<empyrean::UncertaintyMethod>> {
-    let mut out = Vec::with_capacity(tags.len());
-    for &t in tags {
-        out.push(match t {
-            0 => empyrean::UncertaintyMethod::FirstOrder,
-            1 => empyrean::UncertaintyMethod::SecondOrder,
-            2 => empyrean::UncertaintyMethod::sigma_point(),
-            3 => empyrean::UncertaintyMethod::monte_carlo(1000),
-            4 => empyrean::UncertaintyMethod::auto(),
-            // GaussianMixture (tag 5): the impact-probability comparison
-            // harness runs AGM splitting at close approaches and reports
-            // the mixture-corrected impact probability on `ip_agm`. Built
-            // with the engine-default AGM parameters, matching the other
-            // parameter-free tags here (sigma_point() / monte_carlo(1000)).
-            5 => empyrean::UncertaintyMethod::gaussian_mixture(),
-            other => {
-                return Err(PyValueError::new_err(format!(
-                    "unknown uncertainty method tag: {other} (expected 0..=5)"
-                )));
-            }
-        });
+/// Assert that a per-method parameter column is positionally aligned with the
+/// method-tag column.
+///
+/// The columns are consumed by index, never by `zip`: a `zip` over a short
+/// column would silently truncate the method list (dropping requested methods)
+/// and a long one would silently ignore the tail. A mismatch is a typed
+/// `ValueError` naming the offending column and both lengths.
+fn check_method_column_len(name: &str, len: usize, n_tags: usize) -> PyResult<()> {
+    if len != n_tags {
+        return Err(PyValueError::new_err(format!(
+            "{name} must be positionally aligned with method_tags: got {len} \
+             entries for {n_tags} method tags"
+        )));
+    }
+    Ok(())
+}
+
+/// Decode the flat method columns into wrapper [`empyrean::UncertaintyMethod`]s.
+///
+/// One entry per requested method, built from that method's own parameter
+/// slots so a `SigmaPoint` / `MonteCarlo` / `GaussianMixture` spec reaches the
+/// engine with the parameters the caller supplied rather than engine defaults.
+/// Decoding delegates to [`build_uncertainty_method`], the single tag decoder
+/// shared with `_propagate` — one decoder, one error message, no drift.
+#[allow(clippy::too_many_arguments)]
+fn methods_from_flat(
+    tags: &[i32],
+    sigma_n_sigma: &[f64],
+    sigma_samples_per_plane: &[usize],
+    mc_n_samples: &[usize],
+    mc_seed: &[Option<u64>],
+    gm_threshold: &[f64],
+    gm_max_depth: &[usize],
+    gm_components_per_split: &[usize],
+) -> PyResult<Vec<empyrean::UncertaintyMethod>> {
+    let n = tags.len();
+    check_method_column_len("method_sigma_n_sigma", sigma_n_sigma.len(), n)?;
+    check_method_column_len(
+        "method_sigma_samples_per_plane",
+        sigma_samples_per_plane.len(),
+        n,
+    )?;
+    check_method_column_len("method_mc_n_samples", mc_n_samples.len(), n)?;
+    check_method_column_len("method_mc_seed", mc_seed.len(), n)?;
+    check_method_column_len("method_gm_threshold", gm_threshold.len(), n)?;
+    check_method_column_len("method_gm_max_depth", gm_max_depth.len(), n)?;
+    check_method_column_len(
+        "method_gm_components_per_split",
+        gm_components_per_split.len(),
+        n,
+    )?;
+
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        out.push(build_uncertainty_method(
+            tags[i],
+            sigma_n_sigma[i],
+            sigma_samples_per_plane[i],
+            mc_n_samples[i],
+            mc_seed[i],
+            gm_threshold[i],
+            gm_max_depth[i],
+            gm_components_per_split[i],
+        )?);
     }
     Ok(out)
 }
@@ -1786,6 +1837,13 @@ fn methods_from_tags(tags: &[i32]) -> PyResult<Vec<empyrean::UncertaintyMethod>>
     end_mjd_tdb,
     a1s, a2s, a3s,
     method_tags,
+    method_sigma_n_sigma,
+    method_sigma_samples_per_plane,
+    method_mc_n_samples,
+    method_mc_seed,
+    method_gm_threshold,
+    method_gm_max_depth,
+    method_gm_components_per_split,
     body_filter_naif=None,
     ng_alphas=None, ng_r0s=None, ng_ms=None, ng_ns=None, ng_ks=None,
     non_grav_dts=None,
@@ -1811,6 +1869,18 @@ fn _compute_impact_probabilities<'py>(
     a2s: PyReadonlyArray1<'py, f64>,
     a3s: PyReadonlyArray1<'py, f64>,
     method_tags: Vec<i32>,
+    // Per-method uncertainty parameters, seven columns positionally aligned
+    // with `method_tags`. Required (not `Option`): an omittable parameter
+    // channel is a silent-default channel, and these are exactly what makes a
+    // `MonteCarlo(n_samples=...)` / `GaussianMixture(threshold=...)` /
+    // non-default `SigmaPoint(...)` spec reach the engine as written.
+    method_sigma_n_sigma: Vec<f64>,
+    method_sigma_samples_per_plane: Vec<usize>,
+    method_mc_n_samples: Vec<usize>,
+    method_mc_seed: Vec<Option<u64>>,
+    method_gm_threshold: Vec<f64>,
+    method_gm_max_depth: Vec<usize>,
+    method_gm_components_per_split: Vec<usize>,
     body_filter_naif: Option<Vec<i32>>,
     ng_alphas: Option<PyReadonlyArray1<'py, f64>>,
     ng_r0s: Option<PyReadonlyArray1<'py, f64>>,
@@ -1878,7 +1948,16 @@ fn _compute_impact_probabilities<'py>(
             .map(|a| a.as_array().to_owned())
             .as_ref(),
     )?;
-    let methods = methods_from_tags(&method_tags)?;
+    let methods = methods_from_flat(
+        &method_tags,
+        &method_sigma_n_sigma,
+        &method_sigma_samples_per_plane,
+        &method_mc_n_samples,
+        &method_mc_seed,
+        &method_gm_threshold,
+        &method_gm_max_depth,
+        &method_gm_components_per_split,
+    )?;
     let filter: Vec<empyrean::Origin> = body_filter_naif
         .unwrap_or_default()
         .into_iter()
@@ -2017,6 +2096,13 @@ fn _compute_impact_probabilities<'py>(
     end_mjd_tdb,
     a1s, a2s, a3s,
     method_tags,
+    method_sigma_n_sigma,
+    method_sigma_samples_per_plane,
+    method_mc_n_samples,
+    method_mc_seed,
+    method_gm_threshold,
+    method_gm_max_depth,
+    method_gm_components_per_split,
     body_filter_naif=None,
     ng_alphas=None, ng_r0s=None, ng_ms=None, ng_ns=None, ng_ks=None,
     non_grav_dts=None,
@@ -2042,6 +2128,18 @@ fn _compute_b_planes<'py>(
     a2s: PyReadonlyArray1<'py, f64>,
     a3s: PyReadonlyArray1<'py, f64>,
     method_tags: Vec<i32>,
+    // Per-method uncertainty parameters, seven columns positionally aligned
+    // with `method_tags`. Required (not `Option`): an omittable parameter
+    // channel is a silent-default channel, and these are exactly what makes a
+    // `MonteCarlo(n_samples=...)` / `GaussianMixture(threshold=...)` /
+    // non-default `SigmaPoint(...)` spec reach the engine as written.
+    method_sigma_n_sigma: Vec<f64>,
+    method_sigma_samples_per_plane: Vec<usize>,
+    method_mc_n_samples: Vec<usize>,
+    method_mc_seed: Vec<Option<u64>>,
+    method_gm_threshold: Vec<f64>,
+    method_gm_max_depth: Vec<usize>,
+    method_gm_components_per_split: Vec<usize>,
     body_filter_naif: Option<Vec<i32>>,
     ng_alphas: Option<PyReadonlyArray1<'py, f64>>,
     ng_r0s: Option<PyReadonlyArray1<'py, f64>>,
@@ -2109,7 +2207,16 @@ fn _compute_b_planes<'py>(
             .map(|a| a.as_array().to_owned())
             .as_ref(),
     )?;
-    let methods = methods_from_tags(&method_tags)?;
+    let methods = methods_from_flat(
+        &method_tags,
+        &method_sigma_n_sigma,
+        &method_sigma_samples_per_plane,
+        &method_mc_n_samples,
+        &method_mc_seed,
+        &method_gm_threshold,
+        &method_gm_max_depth,
+        &method_gm_components_per_split,
+    )?;
     let filter: Vec<empyrean::Origin> = body_filter_naif
         .unwrap_or_default()
         .into_iter()

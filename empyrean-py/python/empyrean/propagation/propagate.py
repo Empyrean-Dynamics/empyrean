@@ -40,6 +40,7 @@ from empyrean.propagation.config import (
     PropagationConfig,
     SigmaPoint,
     UncertaintyMethod,
+    _uncertainty_method_params,
 )
 from empyrean.propagation.events import (
     AtmosphericEntries,
@@ -398,26 +399,22 @@ def propagate(
     #   1. str / UncertaintyMethod enum → default parameters
     #   2. SigmaPoint / MonteCarlo / GaussianMixture dataclass → method + params
     #   3. int (legacy) → default parameters
-    sigma_n_sigma = 1.0
-    sigma_samples_per_plane = 8
-    mc_n_samples = 1000
-    mc_seed: int | None = 42
-    gm_threshold = 1.0
-    gm_max_depth = 3
-    gm_components_per_split = 3
+    #
+    # The flat parameter slots come from the one shared lowering helper, which
+    # the ephemeris and impact entry points also use, so the three paths cannot
+    # drift apart. The tag dispatch below still owns type validation.
+    (
+        sigma_n_sigma,
+        sigma_samples_per_plane,
+        mc_n_samples,
+        mc_seed,
+        gm_threshold,
+        gm_max_depth,
+        gm_components_per_split,
+    ) = _uncertainty_method_params(uncertainty_method)
 
     if isinstance(uncertainty_method, (SigmaPoint, MonteCarlo, GaussianMixture)):
         um_int = _DATACLASS_TO_INT[type(uncertainty_method)]
-        if isinstance(uncertainty_method, SigmaPoint):
-            sigma_n_sigma = uncertainty_method.n_sigma
-            sigma_samples_per_plane = uncertainty_method.samples_per_plane
-        elif isinstance(uncertainty_method, MonteCarlo):
-            mc_n_samples = uncertainty_method.n_samples
-            mc_seed = uncertainty_method.seed
-        else:  # GaussianMixture
-            gm_threshold = uncertainty_method.threshold
-            gm_max_depth = uncertainty_method.max_depth
-            gm_components_per_split = uncertainty_method.components_per_split
     elif isinstance(uncertainty_method, str):
         um_int_opt = _UNCERTAINTY_METHOD_TO_INT.get(uncertainty_method.lower())
         if um_int_opt is None:

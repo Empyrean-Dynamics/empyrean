@@ -9,7 +9,7 @@ Sensible production defaults out of the box.
 
 import enum
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, NamedTuple
 
 from empyrean.coordinates.enums import Frame, Origin
 from empyrean.propagation.events import EventConfig
@@ -197,8 +197,74 @@ _DATACLASS_TO_INT = {
 }
 
 
+class _UncertaintyParams(NamedTuple):
+    """The flat per-variant uncertainty parameters every distribution entry
+    point marshals alongside the method tag.
+
+    The engine's ``UncertaintyMethod`` is a tagged union whose payload differs
+    per variant, but the FFI boundary is flat: one integer tag plus a fixed set
+    of scalar slots. This tuple is that flat slot set, so a caller-facing spec
+    (:class:`SigmaPoint` / :class:`MonteCarlo` / :class:`GaussianMixture`) is
+    lowered exactly once, in :func:`_uncertainty_method_params`, rather than
+    re-derived at each entry point.
+    """
+
+    sigma_n_sigma: float
+    sigma_samples_per_plane: int
+    mc_n_samples: int
+    mc_seed: int | None
+    gm_threshold: float
+    gm_max_depth: int
+    gm_components_per_split: int
+
+
+_UNCERTAINTY_PARAM_DEFAULTS = _UncertaintyParams(1.0, 8, 1000, 42, 1.0, 3, 3)
+"""Engine-default value for every flat slot.
+
+Each field equals the corresponding dataclass field default
+(:class:`SigmaPoint`, :class:`MonteCarlo`, :class:`GaussianMixture`), which is
+what makes a default-constructed spec a no-op: ``SigmaPoint()`` lowers to
+exactly the same seven values as ``"sigma_point"`` or
+:attr:`UncertaintyMethod.SIGMA_POINT`.
+"""
+
+
 UncertaintyMethodLike = UncertaintyMethod | SigmaPoint | MonteCarlo | GaussianMixture | str
 """Type alias for inputs accepted by the ``uncertainty_method`` argument."""
+
+
+def _uncertainty_method_params(
+    uncertainty_method: UncertaintyMethodLike | int,
+) -> _UncertaintyParams:
+    """Lower one method spec to the flat parameter slots the FFI boundary takes.
+
+    Only the slots belonging to the supplied dataclass are overridden; every
+    other slot keeps its engine default. A non-parameterized spec (the
+    :class:`UncertaintyMethod` enum, its wire string, or a legacy integer tag)
+    carries no parameters of its own and returns
+    :data:`_UNCERTAINTY_PARAM_DEFAULTS` unchanged — selecting the method with
+    engine defaults.
+
+    This function does **not** validate the spec's type; the caller's tag
+    dispatch owns that and raises for an unsupported spec.
+    """
+    if isinstance(uncertainty_method, SigmaPoint):
+        return _UNCERTAINTY_PARAM_DEFAULTS._replace(
+            sigma_n_sigma=uncertainty_method.n_sigma,
+            sigma_samples_per_plane=uncertainty_method.samples_per_plane,
+        )
+    if isinstance(uncertainty_method, MonteCarlo):
+        return _UNCERTAINTY_PARAM_DEFAULTS._replace(
+            mc_n_samples=uncertainty_method.n_samples,
+            mc_seed=uncertainty_method.seed,
+        )
+    if isinstance(uncertainty_method, GaussianMixture):
+        return _UNCERTAINTY_PARAM_DEFAULTS._replace(
+            gm_threshold=uncertainty_method.threshold,
+            gm_max_depth=uncertainty_method.max_depth,
+            gm_components_per_split=uncertainty_method.components_per_split,
+        )
+    return _UNCERTAINTY_PARAM_DEFAULTS
 
 
 @dataclass

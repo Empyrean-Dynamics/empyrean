@@ -2567,7 +2567,13 @@ struct EmpyreanRadarObservation {
 
 /**
  * One element of [`EmpyreanWeightingConfig::additional_layers`].
- * Tagged-union shape: the active fields depend on `kind`.
+ * Tagged-union shape: the active fields depend on `kind`, and the
+ * inactive fields MUST be left at their unset values (zeroed bytes /
+ * 0.0 / NaN epochs) — a layer carrying fields its kind does not read
+ * is rejected with an error rather than silently ignored. In
+ * particular a `NIGHTLY_DEWEIGHTING` layer reads only
+ * `max_gap_days`: nightly de-weighting cannot be scoped by station
+ * or time range.
  */
 struct EmpyreanWeightingLayer {
     /**
@@ -2660,6 +2666,12 @@ struct EmpyreanWeightingConfig {
      * Pointer to additional layers inserted AHEAD of the preset's
      * chain (first-match-wins: they override preset rules for their
      * stations; relative order within the array is preserved).
+     * Presets contribute station-sigma rules only — the production
+     * default chain includes exactly one `NIGHTLY_DEWEIGHTING`
+     * layer, so callers composing this array must include it
+     * explicitly or nightly de-weighting is off. At most one
+     * `NIGHTLY_DEWEIGHTING` layer is accepted per chain (duplicates
+     * compound the 1/√N de-weighting and are rejected).
      * Non-owning — caller keeps the array alive for the OD call.
      */
     const struct EmpyreanWeightingLayer *additional_layers;

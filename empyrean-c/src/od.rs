@@ -315,7 +315,13 @@ pub const EMPYREAN_WEIGHTING_LAYER_OBSERVATORY_RULE: i32 = 0;
 pub const EMPYREAN_WEIGHTING_LAYER_NIGHTLY_DEWEIGHTING: i32 = 1;
 
 /// One element of [`EmpyreanWeightingConfig::additional_layers`].
-/// Tagged-union shape: the active fields depend on `kind`.
+/// Tagged-union shape: the active fields depend on `kind`, and the
+/// inactive fields MUST be left at their unset values (zeroed bytes /
+/// 0.0 / NaN epochs) — a layer carrying fields its kind does not read
+/// is rejected with an error rather than silently ignored. In
+/// particular a `NIGHTLY_DEWEIGHTING` layer reads only
+/// `max_gap_days`: nightly de-weighting cannot be scoped by station
+/// or time range.
 #[repr(C)]
 pub struct EmpyreanWeightingLayer {
     /// Layer kind discriminator — one of
@@ -384,6 +390,12 @@ pub struct EmpyreanWeightingConfig {
     /// Pointer to additional layers inserted AHEAD of the preset's
     /// chain (first-match-wins: they override preset rules for their
     /// stations; relative order within the array is preserved).
+    /// Presets contribute station-sigma rules only — the production
+    /// default chain includes exactly one `NIGHTLY_DEWEIGHTING`
+    /// layer, so callers composing this array must include it
+    /// explicitly or nightly de-weighting is off. At most one
+    /// `NIGHTLY_DEWEIGHTING` layer is accepted per chain (duplicates
+    /// compound the 1/√N de-weighting and are rejected).
     /// Non-owning — caller keeps the array alive for the OD call.
     pub additional_layers: *const EmpyreanWeightingLayer,
     pub num_additional_layers: usize,
@@ -2564,7 +2576,7 @@ fn build_weighting_from_c(
         let slice =
             unsafe { std::slice::from_raw_parts(c.additional_layers, c.num_additional_layers) };
         let mut user_layers: Vec<WeightingLayer> = Vec::with_capacity(slice.len());
-        for layer in slice {
+        for (idx, layer) in slice.iter().enumerate() {
             let parsed = match layer.kind {
                 EMPYREAN_WEIGHTING_LAYER_OBSERVATORY_RULE => {
                     let code = String::from_utf8_lossy(
@@ -2599,6 +2611,40 @@ fn build_weighting_from_c(
                     }
                 }
                 EMPYREAN_WEIGHTING_LAYER_NIGHTLY_DEWEIGHTING => {
+                    // NightlyDeweighting reads ONLY max_gap_days. The
+                    // ObservatoryRule fields have no effect on this
+                    // kind — rather than accept-and-ignore them (the
+                    // caller believes they scoped the layer; the
+                    // scoping silently never happens), reject loudly.
+                    if layer.obs_code.iter().any(|&b| b != 0) {
+                        return Err(format!(
+                            "weighting.additional_layers[{idx}]: NIGHTLY_DEWEIGHTING does not \
+                             support obs_code scoping (nightly de-weighting groups per station \
+                             internally and always applies to every station); leave obs_code \
+                             zeroed, or use an OBSERVATORY_RULE layer for per-station sigmas"
+                        ));
+                    }
+                    if layer.sigma_ra_arcsec != 0.0 || layer.sigma_dec_arcsec != 0.0 {
+                        return Err(format!(
+                            "weighting.additional_layers[{idx}]: NIGHTLY_DEWEIGHTING does not \
+                             read sigma_ra_arcsec/sigma_dec_arcsec; set them to 0.0, or use an \
+                             OBSERVATORY_RULE layer to assign sigmas"
+                        ));
+                    }
+                    let epoch_set = |v: f64| v.is_finite() && v != 0.0;
+                    if epoch_set(layer.start_epoch_mjd_tdb) || epoch_set(layer.end_epoch_mjd_tdb) {
+                        return Err(format!(
+                            "weighting.additional_layers[{idx}]: NIGHTLY_DEWEIGHTING does not \
+                             support a time range (start/end_epoch_mjd_tdb are not read); set \
+                             them to NaN or 0.0"
+                        ));
+                    }
+                    if layer.scale != 0.0 {
+                        return Err(format!(
+                            "weighting.additional_layers[{idx}]: NIGHTLY_DEWEIGHTING does not \
+                             read scale; set it to 0.0"
+                        ));
+                    }
                     let max_gap_days = if layer.max_gap_days > 0.0 {
                         layer.max_gap_days
                     } else {
@@ -2628,6 +2674,22 @@ fn build_weighting_from_c(
         // position in the chain.
         user_layers.append(&mut wcfg.layers);
         wcfg.layers = user_layers;
+    }
+
+    // Duplicate nightly layers compound: each pass multiplies the
+    // weights by another 1/sqrt(N) per night, which no production
+    // scheme intends. Reject rather than silently over-de-weight.
+    let nightly_count = wcfg
+        .layers
+        .iter()
+        .filter(|l| matches!(l, WeightingLayer::NightlyDeweighting { .. }))
+        .count();
+    if nightly_count > 1 {
+        return Err(format!(
+            "weighting layer chain contains {nightly_count} NIGHTLY_DEWEIGHTING layers; each \
+             additional pass compounds the per-night 1/sqrt(N) de-weighting multiplicatively — \
+             include exactly one"
+        ));
     }
 
     Ok(Some(wcfg))

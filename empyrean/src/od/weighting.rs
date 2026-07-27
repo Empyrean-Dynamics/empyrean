@@ -83,6 +83,12 @@ pub struct WeightingConfig {
     /// Layers placed ahead of the preset's chain — first-match-wins,
     /// so they override preset rules for their stations; the preset
     /// is the fallback.
+    ///
+    /// NOTE: assigning this field REPLACES the default
+    /// `[NightlyDeweighting]` list — include a
+    /// [`WeightingLayer::NightlyDeweighting`] entry explicitly to
+    /// keep the production per-night 1/√N de-weighting. At most one
+    /// nightly layer is accepted per chain.
     pub additional_layers: Vec<WeightingLayer>,
 }
 

@@ -2860,7 +2860,20 @@ fn build_rejection_strategy_from_c(
     }))
 }
 
-fn build_od_config_from_c(c: &EmpyreanODConfig) -> Result<ODConfig, String> {
+/// Build a scott [`ODConfig`] from the C request struct.
+///
+/// **The single OD-config parser in the C ABI.** Every entry point that
+/// accepts an [`EmpyreanODConfig`] — the one-shot `determine` /
+/// `evaluate` / `refine` surfaces here and
+/// [`empyrean_session_new`](crate::session::empyrean_session_new) — goes
+/// through this function, so the weighting chain
+/// ([`build_weighting_from_c`]), the debiasing decision
+/// ([`build_debiasing_from_c`]) and every other field resolve
+/// identically on all of them. A second, partial parser would let a
+/// change to the weighting contract land on one surface and not the
+/// other, and would silently drop whatever it forgot to read — do not
+/// add one.
+pub(crate) fn build_od_config_from_c(c: &EmpyreanODConfig) -> Result<ODConfig, String> {
     let fm = int_to_force_model(c.force_model)?;
     let mut cfg = ODConfig::default();
     cfg.force_model = fm.into();

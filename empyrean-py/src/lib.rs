@@ -5804,9 +5804,11 @@ struct PySession {
 #[pymethods]
 impl PySession {
     /// Construct a session by parsing ADES PSV / MPC80 content.
-    /// `force_model` matches the propagation tier ints (0/1/2).
-    /// Other ODConfig knobs use upstream defaults; tweak via the
-    /// dedicated wrappers if needed.
+    /// `config_dict` is the full `ODConfig` wire dict `_determine`
+    /// consumes, resolved by the same builder — weighting, debiasing,
+    /// rejection and the rest apply to a session exactly as they do to
+    /// the one-shot surface. A malformed weighting layer raises here,
+    /// at construction, rather than at the first refine.
     #[new]
     #[pyo3(signature = (ades_path_or_content, config_dict))]
     fn new(ades_path_or_content: &str, config_dict: &Bound<'_, PyDict>) -> PyResult<Self> {

@@ -14,13 +14,13 @@ use std::panic::AssertUnwindSafe;
 
 use empyrean_core::convert::{coordinates_to_coordinate_state, frame_to_int};
 use empyrean_core::coordinates::{AU, Coordinates};
-use empyrean_core::determination::{ODConfig, ODResult, Session, SessionDiff};
+use empyrean_core::determination::{ODResult, Session, SessionDiff};
 
 use crate::od::{
-    EmpyreanODConfig, EmpyreanODResult, EmpyreanObservation, c_observations_to_optical,
-    observation_results_to_c, summary_to_c,
+    EmpyreanODConfig, EmpyreanODResult, EmpyreanObservation, build_od_config_from_c,
+    c_observations_to_optical, observation_results_to_c, summary_to_c,
 };
-use crate::propagate::{EmpyreanPropagatedState, int_to_force_model};
+use crate::propagate::EmpyreanPropagatedState;
 use crate::{EmpyreanContext, set_last_error};
 
 // ────────────────────────────────────────────────────────────────────
@@ -70,6 +70,14 @@ impl EmpyreanSessionDiff {
 /// Construct a new orbit-determination session over a fixed
 /// observation set.
 ///
+/// `config` is parsed by the same builder the one-shot
+/// `empyrean_determine` / `empyrean_evaluate` / `empyrean_refine`
+/// entry points use, so every field — weighting preset and additional
+/// layers, debiasing, rejection, solve-for, origin and output-epoch
+/// policy — resolves identically on both surfaces. A malformed
+/// weighting layer is rejected here, before any fitting: the call
+/// returns null with the reason in `empyrean_last_error`.
+///
 /// Returns a heap-allocated handle on success, or null on error.
 /// The caller owns the returned pointer and must free it with
 /// [`empyrean_session_free`].
@@ -93,7 +101,16 @@ pub unsafe extern "C" fn empyrean_session_new(
                 return std::ptr::null_mut();
             }
         };
-        let cfg = match build_od_config_from_c_local(cfg_ref) {
+        // Parsed by the SAME builder the one-shot determine / evaluate /
+        // refine entry points use. A session-local parser existed here
+        // and read only the force model and the four convergence knobs,
+        // so a caller who configured weighting or debiasing on a session
+        // silently got scott's `ODConfig::default()` instead — no
+        // diagnostic, no parity with the one-shot surface. Every layer
+        // validation error the shared builder raises now propagates out
+        // of this constructor as a null return + `set_last_error`, which
+        // the wrapper turns into a typed error.
+        let cfg = match build_od_config_from_c(cfg_ref) {
             Ok(c) => c,
             Err(e) => {
                 set_last_error(&e);
@@ -391,26 +408,6 @@ pub unsafe extern "C" fn empyrean_session_diff(
 // ────────────────────────────────────────────────────────────────────
 // Helpers (local to this module)
 // ────────────────────────────────────────────────────────────────────
-
-fn build_od_config_from_c_local(c: &EmpyreanODConfig) -> Result<ODConfig, String> {
-    let fm = int_to_force_model(c.force_model)?;
-    let mut cfg = ODConfig::default();
-    cfg.force_model = fm.into();
-    if c.max_iterations > 0 {
-        cfg.max_iterations = c.max_iterations as usize;
-    }
-    if c.convergence_tol > 0.0 {
-        cfg.convergence_tol = c.convergence_tol;
-    }
-    if c.epsilon > 0.0 {
-        cfg.epsilon = c.epsilon;
-    }
-    if c.max_light_time_iterations > 0 {
-        cfg.max_light_time_iterations = c.max_light_time_iterations;
-    }
-    cfg.num_threads = std::num::NonZeroUsize::new(c.num_threads);
-    Ok(cfg)
-}
 
 fn write_od_result(od: &ODResult, result_out: *mut EmpyreanODResult) -> Result<(), String> {
     let prop_state = od_orbit_to_propagated_local(&od.orbit, &od.covariance)?;

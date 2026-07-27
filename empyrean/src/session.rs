@@ -70,6 +70,12 @@ unsafe impl Send for Session {}
 
 impl Session {
     /// Construct a session over a fixed observation set.
+    ///
+    /// `config` is resolved by the same engine-side builder the
+    /// one-shot [`Context::determine`](crate::Context::determine) /
+    /// `evaluate` / `refine` calls use, so a session fit and a one-shot
+    /// fit of the same observations under the same [`ODConfig`] agree.
+    /// A malformed weighting layer is an error here, at construction.
     pub fn new(observations: Observations, config: ODConfig) -> Result<Self> {
         let (obs_ptr, obs_len) = observations.as_ffi_slice();
         let (ffi_config, _perturbers_keep) = config.to_ffi_with()?;

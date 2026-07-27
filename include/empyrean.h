@@ -5021,6 +5021,14 @@ int32_t empyrean_query_radar(const char *const *designations,
  * Construct a new orbit-determination session over a fixed
  * observation set.
  *
+ * `config` is parsed by the same builder the one-shot
+ * `empyrean_determine` / `empyrean_evaluate` / `empyrean_refine`
+ * entry points use, so every field — weighting preset and additional
+ * layers, debiasing, rejection, solve-for, origin and output-epoch
+ * policy — resolves identically on both surfaces. A malformed
+ * weighting layer is rejected here, before any fitting: the call
+ * returns null with the reason in `empyrean_last_error`.
+ *
  * Returns a heap-allocated handle on success, or null on error.
  * The caller owns the returned pointer and must free it with
  * [`empyrean_session_free`].

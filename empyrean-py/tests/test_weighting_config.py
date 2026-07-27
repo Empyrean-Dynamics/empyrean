@@ -1,6 +1,6 @@
 """Weighting config-resolution contract suite (Wave A).
 
-Locks the four config-resolution contracts fixed after the July-2026
+Locks the five config-resolution contracts fixed after the July-2026
 external weighting report, each demonstrated failing against the
 pre-fix build (failure signatures recorded per test):
 
@@ -17,6 +17,12 @@ pre-fix build (failure signatures recorded per test):
 * **defense-in-depth sigma validation** — non-finite / non-positive
   layer sigmas raise at the Python layer (engine-side value
   validation ships separately with the next scott release).
+* **session / one-shot parity** — a :class:`Session` resolves the
+  weighting and debiasing configuration through the same builder as
+  ``determine`` / ``evaluate`` / ``refine``, so the same observations
+  and the same configuration produce the same fit on both surfaces,
+  and every layer-validation error above is raised by the session
+  constructor too.
 
 The fixture is hermetic: a hardcoded heliocentric Cartesian state
 (the Apophis state also used by ``test_no_silent_drops``) and
@@ -37,6 +43,8 @@ from empyrean import (
     CartesianCoordinates,
     CartesianOrbits,
     Origin,
+    Session,
+    determine,
     evaluate,
     generate_ephemeris,
 )
@@ -116,6 +124,35 @@ def f51_observations(probe_orbit) -> ADESObservations:
         dec=(dec + 1.0 / 3600.0).tolist(),
         rms_ra=[None] * n,
         rms_dec=[None] * n,
+    )
+
+
+@pytest.fixture(scope="module")
+def fittable_f51_observations(probe_orbit) -> ADESObservations:
+    """The same synthetic F51 arc, long enough to fit from scratch.
+
+    Section (e) compares *fits*, not evaluations, so the arc has to
+    carry enough curvature for IOD to converge: 15 observations across
+    30 days instead of the 6-night evaluation arc above. Everything
+    else is identical — the orbit's own predicted RA/Dec plus a fixed
+    1″ Dec offset, and no reported rms columns, so the weighting rules
+    alone set the weights.
+    """
+    epochs = [61001.1 + 30.0 * i / 14 for i in range(15)]
+    observers = Observers.from_code("F51", epochs)
+    eph = generate_ephemeris(probe_orbit, observers, force_model=ForceModelTier.APPROXIMATE)
+    ra = eph.ephemeris.coordinates.lon.to_numpy(zero_copy_only=False)
+    dec = eph.ephemeris.coordinates.lat.to_numpy(zero_copy_only=False)
+    n = len(ra)
+    assert n == len(epochs)
+    return ADESObservations.from_kwargs(
+        stn=["F51"] * n,
+        obs_time=[_mjd_to_iso(e) for e in epochs],
+        ra=ra.tolist(),
+        dec=(dec + 1.0 / 3600.0).tolist(),
+        rms_ra=[None] * n,
+        rms_dec=[None] * n,
+        trk_sub=["probe"] * n,
     )
 
 
@@ -458,3 +495,189 @@ def test_raw_wire_bad_sigma_rejected_at_binding(probe_orbit, f51_observations):
     }
     with pytest.raises(ValueError, match="sigma must be finite and > 0"):
         _eval_raw(probe_orbit, f51_observations, raw)
+
+
+# ── (e) session / one-shot parity ────────────────────────────────────
+#
+# Everything above runs through the one-shot surface. The session
+# constructor used to parse the OD config with its own partial parser
+# that read the force model and four convergence knobs and nothing
+# else, so a session caller's weighting and debiasing configuration was
+# discarded wholesale — no diagnostic, and none of the contracts above
+# applied. Both surfaces now share a single OD-config builder; these
+# tests pin that they cannot drift apart again.
+
+
+def _od_config(weighting: WeightingConfig, *, debiasing_enabled: bool = False) -> ODConfig:
+    return ODConfig(
+        force_model=ForceModelTier.APPROXIMATE,
+        weighting=weighting,
+        debiasing=DebiasingConfig(enabled=debiasing_enabled),
+    )
+
+
+def _uniform(sigma: float) -> WeightingConfig:
+    return WeightingConfig(
+        preset=WeightingPreset.NONE,
+        additional_layers=[],
+        default_sigma_arcsec=sigma,
+    )
+
+
+def _state(result) -> np.ndarray:
+    c = result.orbit.coordinates
+    return np.array(
+        [
+            c.x.to_numpy(zero_copy_only=False)[0],
+            c.y.to_numpy(zero_copy_only=False)[0],
+            c.z.to_numpy(zero_copy_only=False)[0],
+            c.vx.to_numpy(zero_copy_only=False)[0],
+            c.vy.to_numpy(zero_copy_only=False)[0],
+            c.vz.to_numpy(zero_copy_only=False)[0],
+        ]
+    )
+
+
+def _assert_same_fit(session_fit, one_shot_fit) -> None:
+    """Both surfaces ran the same fit: same chi2, same residual
+    statistics, same fitted state."""
+    assert np.isfinite(one_shot_fit.summary.chi2)
+    assert one_shot_fit.summary.chi2 > 0.0
+    np.testing.assert_allclose(session_fit.summary.chi2, one_shot_fit.summary.chi2, rtol=1e-12)
+    np.testing.assert_allclose(
+        session_fit.summary.reduced_chi2, one_shot_fit.summary.reduced_chi2, rtol=1e-12
+    )
+    np.testing.assert_allclose(
+        session_fit.summary.rms_combined_arcsec,
+        one_shot_fit.summary.rms_combined_arcsec,
+        rtol=1e-12,
+    )
+    assert session_fit.summary.num_obs == one_shot_fit.summary.num_obs
+    np.testing.assert_allclose(_state(session_fit), _state(one_shot_fit), rtol=1e-12)
+
+
+@pytest.mark.parametrize(
+    ("label", "weighting"),
+    [
+        ("preset_none_uniform_1as", _uniform(1.0)),
+        ("preset_vfc17", WeightingConfig(preset=WeightingPreset.VFC17, additional_layers=[])),
+        (
+            "vfc17_plus_user_f51_rule",
+            WeightingConfig(
+                preset=WeightingPreset.VFC17,
+                additional_layers=[
+                    WeightingLayer(
+                        kind=WeightingLayerKind.OBSERVATORY_RULE,
+                        obs_code="F51",
+                        sigma=(10.0, 10.0),
+                    )
+                ],
+            ),
+        ),
+    ],
+)
+def test_session_fit_matches_one_shot_fit(label, weighting, fittable_f51_observations):
+    """The same observations and the same weighting configuration give
+    the same fit through ``Session.refine`` as through ``determine``.
+
+    Pre-fix failure signature (``preset_none_uniform_1as``): the session
+    constructor never read the weighting config, so the session ran the
+    engine default (VFC17, whose F51 floor is 0.2″) while the one-shot
+    ran the requested uniform 1″ — one-shot chi2 = 0.00974934879161377,
+    session chi2 = 0.24373371932879223, ratio 25.000000 (should be
+    1.000000). ``vfc17_plus_user_f51_rule`` failed the same way with
+    one-shot chi2 = 9.91897809191094e-05 vs the same pinned session
+    value (the user layer was discarded along with everything else);
+    ``preset_vfc17`` passed pre-fix only because it happens to be the
+    engine default the session silently substituted.
+    """
+    cfg = _od_config(weighting)
+    one_shot = determine(fittable_f51_observations, config=cfg)
+    session_fit = Session(fittable_f51_observations, config=cfg).refine()
+    _assert_same_fit(session_fit, one_shot)
+
+
+def test_session_weighting_change_changes_the_session_fit(fittable_f51_observations):
+    """A weighting change actually moves the session result.
+
+    Guards against a routing that compiles but still discards the
+    config: with uniform weighting and no reported sigmas, chi2 scales
+    as 1/sigma², so quadrupling the default sigma must drop chi2 by
+    ~16× (not exactly, because the fitted state moves slightly with the
+    weights).
+
+    Pre-fix failure signature: sigma=1″ and sigma=4″ both produced
+    chi2 = 0.24373371932879223 — bit-identical, ratio 1.000000, the
+    VFC17 default the session substituted for both.
+    """
+    obs = fittable_f51_observations
+    c1 = Session(obs, config=_od_config(_uniform(1.0))).refine().summary.chi2
+    c4 = Session(obs, config=_od_config(_uniform(4.0))).refine().summary.chi2
+    assert c1 > 0.0
+    np.testing.assert_allclose(c4 / c1, 1.0 / 16.0, rtol=0.02)
+
+
+def test_session_honors_debiasing_config(fittable_f51_observations):
+    """The debiasing decision rides the same builder: disabling
+    debiasing on a session gives the one-shot disabled-debiasing fit.
+
+    Pre-fix failure signature: the session ignored ``debiasing`` along
+    with ``weighting`` — session chi2 was 0.24373371932879223 whether
+    debiasing was enabled or disabled, against a one-shot value of
+    0.00974934879161377 for both.
+    """
+    obs = fittable_f51_observations
+    for enabled in (False, True):
+        cfg = _od_config(_uniform(1.0), debiasing_enabled=enabled)
+        _assert_same_fit(Session(obs, config=cfg).refine(), determine(obs, config=cfg))
+
+
+@pytest.mark.parametrize(
+    ("case", "raw", "message"),
+    [
+        (
+            "scale_zero",
+            {
+                "enabled": True,
+                "preset": "none",
+                "additional_layers": [
+                    {
+                        "kind": "observatory_rule",
+                        "obs_code": "F51",
+                        "sigma": [1.0, 1.0],
+                        "scale": 0.0,
+                    }
+                ],
+            },
+            "scale must be finite and > 0",
+        ),
+        (
+            "duplicate_nightly",
+            {
+                "enabled": True,
+                "preset": "vfc17",
+                "additional_layers": [
+                    {"kind": "nightly_deweighting", "max_gap_days": 0.5},
+                    {"kind": "nightly_deweighting", "max_gap_days": 0.3},
+                ],
+            },
+            "NIGHTLY_DEWEIGHTING",
+        ),
+    ],
+)
+def test_session_constructor_rejects_invalid_layer(case, raw, message, fittable_f51_observations):
+    """An invalid weighting layer is rejected by the **session
+    constructor**, as a typed error carrying the parser's reason —
+    not swallowed, and not deferred to the first refine.
+
+    Pre-fix failure signature: both constructors returned a live
+    session with no error at all, and the subsequent refine returned
+    the substituted-default chi2 = 0.24373371932879223.
+    """
+    cfg = _RawWeightingODConfig(
+        raw,
+        force_model=ForceModelTier.APPROXIMATE,
+        debiasing=DebiasingConfig(enabled=False),
+    )
+    with pytest.raises(RuntimeError, match=message):
+        Session(fittable_f51_observations, config=cfg)

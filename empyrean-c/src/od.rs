@@ -291,7 +291,9 @@ pub const EMPYREAN_REJECTION_KIND_CMC2003: u8 = 1;
 // The C ABI exposes weighting as a preset selector + an optional
 // list of additional layers. Presets seed the chain with scott's
 // curated layer sets; additional_layers are appended in order.
-// `preset = NONE` + non-empty additional_layers = build from scratch.
+// `preset = NONE` = build from scratch: only additional_layers
+// contribute rules, and with an empty list the caller's
+// `default_sigma_arcsec` applies uniformly.
 
 /// No weighting preset — only `additional_layers` apply.
 pub const EMPYREAN_WEIGHTING_PRESET_NONE: u8 = 0;
@@ -347,21 +349,33 @@ pub struct EmpyreanWeightingLayer {
 /// pipeline; the resulting layer chain is the preset's layers
 /// followed by `additional_layers` (allows e.g. VFC17 + per-survey
 /// override).
+///
+/// A **zero-initialized struct is NOT the production default** — it
+/// has `enabled = 0`, i.e. weighting disabled (uniform 1″). The
+/// production combination (VFC17 station floors + nightly
+/// de-weighting + Floor policy) must be requested explicitly:
+/// `enabled = 1`, `preset = VFC17`, `sigma_policy = -1`, plus one
+/// `NIGHTLY_DEWEIGHTING` additional layer.
 #[repr(C)]
 pub struct EmpyreanWeightingConfig {
-    /// 1 = enabled (default), 0 = uniform 1″ weighting.
+    /// 1 = run the weighting pipeline, 0 = uniform 1″ weighting.
+    /// Zero-init leaves weighting disabled.
     pub enabled: u8,
     /// Preset selector. One of `EMPYREAN_WEIGHTING_PRESET_*`.
-    /// Default `0` (NONE) means "use additional_layers only";
-    /// when `enabled = 1` and zero-init, the conversion code
-    /// substitutes `VFC17` so default-zero structs keep the
-    /// production behavior.
+    /// `0` (NONE) means no preset rules: `default_sigma_arcsec`
+    /// applies uniformly and only `additional_layers` contribute
+    /// rules. NONE is honored literally — there is no silent
+    /// substitution of the production preset.
     pub preset: u8,
     /// Default 1σ used when no rule applies (arcsec). 0.0 →
     /// upstream default (1.0). Ignored when preset != NONE.
     pub default_sigma_arcsec: f64,
-    /// Sigma combination policy. -1 = use the preset's policy;
-    /// otherwise one of `EMPYREAN_SIGMA_POLICY_*`.
+    /// Sigma combination policy. -1 = use the preset's policy
+    /// (VFC17 / NEODYS presets use Floor); otherwise one of
+    /// `EMPYREAN_SIGMA_POLICY_*`. Note `0` is DEFAULT_ONLY — an
+    /// **active override**, not "unset": a zero-initialized field
+    /// replaces a preset's Floor policy with DefaultOnly. Callers
+    /// who want the preset's own policy must set -1.
     pub sigma_policy: i32,
     /// Pointer to additional layers appended to the preset's chain.
     /// Non-owning — caller keeps the array alive for the OD call.
@@ -1208,13 +1222,17 @@ pub struct EmpyreanODConfig {
     pub num_threads: usize,
     /// Output reference frame: 0=ICRF, 1=EclipticJ2000.
     pub frame: i32,
-    /// Observation weighting pipeline configuration. Zero-init = the
+    /// Observation weighting pipeline configuration. Zero-init =
+    /// `enabled = 0` = weighting DISABLED (uniform 1″); the
     /// production default (VFC17 + nightly de-weighting at floor-σ
-    /// policy). See [`EmpyreanWeightingConfig`].
+    /// policy) must be requested explicitly. See
+    /// [`EmpyreanWeightingConfig`].
     pub weighting: EmpyreanWeightingConfig,
-    /// Catalog-bias-correction configuration. Zero-init = the
-    /// production default (EFCC2020 standard resolution, loaded from
-    /// the DataManager default path). See [`EmpyreanDebiasingConfig`].
+    /// Catalog-bias-correction configuration. Zero-init =
+    /// `enabled = 0` = debiasing DISABLED; the production default
+    /// (EFCC2020 standard resolution, loaded from the DataManager
+    /// default path) must be requested explicitly. See
+    /// [`EmpyreanDebiasingConfig`].
     pub debiasing: EmpyreanDebiasingConfig,
     /// Number of `excluded_perturbers` in [`excluded_perturbers_naif`]; 0 = none.
     pub num_excluded_perturbers: usize,
@@ -2496,18 +2514,14 @@ fn build_weighting_from_c(
         return Ok(None);
     }
 
-    // Zero-init `preset = NONE` + zero-init layers list = "use the
-    // production default" so callers that don't set anything keep
-    // pre-structured-config behavior.
-    let preset_is_none_zero_init =
-        c.preset == EMPYREAN_WEIGHTING_PRESET_NONE && c.num_additional_layers == 0;
-    let effective_preset = if preset_is_none_zero_init {
-        EMPYREAN_WEIGHTING_PRESET_VFC17
-    } else {
-        c.preset
-    };
-
-    let mut wcfg = match effective_preset {
+    // `preset = NONE` means exactly what it says: no preset rules, the
+    // caller's `default_sigma_arcsec` applies uniformly (DefaultOnly
+    // policy unless `sigma_policy` overrides it). There is NO silent
+    // substitution of the production preset — a caller who wants VFC17
+    // must request it. (A zero-initialized struct never reaches this
+    // code: `enabled = 0` returns above, i.e. zero-init = weighting
+    // disabled, not the production default.)
+    let mut wcfg = match c.preset {
         EMPYREAN_WEIGHTING_PRESET_NONE => WeightingConfig {
             default_sigma_arcsec: if c.default_sigma_arcsec > 0.0 {
                 c.default_sigma_arcsec

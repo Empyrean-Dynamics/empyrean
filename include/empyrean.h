@@ -2618,18 +2618,26 @@ struct EmpyreanWeightingLayer {
  * pipeline; the resulting layer chain is the preset's layers
  * followed by `additional_layers` (allows e.g. VFC17 + per-survey
  * override).
+ *
+ * A **zero-initialized struct is NOT the production default** — it
+ * has `enabled = 0`, i.e. weighting disabled (uniform 1″). The
+ * production combination (VFC17 station floors + nightly
+ * de-weighting + Floor policy) must be requested explicitly:
+ * `enabled = 1`, `preset = VFC17`, `sigma_policy = -1`, plus one
+ * `NIGHTLY_DEWEIGHTING` additional layer.
  */
 struct EmpyreanWeightingConfig {
     /**
-     * 1 = enabled (default), 0 = uniform 1″ weighting.
+     * 1 = run the weighting pipeline, 0 = uniform 1″ weighting.
+     * Zero-init leaves weighting disabled.
      */
     uint8_t enabled;
     /**
      * Preset selector. One of `EMPYREAN_WEIGHTING_PRESET_*`.
-     * Default `0` (NONE) means "use additional_layers only";
-     * when `enabled = 1` and zero-init, the conversion code
-     * substitutes `VFC17` so default-zero structs keep the
-     * production behavior.
+     * `0` (NONE) means no preset rules: `default_sigma_arcsec`
+     * applies uniformly and only `additional_layers` contribute
+     * rules. NONE is honored literally — there is no silent
+     * substitution of the production preset.
      */
     uint8_t preset;
     /**
@@ -2638,8 +2646,12 @@ struct EmpyreanWeightingConfig {
      */
     double default_sigma_arcsec;
     /**
-     * Sigma combination policy. -1 = use the preset's policy;
-     * otherwise one of `EMPYREAN_SIGMA_POLICY_*`.
+     * Sigma combination policy. -1 = use the preset's policy
+     * (VFC17 / NEODYS presets use Floor); otherwise one of
+     * `EMPYREAN_SIGMA_POLICY_*`. Note `0` is DEFAULT_ONLY — an
+     * **active override**, not "unset": a zero-initialized field
+     * replaces a preset's Floor policy with DefaultOnly. Callers
+     * who want the preset's own policy must set -1.
      */
     int32_t sigma_policy;
     /**
@@ -2934,15 +2946,19 @@ struct EmpyreanODConfig {
      */
     int32_t frame;
     /**
-     * Observation weighting pipeline configuration. Zero-init = the
+     * Observation weighting pipeline configuration. Zero-init =
+     * `enabled = 0` = weighting DISABLED (uniform 1″); the
      * production default (VFC17 + nightly de-weighting at floor-σ
-     * policy). See [`EmpyreanWeightingConfig`].
+     * policy) must be requested explicitly. See
+     * [`EmpyreanWeightingConfig`].
      */
     struct EmpyreanWeightingConfig weighting;
     /**
-     * Catalog-bias-correction configuration. Zero-init = the
-     * production default (EFCC2020 standard resolution, loaded from
-     * the DataManager default path). See [`EmpyreanDebiasingConfig`].
+     * Catalog-bias-correction configuration. Zero-init =
+     * `enabled = 0` = debiasing DISABLED; the production default
+     * (EFCC2020 standard resolution, loaded from the DataManager
+     * default path) must be requested explicitly. See
+     * [`EmpyreanDebiasingConfig`].
      */
     struct EmpyreanDebiasingConfig debiasing;
     /**

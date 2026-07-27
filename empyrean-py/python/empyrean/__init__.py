@@ -104,6 +104,7 @@ from empyrean.propagation.config import (
     AdvancedIntegratorConfig,
     DiagnosticsConfig,
     ForceModelTier,
+    GaussianMixture,
     IntegratorChoice,
     MonteCarlo,
     OriginSwitchingConfig,

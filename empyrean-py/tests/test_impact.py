@@ -4,6 +4,7 @@ import empyrean
 from empyrean import (
     CartesianCoordinates,
     CartesianOrbits,
+    GaussianMixture,
     NonGravParams,
     Origin,
     UncertaintyMethod,
@@ -63,6 +64,35 @@ def test_compute_impact_probabilities_without_non_grav():
     )
     # Heliocentric near-1-AU orbit with a 10-day window won't have
     # any Earth events; what matters is that the call succeeded.
+    assert isinstance(ips, type(ips))
+
+
+def test_compute_impact_probabilities_accepts_gaussian_mixture():
+    """GaussianMixture (AGM) is accepted by the impact-probability harness
+    in all three spec forms — dataclass, enum, and string — mapping to
+    tag 5; its mixture-corrected impact probability is reported on the
+    ``ip_agm`` column (populated when the splitter fires above its
+    nonlinearity threshold). Before the fix it raised
+    ``TypeError: unsupported method spec: GaussianMixture`` (dataclass) or
+    ``unknown uncertainty method tag: 5`` (enum/string), and the readback
+    silently relabelled a tag-5 row ``first_order``."""
+    from empyrean.impact import _method_to_tag
+
+    assert _method_to_tag(GaussianMixture()) == 5
+    assert _method_to_tag(UncertaintyMethod.GAUSSIAN_MIXTURE) == 5
+    assert _method_to_tag("gaussian_mixture") == 5
+
+    empyrean.initialize()
+    orbits = _make_test_orbit(with_non_grav=False)
+    # Must not raise. The heliocentric near-1-AU orbit has no Earth
+    # encounter in the short window (empty table); what this pins is that
+    # GaussianMixture is accepted end-to-end rather than eager-rejected.
+    ips = compute_impact_probabilities(
+        orbits,
+        end_epoch=60010.0,
+        methods=[GaussianMixture()],
+        body_filter=[Origin.EARTH],
+    )
     assert isinstance(ips, type(ips))
 
 

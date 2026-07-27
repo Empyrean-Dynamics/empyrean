@@ -296,7 +296,7 @@ jobs:
         run: curl -LsSf https://astral.sh/uv/install.sh | sh
 
       - name: Install Python dependencies
-        run: uv pip install --system maturin numpy pyarrow quivr pytest pytest-benchmark pandas ruff
+        run: uv pip install --system maturin numpy pyarrow quivr pytest pytest-benchmark pandas ruff==0.16.0
 
       - name: Lint Python (ruff check + ruff format --check)
         run: |

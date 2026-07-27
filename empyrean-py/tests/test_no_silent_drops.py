@@ -164,15 +164,15 @@ ALLOWED_ALL_NULL: dict[str, str] = {
 # Apophis state from SBDB at MJD 61000 TDB. Fires Earth close approaches
 # on multi-year propagation (well-known 2029 flyby), with covariance and
 # photometry attached so every output channel has the inputs it needs.
-APOPHIS_STATE = dict(
-    epoch=61000.0,
-    x=-7.85264914906904643e-02,
-    y=-8.19748051902064567e-01,
-    z=4.18939515323390882e-02,
-    vx=1.98751024968884596e-02,
-    vy=1.32208844536140196e-03,
-    vz=3.99496044422352188e-04,
-)
+APOPHIS_STATE = {
+    "epoch": 61000.0,
+    "x": -7.85264914906904643e-02,
+    "y": -8.19748051902064567e-01,
+    "z": 4.18939515323390882e-02,
+    "vx": 1.98751024968884596e-02,
+    "vy": 1.32208844536140196e-03,
+    "vz": 3.99496044422352188e-04,
+}
 
 
 def _full_feature_orbit() -> CartesianOrbits:
@@ -230,15 +230,15 @@ def _full_feature_orbit() -> CartesianOrbits:
 # covariance epoch (lifted from villeneuve/tests/test_jet2.rs so the
 # fixture stays hermetic — no SBDB/Horizons fetch). Angles in degrees;
 # tp is MJD TDB (JD 2454790.8988481034 − 2400000.5).
-TC3_COMETARY = dict(
-    epoch=54746.0,
-    q=0.8999568608039946,
-    e=0.3120674404369712,
-    i=2.542215283712214,
-    raan=194.1011435928938,
-    ap=234.44892519,
-    tp=2_454_790.898_848_103_4 - 2_400_000.5,
-)
+TC3_COMETARY = {
+    "epoch": 54746.0,
+    "q": 0.8999568608039946,
+    "e": 0.3120674404369712,
+    "i": 2.542215283712214,
+    "raan": 194.1011435928938,
+    "ap": 234.44892519,
+    "tp": 2_454_790.898_848_103_4 - 2_400_000.5,
+}
 
 
 def _impactor_orbit() -> CartesianOrbits:
@@ -317,7 +317,7 @@ def _walk_columns(table: qv.Table, prefix: str) -> list[tuple[str, int, int]]:
         try:
             arr = col.to_pandas()
             null_count = int(pd.isna(arr).sum())
-        except Exception:
+        except Exception:  # noqa: BLE001 — fall back to arrow null_count
             null_count = col.null_count
         rows.append((path, null_count, total))
     return rows
@@ -1001,12 +1001,12 @@ def _non_grav_solved_orbit(with_cov: bool) -> CartesianOrbits:
         frame="ecliptic_j2000",
         origin=[str(Origin.SUN)],
     )
-    ng_kwargs: dict[str, object] = dict(
-        a1=[0.0],
-        a2=[1.0e-14],  # transverse Yarkovsky (AU/day^2) — activates the non-grav term
-        a3=[0.0],
-        model=["inverse_square"],
-    )
+    ng_kwargs: dict[str, object] = {
+        "a1": [0.0],
+        "a2": [1.0e-14],  # transverse Yarkovsky (AU/day^2) — activates the non-grav term
+        "a3": [0.0],
+        "model": ["inverse_square"],
+    }
     if with_cov:
         # Fitted (A1, A2, A3) covariance, row-major flattened (9 values).
         ng_kwargs["covariance"] = [np.diag([1.0e-20, 1.0e-20, 1.0e-20]).reshape(9).tolist()]

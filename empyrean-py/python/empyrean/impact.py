@@ -39,9 +39,11 @@ from empyrean.coordinates.epoch import Epochs
 from empyrean.propagation.config import (
     _DATACLASS_TO_INT,
     _UNCERTAINTY_METHOD_TO_INT,
+    GaussianMixture,
     MonteCarlo,
     SigmaPoint,
     UncertaintyMethod,
+    _uncertainty_method_params,
 )
 
 FloatArray = np.ndarray[Any, np.dtype[np.float64]]
@@ -68,6 +70,7 @@ METHOD_SECOND_ORDER = "second_order"
 METHOD_SIGMA_POINT = "sigma_point"
 METHOD_MONTE_CARLO = "monte_carlo"
 METHOD_AUTO = "auto"
+METHOD_GAUSSIAN_MIXTURE = "gaussian_mixture"
 
 # Internal: maps the Rust-side integer tag returned by
 # `_compute_impact_probabilities` / `_compute_b_planes` to the
@@ -81,6 +84,7 @@ _TAG_TO_METHOD = {
     2: METHOD_SIGMA_POINT,
     3: METHOD_MONTE_CARLO,
     4: METHOD_AUTO,
+    5: METHOD_GAUSSIAN_MIXTURE,
 }
 
 
@@ -105,7 +109,7 @@ class ImpactProbabilities(qv.Table):
     method = qv.LargeStringColumn()
     """Uncertainty method that produced this row. One of
     ``"first_order"`` / ``"second_order"`` / ``"sigma_point"`` /
-    ``"monte_carlo"``."""
+    ``"monte_carlo"`` / ``"auto"`` / ``"gaussian_mixture"``."""
     orbit_id = qv.LargeStringColumn()
     """Orbit primary key — matches the input ``Orbits.orbit_id``."""
     object_id = qv.LargeStringColumn(nullable=True)
@@ -153,7 +157,15 @@ class ImpactProbabilities(qv.Table):
     """Adaptive Gaussian-mixture impact probability. Populated when the
     requested method enables the AGM refinement (``"auto"``, or an
     explicit Gaussian-mixture request) AND the encounter's nonlinearity
-    exceeded the mixture threshold; null otherwise."""
+    exceeded the mixture threshold; null otherwise.
+
+    Coalescing contract: use :attr:`ip_agm` when finite, otherwise
+    :attr:`ip_linear`. A null here is **not** a failure — it means the AGM
+    splitter did not fire (the encounter's nonlinearity was below
+    threshold), so no mixture correction was warranted and the linear
+    estimate on the same row stands. Never back-fill this column with the
+    linear IP: a null is what lets a consumer tell "AGM ran" from "AGM was
+    a no-op"."""
     ip_mc = qv.Float64Column(nullable=True)
     """Monte-Carlo impact probability —
     :attr:`mc_n_impacts` / :attr:`mc_n_samples`. Populated only when
@@ -220,7 +232,10 @@ class BPlanes(qv.Table):
     """
 
     method = qv.LargeStringColumn()
-    """Uncertainty method tag — see :class:`ImpactProbabilities`."""
+    """Uncertainty method that produced this row. One of
+    ``"first_order"`` / ``"second_order"`` / ``"sigma_point"`` /
+    ``"monte_carlo"`` / ``"auto"`` / ``"gaussian_mixture"`` — same tag
+    space as :class:`ImpactProbabilities`."""
     body = qv.LargeStringColumn()
     """Body name; B-plane is defined relative to this body's
     hyperbolic-excess-velocity asymptote at closest approach."""
@@ -270,12 +285,12 @@ class BPlanes(qv.Table):
 
 # ── Helpers ───────────────────────────────────────────────────
 
-UncertaintyMethodLike = UncertaintyMethod | SigmaPoint | MonteCarlo | str | int
+UncertaintyMethodLike = UncertaintyMethod | SigmaPoint | MonteCarlo | GaussianMixture | str | int
 
 
 def _method_to_tag(m: UncertaintyMethodLike) -> int:
     """Map a Python-level method spec to the int tag the Rust side expects."""
-    if isinstance(m, (SigmaPoint, MonteCarlo)):
+    if isinstance(m, (SigmaPoint, MonteCarlo, GaussianMixture)):
         return _DATACLASS_TO_INT[type(m)]
     if isinstance(m, str):
         tag = _UNCERTAINTY_METHOD_TO_INT.get(m.lower())
@@ -287,6 +302,55 @@ def _method_to_tag(m: UncertaintyMethodLike) -> int:
     if isinstance(m, int):
         return m
     raise TypeError(f"unsupported method spec: {type(m).__name__}")
+
+
+def _flatten_method_specs(
+    methods: Sequence[UncertaintyMethodLike],
+) -> tuple[list[int], dict[str, list[Any]]]:
+    """Lower a sequence of method specs to the flat columns the binding takes.
+
+    Returns the integer tag column plus seven positionally-aligned parameter
+    columns — one entry per requested method, in the order given. A
+    :class:`SigmaPoint` / :class:`MonteCarlo` / :class:`GaussianMixture`
+    dataclass contributes its own parameters at its own index; every other
+    spec form (enum, wire string, legacy int) contributes the engine defaults,
+    so a default-constructed dataclass and its enum shorthand lower to
+    identical columns.
+
+    Collapsing a spec to its bare tag here would discard the parameters, which
+    is how ``SigmaPoint(n_sigma=2.0)`` / ``MonteCarlo(n_samples=100_000)`` /
+    ``GaussianMixture(threshold=0.5)`` previously reached the engine as
+    default-parameter methods.
+    """
+    tags: list[int] = []
+    sigma_n_sigma: list[float] = []
+    sigma_samples_per_plane: list[int] = []
+    mc_n_samples: list[int] = []
+    mc_seed: list[int | None] = []
+    gm_threshold: list[float] = []
+    gm_max_depth: list[int] = []
+    gm_components_per_split: list[int] = []
+    for m in methods:
+        # Tag first: it owns spec-type validation and raises for an
+        # unsupported spec before any parameter is read.
+        tags.append(_method_to_tag(m))
+        params = _uncertainty_method_params(m)
+        sigma_n_sigma.append(params.sigma_n_sigma)
+        sigma_samples_per_plane.append(params.sigma_samples_per_plane)
+        mc_n_samples.append(params.mc_n_samples)
+        mc_seed.append(params.mc_seed)
+        gm_threshold.append(params.gm_threshold)
+        gm_max_depth.append(params.gm_max_depth)
+        gm_components_per_split.append(params.gm_components_per_split)
+    return tags, {
+        "method_sigma_n_sigma": sigma_n_sigma,
+        "method_sigma_samples_per_plane": sigma_samples_per_plane,
+        "method_mc_n_samples": mc_n_samples,
+        "method_mc_seed": mc_seed,
+        "method_gm_threshold": gm_threshold,
+        "method_gm_max_depth": gm_max_depth,
+        "method_gm_components_per_split": gm_components_per_split,
+    }
 
 
 def _tags_to_method_strings(tags: npt.NDArray[np.integer[Any]]) -> list[str]:
@@ -533,6 +597,26 @@ def compute_impact_probabilities(
         Which uncertainty methods to run. One full propagation runs
         per method (in order); the result rows are tagged with the
         method via the ``method`` string column.
+
+        Each entry may be a :class:`~empyrean.propagation.config.SigmaPoint`
+        / :class:`~empyrean.propagation.config.MonteCarlo` /
+        :class:`~empyrean.propagation.config.GaussianMixture` dataclass, and
+        that entry's own parameters are carried through to the engine for
+        that method — ``MonteCarlo(n_samples=100_000, seed=7)`` draws 100 000
+        samples from that seed, and
+        ``GaussianMixture(threshold=0.5, max_depth=4, components_per_split=5)``
+        configures the mixture splitter. Parameters are per entry: methods in
+        the same call do not share them.
+
+        The :class:`~empyrean.propagation.config.UncertaintyMethod` enum, its
+        wire string, and a raw integer tag select the same method with engine
+        defaults.
+
+        A non-default ``SigmaPoint(n_sigma=...)`` /
+        ``SigmaPoint(samples_per_plane=...)`` is **rejected by the engine**:
+        the canonical 2N+1 unscented set is parameter-free, so those legacy
+        knobs accept only their default values. The rejection surfaces as a
+        raised error rather than a silently reinterpreted run.
     body_filter : sequence of Origin | str, optional
         Restrict event monitoring to specific bodies. Pass
         :class:`Origin` instances (e.g. ``[Origin.EARTH, Origin.MOON]``)
@@ -545,7 +629,7 @@ def compute_impact_probabilities(
         Quivr table — one row per (method × orbit × body) encounter.
         See the class for the full column list. ``method`` takes
         ``"first_order"`` / ``"second_order"`` / ``"sigma_point"`` /
-        ``"monte_carlo"``.
+        ``"monte_carlo"`` / ``"auto"`` / ``"gaussian_mixture"``.
 
     Notes
     -----
@@ -553,12 +637,16 @@ def compute_impact_probabilities(
     different uncertainty backings (linear, second-order, sample cloud)
     don't yet share an integration step. The cost scales linearly with
     ``len(methods)``.
+
+    Row counts are not comparable across methods. The analytic methods emit
+    one row per detected close approach, while Monte-Carlo emits at most one
+    row per body.
     """
     from empyrean._convert import origin_to_naif
     from empyrean._empyrean_rs import _compute_impact_probabilities
 
     args = _common_orbit_args(orbits)
-    method_tags = [_method_to_tag(m) for m in methods]
+    method_tags, method_params = _flatten_method_specs(methods)
     end_mjd = _coerce_end_mjd_tdb(end_epoch)
     filter_arg = [origin_to_naif(o) for o in body_filter] if body_filter else None
 
@@ -575,6 +663,7 @@ def compute_impact_probabilities(
         a2s=args["a2s"],
         a3s=args["a3s"],
         method_tags=method_tags,
+        **method_params,
         body_filter_naif=filter_arg,
         non_grav_dts=args["non_grav_dts"],
         non_grav_dt_variances=args["non_grav_dt_variances"],
@@ -648,17 +737,30 @@ def compute_b_planes(
     distance, 3σ ellipse, projected covariance) for every detected
     close approach instead of the IP record.
 
+    ``methods`` follows the same contract: a
+    :class:`~empyrean.propagation.config.SigmaPoint` /
+    :class:`~empyrean.propagation.config.MonteCarlo` /
+    :class:`~empyrean.propagation.config.GaussianMixture` dataclass carries
+    its own parameters through to the engine for that method, while the
+    :class:`~empyrean.propagation.config.UncertaintyMethod` enum, its wire
+    string, and a raw integer tag select the method with engine defaults. A
+    non-default ``SigmaPoint(n_sigma=...)`` / ``SigmaPoint(samples_per_plane=...)``
+    is rejected by the engine — the canonical 2N+1 unscented set is
+    parameter-free.
+
     Returns
     -------
     BPlanes
         Quivr table — one row per (method × orbit × body) close
-        approach. See the class for the full column list.
+        approach. See the class for the full column list. ``method`` takes
+        ``"first_order"`` / ``"second_order"`` / ``"sigma_point"`` /
+        ``"monte_carlo"`` / ``"auto"`` / ``"gaussian_mixture"``.
     """
     from empyrean._convert import origin_to_naif
     from empyrean._empyrean_rs import _compute_b_planes
 
     args = _common_orbit_args(orbits)
-    method_tags = [_method_to_tag(m) for m in methods]
+    method_tags, method_params = _flatten_method_specs(methods)
     end_mjd = _coerce_end_mjd_tdb(end_epoch)
     filter_arg = [origin_to_naif(o) for o in body_filter] if body_filter else None
 
@@ -675,6 +777,7 @@ def compute_b_planes(
         a2s=args["a2s"],
         a3s=args["a3s"],
         method_tags=method_tags,
+        **method_params,
         body_filter_naif=filter_arg,
         non_grav_dts=args["non_grav_dts"],
         non_grav_dt_variances=args["non_grav_dt_variances"],

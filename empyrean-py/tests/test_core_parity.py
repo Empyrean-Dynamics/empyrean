@@ -72,15 +72,15 @@ _MANIFEST = json.loads(MANIFEST_PATH.read_text())
 SCENARIOS: dict[str, dict] = {}
 for _s in _MANIFEST["scenarios"]:
     _g = _s["grid"]
-    SCENARIOS[_s["name"]] = dict(
-        epoch=_s["epoch_mjd_tdb"],
-        state=_s["state"],
-        cov=_s["cov_diag"],
-        grid=[_g["start"] + _g["step"] * i for i in range(_g["n"])],
-        ip_end=_s["ip_end_mjd"],
-        eph_obs_code=_s.get("ephemeris_obs_code"),
-        eph_epochs=_s.get("ephemeris_epochs", []),
-    )
+    SCENARIOS[_s["name"]] = {
+        "epoch": _s["epoch_mjd_tdb"],
+        "state": _s["state"],
+        "cov": _s["cov_diag"],
+        "grid": [_g["start"] + _g["step"] * i for i in range(_g["n"])],
+        "ip_end": _s["ip_end_mjd"],
+        "eph_obs_code": _s.get("ephemeris_obs_code"),
+        "eph_epochs": _s.get("ephemeris_epochs", []),
+    }
 
 # Per event sub-table, the value columns to compare (epoch handled
 # separately, as an alignment check). Field names match the parity-oracle

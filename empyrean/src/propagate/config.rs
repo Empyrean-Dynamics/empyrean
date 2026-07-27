@@ -66,6 +66,29 @@ pub enum UncertaintyMethod {
         /// Adaptive-Gaussian-mixture components per split (odd).
         gmm_components_per_split: usize,
     },
+    /// Adaptive Gaussian mixture (AGM) as a top-level method. The engine
+    /// recursively splits the input Gaussian into a mixture wherever the
+    /// local nonlinearity exceeds `threshold`, propagating each component
+    /// and recombining at the output. Its distinctive product is the
+    /// mixture-corrected impact probability at close approaches; away
+    /// from encounters the output-state covariance is the linear
+    /// \\( \Phi \Sigma \Phi^\top \\) mapping (like
+    /// [`SecondOrder`](Self::SecondOrder)), so for a well-determined
+    /// object it reads back very close to
+    /// [`FirstOrder`](Self::FirstOrder) — that is expected, not a bug.
+    /// Construct with [`gaussian_mixture()`](Self::gaussian_mixture) for
+    /// the engine defaults. Reference: DeMars-Bishop-Jah (JGCD 2013).
+    Mixture {
+        /// Nonlinearity threshold above which the splitter fires
+        /// (default: 1.0).
+        threshold: f64,
+        /// Maximum recursion depth for nested splitting (default: 3).
+        max_depth: usize,
+        /// Number of sub-Gaussians produced per split; the
+        /// DeMars-Bishop-Jah splitting tables are tabulated only for odd
+        /// counts (3 or 5). Default: 3.
+        components_per_split: usize,
+    },
 }
 
 impl UncertaintyMethod {
@@ -93,6 +116,16 @@ impl UncertaintyMethod {
             threshold_ip_skip: 1e-12,
             gmm_max_depth: 3,
             gmm_components_per_split: 3,
+        }
+    }
+
+    /// Adaptive Gaussian mixture with the engine-default parameters
+    /// (threshold = 1.0, max_depth = 3, components_per_split = 3).
+    pub fn gaussian_mixture() -> Self {
+        Self::Mixture {
+            threshold: 1.0,
+            max_depth: 3,
+            components_per_split: 3,
         }
     }
 
@@ -140,6 +173,21 @@ impl UncertaintyMethod {
                 out.auto_threshold_ip_skip = threshold_ip_skip;
                 out.auto_gmm_max_depth = gmm_max_depth as u64;
                 out.auto_gmm_components_per_split = gmm_components_per_split as u64;
+            }
+            Self::Mixture {
+                threshold,
+                max_depth,
+                components_per_split,
+            } => {
+                // Top-level Mixture reuses the AGM parameter slots shared
+                // with Auto (`auto_threshold_mixture` / `auto_gmm_max_depth`
+                // / `auto_gmm_components_per_split`); the tag disambiguates
+                // a standalone GaussianMixture from Auto, so no new FFI
+                // fields are needed.
+                out.tag = 5;
+                out.auto_threshold_mixture = threshold;
+                out.auto_gmm_max_depth = max_depth as u64;
+                out.auto_gmm_components_per_split = components_per_split as u64;
             }
         }
         out

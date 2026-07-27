@@ -82,7 +82,11 @@ test = [
     "pandas>=2.0",
 ]
 lint = [
-    "ruff>=0.6",
+    # Pinned exact: ruff is unpinned-latest in CI, so a minor bump that adds
+    # lint rules turns every open PR red mid-review (bd empyrean-ekqe/zxtd
+    # surfaced this on 0.16.0). Bump deliberately, fixing new findings in the
+    # same change.
+    "ruff==0.16.0",
     "mypy>=1.10",
 ]
 docs = [

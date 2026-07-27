@@ -484,6 +484,8 @@ typedef struct Session Session;
 
 #define EMPYREAN_UNCERTAINTY_AUTO 4
 
+#define EMPYREAN_UNCERTAINTY_MIXTURE 5
+
 /**
  * Resolved-kind tag values for [`EmpyreanPropagatedState::resolved_kind`].
  *
@@ -957,6 +959,7 @@ struct EmpyreanOrbit {
  * | 2   | SigmaPoint  | `sp_n_sigma`, `sp_samples_per_plane` |
  * | 3   | MonteCarlo  | `mc_n_samples`, `mc_seed_some` (1 = use `mc_seed`) |
  * | 4   | Auto        | `auto_threshold_first`, `auto_threshold_mixture`, `auto_threshold_ip_skip`, `auto_gmm_max_depth`, `auto_gmm_components_per_split` |
+ * | 5   | Mixture     | `auto_threshold_mixture`, `auto_gmm_max_depth`, `auto_gmm_components_per_split` (top-level adaptive Gaussian mixture; reuses the AGM parameter slots shared with Auto — `tag` disambiguates) |
  */
 struct EmpyreanUncertaintyMethod {
     /**

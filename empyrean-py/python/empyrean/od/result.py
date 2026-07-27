@@ -30,7 +30,7 @@ from empyrean.orbits.orbits import (
 # JSON-like value type for the nested wire dicts marshaled across the
 # C ABI boundary (str / numeric / bool / None leaves, plus nested dicts
 # and lists of the same).
-WireValue: TypeAlias = str | int | float | bool | None | list["WireValue"] | dict[str, "WireValue"]
+WireValue: TypeAlias = str | int | float | bool | list["WireValue"] | dict[str, "WireValue"] | None
 
 
 # ── Enums ────────────────────────────────────────────────────

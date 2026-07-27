@@ -23,7 +23,7 @@ def initialize_empyrean():
     """
     try:
         empyrean.initialize()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — init failure → skip
         pytest.skip(f"empyrean initialization failed (missing kernels?): {e}")
 
 

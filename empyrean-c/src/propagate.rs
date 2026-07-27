@@ -412,6 +412,7 @@ pub const EMPYREAN_UNCERTAINTY_SECOND: u8 = 1;
 pub const EMPYREAN_UNCERTAINTY_SIGMA_POINT: u8 = 2;
 pub const EMPYREAN_UNCERTAINTY_MONTE_CARLO: u8 = 3;
 pub const EMPYREAN_UNCERTAINTY_AUTO: u8 = 4;
+pub const EMPYREAN_UNCERTAINTY_MIXTURE: u8 = 5;
 
 /// Uncertainty-propagation method, mirroring
 /// [`empyrean_core::propagation::UncertaintyMethod`] as a flat C struct.
@@ -425,6 +426,7 @@ pub const EMPYREAN_UNCERTAINTY_AUTO: u8 = 4;
 /// | 2   | SigmaPoint  | `sp_n_sigma`, `sp_samples_per_plane` |
 /// | 3   | MonteCarlo  | `mc_n_samples`, `mc_seed_some` (1 = use `mc_seed`) |
 /// | 4   | Auto        | `auto_threshold_first`, `auto_threshold_mixture`, `auto_threshold_ip_skip`, `auto_gmm_max_depth`, `auto_gmm_components_per_split` |
+/// | 5   | Mixture     | `auto_threshold_mixture`, `auto_gmm_max_depth`, `auto_gmm_components_per_split` (top-level adaptive Gaussian mixture; reuses the AGM parameter slots shared with Auto — `tag` disambiguates) |
 #[repr(C)]
 pub struct EmpyreanUncertaintyMethod {
     /// Variant tag — see `EMPYREAN_UNCERTAINTY_*` constants.
@@ -873,6 +875,16 @@ pub(crate) fn flat_to_uncertainty_method(
             threshold_ip_skip: c.auto_threshold_ip_skip,
             gmm_max_depth: c.auto_gmm_max_depth as usize,
             gmm_components_per_split: c.auto_gmm_components_per_split as usize,
+        }),
+        // Top-level adaptive Gaussian mixture. Reuses the AGM parameter
+        // slots shared with Auto (`auto_threshold_mixture` /
+        // `auto_gmm_max_depth` / `auto_gmm_components_per_split`); the
+        // `tag` disambiguates a standalone GaussianMixture from Auto's
+        // internal splitter, so no struct-layout change is needed.
+        EMPYREAN_UNCERTAINTY_MIXTURE => Ok(UncertaintyMethod::Mixture {
+            threshold: c.auto_threshold_mixture,
+            max_depth: c.auto_gmm_max_depth as usize,
+            components_per_split: c.auto_gmm_components_per_split as usize,
         }),
         other => Err(format!("unknown uncertainty method tag: {other}")),
     }

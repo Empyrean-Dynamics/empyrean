@@ -4242,6 +4242,17 @@ fn build_od_config_from_dict(d: &Bound<'_, PyDict>) -> PyResult<empyrean::ODConf
                                 sigma_vec.len()
                             )));
                         }
+                        // Defense-in-depth for raw-dict callers (the
+                        // dataclass validates too): non-finite or
+                        // non-positive sigmas produce NaN / infinite
+                        // weights downstream.
+                        if !sigma_vec.iter().all(|s| s.is_finite() && *s > 0.0) {
+                            return Err(PyValueError::new_err(format!(
+                                "weighting layer {idx} (observatory_rule, obs_code \
+                                 {obs_code:?}): sigma must be finite and > 0 arcsec, got \
+                                 {sigma_vec:?}"
+                            )));
+                        }
                         let start = match layer.get_item("start_epoch_mjd_tdb")? {
                             Some(v) if !v.is_none() => Some(v.extract::<f64>()?),
                             _ => None,

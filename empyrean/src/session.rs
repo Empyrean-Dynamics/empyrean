@@ -72,7 +72,7 @@ impl Session {
     /// Construct a session over a fixed observation set.
     pub fn new(observations: Observations, config: ODConfig) -> Result<Self> {
         let (obs_ptr, obs_len) = observations.as_ffi_slice();
-        let (ffi_config, _perturbers_keep) = config.to_ffi_with();
+        let (ffi_config, _perturbers_keep) = config.to_ffi_with()?;
         let raw = unsafe { empyrean_sys::empyrean_session_new(obs_ptr, obs_len, &ffi_config) };
         // Session takes ownership of a copy of the observation array's
         // contents (via c_observations_to_optical → Vec<OpticalObservation>).

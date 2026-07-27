@@ -2582,7 +2582,10 @@ struct EmpyreanWeightingLayer {
      */
     int32_t kind;
     /**
-     * MPC observatory code, null-padded to 4 bytes.
+     * MPC observatory code: printable ASCII, no whitespace,
+     * left-aligned and NUL-padded to 4 bytes. Station matching is
+     * exact and case-sensitive; malformed codes are rejected with an
+     * error (never repaired or trimmed).
      */
     uint8_t obs_code[4];
     /**
@@ -2602,12 +2605,17 @@ struct EmpyreanWeightingLayer {
      */
     double end_epoch_mjd_tdb;
     /**
-     * Scale factor on the resulting weight. 0.0 → upstream default (1.0).
+     * Scale factor on the resulting weight. Must be finite and > 0
+     * — use 1.0 for no scaling. Non-positive or non-finite values
+     * are rejected with an error (0.0 no longer silently maps to
+     * 1.0).
      */
     double scale;
     /**
      * Maximum gap between observations to count as the same night
-     * (days). 0.0 → upstream default (0.5).
+     * (days). Must be finite and > 0 — the production value is 0.5.
+     * Non-positive or non-finite values are rejected with an error
+     * (0.0 no longer silently maps to 0.5).
      */
     double max_gap_days;
 };

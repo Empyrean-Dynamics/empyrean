@@ -133,7 +133,7 @@ impl Context {
         let (radar_ptr, radar_len) = observations.as_radar_ffi_slice();
 
         let mut result = empyrean_sys::EmpyreanODResult::default();
-        let (ffi_config, _perturbers_keep) = config.to_ffi_with();
+        let (ffi_config, _perturbers_keep) = config.to_ffi_with()?;
         let code = unsafe {
             empyrean_sys::empyrean_determine(
                 self.as_raw(),
@@ -166,7 +166,7 @@ impl Context {
         let (obs_ptr, obs_len) = observations.as_ffi_slice();
 
         let mut result = empyrean_sys::EmpyreanEvaluateResult::default();
-        let (ffi_config, _perturbers_keep) = config.to_ffi_with();
+        let (ffi_config, _perturbers_keep) = config.to_ffi_with()?;
         let code = unsafe {
             empyrean_sys::empyrean_evaluate(
                 self.as_raw(),
@@ -205,7 +205,7 @@ impl Context {
         let (obs_ptr, obs_len) = observations.as_ffi_slice();
 
         let mut result = empyrean_sys::EmpyreanODResult::default();
-        let (ffi_config, _perturbers_keep) = config.to_ffi_with();
+        let (ffi_config, _perturbers_keep) = config.to_ffi_with()?;
         let code = unsafe {
             empyrean_sys::empyrean_refine(
                 self.as_raw(),

@@ -112,9 +112,20 @@ impl Default for WeightingConfig {
 }
 
 /// Convert a [`WeightingLayer`] into its C-ABI tagged-union mirror.
+///
+/// `idx` is the layer's position in
+/// [`WeightingConfig::additional_layers`], used to name the offending
+/// layer in validation errors.
+///
+/// The `obs_code` is validated against the C-ABI field before packing:
+/// codes longer than 4 bytes, non-ASCII codes, and codes containing
+/// whitespace are rejected (station matching is exact and
+/// case-sensitive engine-side — a silently truncated or trimmed code
+/// would match the wrong station, or none).
 pub(super) fn weighting_layer_to_ffi(
+    idx: usize,
     layer: &WeightingLayer,
-) -> empyrean_sys::EmpyreanWeightingLayer {
+) -> crate::error::Result<empyrean_sys::EmpyreanWeightingLayer> {
     let mut ffi = empyrean_sys::EmpyreanWeightingLayer {
         kind: 0,
         obs_code: [0u8; 4],
@@ -133,9 +144,27 @@ pub(super) fn weighting_layer_to_ffi(
             end_epoch_mjd_tdb,
             scale,
         } => {
-            ffi.kind = empyrean_sys::EMPYREAN_WEIGHTING_LAYER_OBSERVATORY_RULE as i32;
             let bytes = obs_code.as_bytes();
-            for (i, &b) in bytes.iter().enumerate().take(4) {
+            if bytes.len() > 4 {
+                return Err(crate::error::Error::invalid_input(format!(
+                    "weighting.additional_layers[{idx}]: obs_code {obs_code:?} is longer than \
+                     the 4-byte MPC station field; truncating would match the wrong station"
+                )));
+            }
+            if obs_code.is_empty() {
+                return Err(crate::error::Error::invalid_input(format!(
+                    "weighting.additional_layers[{idx}]: ObservatoryRule has empty obs_code"
+                )));
+            }
+            if !obs_code.chars().all(|ch| ch.is_ascii_graphic()) {
+                return Err(crate::error::Error::invalid_input(format!(
+                    "weighting.additional_layers[{idx}]: obs_code {obs_code:?} must be \
+                     printable ASCII with no whitespace — MPC station matching is exact and \
+                     case-sensitive"
+                )));
+            }
+            ffi.kind = empyrean_sys::EMPYREAN_WEIGHTING_LAYER_OBSERVATORY_RULE as i32;
+            for (i, &b) in bytes.iter().enumerate() {
                 ffi.obs_code[i] = b;
             }
             ffi.sigma_ra_arcsec = sigma[0];
@@ -149,5 +178,5 @@ pub(super) fn weighting_layer_to_ffi(
             ffi.max_gap_days = *max_gap_days;
         }
     }
-    ffi
+    Ok(ffi)
 }

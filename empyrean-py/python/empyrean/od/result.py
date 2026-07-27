@@ -7,6 +7,7 @@ structure (no flattening). ``ODConfig()`` defaults are identical to
 tripping through the C ABI.
 """
 
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TypeAlias
@@ -315,6 +316,12 @@ class WeightingLayer:
                     f"station; use an OBSERVATORY_RULE layer for per-station "
                     f"sigmas."
                 )
+            if not math.isfinite(self.max_gap_days) or self.max_gap_days <= 0.0:
+                raise ValueError(
+                    f"NIGHTLY_DEWEIGHTING layer: max_gap_days must be finite "
+                    f"and > 0 (days), got {self.max_gap_days!r}; the "
+                    f"production default is 0.5."
+                )
         elif self.kind == WeightingLayerKind.OBSERVATORY_RULE:
             if self.max_gap_days != 0.5:
                 raise ValueError(
@@ -322,6 +329,56 @@ class WeightingLayer:
                     f"not read max_gap_days (got {self.max_gap_days!r}); use a "
                     f"NIGHTLY_DEWEIGHTING layer instead."
                 )
+            # obs_code must survive the 4-byte C-ABI field byte-exactly:
+            # matching is exact and case-sensitive engine-side, so a
+            # truncated / trimmed / repaired code would match the wrong
+            # station, or none.
+            if self.obs_code == "":
+                raise ValueError("OBSERVATORY_RULE layer: obs_code must be a non-empty MPC code.")
+            if len(self.obs_code.encode("utf-8", errors="surrogatepass")) > 4:
+                raise ValueError(
+                    f"OBSERVATORY_RULE layer: obs_code {self.obs_code!r} is "
+                    f"longer than the 4-byte MPC station field; matching is "
+                    f"exact — a truncated code would match the wrong station."
+                )
+            if not all(
+                ch.isascii() and ch.isprintable() and not ch.isspace() for ch in self.obs_code
+            ):
+                raise ValueError(
+                    f"OBSERVATORY_RULE layer: obs_code {self.obs_code!r} must "
+                    f"be printable ASCII with no whitespace — MPC station "
+                    f"matching is exact and case-sensitive."
+                )
+            # Defense-in-depth value checks (the engine-side layer-sigma
+            # validation ships separately): a non-finite or non-positive
+            # sigma / scale produces NaN or infinite weights downstream.
+            sigma = tuple(self.sigma)
+            if len(sigma) != 2:
+                raise ValueError(
+                    f"OBSERVATORY_RULE layer (obs_code={self.obs_code!r}): "
+                    f"sigma must be a (ra, dec) pair, got {sigma!r}."
+                )
+            if not all(math.isfinite(s) and s > 0.0 for s in sigma):
+                raise ValueError(
+                    f"OBSERVATORY_RULE layer (obs_code={self.obs_code!r}): "
+                    f"sigma must be finite and > 0 arcsec, got {sigma!r}."
+                )
+            if not math.isfinite(self.scale) or self.scale <= 0.0:
+                raise ValueError(
+                    f"OBSERVATORY_RULE layer (obs_code={self.obs_code!r}): "
+                    f"scale must be finite and > 0, got {self.scale!r}; use "
+                    f"1.0 for no scaling."
+                )
+            for name, value in (
+                ("start_epoch_mjd_tdb", self.start_epoch_mjd_tdb),
+                ("end_epoch_mjd_tdb", self.end_epoch_mjd_tdb),
+            ):
+                if value is not None and not math.isfinite(value):
+                    raise ValueError(
+                        f"OBSERVATORY_RULE layer (obs_code={self.obs_code!r}): "
+                        f"{name} must be a finite MJD TDB or None for "
+                        f"unbounded, got {value!r}."
+                    )
 
 
 def _default_weighting_layers() -> list["WeightingLayer"]:

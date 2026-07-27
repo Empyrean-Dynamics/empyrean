@@ -328,7 +328,10 @@ pub struct EmpyreanWeightingLayer {
     /// `EMPYREAN_WEIGHTING_LAYER_*`.
     pub kind: i32,
     // ── ObservatoryRule fields ─────────────────────────────────
-    /// MPC observatory code, null-padded to 4 bytes.
+    /// MPC observatory code: printable ASCII, no whitespace,
+    /// left-aligned and NUL-padded to 4 bytes. Station matching is
+    /// exact and case-sensitive; malformed codes are rejected with an
+    /// error (never repaired or trimmed).
     pub obs_code: [u8; 4],
     /// 1σ RA·cos(δ) in arcsec.
     pub sigma_ra_arcsec: f64,
@@ -338,11 +341,16 @@ pub struct EmpyreanWeightingLayer {
     pub start_epoch_mjd_tdb: f64,
     /// End of applicable time range (MJD TDB). NaN = unbounded.
     pub end_epoch_mjd_tdb: f64,
-    /// Scale factor on the resulting weight. 0.0 → upstream default (1.0).
+    /// Scale factor on the resulting weight. Must be finite and > 0
+    /// — use 1.0 for no scaling. Non-positive or non-finite values
+    /// are rejected with an error (0.0 no longer silently maps to
+    /// 1.0).
     pub scale: f64,
     // ── NightlyDeweighting fields ──────────────────────────────
     /// Maximum gap between observations to count as the same night
-    /// (days). 0.0 → upstream default (0.5).
+    /// (days). Must be finite and > 0 — the production value is 0.5.
+    /// Non-positive or non-finite values are rejected with an error
+    /// (0.0 no longer silently maps to 0.5).
     pub max_gap_days: f64,
 }
 
@@ -2579,17 +2587,45 @@ fn build_weighting_from_c(
         for (idx, layer) in slice.iter().enumerate() {
             let parsed = match layer.kind {
                 EMPYREAN_WEIGHTING_LAYER_OBSERVATORY_RULE => {
-                    let code = String::from_utf8_lossy(
-                        &layer.obs_code[..layer
-                            .obs_code
-                            .iter()
-                            .position(|&b| b == 0)
-                            .unwrap_or(layer.obs_code.len())],
-                    )
-                    .trim()
-                    .to_string();
+                    // Strict obs_code decode. Station matching is exact
+                    // and case-sensitive, so a malformed code silently
+                    // matches nothing (or, after lossy repair/trim, the
+                    // WRONG station) — reject instead of repairing.
+                    let nul = layer
+                        .obs_code
+                        .iter()
+                        .position(|&b| b == 0)
+                        .unwrap_or(layer.obs_code.len());
+                    if layer.obs_code[nul..].iter().any(|&b| b != 0) {
+                        return Err(format!(
+                            "weighting.additional_layers[{idx}]: obs_code has non-zero bytes \
+                             after the NUL terminator ({:?}); pack the code left-aligned and \
+                             NUL-pad",
+                            layer.obs_code
+                        ));
+                    }
+                    let code = match std::str::from_utf8(&layer.obs_code[..nul]) {
+                        Ok(s) => s,
+                        Err(_) => {
+                            return Err(format!(
+                                "weighting.additional_layers[{idx}]: obs_code bytes {:?} are \
+                                 not valid UTF-8",
+                                &layer.obs_code[..nul]
+                            ));
+                        }
+                    };
                     if code.is_empty() {
-                        return Err("weighting.ObservatoryRule layer has empty obs_code".into());
+                        return Err(format!(
+                            "weighting.additional_layers[{idx}]: ObservatoryRule has empty \
+                             obs_code"
+                        ));
+                    }
+                    if !code.chars().all(|ch| ch.is_ascii_graphic()) {
+                        return Err(format!(
+                            "weighting.additional_layers[{idx}]: obs_code {code:?} must be \
+                             printable ASCII with no whitespace — MPC station matching is \
+                             exact and case-sensitive"
+                        ));
                     }
                     let start_epoch = if layer.start_epoch_mjd_tdb.is_finite() {
                         Some(Epoch::from_mjd_tdb(layer.start_epoch_mjd_tdb))
@@ -2601,13 +2637,24 @@ fn build_weighting_from_c(
                     } else {
                         None
                     };
-                    let scale = if layer.scale > 0.0 { layer.scale } else { 1.0 };
+                    // A non-positive or non-finite scale was previously
+                    // clamped to 1.0 silently (and +inf sailed through,
+                    // yielding NaN/-0.0 chi2). Weight scaling is a
+                    // physical claim about the observations — reject
+                    // instead of substituting.
+                    if !layer.scale.is_finite() || layer.scale <= 0.0 {
+                        return Err(format!(
+                            "weighting.additional_layers[{idx}]: ObservatoryRule scale must be \
+                             finite and > 0, got {}; use 1.0 for no scaling",
+                            layer.scale
+                        ));
+                    }
                     WeightingLayer::ObservatoryRule {
-                        obs_code: code,
+                        obs_code: code.to_string(),
                         sigma: [layer.sigma_ra_arcsec, layer.sigma_dec_arcsec],
                         start_epoch,
                         end_epoch,
-                        scale,
+                        scale: layer.scale,
                     }
                 }
                 EMPYREAN_WEIGHTING_LAYER_NIGHTLY_DEWEIGHTING => {
@@ -2645,12 +2692,21 @@ fn build_weighting_from_c(
                              read scale; set it to 0.0"
                         ));
                     }
-                    let max_gap_days = if layer.max_gap_days > 0.0 {
-                        layer.max_gap_days
-                    } else {
-                        0.5
-                    };
-                    WeightingLayer::NightlyDeweighting { max_gap_days }
+                    // Previously 0.0 (and any non-positive/NaN value)
+                    // silently became the 0.5-day default. Same-night
+                    // grouping is a physical claim — reject instead of
+                    // substituting.
+                    if !layer.max_gap_days.is_finite() || layer.max_gap_days <= 0.0 {
+                        return Err(format!(
+                            "weighting.additional_layers[{idx}]: NIGHTLY_DEWEIGHTING \
+                             max_gap_days must be finite and > 0 (days), got {}; the \
+                             production default is 0.5",
+                            layer.max_gap_days
+                        ));
+                    }
+                    WeightingLayer::NightlyDeweighting {
+                        max_gap_days: layer.max_gap_days,
+                    }
                 }
                 other => {
                     return Err(format!(

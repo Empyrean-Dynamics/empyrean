@@ -223,8 +223,10 @@ class WeightingPreset(str, Enum):
     """Preset selector for :class:`WeightingConfig`.
 
     Picking a preset seeds the layer chain with scott's curated
-    layers; entries in :attr:`WeightingConfig.additional_layers`
-    are appended in order.
+    layers; entries in :attr:`WeightingConfig.additional_layers` are
+    placed ahead of the preset's rules (sigma resolution is
+    first-match-wins, so they override the preset for their stations
+    and the preset is the fallback).
     """
 
     NONE = "none"
@@ -318,7 +320,9 @@ class WeightingConfig:
     """Sigma combination policy override. ``None`` = use the
     preset's policy."""
     additional_layers: list[WeightingLayer] = field(default_factory=_default_weighting_layers)
-    """Layers appended to the preset's chain."""
+    """Layers placed ahead of the preset's chain — first-match-wins,
+    so they override preset rules for their stations; the preset is
+    the fallback."""
 
 
 # ── Debiasing (mirrors empyrean::DebiasingConfig) ─────────────

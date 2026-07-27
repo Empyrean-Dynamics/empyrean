@@ -2615,9 +2615,11 @@ struct EmpyreanWeightingLayer {
  *
  * `enabled = 0` runs OD with uniform 1″ weighting (the old
  * `use_weighting = 0` behavior). `enabled = 1` activates the
- * pipeline; the resulting layer chain is the preset's layers
- * followed by `additional_layers` (allows e.g. VFC17 + per-survey
- * override).
+ * pipeline; the resulting layer chain is `additional_layers`
+ * followed by the preset's layers. Sigma resolution is
+ * first-match-wins, so a user rule overrides the preset for its
+ * station and the preset serves as the fallback (allows e.g. VFC17
+ * + per-survey override).
  *
  * A **zero-initialized struct is NOT the production default** — it
  * has `enabled = 0`, i.e. weighting disabled (uniform 1″). The
@@ -2655,7 +2657,9 @@ struct EmpyreanWeightingConfig {
      */
     int32_t sigma_policy;
     /**
-     * Pointer to additional layers appended to the preset's chain.
+     * Pointer to additional layers inserted AHEAD of the preset's
+     * chain (first-match-wins: they override preset rules for their
+     * stations; relative order within the array is preserved).
      * Non-owning — caller keeps the array alive for the OD call.
      */
     const struct EmpyreanWeightingLayer *additional_layers;

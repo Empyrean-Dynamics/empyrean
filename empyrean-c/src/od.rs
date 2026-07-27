@@ -290,10 +290,12 @@ pub const EMPYREAN_REJECTION_KIND_CMC2003: u8 = 1;
 //
 // The C ABI exposes weighting as a preset selector + an optional
 // list of additional layers. Presets seed the chain with scott's
-// curated layer sets; additional_layers are appended in order.
-// `preset = NONE` = build from scratch: only additional_layers
-// contribute rules, and with an empty list the caller's
-// `default_sigma_arcsec` applies uniformly.
+// curated layer sets; additional_layers go AHEAD of the preset's
+// rules (their relative order preserved), so user rules win their
+// stations under first-match-wins sigma resolution and the preset
+// is the fallback. `preset = NONE` = build from scratch: only
+// additional_layers contribute rules, and with an empty list the
+// caller's `default_sigma_arcsec` applies uniformly.
 
 /// No weighting preset — only `additional_layers` apply.
 pub const EMPYREAN_WEIGHTING_PRESET_NONE: u8 = 0;
@@ -346,9 +348,11 @@ pub struct EmpyreanWeightingLayer {
 ///
 /// `enabled = 0` runs OD with uniform 1″ weighting (the old
 /// `use_weighting = 0` behavior). `enabled = 1` activates the
-/// pipeline; the resulting layer chain is the preset's layers
-/// followed by `additional_layers` (allows e.g. VFC17 + per-survey
-/// override).
+/// pipeline; the resulting layer chain is `additional_layers`
+/// followed by the preset's layers. Sigma resolution is
+/// first-match-wins, so a user rule overrides the preset for its
+/// station and the preset serves as the fallback (allows e.g. VFC17
+/// + per-survey override).
 ///
 /// A **zero-initialized struct is NOT the production default** — it
 /// has `enabled = 0`, i.e. weighting disabled (uniform 1″). The
@@ -377,7 +381,9 @@ pub struct EmpyreanWeightingConfig {
     /// replaces a preset's Floor policy with DefaultOnly. Callers
     /// who want the preset's own policy must set -1.
     pub sigma_policy: i32,
-    /// Pointer to additional layers appended to the preset's chain.
+    /// Pointer to additional layers inserted AHEAD of the preset's
+    /// chain (first-match-wins: they override preset rules for their
+    /// stations; relative order within the array is preserved).
     /// Non-owning — caller keeps the array alive for the OD call.
     pub additional_layers: *const EmpyreanWeightingLayer,
     pub num_additional_layers: usize,
@@ -2557,6 +2563,7 @@ fn build_weighting_from_c(
     if c.num_additional_layers > 0 && !c.additional_layers.is_null() {
         let slice =
             unsafe { std::slice::from_raw_parts(c.additional_layers, c.num_additional_layers) };
+        let mut user_layers: Vec<WeightingLayer> = Vec::with_capacity(slice.len());
         for layer in slice {
             let parsed = match layer.kind {
                 EMPYREAN_WEIGHTING_LAYER_OBSERVATORY_RULE => {
@@ -2607,8 +2614,20 @@ fn build_weighting_from_c(
                     ));
                 }
             };
-            wcfg.layers.push(parsed);
+            user_layers.push(parsed);
         }
+        // User layers must be able to override preset rules. scott's
+        // sigma resolution is first-match-wins over the layer chain and
+        // the preset rules are time-unbounded, so a user rule placed
+        // AFTER the preset could never win its station. Insert the user
+        // layers ahead of the preset chain (preserving their relative
+        // order): user rules take their stations, the preset remains
+        // the fallback. Only sigma-rule precedence changes — weight
+        // *scale* factors and NightlyDeweighting are multiplicative
+        // passes applied from every matching layer regardless of
+        // position in the chain.
+        user_layers.append(&mut wcfg.layers);
+        wcfg.layers = user_layers;
     }
 
     Ok(Some(wcfg))

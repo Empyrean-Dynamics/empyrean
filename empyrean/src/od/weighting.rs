@@ -48,7 +48,9 @@ pub enum WeightingLayer {
 
 /// Preset selector for [`WeightingConfig`]. Picking a preset seeds the
 /// layer chain with curated layers; entries in
-/// [`WeightingConfig::additional_layers`] are appended in order.
+/// [`WeightingConfig::additional_layers`] are placed ahead of the
+/// preset's rules (sigma resolution is first-match-wins, so they
+/// override the preset for their stations).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WeightingPreset {
     /// No preset — only `additional_layers` apply.
@@ -78,7 +80,9 @@ pub struct WeightingConfig {
     pub default_sigma_arcsec: f64,
     /// Sigma combination policy override. `None` = use the preset's policy.
     pub sigma_policy: Option<SigmaPolicy>,
-    /// Layers appended to the preset's chain.
+    /// Layers placed ahead of the preset's chain — first-match-wins,
+    /// so they override preset rules for their stations; the preset
+    /// is the fallback.
     pub additional_layers: Vec<WeightingLayer>,
 }
 

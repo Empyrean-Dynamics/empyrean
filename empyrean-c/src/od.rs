@@ -385,8 +385,10 @@ pub struct EmpyreanWeightingConfig {
     /// rules. NONE is honored literally — there is no silent
     /// substitution of the production preset.
     pub preset: u8,
-    /// Default 1σ used when no rule applies (arcsec). 0.0 →
-    /// upstream default (1.0). Ignored when preset != NONE.
+    /// Default 1σ used when no rule applies (arcsec). Exactly 0.0 is the
+    /// zero-init sentinel and resolves to 1.0; negative or non-finite
+    /// values are rejected with an error rather than silently read as
+    /// 1.0. Ignored when preset != NONE.
     pub default_sigma_arcsec: f64,
     /// Sigma combination policy. -1 = use the preset's policy
     /// (VFC17 / NEODYS presets use Floor); otherwise one of
@@ -2199,6 +2201,59 @@ pub(crate) unsafe fn write_covariance_trust(
 /// scott's `ODResult`. ALWAYS writes every field (zeros / sentinels when
 /// an axis was not solved) — no defaulted covariance presented as real,
 /// per the full-population contract.
+/// Write every field of an [`ODResult`] into the C out-struct **except**
+/// `orbit`, which the caller supplies because the entry paths build the
+/// propagated state differently.
+///
+/// This is the single source of truth for the OD output surface. Both the
+/// one-shot entry points and the session path route through it, so a field
+/// added to [`ODResult`] can never again reach one surface while defaulting
+/// to zero on the other — the failure mode that had the session path
+/// returning an all-zero covariance, `NaN` non-gravitational parameters and
+/// a `solve_for_used` that disagreed with the fit that actually ran.
+pub(crate) unsafe fn write_od_result_fields(result_out: *mut EmpyreanODResult, od: &ODResult) {
+    let (obs_ptr, obs_n) = observation_results_to_c(&od.observations);
+    let summary = summary_to_c(&od.summary);
+    let acceptability = acceptability_to_c(&od.acceptability);
+
+    let (has_cov_9x9, covariance_9x9) = match &od.covariance_9x9 {
+        Some(m) => (1u8, *m),
+        None => (0u8, [[0.0f64; 9]; 9]),
+    };
+    let (has_ng_delta, non_grav_delta) = match &od.non_grav_delta {
+        Some(d) => (1u8, *d),
+        None => (0u8, [f64::NAN; 3]),
+    };
+    let (has_non_grav, non_grav) = od_result_non_grav_to_c(od);
+
+    let (sb_ptr, sb_n) = station_biases_to_c(&od.station_biases);
+
+    unsafe {
+        (*result_out).observations = obs_ptr;
+        (*result_out).num_observations = obs_n;
+        (*result_out).summary = summary;
+        (*result_out).iterations = od.iterations as u32;
+        (*result_out).update_norm = od.update_norm;
+        (*result_out).converged = u8::from(od.acceptability.converged_ok);
+        (*result_out).covariance = od.covariance;
+        (*result_out).covariance_representation = coord_rep_to_int(od.covariance_representation);
+        (*result_out).has_covariance_9x9 = has_cov_9x9;
+        (*result_out).covariance_9x9 = covariance_9x9;
+        (*result_out).has_non_grav_delta = has_ng_delta;
+        (*result_out).non_grav_delta = non_grav_delta;
+        (*result_out).has_non_grav = has_non_grav;
+        (*result_out).non_grav = non_grav;
+        (*result_out).rejection_passes = od.rejection_passes as u32;
+        (*result_out).num_oppositions_fit = od.num_oppositions_fit as u32;
+        (*result_out).force_model_used = v_force_model_tier_to_int(od.force_model_used);
+        (*result_out).solve_for_used = solve_for_to_int(&od.solve_for);
+        (*result_out).acceptability = acceptability;
+        (*result_out).station_biases = sb_ptr;
+        (*result_out).num_station_biases = sb_n;
+        populate_wide_fitting_fields(result_out, od);
+    }
+}
+
 unsafe fn populate_wide_fitting_fields(result_out: *mut EmpyreanODResult, od: &ODResult) {
     unsafe {
         write_covariance_trust(result_out, &od.covariance_trust);
@@ -2547,6 +2602,25 @@ fn build_weighting_from_c(
     // must request it. (A zero-initialized struct never reaches this
     // code: `enabled = 0` returns above, i.e. zero-init = weighting
     // disabled, not the production default.)
+    // `default_sigma_arcsec` splits into a real "unset" state and a caller
+    // bug. Exactly 0.0 is the documented zero-init sentinel and resolves to
+    // 1 arcsec; anything negative or non-finite is not a sentinel, it is a
+    // nonsense sigma, and silently reading it as 1 arcsec would fit the arc
+    // against a weight the caller never asked for.
+    if c.default_sigma_arcsec < 0.0 || c.default_sigma_arcsec.is_nan() {
+        return Err(format!(
+            "weighting default_sigma_arcsec must be finite and >= 0 \
+             (0.0 means \"unset\", resolving to 1.0 arcsec); got {}",
+            c.default_sigma_arcsec
+        ));
+    }
+    if c.default_sigma_arcsec.is_infinite() {
+        return Err(
+            "weighting default_sigma_arcsec must be finite (0.0 means \"unset\", \
+             resolving to 1.0 arcsec); got inf"
+                .to_string(),
+        );
+    }
     let mut wcfg = match c.preset {
         EMPYREAN_WEIGHTING_PRESET_NONE => WeightingConfig {
             default_sigma_arcsec: if c.default_sigma_arcsec > 0.0 {
@@ -3672,47 +3746,9 @@ pub unsafe extern "C" fn empyrean_determine(
             };
 
         let od = &det_result.od;
-        let (obs_ptr, obs_n) = observation_results_to_c(&od.observations);
-        let summary = summary_to_c(&od.summary);
-        let acceptability = acceptability_to_c(&od.acceptability);
-
-        let (has_cov_9x9, covariance_9x9) = match &od.covariance_9x9 {
-            Some(m) => (1u8, *m),
-            None => (0u8, [[0.0f64; 9]; 9]),
-        };
-        let (has_ng_delta, non_grav_delta) = match &od.non_grav_delta {
-            Some(d) => (1u8, *d),
-            None => (0u8, [f64::NAN; 3]),
-        };
-        let (has_non_grav, non_grav) = od_result_non_grav_to_c(od);
-
-        let (sb_ptr, sb_n) = station_biases_to_c(&od.station_biases);
-
         unsafe {
             (*result_out).orbit = prop_state;
-            (*result_out).observations = obs_ptr;
-            (*result_out).num_observations = obs_n;
-            (*result_out).summary = summary;
-            (*result_out).iterations = od.iterations as u32;
-            (*result_out).update_norm = od.update_norm;
-            (*result_out).converged = u8::from(od.acceptability.converged_ok);
-            (*result_out).covariance = od.covariance;
-            (*result_out).covariance_representation =
-                coord_rep_to_int(od.covariance_representation);
-            (*result_out).has_covariance_9x9 = has_cov_9x9;
-            (*result_out).covariance_9x9 = covariance_9x9;
-            (*result_out).has_non_grav_delta = has_ng_delta;
-            (*result_out).non_grav_delta = non_grav_delta;
-            (*result_out).has_non_grav = has_non_grav;
-            (*result_out).non_grav = non_grav;
-            (*result_out).rejection_passes = od.rejection_passes as u32;
-            (*result_out).num_oppositions_fit = od.num_oppositions_fit as u32;
-            (*result_out).force_model_used = v_force_model_tier_to_int(od.force_model_used);
-            (*result_out).solve_for_used = solve_for_to_int(&od.solve_for);
-            (*result_out).acceptability = acceptability;
-            (*result_out).station_biases = sb_ptr;
-            (*result_out).num_station_biases = sb_n;
-            populate_wide_fitting_fields(result_out, od);
+            write_od_result_fields(result_out, od);
         }
         0
     }));
@@ -3932,47 +3968,9 @@ pub unsafe extern "C" fn empyrean_refine(
             }
         };
 
-        let (obs_ptr, obs_n) = observation_results_to_c(&od_result.observations);
-        let summary = summary_to_c(&od_result.summary);
-        let acceptability = acceptability_to_c(&od_result.acceptability);
-
-        let (has_cov_9x9, covariance_9x9) = match &od_result.covariance_9x9 {
-            Some(m) => (1u8, *m),
-            None => (0u8, [[0.0f64; 9]; 9]),
-        };
-        let (has_ng_delta, non_grav_delta) = match &od_result.non_grav_delta {
-            Some(d) => (1u8, *d),
-            None => (0u8, [f64::NAN; 3]),
-        };
-        let (has_non_grav, non_grav) = od_result_non_grav_to_c(&od_result);
-
-        let (sb_ptr, sb_n) = station_biases_to_c(&od_result.station_biases);
-
         unsafe {
             (*result_out).orbit = prop_state;
-            (*result_out).observations = obs_ptr;
-            (*result_out).num_observations = obs_n;
-            (*result_out).summary = summary;
-            (*result_out).iterations = od_result.iterations as u32;
-            (*result_out).update_norm = od_result.update_norm;
-            (*result_out).converged = u8::from(od_result.acceptability.converged_ok);
-            (*result_out).covariance = od_result.covariance;
-            (*result_out).covariance_representation =
-                coord_rep_to_int(od_result.covariance_representation);
-            (*result_out).has_covariance_9x9 = has_cov_9x9;
-            (*result_out).covariance_9x9 = covariance_9x9;
-            (*result_out).has_non_grav_delta = has_ng_delta;
-            (*result_out).non_grav_delta = non_grav_delta;
-            (*result_out).has_non_grav = has_non_grav;
-            (*result_out).non_grav = non_grav;
-            (*result_out).rejection_passes = od_result.rejection_passes as u32;
-            (*result_out).num_oppositions_fit = od_result.num_oppositions_fit as u32;
-            (*result_out).force_model_used = v_force_model_tier_to_int(od_result.force_model_used);
-            (*result_out).solve_for_used = solve_for_to_int(&od_result.solve_for);
-            (*result_out).acceptability = acceptability;
-            (*result_out).station_biases = sb_ptr;
-            (*result_out).num_station_biases = sb_n;
-            populate_wide_fitting_fields(result_out, &od_result);
+            write_od_result_fields(result_out, &od_result);
         }
         0
     }));

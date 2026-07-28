@@ -137,6 +137,12 @@ def fittable_f51_observations(probe_orbit) -> ADESObservations:
     else is identical — the orbit's own predicted RA/Dec plus a fixed
     1″ Dec offset, and no reported rms columns, so the weighting rules
     alone set the weights.
+
+    ``ast_cat`` is populated deliberately: catalog debiasing is a no-op
+    for rows without a star catalog, so a debiasing-parity test built on
+    a catalog-less fixture passes no matter what the session does with
+    the debiasing config. With UCAC4 the correction is live and the test
+    can actually fail on the axis it names.
     """
     epochs = [61001.1 + 30.0 * i / 14 for i in range(15)]
     observers = Observers.from_code("F51", epochs)
@@ -153,6 +159,7 @@ def fittable_f51_observations(probe_orbit) -> ADESObservations:
         rms_ra=[None] * n,
         rms_dec=[None] * n,
         trk_sub=["probe"] * n,
+        ast_cat=["UCAC4"] * n,
     )
 
 
@@ -554,6 +561,24 @@ def _assert_same_fit(session_fit, one_shot_fit) -> None:
     )
     assert session_fit.summary.num_obs == one_shot_fit.summary.num_obs
     np.testing.assert_allclose(_state(session_fit), _state(one_shot_fit), rtol=1e-12)
+
+    # The OUTPUT surface, not just the fit. The session path used to
+    # populate a hand-written subset of the result struct, so it returned
+    # an all-zero covariance (which reads as infinite precision, the
+    # worst possible way to be wrong), NaN non-gravitational parameters,
+    # a solve_for_used that disagreed with the fit that had just run, and
+    # `converged` read off a zeroed acceptability block. Both surfaces
+    # now go through one writer.
+    one_shot_cov = np.asarray(one_shot_fit.covariance, dtype=float)
+    session_cov = np.asarray(session_fit.covariance, dtype=float)
+    assert np.any(one_shot_cov != 0.0), "one-shot covariance is degenerate; fixture is not fitting"
+    assert np.all(np.isfinite(session_cov))
+    assert np.any(session_cov != 0.0), (
+        "session covariance is all zeros — output surface not written"
+    )
+    np.testing.assert_allclose(session_cov, one_shot_cov, rtol=1e-12)
+    assert session_fit.converged == one_shot_fit.converged
+    assert session_fit.solve_for_used == one_shot_fit.solve_for_used
 
 
 @pytest.mark.parametrize(

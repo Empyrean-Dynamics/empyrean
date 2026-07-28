@@ -2657,8 +2657,10 @@ struct EmpyreanWeightingConfig {
      */
     uint8_t preset;
     /**
-     * Default 1σ used when no rule applies (arcsec). 0.0 →
-     * upstream default (1.0). Ignored when preset != NONE.
+     * Default 1σ used when no rule applies (arcsec). Exactly 0.0 is the
+     * zero-init sentinel and resolves to 1.0; negative or non-finite
+     * values are rejected with an error rather than silently read as
+     * 1.0. Ignored when preset != NONE.
      */
     double default_sigma_arcsec;
     /**

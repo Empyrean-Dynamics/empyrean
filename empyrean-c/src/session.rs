@@ -18,7 +18,7 @@ use empyrean_core::determination::{ODResult, Session, SessionDiff};
 
 use crate::od::{
     EmpyreanODConfig, EmpyreanODResult, EmpyreanObservation, build_od_config_from_c,
-    c_observations_to_optical, observation_results_to_c, summary_to_c,
+    c_observations_to_optical,
 };
 use crate::propagate::EmpyreanPropagatedState;
 use crate::{EmpyreanContext, set_last_error};
@@ -411,32 +411,18 @@ pub unsafe extern "C" fn empyrean_session_diff(
 
 fn write_od_result(od: &ODResult, result_out: *mut EmpyreanODResult) -> Result<(), String> {
     let prop_state = od_orbit_to_propagated_local(&od.orbit, &od.covariance)?;
-    let (obs_ptr, obs_n) = observation_results_to_c(&od.observations);
-    let summary = summary_to_c(&od.summary);
     unsafe {
         (*result_out).orbit = prop_state;
-        (*result_out).observations = obs_ptr;
-        (*result_out).num_observations = obs_n;
-        (*result_out).summary = summary;
-        (*result_out).iterations = od.iterations as u32;
-        (*result_out).converged = if od.acceptability.fit_acceptable {
-            1
-        } else {
-            0
-        };
-        // Explicit trust verdict (None → NOT_EVALUATED on this path) so
-        // the caller never reads an uninitialized `trust_event_body`.
-        crate::od::write_covariance_trust(result_out, &od.covariance_trust);
-        // Explicitly zero every owned-pointer surface this path does not
-        // populate (photometry incl. its per_band/gates/dropped_bands
-        // arrays, station biases): `empyrean_od_result_free` frees them
-        // unconditionally, and a C caller is not required to
-        // zero-initialize the out-struct — leaving them unwritten would
-        // free() indeterminate garbage.
-        (*result_out).has_photometry = 0;
-        (*result_out).photometry = crate::od::zeroed_photometry_result();
-        (*result_out).station_biases = std::ptr::null_mut();
-        (*result_out).num_station_biases = 0;
+        // Same writer as the one-shot entry points (empyrean-su54): this
+        // path used to populate a subset by hand, so a session caller got
+        // an all-zero `covariance`, `NaN` non-gravitational parameters, a
+        // `solve_for_used` that disagreed with the fit that had actually
+        // run, and `converged` read off a zeroed acceptability block. It
+        // also owns the pointer surfaces (observations, station biases,
+        // photometry) that `empyrean_od_result_free` frees
+        // unconditionally, so nothing is left indeterminate for a caller
+        // who did not zero-initialize the out-struct.
+        crate::od::write_od_result_fields(result_out, od);
     }
     Ok(())
 }

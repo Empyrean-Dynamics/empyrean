@@ -290,8 +290,12 @@ pub const EMPYREAN_REJECTION_KIND_CMC2003: u8 = 1;
 //
 // The C ABI exposes weighting as a preset selector + an optional
 // list of additional layers. Presets seed the chain with scott's
-// curated layer sets; additional_layers are appended in order.
-// `preset = NONE` + non-empty additional_layers = build from scratch.
+// curated layer sets; additional_layers go AHEAD of the preset's
+// rules (their relative order preserved), so user rules win their
+// stations under first-match-wins sigma resolution and the preset
+// is the fallback. `preset = NONE` = build from scratch: only
+// additional_layers contribute rules, and with an empty list the
+// caller's `default_sigma_arcsec` applies uniformly.
 
 /// No weighting preset — only `additional_layers` apply.
 pub const EMPYREAN_WEIGHTING_PRESET_NONE: u8 = 0;
@@ -311,14 +315,23 @@ pub const EMPYREAN_WEIGHTING_LAYER_OBSERVATORY_RULE: i32 = 0;
 pub const EMPYREAN_WEIGHTING_LAYER_NIGHTLY_DEWEIGHTING: i32 = 1;
 
 /// One element of [`EmpyreanWeightingConfig::additional_layers`].
-/// Tagged-union shape: the active fields depend on `kind`.
+/// Tagged-union shape: the active fields depend on `kind`, and the
+/// inactive fields MUST be left at their unset values (zeroed bytes /
+/// 0.0 / NaN epochs) — a layer carrying fields its kind does not read
+/// is rejected with an error rather than silently ignored. In
+/// particular a `NIGHTLY_DEWEIGHTING` layer reads only
+/// `max_gap_days`: nightly de-weighting cannot be scoped by station
+/// or time range.
 #[repr(C)]
 pub struct EmpyreanWeightingLayer {
     /// Layer kind discriminator — one of
     /// `EMPYREAN_WEIGHTING_LAYER_*`.
     pub kind: i32,
     // ── ObservatoryRule fields ─────────────────────────────────
-    /// MPC observatory code, null-padded to 4 bytes.
+    /// MPC observatory code: printable ASCII, no whitespace,
+    /// left-aligned and NUL-padded to 4 bytes. Station matching is
+    /// exact and case-sensitive; malformed codes are rejected with an
+    /// error (never repaired or trimmed).
     pub obs_code: [u8; 4],
     /// 1σ RA·cos(δ) in arcsec.
     pub sigma_ra_arcsec: f64,
@@ -328,11 +341,16 @@ pub struct EmpyreanWeightingLayer {
     pub start_epoch_mjd_tdb: f64,
     /// End of applicable time range (MJD TDB). NaN = unbounded.
     pub end_epoch_mjd_tdb: f64,
-    /// Scale factor on the resulting weight. 0.0 → upstream default (1.0).
+    /// Scale factor on the resulting weight. Must be finite and > 0
+    /// — use 1.0 for no scaling. Non-positive or non-finite values
+    /// are rejected with an error (0.0 no longer silently maps to
+    /// 1.0).
     pub scale: f64,
     // ── NightlyDeweighting fields ──────────────────────────────
     /// Maximum gap between observations to count as the same night
-    /// (days). 0.0 → upstream default (0.5).
+    /// (days). Must be finite and > 0 — the production value is 0.5.
+    /// Non-positive or non-finite values are rejected with an error
+    /// (0.0 no longer silently maps to 0.5).
     pub max_gap_days: f64,
 }
 
@@ -344,26 +362,50 @@ pub struct EmpyreanWeightingLayer {
 ///
 /// `enabled = 0` runs OD with uniform 1″ weighting (the old
 /// `use_weighting = 0` behavior). `enabled = 1` activates the
-/// pipeline; the resulting layer chain is the preset's layers
-/// followed by `additional_layers` (allows e.g. VFC17 + per-survey
-/// override).
+/// pipeline; the resulting layer chain is `additional_layers`
+/// followed by the preset's layers. Sigma resolution is
+/// first-match-wins, so a user rule overrides the preset for its
+/// station and the preset serves as the fallback (allows e.g. VFC17
+/// + per-survey override).
+///
+/// A **zero-initialized struct is NOT the production default** — it
+/// has `enabled = 0`, i.e. weighting disabled (uniform 1″). The
+/// production combination (VFC17 station floors + nightly
+/// de-weighting + Floor policy) must be requested explicitly:
+/// `enabled = 1`, `preset = VFC17`, `sigma_policy = -1`, plus one
+/// `NIGHTLY_DEWEIGHTING` additional layer.
 #[repr(C)]
 pub struct EmpyreanWeightingConfig {
-    /// 1 = enabled (default), 0 = uniform 1″ weighting.
+    /// 1 = run the weighting pipeline, 0 = uniform 1″ weighting.
+    /// Zero-init leaves weighting disabled.
     pub enabled: u8,
     /// Preset selector. One of `EMPYREAN_WEIGHTING_PRESET_*`.
-    /// Default `0` (NONE) means "use additional_layers only";
-    /// when `enabled = 1` and zero-init, the conversion code
-    /// substitutes `VFC17` so default-zero structs keep the
-    /// production behavior.
+    /// `0` (NONE) means no preset rules: `default_sigma_arcsec`
+    /// applies uniformly and only `additional_layers` contribute
+    /// rules. NONE is honored literally — there is no silent
+    /// substitution of the production preset.
     pub preset: u8,
-    /// Default 1σ used when no rule applies (arcsec). 0.0 →
-    /// upstream default (1.0). Ignored when preset != NONE.
+    /// Default 1σ used when no rule applies (arcsec). Exactly 0.0 is the
+    /// zero-init sentinel and resolves to 1.0; negative or non-finite
+    /// values are rejected with an error rather than silently read as
+    /// 1.0. Ignored when preset != NONE.
     pub default_sigma_arcsec: f64,
-    /// Sigma combination policy. -1 = use the preset's policy;
-    /// otherwise one of `EMPYREAN_SIGMA_POLICY_*`.
+    /// Sigma combination policy. -1 = use the preset's policy
+    /// (VFC17 / NEODYS presets use Floor); otherwise one of
+    /// `EMPYREAN_SIGMA_POLICY_*`. Note `0` is DEFAULT_ONLY — an
+    /// **active override**, not "unset": a zero-initialized field
+    /// replaces a preset's Floor policy with DefaultOnly. Callers
+    /// who want the preset's own policy must set -1.
     pub sigma_policy: i32,
-    /// Pointer to additional layers appended to the preset's chain.
+    /// Pointer to additional layers inserted AHEAD of the preset's
+    /// chain (first-match-wins: they override preset rules for their
+    /// stations; relative order within the array is preserved).
+    /// Presets contribute station-sigma rules only — the production
+    /// default chain includes exactly one `NIGHTLY_DEWEIGHTING`
+    /// layer, so callers composing this array must include it
+    /// explicitly or nightly de-weighting is off. At most one
+    /// `NIGHTLY_DEWEIGHTING` layer is accepted per chain (duplicates
+    /// compound the 1/√N de-weighting and are rejected).
     /// Non-owning — caller keeps the array alive for the OD call.
     pub additional_layers: *const EmpyreanWeightingLayer,
     pub num_additional_layers: usize,
@@ -1208,13 +1250,17 @@ pub struct EmpyreanODConfig {
     pub num_threads: usize,
     /// Output reference frame: 0=ICRF, 1=EclipticJ2000.
     pub frame: i32,
-    /// Observation weighting pipeline configuration. Zero-init = the
+    /// Observation weighting pipeline configuration. Zero-init =
+    /// `enabled = 0` = weighting DISABLED (uniform 1″); the
     /// production default (VFC17 + nightly de-weighting at floor-σ
-    /// policy). See [`EmpyreanWeightingConfig`].
+    /// policy) must be requested explicitly. See
+    /// [`EmpyreanWeightingConfig`].
     pub weighting: EmpyreanWeightingConfig,
-    /// Catalog-bias-correction configuration. Zero-init = the
-    /// production default (EFCC2020 standard resolution, loaded from
-    /// the DataManager default path). See [`EmpyreanDebiasingConfig`].
+    /// Catalog-bias-correction configuration. Zero-init =
+    /// `enabled = 0` = debiasing DISABLED; the production default
+    /// (EFCC2020 standard resolution, loaded from the DataManager
+    /// default path) must be requested explicitly. See
+    /// [`EmpyreanDebiasingConfig`].
     pub debiasing: EmpyreanDebiasingConfig,
     /// Number of `excluded_perturbers` in [`excluded_perturbers_naif`]; 0 = none.
     pub num_excluded_perturbers: usize,
@@ -2155,6 +2201,59 @@ pub(crate) unsafe fn write_covariance_trust(
 /// scott's `ODResult`. ALWAYS writes every field (zeros / sentinels when
 /// an axis was not solved) — no defaulted covariance presented as real,
 /// per the full-population contract.
+/// Write every field of an [`ODResult`] into the C out-struct **except**
+/// `orbit`, which the caller supplies because the entry paths build the
+/// propagated state differently.
+///
+/// This is the single source of truth for the OD output surface. Both the
+/// one-shot entry points and the session path route through it, so a field
+/// added to [`ODResult`] can never again reach one surface while defaulting
+/// to zero on the other — the failure mode that had the session path
+/// returning an all-zero covariance, `NaN` non-gravitational parameters and
+/// a `solve_for_used` that disagreed with the fit that actually ran.
+pub(crate) unsafe fn write_od_result_fields(result_out: *mut EmpyreanODResult, od: &ODResult) {
+    let (obs_ptr, obs_n) = observation_results_to_c(&od.observations);
+    let summary = summary_to_c(&od.summary);
+    let acceptability = acceptability_to_c(&od.acceptability);
+
+    let (has_cov_9x9, covariance_9x9) = match &od.covariance_9x9 {
+        Some(m) => (1u8, *m),
+        None => (0u8, [[0.0f64; 9]; 9]),
+    };
+    let (has_ng_delta, non_grav_delta) = match &od.non_grav_delta {
+        Some(d) => (1u8, *d),
+        None => (0u8, [f64::NAN; 3]),
+    };
+    let (has_non_grav, non_grav) = od_result_non_grav_to_c(od);
+
+    let (sb_ptr, sb_n) = station_biases_to_c(&od.station_biases);
+
+    unsafe {
+        (*result_out).observations = obs_ptr;
+        (*result_out).num_observations = obs_n;
+        (*result_out).summary = summary;
+        (*result_out).iterations = od.iterations as u32;
+        (*result_out).update_norm = od.update_norm;
+        (*result_out).converged = u8::from(od.acceptability.converged_ok);
+        (*result_out).covariance = od.covariance;
+        (*result_out).covariance_representation = coord_rep_to_int(od.covariance_representation);
+        (*result_out).has_covariance_9x9 = has_cov_9x9;
+        (*result_out).covariance_9x9 = covariance_9x9;
+        (*result_out).has_non_grav_delta = has_ng_delta;
+        (*result_out).non_grav_delta = non_grav_delta;
+        (*result_out).has_non_grav = has_non_grav;
+        (*result_out).non_grav = non_grav;
+        (*result_out).rejection_passes = od.rejection_passes as u32;
+        (*result_out).num_oppositions_fit = od.num_oppositions_fit as u32;
+        (*result_out).force_model_used = v_force_model_tier_to_int(od.force_model_used);
+        (*result_out).solve_for_used = solve_for_to_int(&od.solve_for);
+        (*result_out).acceptability = acceptability;
+        (*result_out).station_biases = sb_ptr;
+        (*result_out).num_station_biases = sb_n;
+        populate_wide_fitting_fields(result_out, od);
+    }
+}
+
 unsafe fn populate_wide_fitting_fields(result_out: *mut EmpyreanODResult, od: &ODResult) {
     unsafe {
         write_covariance_trust(result_out, &od.covariance_trust);
@@ -2496,18 +2595,33 @@ fn build_weighting_from_c(
         return Ok(None);
     }
 
-    // Zero-init `preset = NONE` + zero-init layers list = "use the
-    // production default" so callers that don't set anything keep
-    // pre-structured-config behavior.
-    let preset_is_none_zero_init =
-        c.preset == EMPYREAN_WEIGHTING_PRESET_NONE && c.num_additional_layers == 0;
-    let effective_preset = if preset_is_none_zero_init {
-        EMPYREAN_WEIGHTING_PRESET_VFC17
-    } else {
-        c.preset
-    };
-
-    let mut wcfg = match effective_preset {
+    // `preset = NONE` means exactly what it says: no preset rules, the
+    // caller's `default_sigma_arcsec` applies uniformly (DefaultOnly
+    // policy unless `sigma_policy` overrides it). There is NO silent
+    // substitution of the production preset — a caller who wants VFC17
+    // must request it. (A zero-initialized struct never reaches this
+    // code: `enabled = 0` returns above, i.e. zero-init = weighting
+    // disabled, not the production default.)
+    // `default_sigma_arcsec` splits into a real "unset" state and a caller
+    // bug. Exactly 0.0 is the documented zero-init sentinel and resolves to
+    // 1 arcsec; anything negative or non-finite is not a sentinel, it is a
+    // nonsense sigma, and silently reading it as 1 arcsec would fit the arc
+    // against a weight the caller never asked for.
+    if c.default_sigma_arcsec < 0.0 || c.default_sigma_arcsec.is_nan() {
+        return Err(format!(
+            "weighting default_sigma_arcsec must be finite and >= 0 \
+             (0.0 means \"unset\", resolving to 1.0 arcsec); got {}",
+            c.default_sigma_arcsec
+        ));
+    }
+    if c.default_sigma_arcsec.is_infinite() {
+        return Err(
+            "weighting default_sigma_arcsec must be finite (0.0 means \"unset\", \
+             resolving to 1.0 arcsec); got inf"
+                .to_string(),
+        );
+    }
+    let mut wcfg = match c.preset {
         EMPYREAN_WEIGHTING_PRESET_NONE => WeightingConfig {
             default_sigma_arcsec: if c.default_sigma_arcsec > 0.0 {
                 c.default_sigma_arcsec
@@ -2543,20 +2657,49 @@ fn build_weighting_from_c(
     if c.num_additional_layers > 0 && !c.additional_layers.is_null() {
         let slice =
             unsafe { std::slice::from_raw_parts(c.additional_layers, c.num_additional_layers) };
-        for layer in slice {
+        let mut user_layers: Vec<WeightingLayer> = Vec::with_capacity(slice.len());
+        for (idx, layer) in slice.iter().enumerate() {
             let parsed = match layer.kind {
                 EMPYREAN_WEIGHTING_LAYER_OBSERVATORY_RULE => {
-                    let code = String::from_utf8_lossy(
-                        &layer.obs_code[..layer
-                            .obs_code
-                            .iter()
-                            .position(|&b| b == 0)
-                            .unwrap_or(layer.obs_code.len())],
-                    )
-                    .trim()
-                    .to_string();
+                    // Strict obs_code decode. Station matching is exact
+                    // and case-sensitive, so a malformed code silently
+                    // matches nothing (or, after lossy repair/trim, the
+                    // WRONG station) — reject instead of repairing.
+                    let nul = layer
+                        .obs_code
+                        .iter()
+                        .position(|&b| b == 0)
+                        .unwrap_or(layer.obs_code.len());
+                    if layer.obs_code[nul..].iter().any(|&b| b != 0) {
+                        return Err(format!(
+                            "weighting.additional_layers[{idx}]: obs_code has non-zero bytes \
+                             after the NUL terminator ({:?}); pack the code left-aligned and \
+                             NUL-pad",
+                            layer.obs_code
+                        ));
+                    }
+                    let code = match std::str::from_utf8(&layer.obs_code[..nul]) {
+                        Ok(s) => s,
+                        Err(_) => {
+                            return Err(format!(
+                                "weighting.additional_layers[{idx}]: obs_code bytes {:?} are \
+                                 not valid UTF-8",
+                                &layer.obs_code[..nul]
+                            ));
+                        }
+                    };
                     if code.is_empty() {
-                        return Err("weighting.ObservatoryRule layer has empty obs_code".into());
+                        return Err(format!(
+                            "weighting.additional_layers[{idx}]: ObservatoryRule has empty \
+                             obs_code"
+                        ));
+                    }
+                    if !code.chars().all(|ch| ch.is_ascii_graphic()) {
+                        return Err(format!(
+                            "weighting.additional_layers[{idx}]: obs_code {code:?} must be \
+                             printable ASCII with no whitespace — MPC station matching is \
+                             exact and case-sensitive"
+                        ));
                     }
                     let start_epoch = if layer.start_epoch_mjd_tdb.is_finite() {
                         Some(Epoch::from_mjd_tdb(layer.start_epoch_mjd_tdb))
@@ -2568,22 +2711,76 @@ fn build_weighting_from_c(
                     } else {
                         None
                     };
-                    let scale = if layer.scale > 0.0 { layer.scale } else { 1.0 };
+                    // A non-positive or non-finite scale was previously
+                    // clamped to 1.0 silently (and +inf sailed through,
+                    // yielding NaN/-0.0 chi2). Weight scaling is a
+                    // physical claim about the observations — reject
+                    // instead of substituting.
+                    if !layer.scale.is_finite() || layer.scale <= 0.0 {
+                        return Err(format!(
+                            "weighting.additional_layers[{idx}]: ObservatoryRule scale must be \
+                             finite and > 0, got {}; use 1.0 for no scaling",
+                            layer.scale
+                        ));
+                    }
                     WeightingLayer::ObservatoryRule {
-                        obs_code: code,
+                        obs_code: code.to_string(),
                         sigma: [layer.sigma_ra_arcsec, layer.sigma_dec_arcsec],
                         start_epoch,
                         end_epoch,
-                        scale,
+                        scale: layer.scale,
                     }
                 }
                 EMPYREAN_WEIGHTING_LAYER_NIGHTLY_DEWEIGHTING => {
-                    let max_gap_days = if layer.max_gap_days > 0.0 {
-                        layer.max_gap_days
-                    } else {
-                        0.5
-                    };
-                    WeightingLayer::NightlyDeweighting { max_gap_days }
+                    // NightlyDeweighting reads ONLY max_gap_days. The
+                    // ObservatoryRule fields have no effect on this
+                    // kind — rather than accept-and-ignore them (the
+                    // caller believes they scoped the layer; the
+                    // scoping silently never happens), reject loudly.
+                    if layer.obs_code.iter().any(|&b| b != 0) {
+                        return Err(format!(
+                            "weighting.additional_layers[{idx}]: NIGHTLY_DEWEIGHTING does not \
+                             support obs_code scoping (nightly de-weighting groups per station \
+                             internally and always applies to every station); leave obs_code \
+                             zeroed, or use an OBSERVATORY_RULE layer for per-station sigmas"
+                        ));
+                    }
+                    if layer.sigma_ra_arcsec != 0.0 || layer.sigma_dec_arcsec != 0.0 {
+                        return Err(format!(
+                            "weighting.additional_layers[{idx}]: NIGHTLY_DEWEIGHTING does not \
+                             read sigma_ra_arcsec/sigma_dec_arcsec; set them to 0.0, or use an \
+                             OBSERVATORY_RULE layer to assign sigmas"
+                        ));
+                    }
+                    let epoch_set = |v: f64| v.is_finite() && v != 0.0;
+                    if epoch_set(layer.start_epoch_mjd_tdb) || epoch_set(layer.end_epoch_mjd_tdb) {
+                        return Err(format!(
+                            "weighting.additional_layers[{idx}]: NIGHTLY_DEWEIGHTING does not \
+                             support a time range (start/end_epoch_mjd_tdb are not read); set \
+                             them to NaN or 0.0"
+                        ));
+                    }
+                    if layer.scale != 0.0 {
+                        return Err(format!(
+                            "weighting.additional_layers[{idx}]: NIGHTLY_DEWEIGHTING does not \
+                             read scale; set it to 0.0"
+                        ));
+                    }
+                    // Previously 0.0 (and any non-positive/NaN value)
+                    // silently became the 0.5-day default. Same-night
+                    // grouping is a physical claim — reject instead of
+                    // substituting.
+                    if !layer.max_gap_days.is_finite() || layer.max_gap_days <= 0.0 {
+                        return Err(format!(
+                            "weighting.additional_layers[{idx}]: NIGHTLY_DEWEIGHTING \
+                             max_gap_days must be finite and > 0 (days), got {}; the \
+                             production default is 0.5",
+                            layer.max_gap_days
+                        ));
+                    }
+                    WeightingLayer::NightlyDeweighting {
+                        max_gap_days: layer.max_gap_days,
+                    }
                 }
                 other => {
                     return Err(format!(
@@ -2593,8 +2790,36 @@ fn build_weighting_from_c(
                     ));
                 }
             };
-            wcfg.layers.push(parsed);
+            user_layers.push(parsed);
         }
+        // User layers must be able to override preset rules. scott's
+        // sigma resolution is first-match-wins over the layer chain and
+        // the preset rules are time-unbounded, so a user rule placed
+        // AFTER the preset could never win its station. Insert the user
+        // layers ahead of the preset chain (preserving their relative
+        // order): user rules take their stations, the preset remains
+        // the fallback. Only sigma-rule precedence changes — weight
+        // *scale* factors and NightlyDeweighting are multiplicative
+        // passes applied from every matching layer regardless of
+        // position in the chain.
+        user_layers.append(&mut wcfg.layers);
+        wcfg.layers = user_layers;
+    }
+
+    // Duplicate nightly layers compound: each pass multiplies the
+    // weights by another 1/sqrt(N) per night, which no production
+    // scheme intends. Reject rather than silently over-de-weight.
+    let nightly_count = wcfg
+        .layers
+        .iter()
+        .filter(|l| matches!(l, WeightingLayer::NightlyDeweighting { .. }))
+        .count();
+    if nightly_count > 1 {
+        return Err(format!(
+            "weighting layer chain contains {nightly_count} NIGHTLY_DEWEIGHTING layers; each \
+             additional pass compounds the per-night 1/sqrt(N) de-weighting multiplicatively — \
+             include exactly one"
+        ));
     }
 
     Ok(Some(wcfg))
@@ -2709,7 +2934,20 @@ fn build_rejection_strategy_from_c(
     }))
 }
 
-fn build_od_config_from_c(c: &EmpyreanODConfig) -> Result<ODConfig, String> {
+/// Build a scott [`ODConfig`] from the C request struct.
+///
+/// **The single OD-config parser in the C ABI.** Every entry point that
+/// accepts an [`EmpyreanODConfig`] — the one-shot `determine` /
+/// `evaluate` / `refine` surfaces here and
+/// [`empyrean_session_new`](crate::session::empyrean_session_new) — goes
+/// through this function, so the weighting chain
+/// ([`build_weighting_from_c`]), the debiasing decision
+/// ([`build_debiasing_from_c`]) and every other field resolve
+/// identically on all of them. A second, partial parser would let a
+/// change to the weighting contract land on one surface and not the
+/// other, and would silently drop whatever it forgot to read — do not
+/// add one.
+pub(crate) fn build_od_config_from_c(c: &EmpyreanODConfig) -> Result<ODConfig, String> {
     let fm = int_to_force_model(c.force_model)?;
     let mut cfg = ODConfig::default();
     cfg.force_model = fm.into();
@@ -3508,47 +3746,9 @@ pub unsafe extern "C" fn empyrean_determine(
             };
 
         let od = &det_result.od;
-        let (obs_ptr, obs_n) = observation_results_to_c(&od.observations);
-        let summary = summary_to_c(&od.summary);
-        let acceptability = acceptability_to_c(&od.acceptability);
-
-        let (has_cov_9x9, covariance_9x9) = match &od.covariance_9x9 {
-            Some(m) => (1u8, *m),
-            None => (0u8, [[0.0f64; 9]; 9]),
-        };
-        let (has_ng_delta, non_grav_delta) = match &od.non_grav_delta {
-            Some(d) => (1u8, *d),
-            None => (0u8, [f64::NAN; 3]),
-        };
-        let (has_non_grav, non_grav) = od_result_non_grav_to_c(od);
-
-        let (sb_ptr, sb_n) = station_biases_to_c(&od.station_biases);
-
         unsafe {
             (*result_out).orbit = prop_state;
-            (*result_out).observations = obs_ptr;
-            (*result_out).num_observations = obs_n;
-            (*result_out).summary = summary;
-            (*result_out).iterations = od.iterations as u32;
-            (*result_out).update_norm = od.update_norm;
-            (*result_out).converged = u8::from(od.acceptability.converged_ok);
-            (*result_out).covariance = od.covariance;
-            (*result_out).covariance_representation =
-                coord_rep_to_int(od.covariance_representation);
-            (*result_out).has_covariance_9x9 = has_cov_9x9;
-            (*result_out).covariance_9x9 = covariance_9x9;
-            (*result_out).has_non_grav_delta = has_ng_delta;
-            (*result_out).non_grav_delta = non_grav_delta;
-            (*result_out).has_non_grav = has_non_grav;
-            (*result_out).non_grav = non_grav;
-            (*result_out).rejection_passes = od.rejection_passes as u32;
-            (*result_out).num_oppositions_fit = od.num_oppositions_fit as u32;
-            (*result_out).force_model_used = v_force_model_tier_to_int(od.force_model_used);
-            (*result_out).solve_for_used = solve_for_to_int(&od.solve_for);
-            (*result_out).acceptability = acceptability;
-            (*result_out).station_biases = sb_ptr;
-            (*result_out).num_station_biases = sb_n;
-            populate_wide_fitting_fields(result_out, od);
+            write_od_result_fields(result_out, od);
         }
         0
     }));
@@ -3768,47 +3968,9 @@ pub unsafe extern "C" fn empyrean_refine(
             }
         };
 
-        let (obs_ptr, obs_n) = observation_results_to_c(&od_result.observations);
-        let summary = summary_to_c(&od_result.summary);
-        let acceptability = acceptability_to_c(&od_result.acceptability);
-
-        let (has_cov_9x9, covariance_9x9) = match &od_result.covariance_9x9 {
-            Some(m) => (1u8, *m),
-            None => (0u8, [[0.0f64; 9]; 9]),
-        };
-        let (has_ng_delta, non_grav_delta) = match &od_result.non_grav_delta {
-            Some(d) => (1u8, *d),
-            None => (0u8, [f64::NAN; 3]),
-        };
-        let (has_non_grav, non_grav) = od_result_non_grav_to_c(&od_result);
-
-        let (sb_ptr, sb_n) = station_biases_to_c(&od_result.station_biases);
-
         unsafe {
             (*result_out).orbit = prop_state;
-            (*result_out).observations = obs_ptr;
-            (*result_out).num_observations = obs_n;
-            (*result_out).summary = summary;
-            (*result_out).iterations = od_result.iterations as u32;
-            (*result_out).update_norm = od_result.update_norm;
-            (*result_out).converged = u8::from(od_result.acceptability.converged_ok);
-            (*result_out).covariance = od_result.covariance;
-            (*result_out).covariance_representation =
-                coord_rep_to_int(od_result.covariance_representation);
-            (*result_out).has_covariance_9x9 = has_cov_9x9;
-            (*result_out).covariance_9x9 = covariance_9x9;
-            (*result_out).has_non_grav_delta = has_ng_delta;
-            (*result_out).non_grav_delta = non_grav_delta;
-            (*result_out).has_non_grav = has_non_grav;
-            (*result_out).non_grav = non_grav;
-            (*result_out).rejection_passes = od_result.rejection_passes as u32;
-            (*result_out).num_oppositions_fit = od_result.num_oppositions_fit as u32;
-            (*result_out).force_model_used = v_force_model_tier_to_int(od_result.force_model_used);
-            (*result_out).solve_for_used = solve_for_to_int(&od_result.solve_for);
-            (*result_out).acceptability = acceptability;
-            (*result_out).station_biases = sb_ptr;
-            (*result_out).num_station_biases = sb_n;
-            populate_wide_fitting_fields(result_out, &od_result);
+            write_od_result_fields(result_out, &od_result);
         }
         0
     }));

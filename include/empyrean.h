@@ -2567,7 +2567,13 @@ struct EmpyreanRadarObservation {
 
 /**
  * One element of [`EmpyreanWeightingConfig::additional_layers`].
- * Tagged-union shape: the active fields depend on `kind`.
+ * Tagged-union shape: the active fields depend on `kind`, and the
+ * inactive fields MUST be left at their unset values (zeroed bytes /
+ * 0.0 / NaN epochs) — a layer carrying fields its kind does not read
+ * is rejected with an error rather than silently ignored. In
+ * particular a `NIGHTLY_DEWEIGHTING` layer reads only
+ * `max_gap_days`: nightly de-weighting cannot be scoped by station
+ * or time range.
  */
 struct EmpyreanWeightingLayer {
     /**
@@ -2576,7 +2582,10 @@ struct EmpyreanWeightingLayer {
      */
     int32_t kind;
     /**
-     * MPC observatory code, null-padded to 4 bytes.
+     * MPC observatory code: printable ASCII, no whitespace,
+     * left-aligned and NUL-padded to 4 bytes. Station matching is
+     * exact and case-sensitive; malformed codes are rejected with an
+     * error (never repaired or trimmed).
      */
     uint8_t obs_code[4];
     /**
@@ -2596,12 +2605,17 @@ struct EmpyreanWeightingLayer {
      */
     double end_epoch_mjd_tdb;
     /**
-     * Scale factor on the resulting weight. 0.0 → upstream default (1.0).
+     * Scale factor on the resulting weight. Must be finite and > 0
+     * — use 1.0 for no scaling. Non-positive or non-finite values
+     * are rejected with an error (0.0 no longer silently maps to
+     * 1.0).
      */
     double scale;
     /**
      * Maximum gap between observations to count as the same night
-     * (days). 0.0 → upstream default (0.5).
+     * (days). Must be finite and > 0 — the production value is 0.5.
+     * Non-positive or non-finite values are rejected with an error
+     * (0.0 no longer silently maps to 0.5).
      */
     double max_gap_days;
 };
@@ -2615,35 +2629,59 @@ struct EmpyreanWeightingLayer {
  *
  * `enabled = 0` runs OD with uniform 1″ weighting (the old
  * `use_weighting = 0` behavior). `enabled = 1` activates the
- * pipeline; the resulting layer chain is the preset's layers
- * followed by `additional_layers` (allows e.g. VFC17 + per-survey
- * override).
+ * pipeline; the resulting layer chain is `additional_layers`
+ * followed by the preset's layers. Sigma resolution is
+ * first-match-wins, so a user rule overrides the preset for its
+ * station and the preset serves as the fallback (allows e.g. VFC17
+ * + per-survey override).
+ *
+ * A **zero-initialized struct is NOT the production default** — it
+ * has `enabled = 0`, i.e. weighting disabled (uniform 1″). The
+ * production combination (VFC17 station floors + nightly
+ * de-weighting + Floor policy) must be requested explicitly:
+ * `enabled = 1`, `preset = VFC17`, `sigma_policy = -1`, plus one
+ * `NIGHTLY_DEWEIGHTING` additional layer.
  */
 struct EmpyreanWeightingConfig {
     /**
-     * 1 = enabled (default), 0 = uniform 1″ weighting.
+     * 1 = run the weighting pipeline, 0 = uniform 1″ weighting.
+     * Zero-init leaves weighting disabled.
      */
     uint8_t enabled;
     /**
      * Preset selector. One of `EMPYREAN_WEIGHTING_PRESET_*`.
-     * Default `0` (NONE) means "use additional_layers only";
-     * when `enabled = 1` and zero-init, the conversion code
-     * substitutes `VFC17` so default-zero structs keep the
-     * production behavior.
+     * `0` (NONE) means no preset rules: `default_sigma_arcsec`
+     * applies uniformly and only `additional_layers` contribute
+     * rules. NONE is honored literally — there is no silent
+     * substitution of the production preset.
      */
     uint8_t preset;
     /**
-     * Default 1σ used when no rule applies (arcsec). 0.0 →
-     * upstream default (1.0). Ignored when preset != NONE.
+     * Default 1σ used when no rule applies (arcsec). Exactly 0.0 is the
+     * zero-init sentinel and resolves to 1.0; negative or non-finite
+     * values are rejected with an error rather than silently read as
+     * 1.0. Ignored when preset != NONE.
      */
     double default_sigma_arcsec;
     /**
-     * Sigma combination policy. -1 = use the preset's policy;
-     * otherwise one of `EMPYREAN_SIGMA_POLICY_*`.
+     * Sigma combination policy. -1 = use the preset's policy
+     * (VFC17 / NEODYS presets use Floor); otherwise one of
+     * `EMPYREAN_SIGMA_POLICY_*`. Note `0` is DEFAULT_ONLY — an
+     * **active override**, not "unset": a zero-initialized field
+     * replaces a preset's Floor policy with DefaultOnly. Callers
+     * who want the preset's own policy must set -1.
      */
     int32_t sigma_policy;
     /**
-     * Pointer to additional layers appended to the preset's chain.
+     * Pointer to additional layers inserted AHEAD of the preset's
+     * chain (first-match-wins: they override preset rules for their
+     * stations; relative order within the array is preserved).
+     * Presets contribute station-sigma rules only — the production
+     * default chain includes exactly one `NIGHTLY_DEWEIGHTING`
+     * layer, so callers composing this array must include it
+     * explicitly or nightly de-weighting is off. At most one
+     * `NIGHTLY_DEWEIGHTING` layer is accepted per chain (duplicates
+     * compound the 1/√N de-weighting and are rejected).
      * Non-owning — caller keeps the array alive for the OD call.
      */
     const struct EmpyreanWeightingLayer *additional_layers;
@@ -2934,15 +2972,19 @@ struct EmpyreanODConfig {
      */
     int32_t frame;
     /**
-     * Observation weighting pipeline configuration. Zero-init = the
+     * Observation weighting pipeline configuration. Zero-init =
+     * `enabled = 0` = weighting DISABLED (uniform 1″); the
      * production default (VFC17 + nightly de-weighting at floor-σ
-     * policy). See [`EmpyreanWeightingConfig`].
+     * policy) must be requested explicitly. See
+     * [`EmpyreanWeightingConfig`].
      */
     struct EmpyreanWeightingConfig weighting;
     /**
-     * Catalog-bias-correction configuration. Zero-init = the
-     * production default (EFCC2020 standard resolution, loaded from
-     * the DataManager default path). See [`EmpyreanDebiasingConfig`].
+     * Catalog-bias-correction configuration. Zero-init =
+     * `enabled = 0` = debiasing DISABLED; the production default
+     * (EFCC2020 standard resolution, loaded from the DataManager
+     * default path) must be requested explicitly. See
+     * [`EmpyreanDebiasingConfig`].
      */
     struct EmpyreanDebiasingConfig debiasing;
     /**
@@ -4980,6 +5022,14 @@ int32_t empyrean_query_radar(const char *const *designations,
 /**
  * Construct a new orbit-determination session over a fixed
  * observation set.
+ *
+ * `config` is parsed by the same builder the one-shot
+ * `empyrean_determine` / `empyrean_evaluate` / `empyrean_refine`
+ * entry points use, so every field — weighting preset and additional
+ * layers, debiasing, rejection, solve-for, origin and output-epoch
+ * policy — resolves identically on both surfaces. A malformed
+ * weighting layer is rejected here, before any fitting: the call
+ * returns null with the reason in `empyrean_last_error`.
  *
  * Returns a heap-allocated handle on success, or null on error.
  * The caller owns the returned pointer and must free it with

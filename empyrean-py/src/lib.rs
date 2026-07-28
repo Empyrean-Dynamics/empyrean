@@ -4212,12 +4212,23 @@ fn build_od_config_from_dict(d: &Bound<'_, PyDict>) -> PyResult<empyrean::ODConf
             && !layers_obj.is_none()
         {
             let mut additional: Vec<empyrean::WeightingLayer> = Vec::new();
-            for item in layers_obj.try_iter()? {
+            for (idx, item) in layers_obj.try_iter()?.enumerate() {
                 let layer: Bound<'_, PyDict> = item?.extract()?;
                 let kind = get_str(&layer, "kind")?
                     .ok_or_else(|| PyValueError::new_err("weighting layer missing 'kind'"))?;
                 let layer_value = match kind.to_ascii_lowercase().as_str() {
                     "observatory_rule" => {
+                        // Symmetric strictness: max_gap_days belongs to
+                        // nightly_deweighting only.
+                        if let Some(v) = layer.get_item("max_gap_days")?
+                            && !v.is_none()
+                        {
+                            return Err(PyValueError::new_err(format!(
+                                "weighting layer {idx} (observatory_rule): field \
+                                 \"max_gap_days\" is not read by this layer kind; remove it or \
+                                 use a nightly_deweighting layer"
+                            )));
+                        }
                         let obs_code = get_str(&layer, "obs_code")?.ok_or_else(|| {
                             PyValueError::new_err("observatory_rule layer missing obs_code")
                         })?;
@@ -4229,6 +4240,17 @@ fn build_od_config_from_dict(d: &Bound<'_, PyDict>) -> PyResult<empyrean::ODConf
                             return Err(PyValueError::new_err(format!(
                                 "observatory_rule sigma must be 2-element list, got {}",
                                 sigma_vec.len()
+                            )));
+                        }
+                        // Defense-in-depth for raw-dict callers (the
+                        // dataclass validates too): non-finite or
+                        // non-positive sigmas produce NaN / infinite
+                        // weights downstream.
+                        if !sigma_vec.iter().all(|s| s.is_finite() && *s > 0.0) {
+                            return Err(PyValueError::new_err(format!(
+                                "weighting layer {idx} (observatory_rule, obs_code \
+                                 {obs_code:?}): sigma must be finite and > 0 arcsec, got \
+                                 {sigma_vec:?}"
                             )));
                         }
                         let start = match layer.get_item("start_epoch_mjd_tdb")? {
@@ -4249,6 +4271,32 @@ fn build_od_config_from_dict(d: &Bound<'_, PyDict>) -> PyResult<empyrean::ODConf
                         }
                     }
                     "nightly_deweighting" => {
+                        // Strict per-kind validation: NightlyDeweighting
+                        // reads ONLY max_gap_days. ObservatoryRule fields
+                        // on a nightly layer used to be accepted and
+                        // silently ignored — the caller believed they had
+                        // scoped the layer. Reject loudly instead.
+                        if let Some(code) = get_str(&layer, "obs_code")?
+                            && !code.is_empty()
+                        {
+                            return Err(PyValueError::new_err(format!(
+                                "weighting layer {idx} (nightly_deweighting): obs_code {code:?} \
+                                 is not supported — nightly de-weighting groups per station \
+                                 internally and always applies to every station; use an \
+                                 observatory_rule layer for per-station sigmas"
+                            )));
+                        }
+                        for key in ["sigma", "start_epoch_mjd_tdb", "end_epoch_mjd_tdb", "scale"] {
+                            if let Some(v) = layer.get_item(key)?
+                                && !v.is_none()
+                            {
+                                return Err(PyValueError::new_err(format!(
+                                    "weighting layer {idx} (nightly_deweighting): field {key:?} \
+                                     is not read by this layer kind; remove it or use an \
+                                     observatory_rule layer"
+                                )));
+                            }
+                        }
                         let max_gap_days = get_f64(&layer, "max_gap_days")?.unwrap_or(0.5);
                         empyrean::WeightingLayer::NightlyDeweighting { max_gap_days }
                     }
@@ -5756,9 +5804,11 @@ struct PySession {
 #[pymethods]
 impl PySession {
     /// Construct a session by parsing ADES PSV / MPC80 content.
-    /// `force_model` matches the propagation tier ints (0/1/2).
-    /// Other ODConfig knobs use upstream defaults; tweak via the
-    /// dedicated wrappers if needed.
+    /// `config_dict` is the full `ODConfig` wire dict `_determine`
+    /// consumes, resolved by the same builder — weighting, debiasing,
+    /// rejection and the rest apply to a session exactly as they do to
+    /// the one-shot surface. A malformed weighting layer raises here,
+    /// at construction, rather than at the first refine.
     #[new]
     #[pyo3(signature = (ades_path_or_content, config_dict))]
     fn new(ades_path_or_content: &str, config_dict: &Bound<'_, PyDict>) -> PyResult<Self> {

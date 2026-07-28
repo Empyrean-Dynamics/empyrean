@@ -305,7 +305,9 @@ pub(crate) struct ODConfigKeepalive {
 }
 
 impl ODConfig {
-    pub(crate) fn to_ffi_with(&self) -> (empyrean_sys::EmpyreanODConfig, ODConfigKeepalive) {
+    pub(crate) fn to_ffi_with(
+        &self,
+    ) -> crate::error::Result<(empyrean_sys::EmpyreanODConfig, ODConfigKeepalive)> {
         let perturbers: Vec<i32> = self
             .excluded_perturbers
             .iter()
@@ -317,13 +319,15 @@ impl ODConfig {
             OutputEpoch::Epoch(t) => (2, t),
             OutputEpoch::IODEpoch => (3, 0.0),
         };
-        // Materialize weighting layers
+        // Materialize weighting layers (validates obs_codes against
+        // the 4-byte C-ABI field — no silent truncation).
         let weighting_layers: Vec<empyrean_sys::EmpyreanWeightingLayer> = self
             .weighting
             .additional_layers
             .iter()
-            .map(weighting_layer_to_ffi)
-            .collect();
+            .enumerate()
+            .map(|(idx, layer)| weighting_layer_to_ffi(idx, layer))
+            .collect::<crate::error::Result<Vec<_>>>()?;
         let weighting = empyrean_sys::EmpyreanWeightingConfig {
             enabled: u8::from(self.weighting.enabled),
             preset: match self.weighting.preset {
@@ -465,7 +469,7 @@ impl ODConfig {
             weighting_layers,
             bias_dat_path,
         };
-        (cfg, keep)
+        Ok((cfg, keep))
     }
 
     /// Convenience builder: a config carrying just the requested force

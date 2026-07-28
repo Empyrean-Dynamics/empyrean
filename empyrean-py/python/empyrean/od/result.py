@@ -7,6 +7,7 @@ structure (no flattening). ``ODConfig()`` defaults are identical to
 tripping through the C ABI.
 """
 
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TypeAlias
@@ -223,8 +224,10 @@ class WeightingPreset(str, Enum):
     """Preset selector for :class:`WeightingConfig`.
 
     Picking a preset seeds the layer chain with scott's curated
-    layers; entries in :attr:`WeightingConfig.additional_layers`
-    are appended in order.
+    layers; entries in :attr:`WeightingConfig.additional_layers` are
+    placed ahead of the preset's rules (sigma resolution is
+    first-match-wins, so they override the preset for their stations
+    and the preset is the fallback).
     """
 
     NONE = "none"
@@ -256,7 +259,14 @@ class WeightingLayerKind(str, Enum):
 @dataclass
 class WeightingLayer:
     """One element of the weighting pipeline. Tagged-union shape —
-    the active fields depend on :attr:`kind`.
+    the active fields depend on :attr:`kind`, and fields belonging to
+    the *other* kind must be left at their defaults: a
+    ``NIGHTLY_DEWEIGHTING`` layer reads only :attr:`max_gap_days`
+    (nightly de-weighting cannot be scoped by station or time range),
+    and an ``OBSERVATORY_RULE`` layer never reads
+    :attr:`max_gap_days`. Setting an inapplicable field raises
+    ``ValueError`` at construction rather than being silently
+    ignored.
 
     Mirrors ``scott::weighting::WeightingLayer``.
     """
@@ -265,7 +275,8 @@ class WeightingLayer:
 
     # ── ObservatoryRule fields ─────────────────────────────────
     obs_code: str = ""
-    """MPC observatory code (e.g. ``"F51"``)."""
+    """MPC observatory code (e.g. ``"F51"``). Matched exactly and
+    case-sensitively."""
     sigma: tuple[float, float] = (1.0, 1.0)
     """1σ (RA·cos(δ), Dec) in arcseconds."""
     start_epoch_mjd_tdb: float | None = None
@@ -281,6 +292,93 @@ class WeightingLayer:
     max_gap_days: float = 0.5
     """Max gap (days) between observations to count as the same
     night (NightlyDeweighting only)."""
+
+    def __post_init__(self) -> None:
+        if self.kind == WeightingLayerKind.NIGHTLY_DEWEIGHTING:
+            # NightlyDeweighting reads only max_gap_days; a scoping
+            # field here would be silently inert engine-side.
+            inert = []
+            if self.obs_code != "":
+                inert.append(f"obs_code={self.obs_code!r}")
+            if tuple(self.sigma) != (1.0, 1.0):
+                inert.append(f"sigma={tuple(self.sigma)!r}")
+            if self.start_epoch_mjd_tdb is not None:
+                inert.append(f"start_epoch_mjd_tdb={self.start_epoch_mjd_tdb!r}")
+            if self.end_epoch_mjd_tdb is not None:
+                inert.append(f"end_epoch_mjd_tdb={self.end_epoch_mjd_tdb!r}")
+            if self.scale != 1.0:
+                inert.append(f"scale={self.scale!r}")
+            if inert:
+                raise ValueError(
+                    f"NIGHTLY_DEWEIGHTING layer reads only max_gap_days, but "
+                    f"{', '.join(inert)} was set. Nightly de-weighting groups "
+                    f"per station internally and always applies to every "
+                    f"station; use an OBSERVATORY_RULE layer for per-station "
+                    f"sigmas."
+                )
+            if not math.isfinite(self.max_gap_days) or self.max_gap_days <= 0.0:
+                raise ValueError(
+                    f"NIGHTLY_DEWEIGHTING layer: max_gap_days must be finite "
+                    f"and > 0 (days), got {self.max_gap_days!r}; the "
+                    f"production default is 0.5."
+                )
+        elif self.kind == WeightingLayerKind.OBSERVATORY_RULE:
+            if self.max_gap_days != 0.5:
+                raise ValueError(
+                    f"OBSERVATORY_RULE layer (obs_code={self.obs_code!r}) does "
+                    f"not read max_gap_days (got {self.max_gap_days!r}); use a "
+                    f"NIGHTLY_DEWEIGHTING layer instead."
+                )
+            # obs_code must survive the 4-byte C-ABI field byte-exactly:
+            # matching is exact and case-sensitive engine-side, so a
+            # truncated / trimmed / repaired code would match the wrong
+            # station, or none.
+            if self.obs_code == "":
+                raise ValueError("OBSERVATORY_RULE layer: obs_code must be a non-empty MPC code.")
+            if len(self.obs_code.encode("utf-8", errors="surrogatepass")) > 4:
+                raise ValueError(
+                    f"OBSERVATORY_RULE layer: obs_code {self.obs_code!r} is "
+                    f"longer than the 4-byte MPC station field; matching is "
+                    f"exact — a truncated code would match the wrong station."
+                )
+            if not all(
+                ch.isascii() and ch.isprintable() and not ch.isspace() for ch in self.obs_code
+            ):
+                raise ValueError(
+                    f"OBSERVATORY_RULE layer: obs_code {self.obs_code!r} must "
+                    f"be printable ASCII with no whitespace — MPC station "
+                    f"matching is exact and case-sensitive."
+                )
+            # Defense-in-depth value checks (the engine-side layer-sigma
+            # validation ships separately): a non-finite or non-positive
+            # sigma / scale produces NaN or infinite weights downstream.
+            sigma = tuple(self.sigma)
+            if len(sigma) != 2:
+                raise ValueError(
+                    f"OBSERVATORY_RULE layer (obs_code={self.obs_code!r}): "
+                    f"sigma must be a (ra, dec) pair, got {sigma!r}."
+                )
+            if not all(math.isfinite(s) and s > 0.0 for s in sigma):
+                raise ValueError(
+                    f"OBSERVATORY_RULE layer (obs_code={self.obs_code!r}): "
+                    f"sigma must be finite and > 0 arcsec, got {sigma!r}."
+                )
+            if not math.isfinite(self.scale) or self.scale <= 0.0:
+                raise ValueError(
+                    f"OBSERVATORY_RULE layer (obs_code={self.obs_code!r}): "
+                    f"scale must be finite and > 0, got {self.scale!r}; use "
+                    f"1.0 for no scaling."
+                )
+            for name, value in (
+                ("start_epoch_mjd_tdb", self.start_epoch_mjd_tdb),
+                ("end_epoch_mjd_tdb", self.end_epoch_mjd_tdb),
+            ):
+                if value is not None and not math.isfinite(value):
+                    raise ValueError(
+                        f"OBSERVATORY_RULE layer (obs_code={self.obs_code!r}): "
+                        f"{name} must be a finite MJD TDB or None for "
+                        f"unbounded, got {value!r}."
+                    )
 
 
 def _default_weighting_layers() -> list["WeightingLayer"]:
@@ -307,6 +405,30 @@ class WeightingConfig:
     (production hot path; matches ``scott::od::ODConfig::default()``).
     Set ``enabled=False`` for uniform 1″ weighting; pick a different
     preset or replace ``additional_layers`` for custom pipelines.
+
+    .. warning::
+        Passing ``additional_layers`` **replaces** the default layer
+        list — it does not append to it. The default list is
+        ``[WeightingLayer(kind=WeightingLayerKind.NIGHTLY_DEWEIGHTING,
+        max_gap_days=0.5)]``, the production per-night 1/√N
+        de-weighting; supplying e.g. a single observatory rule
+        therefore drops nightly de-weighting from the production
+        default. To add a rule while keeping production behavior,
+        include the nightly layer explicitly::
+
+            WeightingConfig(
+                additional_layers=[
+                    WeightingLayer(
+                        kind=WeightingLayerKind.OBSERVATORY_RULE,
+                        obs_code="F51",
+                        sigma=(0.1, 0.1),
+                    ),
+                    WeightingLayer(kind=WeightingLayerKind.NIGHTLY_DEWEIGHTING),
+                ],
+            )
+
+        At most one NIGHTLY_DEWEIGHTING layer is accepted per chain
+        (duplicates would compound the 1/√N factor and are rejected).
     """
 
     enabled: bool = True
@@ -318,7 +440,9 @@ class WeightingConfig:
     """Sigma combination policy override. ``None`` = use the
     preset's policy."""
     additional_layers: list[WeightingLayer] = field(default_factory=_default_weighting_layers)
-    """Layers appended to the preset's chain."""
+    """Layers placed ahead of the preset's chain — first-match-wins,
+    so they override preset rules for their stations; the preset is
+    the fallback."""
 
 
 # ── Debiasing (mirrors empyrean::DebiasingConfig) ─────────────
@@ -650,6 +774,19 @@ class ODConfig:
 def _weighting_to_dict(w: WeightingConfig) -> dict[str, WireValue]:
     """Serialize a :class:`WeightingConfig` to the wire dict the
     PyO3 bridge expects."""
+    nightly_indices = [
+        i
+        for i, layer in enumerate(w.additional_layers)
+        if layer.kind == WeightingLayerKind.NIGHTLY_DEWEIGHTING
+    ]
+    if len(nightly_indices) > 1:
+        raise ValueError(
+            f"WeightingConfig.additional_layers contains "
+            f"{len(nightly_indices)} NIGHTLY_DEWEIGHTING layers (at indices "
+            f"{nightly_indices}); each additional pass compounds the "
+            f"per-night 1/sqrt(N) de-weighting multiplicatively — include "
+            f"exactly one."
+        )
     return {
         "enabled": w.enabled,
         "preset": _enum_value(w.preset),
@@ -660,6 +797,15 @@ def _weighting_to_dict(w: WeightingConfig) -> dict[str, WireValue]:
 
 
 def _weighting_layer_to_dict(layer: WeightingLayer) -> dict[str, WireValue]:
+    # Emit only the fields the layer's kind reads: the binding rejects
+    # inapplicable fields loudly (strict per-kind validation), and a
+    # nightly layer must not smuggle inert ObservatoryRule scoping
+    # across the wire.
+    if layer.kind == WeightingLayerKind.NIGHTLY_DEWEIGHTING:
+        return {
+            "kind": _enum_value(layer.kind),
+            "max_gap_days": layer.max_gap_days,
+        }
     return {
         "kind": _enum_value(layer.kind),
         "obs_code": layer.obs_code,
@@ -667,7 +813,6 @@ def _weighting_layer_to_dict(layer: WeightingLayer) -> dict[str, WireValue]:
         "start_epoch_mjd_tdb": layer.start_epoch_mjd_tdb,
         "end_epoch_mjd_tdb": layer.end_epoch_mjd_tdb,
         "scale": layer.scale,
-        "max_gap_days": layer.max_gap_days,
     }
 
 

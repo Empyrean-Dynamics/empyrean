@@ -407,8 +407,15 @@ jobs:
   # because every push to main is the next wheel / cdylib / CLI build
   # users will pull.
   #
-  # Requires `VALIDATION_DISPATCH_TOKEN` — a fine-grained PAT scoped
-  # to the empyrean-validation repo only with `actions: write`.
+  # This and empyrean-core's equivalent are now the ONLY two senders:
+  # the engine repos' `sibling-tag-push` was removed from both sides,
+  # so an engine tag reaches validation when core bumps its pin.
+  #
+  # Requires `VALIDATION_DISPATCH_TOKEN` — a fine-grained PAT scoped to
+  # the empyrean-validation repo only with `Contents: read and write`.
+  # That is the repository_dispatch endpoint's fine-grained
+  # requirement; `actions: write` is the workflow_dispatch endpoint's
+  # and does NOT authorize this call.
   trigger-validation:
     name: Trigger validation suite
     needs: [build-lint, test, c, python]

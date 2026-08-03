@@ -103,3 +103,32 @@ sigma_h, dmu_h = chain.propagate_covariance(cov_0)   # returns (cov, mean-shift)
 ```
 
 `n_params` is 6 for state-only DC, 9 when fitting non-grav A1/A2/A3.
+
+The six rows of `H` — and the six axes of `sigma_h` — are the
+topocentric spherical observable, in this order:
+
+| row | constant                   | observable | unit per input unit |
+|-----|----------------------------|------------|---------------------|
+| 0   | `SENSITIVITY_ROW_RANGE`    | range      | AU                  |
+| 1   | `SENSITIVITY_ROW_RA`       | RA         | deg                 |
+| 2   | `SENSITIVITY_ROW_DEC`      | Dec        | deg                 |
+| 3   | `SENSITIVITY_ROW_VRANGE`   | range rate | AU/day              |
+| 4   | `SENSITIVITY_ROW_VRA`      | RA rate    | deg/day             |
+| 5   | `SENSITIVITY_ROW_VDEC`     | Dec rate   | deg/day             |
+
+Range comes first, so row 0 is *not* RA. Index with the constants
+rather than with literals — a hand-written `0` reads a range partial in
+AU where an RA partial in degrees was meant, and the result is finite
+and plausible-looking either way. To get the sky-plane 2×2 in deg²,
+take the RA/Dec submatrix (multiply the RA row and column by
+$\cos\delta$ if you want it in the RA·cos δ convention that on-sky
+residuals use):
+
+```python
+from empyrean import SENSITIVITY_ROW_DEC, SENSITIVITY_ROW_RA
+
+rows = [SENSITIVITY_ROW_RA, SENSITIVITY_ROW_DEC]
+cov_radec_deg2 = sigma_h[i][rows][:, rows]   # 2×2, deg²
+```
+
+The RA rate is $d\alpha/dt$, not $\dot\alpha\cos\delta$.

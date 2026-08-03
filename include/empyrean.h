@@ -127,6 +127,37 @@ typedef struct Session Session;
 #define EMPYREAN_KERNEL_PROVENANCE_BUILT_IN 2
 
 /**
+ * Row of the range (topocentric distance) partials, in AU per input unit.
+ */
+#define EMPYREAN_SENSITIVITY_ROW_RANGE 0
+
+/**
+ * Row of the right-ascension partials, in degrees per input unit.
+ */
+#define EMPYREAN_SENSITIVITY_ROW_RA 1
+
+/**
+ * Row of the declination partials, in degrees per input unit.
+ */
+#define EMPYREAN_SENSITIVITY_ROW_DEC 2
+
+/**
+ * Row of the range-rate partials, in AU/day per input unit.
+ */
+#define EMPYREAN_SENSITIVITY_ROW_VRANGE 3
+
+/**
+ * Row of the RA-rate partials, in deg/day per input unit. The rate is
+ * dRA/dt, not scaled by cos(Dec).
+ */
+#define EMPYREAN_SENSITIVITY_ROW_VRA 4
+
+/**
+ * Row of the Dec-rate partials, in deg/day per input unit.
+ */
+#define EMPYREAN_SENSITIVITY_ROW_VDEC 5
+
+/**
  * Round-trip time-delay measurement: `delay_seconds` / `rms_delay_microseconds`
  * are valid; the Doppler pair is `f64::NAN`.
  */
@@ -1755,6 +1786,12 @@ struct EmpyreanEphemerisEntry {
  * landing in the velocity columns of the angle rows with fractional
  * error ~ tau/dt (tau ~ 0.006-0.017 d) — negligible for multi-night
  * arcs, growing as the arc shrinks toward intra-night.
+ *
+ * The six output rows are the topocentric spherical observable, in the
+ * order given by the `EMPYREAN_SENSITIVITY_ROW_*` constants. Index with
+ * those rather than by hand — the row order is part of this ABI and the
+ * range row sits ahead of the angles, so a hand-written `0` reads range
+ * where RA was meant.
  */
 struct EmpyreanObservationSensitivity {
     /**
@@ -1780,6 +1817,20 @@ struct EmpyreanObservationSensitivity {
     /**
      * Jacobian ∂(observable)/∂(input), row-major `[6][n_params]` flattened
      * (length `6 * n_params`). Null when this epoch carries no Jacobian.
+     *
+     * Element `(row, col)` is `jacobian[row * n_params + col]`. Columns
+     * `0..6` are the input Cartesian state, in the frame and origin the
+     * `frame` / `origin` fields tag; any further columns are the extra
+     * solved-for parameters `n_params` counts.
+     *
+     * The six rows, in order — see `EMPYREAN_SENSITIVITY_ROW_*`:
+     *
+     * - `0` range, AU per input unit
+     * - `1` RA, deg per input unit
+     * - `2` Dec, deg per input unit
+     * - `3` range rate, AU/day per input unit
+     * - `4` RA rate, deg/day per input unit (dRA/dt, NOT scaled by cos Dec)
+     * - `5` Dec rate, deg/day per input unit
      */
     double *jacobian;
     /**
@@ -1790,6 +1841,11 @@ struct EmpyreanObservationSensitivity {
      * Hessian ∂²(observable)/∂(input)², row-major `[6][n_params][n_params]`
      * flattened (length `6 * n_params * n_params`). Null unless a
      * second-order method (Jet2) ran.
+     *
+     * Leading index is the observable, in the same order and the same
+     * units-per-input-unit as `jacobian` — index it with the same
+     * `EMPYREAN_SENSITIVITY_ROW_*` constants. Element `(row, i, j)` is
+     * `hessian[(row * n_params + i) * n_params + j]`.
      */
     double *hessian;
     /**

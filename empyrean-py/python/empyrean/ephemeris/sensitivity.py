@@ -10,7 +10,9 @@ Two flat quivr Tables, one row per ``(orbit, epoch)`` (or
   optional Hessian) at each ephemeris epoch. ``n_params`` column
   documents the inner shape (6 for state-only DC, 9 with non-grav);
   ``jacobian`` / ``hessian`` are variable-length flattened lists
-  (length ``6·n_params`` / ``6·n_params²``).
+  (length ``6·n_params`` / ``6·n_params²``). Their leading axis is the
+  observable — range, RA, Dec, and their rates, in that order; index it
+  with the ``SENSITIVITY_ROW_*`` constants defined here.
 
 Filter to one chain with the standard quivr pattern before calling
 the per-chain accessors::
@@ -41,6 +43,34 @@ from empyrean.coordinates.epoch import Epochs
 EpochLike = float | str | datetime | Epochs
 """Anything :func:`StateSensitivities.index_at` accepts — a scalar MJD
 TDB, a length-1 :class:`Epochs`, an ISO-8601 string, or a ``datetime``."""
+
+
+# ── Observation-sensitivity row order ─────────────────────────────────
+#
+# Row indices into the observation Jacobian's leading axis, shared by
+# the Hessian. The angles are in degrees and the range in AU, so a
+# wrong row is wrong in unit as well as in observable — reading row 0
+# as RA yields a range partial in AU, which is finite, plausible, and
+# silently wrong. Use these instead of literals.
+
+SENSITIVITY_ROW_RANGE = 0
+"""Row of the range (topocentric distance) partials, in AU per input unit."""
+
+SENSITIVITY_ROW_RA = 1
+"""Row of the right-ascension partials, in degrees per input unit."""
+
+SENSITIVITY_ROW_DEC = 2
+"""Row of the declination partials, in degrees per input unit."""
+
+SENSITIVITY_ROW_VRANGE = 3
+"""Row of the range-rate partials, in AU/day per input unit."""
+
+SENSITIVITY_ROW_VRA = 4
+"""Row of the RA-rate partials, in deg/day per input unit. The rate is
+dRA/dt, not scaled by cos(Dec)."""
+
+SENSITIVITY_ROW_VDEC = 5
+"""Row of the Dec-rate partials, in deg/day per input unit."""
 
 
 # ── State-space sensitivity ───────────────────────────────────────────
@@ -301,7 +331,34 @@ class ObservationSensitivities(qv.Table):
     The ``n_params`` column documents which: ``6`` for a state-only DC,
     ``9`` when non-gravitational parameters (A1, A2, A3) are also free
     variables. All rows within a single chain share the same
-    ``n_params``.
+    ``n_params``. Columns ``0:6`` are the input Cartesian state; any
+    further columns are the extra solved-for parameters.
+
+    The leading axis — of both the Jacobian and the Hessian — is the
+    topocentric spherical observable, in this order:
+
+    ==== ============================ ============ ====================
+    row  constant                     observable   unit per input unit
+    ==== ============================ ============ ====================
+    0    ``SENSITIVITY_ROW_RANGE``    range        AU
+    1    ``SENSITIVITY_ROW_RA``       RA           deg
+    2    ``SENSITIVITY_ROW_DEC``      Dec          deg
+    3    ``SENSITIVITY_ROW_VRANGE``   range rate   AU/day
+    4    ``SENSITIVITY_ROW_VRA``      RA rate      deg/day
+    5    ``SENSITIVITY_ROW_VDEC``     Dec rate     deg/day
+    ==== ============================ ============ ====================
+
+    The RA rate is dRA/dt, **not** scaled by cos(Dec). Projecting an
+    input covariance onto the sky plane therefore contracts rows 1 and
+    2; row 0 is range, and reading it as RA gives a number in the wrong
+    observable and the wrong unit. Index with the module-level
+    ``SENSITIVITY_ROW_*`` constants rather than with literals::
+
+        from empyrean import SENSITIVITY_ROW_DEC, SENSITIVITY_ROW_RA
+
+        J = chain.jacobians_array()[chain.index_at(60750.0)]
+        h_ra = J[SENSITIVITY_ROW_RA, :6]
+        h_dec = J[SENSITIVITY_ROW_DEC, :6]
     """
 
     orbit_id = qv.LargeStringColumn()
@@ -338,7 +395,10 @@ class ObservationSensitivities(qv.Table):
     def jacobians_array(self) -> np.ndarray | None:
         """Reshape ``jacobian`` to ``(n_t, 6, n_params)``.
 
-        Returns ``None`` when every row has a null Jacobian.
+        Axis 1 is the observable, in ``SENSITIVITY_ROW_*`` order
+        (range, RA, Dec, and their rates); axis 2 is the input
+        parameter, state first. Returns ``None`` when every row has a
+        null Jacobian.
         """
         _require_single_obs_chain(self, "jacobians_array")
         col = self.column("jacobian")
@@ -358,7 +418,9 @@ class ObservationSensitivities(qv.Table):
     def hessians_array(self) -> np.ndarray | None:
         """Reshape ``hessian`` to ``(n_t, 6, n_params, n_params)``.
 
-        Returns ``None`` when every row has a null Hessian.
+        Axis 1 is the observable, in the same ``SENSITIVITY_ROW_*``
+        order as :meth:`jacobians_array`. Returns ``None`` when every
+        row has a null Hessian.
         """
         _require_single_obs_chain(self, "hessians_array")
         col = self.column("hessian")
@@ -419,6 +481,12 @@ class ObservationSensitivities(qv.Table):
         Returns ``(Σ_obs, Δμ_obs)`` with shapes:
         ``i=None``: ``(n_t, 6, 6)``, ``(n_t, 6)``
         ``i=int``:  ``(6, 6)``, ``(6,)``
+
+        Both are in the observable basis — the ``SENSITIVITY_ROW_*``
+        order (range, RA, Dec, and their rates), with AU on the range
+        axes and degrees on the angle axes. A sky-plane 2×2 is the
+        ``[SENSITIVITY_ROW_RA, SENSITIVITY_ROW_DEC]`` submatrix of
+        ``Σ_obs``, in deg², before any cos(Dec) scaling.
         """
         jacs = self.jacobians_array()
         if jacs is None:

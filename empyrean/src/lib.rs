@@ -127,7 +127,11 @@ pub use coordinate::{
     CoordinateState, Frame, Origin, Representation, frame_to_int, int_to_frame, int_to_rep,
     rep_to_int,
 };
-pub use ephemeris::{EphemerisConfig, EphemerisEntry, EphemerisResult, ObservationSensitivity};
+pub use ephemeris::{
+    EphemerisConfig, EphemerisEntry, EphemerisResult, ObservationSensitivity, SENSITIVITY_ROW_DEC,
+    SENSITIVITY_ROW_RA, SENSITIVITY_ROW_RANGE, SENSITIVITY_ROW_VDEC, SENSITIVITY_ROW_VRA,
+    SENSITIVITY_ROW_VRANGE,
+};
 pub use error::{Error, Result};
 pub use impact::{BPlane, ImpactProbability};
 pub use io::{

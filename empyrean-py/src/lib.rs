@@ -2857,7 +2857,10 @@ fn _generate_ephemeris<'py>(
     // ── Observation sensitivities — one row per
     // (orbit, observer, epoch). jacobian/hessian are row-major-flattened
     // (6×n_params / 6×n_params²); hessian is None unless a second-order
-    // method ran. Empty on the f64-only path. ──
+    // method ran. Empty on the f64-only path. The six observable rows
+    // pass through in engine order — range, RA, Dec, and their rates
+    // (empyrean::SENSITIVITY_ROW_*, mirrored on the Python side as
+    // empyrean.SENSITIVITY_ROW_*) — no reorder here. ──
     let ns = eph_result.sensitivity.len();
     let mut s_orbit_id: Vec<String> = Vec::with_capacity(ns);
     let mut s_object_id: Vec<Option<String>> = Vec::with_capacity(ns);

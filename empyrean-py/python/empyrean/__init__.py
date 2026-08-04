@@ -25,6 +25,12 @@ from empyrean.coordinates.transform import transform_coordinates
 from empyrean.ephemeris.generate import generate_ephemeris
 from empyrean.ephemeris.result import Ephemeris, EphemerisConfig, EphemerisResult
 from empyrean.ephemeris.sensitivity import (
+    SENSITIVITY_ROW_DEC,
+    SENSITIVITY_ROW_RA,
+    SENSITIVITY_ROW_RANGE,
+    SENSITIVITY_ROW_VDEC,
+    SENSITIVITY_ROW_VRA,
+    SENSITIVITY_ROW_VRANGE,
     ObservationSensitivities,
     StateSensitivities,
 )

@@ -19,6 +19,45 @@ use crate::propagate::{
 };
 use crate::{EmpyreanContext, set_last_error};
 
+// ────────────────────────────────────────────────────────────────────
+// Observation-sensitivity row order
+// ────────────────────────────────────────────────────────────────────
+//
+// Row indices into the `[6][n_params]` Jacobian and the
+// `[6][n_params][n_params]` Hessian on
+// [`EmpyreanObservationSensitivity`]. Both carry the same six output
+// rows in the same order.
+//
+// The angles arrive in degrees and the range in AU, so a wrong row is
+// wrong in unit as well as in observable — reading row 0 as RA yields a
+// range partial in AU, which is finite, plausible, and silently wrong.
+// These constants exist so no caller has to remember that.
+//
+// They are a caller-side contract: this crate marshals the Jacobian as
+// an opaque block and never indexes it by observable, so each one is
+// `dead_code` on the Rust side while being exactly what the generated C
+// header is for.
+
+/// Row of the range (topocentric distance) partials, in AU per input unit.
+#[allow(dead_code)]
+pub const EMPYREAN_SENSITIVITY_ROW_RANGE: usize = 0;
+/// Row of the right-ascension partials, in degrees per input unit.
+#[allow(dead_code)]
+pub const EMPYREAN_SENSITIVITY_ROW_RA: usize = 1;
+/// Row of the declination partials, in degrees per input unit.
+#[allow(dead_code)]
+pub const EMPYREAN_SENSITIVITY_ROW_DEC: usize = 2;
+/// Row of the range-rate partials, in AU/day per input unit.
+#[allow(dead_code)]
+pub const EMPYREAN_SENSITIVITY_ROW_VRANGE: usize = 3;
+/// Row of the RA-rate partials, in deg/day per input unit. The rate is
+/// dRA/dt, not scaled by cos(Dec).
+#[allow(dead_code)]
+pub const EMPYREAN_SENSITIVITY_ROW_VRA: usize = 4;
+/// Row of the Dec-rate partials, in deg/day per input unit.
+#[allow(dead_code)]
+pub const EMPYREAN_SENSITIVITY_ROW_VDEC: usize = 5;
+
 // ── C-compatible types ──────────────────────────────────────
 
 /// A single predicted ephemeris entry.
@@ -104,6 +143,12 @@ pub struct EmpyreanEphemerisEntry {
 /// landing in the velocity columns of the angle rows with fractional
 /// error ~ tau/dt (tau ~ 0.006-0.017 d) — negligible for multi-night
 /// arcs, growing as the arc shrinks toward intra-night.
+///
+/// The six output rows are the topocentric spherical observable, in the
+/// order given by the `EMPYREAN_SENSITIVITY_ROW_*` constants. Index with
+/// those rather than by hand — the row order is part of this ABI and the
+/// range row sits ahead of the angles, so a hand-written `0` reads range
+/// where RA was meant.
 #[repr(C)]
 pub struct EmpyreanObservationSensitivity {
     /// Orbit identifier. Owning C string.
@@ -118,12 +163,31 @@ pub struct EmpyreanObservationSensitivity {
     pub n_params: u8,
     /// Jacobian ∂(observable)/∂(input), row-major `[6][n_params]` flattened
     /// (length `6 * n_params`). Null when this epoch carries no Jacobian.
+    ///
+    /// Element `(row, col)` is `jacobian[row * n_params + col]`. Columns
+    /// `0..6` are the input Cartesian state, in the frame and origin the
+    /// `frame` / `origin` fields tag; any further columns are the extra
+    /// solved-for parameters `n_params` counts.
+    ///
+    /// The six rows, in order — see `EMPYREAN_SENSITIVITY_ROW_*`:
+    ///
+    /// - `0` range, AU per input unit
+    /// - `1` RA, deg per input unit
+    /// - `2` Dec, deg per input unit
+    /// - `3` range rate, AU/day per input unit
+    /// - `4` RA rate, deg/day per input unit (dRA/dt, NOT scaled by cos Dec)
+    /// - `5` Dec rate, deg/day per input unit
     pub jacobian: *mut f64,
     /// Length of `jacobian` (`6 * n_params`), 0 when null.
     pub jacobian_len: usize,
     /// Hessian ∂²(observable)/∂(input)², row-major `[6][n_params][n_params]`
     /// flattened (length `6 * n_params * n_params`). Null unless a
     /// second-order method (Jet2) ran.
+    ///
+    /// Leading index is the observable, in the same order and the same
+    /// units-per-input-unit as `jacobian` — index it with the same
+    /// `EMPYREAN_SENSITIVITY_ROW_*` constants. Element `(row, i, j)` is
+    /// `hessian[(row * n_params + i) * n_params + j]`.
     pub hessian: *mut f64,
     /// Length of `hessian` (`6 * n_params²`), 0 when null.
     pub hessian_len: usize,
@@ -811,5 +875,66 @@ mod tests {
         let observers =
             build_observers_from_c(&[observer_with_code(*b"W68\0")]).expect("3-byte code");
         assert_eq!(observers[0].code, *b"W68");
+    }
+}
+
+#[cfg(test)]
+mod sensitivity_row_tests {
+    use super::*;
+
+    const HEADER: &str = include_str!("../../include/empyrean.h");
+
+    /// Value of a `#define NAME <int>` in the generated header.
+    fn header_define(name: &str) -> Option<usize> {
+        HEADER.lines().find_map(|line| {
+            let rest = line.strip_prefix("#define ")?;
+            let (defined, value) = rest.split_once(' ')?;
+            (defined == name).then(|| value.trim().parse().ok())?
+        })
+    }
+
+    /// The row order is an ABI contract, so the values are pinned rather
+    /// than merely self-consistent: a reorder here is a breaking change
+    /// for every compiled consumer, and must be seen as one.
+    #[test]
+    fn row_constants_have_their_abi_values() {
+        assert_eq!(EMPYREAN_SENSITIVITY_ROW_RANGE, 0);
+        assert_eq!(EMPYREAN_SENSITIVITY_ROW_RA, 1);
+        assert_eq!(EMPYREAN_SENSITIVITY_ROW_DEC, 2);
+        assert_eq!(EMPYREAN_SENSITIVITY_ROW_VRANGE, 3);
+        assert_eq!(EMPYREAN_SENSITIVITY_ROW_VRA, 4);
+        assert_eq!(EMPYREAN_SENSITIVITY_ROW_VDEC, 5);
+    }
+
+    /// The checked-in header is what C consumers actually compile
+    /// against. cbindgen regenerates it from this file on build, so a
+    /// stale committed header — the case where the Rust side moved and
+    /// the shipped contract did not — shows up here.
+    #[test]
+    fn the_shipped_header_agrees_with_the_rust_constants() {
+        for (name, want) in [
+            (
+                "EMPYREAN_SENSITIVITY_ROW_RANGE",
+                EMPYREAN_SENSITIVITY_ROW_RANGE,
+            ),
+            ("EMPYREAN_SENSITIVITY_ROW_RA", EMPYREAN_SENSITIVITY_ROW_RA),
+            ("EMPYREAN_SENSITIVITY_ROW_DEC", EMPYREAN_SENSITIVITY_ROW_DEC),
+            (
+                "EMPYREAN_SENSITIVITY_ROW_VRANGE",
+                EMPYREAN_SENSITIVITY_ROW_VRANGE,
+            ),
+            ("EMPYREAN_SENSITIVITY_ROW_VRA", EMPYREAN_SENSITIVITY_ROW_VRA),
+            (
+                "EMPYREAN_SENSITIVITY_ROW_VDEC",
+                EMPYREAN_SENSITIVITY_ROW_VDEC,
+            ),
+        ] {
+            let got = header_define(name)
+                .unwrap_or_else(|| panic!("{name} is missing from include/empyrean.h"));
+            assert_eq!(
+                got, want,
+                "{name} disagrees between the header and the source"
+            );
+        }
     }
 }

@@ -109,9 +109,40 @@ impl EphemerisEntry {
     }
 }
 
+// ────────────────────────────────────────────────────────────────────
+// Observation-sensitivity row order
+// ────────────────────────────────────────────────────────────────────
+//
+// Row indices into [`ObservationSensitivity::jacobian`] and
+// [`ObservationSensitivity::hessian`]; both carry the same six output
+// rows in the same order.
+//
+// The angles are in degrees and the range in AU, so a wrong row is
+// wrong in unit as well as in observable — reading row 0 as RA yields a
+// range partial in AU, which is finite, plausible, and silently wrong.
+// Use these instead of literals.
+
+/// Row of the range (topocentric distance) partials, in AU per input unit.
+pub const SENSITIVITY_ROW_RANGE: usize = 0;
+/// Row of the right-ascension partials, in degrees per input unit.
+pub const SENSITIVITY_ROW_RA: usize = 1;
+/// Row of the declination partials, in degrees per input unit.
+pub const SENSITIVITY_ROW_DEC: usize = 2;
+/// Row of the range-rate partials, in AU/day per input unit.
+pub const SENSITIVITY_ROW_VRANGE: usize = 3;
+/// Row of the RA-rate partials, in deg/day per input unit. The rate is
+/// dRA/dt, not scaled by cos(Dec).
+pub const SENSITIVITY_ROW_VRA: usize = 4;
+/// Row of the Dec-rate partials, in deg/day per input unit.
+pub const SENSITIVITY_ROW_VDEC: usize = 5;
+
 /// Observation-sensitivity row: the partial derivatives of the sky-plane
 /// observable w.r.t. the input state, for one `(orbit, observer, epoch)`.
 /// Produced when the ephemeris uncertainty method traced the STM.
+///
+/// The six output rows are the topocentric spherical observable, in the
+/// order given by the `SENSITIVITY_ROW_*` constants — see
+/// [`jacobian`](Self::jacobian).
 ///
 /// The Jacobian composes ∂(obs)/∂(state at t_obs) · Φ(t_obs, t₀) and
 /// omits the light-time terms: the −v·∂τ/∂x partial, and the STM is
@@ -133,9 +164,36 @@ pub struct ObservationSensitivity {
     pub n_params: u8,
     /// Jacobian ∂(observable)/∂(input), row-major `[6][n_params]` flattened.
     /// Empty when this epoch carries no Jacobian.
+    ///
+    /// Element `(row, col)` is `jacobian[row * n_params as usize + col]`.
+    /// Columns `0..6` are the input Cartesian state, in the frame and
+    /// origin the [`frame`](Self::frame) / [`origin`](Self::origin)
+    /// fields tag; any further columns are the extra solved-for
+    /// parameters [`n_params`](Self::n_params) counts.
+    ///
+    /// The six rows, in order:
+    ///
+    /// | row | constant                                  | observable | unit per input unit |
+    /// |-----|-------------------------------------------|------------|---------------------|
+    /// | 0   | [`SENSITIVITY_ROW_RANGE`]                  | range      | AU                  |
+    /// | 1   | [`SENSITIVITY_ROW_RA`]                     | RA         | deg                 |
+    /// | 2   | [`SENSITIVITY_ROW_DEC`]                    | Dec        | deg                 |
+    /// | 3   | [`SENSITIVITY_ROW_VRANGE`]                 | range rate | AU/day              |
+    /// | 4   | [`SENSITIVITY_ROW_VRA`]                    | RA rate    | deg/day             |
+    /// | 5   | [`SENSITIVITY_ROW_VDEC`]                   | Dec rate   | deg/day             |
+    ///
+    /// The RA rate is dRA/dt, **not** scaled by cos(Dec). Projecting an
+    /// input covariance onto the sky plane therefore means contracting
+    /// rows 1 and 2 — row 0 is range, and reading it as RA yields a
+    /// number in the wrong observable and the wrong unit.
     pub jacobian: Vec<f64>,
     /// Hessian ∂²(observable)/∂(input)², row-major `[6][n_params][n_params]`
     /// flattened. Empty unless a second-order method ran.
+    ///
+    /// Leading index is the observable, in the same order and the same
+    /// units-per-input-unit as [`jacobian`](Self::jacobian) — index it
+    /// with the same `SENSITIVITY_ROW_*` constants. Element `(row, i, j)`
+    /// is `hessian[(row * np + i) * np + j]` with `np = n_params as usize`.
     pub hessian: Vec<f64>,
     /// Frame of the input axis (Frame enum as int).
     pub frame: i32,
@@ -416,6 +474,38 @@ pub(crate) fn marshal_ephemeris_result(
 mod tests {
     use super::*;
     use crate::observers::Observer;
+
+    /// The row order is a contract shared with the C ABI, so the values
+    /// are pinned rather than merely self-consistent: rotating them
+    /// silently re-points every consumer's index at a different
+    /// observable, in a different unit (empyrean-9666l).
+    #[test]
+    fn sensitivity_row_constants_have_their_contract_values() {
+        assert_eq!(SENSITIVITY_ROW_RANGE, 0);
+        assert_eq!(SENSITIVITY_ROW_RA, 1);
+        assert_eq!(SENSITIVITY_ROW_DEC, 2);
+        assert_eq!(SENSITIVITY_ROW_VRANGE, 3);
+        assert_eq!(SENSITIVITY_ROW_VRA, 4);
+        assert_eq!(SENSITIVITY_ROW_VDEC, 5);
+    }
+
+    /// Every row of the `[6][n_params]` Jacobian is addressable, and the
+    /// six constants address six distinct rows — a duplicate or an
+    /// out-of-range index would slice the wrong observable rather than
+    /// fail.
+    #[test]
+    fn sensitivity_row_constants_cover_all_six_rows() {
+        let mut rows = [
+            SENSITIVITY_ROW_RANGE,
+            SENSITIVITY_ROW_RA,
+            SENSITIVITY_ROW_DEC,
+            SENSITIVITY_ROW_VRANGE,
+            SENSITIVITY_ROW_VRA,
+            SENSITIVITY_ROW_VDEC,
+        ];
+        rows.sort_unstable();
+        assert_eq!(rows, [0, 1, 2, 3, 4, 5]);
+    }
 
     /// A 4-character observatory code must be a loud error at the FFI
     /// boundary: clipped to 3 bytes it would silently alias a different

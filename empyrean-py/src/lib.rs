@@ -668,7 +668,10 @@ fn _query_radar<'py>(
 /// so every distribution channel maps the same tag to the same method with
 /// the same per-variant parameters: `SIGMA_POINT` (2) carries
 /// `sigma_n_sigma` / `sigma_samples_per_plane`, `MONTE_CARLO` (3) carries
-/// `mc_n_samples` / `mc_seed`, and `GAUSSIAN_MIXTURE` (5) carries
+/// `mc_n_samples` / `mc_seed`, `AUTO` (4) carries
+/// `auto_threshold_first` / `auto_threshold_mixture` /
+/// `auto_threshold_ip_skip` / `auto_gmm_max_depth` /
+/// `auto_gmm_components_per_split`, and `GAUSSIAN_MIXTURE` (5) carries
 /// `gm_threshold` / `gm_max_depth` / `gm_components_per_split`. An unknown
 /// tag is a typed `ValueError` naming the supported set — never a silent
 /// downgrade to a different method.
@@ -682,6 +685,11 @@ fn build_uncertainty_method(
     gm_threshold: f64,
     gm_max_depth: usize,
     gm_components_per_split: usize,
+    auto_threshold_first: f64,
+    auto_threshold_mixture: f64,
+    auto_threshold_ip_skip: f64,
+    auto_gmm_max_depth: usize,
+    auto_gmm_components_per_split: usize,
 ) -> PyResult<empyrean::UncertaintyMethod> {
     match tag {
         0 => Ok(empyrean::UncertaintyMethod::FirstOrder),
@@ -694,7 +702,18 @@ fn build_uncertainty_method(
             n_samples: mc_n_samples,
             seed: mc_seed,
         }),
-        4 => Ok(empyrean::UncertaintyMethod::auto()),
+        // AUTO carries its five caller-tunable knobs so a parameterized
+        // `Auto(...)` from Python takes effect instead of silently
+        // collapsing to `auto()`'s engine defaults. A default-constructed
+        // `Auto()` lowers to exactly the `auto()` values, so the common
+        // case is unchanged.
+        4 => Ok(empyrean::UncertaintyMethod::Auto {
+            threshold_first: auto_threshold_first,
+            threshold_mixture: auto_threshold_mixture,
+            threshold_ip_skip: auto_threshold_ip_skip,
+            gmm_max_depth: auto_gmm_max_depth,
+            gmm_components_per_split: auto_gmm_components_per_split,
+        }),
         5 => Ok(empyrean::UncertaintyMethod::Mixture {
             threshold: gm_threshold,
             max_depth: gm_max_depth,
@@ -782,6 +801,11 @@ fn build_uncertainty_method(
     sigma_samples_per_plane = 8,
     mc_n_samples = 1000,
     mc_seed = None,
+    auto_threshold_first = 0.1,
+    auto_threshold_mixture = 10.0,
+    auto_threshold_ip_skip = 1e-12,
+    auto_gmm_max_depth = 3,
+    auto_gmm_components_per_split = 3,
     propagation_config_dict = None,
     with_tagged_covariance = false,
     builtsystem = None,
@@ -849,6 +873,15 @@ fn _propagate<'py>(
     sigma_samples_per_plane: usize,
     mc_n_samples: usize,
     mc_seed: Option<u64>,
+    // AUTO's five caller-tunable knobs. A default-constructed `Auto()`
+    // lowers to these engine defaults, so the common path is unchanged;
+    // a parameterized `Auto(...)` threads its thresholds through instead
+    // of silently collapsing to `auto()` defaults.
+    auto_threshold_first: f64,
+    auto_threshold_mixture: f64,
+    auto_threshold_ip_skip: f64,
+    auto_gmm_max_depth: usize,
+    auto_gmm_components_per_split: usize,
     propagation_config_dict: Option<&Bound<'py, PyDict>>,
     // Opt-in: also fill provenance-tagged resolved-kind covariance
     // readback arrays (aligned 1:1 with `states`) into the result dict.
@@ -1040,6 +1073,11 @@ fn _propagate<'py>(
         gm_threshold,
         gm_max_depth,
         gm_components_per_split,
+        auto_threshold_first,
+        auto_threshold_mixture,
+        auto_threshold_ip_skip,
+        auto_gmm_max_depth,
+        auto_gmm_components_per_split,
     )?;
 
     let mut config = empyrean::PropagationConfig {
@@ -1920,6 +1958,17 @@ fn methods_from_flat(
             gm_threshold[i],
             gm_max_depth[i],
             gm_components_per_split[i],
+            // The per-orbit batch surface exposes no per-orbit AUTO
+            // threshold columns, so a tag-4 orbit here resolves to the
+            // engine-default Auto — identical to `auto()` — exactly as it
+            // did before AUTO gained tunable knobs. The single-orbit
+            // `_propagate` / `_generate_ephemeris` paths carry the tuned
+            // values.
+            0.1,
+            10.0,
+            1e-12,
+            3,
+            3,
         )?);
     }
     Ok(out)
@@ -2513,6 +2562,11 @@ fn _get_observers<'py>(
     sigma_samples_per_plane = 8,
     mc_n_samples = 1000,
     mc_seed = None,
+    auto_threshold_first = 0.1,
+    auto_threshold_mixture = 10.0,
+    auto_threshold_ip_skip = 1e-12,
+    auto_gmm_max_depth = 3,
+    auto_gmm_components_per_split = 3,
     ephemeris_config_dict = None,
     builtsystem = None,
 ))]
@@ -2569,6 +2623,15 @@ fn _generate_ephemeris<'py>(
     sigma_samples_per_plane: usize,
     mc_n_samples: usize,
     mc_seed: Option<u64>,
+    // AUTO's five caller-tunable knobs (see `_propagate`). A
+    // default-constructed `Auto()` lowers to these engine defaults; a
+    // parameterized `Auto(...)` threads its thresholds through instead of
+    // collapsing to `auto()` defaults.
+    auto_threshold_first: f64,
+    auto_threshold_mixture: f64,
+    auto_threshold_ip_skip: f64,
+    auto_gmm_max_depth: usize,
+    auto_gmm_components_per_split: usize,
     ephemeris_config_dict: Option<&Bound<'py, PyDict>>,
     // Optional reusable pre-built force-model handle (see `_propagate`).
     // The ephemeris pipeline integrates in EclipticJ2000, so an
@@ -2803,6 +2866,11 @@ fn _generate_ephemeris<'py>(
         gm_threshold,
         gm_max_depth,
         gm_components_per_split,
+        auto_threshold_first,
+        auto_threshold_mixture,
+        auto_threshold_ip_skip,
+        auto_gmm_max_depth,
+        auto_gmm_components_per_split,
     )?;
     // Sampling methods cannot be honored on the ephemeris path: villeneuve
     // derives the sky-plane covariance from a first-order STM projection

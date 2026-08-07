@@ -111,7 +111,13 @@ class Periapses(qv.Table):
 
 
 class Impacts(qv.Table):
-    """Nominal impact events (body surface intersection)."""
+    """Nominal impact events (body surface intersection).
+
+    ``relative_velocity_au_day`` is the body-relative impact speed carried
+    through the flat C-ABI event surface (mirroring
+    :class:`AtmosphericEntries`); it is null on any impact row the engine
+    did not resolve a relative velocity for, never a defaulted zero.
+    """
 
     orbit_id = qv.LargeStringColumn()
     object_id = qv.LargeStringColumn(nullable=True)
@@ -120,6 +126,7 @@ class Impacts(qv.Table):
     latitude_deg = qv.Float64Column(nullable=True)
     longitude_deg = qv.Float64Column(nullable=True)
     altitude_km = qv.Float64Column(nullable=True)
+    relative_velocity_au_day = qv.Float64Column(nullable=True)
 
 
 # ── Possible impacts ────────────────────────────────────────

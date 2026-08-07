@@ -489,9 +489,10 @@ pub fn default_data_dir() -> Result<std::path::PathBuf> {
 /// directory loads with no further downloads. Safe to call concurrently —
 /// construction is serialized internally.
 ///
-/// This drives provisioning by briefly building (and discarding) a full
-/// Standard-tier context, so it loads the kernel set into memory once. A
-/// lightweight download-only path is a planned follow-up.
+/// Provisions through the engine's download-only path
+/// (`empyrean_download_data`): the kernel set is downloaded and cached, but no
+/// context is built or loaded, so this does not pay for a full Standard-tier
+/// context assembly it would immediately discard.
 ///
 /// ```no_run
 /// # fn main() -> Result<(), empyrean::Error> {
@@ -501,10 +502,28 @@ pub fn default_data_dir() -> Result<std::path::PathBuf> {
 /// # }
 /// ```
 pub fn download_data(data_dir: Option<&Path>) -> Result<PathBuf> {
-    // The engine downloads any missing kernels as part of building a
-    // Standard-tier context. Build one to drive provisioning, then discard it
-    // and return the resolved directory.
-    let _ctx = Context::from_data_dir(data_dir)?;
+    // Provision without building a context: the C ABI's
+    // `empyrean_download_data` runs the engine's download-and-cache pass and
+    // stops at the resolved kernel paths — no ephemeris load, no context to
+    // discard.
+    let c_path = match data_dir {
+        Some(d) => Some(path_to_cstring(d)?),
+        None => None,
+    };
+    let raw_path = c_path
+        .as_ref()
+        .map(|c| c.as_ptr())
+        .unwrap_or(std::ptr::null());
+    let code = unsafe { empyrean_sys::empyrean_download_data(raw_path) };
+    if code != 0 {
+        let mut err = Error::capture(code);
+        err.message = dedupe_io_prefix(&err.message);
+        // A strict-offline-style missing-data shortfall carries a structured
+        // file list; keep it (not just the rendered message) as the other
+        // data-dir entry points do.
+        err.missing_data_files = drain_missing_data_files();
+        return Err(augment_construction_error(err, data_dir));
+    }
     match data_dir {
         Some(d) => Ok(d.to_path_buf()),
         None => default_data_dir(),

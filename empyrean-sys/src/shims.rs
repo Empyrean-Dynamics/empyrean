@@ -111,6 +111,37 @@ pub unsafe fn empyrean_context_from_data_dir_with(
 ) -> *mut EmpyreanContext {
     unsafe { lib().empyrean_context_from_data_dir_with(data_dir, options) }
 }
+/** Provision the complete Standard-tier kernel set into `data_dir`
+**without building a context**.
+
+Runs the same download-and-cache pass
+[`empyrean_context_from_data_dir`] performs, but stops at the resolved
+kernel paths: nothing is loaded or parsed, and no `EmpyreanContext` is
+allocated. This is the cheap provisioning primitive behind the
+wrapper's `download_data` — it exists so a caller that only wants to
+warm a data directory does not pay for a full Standard-tier context
+build (and discard). After it returns `0`, a later
+[`empyrean_context_from_data_dir`] over the same directory loads with
+no further downloads.
+
+Pass `NULL` for `data_dir` to provision the platform data directory
+(`~/.local/share/empyrean/data` on Linux, `~/Library/Application
+Support/empyrean/data` on macOS).
+
+Always reaches the network when a kernel is missing or its upstream
+copy moved (the refreshing path); on a warm, complete directory it
+issues only the staleness checks and downloads nothing.
+
+Returns `0` on success. On failure returns the engine error code —
+`-2` when a required resource could not be obtained, with the
+structured file list available through
+[`empyrean_missing_data_files`]; `-1` for a non-UTF-8 `data_dir` or
+another invalid argument; `-99` on a caught panic. Call
+`empyrean_last_error()` for the message on any non-zero return.*/
+#[inline]
+pub unsafe fn empyrean_download_data(data_dir: *const ::std::os::raw::c_char) -> i32 {
+    unsafe { lib().empyrean_download_data(data_dir) }
+}
 /** Retrieve the structured file list from the most recent
 missing-data-files failure on this thread.
 

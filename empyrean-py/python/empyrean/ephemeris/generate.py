@@ -25,6 +25,7 @@ from empyrean.propagation.config import (
     _DATACLASS_TO_INT,
     _FORCE_MODEL_TO_INT,
     _UNCERTAINTY_METHOD_TO_INT,
+    Auto,
     ForceModelTier,
     GaussianMixture,
     MonteCarlo,
@@ -35,7 +36,7 @@ from empyrean.propagation.config import (
 )
 
 FloatArray = np.ndarray[Any, np.dtype[np.float64]]
-UncertaintyMethodLike = UncertaintyMethod | SigmaPoint | MonteCarlo | GaussianMixture | str
+UncertaintyMethodLike = UncertaintyMethod | SigmaPoint | MonteCarlo | GaussianMixture | Auto | str
 
 
 def generate_ephemeris(
@@ -286,9 +287,14 @@ def generate_ephemeris(
         gm_threshold,
         gm_max_depth,
         gm_components_per_split,
+        auto_threshold_first,
+        auto_threshold_mixture,
+        auto_threshold_ip_skip,
+        auto_gmm_max_depth,
+        auto_gmm_components_per_split,
     ) = _uncertainty_method_params(uncertainty_method)
 
-    if isinstance(uncertainty_method, (SigmaPoint, MonteCarlo, GaussianMixture)):
+    if isinstance(uncertainty_method, (SigmaPoint, MonteCarlo, GaussianMixture, Auto)):
         um_int = _DATACLASS_TO_INT[type(uncertainty_method)]
     elif isinstance(uncertainty_method, str):
         um_lookup = _UNCERTAINTY_METHOD_TO_INT.get(uncertainty_method.lower())
@@ -302,7 +308,7 @@ def generate_ephemeris(
     else:
         raise TypeError(
             "uncertainty_method must be UncertaintyMethod, a SigmaPoint / "
-            "MonteCarlo / GaussianMixture dataclass, str, or int; got "
+            "MonteCarlo / GaussianMixture / Auto dataclass, str, or int; got "
             f"{type(uncertainty_method).__name__}"
         )
 
@@ -343,6 +349,14 @@ def generate_ephemeris(
         sigma_samples_per_plane=sigma_samples_per_plane,
         mc_n_samples=mc_n_samples,
         mc_seed=mc_seed,
+        # AUTO's caller-tunable κ band edges + AGM knobs, threaded like the
+        # other flat method params so a parameterized Auto(...) takes
+        # effect rather than silently collapsing to auto() defaults.
+        auto_threshold_first=auto_threshold_first,
+        auto_threshold_mixture=auto_threshold_mixture,
+        auto_threshold_ip_skip=auto_threshold_ip_skip,
+        auto_gmm_max_depth=auto_gmm_max_depth,
+        auto_gmm_components_per_split=auto_gmm_components_per_split,
         # Thread the full nested EphemerisConfig (which embeds a full
         # PropagationConfig) so light-time iteration limits, diagnostics
         # toggles, integrator advanced knobs, and event-detection

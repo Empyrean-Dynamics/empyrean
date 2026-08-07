@@ -34,6 +34,7 @@ from empyrean.propagation.config import (
     _DATACLASS_TO_INT,
     _FORCE_MODEL_TO_INT,
     _UNCERTAINTY_METHOD_TO_INT,
+    Auto,
     ForceModelTier,
     GaussianMixture,
     MonteCarlo,
@@ -74,7 +75,7 @@ _EventTableT = TypeVar("_EventTableT", bound=qv.Table)
 # sites below. The runtime object is unchanged.
 CartesianCovariance: type[_CovarianceTable] = _CartesianCovariance
 
-UncertaintyMethodLike = UncertaintyMethod | SigmaPoint | MonteCarlo | GaussianMixture | str
+UncertaintyMethodLike = UncertaintyMethod | SigmaPoint | MonteCarlo | GaussianMixture | Auto | str
 
 
 def propagate(
@@ -126,11 +127,13 @@ def propagate(
     force_model : ForceModelTier or str, optional
         Quick override for ``config.force_model``. Ignored if ``config``
         is given.
-    uncertainty_method : UncertaintyMethod | SigmaPoint | MonteCarlo | GaussianMixture | str
+    uncertainty_method : UncertaintyMethod | SigmaPoint | MonteCarlo | GaussianMixture | Auto | str
         Optional quick override for ``config.uncertainty_method``. Accepts either
         an enum / string (default parameters) or a parameterized
         dataclass (:class:`SigmaPoint`, :class:`MonteCarlo`,
-        :class:`GaussianMixture`). Ignored if ``config`` is given.
+        :class:`GaussianMixture`, :class:`Auto`). Ignored if ``config`` is
+        given. Pass :class:`Auto` (rather than the bare ``AUTO`` enum) to
+        tune the per-close-approach κ band edges and AGM knobs.
 
         All six methods run in :func:`propagate`:
 
@@ -411,9 +414,14 @@ def propagate(
         gm_threshold,
         gm_max_depth,
         gm_components_per_split,
+        auto_threshold_first,
+        auto_threshold_mixture,
+        auto_threshold_ip_skip,
+        auto_gmm_max_depth,
+        auto_gmm_components_per_split,
     ) = _uncertainty_method_params(uncertainty_method)
 
-    if isinstance(uncertainty_method, (SigmaPoint, MonteCarlo, GaussianMixture)):
+    if isinstance(uncertainty_method, (SigmaPoint, MonteCarlo, GaussianMixture, Auto)):
         um_int = _DATACLASS_TO_INT[type(uncertainty_method)]
     elif isinstance(uncertainty_method, str):
         um_int_opt = _UNCERTAINTY_METHOD_TO_INT.get(uncertainty_method.lower())
@@ -427,7 +435,7 @@ def propagate(
     else:
         raise TypeError(
             "uncertainty_method must be UncertaintyMethod, a SigmaPoint / "
-            "MonteCarlo / GaussianMixture dataclass, str, or int; got "
+            "MonteCarlo / GaussianMixture / Auto dataclass, str, or int; got "
             f"{type(uncertainty_method).__name__}"
         )
 
@@ -493,6 +501,15 @@ def propagate(
         sigma_samples_per_plane=sigma_samples_per_plane,
         mc_n_samples=mc_n_samples,
         mc_seed=mc_seed,
+        # AUTO's caller-tunable κ band edges + AGM knobs. A
+        # default-constructed Auto() / "auto" lowers to the engine
+        # defaults, so the common path is unchanged; a parameterized
+        # Auto(...) takes effect instead of silently using defaults.
+        auto_threshold_first=auto_threshold_first,
+        auto_threshold_mixture=auto_threshold_mixture,
+        auto_threshold_ip_skip=auto_threshold_ip_skip,
+        auto_gmm_max_depth=auto_gmm_max_depth,
+        auto_gmm_components_per_split=auto_gmm_components_per_split,
         propagation_config_dict=config._to_wire_dict(),
         with_tagged_covariance=tagged_covariance,
         builtsystem=_builtsystem,
@@ -832,6 +849,10 @@ def _build_events(result: dict[str, Any]) -> Events:
             latitude_deg=_nullable_float(_arr(impact_lat, imp_idx)),
             longitude_deg=_nullable_float(_arr(impact_lon, imp_idx)),
             altitude_km=_nullable_float(_arr(impact_alt, imp_idx)),
+            # Body-relative impact speed carried by the flat schema
+            # (same column the periapses / atmospheric entries read);
+            # NaN -> null where the ABI did not resolve a velocity.
+            relative_velocity_au_day=_nullable_float(_arr(rel_v, imp_idx)),
         )
     else:
         impacts = Impacts.empty()
@@ -840,8 +861,14 @@ def _build_events(result: dict[str, Any]) -> Events:
     pi_idx = _idx("possible_impact")
     if pi_idx:
         # PossibleImpact probability payload is wired through the C ABI.
-        # The second-order / AGM / MC probabilities are NaN unless the
-        # matching uncertainty method ran.
+        # ip_second_order / nonlinearity / ip_agm / ip_mc are absent
+        # (NaN on the flat row) unless the matching uncertainty method
+        # ran; they are the nullable columns and marshal to Arrow **null**
+        # — matching compute_impact_probabilities' encoding, so
+        # `row.ip_agm is None` is a true test for "AGM did not run"
+        # rather than a false positive on every row. ip_linear /
+        # effective_radius / sigma_distance are always populated and stay
+        # dense.
         possible_impacts = PossibleImpacts.from_kwargs(
             orbit_id=_str(orbit_ids, pi_idx),
             object_id=_str_opt(object_ids, pi_idx),
@@ -854,10 +881,10 @@ def _build_events(result: dict[str, Any]) -> Events:
             sigma_distance_au=_arr(pi_sigma_distance_au, pi_idx),
             ip_linear=_arr(pi_ip_linear, pi_idx),
             relative_velocity_au_day=_arr(rel_v, pi_idx),
-            ip_second_order=_arr(pi_ip_second_order, pi_idx),
-            nonlinearity=_arr(pi_nonlinearity, pi_idx),
-            ip_agm=_arr(pi_ip_agm, pi_idx),
-            ip_mc=_arr(pi_ip_mc, pi_idx),
+            ip_second_order=_nullable_float(_arr(pi_ip_second_order, pi_idx)),
+            nonlinearity=_nullable_float(_arr(pi_nonlinearity, pi_idx)),
+            ip_agm=_nullable_float(_arr(pi_ip_agm, pi_idx)),
+            ip_mc=_nullable_float(_arr(pi_ip_mc, pi_idx)),
         )
     else:
         possible_impacts = PossibleImpacts.empty()

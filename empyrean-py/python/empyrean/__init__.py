@@ -108,6 +108,7 @@ from empyrean.orbits.thrust import (
 )
 from empyrean.propagation.config import (
     AdvancedIntegratorConfig,
+    Auto,
     DiagnosticsConfig,
     EphemerisOverlapPolicy,
     ForceModelTier,

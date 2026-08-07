@@ -150,27 +150,60 @@ class Epochs(qv.Table):
         return cls.from_kwargs(mjd=np.asarray(mjd), scale=target)
 
     def to_iso(self, scale: ScaleArg | None = None) -> list[str]:
-        """Format epochs as ISO 8601 UTC strings.
+        """Format epochs as ISO 8601 **UTC wall-clock** strings.
+
+        The output is always the UTC wall-clock time of the stored
+        instant, interpreting the stored MJD in the table's own
+        :attr:`scale`. A TDB table therefore comes back as UTC ISO with
+        the TDB→UTC offset applied (≈69 s at 2026 epochs) — **not** the
+        raw TDB clock reading relabelled ``Z``.
 
         Parameters
         ----------
         scale : str or TimeScale, optional
-            Interpret the stored MJD values in this scale before
-            formatting. Defaults to the table's stored scale.
-            Useful for cross-scale formatting (e.g. an MJD TDB table
-            formatted as if it were MJD UTC).
+            Guard only. If given it must equal the table's stored
+            :attr:`scale`; ``to_iso`` does not reinterpret the stored
+            instant in a different scale. A mismatched ``scale`` raises
+            rather than silently relabelling the clock reading. To format
+            the instant *as if* it lived in another scale, convert first —
+            ``epochs.to_scale(x).to_iso()`` (or
+            ``epochs.to_utc().to_iso()`` / ``epochs.to_tdb().to_iso()``),
+            which apply the real leap-second + TDB−TT conversion.
 
         Returns
         -------
         list[str]
             One ISO string per row, always with the trailing ``Z``.
+
+        Raises
+        ------
+        ValueError
+            If ``scale`` is given and differs from the table's stored
+            :attr:`scale`.
         """
         from empyrean._empyrean_rs import _mjd_to_iso
 
-        source = _scale_str(scale) if scale is not None else self.scale
+        # Option A (honest surface): the stored MJD is always interpreted
+        # in the table's own scale, so `to_iso` emits the UTC wall-clock
+        # of the actual instant. A different `scale` used to be forwarded
+        # as a *reinterpretation* of the stored MJD — a silent relabel
+        # worth ~69 s at 2026 epochs — so it is now rejected loudly (no
+        # hidden fallback). `scale == self.scale` (or None) is the correct
+        # path and is preserved.
+        if scale is not None and _scale_str(scale) != self.scale:
+            requested = _scale_str(scale)
+            raise ValueError(
+                f"to_iso() always emits the UTC wall-clock time of the stored "
+                f"instant, interpreting the stored MJD in the table's own scale "
+                f"({self.scale!r}); it will not reinterpret it as {requested!r} "
+                f"(that would relabel the clock reading, a silent ~69 s error at "
+                f"2026 epochs). Convert first, then format: "
+                f".to_scale({requested!r}).to_iso() — or .to_utc().to_iso() / "
+                f".to_tdb().to_iso()."
+            )
         iso_strings: list[str] = _mjd_to_iso(
             np.asarray(self.mjd.to_numpy(zero_copy_only=False), dtype=np.float64),
-            source,
+            self.scale,
         )
         return iso_strings
 

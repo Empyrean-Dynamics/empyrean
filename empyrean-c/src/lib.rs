@@ -575,6 +575,78 @@ pub unsafe extern "C" fn empyrean_context_from_data_dir_with(
     }
 }
 
+/// Provision the complete Standard-tier kernel set into `data_dir`
+/// **without building a context**.
+///
+/// Runs the same download-and-cache pass
+/// [`empyrean_context_from_data_dir`] performs, but stops at the resolved
+/// kernel paths: nothing is loaded or parsed, and no `EmpyreanContext` is
+/// allocated. This is the cheap provisioning primitive behind the
+/// wrapper's `download_data` — it exists so a caller that only wants to
+/// warm a data directory does not pay for a full Standard-tier context
+/// build (and discard). After it returns `0`, a later
+/// [`empyrean_context_from_data_dir`] over the same directory loads with
+/// no further downloads.
+///
+/// Pass `NULL` for `data_dir` to provision the platform data directory
+/// (`~/.local/share/empyrean/data` on Linux, `~/Library/Application
+/// Support/empyrean/data` on macOS).
+///
+/// Always reaches the network when a kernel is missing or its upstream
+/// copy moved (the refreshing path); on a warm, complete directory it
+/// issues only the staleness checks and downloads nothing.
+///
+/// Returns `0` on success. On failure returns the engine error code —
+/// `-2` when a required resource could not be obtained, with the
+/// structured file list available through
+/// [`empyrean_missing_data_files`]; `-1` for a non-UTF-8 `data_dir` or
+/// another invalid argument; `-99` on a caught panic. Call
+/// `empyrean_last_error()` for the message on any non-zero return.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn empyrean_download_data(data_dir: *const c_char) -> i32 {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let dir_buf;
+        let dir_opt: Option<&Path> = if data_dir.is_null() {
+            None
+        } else {
+            let cstr = unsafe { CStr::from_ptr(data_dir) };
+            match cstr.to_str() {
+                Ok(s) => {
+                    dir_buf = std::path::PathBuf::from(s);
+                    Some(dir_buf.as_path())
+                }
+                Err(e) => {
+                    set_last_error(&format!("invalid UTF-8 in data_dir: {e}"));
+                    return -1;
+                }
+            }
+        };
+
+        let outcome = {
+            let _guard = construct_lock();
+            empyrean_core::Context::provision_data(
+                dir_opt,
+                empyrean_core::data::UpstreamForceModelTier::Standard,
+            )
+        };
+        match outcome {
+            Ok(()) => 0,
+            // Keeps the missing-file list, not just its rendering, and
+            // returns the engine's own error code — same contract as
+            // `empyrean_context_from_data_dir_with`.
+            Err(e) => set_last_error_from(&e),
+        }
+    }));
+
+    match result {
+        Ok(code) => code,
+        Err(_) => {
+            set_last_error("panic in empyrean_download_data");
+            -99
+        }
+    }
+}
+
 /// The data files a strict-offline construction found absent.
 ///
 /// Populated by [`empyrean_missing_data_files`]; release it with

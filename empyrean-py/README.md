@@ -169,8 +169,18 @@ if phot is not None and phot.covariance is not None:
 ## Ephemeris
 
 ```python
+from empyrean import Frame, Origin
+
 observers = empyrean.get_observer_states(["W84", "F51"], epochs)
 eph = empyrean.generate_ephemeris(orbits, observers)
+
+# Observer states default to the ICRF / SSB construction basis, which is
+# what ephemeris generation and orbit determination require and which is
+# returned untransformed. Pass frame= / origin= when you want the sites
+# somewhere else — e.g. heliocentric ecliptic, for geometry plots:
+sites = empyrean.get_observer_states(
+    ["W84", "F51"], epochs, frame=Frame.ECLIPTICJ2000, origin=Origin.SUN
+)
 
 print(eph.ephemeris.coordinates.lon.to_numpy())   # RA (degrees)
 print(eph.ephemeris.coordinates.lat.to_numpy())   # Dec (degrees)
@@ -337,6 +347,26 @@ platform data directory (`~/.local/share/empyrean/data/` on Linux,
 
 Any of these can be relocated by pointing `EMPYREAN_DATA_DIR` at a
 directory holding them.
+
+**Running offline**
+
+`empyrean.initialize(refresh=False)` resolves the kernel set from the
+data directory alone — no downloads, no staleness checks. If anything is
+missing it raises `FileNotFoundError` naming *every* absent file, both in
+the message and as a `missing_data_files` list on the exception, so one
+run tells you exactly what to stage. There is no partial load and no
+quiet fall back to a smaller force model.
+
+```python
+try:
+    empyrean.initialize(refresh=False)
+except FileNotFoundError as e:
+    print("stage these first:", e.missing_data_files)
+```
+
+Setting `EMPYREAN_OFFLINE=1` in the environment applies the same policy
+to every `initialize()` in the process and announces itself on stderr. It
+is a floor, not a switch: it can turn network access off, never back on.
 
 ## Accuracy
 

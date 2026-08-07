@@ -195,11 +195,13 @@ if let Some(phot) = &fit.photometry {
 ## Ephemeris
 
 ```rust,no_run
-# use empyrean::{Context, EphemerisConfig, Epoch};
+# use empyrean::{Context, EphemerisConfig, Epoch, Frame, Origin};
 # let ctx = Context::from_data_dir(None)?;
 # let orbits = empyrean::query_sbdb(&["Apophis"], None)?.orbits;
 let epochs = vec![Epoch::from_mjd_tdb(65000.0)];
-let observers = ctx.get_observers(&["W84", "F51"], &epochs)?;
+// ICRF / solar-system barycenter is the construction basis — the one
+// ephemeris generation requires, and the one that takes no transform.
+let observers = ctx.get_observers(&["W84", "F51"], &epochs, Frame::ICRF, Origin::SSB)?;
 let eph = ctx.generate_ephemeris(&orbits, &observers, &EphemerisConfig::default())?;
 
 for entry in &eph.entries {

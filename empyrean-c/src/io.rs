@@ -453,7 +453,11 @@ pub(crate) fn orbits_to_batch(orbits: &Orbits<AU>) -> Result<EmpyreanOrbitBatch,
     }
     for i in 0..n {
         let coord = orbits.coordinates()[i].into_angular::<empyrean_core::coordinates::Degrees>();
-        let cs = coordinates_to_coordinate_state(&coord);
+        // Fallible since the engine stopped panicking on an origin with
+        // no NAIF id (an MPC site code). Surface it — a fabricated
+        // sentinel written into a Parquet/JSON/CSV orbit file would read
+        // back as a different body.
+        let cs = coordinates_to_coordinate_state(&coord).map_err(|e| format!("orbit {i}: {e}"))?;
         let mut orbit = EmpyreanOrbit {
             state: CoordinateState::from_empyrean(&cs),
             // Same as the read path: per-orbit id pointers stay null in

@@ -8,13 +8,13 @@ unavailable, so they document/verify the end-to-end fix without gating
 the offline unit suite in ``test_uncertainty_methods.py``.
 
 The object comes back in the **cometary** representation (SBDB
-convention), which surfaces a distinct, deeper engine limitation
-(bd empyrean-r2dq): villeneuve's sigma-point path silently skips
-non-Cartesian input orbits and leaves a first-order (linear) covariance
-in place. The marshaling fix in this task is correct regardless — it
-threads SIGMA_POINT / MONTE_CARLO through and stops the ephemeris
-silent-ignore — and the genuine sigma-point covariance is verified here
-on a Cartesian orbit derived from the same SBDB record.
+convention), which used to surface a distinct, deeper engine limitation
+(bd empyrean-r2dq): villeneuve's sigma-point path silently skipped
+non-Cartesian input orbits and left a first-order (linear) covariance in
+place. That is fixed engine-side — sigma points are constructed in
+native element space — so the cometary path is now asserted directly
+rather than xfailed. The Cartesian orbit derived from the same SBDB
+record is kept as a second, independent check of the same property.
 """
 
 from __future__ import annotations
@@ -59,8 +59,10 @@ def sbdb_grid(sbdb_orbit) -> np.ndarray:
 @pytest.fixture(scope="module")
 def sbdb_orbit_cartesian(sbdb_orbit, sbdb_grid) -> CartesianOrbits:
     """The same SBDB record as a Cartesian orbit (state + covariance at
-    the epoch), obtained by propagating to its own epoch. Sidesteps the
-    non-Cartesian sigma-point engine limitation (empyrean-r2dq)."""
+    the epoch), obtained by propagating to its own epoch. Originally the
+    workaround for the non-Cartesian sigma-point engine limitation
+    (empyrean-r2dq); retained after the fix as a second representation
+    exercising the same property."""
     t0 = sbdb_grid[0]
     r0 = empyrean.propagate(
         sbdb_orbit, np.array([t0]), uncertainty_method=UncertaintyMethod.FIRST_ORDER
@@ -103,6 +105,32 @@ def test_sbdb_propagate_sampling_methods_do_not_raise(sbdb_orbit, sbdb_grid) -> 
         assert len(res.states) == len(sbdb_grid)
 
 
+def _assert_sigma_point_is_not_linear(res_fo, res_sp) -> None:
+    """Pin that a ``sigma_point``-tagged covariance actually carries
+    resampled values rather than the linear ones under a new label.
+
+    Asserting the tag alone cannot distinguish a working sigma-point path
+    from a mislabelled first-order one — the covariance has to be shown
+    to differ. The correction is genuine but small on a well-determined
+    orbit over a short arc, so this checks the covariance moved at all
+    and stayed finite, without pinning a magnitude that would re-baseline
+    on every engine change.
+    """
+    cov_fo = res_fo.states.coordinates.covariance.to_matrix()
+    cov_sp = res_sp.states.coordinates.covariance.to_matrix()
+    assert cov_fo.shape == cov_sp.shape
+    for i in range(cov_fo.shape[0]):
+        a, b = cov_fo[i], cov_sp[i]
+        assert np.all(np.isfinite(b)), f"sigma-point covariance not finite at epoch {i}"
+        assert np.all(np.diag(b) > 0.0), (
+            f"sigma-point covariance has a non-positive variance at epoch {i}"
+        )
+        assert not np.array_equal(a, b), (
+            f"sigma-point covariance is bit-identical to the first-order one at "
+            f"epoch {i} — tagged 'sigma_point' but never resampled (empyrean-r2dq)"
+        )
+
+
 def test_sbdb_cartesian_sigma_point_is_genuine(sbdb_orbit_cartesian, sbdb_grid) -> None:
     """On a Cartesian orbit derived from the SBDB record, SIGMA_POINT
     produces a genuine, provenance-tagged sample covariance distinct from
@@ -121,6 +149,7 @@ def test_sbdb_cartesian_sigma_point_is_genuine(sbdb_orbit_cartesian, sbdb_grid) 
     )
     assert set(res_sp.tagged_covariance.kind.to_pylist()) == {"sigma_point"}
     assert set(res_fo.tagged_covariance.kind.to_pylist()) == {"linear"}
+    _assert_sigma_point_is_not_linear(res_fo, res_sp)
 
 
 def test_agm_impact_probability_fires_and_labels_correctly() -> None:
@@ -196,20 +225,27 @@ def test_agm_impact_probability_fires_and_labels_correctly() -> None:
     assert np.isfinite(gm["ip_linear"])
 
 
-@pytest.mark.xfail(
-    reason="empyrean-r2dq: villeneuve sigma-point silently skips non-Cartesian "
-    "(cometary) input orbits and leaves a linear covariance in place",
-    strict=True,
-)
 def test_sbdb_cometary_sigma_point_is_genuine(sbdb_orbit, sbdb_grid) -> None:
-    """Forward-looking guard for the SBDB (cometary) sigma-point path.
+    """The SBDB (cometary) sigma-point path, which is the workflow a user
+    actually runs — ``query_sbdb`` returns cometary orbits.
 
-    This is the workflow a user actually runs (``query_sbdb`` returns
-    cometary orbits). It currently **xfails**: the engine leaves a linear
-    covariance in place. When empyrean-r2dq is fixed engine-side, this
-    flips to xpass and flags that the limitation — and the workaround in
-    :func:`test_sbdb_cartesian_sigma_point_is_genuine` — can be retired.
+    This was a strict-xfail guard for empyrean-r2dq, where the engine
+    silently skipped non-Cartesian input and left a first-order
+    covariance in place under a SIGMA_POINT request. r2dq is fixed
+    engine-side (sigma points are now constructed in native element
+    space), so the guard is retired and the path is asserted directly.
+
+    The tag alone is not the assertion: a covariance mislabelled
+    ``sigma_point`` while still holding the linear values is exactly the
+    failure r2dq was, so genuineness is pinned by comparing against the
+    FIRST_ORDER covariance of the same propagation.
     """
+    res_fo = empyrean.propagate(
+        sbdb_orbit,
+        sbdb_grid,
+        uncertainty_method=UncertaintyMethod.FIRST_ORDER,
+        tagged_covariance=True,
+    )
     res_sp = empyrean.propagate(
         sbdb_orbit,
         sbdb_grid,
@@ -217,6 +253,8 @@ def test_sbdb_cometary_sigma_point_is_genuine(sbdb_orbit, sbdb_grid) -> None:
         tagged_covariance=True,
     )
     assert set(res_sp.tagged_covariance.kind.to_pylist()) == {"sigma_point"}
+    assert set(res_fo.tagged_covariance.kind.to_pylist()) == {"linear"}
+    _assert_sigma_point_is_not_linear(res_fo, res_sp)
 
 
 def test_sbdb_generate_ephemeris_rejects_sampling(sbdb_orbit, sbdb_grid) -> None:

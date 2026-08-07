@@ -17,6 +17,18 @@ pub struct Error {
     /// Error message captured from `empyrean_last_error()` at the time
     /// of the failure.
     pub message: String,
+    /// Data files a strict-offline construction found absent.
+    ///
+    /// Non-empty **only** for a
+    /// [`Context::from_data_dir_with`](crate::Context::from_data_dir_with)
+    /// failure under `refresh: false`, where it names **every** file the
+    /// requested tier needs and the directory does not have — so a caller
+    /// can fetch or report exactly that set in one pass instead of
+    /// splitting [`message`](Self::message) back apart on a separator a
+    /// filename may itself contain. Prefer
+    /// [`missing_data_files`](Self::missing_data_files) to reading the
+    /// field.
+    pub missing_data_files: Vec<String>,
 }
 
 impl Error {
@@ -30,7 +42,11 @@ impl Error {
                 CStr::from_ptr(ptr).to_string_lossy().into_owned()
             }
         };
-        Error { code, message }
+        Error {
+            code,
+            message,
+            missing_data_files: Vec::new(),
+        }
     }
 
     /// Build an error for a null pointer / failed constructor.
@@ -43,7 +59,20 @@ impl Error {
         Error {
             code: -1,
             message: msg.into(),
+            missing_data_files: Vec::new(),
         }
+    }
+
+    /// The data files a strict-offline construction found absent, or an
+    /// empty slice for every other failure.
+    ///
+    /// The actionable form of a
+    /// [`Context::from_data_dir_with`](crate::Context::from_data_dir_with)
+    /// failure under `refresh: false`: fetch exactly these and the same
+    /// call succeeds. Pair with `self.code == -2`, which is the category
+    /// this failure carries.
+    pub fn missing_data_files(&self) -> &[String] {
+        &self.missing_data_files
     }
 }
 

@@ -50,10 +50,27 @@ and Rust-native lifetime management.
 ## What the bindings cover
 
 The declarations track the full C ABI at `EMPYREAN_ABI_VERSION`
-(currently `2`), including the v0.9.0 wide-parameter fitting surface
-and the ABI-2 output surface below. ABI 2 grew existing struct shapes
-by appending fields, so consumers must recompile against the matching
-header. Each type below maps 1:1 onto a C struct; consult `include/empyrean.h`
+(currently `3`), including the v0.9.0 wide-parameter fitting surface
+and the ABI-2 output surface below. ABI 2 grew existing struct shapes by
+appending fields; ABI 3 appends `ephemeris_overlap_policy` to
+`EmpyreanPropagationConfig`, `frame` / `origin` to `EmpyreanObserver`,
+and `quality_kappa_state` to `EmpyreanTaggedCovariance`, makes
+`empyrean_transform_coordinates` the batched (array in / array out)
+entry point with the one-state form renamed
+`empyrean_transform_coordinates_single`, and widens
+`empyrean_get_observers` with `frame` / `origin`. Consumers must
+recompile against the matching header.
+
+The version handshake is enforced here, not merely documented: the
+loader calls `empyrean_abi_version()` the moment it opens `libempyrean`
+and panics — naming both versions and the resolved path — if the engine
+disagrees with `EMPYREAN_ABI_VERSION`. `dlsym` matches on symbol name
+alone, and ABI 3 is the first version to change an existing exported
+function's parameter list, so a stale engine picked up from `EMPYREAN_LIB`
+or a leftover `target/release` would read a caller's integer as an
+out-pointer rather than merely return wrong numbers.
+
+Each type below maps 1:1 onto a C struct; consult `include/empyrean.h`
 at the repository root for field-level semantics.
 
 - **Wide-parameter OD.** `empyrean_determine` / `empyrean_refine` solve

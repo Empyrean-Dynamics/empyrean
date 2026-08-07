@@ -363,6 +363,42 @@ impl Default for EventConfig {
     }
 }
 
+/// What to do when the propagated state coincides with an SB441-N16
+/// perturber's own SPK ephemeris — the self-perturbation case, where a
+/// body is both the thing being propagated and one of the forces acting
+/// on it.
+///
+/// All sixteen SB441-N16 bodies (1 Ceres, 2 Pallas, 4 Vesta, 7 Iris, …)
+/// are simultaneously members of the
+/// [`ForceModelTier::Standard`] force model and legitimate objects to
+/// propagate, so an orbit handed in for one of them sits on top of the
+/// ephemeris the force model is reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EphemerisOverlapPolicy {
+    /// Skip integration and return the matched perturber's SPK states at
+    /// the requested epochs. **Default** — the historical behaviour,
+    /// preserved bit for bit.
+    ///
+    /// The SPK is the authoritative solution for that body, so for the
+    /// body itself these states are exact. What it costs, stated plainly:
+    /// the caller's initial condition is **discarded** (two inputs within
+    /// the detection threshold produce identical output, which makes the
+    /// path useless for anything differential — an OD step, a covariance
+    /// sweep), and **no trajectory is produced**, so there is no dense
+    /// trajectory, no STM, and no sensitivity chain. Ephemeris and radar
+    /// generation both read those, and therefore fail outright for an
+    /// overlapped body under this policy.
+    #[default]
+    SubstituteSpk,
+    /// Integrate normally, with the matched perturber removed from the
+    /// force model for the remainder of that orbit's propagation, and
+    /// report the overlap.
+    ///
+    /// Choose this when you need a trajectory rather than a table of SPK
+    /// samples — which is always, for ephemeris generation.
+    ExcludeAndIntegrate,
+}
+
 /// Top-level propagation configuration.
 ///
 /// Force-model fields at the top, nested `events` / `diagnostics` /
@@ -406,6 +442,22 @@ pub struct PropagationConfig {
     // ── Integrator calibration ─────────────────────────────
     /// Integrator-tuning knobs (rarely touched).
     pub advanced: AdvancedIntegratorConfig,
+
+    // ── Ephemeris-overlap policy ───────────────────────────
+    /// What to do when the propagated state coincides with an SB441-N16
+    /// perturber's own SPK ephemeris. Default
+    /// [`EphemerisOverlapPolicy::SubstituteSpk`] — the historical behaviour. See
+    /// [`EphemerisOverlapPolicy`] for what that costs and when to change it.
+    ///
+    /// Overlap **detection** is on by default and decides whether this
+    /// field is consulted at all. The engine suppresses detection
+    /// whenever [`excluded_perturbers`](Self::excluded_perturbers) is
+    /// non-empty — a caller who named exclusions has already made the
+    /// call this policy would make for them — so setting
+    /// [`ExcludeAndIntegrate`](EphemerisOverlapPolicy::ExcludeAndIntegrate)
+    /// alongside an explicit exclusion does nothing. Use one or the
+    /// other. The detection toggle itself is not exposed here.
+    pub ephemeris_overlap_policy: EphemerisOverlapPolicy,
 }
 
 impl Default for PropagationConfig {
@@ -420,6 +472,7 @@ impl Default for PropagationConfig {
             diagnostics: DiagnosticsConfig::default(),
             num_threads: None,
             advanced: AdvancedIntegratorConfig::default(),
+            ephemeris_overlap_policy: EphemerisOverlapPolicy::default(),
         }
     }
 }
@@ -514,6 +567,14 @@ impl PropagationConfig {
                     hysteresis: self.advanced.origin_switching.hysteresis,
                 },
             },
+            ephemeris_overlap_policy: match self.ephemeris_overlap_policy {
+                EphemerisOverlapPolicy::SubstituteSpk => {
+                    empyrean_sys::EMPYREAN_EPHEMERIS_OVERLAP_POLICY_SUBSTITUTE_SPK
+                }
+                EphemerisOverlapPolicy::ExcludeAndIntegrate => {
+                    empyrean_sys::EMPYREAN_EPHEMERIS_OVERLAP_POLICY_EXCLUDE_AND_INTEGRATE
+                }
+            },
         };
         (
             cfg,
@@ -530,4 +591,54 @@ impl PropagationConfig {
 pub(crate) struct PropConfigKeep {
     _perturbers: Vec<i32>,
     _body_filter: Vec<i32>,
+}
+
+/// The [`EphemerisOverlapPolicy`] surface. The wrapper enum, the ABI integers it
+/// marshals to, and the engine flag they select all ship together, so
+/// these pin the mapping and the default.
+#[cfg(test)]
+mod overlap_policy_tests {
+    use super::*;
+
+    /// The default must be the historical behaviour, and must marshal as
+    /// the ABI's zero — a config nobody touched has to keep meaning what
+    /// it meant before the field existed.
+    #[test]
+    fn the_default_marshals_as_the_abi_zero() {
+        assert_eq!(
+            EphemerisOverlapPolicy::default(),
+            EphemerisOverlapPolicy::SubstituteSpk
+        );
+        let (ffi, _keep) = PropagationConfig::default().to_ffi_with();
+        assert_eq!(
+            ffi.ephemeris_overlap_policy,
+            empyrean_sys::EMPYREAN_EPHEMERIS_OVERLAP_POLICY_SUBSTITUTE_SPK
+        );
+        assert_eq!(ffi.ephemeris_overlap_policy, 0);
+    }
+
+    /// Both variants reach the wire as their contract values.
+    #[test]
+    fn both_variants_marshal_to_their_contract_values() {
+        for (policy, want) in [
+            (
+                EphemerisOverlapPolicy::SubstituteSpk,
+                empyrean_sys::EMPYREAN_EPHEMERIS_OVERLAP_POLICY_SUBSTITUTE_SPK,
+            ),
+            (
+                EphemerisOverlapPolicy::ExcludeAndIntegrate,
+                empyrean_sys::EMPYREAN_EPHEMERIS_OVERLAP_POLICY_EXCLUDE_AND_INTEGRATE,
+            ),
+        ] {
+            let cfg = PropagationConfig {
+                ephemeris_overlap_policy: policy,
+                ..PropagationConfig::default()
+            };
+            let (ffi, _keep) = cfg.to_ffi_with();
+            assert_eq!(
+                ffi.ephemeris_overlap_policy, want,
+                "{policy:?} marshals to {want}"
+            );
+        }
+    }
 }

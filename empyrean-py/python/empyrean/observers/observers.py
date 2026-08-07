@@ -5,6 +5,7 @@ from collections.abc import Sequence
 import numpy as np
 import quivr as qv
 
+from empyrean._convert import frame_to_int, int_to_frame, naif_to_origin, origin_to_naif
 from empyrean.coordinates.coordinates import CartesianCoordinates
 from empyrean.coordinates.enums import Frame, Origin
 from empyrean.coordinates.epoch import Epochs
@@ -17,7 +18,12 @@ class Observers(qv.Table):
     lives inside a nested :class:`CartesianCoordinates` table — same
     schema as orbit positions — so frame and origin are explicit and
     consistent with the rest of the API. By default that's
-    :attr:`Frame.ICRF` and :attr:`Origin.SSB`.
+    :attr:`Frame.ICRF` and :attr:`Origin.SSB` — the **construction
+    basis**, and the one every downstream consumer (ephemeris
+    generation, orbit determination) requires. Pass ``frame`` /
+    ``origin`` to :meth:`from_code` / :meth:`from_codes` to get the
+    states in another basis instead, for geometry work that wants one
+    (e.g. heliocentric ecliptic site positions).
 
     Construct via :meth:`from_code` (single observatory, ``N`` epochs)
     or :meth:`from_codes` (cartesian product of ``N`` observatories ×
@@ -35,6 +41,8 @@ class Observers(qv.Table):
         cls,
         obs_code: str,
         epochs: Epochs | np.ndarray | Sequence[float],
+        frame: Frame | str | int = Frame.ICRF,
+        origin: Origin | str | int = Origin.SSB,
     ) -> "Observers":
         """Observer states for a **single** observatory at ``N`` epochs.
 
@@ -47,6 +55,12 @@ class Observers(qv.Table):
         epochs : Epochs | array-like
             ``N`` observation epochs. An :class:`Epochs` table is
             converted to TDB internally; an array is treated as MJD TDB.
+        frame : Frame | str | int
+            Reference frame for the returned states. Default
+            :attr:`Frame.ICRF`. See :meth:`from_codes`.
+        origin : Origin | str | int
+            Body the states are relative to. Default
+            :attr:`Origin.SSB`. See :meth:`from_codes`.
 
         Returns
         -------
@@ -60,13 +74,15 @@ class Observers(qv.Table):
         >>> len(obs)
         2
         """
-        return cls.from_codes([obs_code], epochs)
+        return cls.from_codes([obs_code], epochs, frame=frame, origin=origin)
 
     @classmethod
     def from_codes(
         cls,
         obs_codes: Sequence[str],
         epochs: Epochs | np.ndarray | Sequence[float],
+        frame: Frame | str | int = Frame.ICRF,
+        origin: Origin | str | int = Origin.SSB,
     ) -> "Observers":
         """Observer states for the **cartesian product** of ``N``
         observatory codes × ``M`` epochs.
@@ -83,6 +99,26 @@ class Observers(qv.Table):
         epochs : Epochs | array-like
             ``M`` observation epochs. An :class:`Epochs` table is
             converted to TDB internally; an array is treated as MJD TDB.
+        frame : Frame | str | int
+            Reference frame for the returned states. Default
+            :attr:`Frame.ICRF`.
+        origin : Origin | str | int
+            Body the states are relative to. Default :attr:`Origin.SSB`.
+
+        Notes
+        -----
+        ``(Frame.ICRF, Origin.SSB)`` is the **construction basis** — the
+        one ephemeris generation and orbit determination require, and the
+        one to keep when the observers are headed there. Requesting it
+        takes no transform at all: the states come back exactly as
+        constructed, bit for bit. Any other basis rotates and/or
+        translates them, which is what a consumer plotting observer
+        geometry wants (e.g. heliocentric ecliptic site positions via
+        ``frame=Frame.ECLIPTICJ2000, origin=Origin.SUN``).
+
+        The ``frame`` / ``origin`` stamped on the returned table are read
+        off the states the engine returned, not echoed from the request,
+        so a table always reports the basis that actually produced it.
 
         Returns
         -------
@@ -106,12 +142,30 @@ class Observers(qv.Table):
         else:
             epochs_mjd = np.asarray(epochs, dtype=np.float64)
 
-        result = _get_observers(list(obs_codes), epochs_mjd)
+        result = _get_observers(
+            list(obs_codes), epochs_mjd, frame_to_int(frame), origin_to_naif(origin)
+        )
 
         nights = result["observing_night"]
         night_list = [int(n) if n >= 0 else None for n in nights]
 
-        n_rows = len(result["epoch"])
+        # Basis as reported by the returned states, never echoed from the
+        # request. `frame` is a table-level attribute in quivr, so a
+        # mixed-frame return would be unrepresentable — surface it loudly
+        # instead of silently keeping the first row's value.
+        frames = np.asarray(result["frame"])
+        origins = np.asarray(result["origin"])
+        if len(frames) == 0:
+            out_frame = int_to_frame(frame_to_int(frame))
+        elif np.all(frames == frames[0]):
+            out_frame = int_to_frame(int(frames[0]))
+        else:
+            raise ValueError(
+                "observer states came back in more than one frame "
+                f"({sorted({int(f) for f in frames})}); Observers carries a single "
+                "table-level frame and cannot represent a mixed-frame table"
+            )
+
         coordinates = CartesianCoordinates.from_kwargs(
             epoch=np.asarray(result["epoch"]),
             x=np.asarray(result["x"]),
@@ -120,8 +174,8 @@ class Observers(qv.Table):
             vx=np.asarray(result["vx"]),
             vy=np.asarray(result["vy"]),
             vz=np.asarray(result["vz"]),
-            frame=Frame.ICRF.value,
-            origin=[str(Origin.SSB)] * n_rows,
+            frame=out_frame.value,
+            origin=[naif_to_origin(int(o)) for o in origins],
         )
 
         return cls.from_kwargs(

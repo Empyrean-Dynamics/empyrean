@@ -61,8 +61,8 @@ mod config;
 mod result;
 
 pub use config::{
-    AdvancedIntegratorConfig, DiagnosticsConfig, EventConfig, ForceModelTier, IntegratorChoice,
-    OriginSwitchingConfig, PropagationConfig, UncertaintyMethod,
+    AdvancedIntegratorConfig, DiagnosticsConfig, EphemerisOverlapPolicy, EventConfig,
+    ForceModelTier, IntegratorChoice, OriginSwitchingConfig, PropagationConfig, UncertaintyMethod,
 };
 pub use result::{
     CovarianceKind, CovarianceQuality, Event, PropagatedState, PropagationResult, TaggedCovariance,

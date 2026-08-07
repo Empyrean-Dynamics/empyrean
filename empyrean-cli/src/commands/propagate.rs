@@ -5,6 +5,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use empyrean::{OrbitBatch, PropagationConfig, PropagationResult, UncertaintyMethod};
 
+use super::{DataOptions, load_context};
 use crate::io::output::OutputFormat;
 use crate::io::{orbit_input, output};
 use crate::{ForceModel, UncertaintyMethodArg};
@@ -64,14 +65,18 @@ pub struct PropagateArgs {
 /// matrices are AU-based; position σ is reported in km.
 const AU_KM: f64 = 149_597_870.7;
 
-pub fn run(data_dir: Option<PathBuf>, args: PropagateArgs) -> Result<()> {
+pub fn run(data: &DataOptions, args: PropagateArgs) -> Result<()> {
     // Try daemon first — but only when neither the tagged-covariance
-    // readback nor a thrust file is requested. The daemon protocol
+    // readback nor a thrust file is requested, and only when the caller
+    // did not ask for a strict-offline context. The daemon protocol
     // returns a summary string and cannot stream the per-epoch series
     // (`--tagged-covariance`), and its wire request carries no thrust
     // fields, so `--thrust-arcs` must also fall through to the in-process
     // path below — sending it to the daemon would silently drop the burn.
-    if !args.tagged_covariance && args.thrust_arcs.is_none() {
+    // `--no-refresh` falls through for the same reason: a daemon already
+    // holding a context built under its own policy cannot honour the
+    // request, and serving it anyway would quietly ignore the flag.
+    if !args.tagged_covariance && args.thrust_arcs.is_none() && data.daemon_eligible() {
         let request = crate::daemon::protocol::Request::Propagate {
             object_ids: args.object_ids.clone(),
             input_path: args.input.as_ref().map(|p| p.display().to_string()),
@@ -92,10 +97,7 @@ pub fn run(data_dir: Option<PathBuf>, args: PropagateArgs) -> Result<()> {
     }
 
     // In-process fallback.
-    let t0 = Instant::now();
-    let ctx =
-        empyrean::Context::from_data_dir(data_dir.as_deref()).context("failed to load context")?;
-    eprintln!("Loaded context ({:.1}s)", t0.elapsed().as_secs_f64());
+    let ctx = load_context(data)?;
 
     let mut batch = orbit_input::load_orbits(&args.object_ids, &args.input)?;
 
@@ -199,6 +201,9 @@ fn print_tagged_covariance_series(input: &OrbitBatch, result: &PropagationResult
             }
             CovarianceQuality::Repaired { min_eig } => {
                 format!("repaired(min_eig={min_eig:.2e})")
+            }
+            CovarianceQuality::ExpansionSuspect { kappa_state } => {
+                format!("expansion-suspect(kappa_state={kappa_state:.2e})")
             }
         }
     }

@@ -351,6 +351,13 @@ pub struct EmpyreanWeightingLayer {
     /// (days). Must be finite and > 0 — the production value is 0.5.
     /// Non-positive or non-finite values are rejected with an error
     /// (0.0 no longer silently maps to 0.5).
+    ///
+    /// The de-weighting **law** is not selectable at this ABI: a
+    /// `NIGHTLY_DEWEIGHTING` layer always applies Vereš, Farnocchia,
+    /// Chesley & Chamberlin (2017) §3 — σ unchanged for a batch of
+    /// N ≤ 4, then σ_eff = σ√(N/4). The pre-2017 σ_eff = σ√N law the
+    /// engine still carries as a historical baseline is deliberately
+    /// not exposed here.
     pub max_gap_days: f64,
 }
 
@@ -488,7 +495,26 @@ pub const EMPYREAN_PHOTOMETRY_MODEL_HG1G2: i32 = 4;
 /// per-crate semver strings in `EmpyreanVersions` (which are provenance).
 /// Consumers compiled against a given `EMPYREAN_SOLVE_WIDTH` check this at
 /// load; any additive change to the frozen structs bumps it.
-pub const EMPYREAN_ABI_VERSION: u32 = 2;
+///
+/// Version 3 (this one) is a single, batched break:
+///
+/// - `EmpyreanPropagationConfig` grows `ephemeris_overlap_policy` at its tail (and
+///   so does the `EmpyreanEphemerisConfig` that embeds it);
+/// - `EmpyreanObserver` grows `frame` / `origin` — the basis the state
+///   is expressed in, which used to be an undeclared ICRF/SSB
+///   assumption;
+/// - `EmpyreanTaggedCovariance` grows `quality_kappa_state`, the payload
+///   of the new `EMPYREAN_COVARIANCE_QUALITY_EXPANSION_SUSPECT` tag;
+/// - `empyrean_transform_coordinates` becomes the **batched** entry
+///   point (array in, array out) and the one-state form is renamed
+///   `empyrean_transform_coordinates_single`;
+/// - `empyrean_get_observers` gains `frame` / `origin` parameters.
+///
+/// Fields are only ever appended, never reordered or removed, so the two
+/// signature changes are the only source-breaking ones — a consumer
+/// built against an older header must recompile against this one either
+/// way.
+pub const EMPYREAN_ABI_VERSION: u32 = 3;
 
 /// Runtime accessor for [`EMPYREAN_ABI_VERSION`] — lets a dynamically
 /// linked consumer confirm the loaded library's frozen-shape contract
@@ -2588,7 +2614,9 @@ fn int_to_coord_rep(v: i32) -> Result<CoordinateRepresentation, String> {
 fn build_weighting_from_c(
     c: &EmpyreanWeightingConfig,
 ) -> Result<Option<empyrean_core::determination::WeightingConfig>, String> {
-    use empyrean_core::determination::{SigmaPolicy, WeightingConfig, WeightingLayer};
+    use empyrean_core::determination::{
+        FloorsTable, NightlyDeweighting, SigmaPolicy, WeightingConfig, WeightingLayer,
+    };
     use empyrean_core::time::Epoch;
 
     if c.enabled == 0 {
@@ -2630,6 +2658,29 @@ fn build_weighting_from_c(
             },
             layers: Vec::new(),
             sigma_policy: SigmaPolicy::default(),
+            // `NONE` builds the layer chain by hand, so it has no
+            // published station-floors table behind it — the identity is
+            // recorded as `FloorsTable::Custom`. The identity is *recorded*,
+            // never inferred, so it stays `Custom` even once user layers
+            // are inserted below: a chain that merely resembles a
+            // published table must not be reported as one. The preset
+            // arms below carry whatever identity their own constructor
+            // set.
+            //
+            // Named directly now that `FloorsTable` is re-exported from
+            // `empyrean_core::determination` (it is part of the public
+            // shape of the re-exported `WeightingConfig`). This is the same
+            // value the engine's own `Default` yields, but spelling the
+            // variant makes the provenance visible at the call site and
+            // fails to compile if the empty-chain identity ever changes;
+            // `weighting_identity_tests` pins it with a direct
+            // variant-equality assertion.
+            //
+            // This arm is the only site that sets the field: it builds an
+            // EMPTY layer chain, so "no published table identity" is the
+            // true provenance. The preset arms below keep whatever
+            // identity their own constructor recorded.
+            floors_table: FloorsTable::Custom,
         },
         EMPYREAN_WEIGHTING_PRESET_VFCC2017 => WeightingConfig::veres_farnocchia_chesley_2017(),
         EMPYREAN_WEIGHTING_PRESET_NEODYS => WeightingConfig::neodys()
@@ -2780,6 +2831,25 @@ fn build_weighting_from_c(
                     }
                     WeightingLayer::NightlyDeweighting {
                         max_gap_days: layer.max_gap_days,
+                        // The engine admits two published de-weighting
+                        // laws; this ABI exposes only the current one
+                        // (Vereš et al. 2017 §3, σ_eff = σ√(N/4) above
+                        // N = 4). That is a *subset*, not a dropped
+                        // request: `EmpyreanWeightingLayer` carries no
+                        // scheme field, so there is no caller choice to
+                        // discard. The pre-2017 √N law is retained
+                        // upstream as a historical baseline only,
+                        // reachable from the Rust engine API.
+                        //
+                        // Named directly now that `NightlyDeweighting` is
+                        // re-exported from `empyrean_core::determination`.
+                        // This is the same value the engine's own
+                        // `Default` yields, but spelling the variant makes
+                        // the selected law visible at the call site and
+                        // fails to compile if the default ever changes;
+                        // `weighting_identity_tests` pins it with a direct
+                        // variant-equality assertion.
+                        scheme: NightlyDeweighting::VFC17,
                     }
                 }
                 other => {
@@ -4565,5 +4635,103 @@ mod tests {
             empyrean_od_result_free(&mut od_result);
             empyrean_observations_free(obs_ptr, obs_n);
         }
+    }
+}
+
+/// The weighting-config identity fields scott grew (`floors_table` on the
+/// config, `scheme` on a nightly layer) and what this ABI resolves them to.
+///
+/// `build_weighting_from_c` names both directly (`FloorsTable::Custom`,
+/// `NightlyDeweighting::VFC17`) now that both are re-exported from
+/// `empyrean_core::determination`. These pin the resolved identities: the
+/// identity a delivered fit reports must be `Custom` for a hand-assembled
+/// chain, and a `NIGHTLY_DEWEIGHTING` layer must apply the current published
+/// law, not the pre-2017 one. Asserted by direct variant equality against
+/// the named types — a compile-time failure if a field's type changes to
+/// another enum with a same-named variant, which `Debug`-string pinning
+/// could not catch.
+#[cfg(test)]
+mod weighting_identity_tests {
+    use super::*;
+    use empyrean_core::determination::{FloorsTable, NightlyDeweighting, WeightingLayer};
+
+    fn enabled_config(preset: u8) -> EmpyreanWeightingConfig {
+        let mut c: EmpyreanWeightingConfig = unsafe { std::mem::zeroed() };
+        c.enabled = 1;
+        c.preset = preset;
+        c.sigma_policy = -1;
+        c
+    }
+
+    /// A `preset = NONE` chain is caller-assembled, so it carries no
+    /// published floors-table identity. Reporting one would let a config
+    /// that merely resembles a published table be delivered as being it.
+    #[test]
+    fn a_hand_assembled_chain_reports_a_custom_floors_table() {
+        let cfg = build_weighting_from_c(&enabled_config(EMPYREAN_WEIGHTING_PRESET_NONE))
+            .expect("preset NONE converts")
+            .expect("weighting is enabled");
+        assert_eq!(
+            cfg.floors_table,
+            FloorsTable::Custom,
+            "a hand-assembled layer chain must not claim a published table"
+        );
+    }
+
+    /// The VFC17 preset's own constructor records its identity; routing
+    /// through this converter must not overwrite it with `Custom`.
+    #[test]
+    fn the_vfc17_preset_keeps_its_recorded_identity() {
+        let cfg = build_weighting_from_c(&enabled_config(EMPYREAN_WEIGHTING_PRESET_VFC17))
+            .expect("preset VFC17 converts")
+            .expect("weighting is enabled");
+        assert_eq!(
+            cfg.floors_table,
+            FloorsTable::VFC17,
+            "the preset's recorded identity must survive the conversion"
+        );
+    }
+
+    /// A `NIGHTLY_DEWEIGHTING` layer applies Vereš et al. (2017) §3
+    /// (σ unchanged to N = 4, then σ√(N/4)). The engine still carries the
+    /// pre-2017 σ√N law as a historical baseline, and it shipped as a
+    /// library default once — this pins that the ABI does not select it.
+    #[test]
+    fn a_nightly_layer_applies_the_current_published_law() {
+        let layers = [EmpyreanWeightingLayer {
+            kind: EMPYREAN_WEIGHTING_LAYER_NIGHTLY_DEWEIGHTING,
+            obs_code: [0; 4],
+            sigma_ra_arcsec: 0.0,
+            sigma_dec_arcsec: 0.0,
+            start_epoch_mjd_tdb: f64::NAN,
+            end_epoch_mjd_tdb: f64::NAN,
+            scale: 0.0,
+            max_gap_days: 0.5,
+        }];
+        let mut c = enabled_config(EMPYREAN_WEIGHTING_PRESET_NONE);
+        c.num_additional_layers = layers.len();
+        c.additional_layers = layers.as_ptr();
+
+        let cfg = build_weighting_from_c(&c)
+            .expect("a nightly layer converts")
+            .expect("weighting is enabled");
+        let (scheme, max_gap_days) = cfg
+            .layers
+            .iter()
+            .find_map(|l| match l {
+                WeightingLayer::NightlyDeweighting {
+                    scheme,
+                    max_gap_days,
+                } => Some((*scheme, *max_gap_days)),
+                _ => None,
+            })
+            .expect("the nightly layer reaches the engine config");
+        assert_eq!(
+            scheme,
+            NightlyDeweighting::VFC17,
+            "a nightly layer must apply the current published law, not the \
+             pre-2017 sqrt(N) baseline"
+        );
+        assert_eq!(max_gap_days, 0.5, "max_gap_days must survive");
     }
 }

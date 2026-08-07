@@ -64,6 +64,29 @@ the bodies whose ephemeris is actually loaded by `ForceModelTier`
 | `ICRF`               | `"icrf"`             | A frame, not a body, but accepted in the same parameter slot for API consistency. |
 | `Origin.asteroid(n)` | `"asteroid_<n>"`     | Numbered-asteroid origin — e.g. `Origin.asteroid(433)` for Eros. Useful when fitting an asteroid that the force model would otherwise include as a perturber: pass it via `excluded_perturbers` so it does not self-attract. |
 
+### Observer states
+
+{meth}`~empyrean.Observers.from_code` /
+{meth}`~empyrean.Observers.from_codes` and
+{func}`~empyrean.get_observer_states` return ICRF / SSB by default —
+the **construction basis**, and the one
+{func}`~empyrean.generate_ephemeris` and orbit determination require.
+Requesting it takes no transform at all: the states come back exactly as
+constructed, bit for bit.
+
+Pass `frame=` / `origin=` when you want the geometry in some other
+basis — plotting heliocentric ecliptic site positions, say:
+
+```python
+sites = empyrean.Observers.from_codes(
+    ["500", "568"], epochs, frame="eclipticj2000", origin="Sun"
+)
+```
+
+Every returned row carries the basis it is expressed in, read off the
+state rather than echoed from the request, so a table is never ambiguous
+about which basis produced it.
+
 For unfamiliar bodies, see
 [NAIF's body-ID page](https://naif.jpl.nasa.gov/pub/naif/toolkit_docs/C/req/naif_ids.html);
 to add a new body, the underlying ephemeris kernel set has to carry

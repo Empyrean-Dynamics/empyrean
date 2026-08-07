@@ -446,7 +446,12 @@ fn od_orbit_to_propagated_local(
             // convention; convert to degrees for FFI parity with the
             // rest of the C ABI.
             let coord_deg = coord.into_angular::<empyrean_core::coordinates::Degrees>();
-            let cs = coordinates_to_coordinate_state(&coord_deg);
+            // Fallible since the engine stopped panicking on an origin
+            // with no NAIF id (an MPC site code). Surface it rather than
+            // invent a sentinel: a made-up integer read back through the
+            // ABI would name a different body.
+            let cs = coordinates_to_coordinate_state(&coord_deg)
+                .map_err(|e| format!("session OD result orbit: {e}"))?;
             return Ok(EmpyreanPropagatedState {
                 epoch_mjd_tdb: cs.epoch_mjd_tdb,
                 x: cs.elements[0],

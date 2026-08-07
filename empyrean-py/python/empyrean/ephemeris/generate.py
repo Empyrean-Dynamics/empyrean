@@ -76,6 +76,17 @@ def generate_ephemeris(
         If omitted, one is built from the sugar kwargs below (or
         defaults).
 
+        ``config.propagation.ephemeris_overlap_policy`` and
+        ``config.propagation.excluded_perturbers`` are both honored
+        here, and one of them is required to generate an ephemeris for
+        an SB441-N16 body (1 Ceres, 2 Pallas, 4 Vesta, …), which is
+        otherwise both the target and one of its own perturbers; see
+        :class:`EphemerisConfig`.
+
+        ``config.propagation.events`` and
+        ``config.propagation.diagnostics`` do not apply to this call and
+        raise a :class:`ValueError` if modified.
+
     Other Parameters
     ----------------
     force_model : ForceModelTier or str, optional
@@ -103,13 +114,18 @@ def generate_ephemeris(
     Returns
     -------
     EphemerisResult
-        Wraps the :class:`~empyrean.types.Ephemeris` table and, when
-        input covariance is carried, the observation-partials
-        :class:`~empyrean.types.ObservationSensitivity` container.
-        Rows are orbit-major and, within each orbit, follow the
-        **observer-input order** (sensitivity rows too). Each observer
-        carries its own epoch, so positional pairing against the input
-        observers is safe within an orbit block.
+        Wraps the :class:`~empyrean.types.Ephemeris` table and, when the
+        propagation traced the state-transition matrix, the
+        observation-partials
+        :class:`~empyrean.types.ObservationSensitivity` container. The
+        STM is traced when the input orbit carries a covariance, and —
+        covariance or not — whenever
+        ``config.propagation.compute_stm=True``: that flag reaches the
+        engine on this path, so partials can be requested for an orbit
+        with no covariance at all. Rows are orbit-major and, within each
+        orbit, follow the **observer-input order** (sensitivity rows
+        too). Each observer carries its own epoch, so positional pairing
+        against the input observers is safe within an orbit block.
 
     Examples
     --------
@@ -236,12 +252,11 @@ def generate_ephemeris(
     obs_codes = observers.obs_code.to_pylist()
     oc = observers.coordinates
     obs_epochs = np.asarray(oc.epoch.to_numpy(zero_copy_only=False), dtype=np.float64)
-    obs_x = np.asarray(oc.x.to_numpy(zero_copy_only=False), dtype=np.float64)
-    obs_y = np.asarray(oc.y.to_numpy(zero_copy_only=False), dtype=np.float64)
-    obs_z = np.asarray(oc.z.to_numpy(zero_copy_only=False), dtype=np.float64)
-    obs_vx = np.asarray(oc.vx.to_numpy(zero_copy_only=False), dtype=np.float64)
-    obs_vy = np.asarray(oc.vy.to_numpy(zero_copy_only=False), dtype=np.float64)
-    obs_vz = np.asarray(oc.vz.to_numpy(zero_copy_only=False), dtype=np.float64)
+    # Only the code and the epoch cross the boundary. The binding
+    # recomputes each observer's state from that pair — the table's own
+    # position/velocity columns are not a second input, because two
+    # sources for one number is how a lookup failure used to turn into
+    # silently substituted geometry.
 
     # ── Map force model to int ───────────────────────────────
     if isinstance(force_model, str):
@@ -310,12 +325,6 @@ def generate_ephemeris(
         phot_model,
         obs_codes,
         obs_epochs,
-        obs_x,
-        obs_y,
-        obs_z,
-        obs_vx,
-        obs_vy,
-        obs_vz,
         fm_int,
         epsilon,
         uncertainty_method=um_int,

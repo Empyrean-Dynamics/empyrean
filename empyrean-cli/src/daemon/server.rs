@@ -16,8 +16,16 @@ use crate::io::orbit_input;
 use crate::io::output::{self, OutputFormat};
 
 /// Start the daemon server. Blocks forever (until Shutdown or signal).
+///
+/// The context is built once, here, under the [`DataOptions`] the daemon
+/// was started with — so `--no-refresh` on `serve` makes the daemon's
+/// one construction strict-offline. A *client* command's own
+/// `--no-refresh` cannot retroactively apply to an already-running
+/// daemon, which is why those commands skip the daemon fast path
+/// entirely rather than being served a context built under a different
+/// policy.
 pub fn serve(
-    data_dir: Option<&Path>,
+    data: &crate::commands::DataOptions,
     socket_path: &Path,
     _num_threads: Option<usize>,
 ) -> Result<()> {
@@ -42,7 +50,7 @@ pub fn serve(
 
     eprintln!("Loading context...");
     let t0 = std::time::Instant::now();
-    let ctx = empyrean::Context::from_data_dir(data_dir).context("failed to load context")?;
+    let ctx = data.build_context().context("failed to load context")?;
     eprintln!("Ready ({:.1}s)", t0.elapsed().as_secs_f64());
 
     for stream in listener.incoming() {
@@ -237,7 +245,14 @@ fn handle_ephemeris(
     };
 
     let obs_refs: Vec<&str> = observers.iter().map(|s| s.as_str()).collect();
-    let obs_states = match ctx.get_observers(&obs_refs, &[empyrean::Epoch::from_mjd_tdb(epoch)]) {
+    let obs_states = match ctx.get_observers(
+        &obs_refs,
+        &[empyrean::Epoch::from_mjd_tdb(epoch)],
+        // The construction basis: these observers go straight into
+        // ephemeris generation, which requires it.
+        empyrean::Frame::ICRF,
+        empyrean::Origin::SSB,
+    ) {
         Ok(o) => o,
         Err(e) => return Response::err("failed to get observers", e.to_string()),
     };

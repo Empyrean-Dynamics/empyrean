@@ -313,7 +313,12 @@ fn channel_fingerprint(ctx: &Context, s: &Scenario) -> BTreeMap<String, Option<f
             .map(|&t| Epoch::from_mjd_tdb(t))
             .collect();
         let observers = ctx
-            .get_observers(&[code.as_str()], &eph_epochs)
+            .get_observers(
+                &[code.as_str()],
+                &eph_epochs,
+                empyrean::Frame::ICRF,
+                empyrean::Origin::SSB,
+            )
             .expect("observers");
         let entries = ctx
             .generate_ephemeris(

@@ -65,9 +65,61 @@ demand and cached under the same XDG data dir:
 | `moon_pa_de440_200625.bpc`        | First {func}`empyrean.initialize` (~30 MB)            | `https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/` |
 | Spacecraft SPK (JWST, Gaia, HST)  | Only when an observation cites that observatory code  | `https://naif.jpl.nasa.gov/pub/naif/…`                    |
 
-For air-gapped or offline ops, mirror these into your
-``EMPYREAN_DATA_DIR`` ahead of time and ``initialize()`` will skip
-the network fetch.
+## Offline and air-gapped operation
+
+Mirroring every file into ``EMPYREAN_DATA_DIR`` ahead of time is
+necessary but **not sufficient**: with a fully populated directory,
+{func}`empyrean.initialize` still reaches out to check whether the
+lazy-fetched extras are stale, so an egress-restricted host sees
+outbound requests that hang until they time out:
+
+```text
+Warning: staleness check failed for obscodes_extended.json:
+HTTP error: HEAD https://minorplanetcenter.net/... : timeout: connect
+```
+
+Ask for strict offline instead. It resolves the tier's kernel set from
+the data directory alone and never opens a socket:
+
+```python
+import empyrean
+
+empyrean.initialize(refresh=False)
+```
+
+There is no try-the-network-and-tolerate path and no
+degrade-to-a-lower-tier path — the context either has everything the
+tier needs on disk or it is not built. A failure names **every** absent
+file, not just the first one hit, as structured data on the exception:
+
+```python
+try:
+    empyrean.initialize(refresh=False)
+except FileNotFoundError as exc:
+    for name in exc.missing_data_files:
+        print("missing:", name)
+```
+
+Set ``EMPYREAN_OFFLINE=1`` in the environment to make it the floor for
+the whole process. It is a floor, never an override: it can only ever
+*remove* network access, it announces on stderr whenever it downgrades a
+request, and only the exact value ``1`` asserts it. It reaches
+{func}`empyrean.initialize` and every CLI command:
+
+```bash
+export EMPYREAN_OFFLINE=1
+empyrean init                # verifies the data dir, downloads nothing
+```
+
+The same switch is spelled ``--no-refresh`` as an explicit CLI flag, and
+``Context::from_data_dir_with(dir, DataDirOptions { refresh: false, .. })``
+in Rust.
+
+```{note}
+The explicit-paths branch — passing ``spk_path`` / ``gm_path`` to
+{func}`empyrean.initialize` — never fetched anything to begin with, so
+``refresh`` does not apply there.
+```
 
 ## Time scales
 

@@ -68,8 +68,10 @@ class CovarianceKind(str, enum.Enum):
 class CovarianceQuality(str, enum.Enum):
     """Definiteness of a tagged covariance matrix.
 
-    The associated ``min_eig`` (NaN for positive-definite) rides
-    alongside in the ``quality_min_eig`` column / dataclass field.
+    Each member's payload rides alongside in its own column /
+    dataclass field, and is NaN on every other member: ``min_eig`` for
+    :attr:`INDEFINITE` and :attr:`REPAIRED`, ``kappa_state`` for
+    :attr:`EXPANSION_SUSPECT`. The tag is the presence rule.
     """
 
     POSITIVE_DEFINITE = "positive_definite"
@@ -79,6 +81,14 @@ class CovarianceQuality(str, enum.Enum):
     REPAIRED = "repaired"
     """Explicitly repaired to PSD; ``min_eig`` is the value before
     repair (code 2)."""
+    EXPANSION_SUSPECT = "expansion_suspect"
+    """Definite, but the second-order expansion behind it is not
+    clearly valid here — the quadratic term is not small against the
+    linear one (code 3). ``quality_kappa_state`` carries the ratio.
+
+    Deliberately not folded into :attr:`POSITIVE_DEFINITE`: the matrix
+    *is* definite, so a check for definiteness alone would accept a
+    covariance the engine does not vouch for."""
 
 
 class TargetFunctional(str, enum.Enum):
@@ -105,6 +115,7 @@ _QUALITY_BY_CODE = {
     0: CovarianceQuality.POSITIVE_DEFINITE,
     1: CovarianceQuality.INDEFINITE,
     2: CovarianceQuality.REPAIRED,
+    3: CovarianceQuality.EXPANSION_SUSPECT,
 }
 _TARGET_BY_CODE = {
     0: TargetFunctional.CARTESIAN_STATE,
@@ -134,8 +145,14 @@ class TaggedCovariance:
     quality : CovarianceQuality
         Definiteness of ``matrix``.
     quality_min_eig : float
-        Minimum eigenvalue for indefinite / repaired matrices; NaN when
-        positive-definite.
+        Minimum eigenvalue for indefinite / repaired matrices; NaN for
+        every other ``quality``.
+    quality_kappa_state : float
+        κ_state, the block-wise quadratic/linear ratio that produced an
+        :attr:`CovarianceQuality.EXPANSION_SUSPECT` tag; NaN for every
+        other ``quality``, and ``inf`` when a zero-spread block carried
+        a nonzero second-order correction. Read-only provenance —
+        guard with :func:`math.isfinite` before any arithmetic.
     mc_seed : int, optional
         Monte-Carlo run seed (set only when ``kind`` is
         :attr:`CovarianceKind.MONTE_CARLO`).
@@ -166,6 +183,7 @@ class TaggedCovariance:
     kind: CovarianceKind
     quality: CovarianceQuality
     quality_min_eig: float
+    quality_kappa_state: float
     mc_seed: int | None
     mean_shift_prop: np.ndarray | None
     mean_shift_input: np.ndarray | None
@@ -236,8 +254,11 @@ class TaggedCovariances(qv.Table):
     quality = qv.LargeStringColumn()
     """Definiteness (``CovarianceQuality`` value)."""
     quality_min_eig = qv.Float64Column(nullable=True)
-    """Minimum eigenvalue for indefinite / repaired matrices; null
-    (NaN) when positive-definite."""
+    """Minimum eigenvalue for indefinite / repaired matrices; NaN for
+    every other ``quality``."""
+    quality_kappa_state = qv.Float64Column(nullable=True)
+    """κ_state behind an ``expansion_suspect`` tag; NaN for every other
+    ``quality``. Read-only provenance — check ``np.isfinite`` first."""
 
     mc_seed = qv.UInt64Column(nullable=True)
     """Monte-Carlo run seed; null unless ``kind`` is ``monte_carlo``."""
@@ -351,6 +372,7 @@ class TaggedCovariances(qv.Table):
         kinds = self.column("kind").to_pylist()
         qualities = self.column("quality").to_pylist()
         min_eigs = self.column("quality_min_eig").to_numpy(zero_copy_only=False)
+        kappas = self.column("quality_kappa_state").to_numpy(zero_copy_only=False)
         targets = self.column("target_functional").to_pylist()
         origins = self.column("origin").to_pylist()
         frames = self.column("frame").to_pylist()
@@ -389,6 +411,7 @@ class TaggedCovariances(qv.Table):
                     kind=CovarianceKind(kinds[i]),
                     quality=CovarianceQuality(qualities[i]),
                     quality_min_eig=float(min_eigs[i]),
+                    quality_kappa_state=float(kappas[i]),
                     mc_seed=int(mc_seeds[i]) if mc_seeds[i] is not None else None,
                     mean_shift_prop=(
                         np.ascontiguousarray(prop[i], dtype=np.float64)
@@ -442,6 +465,7 @@ def build_tagged_covariances(
     has_mean_shift_input = np.asarray(tagged["has_mean_shift_input"], dtype=bool)
     quality_codes = np.asarray(tagged["quality"])
     quality_min_eig = np.asarray(tagged["quality_min_eig"], dtype=np.float64)
+    quality_kappa_state = np.asarray(tagged["quality_kappa_state"], dtype=np.float64)
     non_grav = np.asarray(tagged["non_grav"], dtype=bool)  # (n, 3)
     thrust_segments = np.asarray(tagged["thrust_segments"], dtype=np.uint32)
     solved_width = np.asarray(tagged["solved_width"], dtype=np.uint32)
@@ -474,6 +498,7 @@ def build_tagged_covariances(
         "kind": kind_strs,
         "quality": quality_strs,
         "quality_min_eig": quality_min_eig,
+        "quality_kappa_state": quality_kappa_state,
         "mc_seed": mc_seed_col,
         "mean_shift_prop_x": mean_shift_prop[:, 0],
         "mean_shift_prop_y": mean_shift_prop[:, 1],

@@ -22,6 +22,73 @@ typedef struct Session Session;
 
 
 /**
+ * Acquire kernels as `empyrean_context_from_data_dir` always has:
+ * download anything the tier requires and is missing, and re-download
+ * anything whose upstream copy moved. The `memset(0)` default.
+ */
+#define EMPYREAN_DATA_REFRESH_DEFAULT 0
+
+/**
+ * Same as [`EMPYREAN_DATA_REFRESH_DEFAULT`], spelled explicitly.
+ */
+#define EMPYREAN_DATA_REFRESH_ON 1
+
+/**
+ * **Strict offline.** Resolve the tier's kernels from the data
+ * directory alone — no HTTP HEAD, no download, no staleness check — and
+ * fail with `-2` (missing data), naming every absent file through
+ * [`empyrean_missing_data_files`], if any is not there.
+ *
+ * Nothing is degraded to make an incomplete directory work: there is no
+ * try-the-network-and-tolerate path, no fall back to a lower tier, and
+ * no partially-loaded context. The call either produces a context
+ * carrying the whole requested tier or it fails naming what is absent.
+ */
+#define EMPYREAN_DATA_REFRESH_OFF 2
+
+/**
+ * Acquire and load the default tier (Standard). The `memset(0)` default.
+ *
+ * # Why these are not the `force_model` integers
+ *
+ * [`EmpyreanPropagationConfig::force_model`](crate::propagate::EmpyreanPropagationConfig::force_model)
+ * encodes Approximate as `0`, because a propagation config has no
+ * "unset tier" state — it always propagates under some tier. A data
+ * directory does: `NULL` options must mean "what `from_data_dir` does",
+ * and a zeroed struct must agree with `NULL`. So this field spends `0`
+ * on DEFAULT and shifts the ladder by one rather than making
+ * `memset(0)` silently select the Approximate kernel set.
+ */
+#define EMPYREAN_DATA_TIER_DEFAULT 0
+
+/**
+ * Point-mass planets + Moon + Pluto.
+ */
+#define EMPYREAN_DATA_TIER_APPROXIMATE 1
+
+/**
+ * Approximate + EIH GR + Sun J2.
+ */
+#define EMPYREAN_DATA_TIER_BASIC 2
+
+/**
+ * Production tier — Basic + the 16 SB441-N16 asteroid perturbers +
+ * Earth J2–J4 + non-gravitational forces. Same as
+ * [`EMPYREAN_DATA_TIER_DEFAULT`], spelled explicitly.
+ */
+#define EMPYREAN_DATA_TIER_STANDARD 3
+
+/**
+ * Standard + planetary spherical harmonics (~290 MB of extra kernels).
+ *
+ * **Reserved, not accepted.** The propagation surface exposes no Full
+ * tier in this release, so acquiring its kernels would buy a kernel set
+ * nothing at this ABI can integrate under. Passing it is a `-1` naming
+ * the reason rather than a silent downgrade to Standard.
+ */
+#define EMPYREAN_DATA_TIER_FULL 4
+
+/**
  * Success.
  */
 #define EMPYREAN_BUILTSYSTEM_OK 0
@@ -382,8 +449,27 @@ typedef struct Session Session;
  * per-crate semver strings in `EmpyreanVersions` (which are provenance).
  * Consumers compiled against a given `EMPYREAN_SOLVE_WIDTH` check this at
  * load; any additive change to the frozen structs bumps it.
+ *
+ * Version 3 (this one) is a single, batched break:
+ *
+ * - `EmpyreanPropagationConfig` grows `ephemeris_overlap_policy` at its tail (and
+ *   so does the `EmpyreanEphemerisConfig` that embeds it);
+ * - `EmpyreanObserver` grows `frame` / `origin` — the basis the state
+ *   is expressed in, which used to be an undeclared ICRF/SSB
+ *   assumption;
+ * - `EmpyreanTaggedCovariance` grows `quality_kappa_state`, the payload
+ *   of the new `EMPYREAN_COVARIANCE_QUALITY_EXPANSION_SUSPECT` tag;
+ * - `empyrean_transform_coordinates` becomes the **batched** entry
+ *   point (array in, array out) and the one-state form is renamed
+ *   `empyrean_transform_coordinates_single`;
+ * - `empyrean_get_observers` gains `frame` / `origin` parameters.
+ *
+ * Fields are only ever appended, never reordered or removed, so the two
+ * signature changes are the only source-breaking ones — a consumer
+ * built against an older header must recompile against this one either
+ * way.
  */
-#define EMPYREAN_ABI_VERSION 2
+#define EMPYREAN_ABI_VERSION 3
 
 /**
  * Auto: selects the central body (heliocentric vs Earth-centric)
@@ -518,6 +604,26 @@ typedef struct Session Session;
 #define EMPYREAN_UNCERTAINTY_MIXTURE 5
 
 /**
+ * Substitute the perturber's SPK state and skip integration. The
+ * historical behaviour and the `memset(0)` default.
+ *
+ * The SPK is the authoritative solution for that body, so the returned
+ * states are exact *for the body itself* — but the caller's own initial
+ * condition is discarded, and nothing is integrated, so there is no
+ * dense trajectory, no STM, and no sensitivity chain. Ephemeris
+ * generation and the radar forward model both read the dense trajectory
+ * and therefore **fail** for an overlapped body under this policy; pass
+ * [`EMPYREAN_EPHEMERIS_OVERLAP_POLICY_EXCLUDE_AND_INTEGRATE`] there.
+ */
+#define EMPYREAN_EPHEMERIS_OVERLAP_POLICY_SUBSTITUTE_SPK 0
+
+/**
+ * Drop the overlapped perturber from the force model and integrate the
+ * caller's own initial conditions, reporting the overlap.
+ */
+#define EMPYREAN_EPHEMERIS_OVERLAP_POLICY_EXCLUDE_AND_INTEGRATE 1
+
+/**
  * Resolved-kind tag values for [`EmpyreanPropagatedState::resolved_kind`].
  *
  * Mirrors [`empyrean_core::propagation::CovarianceKind`]; carries the
@@ -565,6 +671,23 @@ typedef struct Session Session;
  * `_cartesian` accessor (which only classifies, never repairs).
  */
 #define EMPYREAN_COVARIANCE_QUALITY_REPAIRED 2
+
+/**
+ * The matrix is positive definite, **but** the Taylor expansion that
+ * produced it shows signs of having left its validity domain — the
+ * beyond-linear correction is large relative to the linear spread.
+ * `quality_kappa_state` carries the block-wise quadratic/linear ratio
+ * that triggered it; `quality_min_eig` is NaN (there is no negative
+ * eigenvalue — the matrix is definite).
+ *
+ * The moments are still the ones that were requested, but they must
+ * **not** be presented as an authoritative Gaussian: an unflagged
+ * second-order result through a deep close approach has been observed
+ * ~10³× wide of the Monte-Carlo truth. Surfaced as its own tag rather
+ * than folded into `POSITIVE_DEFINITE`, which would hide the
+ * degradation behind a clean bill of health.
+ */
+#define EMPYREAN_COVARIANCE_QUALITY_EXPANSION_SUSPECT 3
 
 /**
  * Generic Cartesian-state second moment.
@@ -632,6 +755,23 @@ typedef struct Session Session;
 #define EMPYREAN_TAGGED_COV_SAMPLE_COVARIANCE_MISSING -9
 
 /**
+ * The result's sensitivity chains and its per-orbit row counts have
+ * different lengths, so `orbit_index` does not name the same orbit in
+ * both and no row can be addressed for it safely. Refused for the whole
+ * result rather than served with a shifted pairing that is undetectable
+ * per entry.
+ */
+#define EMPYREAN_TAGGED_COV_CHAIN_ORBIT_COUNT_MISMATCH -10
+
+/**
+ * The state row addressed for a sample-based epoch is stamped with a
+ * DIFFERENT epoch than the sensitivity chain names for it (or does not
+ * exist). Refused at the seam: a covariance served under another
+ * epoch's label is invisible in the returned series.
+ */
+#define EMPYREAN_TAGGED_COV_SAMPLE_ROW_EPOCH_MISMATCH -11
+
+/**
  * A panic was caught at the boundary.
  */
 #define EMPYREAN_TAGGED_COV_PANIC -99
@@ -652,8 +792,69 @@ struct EmpyreanBuiltSystem;
  * C FFI opaque handle. Internally an [`empyrean_core::Context`]; the
  * C header forward-declares `struct EmpyreanContext` — callers only
  * see the pointer.
+ *
+ * # Thread safety
+ *
+ * A built `EmpyreanContext` is **read-only and safe to share across
+ * threads**: one pointer may be handed to any number of concurrent
+ * `empyrean_propagate` / `empyrean_generate_ephemeris` /
+ * `empyrean_determine` calls without external locking. Build it once
+ * and share it — construction is the expensive part (it loads the whole
+ * kernel set), and every constructor here is serialized internally
+ * through [`CONSTRUCT_LOCK`] because the engine's first-init kernel
+ * provisioning does writable-cache file I/O that is not concurrency
+ * safe.
+ *
+ * The two `&mut`-shaped entry points — [`empyrean_context_with_spk`] and
+ * [`empyrean_context_free`] — are the exceptions: they mutate or destroy
+ * the context, so the caller must guarantee no other thread is using the
+ * pointer for the duration of the call. `with_spk` takes the same
+ * construction lock; `free` cannot.
  */
 typedef Context EmpyreanContext;
+
+/**
+ * Options for [`empyrean_context_from_data_dir_with`].
+ *
+ * `memset(0)` — or passing a `NULL` pointer instead of the struct —
+ * selects exactly what [`empyrean_context_from_data_dir`] does. Set only
+ * the fields you are changing.
+ */
+struct EmpyreanDataDirOptions {
+    /**
+     * Whether the constructor may reach the network — one of the
+     * `EMPYREAN_DATA_REFRESH_*` constants. `0` = DEFAULT (on).
+     */
+    uint8_t refresh;
+    /**
+     * Force-model tier whose kernel set is acquired and loaded — one of
+     * the `EMPYREAN_DATA_TIER_*` constants. `0` = DEFAULT (Standard).
+     *
+     * Note the deliberate offset from
+     * `EmpyreanPropagationConfig::force_model`; see
+     * [`EMPYREAN_DATA_TIER_DEFAULT`].
+     */
+    int32_t tier;
+};
+
+/**
+ * The data files a strict-offline construction found absent.
+ *
+ * Populated by [`empyrean_missing_data_files`]; release it with
+ * [`empyrean_missing_data_files_free`].
+ */
+struct EmpyreanMissingDataFiles {
+    /**
+     * Heap array of `num_files` NUL-terminated UTF-8 file names, or
+     * null when `num_files == 0`.
+     */
+    char **files;
+    /**
+     * Number of missing files. `0` when the last error on this thread
+     * was not a missing-data-files failure.
+     */
+    uintptr_t num_files;
+};
 
 /**
  * Per-crate version strings reported by the empyrean stack.
@@ -689,6 +890,9 @@ struct EmpyreanVersions {
  * duplicate definition exists so cbindgen (which has `parse_deps =
  * false`) can emit the matching C struct in `empyrean.h` without
  * traversing into the empyrean-core crate.
+ *
+ * `Copy` is a Rust-side convenience only (the batched transform writes
+ * whole rows into a caller-owned array); the C layout is unaffected.
  */
 struct CoordinateState {
     double epoch_mjd_tdb;
@@ -1269,6 +1473,27 @@ struct EmpyreanPropagationConfig {
      */
     uintptr_t num_threads;
     struct EmpyreanAdvancedIntegratorConfig advanced;
+    /**
+     * What to do when the propagated state coincides with an SB441-N16
+     * perturber's own SPK ephemeris — see the
+     * `EMPYREAN_EPHEMERIS_OVERLAP_POLICY_*` constants. `0` = `SUBSTITUTE_SPK`
+     * (the historical behaviour, so `memset(0)` keeps its meaning);
+     * `1` = `EXCLUDE_AND_INTEGRATE`. Any other value is rejected.
+     *
+     * **When it is consulted.** Overlap detection is on by default and
+     * is what decides whether this field is read at all — but the engine
+     * suppresses detection entirely whenever `excluded_perturbers_naif`
+     * is non-empty, on the grounds that a caller who named exclusions
+     * has already made the call this policy would make for them. So
+     * setting `EXCLUDE_AND_INTEGRATE` *together with* any explicit
+     * exclusion is a no-op: use one or the other, not both. The
+     * detection toggle itself is not exposed at this ABI.
+     *
+     * Appended at the tail of the struct deliberately: growing a
+     * `#[repr(C)]` config at the end is the only way to extend it
+     * without moving an existing field's offset.
+     */
+    int32_t ephemeris_overlap_policy;
 };
 
 /**
@@ -1588,6 +1813,11 @@ struct EmpyreanPropagationResult {
 
 /**
  * A single observer state for the C API.
+ *
+ * The state is expressed in the `(frame, origin)` basis carried in the
+ * two tail fields. Before ABI 3 the basis was an undeclared ICRF / SSB
+ * assumption baked into the field docs; it is now on the struct, so a
+ * consumer reading a row never has to infer which basis produced it.
  */
 struct EmpyreanObserver {
     /**
@@ -1599,13 +1829,13 @@ struct EmpyreanObserver {
      */
     double epoch_mjd_tdb;
     /**
-     * Position in ICRF relative to SSB (AU).
+     * Position in the `(frame, origin)` basis below (AU).
      */
     double x;
     double y;
     double z;
     /**
-     * Velocity in ICRF relative to SSB (AU/day).
+     * Velocity in the `(frame, origin)` basis below (AU/day).
      */
     double vx;
     double vy;
@@ -1614,21 +1844,59 @@ struct EmpyreanObserver {
      * Observing night as YYYYMMDD integer, or -1 if unavailable.
      */
     int32_t observing_night;
+    /**
+     * Reference frame the state is expressed in: 0=ICRF,
+     * 1=EclipticJ2000 (same encoding as
+     * `EmpyreanPropagationConfig::frame`).
+     *
+     * Appended at the tail of the struct deliberately: growing a
+     * `#[repr(C)]` record at the end is the only way to extend it
+     * without moving an existing field's offset.
+     */
+    int32_t frame;
+    /**
+     * NAIF id of the body the state is relative to (0 = solar-system
+     * barycenter, 399 = Earth, …), same encoding as
+     * `EmpyreanPropagatedState::origin`.
+     */
+    int32_t origin;
 };
 
 /**
  * Ephemeris-generation configuration.
  *
- * Wraps the inner [`EmpyreanPropagationConfig`] (force model,
- * uncertainty method, output frame) plus the light-time iteration
- * controls and a diagnostics toggle. The propagation runs internally
- * to bring each orbit to its observation epoch, so every
- * propagation-level knob applies here too.
+ * Wraps the inner [`EmpyreanPropagationConfig`] plus the light-time
+ * iteration controls and a diagnostics toggle. The propagation runs
+ * internally to bring each orbit to its observation epoch, so the
+ * propagation-level knobs the integrator consults apply here too:
+ * `force_model`, `excluded_perturbers_naif`, `uncertainty_method`,
+ * `compute_stm`, `frame`, `num_threads`, `ephemeris_overlap_policy`, and the
+ * whole `advanced` block.
+ *
+ * Two blocks do **not** apply: `events` and `diagnostics`. Ephemeris
+ * generation runs with event detection and timeseries diagnostics off
+ * and [`EmpyreanEphemerisResult`] carries no channel for either, so
+ * setting a field in either block is refused with an error naming it
+ * rather than accepted and dropped. Leave both zeroed (a `memset(0)`
+ * config is valid); use `empyrean_propagate` when you need them.
+ *
+ * # Generating for an SB441-N16 body
+ *
+ * `ephemeris_overlap_policy` matters more here than on `empyrean_propagate`.
+ * Under the default `EMPYREAN_EPHEMERIS_OVERLAP_POLICY_SUBSTITUTE_SPK` the engine
+ * skips integration for a target that coincides with one of its own
+ * perturbers — and ephemeris generation reads the dense trajectory that
+ * integration would have produced, so the call **fails** for any
+ * SB441-N16 body at Standard tier. Pass
+ * `EMPYREAN_EPHEMERIS_OVERLAP_POLICY_EXCLUDE_AND_INTEGRATE` (or exclude the body
+ * via `excluded_perturbers_naif`) to generate ephemerides for one.
  */
 struct EmpyreanEphemerisConfig {
     /**
      * Inner propagation configuration applied to the trajectory that
-     * brings each orbit to its observation epoch.
+     * brings each orbit to its observation epoch. The `events` and
+     * `diagnostics` sub-blocks must be left zeroed — see the struct
+     * docs.
      */
     struct EmpyreanPropagationConfig propagation;
     /**
@@ -2672,6 +2940,13 @@ struct EmpyreanWeightingLayer {
      * (days). Must be finite and > 0 — the production value is 0.5.
      * Non-positive or non-finite values are rejected with an error
      * (0.0 no longer silently maps to 0.5).
+     *
+     * The de-weighting **law** is not selectable at this ABI: a
+     * `NIGHTLY_DEWEIGHTING` layer always applies Vereš, Farnocchia,
+     * Chesley & Chamberlin (2017) §3 — σ unchanged for a batch of
+     * N ≤ 4, then σ_eff = σ√(N/4). The pre-2017 σ_eff = σ√N law the
+     * engine still carries as a historical baseline is deliberately
+     * not exposed here.
      */
     double max_gap_days;
 };
@@ -4125,8 +4400,10 @@ struct EmpyreanTaggedCovariance {
     uint8_t quality;
     /**
      * `min_eig` for INDEFINITE / REPAIRED; `f64::NAN` for
-     * POSITIVE_DEFINITE. **Read-only provenance** — `isnan`-guard before
-     * any arithmetic; never feed to a clamp.
+     * POSITIVE_DEFINITE and EXPANSION_SUSPECT (both are definite, so
+     * there is no negative eigenvalue to report). **Read-only
+     * provenance** — `isnan`-guard before any arithmetic; never feed to
+     * a clamp.
      */
     double quality_min_eig;
     /**
@@ -4159,6 +4436,20 @@ struct EmpyreanTaggedCovariance {
      * `EMPYREAN_TARGET_FUNCTIONAL_*` (always CARTESIAN_STATE on this accessor).
      */
     uint8_t target_functional;
+    /**
+     * κ_state — the block-wise quadratic/linear ratio that classified
+     * this covariance `EMPYREAN_COVARIANCE_QUALITY_EXPANSION_SUSPECT`.
+     * `f64::NAN` for every other quality (the measure is only computed
+     * where the expansion validity is in question), and `f64::INFINITY`
+     * when a zero-spread block carried a nonzero second-order
+     * correction. **Read-only provenance** — `isnan`-guard before any
+     * arithmetic.
+     *
+     * Appended at the tail of the struct deliberately: growing a
+     * `#[repr(C)]` result at the end is the only way to extend it
+     * without moving an existing field's offset.
+     */
+    double quality_kappa_state;
 };
 
 /**
@@ -4307,6 +4598,67 @@ struct EmpyreanStateResult {
  * `empyrean_context_free()`.
  */
  EmpyreanContext *empyrean_context_from_data_dir(const char *data_dir);
+
+/**
+ * Create a new `EmpyreanContext` from a data directory under explicit
+ * options — the superset of [`empyrean_context_from_data_dir`].
+ *
+ * Pass `options = NULL` (or a `memset(0)` struct) for exactly the
+ * behaviour of [`empyrean_context_from_data_dir`]: acquire and load the
+ * full Standard-tier kernel set, downloading anything missing.
+ *
+ * # Strict offline
+ *
+ * `options->refresh = EMPYREAN_DATA_REFRESH_OFF` is the reason this
+ * entry point exists. It resolves the tier's kernels from `data_dir`
+ * alone and fails if any is absent, naming **every** missing file
+ * through [`empyrean_missing_data_files`] — villeneuve's kernels plus
+ * the catalog-debiasing table — so an offline context can never come up
+ * silently missing part of its data. No lower-tier fallback, no
+ * download-just-this-one, no partially-loaded context.
+ *
+ * This entry point reads **no environment variable** to decide
+ * `refresh`. `EMPYREAN_OFFLINE` is a *channel*-level floor applied by
+ * the layers above (the Rust wrapper, the CLI, the Python package); the
+ * C ABI honours exactly what the caller passed.
+ *
+ * Returns a heap-allocated pointer on success, or null on error. Call
+ * `empyrean_last_error()` for the message, and
+ * [`empyrean_missing_data_files`] for the structured file list when the
+ * failure was a strict-offline shortfall. The caller owns the returned
+ * pointer and must free it with `empyrean_context_free()`.
+ */
+
+EmpyreanContext *empyrean_context_from_data_dir_with(const char *data_dir,
+                                                     const struct EmpyreanDataDirOptions *options);
+
+/**
+ * Retrieve the structured file list from the most recent
+ * missing-data-files failure on this thread.
+ *
+ * The companion to `empyrean_last_error()`: that returns the rendered
+ * message, this returns the list the message was rendered from, so a
+ * caller can fetch or report exactly those names instead of splitting a
+ * string (file names may contain the separator).
+ *
+ * Returns 0 and fills `out` on success. `out->num_files == 0` — with
+ * `out->files` null — means the last error on this thread was not a
+ * missing-data-files failure; it is not itself an error. Returns `-1`
+ * for a null `out`, `-5` on allocation failure, `-99` on a caught panic.
+ *
+ * The list is thread-local and is cleared by the next call that records
+ * an error on this thread, so read it immediately after the failing
+ * call. **The caller owns `out` and must release it with
+ * [`empyrean_missing_data_files_free`].**
+ */
+ int32_t empyrean_missing_data_files(struct EmpyreanMissingDataFiles *out);
+
+/**
+ * Free an [`EmpyreanMissingDataFiles`] populated by
+ * [`empyrean_missing_data_files`]. Passing a null or zeroed struct is a
+ * no-op; the struct is left zeroed so a double free is safe.
+ */
+ void empyrean_missing_data_files_free(struct EmpyreanMissingDataFiles *out);
 
 /**
  * Free an `EmpyreanContext` previously returned by `empyrean_context_new()`.
@@ -4718,11 +5070,52 @@ int32_t empyrean_split_gaussian(const double (*mean)[6],
                                 double (*covariances_out)[6][6]);
 
 /**
- * Compute observer states for given observatory codes and epochs.
+ * Compute observer states for given observatory codes and epochs, in a
+ * caller-chosen `(frame, origin)` basis.
  *
- * Returns 0 on success, negative error code on failure.
- * On success, `result_out` is populated with observer states.
- * The caller must free the result with `empyrean_observer_result_free()`.
+ * The result is the Cartesian product `obs_codes × epochs`, **code-major**:
+ * all epochs for `obs_codes[0]`, then all epochs for `obs_codes[1]`, so
+ * `observers[i * num_epochs + j]` is `(obs_codes[i], epochs[j])`.
+ *
+ * # Choosing a basis
+ *
+ * `frame = 0` (ICRF) with `origin = 0` (solar-system barycenter) is the
+ * **construction basis** — the one every consumer of an observer state
+ * requires, and the one to pass when the observers are headed for
+ * `empyrean_generate_ephemeris`,
+ * `empyrean_builtsystem_generate_ephemeris`, or orbit determination.
+ * Requesting it takes no transform at all: the observers come back
+ * exactly as constructed, bit for bit. Any other basis rotates and/or
+ * translates them, which is what a consumer plotting observer geometry
+ * wants (e.g. heliocentric ecliptic site positions via
+ * `frame = 1`, `origin = 10`).
+ *
+ * Each returned row carries the basis it is expressed in
+ * ([`EmpyreanObserver::frame`] / [`EmpyreanObserver::origin`]), so a
+ * row is never ambiguous about which basis produced it.
+ *
+ * # Returns
+ *
+ * `0` on success; `result_out` is populated and the caller must free it
+ * with `empyrean_observer_result_free()`.
+ *
+ * Every rejection aborts the whole call — there is no partial output and
+ * no silently untransformed entry. The failure codes are split by
+ * **remedy**, not flattened, because a channel that collapses them tells
+ * an operator to fix their input when the fix is on disk:
+ *
+ * - `-1` — retry with different arguments: an observatory code is not in
+ *   the registry; `frame` is one an observer cannot be rotated into
+ *   (anything outside ICRF ↔ EclipticJ2000); `origin` names an MPC site
+ *   rather than an SPK body; a null pointer or non-UTF-8 code.
+ * - `-2` — load or fetch data, the arguments are fine: the code names a
+ *   space telescope whose SPK is not loaded; `origin` has no SPK
+ *   coverage at a requested epoch; an epoch falls outside the loaded
+ *   BPC's window, or this context carries no BPC / no observatory
+ *   registry at all.
+ * - `-5` — allocation failure. `-99` — a panic was caught at the boundary.
+ *
+ * Call `empyrean_last_error()` for the message in every failing case.
  */
 
 int32_t empyrean_get_observers(const EmpyreanContext *ctx,
@@ -4730,6 +5123,8 @@ int32_t empyrean_get_observers(const EmpyreanContext *ctx,
                                uintptr_t num_codes,
                                const double *epochs_mjd_tdb,
                                uintptr_t num_epochs,
+                               int32_t frame,
+                               int32_t origin,
                                struct EmpyreanObserverResult *result_out);
 
 /**
@@ -5229,17 +5624,83 @@ int32_t empyrean_get_states(const EmpyreanContext *ctx,
  int32_t empyrean_mjd_to_iso(double mjd, int32_t scale, char *out_buf, uintptr_t buf_len);
 
 /**
- * Transform a coordinate state to a new representation, frame, and/or origin.
+ * Transform a **batch** of coordinate states to a new representation,
+ * frame, and/or origin.
+ *
+ * The batched form carries the main name; the unit of work is
+ * [`empyrean_transform_coordinates_single`]. Element `i` of `states_out`
+ * is **bit-identical** to that function applied to `states[i]` with the
+ * same target arguments, so batching is a scheduling choice and never a
+ * numerical one.
+ *
+ * `states` and `states_out` are both caller-owned arrays of exactly
+ * `num_states` elements — nothing is heap-allocated here and there is no
+ * result to free. They may not overlap. `num_states == 0` is a valid
+ * no-op call (both pointers are then ignored and may be null).
+ *
+ * # What the batch does and does not buy
+ *
+ * Two costs in the transform pipeline do not depend on the individual
+ * state and the engine pays each once per distinct key rather than once
+ * per state: gravitational-parameter resolution (keyed on the origin)
+ * and the origin shift (keyed on `(from, to, epoch)`). States sharing an
+ * epoch — a catalogue snapshot, a sigma-point cloud — reuse one shift.
+ *
+ * Note what that does **not** buy: those memos are scoped to the
+ * context, not to the call, so a loop over
+ * [`empyrean_transform_coordinates_single`] on the same context hits
+ * them too. Measured against such a loop the batch is ~17% faster from a
+ * thousand states up and indistinguishable at one — what it saves is the
+ * per-call boundary crossing, not the shift. Reach for it for the shape
+ * (one call, one error, one index) rather than for a large speedup. A
+ * batch that reuses nothing costs the same as the equivalent
+ * single-state loop rather than more.
+ *
+ * # Returns
+ *
+ * `0` on success. `-1` for a null pointer or an unresolvable target
+ * basis — an argument-shaped failure of the call as a whole; `-2` when
+ * an individual element fails, whether the input state is malformed,
+ * the engine refuses it, or its result cannot be marshaled back out.
+ * **Fail-fast, with the index**: the first failing element aborts the
+ * batch, `states_out` is left untouched, and `empyrean_last_error()`
+ * names the zero-based index of the element that failed along with its
+ * underlying cause. No partial output is ever written — a batch either
+ * transforms completely or not at all.
+ */
+
+int32_t empyrean_transform_coordinates(const EmpyreanContext *ctx,
+                                       const struct CoordinateState *states,
+                                       uintptr_t num_states,
+                                       int32_t target_representation,
+                                       int32_t target_frame,
+                                       int32_t target_origin,
+                                       struct CoordinateState *states_out);
+
+/**
+ * Transform **one** coordinate state to a new representation, frame,
+ * and/or origin.
+ *
+ * The single-state unit of work; [`empyrean_transform_coordinates`] is
+ * the batched form that transforms a whole array in one call. Reach for
+ * the batch when a whole table is going to the same target basis — for
+ * the call shape (one call, one error, one index), not for a large
+ * speedup: the engine's memos are scoped to the context, so a loop over
+ * this function on the same context amortizes them just as well. See
+ * that function's docs for the measurement.
+ *
+ * Covariance is propagated through the Jacobian of the transformation
+ * when the input state carries one.
  *
  * Returns 0 on success or a negative error code on failure.
  * Call `empyrean_last_error()` to retrieve the error message on failure.
  */
 
-int32_t empyrean_transform_coordinates(const EmpyreanContext *ctx,
-                                       const struct CoordinateState *input,
-                                       int32_t target_representation,
-                                       int32_t target_frame,
-                                       int32_t target_origin,
-                                       struct CoordinateState *output);
+int32_t empyrean_transform_coordinates_single(const EmpyreanContext *ctx,
+                                              const struct CoordinateState *input,
+                                              int32_t target_representation,
+                                              int32_t target_frame,
+                                              int32_t target_origin,
+                                              struct CoordinateState *output);
 
 #endif  /* EMPYREAN_H */

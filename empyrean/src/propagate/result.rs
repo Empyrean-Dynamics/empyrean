@@ -79,6 +79,22 @@ pub enum CovarianceQuality {
         /// The most-negative eigenvalue before the PSD repair.
         min_eig: f64,
     },
+    /// Definite, but the second-order expansion that produced it is not
+    /// clearly valid at this epoch: the quadratic term is not small
+    /// against the linear one.
+    ///
+    /// Deliberately **not** folded into
+    /// [`PositiveDefinite`](Self::PositiveDefinite) — the matrix is
+    /// definite, so a consumer checking only for definiteness would
+    /// receive a degraded covariance with a clean bill of health.
+    ExpansionSuspect {
+        /// κ_state, the block-wise quadratic/linear ratio that produced
+        /// this classification. `f64::INFINITY` when a zero-spread block
+        /// carried a nonzero second-order correction. **Read-only
+        /// provenance** — `is_nan`/`is_infinite`-guard before any
+        /// arithmetic; never feed it to a clamp.
+        kappa_state: f64,
+    },
 }
 
 /// The functional a covariance's second moment describes.
@@ -149,6 +165,11 @@ impl TaggedCovariance {
             empyrean_sys::EMPYREAN_COVARIANCE_QUALITY_REPAIRED => CovarianceQuality::Repaired {
                 min_eig: s.quality_min_eig,
             },
+            empyrean_sys::EMPYREAN_COVARIANCE_QUALITY_EXPANSION_SUSPECT => {
+                CovarianceQuality::ExpansionSuspect {
+                    kappa_state: s.quality_kappa_state,
+                }
+            }
             other => {
                 return Err(Error::invalid_input(format!(
                     "C ABI returned unknown covariance quality tag: {other}"
@@ -205,8 +226,13 @@ pub struct PropagatedState {
     /// covariance at a close approach use
     /// [`PropagationResult::covariance_series_cartesian`].
     pub covariance: Option<[[f64; 6]; 6]>,
-    /// State Transition Matrix Φ(t, t₀). `None` unless first- or
-    /// second-order uncertainty propagation produced it.
+    /// State Transition Matrix Φ(t, t₀). `None` unless the propagation
+    /// traced it — which happens when first- or second-order uncertainty
+    /// propagation produced it from an input covariance, **or** when
+    /// [`PropagationConfig::compute_stm`](super::PropagationConfig::compute_stm)
+    /// requested the trace outright. `compute_stm` does not need an input
+    /// covariance: it forces the hyperdual integration on its own, so an
+    /// orbit with no covariance still comes back with an STM.
     pub stm: Option<[[f64; 6]; 6]>,
     /// State Transition Tensor Ψ(t, t₀):
     /// `stt[k][a][b] = ∂²x_k / ∂x₀_a ∂x₀_b`. `None` unless

@@ -147,6 +147,12 @@ println!("{} states, {} events", result.states.len(), result.events.len());
 # on macOS; honors EMPYREAN_DATA_DIR).
 empyrean init
 
+# On an air-gapped machine, --no-refresh never touches the network: it
+# loads what --data-dir already holds and fails naming every absent file
+# rather than downloading or quietly loading less. Accepted on every
+# command; `empyrean init --no-refresh` is a pure verifier.
+empyrean --no-refresh init
+
 # Propagate Apophis 10 years past its SBDB epoch (epoch ≈ 61269 → 64922 MJD TDB).
 empyrean propagate --object-id 99942 --epoch 64922.0 --out-dir ./out
 
@@ -185,7 +191,7 @@ print(result.ephemeris.to_dataframe())
 #### Rust
 
 ```rust,no_run
-use empyrean::{Context, Epoch, EphemerisConfig};
+use empyrean::{Context, EphemerisConfig, Epoch, Frame, Origin};
 
 let ctx = Context::from_data_dir(None)?;
 let batch = empyrean::query_sbdb(&["99942"], None)?;
@@ -196,8 +202,9 @@ let epochs = vec![
     Epoch::from_mjd_tdb(t0 + 60.0),
 ];
 
-// Observer states at Mauna Kea (MPC code 568) for each epoch.
-let observers = ctx.get_observers(&["568"], &epochs)?;
+// Observer states at Mauna Kea (MPC code 568) for each epoch, in the
+// construction basis every ephemeris consumer requires.
+let observers = ctx.get_observers(&["568"], &epochs, Frame::ICRF, Origin::SSB)?;
 let result = ctx.generate_ephemeris(
     &batch.orbits,
     &observers,

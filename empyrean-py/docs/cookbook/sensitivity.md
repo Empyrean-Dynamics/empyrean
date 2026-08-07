@@ -5,6 +5,36 @@ The {class}`~empyrean.StateSensitivities` and
 transition matrices (and their second-order tensors) for use in
 covariance propagation, nonlinearity diagnostics, and Bayesian updates.
 
+## Getting a table in the first place
+
+Partials exist whenever the propagation **traced the STM** — not, as the
+docs used to say, whenever an input covariance was supplied. An input
+covariance is one way to make the engine trace it; asking directly is
+the other, and it is the one to reach for when there is no prior:
+
+```python
+from empyrean import PropagationConfig
+
+result = empyrean.propagate(
+    orbits, epochs, config=PropagationConfig(compute_stm=True)
+)
+result.sensitivity      # populated, with no input covariance anywhere
+```
+
+`compute_stm` applies on the ephemeris path too, where it fills the
+observation Jacobians on
+{attr}`~empyrean.EphemerisResult.sensitivity`:
+
+```python
+eph = empyrean.generate_ephemeris(
+    orbits,
+    observers,
+    config=empyrean.EphemerisConfig(
+        propagation=PropagationConfig(compute_stm=True)
+    ),
+)
+```
+
 ## Filter to one chain
 
 Sensitivity tables hold every `(orbit, epoch)` row across all

@@ -146,10 +146,24 @@ An axis that was not solved carries `EMPYREAN_SLOT_NONE`. The leading
 `width` are reserved (zero), not defaulted covariance. A consumer
 compiled against a given `EMPYREAN_SOLVE_WIDTH` should confirm the
 runtime library agrees by checking `empyrean_abi_version()` against
-`EMPYREAN_ABI_VERSION` at load — the v0.9.0 release ships ABI
-version 2. Version 2 grew several result structs — fields are only ever
-appended, never reordered or removed — so a consumer built against the
-version-1 header must recompile against the version-2 header.
+`EMPYREAN_ABI_VERSION` at load. Version 2 grew several result structs.
+Version 3 is one batched break:
+
+- `EmpyreanPropagationConfig` gains `ephemeris_overlap_policy` at its tail (and so
+  does the `EmpyreanEphemerisConfig` that embeds it);
+- `EmpyreanObserver` gains `frame` / `origin` — the basis its state is
+  expressed in, which used to be an undeclared ICRF / SSB assumption;
+- `EmpyreanTaggedCovariance` gains `quality_kappa_state`, the payload of
+  the new `EMPYREAN_COVARIANCE_QUALITY_EXPANSION_SUSPECT` tag;
+- `empyrean_transform_coordinates` becomes the **batched** entry point
+  (array in, array out) and the one-state form is renamed
+  `empyrean_transform_coordinates_single`;
+- `empyrean_get_observers` gains `frame` / `origin` parameters.
+
+Struct fields are only ever appended, never reordered or removed, so the
+two signature changes are the only source-breaking ones — a consumer
+built against an older header must recompile against the current one
+either way.
 
 ### Covariance trust & per-observation diagnostics
 

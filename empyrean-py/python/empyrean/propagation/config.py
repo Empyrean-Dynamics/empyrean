@@ -304,6 +304,36 @@ class IntegratorChoice(str, enum.Enum):
     looser median Horizons error (~358 m vs GR15's ~35 m)."""
 
 
+class EphemerisOverlapPolicy(str, enum.Enum):
+    """What to do when the propagated state coincides with an SB441-N16
+    perturber's own SPK ephemeris — the self-perturbation case, where a
+    body is both the thing being propagated and one of the forces
+    acting on it.
+
+    All sixteen SB441-N16 bodies (1 Ceres, 2 Pallas, 4 Vesta, 7 Iris, …)
+    are simultaneously members of the Standard force model and
+    legitimate objects to propagate.
+    """
+
+    SUBSTITUTE_SPK = "substitute_spk"
+    """Return the perturber's own SPK states and skip integration.
+    Default, and the historical behaviour.
+
+    The SPK is the authoritative solution for that body, so for the body
+    itself these states are exact. What it costs: the caller's initial
+    condition is **discarded**, and nothing is integrated, so there is no
+    dense trajectory, no STM, and no sensitivity chain — which is why
+    :func:`empyrean.generate_ephemeris` fails outright for such a body
+    under this policy."""
+
+    EXCLUDE_AND_INTEGRATE = "exclude_and_integrate"
+    """Drop the overlapped perturber from the force model, integrate the
+    caller's own initial conditions, and report the overlap.
+
+    This is what generating an ephemeris for an SB441-N16 body at
+    Standard tier requires."""
+
+
 @dataclass
 class OriginSwitchingConfig:
     """Trajectory splitting at body acceleration-dominance boundaries
@@ -381,7 +411,10 @@ class PropagationConfig:
         and the parameterized variants
         (:class:`SigmaPoint`, :class:`MonteCarlo`, :class:`GaussianMixture`).
     compute_stm : bool
-        Produce STMs even when the input has no covariance.
+        Produce STMs even when the input has no covariance. Applies on
+        the ephemeris path too — an :class:`EphemerisConfig` carrying
+        ``propagation.compute_stm=True`` comes back with observation
+        Jacobians for an orbit that has no covariance attached.
     frame : Frame
         Output reference frame.
     events : EventConfig
@@ -396,6 +429,16 @@ class PropagationConfig:
         not within a single trajectory.
     advanced : AdvancedIntegratorConfig
         Integrator-tuning knobs (rarely touched).
+    ephemeris_overlap_policy : EphemerisOverlapPolicy
+        What to do when the propagated state coincides with an
+        SB441-N16 perturber's own SPK ephemeris. Default
+        ``SUBSTITUTE_SPK``; see :class:`EphemerisOverlapPolicy`.
+
+        Overlap *detection* is on by default and decides whether this
+        is consulted at all — and the engine suppresses detection
+        whenever ``excluded_perturbers`` is non-empty, so setting
+        ``EXCLUDE_AND_INTEGRATE`` alongside an explicit exclusion does
+        nothing. Use one or the other.
     """
 
     force_model: ForceModelTier = ForceModelTier.STANDARD
@@ -407,6 +450,7 @@ class PropagationConfig:
     diagnostics: DiagnosticsConfig = field(default_factory=DiagnosticsConfig)
     num_threads: int | None = None
     advanced: AdvancedIntegratorConfig = field(default_factory=AdvancedIntegratorConfig)
+    ephemeris_overlap_policy: EphemerisOverlapPolicy = EphemerisOverlapPolicy.SUBSTITUTE_SPK
 
     # ── Back-compat shim ─────────────────────────────────────
     @property
@@ -505,6 +549,7 @@ class PropagationConfig:
                     "hysteresis": adv.origin_switching.hysteresis,
                 },
             },
+            "ephemeris_overlap_policy": _enum_str(self.ephemeris_overlap_policy),
         }
 
 

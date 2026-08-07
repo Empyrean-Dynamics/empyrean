@@ -4,6 +4,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use empyrean::OrbitBatch;
 
+use super::{DataOptions, load_context};
 use crate::ForceModel;
 use crate::io::output::{self, OutputFormat};
 
@@ -267,7 +268,7 @@ fn run_refine_path(
         .context("refine-path pass 2 (wide refine) failed")
 }
 
-pub fn run(data_dir: Option<PathBuf>, args: DetermineArgs) -> Result<()> {
+pub fn run(data: &DataOptions, args: DetermineArgs) -> Result<()> {
     // Reject a mismatched prior/axis combination before any expensive work.
     validate_prior_flags(&args)?;
 
@@ -279,9 +280,13 @@ pub fn run(data_dir: Option<PathBuf>, args: DetermineArgs) -> Result<()> {
     // The daemon protocol only carries force_model + max_iterations, so a
     // fitting request (non-grav / DT / AMRAT / thrust / photometry) must
     // run in-process — the daemon can't express it yet.
+    //
+    // `--no-refresh` also runs in-process: a running daemon's context was
+    // built under its own policy and cannot honour a strict-offline
+    // request retroactively, so serving it would quietly ignore the flag.
     let uses_fitting =
         args.solve_for != SolveForArg::Auto || args.thrust_segments > 0 || args.photometry;
-    if !uses_fitting {
+    if !uses_fitting && data.daemon_eligible() {
         let request = crate::daemon::protocol::Request::Determine {
             ades_path: args.ades_file.display().to_string(),
             force_model: args.force_model.as_str().to_string(),
@@ -300,10 +305,7 @@ pub fn run(data_dir: Option<PathBuf>, args: DetermineArgs) -> Result<()> {
     }
 
     // In-process fallback.
-    let t0 = Instant::now();
-    let ctx =
-        empyrean::Context::from_data_dir(data_dir.as_deref()).context("failed to load context")?;
-    eprintln!("Loaded context ({:.1}s)", t0.elapsed().as_secs_f64());
+    let ctx = load_context(data)?;
 
     let path_str = args.ades_file.display().to_string();
     let observations = ctx

@@ -4,6 +4,262 @@ Notable changes to the empyrean distribution — the `empyrean`, `empyrean-sys`,
 `empyrean-c`, and `empyrean-cli` crates and the `empyrean` Python package. This
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [Unreleased]
+
+C ABI version **3**. Two exported functions change signature and four
+struct sizes change (three grow directly; `EmpyreanEphemerisConfig` grows
+by embedding one of them), so this release is **source-breaking for C
+consumers** — recompile against the version-3 header. Every other symbol
+and every prior field offset is unchanged; struct growth is append-only,
+as always. The sizes are enumerated under the `EMPYREAN_ABI_VERSION`
+entry below.
+
+### Added
+
+- **Strict-offline context construction.** A context can be built with
+  the network switched off: it resolves the tier's kernel set from the
+  data directory alone and fails, **naming every absent file**, if any is
+  missing. There is no try-the-network-and-tolerate path and no
+  degrade-to-a-lower-tier path — an offline context either has the full
+  requested tier on disk or it does not get built. Available on every
+  channel: `empyrean_context_from_data_dir_with(dir, options)` with the
+  new `EmpyreanDataDirOptions { refresh, tier }` in C (a `NULL` options
+  pointer is exactly the old constructor), `Context::from_data_dir_with`
+  with `DataDirOptions` in Rust, `initialize(..., refresh=False)` in
+  Python, and the global `--no-refresh` flag on the CLI.
+- **The absent files come back as a list, not as prose.** A strict-offline
+  failure carries every missing filename as structured data rather than
+  one long message a caller has to split on a separator a filename may
+  itself contain: `empyrean_missing_data_files()` /
+  `empyrean_missing_data_files_free()` in C, `Error::missing_data_files()`
+  in Rust, and a `missing_data_files` attribute on the `FileNotFoundError`
+  Python raises. The list is complete — every file the tier needs and the
+  directory lacks, not just the first one hit.
+- **`EMPYREAN_OFFLINE=1` as a floor.** Set in the environment, it
+  downgrades a requested `refresh` to off and says so on stderr. It is a
+  floor, never an override: it can only ever *remove* network access, so
+  a machine that must not reach the network cannot have that decision
+  reversed by a library call. Only the exact value `1` asserts it.
+  Applied at the Rust wrapper layer; the C ABI itself reads no
+  environment variable. `empyrean::offline_floor_is_active()` reports
+  whether it is in force, for callers that do network work of their own
+  before building a context — the CLI uses it so `empyrean init` skips
+  its kernel download under the floor instead of covering only the load.
+
+  **Where it binds, exactly.** `Context::from_data_dir` does **not**
+  consult it: reinterpreting the older, options-less constructor would
+  change the meaning of code written before the variable existed, so a
+  Rust service calling it reaches the network regardless. Every other
+  channel does — `Context::from_data_dir_with`, Python's `initialize()`
+  (which now routes through that constructor, a behaviour change on the
+  default path), and every CLI command including `init`'s pre-context
+  download. Reach for `from_data_dir_with` when the variable should
+  apply.
+
+  The floor downgrades **every** requested `refresh: true`, including one
+  written by hand: `refresh` is a plain `bool` mirroring the engine's own
+  options bag, so "defaulted" and "explicit" are not distinguishable
+  states to branch on. A process that genuinely must reach the network on
+  such a machine unsets the variable for itself. Every downgrade is
+  announced on stderr.
+- **Ephemeris overlap policy.** `EmpyreanPropagationConfig` gains
+  `ephemeris_overlap_policy`, selecting what the engine does when a target
+  coincides with one of its own perturbers:
+  `EMPYREAN_EPHEMERIS_OVERLAP_POLICY_SUBSTITUTE_SPK` (0, the historical
+  behaviour, and what a `memset(0)` config still means) or
+  `EMPYREAN_EPHEMERIS_OVERLAP_POLICY_EXCLUDE_AND_INTEGRATE` (1). The
+  second is what generating an ephemeris for an SB441-N16 body (1 Ceres,
+  2 Pallas, 4 Vesta, …) at Standard tier requires — without it the engine
+  substitutes the body's own SPK states, produces no dense trajectory, and
+  the call fails. An unrecognized value is refused by value rather than
+  defaulted. Reachable on every channel that carries a propagation config:
+  `PropagationConfig::ephemeris_overlap_policy` / `EphemerisOverlapPolicy`
+  in Rust, and `PropagationConfig(ephemeris_overlap_policy=...)` taking
+  `"substitute_spk"` / `"exclude_and_integrate"` in Python. It is **not**
+  on the CLI, which exposes no sibling propagation knobs on the commands
+  that would need it; `empyrean ephemeris` for an SB441-N16 body has no
+  in-CLI remedy and must go through one of the other three channels.
+
+  Overlap *detection* is what decides whether the policy is consulted, it
+  is on by default, and the engine suppresses it entirely whenever the
+  exclusion list is non-empty — so setting `EXCLUDE_AND_INTEGRATE`
+  alongside an explicit `excluded_perturbers` entry does nothing. Use one
+  or the other. The detection toggle itself is not exposed at any
+  distribution layer.
+- **Observer states in a caller-chosen basis.** Observatory-code lookups
+  can be returned in any supported `(frame, origin)` rather than only the
+  ICRF / SSB construction basis — `frame` / `origin` arguments on
+  `empyrean_get_observers`, `Context::get_observers`,
+  `Observers.from_code` / `from_codes`, and `get_observer_states`. ICRF /
+  SSB remains the default and is returned untransformed, bit for bit;
+  it is still what ephemeris generation and orbit determination require.
+  Each returned row carries the basis it is actually expressed in, read
+  off the state rather than echoed from the request.
+- **Covariance-quality detail.** `EmpyreanTaggedCovariance` gains
+  `quality_kappa_state` and the `EMPYREAN_COVARIANCE_QUALITY_EXPANSION_SUSPECT`
+  verdict, so a covariance that is definite but whose expansion is not
+  trustworthy is reported as such instead of passing as clean.
+  Chain/orbit count and sample-row epoch mismatches get their own error
+  codes (`EMPYREAN_TAGGED_COV_CHAIN_ORBIT_COUNT_MISMATCH`,
+  `EMPYREAN_TAGGED_COV_SAMPLE_ROW_EPOCH_MISMATCH`) rather than being
+  collapsed onto a shared one — the two have different remedies.
+
+### Changed
+
+- **BREAKING — `empyrean_transform_coordinates` is now the batched form.**
+  It takes an array of states and an output array
+  (`states`, `num_states`, `states_out`, all caller-owned) and transforms
+  the whole batch in one call; the previous single-state shape is
+  unchanged but renamed `empyrean_transform_coordinates_single`. The
+  batched form carries the main name because a whole table going to one
+  target basis is the common call, and one call is one error instead of
+  `N`. Element `i` of a batch is **bit-identical** to the single-state
+  call on `states[i]`, so this is a call-shape choice and never a
+  numerical one — see the Python entry below for what it does and does
+  not buy in wall-clock. Failures are fail-fast and index-attributed —
+  the message names the offending element and `states_out` is left
+  untouched, so there is never a partially-written output array. The two
+  return codes are split by *what went wrong with the call*, not by where
+  the failure happened: `-1` means the arguments are wrong (a null
+  pointer, an unresolvable target basis), `-2` means element `i` failed,
+  whether it was malformed on the way in, refused by the engine, or
+  unmarshalable on the way out. Mirrored
+  as `Context::transform_coordinates` (slice) and
+  `Context::transform_coordinates_single` in Rust. C callers of the old
+  scalar function change the name; Rust callers of `Context::transform`
+  change to `transform_coordinates_single`.
+- **BREAKING — `empyrean_get_observers` gained `frame` and `origin`
+  parameters**, widened in place rather than given a sibling entry point,
+  and `EmpyreanObserver` grew `frame` / `origin` tail fields (72 → 80
+  bytes; every prior offset unchanged). Passing `0` / `0` is the
+  construction basis and exactly the old behaviour, so a `memset(0)`
+  request and an untouched consumer are unaffected beyond the recompile.
+  `Context::get_observers` takes the two arguments in Rust; `Observer`
+  gains the matching fields.
+- **BREAKING — `EMPYREAN_ABI_VERSION` is now 3.** Bumped once for the
+  whole batch of changes above. Four struct sizes change:
+  `EmpyreanPropagationConfig` grew by `ephemeris_overlap_policy`
+  (288 → 296 bytes), `EmpyreanEphemerisConfig` by embedding it
+  (312 → 320) — easy to miss, since it gained no field of its own —
+  `EmpyreanObserver` by the basis fields (72 → 80), and
+  `EmpyreanTaggedCovariance` by `quality_kappa_state` (520 → 528). Fields
+  are only ever appended, never reordered or removed.
+
+  `empyrean-sys` now **enforces** the handshake the header has always
+  documented: it calls `empyrean_abi_version()` the moment it opens
+  `libempyrean` and panics, naming both versions and the resolved path, if
+  the loaded engine disagrees. `dlsym` matches on symbol name alone, and
+  ABI 3 is the first version to change the parameter list of an existing
+  exported function, so a stale engine no longer merely returns wrong
+  values — it reads a caller's integer as an out-pointer. C consumers
+  should make the same check at load.
+- **Python `transform_coordinates` crosses the FFI once per table.** The
+  binding used to walk the table and call the single-state entry point
+  once per row; it now marshals the whole table and makes one batched
+  call. The Python surface is unchanged — still table-in, table-out — and
+  the results are bit-identical row for row. Measured against the old
+  shape it is ~17% faster from a thousand rows up and indistinguishable
+  at one row: the engine's gravitational-parameter and origin-shift memos
+  are scoped to the context, so they already amortized across successive
+  single-state calls, and what the batch saves is the per-call boundary
+  crossing. Failures are now attributed to the offending row.
+- **CLI: a global `--no-refresh`.** Accepted alongside `--data-dir` on
+  every context-building command. A command that would otherwise hand its
+  work to a running daemon runs in-process instead when the flag is set:
+  the daemon's context was built once, under its own options, and cannot
+  honour a strict-offline request retroactively — serving it anyway would
+  ignore the flag without saying so. On `init` the flag turns the command
+  into a verifier: it downloads nothing and reports exactly which files
+  the data directory is missing. `EMPYREAN_OFFLINE=1` reaches all of the
+  same places, `init`'s download included.
+
+### Fixed
+
+- **`compute_stm` reaches the engine on the ephemeris path.** The C-ABI
+  ephemeris-config converter hand-rolled its narrow config instead of
+  routing through the shared propagation converter, so every
+  propagation-level knob it did not happen to copy was silently
+  discarded — `compute_stm` above all, on **both** the one-shot and
+  handle-based entry points. A caller that asked for observation
+  sensitivities on an orbit with no covariance got a clean success code,
+  no warnings, and no partials. The converter now routes through the
+  shared one and narrows field by field with no defaulting tail, so a
+  knob added upstream breaks the build rather than starting a fresh
+  silent drop. `excluded_perturbers_naif`, `num_threads`, the
+  `ephemeris_overlap_policy` above, and the whole `advanced` block were
+  dropped by
+  the same defect and are fixed with it. The two blocks ephemeris
+  generation genuinely cannot honour — `events` and `diagnostics` — are
+  now **refused by name** rather than accepted and ignored.
+- **A non-default observer basis returned states instead of a caught
+  panic.** The first cut of the widened `empyrean_get_observers`
+  marshaled through accessors that assert ICRF / SSB, so every
+  non-default request unwound into the FFI boundary and surfaced as
+  error code `-99`.
+- **Documented contracts that described the bug.** The Python
+  `EphemerisResult.sensitivity` docs, the sensitivity-table error
+  messages, and the Rust `PropagatedState::stm` docs all said partials
+  require an input covariance. They require a *traced STM*, which an
+  input covariance produces and which `compute_stm` also produces on its
+  own. Corrected across the wrapper and the Python package.
+- **Python observation-sensitivity rows are keyed on the caller's ids.**
+  The sensitivity table carried the C ABI's synthetic `"orbit_0"` while
+  the ephemeris table beside it carried the real `orbit_id`, so the
+  documented per-chain filter — `sens.select("orbit_id", oid)` — returned
+  an empty table for every real orbit id, and `object_id` was always
+  null. Both are now recovered from the caller's input the same way the
+  ephemeris rows already were.
+- **Coordinate-state conversion failures surface.** The internal
+  coordinate-state converter used on the OD-session and orbit-write paths
+  is now fallible and its failures are propagated, rather than a sentinel
+  value being substituted for a state that could not be converted.
+- **A short batch-transform result can no longer be read back as data.**
+  The C batch wrote its output by zipping the engine's result against the
+  caller's array, so a result shorter than `num_states` would have stopped
+  early and still returned success — leaving the tail of `states_out`
+  whatever it was, which for a zeroed array is a perfectly valid
+  Cartesian / ICRF / SSB state at MJD 0. The row count is now checked
+  against the input before anything is written.
+- **Python `generate_ephemeris` no longer substitutes observer geometry.**
+  A failed observatory-code lookup — an epoch outside the loaded BPC's
+  coverage, an unknown code — fell back to the caller's own
+  position/velocity columns with `observing_night = -1`, returning
+  astrometry computed from stale geometry with a clean success, no
+  warning, and the nightly grouping the OD weighting depends on silently
+  discarded. The lookup's error now propagates. The observer table's
+  state columns are no longer sent across the boundary at all: every
+  observer is recomputed from its (code, epoch), so there is one source
+  for those numbers rather than two.
+- **`ExpansionSuspect` covariances reach the Rust and Python layers.**
+  The wrapper's tagged-covariance reader had no arm for the new quality
+  tag and rejected the whole record with "unknown covariance quality
+  tag: 3"; `quality_kappa_state` was never read. Both are now carried
+  through, as `CovarianceQuality::ExpansionSuspect { kappa_state }` in
+  Rust and as a `quality_kappa_state` column plus an `expansion_suspect`
+  member of `CovarianceQuality` in Python.
+- **The ephemeris config's Python docs no longer describe the bug they
+  were written to fix.** `EphemerisConfig` still claimed that "every
+  propagation-side knob" is set on the embedded `PropagationConfig`, a
+  sentence false in both directions: `events` and `diagnostics` are
+  hard-refused, and neither `excluded_perturbers` nor
+  `ephemeris_overlap_policy` — the two knobs that decide whether an
+  SB441-N16 ephemeris works at all — was mentioned. Rewritten to the
+  explicit list.
+- **The events / diagnostics refusal is a `ValueError` in Python.** It
+  reached the caller as a `RuntimeError` from the FFI marshaling step,
+  while the unsupported-`uncertainty_method` rejection on the same call is
+  documented as raising `ValueError`. Both are caller mistakes and both
+  now raise the same class.
+- **`empyrean-sys`'s generated shims were double-encoded.** A
+  regeneration wrote the file through a Latin-1 round trip, so every
+  em-dash, ellipsis and Greek letter in its doc text — the docs.rs surface
+  of the whole v3 API — rendered as mojibake. Nothing that compiles the
+  crate reads doc text, so no gate saw it; a test now checks both
+  generated files for the byte pattern. `shims.rs` is also generated
+  mechanically from `bindings.rs` now, so the two cannot drift in doc text
+  or signature, and the exact `bindgen` invocation is recorded at the top
+  of `bindings.rs`.
+
 ## [0.9.0] — 2026-07-21
 
 The complete output surface: every value the engine computes now crosses

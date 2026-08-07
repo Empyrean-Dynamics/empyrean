@@ -15,7 +15,7 @@
 //! ephemerides at an observatory, and inspect detected events:
 //!
 //! ```no_run
-//! use empyrean::{Context, EphemerisConfig, Origin, PropagationConfig};
+//! use empyrean::{Context, EphemerisConfig, Frame, Origin, PropagationConfig};
 //!
 //! let ctx = Context::from_data_dir(None)?;
 //!
@@ -30,7 +30,7 @@
 //! println!("{} states, {} events", result.states.len(), result.events.len());
 //!
 //! // 3. Predict on-sky positions at Mauna Kea (MPC code 568).
-//! let observers = ctx.get_observers(&["568"], &epochs)?;
+//! let observers = ctx.get_observers(&["568"], &epochs, Frame::ICRF, Origin::SSB)?;
 //! let eph_cfg = EphemerisConfig::default();
 //! let eph = ctx.generate_ephemeris(&batch.orbits, &observers, &eph_cfg)?;
 //! # Ok::<(), empyrean::Error>(())
@@ -54,7 +54,8 @@
 //!     Frame::EclipticJ2000,
 //!     Origin::SUN,
 //! );
-//! let cart = ctx.transform(&input, Representation::Cartesian, Frame::ICRF, Origin::SUN)?;
+//! let cart =
+//!     ctx.transform_coordinates_single(&input, Representation::Cartesian, Frame::ICRF, Origin::SUN)?;
 //! println!("x = {:.6} AU", cart.elements[0]);
 //! # Ok::<(), empyrean::Error>(())
 //! ```
@@ -71,7 +72,7 @@
 //! | Stateful, mask-and-refit OD            | [`Session`]                                      |
 //! | Impact probability                     | [`Context::compute_impact_probabilities`]        |
 //! | B-plane geometry                       | [`Context::compute_b_planes`]                    |
-//! | Convert between coordinate types       | [`Context::transform`]                           |
+//! | Convert between coordinate types       | [`Context::transform_coordinates`] (batch) / [`Context::transform_coordinates_single`] |
 //! | Body / observer states                 | [`Context::get_states`] / [`Context::get_observers`] |
 //! | Pull an orbit from JPL SBDB            | [`query_sbdb`]                                   |
 //! | Pull predicted ephemeris from Horizons | [`query_horizons`]                               |
@@ -122,7 +123,9 @@ pub use built_system::{
     BuiltSystem, BuiltSystemGuardError, KernelKind, KernelProvenance, KernelRecord,
     SystemDescription,
 };
-pub use context::{Context, default_data_dir, download_data};
+pub use context::{
+    Context, DataDirOptions, DataTier, default_data_dir, download_data, offline_floor_is_active,
+};
 pub use coordinate::{
     CoordinateState, Frame, Origin, Representation, frame_to_int, int_to_frame, int_to_rep,
     rep_to_int,
@@ -154,9 +157,10 @@ pub use od::{
 };
 pub use orbit::{Orbit, PhaseFunction};
 pub use propagate::{
-    AdvancedIntegratorConfig, CovarianceKind, CovarianceQuality, DiagnosticsConfig, Event,
-    EventConfig, ForceModelTier, IntegratorChoice, OriginSwitchingConfig, PropagatedState,
-    PropagationConfig, PropagationResult, TaggedCovariance, TargetFunctional, UncertaintyMethod,
+    AdvancedIntegratorConfig, CovarianceKind, CovarianceQuality, DiagnosticsConfig,
+    EphemerisOverlapPolicy, Event, EventConfig, ForceModelTier, IntegratorChoice,
+    OriginSwitchingConfig, PropagatedState, PropagationConfig, PropagationResult, TaggedCovariance,
+    TargetFunctional, UncertaintyMethod,
 };
 pub use query::{
     query_horizons, query_horizons_vectors, query_observations, query_radar, query_sbdb,

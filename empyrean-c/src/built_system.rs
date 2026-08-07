@@ -1073,6 +1073,9 @@ mod tests {
             vy: 0.0148,
             vz: 0.0064,
             observing_night: -1,
+            // The construction basis ephemeris generation requires.
+            frame: 0,  // ICRF
+            origin: 0, // solar-system barycenter
         }];
 
         // One-shot baseline.

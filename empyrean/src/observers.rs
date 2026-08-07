@@ -1,6 +1,7 @@
 //! MPC observatory code → observer state queries.
 
 use crate::context::Context;
+use crate::coordinate::{Frame, Origin, int_to_frame};
 use crate::error::{Error, Result};
 use std::ffi::CString;
 
@@ -11,23 +12,40 @@ pub struct Observer {
     pub obs_code: String,
     /// Epoch.
     pub epoch: crate::Epoch,
-    /// Position in ICRF relative to SSB (AU).
+    /// Position in the [`frame`](Self::frame) / [`origin`](Self::origin)
+    /// basis (AU).
     pub position: [f64; 3],
-    /// Velocity in ICRF relative to SSB (AU/day).
+    /// Velocity in the [`frame`](Self::frame) / [`origin`](Self::origin)
+    /// basis (AU/day).
     pub velocity: [f64; 3],
     /// Observing night as YYYYMMDD integer, or -1 if unavailable.
     pub observing_night: i32,
+    /// Reference frame [`position`](Self::position) and
+    /// [`velocity`](Self::velocity) are expressed in.
+    ///
+    /// Read off the returned state rather than echoed from the request,
+    /// so a row always reports the basis that actually produced it.
+    pub frame: Frame,
+    /// Body the state is relative to.
+    pub origin: Origin,
 }
 
 impl Observer {
-    pub(crate) fn from_ffi(o: &empyrean_sys::EmpyreanObserver) -> Self {
-        Self {
+    pub(crate) fn from_ffi(o: &empyrean_sys::EmpyreanObserver) -> Result<Self> {
+        Ok(Self {
             obs_code: obs_code_from_bytes(&o.obs_code),
             epoch: crate::Epoch::from_mjd_tdb(o.epoch_mjd_tdb),
             position: [o.x, o.y, o.z],
             velocity: [o.vx, o.vy, o.vz],
             observing_night: o.observing_night,
-        }
+            frame: int_to_frame(o.frame)?,
+            origin: Origin::from_naif_id(o.origin).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "libempyrean returned an unknown origin NAIF id: {}",
+                    o.origin
+                ))
+            })?,
+        })
     }
 }
 
@@ -37,14 +55,43 @@ pub(crate) fn obs_code_from_bytes(bytes: &[u8; 4]) -> String {
 }
 
 impl Context {
-    /// Compute observer states (cross product: codes × epochs).
+    /// Compute observer states (cross product: codes × epochs) in a
+    /// caller-chosen `(frame, origin)` basis.
     ///
     /// Returns `obs_codes.len() * epochs.len()` observer entries in
-    /// code-major order.
+    /// code-major order: all epochs for `obs_codes[0]`, then all epochs
+    /// for `obs_codes[1]`, so `result[i * epochs.len() + j]` is
+    /// `(obs_codes[i], epochs[j])`.
+    ///
+    /// # Choosing a basis
+    ///
+    /// [`Frame::ICRF`] with [`Origin::SSB`] is the **construction
+    /// basis** — the one every consumer of an observer state requires,
+    /// and the one to pass when the observers are headed for ephemeris
+    /// generation or orbit determination. Requesting it takes no
+    /// transform at all: the observers come back exactly as constructed,
+    /// bit for bit. Any other basis rotates and/or translates them, which
+    /// is what a consumer plotting observer geometry wants (e.g.
+    /// heliocentric ecliptic site positions via
+    /// `(Frame::EclipticJ2000, Origin::SUN)`).
+    ///
+    /// # Errors
+    ///
+    /// Every rejection aborts the whole call — there is no partial output
+    /// and no silently untransformed entry. The failures keep the
+    /// engine's two axes rather than being flattened onto one:
+    /// [`Error::code`] is `-1` when the remedy is different arguments (an
+    /// unknown observatory code, a frame an observer cannot be rotated
+    /// into, an origin that is an MPC site rather than an SPK body) and
+    /// `-2` when the remedy is to load or fetch data (an unfetched
+    /// spacecraft kernel, an SPK coverage gap, a BPC window that ends
+    /// before the requested epoch).
     pub fn get_observers(
         &self,
         obs_codes: &[&str],
         epochs: &[crate::Epoch],
+        frame: Frame,
+        origin: Origin,
     ) -> Result<Vec<Observer>> {
         let cstrings: Vec<CString> = obs_codes
             .iter()
@@ -69,19 +116,23 @@ impl Context {
                 ptrs.len(),
                 epochs_mjd_tdb.as_ptr(),
                 epochs_mjd_tdb.len(),
+                frame as i32,
+                origin.naif_id(),
                 &mut result,
             )
         };
         if code != 0 {
             return Err(Error::capture(code));
         }
-        let observers = unsafe {
+        let observers: Result<Vec<Observer>> = unsafe {
             std::slice::from_raw_parts(result.observers, result.num_observers)
                 .iter()
                 .map(Observer::from_ffi)
                 .collect()
         };
+        // Free before propagating: the native array is owned regardless
+        // of whether marshaling every row succeeded.
         unsafe { empyrean_sys::empyrean_observer_result_free(&mut result) };
-        Ok(observers)
+        observers
     }
 }

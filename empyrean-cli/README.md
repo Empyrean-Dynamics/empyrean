@@ -78,6 +78,8 @@ match the Python and Rust API outputs exactly — same `orbit_id` /
 `object_id` join keys, same time scales, same physical units — so you
 can mix-and-match channels for the same workflow.
 
+`empyrean show` browses what they wrote — see [Browsing output](#browsing-output).
+
 Beyond the headline pipelines: `propagate` takes `--uncertainty-method`
 (`first-order` / `second-order` / `sigma-point` / `monte-carlo` /
 `auto`) and `--tagged-covariance`; `empyrean query horizons-vectors`
@@ -86,6 +88,59 @@ manage the API response cache; and `empyrean serve` / `empyrean stop`
 run a daemon that keeps the loaded kernels in memory for faster
 subsequent commands. See `empyrean <command> --help` for the full
 flag surface.
+
+## Browsing output
+
+`empyrean show` pages through the tables the pipeline commands write —
+Parquet, CSV, or JSON — without leaving the terminal and without a
+notebook.
+
+```sh
+# List an output directory and pick a file to open.
+empyrean show --out-dir ./out
+
+# Straight into one file.
+empyrean show ./out/residuals.parquet
+```
+
+The listing gives each artifact's row count, size, and what it holds:
+
+```text
+./out
+
+    FILE                  ROWS  SIZE      DESCRIPTION
+ 1. fitted_orbit.parquet  1     21.4 KiB  Fitted orbit — solved state, covariance, and non-gravitational terms
+ 2. residuals.parquet     128   12.0 KiB  Per-observation residuals — RA/Dec, χ², and rejection outcome
+```
+
+In the pager: **space** / **enter** for the next page, **b** for the
+previous one, **←** / **→** to slide the column window (an orbits table
+is 82 columns — most of them a covariance block), **/** to filter rows by
+substring, **Esc** to drop the filter, **q** to quit.
+
+It streams. The first page of a multi-million-row residuals table appears
+immediately and memory does not grow with the file, because rows are
+pulled a record batch at a time rather than loaded. Paging *backward*
+re-reads from the start of the file to reach the target row, so `b` gets
+slower the deeper into a very large file you are; paging forward does not.
+
+Piped, `show` drops the interactivity and writes the whole table as
+aligned text, so it composes:
+
+```sh
+empyrean show ./out/residuals.parquet --columns obs_id,chi2 | grep -v NaN
+empyrean show ./out/states.parquet --limit 5 --no-header
+```
+
+Flags: `--limit N` caps the rows, `--columns a,b,c` selects and reorders
+them, `--filter TEXT` keeps matching rows, `--no-header` drops the header
+line, and `--full-precision` prints every digit of every float instead of
+the default six significant figures (the default is readable; the flag is
+exact and round-trips).
+
+`show` reads files and nothing else — it needs no SPICE kernels and never
+loads the `libempyrean` runtime, so it works on a machine that has only
+the CLI and on outputs copied off a cluster.
 
 ## Continuous thrust
 

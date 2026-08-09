@@ -48,6 +48,21 @@ enum Command {
     /// Determine orbits from ADES observations.
     Determine(commands::determine::DetermineArgs),
 
+    /// Browse output tables — page through a file, or list a directory.
+    ///
+    /// Reads the Parquet / CSV / JSON the pipeline commands write,
+    /// streaming a page at a time so a multi-million-row residuals table
+    /// opens instantly. Piped, it writes the whole table as aligned text
+    /// instead of paging.
+    ///
+    /// In the pager: space/enter next page, b previous, ←/→ slide the
+    /// column window, / filter rows, Esc clear the filter, q quit.
+    ///
+    /// This subcommand only reads files. It needs no SPICE kernels and
+    /// never loads the engine, so the global --data-dir / --no-refresh
+    /// options have no effect on it.
+    Show(commands::show::ShowArgs),
+
     /// Query external JPL data services.
     #[command(subcommand)]
     Query(commands::query::QueryCommand),
@@ -142,6 +157,9 @@ fn main() -> Result<()> {
         Command::Propagate(args) => commands::propagate::run(&data, args),
         Command::Ephemeris(args) => commands::ephemeris::run(&data, args),
         Command::Determine(args) => commands::determine::run(&data, args),
+        // `show` reads files the pipeline already wrote. It needs no
+        // kernels and never loads the engine, so it takes no DataOptions.
+        Command::Show(args) => commands::show::run(args),
         Command::Query(cmd) => commands::query::run(cmd),
         Command::Cache(cmd) => commands::cache::run(cmd),
         Command::Serve { num_threads } => {

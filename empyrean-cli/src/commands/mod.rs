@@ -4,6 +4,7 @@ pub mod ephemeris;
 pub mod init;
 pub mod propagate;
 pub mod query;
+pub mod show;
 
 use std::path::{Path, PathBuf};
 

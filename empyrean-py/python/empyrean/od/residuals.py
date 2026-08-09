@@ -74,8 +74,8 @@ class ObservationResults(qv.Table):
     ``cooks_distance`` / ``adaptive`` / ``unsupported_observatory`` /
     ``cmc2003`` / ``radar_observations_unsupported`` /
     ``occultation_observations_unsupported`` / ``outside_arc`` /
-    ``not_evaluated``. Mirrors ``scott::rejection::RejectionReason``
-    snake-cased."""
+    ``non_finite_chi2`` / ``missing_jacobian`` / ``not_evaluated``.
+    Mirrors ``scott::rejection::RejectionReason`` snake-cased."""
     rejection_criterion = qv.Float64Column(nullable=True)
     """The criterion value (χ², Cook's D, ...) tested against the threshold."""
     rejection_threshold = qv.Float64Column(nullable=True)

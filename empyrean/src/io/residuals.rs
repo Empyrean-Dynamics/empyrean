@@ -47,6 +47,8 @@ fn residuals_to_ffi_array(
             R::RadarObservationsUnsupported => 7,
             R::OccultationObservationsUnsupported => 8,
             R::OutsideArc => 9,
+            R::NonFiniteChi2 => 10,
+            R::MissingJacobian => 11,
             R::NotEvaluated => -1,
         }
     };

@@ -271,6 +271,16 @@ pub const EMPYREAN_REJECTION_OCCULTATION_UNSUPPORTED: i32 = 8;
 /// chaotic-capture interior, regime change between pre- and
 /// post-encounter geometry).
 pub const EMPYREAN_REJECTION_OUTSIDE_ARC: i32 = 9;
+/// The observation's χ² against the published orbit is non-finite (NaN
+/// or infinite residual / weight product), so it cannot participate in
+/// any fit statistic. Every summary already excluded it from χ²/dof;
+/// this code makes the exclusion visible instead of letting the row
+/// read as used ("48 of 48 used" for a fit that used 42).
+pub const EMPYREAN_REJECTION_NON_FINITE_CHI2: i32 = 10;
+/// The propagation retained no Jacobian / STM at this observation's
+/// epoch, so the observation contributed no row to the normal equations
+/// — it was never part of the fit and its per-obs χ² is NaN.
+pub const EMPYREAN_REJECTION_MISSING_JACOBIAN: i32 = 11;
 /// Rejection was not evaluated for this observation (e.g. evaluate path).
 pub const EMPYREAN_REJECTION_NOT_EVALUATED: i32 = -1;
 
@@ -1617,6 +1627,8 @@ fn rejection_reason_to_c(reason: RejectionReason) -> i32 {
             EMPYREAN_REJECTION_OCCULTATION_UNSUPPORTED
         }
         RejectionReason::OutsideArc => EMPYREAN_REJECTION_OUTSIDE_ARC,
+        RejectionReason::NonFiniteChi2 => EMPYREAN_REJECTION_NON_FINITE_CHI2,
+        RejectionReason::MissingJacobian => EMPYREAN_REJECTION_MISSING_JACOBIAN,
     }
 }
 
@@ -3776,13 +3788,23 @@ pub unsafe extern "C" fn empyrean_determine(
             None
         };
 
-        let determine_results = determine(
+        // Batch-level failure (a row with no permID/provID/trkSub, an invalid
+        // shared weighting config) aborts the whole call rather than producing
+        // per-object results — surface it with its own message instead of
+        // reporting the generic "produced no results".
+        let determine_results = match determine(
             ctx_ref,
             Observations::new(obs_vec, radar_vec),
             initial_map.as_ref(),
             &cfg,
             None,
-        );
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                set_last_error(&format!("orbit determination failed: {e}"));
+                return -3;
+            }
+        };
 
         // Pick the first acceptable fit, else the first overall.
         let best = determine_results

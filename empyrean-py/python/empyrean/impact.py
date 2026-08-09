@@ -39,6 +39,7 @@ from empyrean.coordinates.epoch import Epochs
 from empyrean.propagation.config import (
     _DATACLASS_TO_INT,
     _UNCERTAINTY_METHOD_TO_INT,
+    Auto,
     GaussianMixture,
     MonteCarlo,
     SigmaPoint,
@@ -285,12 +286,14 @@ class BPlanes(qv.Table):
 
 # ── Helpers ───────────────────────────────────────────────────
 
-UncertaintyMethodLike = UncertaintyMethod | SigmaPoint | MonteCarlo | GaussianMixture | str | int
+UncertaintyMethodLike = (
+    UncertaintyMethod | SigmaPoint | MonteCarlo | GaussianMixture | Auto | str | int
+)
 
 
 def _method_to_tag(m: UncertaintyMethodLike) -> int:
     """Map a Python-level method spec to the int tag the Rust side expects."""
-    if isinstance(m, (SigmaPoint, MonteCarlo, GaussianMixture)):
+    if isinstance(m, (SigmaPoint, MonteCarlo, GaussianMixture, Auto)):
         return _DATACLASS_TO_INT[type(m)]
     if isinstance(m, str):
         tag = _UNCERTAINTY_METHOD_TO_INT.get(m.lower())
@@ -301,7 +304,11 @@ def _method_to_tag(m: UncertaintyMethodLike) -> int:
         return _UNCERTAINTY_METHOD_TO_INT[m]
     if isinstance(m, int):
         return m
-    raise TypeError(f"unsupported method spec: {type(m).__name__}")
+    raise TypeError(
+        f"unsupported method spec: {type(m).__name__}; pass an UncertaintyMethod "
+        f"enum member, a wire string (e.g. 'first_order'), or a SigmaPoint / "
+        f"MonteCarlo / GaussianMixture / Auto dataclass"
+    )
 
 
 def _flatten_method_specs(
@@ -309,13 +316,13 @@ def _flatten_method_specs(
 ) -> tuple[list[int], dict[str, list[Any]]]:
     """Lower a sequence of method specs to the flat columns the binding takes.
 
-    Returns the integer tag column plus seven positionally-aligned parameter
+    Returns the integer tag column plus twelve positionally-aligned parameter
     columns — one entry per requested method, in the order given. A
-    :class:`SigmaPoint` / :class:`MonteCarlo` / :class:`GaussianMixture`
-    dataclass contributes its own parameters at its own index; every other
-    spec form (enum, wire string, legacy int) contributes the engine defaults,
-    so a default-constructed dataclass and its enum shorthand lower to
-    identical columns.
+    :class:`SigmaPoint` / :class:`MonteCarlo` / :class:`GaussianMixture` /
+    :class:`Auto` dataclass contributes its own parameters at its own index;
+    every other spec form (enum, wire string, legacy int) contributes the
+    engine defaults, so a default-constructed dataclass and its enum
+    shorthand lower to identical columns.
 
     Collapsing a spec to its bare tag here would discard the parameters, which
     is how ``SigmaPoint(n_sigma=2.0)`` / ``MonteCarlo(n_samples=100_000)`` /
@@ -330,6 +337,11 @@ def _flatten_method_specs(
     gm_threshold: list[float] = []
     gm_max_depth: list[int] = []
     gm_components_per_split: list[int] = []
+    auto_threshold_first: list[float] = []
+    auto_threshold_mixture: list[float] = []
+    auto_threshold_ip_skip: list[float] = []
+    auto_gmm_max_depth: list[int] = []
+    auto_gmm_components_per_split: list[int] = []
     for m in methods:
         # Tag first: it owns spec-type validation and raises for an
         # unsupported spec before any parameter is read.
@@ -342,6 +354,11 @@ def _flatten_method_specs(
         gm_threshold.append(params.gm_threshold)
         gm_max_depth.append(params.gm_max_depth)
         gm_components_per_split.append(params.gm_components_per_split)
+        auto_threshold_first.append(params.auto_threshold_first)
+        auto_threshold_mixture.append(params.auto_threshold_mixture)
+        auto_threshold_ip_skip.append(params.auto_threshold_ip_skip)
+        auto_gmm_max_depth.append(params.auto_gmm_max_depth)
+        auto_gmm_components_per_split.append(params.auto_gmm_components_per_split)
     return tags, {
         "method_sigma_n_sigma": sigma_n_sigma,
         "method_sigma_samples_per_plane": sigma_samples_per_plane,
@@ -350,6 +367,11 @@ def _flatten_method_specs(
         "method_gm_threshold": gm_threshold,
         "method_gm_max_depth": gm_max_depth,
         "method_gm_components_per_split": gm_components_per_split,
+        "method_auto_threshold_first": auto_threshold_first,
+        "method_auto_threshold_mixture": auto_threshold_mixture,
+        "method_auto_threshold_ip_skip": auto_threshold_ip_skip,
+        "method_auto_gmm_max_depth": auto_gmm_max_depth,
+        "method_auto_gmm_components_per_split": auto_gmm_components_per_split,
     }
 
 

@@ -43,6 +43,14 @@ pub enum RejectionReason {
     /// regime mismatch separately lets downstream tooling skip past
     /// these without confusing them with measurement error.
     OutsideArc,
+    /// The observation's χ² against the published orbit is non-finite, so
+    /// it cannot participate in any fit statistic. Reported explicitly so
+    /// the row reads as excluded rather than silently counting as used.
+    NonFiniteChi2,
+    /// The propagation retained no Jacobian / STM at this observation's
+    /// epoch, so the observation contributed no row to the normal
+    /// equations — it was never part of the fit.
+    MissingJacobian,
     /// Rejection was not evaluated (e.g. evaluate path).
     NotEvaluated,
 }
@@ -60,6 +68,8 @@ impl RejectionReason {
             7 => RejectionReason::RadarObservationsUnsupported,
             8 => RejectionReason::OccultationObservationsUnsupported,
             9 => RejectionReason::OutsideArc,
+            10 => RejectionReason::NonFiniteChi2,
+            11 => RejectionReason::MissingJacobian,
             _ => RejectionReason::NotEvaluated,
         }
     }

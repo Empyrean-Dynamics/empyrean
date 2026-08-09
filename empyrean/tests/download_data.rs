@@ -1,7 +1,14 @@
 //! Regression: `download_data` actually provisions a usable data directory and
 //! is idempotent — it is no longer a no-op resolver.
+//!
+//! Ignored by default: the provision path reaches NAIF / MPC / PDS
+//! unconditionally, so a default `cargo test` stays offline-safe. Run the
+//! behavioral form explicitly with `cargo test --test download_data --
+//! --ignored` on a networked machine (the core `provision_data` pair
+//! follows the same convention).
 
 #[test]
+#[ignore = "reaches the network (NAIF/MPC/PDS downloads); run with -- --ignored"]
 fn download_data_provisions_and_is_idempotent() {
     let dir = empyrean::download_data(None).expect("download_data must provision the data dir");
     assert!(

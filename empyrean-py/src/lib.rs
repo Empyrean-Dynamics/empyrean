@@ -1915,8 +1915,9 @@ fn check_method_column_len(name: &str, len: usize, n_tags: usize) -> PyResult<()
 /// Decode the flat method columns into wrapper [`empyrean::UncertaintyMethod`]s.
 ///
 /// One entry per requested method, built from that method's own parameter
-/// slots so a `SigmaPoint` / `MonteCarlo` / `GaussianMixture` spec reaches the
-/// engine with the parameters the caller supplied rather than engine defaults.
+/// slots so a `SigmaPoint` / `MonteCarlo` / `GaussianMixture` / `Auto` spec
+/// reaches the engine with the parameters the caller supplied rather than
+/// engine defaults.
 /// Decoding delegates to [`build_uncertainty_method`], the single tag decoder
 /// shared with `_propagate` — one decoder, one error message, no drift.
 #[allow(clippy::too_many_arguments)]
@@ -1929,6 +1930,11 @@ fn methods_from_flat(
     gm_threshold: &[f64],
     gm_max_depth: &[usize],
     gm_components_per_split: &[usize],
+    auto_threshold_first: &[f64],
+    auto_threshold_mixture: &[f64],
+    auto_threshold_ip_skip: &[f64],
+    auto_gmm_max_depth: &[usize],
+    auto_gmm_components_per_split: &[usize],
 ) -> PyResult<Vec<empyrean::UncertaintyMethod>> {
     let n = tags.len();
     check_method_column_len("method_sigma_n_sigma", sigma_n_sigma.len(), n)?;
@@ -1946,6 +1952,23 @@ fn methods_from_flat(
         gm_components_per_split.len(),
         n,
     )?;
+    check_method_column_len("method_auto_threshold_first", auto_threshold_first.len(), n)?;
+    check_method_column_len(
+        "method_auto_threshold_mixture",
+        auto_threshold_mixture.len(),
+        n,
+    )?;
+    check_method_column_len(
+        "method_auto_threshold_ip_skip",
+        auto_threshold_ip_skip.len(),
+        n,
+    )?;
+    check_method_column_len("method_auto_gmm_max_depth", auto_gmm_max_depth.len(), n)?;
+    check_method_column_len(
+        "method_auto_gmm_components_per_split",
+        auto_gmm_components_per_split.len(),
+        n,
+    )?;
 
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
@@ -1958,17 +1981,11 @@ fn methods_from_flat(
             gm_threshold[i],
             gm_max_depth[i],
             gm_components_per_split[i],
-            // The per-orbit batch surface exposes no per-orbit AUTO
-            // threshold columns, so a tag-4 orbit here resolves to the
-            // engine-default Auto — identical to `auto()` — exactly as it
-            // did before AUTO gained tunable knobs. The single-orbit
-            // `_propagate` / `_generate_ephemeris` paths carry the tuned
-            // values.
-            0.1,
-            10.0,
-            1e-12,
-            3,
-            3,
+            auto_threshold_first[i],
+            auto_threshold_mixture[i],
+            auto_threshold_ip_skip[i],
+            auto_gmm_max_depth[i],
+            auto_gmm_components_per_split[i],
         )?);
     }
     Ok(out)
@@ -1987,6 +2004,11 @@ fn methods_from_flat(
     method_gm_threshold,
     method_gm_max_depth,
     method_gm_components_per_split,
+    method_auto_threshold_first,
+    method_auto_threshold_mixture,
+    method_auto_threshold_ip_skip,
+    method_auto_gmm_max_depth,
+    method_auto_gmm_components_per_split,
     body_filter_naif=None,
     ng_alphas=None, ng_r0s=None, ng_ms=None, ng_ns=None, ng_ks=None,
     non_grav_dts=None,
@@ -2024,6 +2046,11 @@ fn _compute_impact_probabilities<'py>(
     method_gm_threshold: Vec<f64>,
     method_gm_max_depth: Vec<usize>,
     method_gm_components_per_split: Vec<usize>,
+    method_auto_threshold_first: Vec<f64>,
+    method_auto_threshold_mixture: Vec<f64>,
+    method_auto_threshold_ip_skip: Vec<f64>,
+    method_auto_gmm_max_depth: Vec<usize>,
+    method_auto_gmm_components_per_split: Vec<usize>,
     body_filter_naif: Option<Vec<i32>>,
     ng_alphas: Option<PyReadonlyArray1<'py, f64>>,
     ng_r0s: Option<PyReadonlyArray1<'py, f64>>,
@@ -2100,6 +2127,11 @@ fn _compute_impact_probabilities<'py>(
         &method_gm_threshold,
         &method_gm_max_depth,
         &method_gm_components_per_split,
+        &method_auto_threshold_first,
+        &method_auto_threshold_mixture,
+        &method_auto_threshold_ip_skip,
+        &method_auto_gmm_max_depth,
+        &method_auto_gmm_components_per_split,
     )?;
     let filter: Vec<empyrean::Origin> = body_filter_naif
         .unwrap_or_default()
@@ -2246,6 +2278,11 @@ fn _compute_impact_probabilities<'py>(
     method_gm_threshold,
     method_gm_max_depth,
     method_gm_components_per_split,
+    method_auto_threshold_first,
+    method_auto_threshold_mixture,
+    method_auto_threshold_ip_skip,
+    method_auto_gmm_max_depth,
+    method_auto_gmm_components_per_split,
     body_filter_naif=None,
     ng_alphas=None, ng_r0s=None, ng_ms=None, ng_ns=None, ng_ks=None,
     non_grav_dts=None,
@@ -2283,6 +2320,11 @@ fn _compute_b_planes<'py>(
     method_gm_threshold: Vec<f64>,
     method_gm_max_depth: Vec<usize>,
     method_gm_components_per_split: Vec<usize>,
+    method_auto_threshold_first: Vec<f64>,
+    method_auto_threshold_mixture: Vec<f64>,
+    method_auto_threshold_ip_skip: Vec<f64>,
+    method_auto_gmm_max_depth: Vec<usize>,
+    method_auto_gmm_components_per_split: Vec<usize>,
     body_filter_naif: Option<Vec<i32>>,
     ng_alphas: Option<PyReadonlyArray1<'py, f64>>,
     ng_r0s: Option<PyReadonlyArray1<'py, f64>>,
@@ -2359,6 +2401,11 @@ fn _compute_b_planes<'py>(
         &method_gm_threshold,
         &method_gm_max_depth,
         &method_gm_components_per_split,
+        &method_auto_threshold_first,
+        &method_auto_threshold_mixture,
+        &method_auto_threshold_ip_skip,
+        &method_auto_gmm_max_depth,
+        &method_auto_gmm_components_per_split,
     )?;
     let filter: Vec<empyrean::Origin> = body_filter_naif
         .unwrap_or_default()
@@ -3678,6 +3725,8 @@ fn rejection_reason_str(r: empyrean::RejectionReason) -> &'static str {
         R::RadarObservationsUnsupported => "radar_observations_unsupported",
         R::OccultationObservationsUnsupported => "occultation_observations_unsupported",
         R::OutsideArc => "outside_arc",
+        R::NonFiniteChi2 => "non_finite_chi2",
+        R::MissingJacobian => "missing_jacobian",
         R::NotEvaluated => "not_evaluated",
     }
 }

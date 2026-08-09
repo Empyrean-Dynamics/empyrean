@@ -42,7 +42,7 @@ pub const EMPYREAN_REJECTION_NOT_EVALUATED: i32 = -1;
 pub const EMPYREAN_REJECTION_KIND_ADAPTIVE: u32 = 0;
 pub const EMPYREAN_REJECTION_KIND_CMC2003: u32 = 1;
 pub const EMPYREAN_WEIGHTING_PRESET_NONE: u32 = 0;
-pub const EMPYREAN_WEIGHTING_PRESET_VFC17: u32 = 1;
+pub const EMPYREAN_WEIGHTING_PRESET_VFCC2017: u32 = 1;
 pub const EMPYREAN_WEIGHTING_PRESET_NEODYS: u32 = 2;
 pub const EMPYREAN_SIGMA_POLICY_DEFAULT_ONLY: u32 = 0;
 pub const EMPYREAN_SIGMA_POLICY_FLOOR: u32 = 1;
@@ -2184,7 +2184,7 @@ const _: () = {
     ["Offset of field: EmpyreanWeightingLayer::max_gap_days"]
         [::std::mem::offset_of!(EmpyreanWeightingLayer, max_gap_days) - 48usize];
 };
-#[doc = " Weighting configuration. Mirrors\n [`scott::weighting::WeightingConfig`] structurally; extends it\n with an `enabled` toggle and a preset selector for the common\n case of \"use the production preset\" without constructing layers\n by hand.\n\n `enabled = 0` runs OD with uniform 1″ weighting (the old\n `use_weighting = 0` behavior). `enabled = 1` activates the\n pipeline; the resulting layer chain is `additional_layers`\n followed by the preset's layers. Sigma resolution is\n first-match-wins, so a user rule overrides the preset for its\n station and the preset serves as the fallback (allows e.g. VFC17\n + per-survey override).\n\n A **zero-initialized struct is NOT the production default** — it\n has `enabled = 0`, i.e. weighting disabled (uniform 1″). The\n production combination (VFC17 station floors + nightly\n de-weighting + Floor policy) must be requested explicitly:\n `enabled = 1`, `preset = VFC17`, `sigma_policy = -1`, plus one\n `NIGHTLY_DEWEIGHTING` additional layer."]
+#[doc = " Weighting configuration. Mirrors\n [`scott::weighting::WeightingConfig`] structurally; extends it\n with an `enabled` toggle and a preset selector for the common\n case of \"use the production preset\" without constructing layers\n by hand.\n\n `enabled = 0` runs OD with uniform 1″ weighting (the old\n `use_weighting = 0` behavior). `enabled = 1` activates the\n pipeline; the resulting layer chain is `additional_layers`\n followed by the preset's layers. Sigma resolution is\n first-match-wins, so a user rule overrides the preset for its\n station and the preset serves as the fallback (allows e.g. VFCC2017\n + per-survey override).\n\n A **zero-initialized struct is NOT the production default** — it\n has `enabled = 0`, i.e. weighting disabled (uniform 1″). The\n production combination (VFCC2017 station floors + nightly\n de-weighting + Floor policy) must be requested explicitly:\n `enabled = 1`, `preset = VFCC2017`, `sigma_policy = -1`, plus one\n `NIGHTLY_DEWEIGHTING` additional layer."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct EmpyreanWeightingConfig {
@@ -2194,7 +2194,7 @@ pub struct EmpyreanWeightingConfig {
     pub preset: u8,
     #[doc = " Default 1σ used when no rule applies (arcsec). 0.0 →\n upstream default (1.0). Ignored when preset != NONE."]
     pub default_sigma_arcsec: f64,
-    #[doc = " Sigma combination policy. -1 = use the preset's policy\n (VFC17 / NEODYS presets use Floor); otherwise one of\n `EMPYREAN_SIGMA_POLICY_*`. Note `0` is DEFAULT_ONLY — an\n **active override**, not \"unset\": a zero-initialized field\n replaces a preset's Floor policy with DefaultOnly. Callers\n who want the preset's own policy must set -1."]
+    #[doc = " Sigma combination policy. -1 = use the preset's policy\n (VFCC2017 / NEODYS presets use Floor); otherwise one of\n `EMPYREAN_SIGMA_POLICY_*`. Note `0` is DEFAULT_ONLY — an\n **active override**, not \"unset\": a zero-initialized field\n replaces a preset's Floor policy with DefaultOnly. Callers\n who want the preset's own policy must set -1."]
     pub sigma_policy: i32,
     #[doc = " Pointer to additional layers inserted AHEAD of the preset's\n chain (first-match-wins: they override preset rules for their\n stations; relative order within the array is preserved).\n Presets contribute station-sigma rules only — the production\n default chain includes exactly one `NIGHTLY_DEWEIGHTING`\n layer, so callers composing this array must include it\n explicitly or nightly de-weighting is off. At most one\n `NIGHTLY_DEWEIGHTING` layer is accepted per chain (duplicates\n compound the 1/√N de-weighting and are rejected).\n Non-owning — caller keeps the array alive for the OD call."]
     pub additional_layers: *const EmpyreanWeightingLayer,
@@ -2508,7 +2508,7 @@ pub struct EmpyreanODConfig {
     pub num_threads: usize,
     #[doc = " Output reference frame: 0=ICRF, 1=EclipticJ2000."]
     pub frame: i32,
-    #[doc = " Observation weighting pipeline configuration. Zero-init =\n `enabled = 0` = weighting DISABLED (uniform 1″); the\n production default (VFC17 + nightly de-weighting at floor-σ\n policy) must be requested explicitly. See\n [`EmpyreanWeightingConfig`]."]
+    #[doc = " Observation weighting pipeline configuration. Zero-init =\n `enabled = 0` = weighting DISABLED (uniform 1″); the\n production default (VFCC2017 + nightly de-weighting at floor-σ\n policy) must be requested explicitly. See\n [`EmpyreanWeightingConfig`]."]
     pub weighting: EmpyreanWeightingConfig,
     #[doc = " Catalog-bias-correction configuration. Zero-init =\n `enabled = 0` = debiasing DISABLED; the production default\n (EFCC2020 standard resolution, loaded from the DataManager\n default path) must be requested explicitly. See\n [`EmpyreanDebiasingConfig`]."]
     pub debiasing: EmpyreanDebiasingConfig,

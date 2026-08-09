@@ -115,7 +115,7 @@ class Session:
         config : ODConfig, optional
             Full nested configuration mirroring scott's ``ODConfig``.
             Defaults to :class:`ODConfig` defaults (Standard force model,
-            VFC17 + EFCC2020 weighting, AUTO solve-for, adaptive
+            VFCC2017 + EFCC2020 weighting, AUTO solve-for, adaptive
             rejection on).
         """
         from empyrean._empyrean_rs import Session as _RustSession

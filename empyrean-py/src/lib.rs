@@ -4185,7 +4185,7 @@ fn build_od_config_from_dict(d: &Bound<'_, PyDict>) -> PyResult<empyrean::ODConf
         if let Some(s) = get_str(&w, "preset")? {
             wc.preset = match s.to_ascii_lowercase().as_str() {
                 "none" => empyrean::WeightingPreset::None,
-                "vfc17" => empyrean::WeightingPreset::Vfc17,
+                "vfcc2017" => empyrean::WeightingPreset::VFCC2017,
                 "neodys" => empyrean::WeightingPreset::Neodys,
                 other => {
                     return Err(PyValueError::new_err(format!(

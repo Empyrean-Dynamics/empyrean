@@ -292,10 +292,10 @@ typedef struct Session Session;
 #define EMPYREAN_WEIGHTING_PRESET_NONE 0
 
 /**
- * VFC17 — Vereš, Farnocchia, Chesley et al. 2017 station floors +
+ * VFCC2017 — Vereš, Farnocchia, Chesley & Chamberlin 2017 station floors +
  * nightly de-weighting. The production default.
  */
-#define EMPYREAN_WEIGHTING_PRESET_VFC17 1
+#define EMPYREAN_WEIGHTING_PRESET_VFCC2017 1
 
 /**
  * NEODyS production preset.
@@ -2688,14 +2688,14 @@ struct EmpyreanWeightingLayer {
  * pipeline; the resulting layer chain is `additional_layers`
  * followed by the preset's layers. Sigma resolution is
  * first-match-wins, so a user rule overrides the preset for its
- * station and the preset serves as the fallback (allows e.g. VFC17
+ * station and the preset serves as the fallback (allows e.g. VFCC2017
  * + per-survey override).
  *
  * A **zero-initialized struct is NOT the production default** — it
  * has `enabled = 0`, i.e. weighting disabled (uniform 1″). The
- * production combination (VFC17 station floors + nightly
+ * production combination (VFCC2017 station floors + nightly
  * de-weighting + Floor policy) must be requested explicitly:
- * `enabled = 1`, `preset = VFC17`, `sigma_policy = -1`, plus one
+ * `enabled = 1`, `preset = VFCC2017`, `sigma_policy = -1`, plus one
  * `NIGHTLY_DEWEIGHTING` additional layer.
  */
 struct EmpyreanWeightingConfig {
@@ -2721,7 +2721,7 @@ struct EmpyreanWeightingConfig {
     double default_sigma_arcsec;
     /**
      * Sigma combination policy. -1 = use the preset's policy
-     * (VFC17 / NEODYS presets use Floor); otherwise one of
+     * (VFCC2017 / NEODYS presets use Floor); otherwise one of
      * `EMPYREAN_SIGMA_POLICY_*`. Note `0` is DEFAULT_ONLY — an
      * **active override**, not "unset": a zero-initialized field
      * replaces a preset's Floor policy with DefaultOnly. Callers
@@ -3030,7 +3030,7 @@ struct EmpyreanODConfig {
     /**
      * Observation weighting pipeline configuration. Zero-init =
      * `enabled = 0` = weighting DISABLED (uniform 1″); the
-     * production default (VFC17 + nightly de-weighting at floor-σ
+     * production default (VFCC2017 + nightly de-weighting at floor-σ
      * policy) must be requested explicitly. See
      * [`EmpyreanWeightingConfig`].
      */

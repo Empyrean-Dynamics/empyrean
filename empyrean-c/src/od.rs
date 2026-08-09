@@ -299,9 +299,9 @@ pub const EMPYREAN_REJECTION_KIND_CMC2003: u8 = 1;
 
 /// No weighting preset — only `additional_layers` apply.
 pub const EMPYREAN_WEIGHTING_PRESET_NONE: u8 = 0;
-/// VFC17 — Vereš, Farnocchia, Chesley et al. 2017 station floors +
+/// VFCC2017 — Vereš, Farnocchia, Chesley & Chamberlin 2017 station floors +
 /// nightly de-weighting. The production default.
-pub const EMPYREAN_WEIGHTING_PRESET_VFC17: u8 = 1;
+pub const EMPYREAN_WEIGHTING_PRESET_VFCC2017: u8 = 1;
 /// NEODyS production preset.
 pub const EMPYREAN_WEIGHTING_PRESET_NEODYS: u8 = 2;
 
@@ -365,14 +365,14 @@ pub struct EmpyreanWeightingLayer {
 /// pipeline; the resulting layer chain is `additional_layers`
 /// followed by the preset's layers. Sigma resolution is
 /// first-match-wins, so a user rule overrides the preset for its
-/// station and the preset serves as the fallback (allows e.g. VFC17
+/// station and the preset serves as the fallback (allows e.g. VFCC2017
 /// + per-survey override).
 ///
 /// A **zero-initialized struct is NOT the production default** — it
 /// has `enabled = 0`, i.e. weighting disabled (uniform 1″). The
-/// production combination (VFC17 station floors + nightly
+/// production combination (VFCC2017 station floors + nightly
 /// de-weighting + Floor policy) must be requested explicitly:
-/// `enabled = 1`, `preset = VFC17`, `sigma_policy = -1`, plus one
+/// `enabled = 1`, `preset = VFCC2017`, `sigma_policy = -1`, plus one
 /// `NIGHTLY_DEWEIGHTING` additional layer.
 #[repr(C)]
 pub struct EmpyreanWeightingConfig {
@@ -391,7 +391,7 @@ pub struct EmpyreanWeightingConfig {
     /// 1.0. Ignored when preset != NONE.
     pub default_sigma_arcsec: f64,
     /// Sigma combination policy. -1 = use the preset's policy
-    /// (VFC17 / NEODYS presets use Floor); otherwise one of
+    /// (VFCC2017 / NEODYS presets use Floor); otherwise one of
     /// `EMPYREAN_SIGMA_POLICY_*`. Note `0` is DEFAULT_ONLY — an
     /// **active override**, not "unset": a zero-initialized field
     /// replaces a preset's Floor policy with DefaultOnly. Callers
@@ -1252,7 +1252,7 @@ pub struct EmpyreanODConfig {
     pub frame: i32,
     /// Observation weighting pipeline configuration. Zero-init =
     /// `enabled = 0` = weighting DISABLED (uniform 1″); the
-    /// production default (VFC17 + nightly de-weighting at floor-σ
+    /// production default (VFCC2017 + nightly de-weighting at floor-σ
     /// policy) must be requested explicitly. See
     /// [`EmpyreanWeightingConfig`].
     pub weighting: EmpyreanWeightingConfig,
@@ -2598,7 +2598,7 @@ fn build_weighting_from_c(
     // `preset = NONE` means exactly what it says: no preset rules, the
     // caller's `default_sigma_arcsec` applies uniformly (DefaultOnly
     // policy unless `sigma_policy` overrides it). There is NO silent
-    // substitution of the production preset — a caller who wants VFC17
+    // substitution of the production preset — a caller who wants VFCC2017
     // must request it. (A zero-initialized struct never reaches this
     // code: `enabled = 0` returns above, i.e. zero-init = weighting
     // disabled, not the production default.)
@@ -2631,14 +2631,14 @@ fn build_weighting_from_c(
             layers: Vec::new(),
             sigma_policy: SigmaPolicy::default(),
         },
-        EMPYREAN_WEIGHTING_PRESET_VFC17 => WeightingConfig::veres_farnocchia_chesley_2017(),
+        EMPYREAN_WEIGHTING_PRESET_VFCC2017 => WeightingConfig::veres_farnocchia_chesley_2017(),
         EMPYREAN_WEIGHTING_PRESET_NEODYS => WeightingConfig::neodys()
             .map_err(|e| format!("failed to load NEODyS weighting preset: {e}"))?,
         other => {
             return Err(format!(
-                "unsupported weighting.preset = {other} (expected NONE = {} / VFC17 = {} / NEODYS = {})",
+                "unsupported weighting.preset = {other} (expected NONE = {} / VFCC2017 = {} / NEODYS = {})",
                 EMPYREAN_WEIGHTING_PRESET_NONE,
-                EMPYREAN_WEIGHTING_PRESET_VFC17,
+                EMPYREAN_WEIGHTING_PRESET_VFCC2017,
                 EMPYREAN_WEIGHTING_PRESET_NEODYS,
             ));
         }

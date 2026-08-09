@@ -124,7 +124,7 @@ report `bias_ra ± sigma_ra` directly without further inflation.
 
 Per-observation weights and pre-Gaia astrometric catalog debiasing are
 on by default — {func}`~empyrean.determine` ships with the production
-preset (Vereš, Farnocchia, Chesley et al. 2017 station floors plus
+preset (Vereš, Farnocchia, Chesley & Chamberlin 2017 station floors plus
 nightly de-weighting at the floor-σ policy, and EFCC2020 catalog-bias
 correction at standard healpix resolution). For most workflows you
 don't need to touch these.
@@ -143,10 +143,10 @@ cfg_unweighted = ODConfig(
     debiasing=DebiasingConfig(enabled=False),
 )
 
-# VFC17 stations plus a per-survey override for one observatory
+# VFCC2017 stations plus a per-survey override for one observatory
 cfg_custom = ODConfig(
     weighting=WeightingConfig(
-        preset=WeightingPreset.VFC17,
+        preset=WeightingPreset.VFCC2017,
         sigma_policy=SigmaPolicy.FLOOR,
         additional_layers=[
             WeightingLayer(

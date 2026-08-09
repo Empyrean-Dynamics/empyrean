@@ -18,7 +18,7 @@
 //!
 //! let ctx = Context::from_data_dir(None)?;
 //! let obs = ctx.read_ades("apophis_2004_2021.psv")?;
-//! let cfg = ODConfig::default(); // VFC17 weights + EFCC2020 debias + auto-escalate
+//! let cfg = ODConfig::default(); // VFCC2017 weights + EFCC2020 debias + auto-escalate
 //!
 //! let fit = ctx.determine(&obs, None, &cfg)?;
 //! println!(

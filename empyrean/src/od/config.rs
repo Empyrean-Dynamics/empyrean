@@ -147,7 +147,7 @@ pub struct ODConfig {
     pub num_threads: usize,
     /// Output reference frame.
     pub frame: crate::coordinate::Frame,
-    /// Observation weighting pipeline. Default = `enabled` + VFC17
+    /// Observation weighting pipeline. Default = `enabled` + VFCC2017
     /// preset (production hot path).
     pub weighting: WeightingConfig,
     /// Catalog-bias-correction configuration. Default = `enabled` +
@@ -252,7 +252,7 @@ impl PhotometryConfig {
 impl Default for ODConfig {
     fn default() -> Self {
         // Production hot path:
-        //   - VFC17 station weighting + nightly de-weighting on
+        //   - VFCC2017 station weighting + nightly de-weighting on
         //   - EFCC2020 catalog debiasing on (if `bias.dat` is on disk)
         //   - SolveForParams::Auto (escalates 6→9 params on poor fit)
         //   - Adaptive rejection enabled
@@ -332,7 +332,7 @@ impl ODConfig {
             enabled: u8::from(self.weighting.enabled),
             preset: match self.weighting.preset {
                 WeightingPreset::None => empyrean_sys::EMPYREAN_WEIGHTING_PRESET_NONE as u8,
-                WeightingPreset::Vfc17 => empyrean_sys::EMPYREAN_WEIGHTING_PRESET_VFC17 as u8,
+                WeightingPreset::VFCC2017 => empyrean_sys::EMPYREAN_WEIGHTING_PRESET_VFCC2017 as u8,
                 WeightingPreset::Neodys => empyrean_sys::EMPYREAN_WEIGHTING_PRESET_NEODYS as u8,
             },
             default_sigma_arcsec: self.weighting.default_sigma_arcsec,

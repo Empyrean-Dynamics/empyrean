@@ -232,8 +232,8 @@ class WeightingPreset(str, Enum):
 
     NONE = "none"
     """No preset — only ``additional_layers`` apply."""
-    VFC17 = "vfc17"
-    """Vereš, Farnocchia, Chesley et al. 2017 station floors +
+    VFCC2017 = "vfcc2017"
+    """Vereš, Farnocchia, Chesley & Chamberlin 2017 station floors +
     nightly de-weighting at floor-σ policy. Production default."""
     NEODYS = "neodys"
     """NEODyS production preset."""
@@ -246,7 +246,7 @@ class SigmaPolicy(str, Enum):
     DEFAULT_ONLY = "default_only"
     """``σ = reported`` if present, else ``σ = rule``. Default."""
     FLOOR = "floor"
-    """``σ = max(reported, rule)``. VFC17 / NEODyS production policy."""
+    """``σ = max(reported, rule)``. VFCC2017 / NEODyS production policy."""
 
 
 class WeightingLayerKind(str, Enum):
@@ -383,7 +383,7 @@ class WeightingLayer:
 
 def _default_weighting_layers() -> list["WeightingLayer"]:
     # Mirrors `scott::od::ODConfig::default()` — the production preset is
-    # VFC17 station floors WITH NightlyDeweighting (1/√N within 0.5 days)
+    # VFCC2017 station floors WITH NightlyDeweighting (1/√N within 0.5 days)
     # appended. Without the nightly layer, OD on objects with clustered
     # same-station-same-night observations diverges from `validate-core`'s
     # direct-scott path because the rejection layer treats high-weight
@@ -401,7 +401,7 @@ class WeightingConfig:
     """Observation weighting pipeline. Mirrors
     ``empyrean::WeightingConfig``.
 
-    Default = enabled with the VFC17 preset + a NightlyDeweighting layer
+    Default = enabled with the VFCC2017 preset + a NightlyDeweighting layer
     (production hot path; matches ``scott::od::ODConfig::default()``).
     Set ``enabled=False`` for uniform 1″ weighting; pick a different
     preset or replace ``additional_layers`` for custom pipelines.
@@ -432,7 +432,7 @@ class WeightingConfig:
     """
 
     enabled: bool = True
-    preset: WeightingPreset = WeightingPreset.VFC17
+    preset: WeightingPreset = WeightingPreset.VFCC2017
     default_sigma_arcsec: float = 1.0
     """Default 1σ when no rule applies (arcsec). Used only when
     ``preset = NONE``."""
@@ -604,7 +604,7 @@ class ODConfig:
 
     Sensible production defaults out of the box:
 
-      - VFC17 station weighting + nightly de-weighting
+      - VFCC2017 station weighting + nightly de-weighting
         (:attr:`WeightingConfig.preset`)
       - EFCC2020 catalog debiasing enabled
         (:attr:`DebiasingConfig.enabled`)
@@ -621,7 +621,7 @@ class ODConfig:
     """``0`` = use all available cores."""
     frame: Frame = Frame.ICRF
     weighting: "WeightingConfig" = field(default_factory=lambda: WeightingConfig())
-    """Observation weighting pipeline. Default = enabled + VFC17
+    """Observation weighting pipeline. Default = enabled + VFCC2017
     preset. See :class:`WeightingConfig` for full layered control."""
     debiasing: "DebiasingConfig" = field(default_factory=lambda: DebiasingConfig())
     """Catalog-bias-correction configuration. Default = EFCC2020

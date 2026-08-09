@@ -4,6 +4,14 @@
 //! [`DetermineResult`](crate::DetermineResult) /
 //! [`EvaluateResult`](crate::EvaluateResult); only a write surface is
 //! exposed here.
+//!
+//! The file carries the **whole** [`ObservationResidual`] surface — the
+//! join keys (`object_id`, `obs_id`), the epoch and catalog, the
+//! rejection attribution with its criterion and thresholds, the
+//! influence diagnostics, the along/cross-track decomposition, and the
+//! radar block — not a projection of it. All three formats emit the same
+//! columns; they differ only in how a non-computable number is spelled
+//! (CSV a literal `NaN`, JSON `null`).
 
 use std::path::Path;
 
@@ -61,6 +69,9 @@ fn residuals_to_ffi_array(
             code[..take].copy_from_slice(&bytes[..take]);
             Ok(empyrean_sys::EmpyreanObservationResult {
                 obs_id: opt_str_ptr(&r.obs_id, keep_strings),
+                // The grouping key travels with the row, so a residual
+                // table concatenated across a batch stays attributable.
+                object_id: opt_str_ptr(r.object_id.as_deref().unwrap_or(""), keep_strings),
                 obs_code: code,
                 ast_cat: opt_str_ptr(r.ast_cat.as_deref().unwrap_or(""), keep_strings),
                 epoch_mjd_tdb: r.epoch.mjd_tdb()?,

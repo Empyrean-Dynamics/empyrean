@@ -1,11 +1,13 @@
 //! C ABI exports for file I/O.
 //!
-//! Three formats × four data types:
+//! Three formats × five data types:
 //!
 //! - **Orbits** (read + write): parquet, JSON, CSV.
 //! - **Ephemeris** (write): parquet, JSON, CSV.
 //! - **Events** (write): parquet, JSON, CSV.
 //! - **Residuals** (write): parquet, JSON, CSV.
+//! - **Fit summary** (write): parquet, JSON, CSV — one row per object a
+//!   batch orbit determination attempted, delivered or failed.
 //!
 //! All readers populate a flat C-ABI struct or array; writers consume
 //! the same types. Caller-allocated results (e.g. `EmpyreanOrbitBatch`
@@ -622,118 +624,49 @@ pub unsafe extern "C" fn empyrean_orbits_write_json(
 // Orbit I/O — CSV
 // ────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Serialize, Deserialize)]
-struct OrbitCsvRow {
-    orbit_id: String,
-    object_id: String,
-    epoch_mjd_tdb: f64,
-    e0: f64,
-    e1: f64,
-    e2: f64,
-    e3: f64,
-    e4: f64,
-    e5: f64,
-    representation: String,
-    frame: String,
-    origin: i32,
-    a1: f64,
-    a2: f64,
-    a3: f64,
-    ng_alpha: f64,
-    ng_r0: f64,
-    ng_m: f64,
-    ng_n: f64,
-    ng_k: f64,
-}
-
-impl From<&OrbitRow> for OrbitCsvRow {
-    fn from(r: &OrbitRow) -> Self {
-        Self {
-            orbit_id: r.orbit_id.clone(),
-            object_id: r.object_id.clone().unwrap_or_default(),
-            epoch_mjd_tdb: r.epoch_mjd_tdb,
-            e0: r.elements[0],
-            e1: r.elements[1],
-            e2: r.elements[2],
-            e3: r.elements[3],
-            e4: r.elements[4],
-            e5: r.elements[5],
-            representation: r.representation.clone(),
-            frame: r.frame.clone(),
-            origin: r.origin,
-            a1: r.a1,
-            a2: r.a2,
-            a3: r.a3,
-            ng_alpha: r.ng_alpha,
-            ng_r0: r.ng_r0,
-            ng_m: r.ng_m,
-            ng_n: r.ng_n,
-            ng_k: r.ng_k,
-        }
-    }
-}
-
-impl From<OrbitCsvRow> for OrbitRow {
-    fn from(r: OrbitCsvRow) -> Self {
-        Self {
-            orbit_id: r.orbit_id,
-            object_id: if r.object_id.is_empty() {
-                None
-            } else {
-                Some(r.object_id)
-            },
-            epoch_mjd_tdb: r.epoch_mjd_tdb,
-            elements: [r.e0, r.e1, r.e2, r.e3, r.e4, r.e5],
-            representation: r.representation,
-            frame: r.frame,
-            origin: r.origin,
-            covariance: None,
-            a1: r.a1,
-            a2: r.a2,
-            a3: r.a3,
-            ng_alpha: r.ng_alpha,
-            ng_r0: r.ng_r0,
-            ng_m: r.ng_m,
-            ng_n: r.ng_n,
-            ng_k: r.ng_k,
-        }
-    }
-}
-
 /// Read an orbits CSV file.
 ///
-/// CSV does not carry covariance (use parquet for covariance round-trip).
+/// Uses the engine's own CSV reader, so the file is the same schema the
+/// parquet path round-trips — covariance included. The
+/// `_with_non_grav` reader is the one used: the plain reader drops the
+/// Marsden A1/A2/A3 block, and an orbit that loses its non-gravitational
+/// parameters on a round trip is silently a different orbit.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn empyrean_orbits_read_csv(
     path: *const c_char,
     out: *mut EmpyreanOrbitBatch,
 ) -> i32 {
     file_op(path, out, |p, o| {
-        let mut reader = csv::Reader::from_path(p).map_err(|e| format!("csv open: {e}"))?;
-        let mut rows = Vec::new();
-        for rec in reader.deserialize::<OrbitCsvRow>() {
-            let r = rec.map_err(|e| format!("csv parse: {e}"))?;
-            rows.push(OrbitRow::from(r));
-        }
-        *o = rows_to_batch(rows)?;
+        // The row's own g(r) exponents win; the model passed here is only
+        // the fallback for a row that carried none, and an all-zero
+        // exponent set IS the inverse-square asteroid default.
+        let orbits: Orbits<AU> = empyrean_core::io::read_orbits_csv_with_non_grav(
+            p,
+            NonGravModel::MarsdenSekanina(GFunction::inverse_square()),
+        )
+        .map_err(|e| format!("csv read failed: {e:?}"))?;
+        *o = orbits_to_batch(&orbits)?;
         Ok(())
     })
 }
 
 /// Write an orbit batch to CSV.
+///
+/// Routed through the engine's writer — the same `Orbits<AU>` the
+/// parquet path writes — so CSV carries the full column set (state,
+/// covariance, non-grav including `dt` / `dt_variance`, photometry, SRP)
+/// rather than a flattened projection of it. A batch carrying a wide
+/// cross-covariance the row schema cannot express is refused before the
+/// file is created rather than written short.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn empyrean_orbits_write_csv(
     path: *const c_char,
     batch: *const EmpyreanOrbitBatch,
 ) -> i32 {
     file_in_op(path, batch, |p, b| {
-        let rows = batch_to_rows(b)?;
-        let mut wtr = csv::Writer::from_path(p).map_err(|e| format!("csv create: {e}"))?;
-        for row in &rows {
-            wtr.serialize(OrbitCsvRow::from(row))
-                .map_err(|e| format!("csv write: {e}"))?;
-        }
-        wtr.flush().map_err(|e| format!("csv flush: {e}"))
+        let orbits = batch_to_orbits(b)?;
+        empyrean_core::io::write_orbits_csv(p, &orbits)
+            .map_err(|e| format!("csv write failed: {e:?}"))
     })
 }
 
@@ -1013,26 +946,422 @@ pub unsafe extern "C" fn empyrean_events_write_csv(
 // Residuals I/O — write only
 // ────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Serialize, Deserialize)]
+/// One per-observation residual row, owned and format-independent.
+///
+/// Mirrors [`EmpyreanObservationResult`] field for field — the whole
+/// surface reaches disk, not a projection of it. Field names here are
+/// storage; the **wire** names and their order live in exactly one
+/// place, [`RESIDUAL_COLUMNS`], which drives all three writers so the
+/// formats cannot disagree about what a residual file contains.
+#[derive(Debug, Clone)]
 struct ResidualRow {
+    object_id: String,
+    obs_id: String,
+    obs_code: String,
+    ast_cat: String,
+    epoch_mjd_tdb: f64,
     ra_residual_arcsec: f64,
     dec_residual_arcsec: f64,
     chi2: f64,
+    dof: i32,
     probability: f64,
     selected: bool,
+    residual_cov_ra: f64,
+    residual_cov_dec: f64,
+    residual_cov_corr: f64,
+    rejection_reason: String,
+    rejection_criterion: f64,
+    rejection_threshold: f64,
+    rejection_effective_threshold: f64,
+    rejection_information_loss: f64,
+    cooks_distance: f64,
+    leverage: f64,
+    fractional_information: f64,
+    along_track_arcsec: f64,
+    cross_track_arcsec: f64,
+    along_track_error_arcsec: f64,
+    cross_track_error_arcsec: f64,
+    track_position_angle_deg: f64,
+    influence_information_loss: f64,
+    along_cross_covariance_arcsec2: f64,
+    radar_residual: f64,
+    radar_chi2: f64,
+    radar_probability: f64,
+    radar_variance: f64,
+    radar_dof: i32,
+    has_radar: bool,
+    radar_kind: String,
+}
+
+/// The stable name of a rejection code, for the file's attribution
+/// taxonomy. An integer on disk would make the column unreadable without
+/// the header; the names match the Python `ObservationResults`
+/// `rejection_reason` column exactly.
+fn rejection_reason_str(code: i32) -> &'static str {
+    match code {
+        crate::od::EMPYREAN_REJECTION_ACCEPTED => "accepted",
+        crate::od::EMPYREAN_REJECTION_CHI_SQUARED => "chi_squared",
+        crate::od::EMPYREAN_REJECTION_SIGMA_CLIP => "sigma_clip",
+        crate::od::EMPYREAN_REJECTION_COOKS_DISTANCE => "cooks_distance",
+        crate::od::EMPYREAN_REJECTION_ADAPTIVE => "adaptive",
+        crate::od::EMPYREAN_REJECTION_UNSUPPORTED_OBSERVATORY => "unsupported_observatory",
+        crate::od::EMPYREAN_REJECTION_CMC2003 => "cmc2003",
+        crate::od::EMPYREAN_REJECTION_RADAR_UNSUPPORTED => "radar_observations_unsupported",
+        crate::od::EMPYREAN_REJECTION_OCCULTATION_UNSUPPORTED => {
+            "occultation_observations_unsupported"
+        }
+        crate::od::EMPYREAN_REJECTION_OUTSIDE_ARC => "outside_arc",
+        crate::od::EMPYREAN_REJECTION_NON_FINITE_CHI2 => "non_finite_chi2",
+        crate::od::EMPYREAN_REJECTION_MISSING_JACOBIAN => "missing_jacobian",
+        crate::od::EMPYREAN_REJECTION_SPACECRAFT_KERNEL_MISSING => "spacecraft_kernel_missing",
+        crate::od::EMPYREAN_REJECTION_OBSERVER_CONSTRUCTION_FAILED => {
+            "observer_construction_failed"
+        }
+        crate::od::EMPYREAN_REJECTION_NEVER_ABSORBED => "never_absorbed",
+        _ => "not_evaluated",
+    }
 }
 
 fn residuals_to_rows(observations: &[EmpyreanObservationResult]) -> Vec<ResidualRow> {
     observations
         .iter()
         .map(|o| ResidualRow {
+            object_id: cstr_or_empty(o.object_id),
+            obs_id: cstr_or_empty(o.obs_id),
+            // Fixed 3-byte + NUL field, not a pointer.
+            obs_code: String::from_utf8_lossy(&o.obs_code)
+                .trim_end_matches('\0')
+                .to_string(),
+            ast_cat: cstr_or_empty(o.ast_cat),
+            epoch_mjd_tdb: o.epoch_mjd_tdb,
             ra_residual_arcsec: o.ra_residual_arcsec,
             dec_residual_arcsec: o.dec_residual_arcsec,
             chi2: o.chi2,
+            dof: o.dof as i32,
             probability: o.probability,
             selected: o.selected != 0,
+            residual_cov_ra: o.residual_cov_ra,
+            residual_cov_dec: o.residual_cov_dec,
+            residual_cov_corr: o.residual_cov_corr,
+            rejection_reason: rejection_reason_str(o.rejection_reason).to_string(),
+            rejection_criterion: o.rejection_criterion,
+            rejection_threshold: o.rejection_threshold,
+            rejection_effective_threshold: o.rejection_effective_threshold,
+            rejection_information_loss: o.rejection_information_loss,
+            cooks_distance: o.cooks_distance,
+            leverage: o.leverage,
+            fractional_information: o.fractional_information,
+            along_track_arcsec: o.along_track_arcsec,
+            cross_track_arcsec: o.cross_track_arcsec,
+            along_track_error_arcsec: o.along_track_error_arcsec,
+            cross_track_error_arcsec: o.cross_track_error_arcsec,
+            track_position_angle_deg: o.track_position_angle_deg,
+            influence_information_loss: o.influence_information_loss,
+            along_cross_covariance_arcsec2: o.along_cross_covariance_arcsec2,
+            radar_residual: o.radar_residual,
+            radar_chi2: o.radar_chi2,
+            radar_probability: o.radar_probability,
+            radar_variance: o.radar_variance,
+            radar_dof: o.radar_dof as i32,
+            has_radar: o.has_radar != 0,
+            // Empty on optical rows: the discriminator is `has_radar`,
+            // and naming a kind for a row that has none would be a lie.
+            radar_kind: if o.has_radar == 0 {
+                String::new()
+            } else if o.radar_kind == crate::od::EMPYREAN_RADAR_KIND_DOPPLER {
+                "doppler".to_string()
+            } else {
+                "delay".to_string()
+            },
         })
         .collect()
+}
+
+/// Owned `String` from an owned C string pointer; empty for null.
+fn cstr_or_empty(p: *mut c_char) -> String {
+    if p.is_null() {
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
+    }
+}
+
+/// One cell of a residual row, in the only three storage classes the
+/// residual surface uses.
+enum Cell<'a> {
+    F64(f64),
+    I32(i32),
+    Bool(bool),
+    Str(&'a str),
+}
+
+/// A residual file column: its wire name, its parquet type, and how to
+/// read it off a row.
+struct ResidualColumn {
+    name: &'static str,
+    data_type: DataType,
+    get: fn(&ResidualRow) -> Cell<'_>,
+}
+
+/// **The** residual file schema. Parquet, CSV, and JSON are all emitted
+/// from this list, so "the three formats carry the same columns" is a
+/// property of the code rather than something a test has to police —
+/// the test then only has to confirm it.
+///
+/// Every field [`EmpyreanObservationResult`] carries appears here.
+/// Non-computable numbers are NaN (JSON writes `null`, its established
+/// encoding for the same thing, because JSON has no NaN literal).
+static RESIDUAL_COLUMNS: &[ResidualColumn] = &[
+    ResidualColumn {
+        name: "object_id",
+        data_type: DataType::Utf8,
+        get: |r| Cell::Str(&r.object_id),
+    },
+    ResidualColumn {
+        name: "obs_id",
+        data_type: DataType::Utf8,
+        get: |r| Cell::Str(&r.obs_id),
+    },
+    ResidualColumn {
+        name: "obs_code",
+        data_type: DataType::Utf8,
+        get: |r| Cell::Str(&r.obs_code),
+    },
+    ResidualColumn {
+        name: "ast_cat",
+        data_type: DataType::Utf8,
+        get: |r| Cell::Str(&r.ast_cat),
+    },
+    ResidualColumn {
+        name: "epoch_mjd_tdb",
+        data_type: DataType::Float64,
+        get: |r| Cell::F64(r.epoch_mjd_tdb),
+    },
+    ResidualColumn {
+        name: "ra_residual_arcsec",
+        data_type: DataType::Float64,
+        get: |r| Cell::F64(r.ra_residual_arcsec),
+    },
+    ResidualColumn {
+        name: "dec_residual_arcsec",
+        data_type: DataType::Float64,
+        get: |r| Cell::F64(r.dec_residual_arcsec),
+    },
+    ResidualColumn {
+        name: "chi2",
+        data_type: DataType::Float64,
+        get: |r| Cell::F64(r.chi2),
+    },
+    ResidualColumn {
+        name: "dof",
+        data_type: DataType::Int32,
+        get: |r| Cell::I32(r.dof),
+    },
+    ResidualColumn {
+        name: "probability",
+        data_type: DataType::Float64,
+        get: |r| Cell::F64(r.probability),
+    },
+    ResidualColumn {
+        name: "selected",
+        data_type: DataType::Boolean,
+        get: |r| Cell::Bool(r.selected),
+    },
+    ResidualColumn {
+        name: "residual_cov_ra",
+        data_type: DataType::Float64,
+        get: |r| Cell::F64(r.residual_cov_ra),
+    },
+    ResidualColumn {
+        name: "residual_cov_dec",
+        data_type: DataType::Float64,
+        get: |r| Cell::F64(r.residual_cov_dec),
+    },
+    ResidualColumn {
+        name: "residual_cov_corr",
+        data_type: DataType::Float64,
+        get: |r| Cell::F64(r.residual_cov_corr),
+    },
+    ResidualColumn {
+        name: "rejection_reason",
+        data_type: DataType::Utf8,
+        get: |r| Cell::Str(&r.rejection_reason),
+    },
+    ResidualColumn {
+        name: "rejection_criterion",
+        data_type: DataType::Float64,
+        get: |r| Cell::F64(r.rejection_criterion),
+    },
+    ResidualColumn {
+        name: "rejection_threshold",
+        data_type: DataType::Float64,
+        get: |r| Cell::F64(r.rejection_threshold),
+    },
+    ResidualColumn {
+        name: "rejection_effective_threshold",
+        data_type: DataType::Float64,
+        get: |r| Cell::F64(r.rejection_effective_threshold),
+    },
+    ResidualColumn {
+        name: "rejection_information_loss",
+        data_type: DataType::Float64,
+        get: |r| Cell::F64(r.rejection_information_loss),
+    },
+    ResidualColumn {
+        name: "cooks_distance",
+        data_type: DataType::Float64,
+        get: |r| Cell::F64(r.cooks_distance),
+    },
+    ResidualColumn {
+        name: "leverage",
+        data_type: DataType::Float64,
+        get: |r| Cell::F64(r.leverage),
+    },
+    ResidualColumn {
+        name: "fractional_information",
+        data_type: DataType::Float64,
+        get: |r| Cell::F64(r.fractional_information),
+    },
+    ResidualColumn {
+        name: "along_track_arcsec",
+        data_type: DataType::Float64,
+        get: |r| Cell::F64(r.along_track_arcsec),
+    },
+    ResidualColumn {
+        name: "cross_track_arcsec",
+        data_type: DataType::Float64,
+        get: |r| Cell::F64(r.cross_track_arcsec),
+    },
+    ResidualColumn {
+        name: "along_track_error_arcsec",
+        data_type: DataType::Float64,
+        get: |r| Cell::F64(r.along_track_error_arcsec),
+    },
+    ResidualColumn {
+        name: "cross_track_error_arcsec",
+        data_type: DataType::Float64,
+        get: |r| Cell::F64(r.cross_track_error_arcsec),
+    },
+    ResidualColumn {
+        name: "track_position_angle_deg",
+        data_type: DataType::Float64,
+        get: |r| Cell::F64(r.track_position_angle_deg),
+    },
+    ResidualColumn {
+        name: "influence_information_loss",
+        data_type: DataType::Float64,
+        get: |r| Cell::F64(r.influence_information_loss),
+    },
+    ResidualColumn {
+        name: "along_cross_covariance_arcsec2",
+        data_type: DataType::Float64,
+        get: |r| Cell::F64(r.along_cross_covariance_arcsec2),
+    },
+    ResidualColumn {
+        name: "radar_residual",
+        data_type: DataType::Float64,
+        get: |r| Cell::F64(r.radar_residual),
+    },
+    ResidualColumn {
+        name: "radar_chi2",
+        data_type: DataType::Float64,
+        get: |r| Cell::F64(r.radar_chi2),
+    },
+    ResidualColumn {
+        name: "radar_probability",
+        data_type: DataType::Float64,
+        get: |r| Cell::F64(r.radar_probability),
+    },
+    ResidualColumn {
+        name: "radar_variance",
+        data_type: DataType::Float64,
+        get: |r| Cell::F64(r.radar_variance),
+    },
+    ResidualColumn {
+        name: "radar_dof",
+        data_type: DataType::Int32,
+        get: |r| Cell::I32(r.radar_dof),
+    },
+    ResidualColumn {
+        name: "has_radar",
+        data_type: DataType::Boolean,
+        get: |r| Cell::Bool(r.has_radar),
+    },
+    ResidualColumn {
+        name: "radar_kind",
+        data_type: DataType::Utf8,
+        get: |r| Cell::Str(&r.radar_kind),
+    },
+];
+
+fn write_residual_rows_parquet(path: &Path, rows: &[ResidualRow]) -> Result<(), String> {
+    let fields: Vec<ParquetField> = RESIDUAL_COLUMNS
+        .iter()
+        .map(|c| ParquetField {
+            name: c.name,
+            data_type: c.data_type.clone(),
+            nullable: false,
+        })
+        .collect();
+    write_rows_parquet_generic(path, rows, &fields, |row, builders| {
+        for (i, col) in RESIDUAL_COLUMNS.iter().enumerate() {
+            match ((col.get)(row), &mut builders[i]) {
+                (Cell::F64(v), Builder::F64(b)) => b.append_value(v),
+                (Cell::I32(v), Builder::I32(b)) => b.append_value(v),
+                (Cell::Bool(v), Builder::Bool(b)) => b.append_value(v),
+                (Cell::Str(v), Builder::Str(b)) => b.append_value(v),
+                _ => return Err(format!("residual column {} type mismatch", col.name)),
+            }
+        }
+        Ok(())
+    })
+}
+
+fn write_residual_rows_csv(path: &Path, rows: &[ResidualRow]) -> Result<(), String> {
+    let mut wtr = csv::Writer::from_path(path).map_err(|e| format!("csv create: {e}"))?;
+    wtr.write_record(RESIDUAL_COLUMNS.iter().map(|c| c.name))
+        .map_err(|e| format!("csv header: {e}"))?;
+    for row in rows {
+        // CSV keeps the literal `NaN` — it has no null, and an empty
+        // cell would be indistinguishable from a missing column.
+        let record: Vec<String> = RESIDUAL_COLUMNS
+            .iter()
+            .map(|c| match (c.get)(row) {
+                Cell::F64(v) => v.to_string(),
+                Cell::I32(v) => v.to_string(),
+                Cell::Bool(v) => v.to_string(),
+                Cell::Str(v) => v.to_string(),
+            })
+            .collect();
+        wtr.write_record(&record)
+            .map_err(|e| format!("csv write: {e}"))?;
+    }
+    wtr.flush().map_err(|e| format!("csv flush: {e}"))
+}
+
+fn write_residual_rows_json(path: &Path, rows: &[ResidualRow]) -> Result<(), String> {
+    let values: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|row| {
+            let mut map = serde_json::Map::with_capacity(RESIDUAL_COLUMNS.len());
+            for col in RESIDUAL_COLUMNS {
+                let v = match (col.get)(row) {
+                    // JSON has no NaN literal; `null` is the established
+                    // encoding for the same "not computable" state.
+                    Cell::F64(v) => serde_json::Number::from_f64(v)
+                        .map(serde_json::Value::Number)
+                        .unwrap_or(serde_json::Value::Null),
+                    Cell::I32(v) => serde_json::Value::Number(v.into()),
+                    Cell::Bool(v) => serde_json::Value::Bool(v),
+                    Cell::Str(v) => serde_json::Value::String(v.to_string()),
+                };
+                map.insert(col.name.to_string(), v);
+            }
+            serde_json::Value::Object(map)
+        })
+        .collect();
+    let f = File::create(path).map_err(|e| format!("create: {e}"))?;
+    serde_json::to_writer_pretty(f, &values).map_err(|e| format!("json write: {e}"))
 }
 
 /// Write OD residuals to parquet.
@@ -1043,10 +1372,7 @@ pub unsafe extern "C" fn empyrean_residuals_write_parquet(
     num_obs: usize,
 ) -> i32 {
     array_in_op(path, obs_ptr, num_obs, |p, slice| {
-        let rows = residuals_to_rows(slice);
-        write_rows_parquet_generic(p, &rows, &RESIDUAL_PARQUET_FIELDS, |row, builders| {
-            residual_append(row, builders)
-        })
+        write_residual_rows_parquet(p, &residuals_to_rows(slice))
     })
 }
 
@@ -1058,8 +1384,7 @@ pub unsafe extern "C" fn empyrean_residuals_write_json(
     num_obs: usize,
 ) -> i32 {
     array_in_op(path, obs_ptr, num_obs, |p, slice| {
-        let rows = residuals_to_rows(slice);
-        write_json(p, &rows)
+        write_residual_rows_json(p, &residuals_to_rows(slice))
     })
 }
 
@@ -1071,7 +1396,178 @@ pub unsafe extern "C" fn empyrean_residuals_write_csv(
     num_obs: usize,
 ) -> i32 {
     array_in_op(path, obs_ptr, num_obs, |p, slice| {
-        let rows = residuals_to_rows(slice);
+        write_residual_rows_csv(p, &residuals_to_rows(slice))
+    })
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Fit summary I/O — write only
+// ────────────────────────────────────────────────────────────────────
+
+/// One row of the per-object fit summary: what a batch orbit
+/// determination did with **one** input object, delivered or not.
+///
+/// This is the row shape of the `fit_summary` table every distribution
+/// channel emits, so the file the CLI writes and the table the Python
+/// API returns describe a fit with the same column names.
+///
+/// A failed object still gets a row — that is the point of the table.
+/// Its numeric columns are NaN (never 0.0, which would read as a
+/// measurement), its `_ok` booleans are false, and `error` carries the
+/// reason. `status` is `"delivered"` or `"failed"`.
+///
+/// Both string fields are borrowed for the duration of the call: the
+/// writer copies what it needs and frees nothing.
+#[repr(C)]
+pub struct EmpyreanFitSummary {
+    /// ADES object identifier. Never null.
+    pub object_id: *const c_char,
+    /// `"delivered"` or `"failed"`. Never null.
+    pub status: *const c_char,
+    /// 1 when the differential correction reached its stopping
+    /// criterion. 0 on a failed object.
+    pub converged: u8,
+    /// DC iterations used. 0 on a failed object.
+    pub iterations: u32,
+    /// Observations this object contributed.
+    pub n_obs: usize,
+    /// Observations the fit retained.
+    pub n_selected: usize,
+    pub rms_ra_arcsec: f64,
+    pub rms_dec_arcsec: f64,
+    pub reduced_chi2: f64,
+    pub fit_acceptable: u8,
+    pub extrapolation_acceptable: u8,
+    pub selection_fraction_ok: u8,
+    pub selection_fraction: f64,
+    pub selection_fraction_threshold: f64,
+    pub selected_arc_coverage_ok: u8,
+    pub selected_arc_days: f64,
+    pub selected_arc_fraction: f64,
+    pub selected_arc_fraction_threshold: f64,
+    pub trailing_gap_ok: u8,
+    pub trailing_gap_days: f64,
+    pub trailing_gap_threshold_days: f64,
+    pub fractional_sigma_a_ok: u8,
+    pub fractional_sigma_a: f64,
+    pub fractional_sigma_a_threshold: f64,
+    /// Width of the solved-parameter set (6 for a state-only fit). 0 on
+    /// a failed object.
+    pub solve_for_width: u32,
+    /// Failure message. Null on a delivered object.
+    pub error: *const c_char,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct FitSummaryRow {
+    object_id: String,
+    status: String,
+    converged: bool,
+    iterations: i32,
+    n_obs: i32,
+    n_selected: i32,
+    rms_ra_arcsec: f64,
+    rms_dec_arcsec: f64,
+    reduced_chi2: f64,
+    fit_acceptable: bool,
+    extrapolation_acceptable: bool,
+    selection_fraction_ok: bool,
+    selection_fraction: f64,
+    selection_fraction_threshold: f64,
+    selected_arc_coverage_ok: bool,
+    selected_arc_days: f64,
+    selected_arc_fraction: f64,
+    selected_arc_fraction_threshold: f64,
+    trailing_gap_ok: bool,
+    trailing_gap_days: f64,
+    trailing_gap_threshold_days: f64,
+    fractional_sigma_a_ok: bool,
+    fractional_sigma_a: f64,
+    fractional_sigma_a_threshold: f64,
+    solve_for_width: i32,
+    error: String,
+}
+
+fn fit_summaries_to_rows(summaries: &[EmpyreanFitSummary]) -> Vec<FitSummaryRow> {
+    summaries
+        .iter()
+        .map(|s| FitSummaryRow {
+            object_id: cstr_const_or_empty(s.object_id),
+            status: cstr_const_or_empty(s.status),
+            converged: s.converged != 0,
+            iterations: s.iterations as i32,
+            n_obs: s.n_obs as i32,
+            n_selected: s.n_selected as i32,
+            rms_ra_arcsec: s.rms_ra_arcsec,
+            rms_dec_arcsec: s.rms_dec_arcsec,
+            reduced_chi2: s.reduced_chi2,
+            fit_acceptable: s.fit_acceptable != 0,
+            extrapolation_acceptable: s.extrapolation_acceptable != 0,
+            selection_fraction_ok: s.selection_fraction_ok != 0,
+            selection_fraction: s.selection_fraction,
+            selection_fraction_threshold: s.selection_fraction_threshold,
+            selected_arc_coverage_ok: s.selected_arc_coverage_ok != 0,
+            selected_arc_days: s.selected_arc_days,
+            selected_arc_fraction: s.selected_arc_fraction,
+            selected_arc_fraction_threshold: s.selected_arc_fraction_threshold,
+            trailing_gap_ok: s.trailing_gap_ok != 0,
+            trailing_gap_days: s.trailing_gap_days,
+            trailing_gap_threshold_days: s.trailing_gap_threshold_days,
+            fractional_sigma_a_ok: s.fractional_sigma_a_ok != 0,
+            fractional_sigma_a: s.fractional_sigma_a,
+            fractional_sigma_a_threshold: s.fractional_sigma_a_threshold,
+            solve_for_width: s.solve_for_width as i32,
+            error: cstr_const_or_empty(s.error),
+        })
+        .collect()
+}
+
+/// Owned `String` from a borrowed C string pointer; empty for null.
+fn cstr_const_or_empty(p: *const c_char) -> String {
+    if p.is_null() {
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
+    }
+}
+
+/// Write the per-object fit summary to parquet.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn empyrean_fit_summary_write_parquet(
+    path: *const c_char,
+    summaries_ptr: *const EmpyreanFitSummary,
+    num_summaries: usize,
+) -> i32 {
+    array_in_op(path, summaries_ptr, num_summaries, |p, slice| {
+        let rows = fit_summaries_to_rows(slice);
+        write_rows_parquet_generic(p, &rows, &FIT_SUMMARY_PARQUET_FIELDS, |row, builders| {
+            fit_summary_append(row, builders)
+        })
+    })
+}
+
+/// Write the per-object fit summary to JSON.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn empyrean_fit_summary_write_json(
+    path: *const c_char,
+    summaries_ptr: *const EmpyreanFitSummary,
+    num_summaries: usize,
+) -> i32 {
+    array_in_op(path, summaries_ptr, num_summaries, |p, slice| {
+        let rows = fit_summaries_to_rows(slice);
+        write_json(p, &rows)
+    })
+}
+
+/// Write the per-object fit summary to CSV.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn empyrean_fit_summary_write_csv(
+    path: *const c_char,
+    summaries_ptr: *const EmpyreanFitSummary,
+    num_summaries: usize,
+) -> i32 {
+    array_in_op(path, summaries_ptr, num_summaries, |p, slice| {
+        let rows = fit_summaries_to_rows(slice);
         write_csv(p, &rows)
     })
 }
@@ -1598,50 +2094,194 @@ fn event_append(row: &EventRow, b: &mut [Builder]) -> Result<(), String> {
     Ok(())
 }
 
-const RESIDUAL_PARQUET_FIELDS: [ParquetField; 5] = [
+const FIT_SUMMARY_PARQUET_FIELDS: [ParquetField; 26] = [
     ParquetField {
-        name: "ra_residual_arcsec",
-        data_type: DataType::Float64,
+        name: "object_id",
+        data_type: DataType::Utf8,
         nullable: false,
     },
     ParquetField {
-        name: "dec_residual_arcsec",
-        data_type: DataType::Float64,
+        name: "status",
+        data_type: DataType::Utf8,
         nullable: false,
     },
     ParquetField {
-        name: "chi2",
-        data_type: DataType::Float64,
-        nullable: false,
-    },
-    ParquetField {
-        name: "probability",
-        data_type: DataType::Float64,
-        nullable: false,
-    },
-    ParquetField {
-        name: "selected",
+        name: "converged",
         data_type: DataType::Boolean,
+        nullable: false,
+    },
+    ParquetField {
+        name: "iterations",
+        data_type: DataType::Int32,
+        nullable: false,
+    },
+    ParquetField {
+        name: "n_obs",
+        data_type: DataType::Int32,
+        nullable: false,
+    },
+    ParquetField {
+        name: "n_selected",
+        data_type: DataType::Int32,
+        nullable: false,
+    },
+    ParquetField {
+        name: "rms_ra_arcsec",
+        data_type: DataType::Float64,
+        nullable: false,
+    },
+    ParquetField {
+        name: "rms_dec_arcsec",
+        data_type: DataType::Float64,
+        nullable: false,
+    },
+    ParquetField {
+        name: "reduced_chi2",
+        data_type: DataType::Float64,
+        nullable: false,
+    },
+    ParquetField {
+        name: "fit_acceptable",
+        data_type: DataType::Boolean,
+        nullable: false,
+    },
+    ParquetField {
+        name: "extrapolation_acceptable",
+        data_type: DataType::Boolean,
+        nullable: false,
+    },
+    ParquetField {
+        name: "selection_fraction_ok",
+        data_type: DataType::Boolean,
+        nullable: false,
+    },
+    ParquetField {
+        name: "selection_fraction",
+        data_type: DataType::Float64,
+        nullable: false,
+    },
+    ParquetField {
+        name: "selection_fraction_threshold",
+        data_type: DataType::Float64,
+        nullable: false,
+    },
+    ParquetField {
+        name: "selected_arc_coverage_ok",
+        data_type: DataType::Boolean,
+        nullable: false,
+    },
+    ParquetField {
+        name: "selected_arc_days",
+        data_type: DataType::Float64,
+        nullable: false,
+    },
+    ParquetField {
+        name: "selected_arc_fraction",
+        data_type: DataType::Float64,
+        nullable: false,
+    },
+    ParquetField {
+        name: "selected_arc_fraction_threshold",
+        data_type: DataType::Float64,
+        nullable: false,
+    },
+    ParquetField {
+        name: "trailing_gap_ok",
+        data_type: DataType::Boolean,
+        nullable: false,
+    },
+    ParquetField {
+        name: "trailing_gap_days",
+        data_type: DataType::Float64,
+        nullable: false,
+    },
+    ParquetField {
+        name: "trailing_gap_threshold_days",
+        data_type: DataType::Float64,
+        nullable: false,
+    },
+    ParquetField {
+        name: "fractional_sigma_a_ok",
+        data_type: DataType::Boolean,
+        nullable: false,
+    },
+    ParquetField {
+        name: "fractional_sigma_a",
+        data_type: DataType::Float64,
+        nullable: false,
+    },
+    ParquetField {
+        name: "fractional_sigma_a_threshold",
+        data_type: DataType::Float64,
+        nullable: false,
+    },
+    ParquetField {
+        name: "solve_for_width",
+        data_type: DataType::Int32,
+        nullable: false,
+    },
+    ParquetField {
+        name: "error",
+        data_type: DataType::Utf8,
         nullable: false,
     },
 ];
 
-fn residual_append(row: &ResidualRow, b: &mut [Builder]) -> Result<(), String> {
-    if let Builder::F64(f) = &mut b[0] {
-        f.append_value(row.ra_residual_arcsec);
+fn fit_summary_append(row: &FitSummaryRow, b: &mut [Builder]) -> Result<(), String> {
+    macro_rules! str_at {
+        ($idx:expr, $val:expr) => {
+            if let Builder::Str(s) = &mut b[$idx] {
+                s.append_value($val);
+            }
+        };
     }
-    if let Builder::F64(f) = &mut b[1] {
-        f.append_value(row.dec_residual_arcsec);
+    macro_rules! bool_at {
+        ($idx:expr, $val:expr) => {
+            if let Builder::Bool(x) = &mut b[$idx] {
+                x.append_value($val);
+            }
+        };
     }
-    if let Builder::F64(f) = &mut b[2] {
-        f.append_value(row.chi2);
+    macro_rules! i32_at {
+        ($idx:expr, $val:expr) => {
+            if let Builder::I32(i) = &mut b[$idx] {
+                i.append_value($val);
+            }
+        };
     }
-    if let Builder::F64(f) = &mut b[3] {
-        f.append_value(row.probability);
+    macro_rules! f64_at {
+        ($idx:expr, $val:expr) => {
+            if let Builder::F64(f) = &mut b[$idx] {
+                f.append_value($val);
+            }
+        };
     }
-    if let Builder::Bool(b_) = &mut b[4] {
-        b_.append_value(row.selected);
-    }
+    str_at!(0, &row.object_id);
+    str_at!(1, &row.status);
+    bool_at!(2, row.converged);
+    i32_at!(3, row.iterations);
+    i32_at!(4, row.n_obs);
+    i32_at!(5, row.n_selected);
+    f64_at!(6, row.rms_ra_arcsec);
+    f64_at!(7, row.rms_dec_arcsec);
+    f64_at!(8, row.reduced_chi2);
+    bool_at!(9, row.fit_acceptable);
+    bool_at!(10, row.extrapolation_acceptable);
+    bool_at!(11, row.selection_fraction_ok);
+    f64_at!(12, row.selection_fraction);
+    f64_at!(13, row.selection_fraction_threshold);
+    bool_at!(14, row.selected_arc_coverage_ok);
+    f64_at!(15, row.selected_arc_days);
+    f64_at!(16, row.selected_arc_fraction);
+    f64_at!(17, row.selected_arc_fraction_threshold);
+    bool_at!(18, row.trailing_gap_ok);
+    f64_at!(19, row.trailing_gap_days);
+    f64_at!(20, row.trailing_gap_threshold_days);
+    bool_at!(21, row.fractional_sigma_a_ok);
+    f64_at!(22, row.fractional_sigma_a);
+    f64_at!(23, row.fractional_sigma_a_threshold);
+    i32_at!(24, row.solve_for_width);
+    str_at!(25, &row.error);
     Ok(())
 }
 
@@ -1767,4 +2407,359 @@ fn _suppress_unused() {
     let _ = frame_to_int as fn(_) -> _;
     let _ = representation_to_int as fn(_) -> _;
     let _ = std::mem::size_of::<DynamicalEvent>();
+}
+
+#[cfg(test)]
+mod residual_writer_tests {
+    use super::*;
+    use crate::od::EmpyreanObservationResult;
+
+    /// Every field the residual surface carries, by wire name. This list
+    /// is the contract: it is written out here independently of
+    /// [`RESIDUAL_COLUMNS`], so dropping a column from the schema fails
+    /// the test rather than quietly shortening the file.
+    const EXPECTED_COLUMNS: [&str; 36] = [
+        "object_id",
+        "obs_id",
+        "obs_code",
+        "ast_cat",
+        "epoch_mjd_tdb",
+        "ra_residual_arcsec",
+        "dec_residual_arcsec",
+        "chi2",
+        "dof",
+        "probability",
+        "selected",
+        "residual_cov_ra",
+        "residual_cov_dec",
+        "residual_cov_corr",
+        "rejection_reason",
+        "rejection_criterion",
+        "rejection_threshold",
+        "rejection_effective_threshold",
+        "rejection_information_loss",
+        "cooks_distance",
+        "leverage",
+        "fractional_information",
+        "along_track_arcsec",
+        "cross_track_arcsec",
+        "along_track_error_arcsec",
+        "cross_track_error_arcsec",
+        "track_position_angle_deg",
+        "influence_information_loss",
+        "along_cross_covariance_arcsec2",
+        "radar_residual",
+        "radar_chi2",
+        "radar_probability",
+        "radar_variance",
+        "radar_dof",
+        "has_radar",
+        "radar_kind",
+    ];
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "empyrean-residual-writer-{tag}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&d).expect("create temp dir");
+        d
+    }
+
+    /// One optical row with a rejection decision and a NaN in a field
+    /// that is genuinely not computable, plus one radar row.
+    fn sample_rows() -> Vec<EmpyreanObservationResult> {
+        let mut optical: EmpyreanObservationResult = unsafe { std::mem::zeroed() };
+        optical.obs_id = crate::od::alloc_cstring_for_test("obs-1");
+        optical.object_id = crate::od::alloc_cstring_for_test("2024 YR4");
+        optical.obs_code = *b"703\0";
+        optical.ast_cat = crate::od::alloc_cstring_for_test("Gaia3");
+        optical.epoch_mjd_tdb = 60320.5;
+        optical.ra_residual_arcsec = 0.31;
+        optical.dec_residual_arcsec = -0.12;
+        optical.chi2 = 1.4;
+        optical.dof = 2;
+        optical.probability = 0.49;
+        optical.selected = 1;
+        optical.rejection_reason = crate::od::EMPYREAN_REJECTION_CHI_SQUARED;
+        optical.rejection_criterion = 9.1;
+        optical.rejection_threshold = 8.0;
+        // No AT/CT decomposition available for this row.
+        optical.along_track_arcsec = f64::NAN;
+        optical.cross_track_arcsec = f64::NAN;
+        optical.radar_residual = f64::NAN;
+        optical.radar_chi2 = f64::NAN;
+        optical.radar_probability = f64::NAN;
+        optical.radar_variance = f64::NAN;
+
+        let mut radar: EmpyreanObservationResult = unsafe { std::mem::zeroed() };
+        radar.obs_id = crate::od::alloc_cstring_for_test("obs-2");
+        radar.object_id = crate::od::alloc_cstring_for_test("2024 YR4");
+        radar.obs_code = *b"251\0";
+        radar.epoch_mjd_tdb = 60321.0;
+        radar.ra_residual_arcsec = f64::NAN;
+        radar.dec_residual_arcsec = f64::NAN;
+        radar.chi2 = 0.8;
+        radar.has_radar = 1;
+        radar.radar_kind = crate::od::EMPYREAN_RADAR_KIND_DOPPLER;
+        radar.radar_residual = -0.4;
+        radar.radar_dof = 1;
+        radar.rejection_reason = crate::od::EMPYREAN_REJECTION_ACCEPTED;
+
+        vec![optical, radar]
+    }
+
+    fn write_all(dir: &std::path::Path, rows: &[EmpyreanObservationResult]) {
+        write_residual_rows_parquet(&dir.join("r.parquet"), &residuals_to_rows(rows))
+            .expect("parquet");
+        write_residual_rows_csv(&dir.join("r.csv"), &residuals_to_rows(rows)).expect("csv");
+        write_residual_rows_json(&dir.join("r.json"), &residuals_to_rows(rows)).expect("json");
+    }
+
+    fn parquet_columns(path: &std::path::Path) -> Vec<String> {
+        let file = File::open(path).expect("open parquet");
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+            .expect("parquet reader");
+        reader
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect()
+    }
+
+    fn csv_columns(path: &std::path::Path) -> Vec<String> {
+        let text = std::fs::read_to_string(path).expect("read csv");
+        text.lines()
+            .next()
+            .expect("header")
+            .split(',')
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    fn json_rows(path: &std::path::Path) -> Vec<serde_json::Map<String, serde_json::Value>> {
+        let text = std::fs::read_to_string(path).expect("read json");
+        let v: Vec<serde_json::Value> = serde_json::from_str(&text).expect("parse json");
+        v.into_iter()
+            .map(|x| x.as_object().expect("object row").clone())
+            .collect()
+    }
+
+    /// The whole in-memory residual surface reaches disk. A projection
+    /// is what this replaced: five columns out of thirty-six.
+    #[test]
+    fn every_residual_field_reaches_disk() {
+        let dir = tmp_dir("all-fields");
+        let rows = sample_rows();
+        write_all(&dir, &rows);
+
+        assert_eq!(
+            csv_columns(&dir.join("r.csv")),
+            EXPECTED_COLUMNS.to_vec(),
+            "the CSV schema is the full residual surface, in order"
+        );
+        // The schema table and the expectation list agree, so neither can
+        // drift alone.
+        let from_table: Vec<&str> = RESIDUAL_COLUMNS.iter().map(|c| c.name).collect();
+        assert_eq!(from_table, EXPECTED_COLUMNS.to_vec());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Parquet, CSV, and JSON describe the same rows with the same
+    /// columns. Format-specific value encodings are allowed; the column
+    /// set is not.
+    #[test]
+    fn all_three_formats_emit_the_same_columns() {
+        let dir = tmp_dir("parity");
+        let rows = sample_rows();
+        write_all(&dir, &rows);
+
+        let pq = parquet_columns(&dir.join("r.parquet"));
+        let csv = csv_columns(&dir.join("r.csv"));
+        let json = json_rows(&dir.join("r.json"));
+
+        assert_eq!(pq, csv, "parquet and CSV must carry the same columns");
+        assert_eq!(json.len(), rows.len(), "one JSON object per row");
+        for row in &json {
+            let mut names: Vec<&str> = row.keys().map(|s| s.as_str()).collect();
+            names.sort_unstable();
+            let mut expected: Vec<&str> = csv.iter().map(|s| s.as_str()).collect();
+            expected.sort_unstable();
+            assert_eq!(names, expected, "JSON must carry the same columns");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A non-computable number is NaN in CSV (which has no null) and
+    /// `null` in JSON (which has no NaN). Both mean "not computable" —
+    /// neither is ever written as `0.0`.
+    #[test]
+    fn non_computable_numbers_encode_per_format_never_as_zero() {
+        let dir = tmp_dir("nan");
+        let rows = sample_rows();
+        write_all(&dir, &rows);
+
+        let csv_text = std::fs::read_to_string(dir.join("r.csv")).expect("read csv");
+        let header = csv_columns(&dir.join("r.csv"));
+        let at_idx = header
+            .iter()
+            .position(|c| c == "along_track_arcsec")
+            .expect("column present");
+        let first_data = csv_text.lines().nth(1).expect("a data row");
+        assert_eq!(
+            first_data.split(',').nth(at_idx),
+            Some("NaN"),
+            "CSV keeps the literal NaN\n{csv_text}"
+        );
+
+        let json = json_rows(&dir.join("r.json"));
+        assert!(
+            json[0]["along_track_arcsec"].is_null(),
+            "JSON encodes NaN as null: {}",
+            json[0]["along_track_arcsec"]
+        );
+        assert!(!json[0]["along_track_arcsec"].is_number());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The rejection code is written as its name, so the attribution
+    /// taxonomy is readable without a lookup table, and the radar
+    /// discriminator never labels an optical row.
+    #[test]
+    fn rejection_reason_and_radar_kind_are_written_as_names() {
+        let dir = tmp_dir("names");
+        let rows = sample_rows();
+        write_all(&dir, &rows);
+
+        let json = json_rows(&dir.join("r.json"));
+        assert_eq!(json[0]["rejection_reason"], "chi_squared");
+        assert_eq!(json[1]["rejection_reason"], "accepted");
+        // Optical row: no radar, so no kind is claimed.
+        assert_eq!(json[0]["has_radar"], false);
+        assert_eq!(json[0]["radar_kind"], "");
+        assert_eq!(json[1]["has_radar"], true);
+        assert_eq!(json[1]["radar_kind"], "doppler");
+        // The grouping key survives to every row.
+        assert_eq!(json[0]["object_id"], "2024 YR4");
+        assert_eq!(json[1]["object_id"], "2024 YR4");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A one-orbit batch with a populated covariance, for the orbit
+    /// writers.
+    fn sample_orbit_batch() -> EmpyreanOrbitBatch {
+        let mut orbit: EmpyreanOrbit = unsafe { std::mem::zeroed() };
+        orbit.state = CoordinateState {
+            epoch_mjd_tdb: 60320.0,
+            elements: [1.1, 0.2, 0.03, -0.004, 0.017, 0.0006],
+            covariance: {
+                let mut c = [[0.0f64; 6]; 6];
+                for (i, row) in c.iter_mut().enumerate() {
+                    row[i] = 1.0e-9 * (i as f64 + 1.0);
+                }
+                c
+            },
+            has_covariance: 1,
+            representation: crate::od::EMPYREAN_REPRESENTATION_CARTESIAN,
+            frame: 0,
+            origin: 10,
+        };
+        orbit.non_grav_dt = f64::NAN;
+        orbit.non_grav_dt_variance = f64::NAN;
+        orbit.h_mag = f64::NAN;
+        orbit.slope1 = f64::NAN;
+        orbit.slope2 = f64::NAN;
+
+        let id = crate::od::alloc_cstring_for_test("test-orbit");
+        let orbits = Box::into_raw(Box::new(orbit));
+        let ids = Box::into_raw(Box::new(id));
+        let object_ids = Box::into_raw(Box::new(std::ptr::null_mut::<c_char>()));
+        EmpyreanOrbitBatch {
+            orbits,
+            orbit_ids: ids,
+            object_ids,
+            num_orbits: 1,
+        }
+    }
+
+    /// The CSV orbit file is not a lossy projection of the parquet one:
+    /// both carry the same column set, covariance included. CSV used to
+    /// drop it entirely, so `--format csv` silently discarded the
+    /// uncertainty the whole engine exists to propagate.
+    #[test]
+    fn orbit_csv_and_parquet_carry_the_same_columns() {
+        let dir = tmp_dir("orbit-parity");
+        let batch = sample_orbit_batch();
+        let pq_path = dir.join("o.parquet");
+        let csv_path = dir.join("o.csv");
+        let c_pq = CString::new(pq_path.display().to_string()).unwrap();
+        let c_csv = CString::new(csv_path.display().to_string()).unwrap();
+
+        let rc_pq = unsafe { empyrean_orbits_write_parquet(c_pq.as_ptr(), &batch) };
+        let rc_csv = unsafe { empyrean_orbits_write_csv(c_csv.as_ptr(), &batch) };
+        assert_eq!(rc_pq, 0, "parquet write");
+        assert_eq!(rc_csv, 0, "csv write");
+
+        let mut pq_cols = parquet_columns(&pq_path);
+        let mut csv_cols = csv_columns(&csv_path);
+        assert_eq!(
+            pq_cols.len(),
+            csv_cols.len(),
+            "same column count\nparquet: {pq_cols:?}\ncsv: {csv_cols:?}"
+        );
+        pq_cols.sort();
+        csv_cols.sort();
+        // Set equality, not positional: the two engine writers order the
+        // photometry and SRP blocks differently at the tail. Both formats
+        // are self-describing, so a name-keyed reader is unaffected.
+        assert_eq!(pq_cols, csv_cols, "same column SET");
+
+        // The covariance actually reached the CSV, with a value.
+        let header = csv_columns(&csv_path);
+        let text = std::fs::read_to_string(&csv_path).expect("read csv");
+        let first = text.lines().nth(1).expect("a data row");
+        let idx = header.iter().position(|c| c == "cov_00").expect("cov_00");
+        let cell = first.split(',').nth(idx).expect("cov_00 cell");
+        assert!(
+            cell.parse::<f64>().is_ok_and(|v| v > 0.0),
+            "CSV must carry a real covariance, got {cell:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        unsafe { empyrean_orbits_batch_free(&batch as *const _ as *mut _) };
+    }
+
+    /// Every rejection code maps to a distinct name — a collision would
+    /// merge two causes in the attribution census.
+    #[test]
+    fn rejection_reason_names_are_distinct() {
+        let codes = [
+            crate::od::EMPYREAN_REJECTION_ACCEPTED,
+            crate::od::EMPYREAN_REJECTION_CHI_SQUARED,
+            crate::od::EMPYREAN_REJECTION_SIGMA_CLIP,
+            crate::od::EMPYREAN_REJECTION_COOKS_DISTANCE,
+            crate::od::EMPYREAN_REJECTION_ADAPTIVE,
+            crate::od::EMPYREAN_REJECTION_UNSUPPORTED_OBSERVATORY,
+            crate::od::EMPYREAN_REJECTION_CMC2003,
+            crate::od::EMPYREAN_REJECTION_RADAR_UNSUPPORTED,
+            crate::od::EMPYREAN_REJECTION_OCCULTATION_UNSUPPORTED,
+            crate::od::EMPYREAN_REJECTION_OUTSIDE_ARC,
+            crate::od::EMPYREAN_REJECTION_NON_FINITE_CHI2,
+            crate::od::EMPYREAN_REJECTION_MISSING_JACOBIAN,
+            crate::od::EMPYREAN_REJECTION_SPACECRAFT_KERNEL_MISSING,
+            crate::od::EMPYREAN_REJECTION_OBSERVER_CONSTRUCTION_FAILED,
+            crate::od::EMPYREAN_REJECTION_NEVER_ABSORBED,
+            crate::od::EMPYREAN_REJECTION_NOT_EVALUATED,
+        ];
+        let mut names: Vec<&str> = codes.iter().map(|c| rejection_reason_str(*c)).collect();
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), total, "each code needs its own name");
+    }
 }

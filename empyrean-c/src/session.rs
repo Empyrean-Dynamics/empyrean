@@ -422,7 +422,9 @@ fn write_od_result(od: &ODResult, result_out: *mut EmpyreanODResult) -> Result<(
         // photometry) that `empyrean_od_result_free` frees
         // unconditionally, so nothing is left indeterminate for a caller
         // who did not zero-initialize the out-struct.
-        crate::od::write_od_result_fields(result_out, od);
+        // A session holds one object's observations, so the per-row
+        // grouping key is the caller's, not the engine's: null object_id.
+        crate::od::write_od_result_fields(result_out, od, None);
     }
     Ok(())
 }

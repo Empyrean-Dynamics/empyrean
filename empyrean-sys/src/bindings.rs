@@ -82,6 +82,11 @@ pub const EMPYREAN_REJECTION_CMC2003: u32 = 6;
 pub const EMPYREAN_REJECTION_RADAR_UNSUPPORTED: u32 = 7;
 pub const EMPYREAN_REJECTION_OCCULTATION_UNSUPPORTED: u32 = 8;
 pub const EMPYREAN_REJECTION_OUTSIDE_ARC: u32 = 9;
+pub const EMPYREAN_REJECTION_NON_FINITE_CHI2: u32 = 10;
+pub const EMPYREAN_REJECTION_MISSING_JACOBIAN: u32 = 11;
+pub const EMPYREAN_REJECTION_SPACECRAFT_KERNEL_MISSING: u32 = 12;
+pub const EMPYREAN_REJECTION_OBSERVER_CONSTRUCTION_FAILED: u32 = 13;
+pub const EMPYREAN_REJECTION_NEVER_ABSORBED: u32 = 14;
 pub const EMPYREAN_REJECTION_NOT_EVALUATED: i32 = -1;
 pub const EMPYREAN_REJECTION_KIND_ADAPTIVE: u32 = 0;
 pub const EMPYREAN_REJECTION_KIND_CMC2003: u32 = 1;
@@ -117,6 +122,17 @@ pub const EMPYREAN_REPRESENTATION_CARTESIAN: u32 = 0;
 pub const EMPYREAN_REPRESENTATION_KEPLERIAN: u32 = 1;
 pub const EMPYREAN_REPRESENTATION_COMETARY: u32 = 2;
 pub const EMPYREAN_REPRESENTATION_SPHERICAL: u32 = 3;
+pub const EMPYREAN_OD_FAILURE_NONE: i32 = 0;
+pub const EMPYREAN_OD_FAILURE_OBSERVATION_CONVERSION: i32 = 1;
+pub const EMPYREAN_OD_FAILURE_OBSERVER_CONSTRUCTION: i32 = 2;
+pub const EMPYREAN_OD_FAILURE_UNSUPPORTED_COORDINATE_SYSTEM: i32 = 3;
+pub const EMPYREAN_OD_FAILURE_EARTH_ORIENTATION_COVERAGE: i32 = 4;
+pub const EMPYREAN_OD_FAILURE_IOD: i32 = 5;
+pub const EMPYREAN_OD_FAILURE_OD: i32 = 6;
+pub const EMPYREAN_OD_FAILURE_DUPLICATE_OBS_IDS: i32 = 7;
+pub const EMPYREAN_OD_FAILURE_RADAR_ONLY: i32 = 8;
+pub const EMPYREAN_OD_FAILURE_NON_GRAV_NOT_RECOVERED: i32 = 9;
+pub const EMPYREAN_DETERMINE_NONE_DELIVERED: i32 = -4;
 pub const EMPYREAN_PHASE_FUNCTION_NONE: i32 = -1;
 pub const EMPYREAN_PHASE_FUNCTION_HG: u32 = 0;
 pub const EMPYREAN_PHASE_FUNCTION_HG1G2: u32 = 1;
@@ -1815,12 +1831,14 @@ impl Default for EmpyreanOrbitBatch {
         }
     }
 }
-#[doc = " Per-observation result from orbit determination or evaluation.\n\n Mirrors scott's [`ObservationResult`](scott::results::ObservationResult)\n — every field upstream produces is carried across the C ABI. NaN /\n `EMPYREAN_REJECTION_NOT_EVALUATED` mark fields that aren't populated\n for the call type (e.g. evaluate doesn't compute rejection or\n influence diagnostics).\n\n `obs_id` is a heap-allocated NUL-terminated UTF-8 string; the\n pointer is freed by [`empyrean_od_result_free`] /\n [`empyrean_evaluate_result_free`] when the parent array is freed.\n Do NOT free it manually."]
+#[doc = " Per-observation result from orbit determination or evaluation.\n\n Mirrors scott's [`ObservationResult`](scott::results::ObservationResult)\n — every field upstream produces is carried across the C ABI. NaN /\n `EMPYREAN_REJECTION_NOT_EVALUATED` mark fields that aren't populated\n for the call type (e.g. evaluate doesn't compute rejection or\n influence diagnostics).\n\n `obs_id`, `object_id` and `ast_cat` are heap-allocated NUL-terminated\n UTF-8 strings; the pointers are freed by\n [`empyrean_determine_results_free`] / [`empyrean_od_result_free`] /\n [`empyrean_evaluate_result_free`] when the parent array is freed.\n Do NOT free them manually."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct EmpyreanObservationResult {
     #[doc = " ADES `obsID` (or scott auto-assigned). Owned by the parent array\n — freed by the matching `*_result_free` call."]
     pub obs_id: *mut ::std::os::raw::c_char,
+    #[doc = " ADES object identifier (permID / provID / trkSub) of the object\n this row was fitted against. Populated by\n [`empyrean_determine`], which groups by object — so a caller may\n concatenate every object's rows into one flat table and still\n know which fit each row belongs to.\n\n Null on the single-object paths (`empyrean_evaluate`,\n `empyrean_refine`), where the caller supplied the one orbit and\n no grouping key exists. Owned by the parent array."]
+    pub object_id: *mut ::std::os::raw::c_char,
     #[doc = " MPC observatory code (3-byte + NUL)."]
     pub obs_code: [u8; 4usize],
     #[doc = " Star catalog used for astrometric reduction (ADES `astCat`).\n Heap-allocated; null when ADES did not carry one. Freed with the array."]
@@ -1893,85 +1911,192 @@ pub struct EmpyreanObservationResult {
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of EmpyreanObservationResult"]
-        [::std::mem::size_of::<EmpyreanObservationResult>() - 264usize];
+        [::std::mem::size_of::<EmpyreanObservationResult>() - 272usize];
     ["Alignment of EmpyreanObservationResult"]
         [::std::mem::align_of::<EmpyreanObservationResult>() - 8usize];
     ["Offset of field: EmpyreanObservationResult::obs_id"]
         [::std::mem::offset_of!(EmpyreanObservationResult, obs_id) - 0usize];
+    ["Offset of field: EmpyreanObservationResult::object_id"]
+        [::std::mem::offset_of!(EmpyreanObservationResult, object_id) - 8usize];
     ["Offset of field: EmpyreanObservationResult::obs_code"]
-        [::std::mem::offset_of!(EmpyreanObservationResult, obs_code) - 8usize];
+        [::std::mem::offset_of!(EmpyreanObservationResult, obs_code) - 16usize];
     ["Offset of field: EmpyreanObservationResult::ast_cat"]
-        [::std::mem::offset_of!(EmpyreanObservationResult, ast_cat) - 16usize];
+        [::std::mem::offset_of!(EmpyreanObservationResult, ast_cat) - 24usize];
     ["Offset of field: EmpyreanObservationResult::epoch_mjd_tdb"]
-        [::std::mem::offset_of!(EmpyreanObservationResult, epoch_mjd_tdb) - 24usize];
+        [::std::mem::offset_of!(EmpyreanObservationResult, epoch_mjd_tdb) - 32usize];
     ["Offset of field: EmpyreanObservationResult::ra_residual_arcsec"]
-        [::std::mem::offset_of!(EmpyreanObservationResult, ra_residual_arcsec) - 32usize];
+        [::std::mem::offset_of!(EmpyreanObservationResult, ra_residual_arcsec) - 40usize];
     ["Offset of field: EmpyreanObservationResult::dec_residual_arcsec"]
-        [::std::mem::offset_of!(EmpyreanObservationResult, dec_residual_arcsec) - 40usize];
+        [::std::mem::offset_of!(EmpyreanObservationResult, dec_residual_arcsec) - 48usize];
     ["Offset of field: EmpyreanObservationResult::chi2"]
-        [::std::mem::offset_of!(EmpyreanObservationResult, chi2) - 48usize];
+        [::std::mem::offset_of!(EmpyreanObservationResult, chi2) - 56usize];
     ["Offset of field: EmpyreanObservationResult::dof"]
-        [::std::mem::offset_of!(EmpyreanObservationResult, dof) - 56usize];
+        [::std::mem::offset_of!(EmpyreanObservationResult, dof) - 64usize];
     ["Offset of field: EmpyreanObservationResult::probability"]
-        [::std::mem::offset_of!(EmpyreanObservationResult, probability) - 64usize];
+        [::std::mem::offset_of!(EmpyreanObservationResult, probability) - 72usize];
     ["Offset of field: EmpyreanObservationResult::selected"]
-        [::std::mem::offset_of!(EmpyreanObservationResult, selected) - 72usize];
+        [::std::mem::offset_of!(EmpyreanObservationResult, selected) - 80usize];
     ["Offset of field: EmpyreanObservationResult::residual_cov_ra"]
-        [::std::mem::offset_of!(EmpyreanObservationResult, residual_cov_ra) - 80usize];
+        [::std::mem::offset_of!(EmpyreanObservationResult, residual_cov_ra) - 88usize];
     ["Offset of field: EmpyreanObservationResult::residual_cov_dec"]
-        [::std::mem::offset_of!(EmpyreanObservationResult, residual_cov_dec) - 88usize];
+        [::std::mem::offset_of!(EmpyreanObservationResult, residual_cov_dec) - 96usize];
     ["Offset of field: EmpyreanObservationResult::residual_cov_corr"]
-        [::std::mem::offset_of!(EmpyreanObservationResult, residual_cov_corr) - 96usize];
+        [::std::mem::offset_of!(EmpyreanObservationResult, residual_cov_corr) - 104usize];
     ["Offset of field: EmpyreanObservationResult::rejection_reason"]
-        [::std::mem::offset_of!(EmpyreanObservationResult, rejection_reason) - 104usize];
+        [::std::mem::offset_of!(EmpyreanObservationResult, rejection_reason) - 112usize];
     ["Offset of field: EmpyreanObservationResult::rejection_criterion"]
-        [::std::mem::offset_of!(EmpyreanObservationResult, rejection_criterion) - 112usize];
+        [::std::mem::offset_of!(EmpyreanObservationResult, rejection_criterion) - 120usize];
     ["Offset of field: EmpyreanObservationResult::rejection_threshold"]
-        [::std::mem::offset_of!(EmpyreanObservationResult, rejection_threshold) - 120usize];
+        [::std::mem::offset_of!(EmpyreanObservationResult, rejection_threshold) - 128usize];
     ["Offset of field: EmpyreanObservationResult::rejection_effective_threshold"][::std::mem::offset_of!(
         EmpyreanObservationResult,
         rejection_effective_threshold
-    ) - 128usize];
+    ) - 136usize];
     ["Offset of field: EmpyreanObservationResult::rejection_information_loss"]
-        [::std::mem::offset_of!(EmpyreanObservationResult, rejection_information_loss) - 136usize];
+        [::std::mem::offset_of!(EmpyreanObservationResult, rejection_information_loss) - 144usize];
     ["Offset of field: EmpyreanObservationResult::cooks_distance"]
-        [::std::mem::offset_of!(EmpyreanObservationResult, cooks_distance) - 144usize];
+        [::std::mem::offset_of!(EmpyreanObservationResult, cooks_distance) - 152usize];
     ["Offset of field: EmpyreanObservationResult::leverage"]
-        [::std::mem::offset_of!(EmpyreanObservationResult, leverage) - 152usize];
+        [::std::mem::offset_of!(EmpyreanObservationResult, leverage) - 160usize];
     ["Offset of field: EmpyreanObservationResult::fractional_information"]
-        [::std::mem::offset_of!(EmpyreanObservationResult, fractional_information) - 160usize];
+        [::std::mem::offset_of!(EmpyreanObservationResult, fractional_information) - 168usize];
     ["Offset of field: EmpyreanObservationResult::along_track_arcsec"]
-        [::std::mem::offset_of!(EmpyreanObservationResult, along_track_arcsec) - 168usize];
+        [::std::mem::offset_of!(EmpyreanObservationResult, along_track_arcsec) - 176usize];
     ["Offset of field: EmpyreanObservationResult::cross_track_arcsec"]
-        [::std::mem::offset_of!(EmpyreanObservationResult, cross_track_arcsec) - 176usize];
+        [::std::mem::offset_of!(EmpyreanObservationResult, cross_track_arcsec) - 184usize];
     ["Offset of field: EmpyreanObservationResult::along_track_error_arcsec"]
-        [::std::mem::offset_of!(EmpyreanObservationResult, along_track_error_arcsec) - 184usize];
+        [::std::mem::offset_of!(EmpyreanObservationResult, along_track_error_arcsec) - 192usize];
     ["Offset of field: EmpyreanObservationResult::cross_track_error_arcsec"]
-        [::std::mem::offset_of!(EmpyreanObservationResult, cross_track_error_arcsec) - 192usize];
+        [::std::mem::offset_of!(EmpyreanObservationResult, cross_track_error_arcsec) - 200usize];
     ["Offset of field: EmpyreanObservationResult::track_position_angle_deg"]
-        [::std::mem::offset_of!(EmpyreanObservationResult, track_position_angle_deg) - 200usize];
+        [::std::mem::offset_of!(EmpyreanObservationResult, track_position_angle_deg) - 208usize];
     ["Offset of field: EmpyreanObservationResult::influence_information_loss"]
-        [::std::mem::offset_of!(EmpyreanObservationResult, influence_information_loss) - 208usize];
+        [::std::mem::offset_of!(EmpyreanObservationResult, influence_information_loss) - 216usize];
     ["Offset of field: EmpyreanObservationResult::along_cross_covariance_arcsec2"][::std::mem::offset_of!(
         EmpyreanObservationResult,
         along_cross_covariance_arcsec2
-    ) - 216usize];
+    ) - 224usize];
     ["Offset of field: EmpyreanObservationResult::radar_residual"]
-        [::std::mem::offset_of!(EmpyreanObservationResult, radar_residual) - 224usize];
+        [::std::mem::offset_of!(EmpyreanObservationResult, radar_residual) - 232usize];
     ["Offset of field: EmpyreanObservationResult::radar_chi2"]
-        [::std::mem::offset_of!(EmpyreanObservationResult, radar_chi2) - 232usize];
+        [::std::mem::offset_of!(EmpyreanObservationResult, radar_chi2) - 240usize];
     ["Offset of field: EmpyreanObservationResult::radar_probability"]
-        [::std::mem::offset_of!(EmpyreanObservationResult, radar_probability) - 240usize];
+        [::std::mem::offset_of!(EmpyreanObservationResult, radar_probability) - 248usize];
     ["Offset of field: EmpyreanObservationResult::radar_variance"]
-        [::std::mem::offset_of!(EmpyreanObservationResult, radar_variance) - 248usize];
+        [::std::mem::offset_of!(EmpyreanObservationResult, radar_variance) - 256usize];
     ["Offset of field: EmpyreanObservationResult::radar_dof"]
-        [::std::mem::offset_of!(EmpyreanObservationResult, radar_dof) - 256usize];
+        [::std::mem::offset_of!(EmpyreanObservationResult, radar_dof) - 264usize];
     ["Offset of field: EmpyreanObservationResult::has_radar"]
-        [::std::mem::offset_of!(EmpyreanObservationResult, has_radar) - 260usize];
+        [::std::mem::offset_of!(EmpyreanObservationResult, has_radar) - 268usize];
     ["Offset of field: EmpyreanObservationResult::radar_kind"]
-        [::std::mem::offset_of!(EmpyreanObservationResult, radar_kind) - 261usize];
+        [::std::mem::offset_of!(EmpyreanObservationResult, radar_kind) - 269usize];
 };
 impl Default for EmpyreanObservationResult {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[doc = " One row of the per-object fit summary: what a batch orbit\n determination did with **one** input object, delivered or not.\n\n This is the row shape of the `fit_summary` table every distribution\n channel emits, so the file the CLI writes and the table the Python\n API returns describe a fit with the same column names.\n\n A failed object still gets a row — that is the point of the table.\n Its numeric columns are NaN (never 0.0, which would read as a\n measurement), its `_ok` booleans are false, and `error` carries the\n reason. `status` is `\"delivered\"` or `\"failed\"`.\n\n Both string fields are borrowed for the duration of the call: the\n writer copies what it needs and frees nothing."]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct EmpyreanFitSummary {
+    #[doc = " ADES object identifier. Never null."]
+    pub object_id: *const ::std::os::raw::c_char,
+    #[doc = " `\"delivered\"` or `\"failed\"`. Never null."]
+    pub status: *const ::std::os::raw::c_char,
+    #[doc = " 1 when the differential correction reached its stopping\n criterion. 0 on a failed object."]
+    pub converged: u8,
+    #[doc = " DC iterations used. 0 on a failed object."]
+    pub iterations: u32,
+    #[doc = " Observations this object contributed."]
+    pub n_obs: usize,
+    #[doc = " Observations the fit retained."]
+    pub n_selected: usize,
+    pub rms_ra_arcsec: f64,
+    pub rms_dec_arcsec: f64,
+    pub reduced_chi2: f64,
+    pub fit_acceptable: u8,
+    pub extrapolation_acceptable: u8,
+    pub selection_fraction_ok: u8,
+    pub selection_fraction: f64,
+    pub selection_fraction_threshold: f64,
+    pub selected_arc_coverage_ok: u8,
+    pub selected_arc_days: f64,
+    pub selected_arc_fraction: f64,
+    pub selected_arc_fraction_threshold: f64,
+    pub trailing_gap_ok: u8,
+    pub trailing_gap_days: f64,
+    pub trailing_gap_threshold_days: f64,
+    pub fractional_sigma_a_ok: u8,
+    pub fractional_sigma_a: f64,
+    pub fractional_sigma_a_threshold: f64,
+    #[doc = " Width of the solved-parameter set (6 for a state-only fit). 0 on\n a failed object."]
+    pub solve_for_width: u32,
+    #[doc = " Failure message. Null on a delivered object."]
+    pub error: *const ::std::os::raw::c_char,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of EmpyreanFitSummary"][::std::mem::size_of::<EmpyreanFitSummary>() - 184usize];
+    ["Alignment of EmpyreanFitSummary"][::std::mem::align_of::<EmpyreanFitSummary>() - 8usize];
+    ["Offset of field: EmpyreanFitSummary::object_id"]
+        [::std::mem::offset_of!(EmpyreanFitSummary, object_id) - 0usize];
+    ["Offset of field: EmpyreanFitSummary::status"]
+        [::std::mem::offset_of!(EmpyreanFitSummary, status) - 8usize];
+    ["Offset of field: EmpyreanFitSummary::converged"]
+        [::std::mem::offset_of!(EmpyreanFitSummary, converged) - 16usize];
+    ["Offset of field: EmpyreanFitSummary::iterations"]
+        [::std::mem::offset_of!(EmpyreanFitSummary, iterations) - 20usize];
+    ["Offset of field: EmpyreanFitSummary::n_obs"]
+        [::std::mem::offset_of!(EmpyreanFitSummary, n_obs) - 24usize];
+    ["Offset of field: EmpyreanFitSummary::n_selected"]
+        [::std::mem::offset_of!(EmpyreanFitSummary, n_selected) - 32usize];
+    ["Offset of field: EmpyreanFitSummary::rms_ra_arcsec"]
+        [::std::mem::offset_of!(EmpyreanFitSummary, rms_ra_arcsec) - 40usize];
+    ["Offset of field: EmpyreanFitSummary::rms_dec_arcsec"]
+        [::std::mem::offset_of!(EmpyreanFitSummary, rms_dec_arcsec) - 48usize];
+    ["Offset of field: EmpyreanFitSummary::reduced_chi2"]
+        [::std::mem::offset_of!(EmpyreanFitSummary, reduced_chi2) - 56usize];
+    ["Offset of field: EmpyreanFitSummary::fit_acceptable"]
+        [::std::mem::offset_of!(EmpyreanFitSummary, fit_acceptable) - 64usize];
+    ["Offset of field: EmpyreanFitSummary::extrapolation_acceptable"]
+        [::std::mem::offset_of!(EmpyreanFitSummary, extrapolation_acceptable) - 65usize];
+    ["Offset of field: EmpyreanFitSummary::selection_fraction_ok"]
+        [::std::mem::offset_of!(EmpyreanFitSummary, selection_fraction_ok) - 66usize];
+    ["Offset of field: EmpyreanFitSummary::selection_fraction"]
+        [::std::mem::offset_of!(EmpyreanFitSummary, selection_fraction) - 72usize];
+    ["Offset of field: EmpyreanFitSummary::selection_fraction_threshold"]
+        [::std::mem::offset_of!(EmpyreanFitSummary, selection_fraction_threshold) - 80usize];
+    ["Offset of field: EmpyreanFitSummary::selected_arc_coverage_ok"]
+        [::std::mem::offset_of!(EmpyreanFitSummary, selected_arc_coverage_ok) - 88usize];
+    ["Offset of field: EmpyreanFitSummary::selected_arc_days"]
+        [::std::mem::offset_of!(EmpyreanFitSummary, selected_arc_days) - 96usize];
+    ["Offset of field: EmpyreanFitSummary::selected_arc_fraction"]
+        [::std::mem::offset_of!(EmpyreanFitSummary, selected_arc_fraction) - 104usize];
+    ["Offset of field: EmpyreanFitSummary::selected_arc_fraction_threshold"]
+        [::std::mem::offset_of!(EmpyreanFitSummary, selected_arc_fraction_threshold) - 112usize];
+    ["Offset of field: EmpyreanFitSummary::trailing_gap_ok"]
+        [::std::mem::offset_of!(EmpyreanFitSummary, trailing_gap_ok) - 120usize];
+    ["Offset of field: EmpyreanFitSummary::trailing_gap_days"]
+        [::std::mem::offset_of!(EmpyreanFitSummary, trailing_gap_days) - 128usize];
+    ["Offset of field: EmpyreanFitSummary::trailing_gap_threshold_days"]
+        [::std::mem::offset_of!(EmpyreanFitSummary, trailing_gap_threshold_days) - 136usize];
+    ["Offset of field: EmpyreanFitSummary::fractional_sigma_a_ok"]
+        [::std::mem::offset_of!(EmpyreanFitSummary, fractional_sigma_a_ok) - 144usize];
+    ["Offset of field: EmpyreanFitSummary::fractional_sigma_a"]
+        [::std::mem::offset_of!(EmpyreanFitSummary, fractional_sigma_a) - 152usize];
+    ["Offset of field: EmpyreanFitSummary::fractional_sigma_a_threshold"]
+        [::std::mem::offset_of!(EmpyreanFitSummary, fractional_sigma_a_threshold) - 160usize];
+    ["Offset of field: EmpyreanFitSummary::solve_for_width"]
+        [::std::mem::offset_of!(EmpyreanFitSummary, solve_for_width) - 168usize];
+    ["Offset of field: EmpyreanFitSummary::error"]
+        [::std::mem::offset_of!(EmpyreanFitSummary, error) - 176usize];
+};
+impl Default for EmpyreanFitSummary {
     fn default() -> Self {
         let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
         unsafe {
@@ -2621,8 +2746,10 @@ pub struct EmpyreanODConfig {
     pub max_iterations: u32,
     #[doc = " DC convergence tolerance on Δx^T N Δx. 0.0 → upstream default (0.1)."]
     pub convergence_tol: f64,
-    #[doc = " Use STM-cached ephemeris updates for iterations 2+. 1 = on (default)."]
-    pub use_stm_cache: u8,
+    #[doc = " Allow the outward-expansion pipeline to truncate a sub-arc it\n cannot fit as one piece. Tri-state: `-1` (or any negative) =\n engine default (allowed), `1` = allowed, `0` = **forbidden**.\n\n Forbidding truncation makes an arc that spans a dynamical\n discontinuity FAIL loudly instead of delivering a fit of the\n reconcilable sub-arc with the rest tagged\n `EMPYREAN_REJECTION_OUTSIDE_ARC`. Two interactions matter before\n relying on `0`: per-observation rejection is orthogonal and still\n runs (set `rejection.enabled = 0` as well to fit the whole arc or\n fail), and under `EMPYREAN_ORIGIN_POLICY_AUTO` the refusal is a\n cascade trigger rather than a final answer — pin the origin with\n `EMPYREAN_ORIGIN_POLICY_EXPLICIT` to get a pure loud failure."]
+    pub allow_arc_truncation: i8,
+    #[doc = " Master switch for the co-orbital IOD lane. Tri-state: `-1` (or any\n negative) = engine default (enabled), `1` = enabled, `0` = forced\n off (the historical cascade).\n\n Enabling it does not route ordinary objects through the lane: it\n still fires only when every co-orbitality gate passes. The lane's\n detection parameters are not exposed here — reach for the\n empyrean-core Rust API to tune them."]
+    pub coorbital_enabled: i8,
     #[doc = " Solve-for parameter set (`EMPYREAN_SOLVE_FOR_*`). Default = Auto."]
     pub solve_for: i32,
     pub auto_escalation: EmpyreanAutoEscalationPolicy,
@@ -2679,8 +2806,10 @@ const _: () = {
         [::std::mem::offset_of!(EmpyreanODConfig, max_iterations) - 192usize];
     ["Offset of field: EmpyreanODConfig::convergence_tol"]
         [::std::mem::offset_of!(EmpyreanODConfig, convergence_tol) - 200usize];
-    ["Offset of field: EmpyreanODConfig::use_stm_cache"]
-        [::std::mem::offset_of!(EmpyreanODConfig, use_stm_cache) - 208usize];
+    ["Offset of field: EmpyreanODConfig::allow_arc_truncation"]
+        [::std::mem::offset_of!(EmpyreanODConfig, allow_arc_truncation) - 208usize];
+    ["Offset of field: EmpyreanODConfig::coorbital_enabled"]
+        [::std::mem::offset_of!(EmpyreanODConfig, coorbital_enabled) - 209usize];
     ["Offset of field: EmpyreanODConfig::solve_for"]
         [::std::mem::offset_of!(EmpyreanODConfig, solve_for) - 212usize];
     ["Offset of field: EmpyreanODConfig::auto_escalation"]
@@ -2842,7 +2971,7 @@ const _: () = {
     ["Offset of field: EmpyreanNonGravParams::covariance"]
         [::std::mem::offset_of!(EmpyreanNonGravParams, covariance) - 88usize];
 };
-#[doc = " Acceptability sub-checks computed post-DC.\n\n Mirrors scott's [`AcceptabilityReport`](scott::od::AcceptabilityReport).\n Boolean fields are encoded as `u8` (0/1). When a value is unavailable\n (e.g. AT/CT ratio with no sky-motion rates), the `_value` is NaN and\n the corresponding `_ok` flag is 0. Always populated on\n [`EmpyreanODResult`]; on [`EmpyreanEvaluateResult`] the report is\n filled with NaN/0 because evaluate does not produce a fitted orbit."]
+#[doc = " Acceptability sub-checks computed post-DC.\n\n Mirrors scott's [`AcceptabilityReport`](scott::od::AcceptabilityReport).\n Boolean fields are encoded as `u8` (0/1). Always populated on\n [`EmpyreanODResult`]; on [`EmpyreanEvaluateResult`] the report is\n filled with NaN/0 because evaluate does not produce a fitted orbit.\n\n # NaN convention\n\n **Every `f64` here is NaN when the quantity could not be computed**\n (AT/CT ratio with no sky-motion rates, selected-arc spans when the fit\n selected nothing, …) — NaN is the only \"not computable\" marker, never\n `0.0`, because a threshold-comparison of `0.0` reads as a real\n measurement that happens to be at the floor. The `_ok` booleans are\n **always valid**: a gate whose value is NaN reports `0` (did not pass),\n so a consumer can branch on the verdict without first testing the value\n for NaN.\n\n # Fit vs. extrapolation\n\n `fit_acceptable` is the AND of the fit-quality gates (convergence,\n positive-definite covariance, reduced χ², RMS, residual isotropy).\n `extrapolation_acceptable` additionally requires the four selection /\n coverage axes below — `selection_fraction_ok`,\n `selected_arc_coverage_ok`, `trailing_gap_ok` and\n `fractional_sigma_a_ok`. Those four are deliberately NOT part of\n `fit_acceptable`: a heavily pruned fit can still describe its retained\n subset well while being unsafe to propagate forward."]
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
 pub struct EmpyreanAcceptabilityReport {
@@ -2859,17 +2988,36 @@ pub struct EmpyreanAcceptabilityReport {
     pub at_ct_ratio_value: f64,
     pub at_ct_ratio_threshold: f64,
     pub covariance_ok: u8,
+    #[doc = " FULL observation span at or above `arc_days_threshold`. Kept for\n callers that want the full-arc meaning; `extrapolation_acceptable`\n judges coverage on `selected_arc_coverage_ok` instead."]
     pub arc_coverage_ok: u8,
     pub arc_days_value: f64,
     pub arc_days_threshold: f64,
     pub fractional_sigma_a_ok: u8,
     pub fractional_sigma_a_value: f64,
     pub fractional_sigma_a_threshold: f64,
+    #[doc = " Fraction of observations retained (n_selected / n_obs) at or above\n the configured floor. `false` means the residual bars above\n describe a heavily pruned subset. Reproduce the fraction from\n `selection_fraction_value`, NOT from\n [`EmpyreanResidualSummary`] — the summary counts merged\n radar / occultation stub rows that were never candidates for\n outlier pruning, so its ratio is a different (smaller) number."]
+    pub selection_fraction_ok: u8,
+    pub selection_fraction_value: f64,
+    pub selection_fraction_threshold: f64,
+    #[doc = " The SELECTED observations cover enough of the arc to extrapolate\n across it: the selected span clears the absolute\n `arc_days_threshold` floor AND spans at least\n `selected_arc_fraction_threshold` of the full observed span."]
+    pub selected_arc_coverage_ok: u8,
+    #[doc = " Arc span (days) over the selected observations only. NaN when\n nothing is selected."]
+    pub selected_arc_days_value: f64,
+    #[doc = " Selected-span / full-span ratio."]
+    pub selected_arc_fraction_value: f64,
+    pub selected_arc_fraction_threshold: f64,
+    #[doc = " The most-recent observations were NOT rejected. The absolute,\n asymmetric backstop the span-ratio axis cannot provide: it catches\n a short recent tail rejected off a long arc, where the ratio still\n passes but the discarded rows are the ones nearest a forward\n extrapolation target."]
+    pub trailing_gap_ok: u8,
+    #[doc = " Days between the last selected and the last full-arc observation.\n `0.0` when the last kept observation is the last observation; NaN\n when nothing is selected."]
+    pub trailing_gap_days_value: f64,
+    pub trailing_gap_threshold: f64,
+    #[doc = " Radar astrometry joint-fit acceptability, as a tri-state:\n `1` = pass, `0` = fail, `-1` = not applicable (no radar\n contribution to this fit). Currently always `-1` — upstream\n reserves this for when optical and radar both constrain a fit.\n `-1` is distinct from `0` on purpose: \"no radar\" must never read\n as \"radar failed\"."]
+    pub radar_fit_ok: i8,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of EmpyreanAcceptabilityReport"]
-        [::std::mem::size_of::<EmpyreanAcceptabilityReport>() - 120usize];
+        [::std::mem::size_of::<EmpyreanAcceptabilityReport>() - 208usize];
     ["Alignment of EmpyreanAcceptabilityReport"]
         [::std::mem::align_of::<EmpyreanAcceptabilityReport>() - 8usize];
     ["Offset of field: EmpyreanAcceptabilityReport::fit_acceptable"]
@@ -2912,6 +3060,34 @@ const _: () = {
         EmpyreanAcceptabilityReport,
         fractional_sigma_a_threshold
     ) - 112usize];
+    ["Offset of field: EmpyreanAcceptabilityReport::selection_fraction_ok"]
+        [::std::mem::offset_of!(EmpyreanAcceptabilityReport, selection_fraction_ok) - 120usize];
+    ["Offset of field: EmpyreanAcceptabilityReport::selection_fraction_value"]
+        [::std::mem::offset_of!(EmpyreanAcceptabilityReport, selection_fraction_value) - 128usize];
+    ["Offset of field: EmpyreanAcceptabilityReport::selection_fraction_threshold"][::std::mem::offset_of!(
+        EmpyreanAcceptabilityReport,
+        selection_fraction_threshold
+    ) - 136usize];
+    ["Offset of field: EmpyreanAcceptabilityReport::selected_arc_coverage_ok"]
+        [::std::mem::offset_of!(EmpyreanAcceptabilityReport, selected_arc_coverage_ok) - 144usize];
+    ["Offset of field: EmpyreanAcceptabilityReport::selected_arc_days_value"]
+        [::std::mem::offset_of!(EmpyreanAcceptabilityReport, selected_arc_days_value) - 152usize];
+    ["Offset of field: EmpyreanAcceptabilityReport::selected_arc_fraction_value"][::std::mem::offset_of!(
+        EmpyreanAcceptabilityReport,
+        selected_arc_fraction_value
+    ) - 160usize];
+    ["Offset of field: EmpyreanAcceptabilityReport::selected_arc_fraction_threshold"][::std::mem::offset_of!(
+        EmpyreanAcceptabilityReport,
+        selected_arc_fraction_threshold
+    ) - 168usize];
+    ["Offset of field: EmpyreanAcceptabilityReport::trailing_gap_ok"]
+        [::std::mem::offset_of!(EmpyreanAcceptabilityReport, trailing_gap_ok) - 176usize];
+    ["Offset of field: EmpyreanAcceptabilityReport::trailing_gap_days_value"]
+        [::std::mem::offset_of!(EmpyreanAcceptabilityReport, trailing_gap_days_value) - 184usize];
+    ["Offset of field: EmpyreanAcceptabilityReport::trailing_gap_threshold"]
+        [::std::mem::offset_of!(EmpyreanAcceptabilityReport, trailing_gap_threshold) - 192usize];
+    ["Offset of field: EmpyreanAcceptabilityReport::radar_fit_ok"]
+        [::std::mem::offset_of!(EmpyreanAcceptabilityReport, radar_fit_ok) - 200usize];
 };
 #[doc = " One per-station bias estimate from a Schur-eliminated nuisance fit.\n\n Mirrors [`scott::results::StationBias`]. Populated rows in the\n returned array correspond to stations that met the\n `min_obs_per_station` threshold; under-observed stations are absent.\n Timing fields are populated only when a `BiasKind::StationTiming`\n nuisance was active (currently no surface to enable it from the C\n ABI; reserved for a planned follow-up).\n\n `obs_code` is heap-allocated and owned by the parent array — freed\n by [`empyrean_od_result_free`] when the result is freed. Don't free\n it manually."]
 #[repr(C)]
@@ -3306,7 +3482,7 @@ pub struct EmpyreanODResult {
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of EmpyreanODResult"][::std::mem::size_of::<EmpyreanODResult>() - 7600usize];
+    ["Size of EmpyreanODResult"][::std::mem::size_of::<EmpyreanODResult>() - 7688usize];
     ["Alignment of EmpyreanODResult"][::std::mem::align_of::<EmpyreanODResult>() - 8usize];
     ["Offset of field: EmpyreanODResult::orbit"]
         [::std::mem::offset_of!(EmpyreanODResult, orbit) - 0usize];
@@ -3349,55 +3525,130 @@ const _: () = {
     ["Offset of field: EmpyreanODResult::acceptability"]
         [::std::mem::offset_of!(EmpyreanODResult, acceptability) - 3736usize];
     ["Offset of field: EmpyreanODResult::station_biases"]
-        [::std::mem::offset_of!(EmpyreanODResult, station_biases) - 3856usize];
+        [::std::mem::offset_of!(EmpyreanODResult, station_biases) - 3944usize];
     ["Offset of field: EmpyreanODResult::num_station_biases"]
-        [::std::mem::offset_of!(EmpyreanODResult, num_station_biases) - 3864usize];
+        [::std::mem::offset_of!(EmpyreanODResult, num_station_biases) - 3952usize];
     ["Offset of field: EmpyreanODResult::has_solved_covariance"]
-        [::std::mem::offset_of!(EmpyreanODResult, has_solved_covariance) - 3872usize];
+        [::std::mem::offset_of!(EmpyreanODResult, has_solved_covariance) - 3960usize];
     ["Offset of field: EmpyreanODResult::solved_covariance"]
-        [::std::mem::offset_of!(EmpyreanODResult, solved_covariance) - 3880usize];
+        [::std::mem::offset_of!(EmpyreanODResult, solved_covariance) - 3968usize];
     ["Offset of field: EmpyreanODResult::has_dt_delta"]
-        [::std::mem::offset_of!(EmpyreanODResult, has_dt_delta) - 7136usize];
+        [::std::mem::offset_of!(EmpyreanODResult, has_dt_delta) - 7224usize];
     ["Offset of field: EmpyreanODResult::dt_delta"]
-        [::std::mem::offset_of!(EmpyreanODResult, dt_delta) - 7144usize];
+        [::std::mem::offset_of!(EmpyreanODResult, dt_delta) - 7232usize];
     ["Offset of field: EmpyreanODResult::has_amrat_delta"]
-        [::std::mem::offset_of!(EmpyreanODResult, has_amrat_delta) - 7152usize];
+        [::std::mem::offset_of!(EmpyreanODResult, has_amrat_delta) - 7240usize];
     ["Offset of field: EmpyreanODResult::amrat_delta"]
-        [::std::mem::offset_of!(EmpyreanODResult, amrat_delta) - 7160usize];
+        [::std::mem::offset_of!(EmpyreanODResult, amrat_delta) - 7248usize];
     ["Offset of field: EmpyreanODResult::thrust_delta_count"]
-        [::std::mem::offset_of!(EmpyreanODResult, thrust_delta_count) - 7168usize];
+        [::std::mem::offset_of!(EmpyreanODResult, thrust_delta_count) - 7256usize];
     ["Offset of field: EmpyreanODResult::thrust_delta_m_per_s"]
-        [::std::mem::offset_of!(EmpyreanODResult, thrust_delta_m_per_s) - 7176usize];
+        [::std::mem::offset_of!(EmpyreanODResult, thrust_delta_m_per_s) - 7264usize];
     ["Offset of field: EmpyreanODResult::dv_frame"]
-        [::std::mem::offset_of!(EmpyreanODResult, dv_frame) - 7248usize];
+        [::std::mem::offset_of!(EmpyreanODResult, dv_frame) - 7336usize];
     ["Offset of field: EmpyreanODResult::has_photometry"]
-        [::std::mem::offset_of!(EmpyreanODResult, has_photometry) - 7252usize];
+        [::std::mem::offset_of!(EmpyreanODResult, has_photometry) - 7340usize];
     ["Offset of field: EmpyreanODResult::photometry"]
-        [::std::mem::offset_of!(EmpyreanODResult, photometry) - 7256usize];
+        [::std::mem::offset_of!(EmpyreanODResult, photometry) - 7344usize];
     ["Offset of field: EmpyreanODResult::has_srp"]
-        [::std::mem::offset_of!(EmpyreanODResult, has_srp) - 7504usize];
+        [::std::mem::offset_of!(EmpyreanODResult, has_srp) - 7592usize];
     ["Offset of field: EmpyreanODResult::srp"]
-        [::std::mem::offset_of!(EmpyreanODResult, srp) - 7512usize];
+        [::std::mem::offset_of!(EmpyreanODResult, srp) - 7600usize];
     ["Offset of field: EmpyreanODResult::covariance_trust"]
-        [::std::mem::offset_of!(EmpyreanODResult, covariance_trust) - 7544usize];
+        [::std::mem::offset_of!(EmpyreanODResult, covariance_trust) - 7632usize];
     ["Offset of field: EmpyreanODResult::trust_event_kind"]
-        [::std::mem::offset_of!(EmpyreanODResult, trust_event_kind) - 7548usize];
+        [::std::mem::offset_of!(EmpyreanODResult, trust_event_kind) - 7636usize];
     ["Offset of field: EmpyreanODResult::trust_event_epoch_mjd_tdb"]
-        [::std::mem::offset_of!(EmpyreanODResult, trust_event_epoch_mjd_tdb) - 7552usize];
+        [::std::mem::offset_of!(EmpyreanODResult, trust_event_epoch_mjd_tdb) - 7640usize];
     ["Offset of field: EmpyreanODResult::trust_event_distance_au"]
-        [::std::mem::offset_of!(EmpyreanODResult, trust_event_distance_au) - 7560usize];
+        [::std::mem::offset_of!(EmpyreanODResult, trust_event_distance_au) - 7648usize];
     ["Offset of field: EmpyreanODResult::trust_event_nonlinearity"]
-        [::std::mem::offset_of!(EmpyreanODResult, trust_event_nonlinearity) - 7568usize];
+        [::std::mem::offset_of!(EmpyreanODResult, trust_event_nonlinearity) - 7656usize];
     ["Offset of field: EmpyreanODResult::trust_event_threshold"]
-        [::std::mem::offset_of!(EmpyreanODResult, trust_event_threshold) - 7576usize];
+        [::std::mem::offset_of!(EmpyreanODResult, trust_event_threshold) - 7664usize];
     ["Offset of field: EmpyreanODResult::trust_event_body"]
-        [::std::mem::offset_of!(EmpyreanODResult, trust_event_body) - 7584usize];
+        [::std::mem::offset_of!(EmpyreanODResult, trust_event_body) - 7672usize];
     ["Offset of field: EmpyreanODResult::trust_solved_width"]
-        [::std::mem::offset_of!(EmpyreanODResult, trust_solved_width) - 7592usize];
+        [::std::mem::offset_of!(EmpyreanODResult, trust_solved_width) - 7680usize];
     ["Offset of field: EmpyreanODResult::trust_second_order_recoverable"]
-        [::std::mem::offset_of!(EmpyreanODResult, trust_second_order_recoverable) - 7596usize];
+        [::std::mem::offset_of!(EmpyreanODResult, trust_second_order_recoverable) - 7684usize];
 };
 impl Default for EmpyreanODResult {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[doc = " One object's slot in a batch [`empyrean_determine`] result.\n\n Exactly one of the two payloads is live, selected by `delivered`:\n\n - `delivered == 1` — `result` is a fully populated\n   [`EmpyreanODResult`], `error` is null and `error_code` is\n   [`EMPYREAN_OD_FAILURE_NONE`].\n - `delivered == 0` — this object's fit failed. `error` carries the\n   engine's message and `error_code` classifies it\n   (`EMPYREAN_OD_FAILURE_*`). **`result` is NaN-poisoned**: every\n   `f64` is NaN, every pointer null, every count 0, and every\n   enumerated `i32` is `-1` (never a valid code), so a caller that\n   forgets to check `delivered` gets an obviously invalid record\n   rather than a plausible all-zero fit.\n\n A failed object never aborts the batch — the other objects are still\n fitted and delivered.\n\n `object_id` and `error` are owned by the parent table and freed by\n [`empyrean_determine_results_free`]. Do NOT free them manually."]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct EmpyreanODObjectResult {
+    #[doc = " ADES object identifier (permID / provID / trkSub) this slot's\n observations were grouped under. `\"unknown\"` when the group's\n records carried no identifier at all. Never null."]
+    pub object_id: *mut ::std::os::raw::c_char,
+    #[doc = " 1 when `result` carries a delivered fit; 0 when the fit failed."]
+    pub delivered: u8,
+    #[doc = " The fit. Meaningful only when `delivered == 1`; NaN-poisoned\n otherwise (see the type-level note)."]
+    pub result: EmpyreanODResult,
+    #[doc = " Failure message. Null when `delivered == 1`."]
+    pub error: *mut ::std::os::raw::c_char,
+    #[doc = " `EMPYREAN_OD_FAILURE_*` classification of `error`.\n [`EMPYREAN_OD_FAILURE_NONE`] when `delivered == 1`."]
+    pub error_code: i32,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of EmpyreanODObjectResult"][::std::mem::size_of::<EmpyreanODObjectResult>() - 7720usize];
+    ["Alignment of EmpyreanODObjectResult"]
+        [::std::mem::align_of::<EmpyreanODObjectResult>() - 8usize];
+    ["Offset of field: EmpyreanODObjectResult::object_id"]
+        [::std::mem::offset_of!(EmpyreanODObjectResult, object_id) - 0usize];
+    ["Offset of field: EmpyreanODObjectResult::delivered"]
+        [::std::mem::offset_of!(EmpyreanODObjectResult, delivered) - 8usize];
+    ["Offset of field: EmpyreanODObjectResult::result"]
+        [::std::mem::offset_of!(EmpyreanODObjectResult, result) - 16usize];
+    ["Offset of field: EmpyreanODObjectResult::error"]
+        [::std::mem::offset_of!(EmpyreanODObjectResult, error) - 7704usize];
+    ["Offset of field: EmpyreanODObjectResult::error_code"]
+        [::std::mem::offset_of!(EmpyreanODObjectResult, error_code) - 7712usize];
+};
+impl Default for EmpyreanODObjectResult {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[doc = " Result table of a batch [`empyrean_determine`] — one\n [`EmpyreanODObjectResult`] per ADES object found in the\n observations, in ascending `object_id` order.\n\n Ordering is by identifier rather than by input row order so the same\n observation set produces the same table regardless of how the rows\n were interleaved, and so a caller can bisect for an object.\n\n Release with [`empyrean_determine_results_free`] — including when\n `empyrean_determine` returned\n [`EMPYREAN_DETERMINE_NONE_DELIVERED`], which still populates the\n table."]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct EmpyreanDetermineResults {
+    #[doc = " Owned array of per-object slots. Null only when\n `num_objects == 0`."]
+    pub objects: *mut EmpyreanODObjectResult,
+    pub num_objects: usize,
+    #[doc = " Initial-orbit keys that matched no observation group. A seed the\n caller supplied and the engine could not attach to any object is\n reported here rather than dropped: it means the seed's identity\n does not match any ADES identifier in the observations. Owned\n array of owned C strings."]
+    pub unmatched_orbit_ids: *mut *mut ::std::os::raw::c_char,
+    pub num_unmatched_orbit_ids: usize,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of EmpyreanDetermineResults"]
+        [::std::mem::size_of::<EmpyreanDetermineResults>() - 32usize];
+    ["Alignment of EmpyreanDetermineResults"]
+        [::std::mem::align_of::<EmpyreanDetermineResults>() - 8usize];
+    ["Offset of field: EmpyreanDetermineResults::objects"]
+        [::std::mem::offset_of!(EmpyreanDetermineResults, objects) - 0usize];
+    ["Offset of field: EmpyreanDetermineResults::num_objects"]
+        [::std::mem::offset_of!(EmpyreanDetermineResults, num_objects) - 8usize];
+    ["Offset of field: EmpyreanDetermineResults::unmatched_orbit_ids"]
+        [::std::mem::offset_of!(EmpyreanDetermineResults, unmatched_orbit_ids) - 16usize];
+    ["Offset of field: EmpyreanDetermineResults::num_unmatched_orbit_ids"]
+        [::std::mem::offset_of!(EmpyreanDetermineResults, num_unmatched_orbit_ids) - 24usize];
+};
+impl Default for EmpyreanDetermineResults {
     fn default() -> Self {
         let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
         unsafe {
@@ -4192,6 +4443,21 @@ pub struct EmpyreanLib {
         obs_ptr: *const EmpyreanObservationResult,
         num_obs: usize,
     ) -> i32,
+    pub empyrean_fit_summary_write_parquet: unsafe extern "C" fn(
+        path: *const ::std::os::raw::c_char,
+        summaries_ptr: *const EmpyreanFitSummary,
+        num_summaries: usize,
+    ) -> i32,
+    pub empyrean_fit_summary_write_json: unsafe extern "C" fn(
+        path: *const ::std::os::raw::c_char,
+        summaries_ptr: *const EmpyreanFitSummary,
+        num_summaries: usize,
+    ) -> i32,
+    pub empyrean_fit_summary_write_csv: unsafe extern "C" fn(
+        path: *const ::std::os::raw::c_char,
+        summaries_ptr: *const EmpyreanFitSummary,
+        num_summaries: usize,
+    ) -> i32,
     pub empyrean_eigenvector_max_6x6: unsafe extern "C" fn(
         matrix: *const [[f64; 6usize]; 6usize],
         eigenvalue_out: *mut f64,
@@ -4249,8 +4515,10 @@ pub struct EmpyreanLib {
         initial_orbits: *const EmpyreanOrbit,
         num_initial_orbits: usize,
         config: *const EmpyreanODConfig,
-        result_out: *mut EmpyreanODResult,
+        results_out: *mut EmpyreanDetermineResults,
     ) -> i32,
+    pub empyrean_determine_results_free:
+        unsafe extern "C" fn(results: *mut EmpyreanDetermineResults),
     pub empyrean_od_result_free: unsafe extern "C" fn(result: *mut EmpyreanODResult),
     pub empyrean_evaluate: unsafe extern "C" fn(
         ctx: *const EmpyreanContext,
@@ -4539,6 +4807,15 @@ impl EmpyreanLib {
         let empyrean_residuals_write_csv = __library
             .get(b"empyrean_residuals_write_csv\0")
             .map(|sym| *sym)?;
+        let empyrean_fit_summary_write_parquet = __library
+            .get(b"empyrean_fit_summary_write_parquet\0")
+            .map(|sym| *sym)?;
+        let empyrean_fit_summary_write_json = __library
+            .get(b"empyrean_fit_summary_write_json\0")
+            .map(|sym| *sym)?;
+        let empyrean_fit_summary_write_csv = __library
+            .get(b"empyrean_fit_summary_write_csv\0")
+            .map(|sym| *sym)?;
         let empyrean_eigenvector_max_6x6 = __library
             .get(b"empyrean_eigenvector_max_6x6\0")
             .map(|sym| *sym)?;
@@ -4564,6 +4841,9 @@ impl EmpyreanLib {
             .get(b"empyrean_radar_observations_free\0")
             .map(|sym| *sym)?;
         let empyrean_determine = __library.get(b"empyrean_determine\0").map(|sym| *sym)?;
+        let empyrean_determine_results_free = __library
+            .get(b"empyrean_determine_results_free\0")
+            .map(|sym| *sym)?;
         let empyrean_od_result_free = __library
             .get(b"empyrean_od_result_free\0")
             .map(|sym| *sym)?;
@@ -4687,6 +4967,9 @@ impl EmpyreanLib {
             empyrean_residuals_write_parquet,
             empyrean_residuals_write_json,
             empyrean_residuals_write_csv,
+            empyrean_fit_summary_write_parquet,
+            empyrean_fit_summary_write_json,
+            empyrean_fit_summary_write_csv,
             empyrean_eigenvector_max_6x6,
             empyrean_split_gaussian,
             empyrean_get_observers,
@@ -4698,6 +4981,7 @@ impl EmpyreanLib {
             empyrean_radar_observations_from_array,
             empyrean_radar_observations_free,
             empyrean_determine,
+            empyrean_determine_results_free,
             empyrean_od_result_free,
             empyrean_evaluate,
             empyrean_evaluate_result_free,
@@ -4997,7 +5281,7 @@ impl EmpyreanLib {
     ) -> i32 {
         (self.empyrean_orbits_write_json)(path, batch)
     }
-    #[doc = " Read an orbits CSV file.\n\n CSV does not carry covariance (use parquet for covariance round-trip)."]
+    #[doc = " Read an orbits CSV file.\n\n Uses the engine's own CSV reader, so the file is the same schema the\n parquet path round-trips — covariance included. The\n `_with_non_grav` reader is the one used: the plain reader drops the\n Marsden A1/A2/A3 block, and an orbit that loses its non-gravitational\n parameters on a round trip is silently a different orbit."]
     pub unsafe fn empyrean_orbits_read_csv(
         &self,
         path: *const ::std::os::raw::c_char,
@@ -5005,7 +5289,7 @@ impl EmpyreanLib {
     ) -> i32 {
         (self.empyrean_orbits_read_csv)(path, out)
     }
-    #[doc = " Write an orbit batch to CSV."]
+    #[doc = " Write an orbit batch to CSV.\n\n Routed through the engine's writer — the same `Orbits<AU>` the\n parquet path writes — so CSV carries the full column set (state,\n covariance, non-grav including `dt` / `dt_variance`, photometry, SRP)\n rather than a flattened projection of it. A batch carrying a wide\n cross-covariance the row schema cannot express is refused before the\n file is created rather than written short."]
     pub unsafe fn empyrean_orbits_write_csv(
         &self,
         path: *const ::std::os::raw::c_char,
@@ -5093,6 +5377,33 @@ impl EmpyreanLib {
         num_obs: usize,
     ) -> i32 {
         (self.empyrean_residuals_write_csv)(path, obs_ptr, num_obs)
+    }
+    #[doc = " Write the per-object fit summary to parquet."]
+    pub unsafe fn empyrean_fit_summary_write_parquet(
+        &self,
+        path: *const ::std::os::raw::c_char,
+        summaries_ptr: *const EmpyreanFitSummary,
+        num_summaries: usize,
+    ) -> i32 {
+        (self.empyrean_fit_summary_write_parquet)(path, summaries_ptr, num_summaries)
+    }
+    #[doc = " Write the per-object fit summary to JSON."]
+    pub unsafe fn empyrean_fit_summary_write_json(
+        &self,
+        path: *const ::std::os::raw::c_char,
+        summaries_ptr: *const EmpyreanFitSummary,
+        num_summaries: usize,
+    ) -> i32 {
+        (self.empyrean_fit_summary_write_json)(path, summaries_ptr, num_summaries)
+    }
+    #[doc = " Write the per-object fit summary to CSV."]
+    pub unsafe fn empyrean_fit_summary_write_csv(
+        &self,
+        path: *const ::std::os::raw::c_char,
+        summaries_ptr: *const EmpyreanFitSummary,
+        num_summaries: usize,
+    ) -> i32 {
+        (self.empyrean_fit_summary_write_csv)(path, summaries_ptr, num_summaries)
     }
     #[doc = " Find the dominant eigenvalue and eigenvector of a 6x6 symmetric matrix.\n\n Returns 0 on success. `eigenvalue_out` receives the eigenvalue,\n `eigenvector_out` receives the 6-element eigenvector."]
     pub unsafe fn empyrean_eigenvector_max_6x6(
@@ -5198,7 +5509,7 @@ impl EmpyreanLib {
     ) {
         (self.empyrean_radar_observations_free)(observations, num)
     }
-    #[doc = " Run the full orbit determination pipeline.\n\n When `num_initial_orbits > 0`, the supplied orbits are used as DC\n seeds (one per ADES object_id encountered in `observations`,\n matched by orbit index). Pass `null, 0` to let the IOD pipeline\n produce its own seeds."]
+    #[doc = " Run the full orbit determination pipeline over every object in\n `observations`.\n\n The observations are grouped by ADES object identifier (permID /\n provID / trkSub) and each group is fitted independently, so one call\n determines a whole batch. `results_out` receives one\n [`EmpyreanODObjectResult`] per group, ordered by `object_id`.\n\n When `num_initial_orbits > 0`, the supplied orbits are used as DC\n seeds (one per ADES object_id encountered in `observations`,\n matched by orbit index). Pass `null, 0` to let the IOD pipeline\n produce its own seeds. A seed that matches no group is reported in\n [`EmpyreanDetermineResults::unmatched_orbit_ids`], never dropped.\n\n # Return codes\n\n - `0` — the batch ran and **at least one** object delivered a fit.\n   Individual failures do not abort the batch; check each slot's\n   `delivered` flag. `results_out` is populated.\n - [`EMPYREAN_DETERMINE_NONE_DELIVERED`] (`-4`) — the batch ran but\n   every object failed. `results_out` IS populated with the per-object\n   errors and must still be freed.\n - `-1` — null pointer or malformed input; nothing is written.\n - `-3` — a batch-level failure (an unparseable weighting config, an\n   observation row with no identifier at all) aborted the run before\n   any object was fitted; nothing is written.\n\n A single-object input is not a special case: it produces a\n one-row table.\n\n # Ownership\n\n On `0` and `-4`, release `results_out` with\n [`empyrean_determine_results_free`]. On `-1` / `-3` there is nothing\n to free."]
     pub unsafe fn empyrean_determine(
         &self,
         ctx: *const EmpyreanContext,
@@ -5209,7 +5520,7 @@ impl EmpyreanLib {
         initial_orbits: *const EmpyreanOrbit,
         num_initial_orbits: usize,
         config: *const EmpyreanODConfig,
-        result_out: *mut EmpyreanODResult,
+        results_out: *mut EmpyreanDetermineResults,
     ) -> i32 {
         (self.empyrean_determine)(
             ctx,
@@ -5220,10 +5531,14 @@ impl EmpyreanLib {
             initial_orbits,
             num_initial_orbits,
             config,
-            result_out,
+            results_out,
         )
     }
-    #[doc = " Free an OD result previously returned by `empyrean_determine()` or `empyrean_refine()`."]
+    #[doc = " Free a batch result table previously written by\n `empyrean_determine()`.\n\n Releases every per-object slot (including the fits inside the\n delivered ones), the per-object identifier / error strings, and the\n unmatched-seed list. Safe to call on a table returned with\n [`EMPYREAN_DETERMINE_NONE_DELIVERED`], and idempotent — the table is\n left empty."]
+    pub unsafe fn empyrean_determine_results_free(&self, results: *mut EmpyreanDetermineResults) {
+        (self.empyrean_determine_results_free)(results)
+    }
+    #[doc = " Free an OD result previously returned by `empyrean_refine()`.\n\n Batch `empyrean_determine()` results are released with\n [`empyrean_determine_results_free`] instead."]
     pub unsafe fn empyrean_od_result_free(&self, result: *mut EmpyreanODResult) {
         (self.empyrean_od_result_free)(result)
     }

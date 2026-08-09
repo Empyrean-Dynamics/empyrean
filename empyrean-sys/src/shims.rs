@@ -542,7 +542,11 @@ pub unsafe fn empyrean_orbits_write_json(
 }
 /** Read an orbits CSV file.
 
-CSV does not carry covariance (use parquet for covariance round-trip).*/
+Uses the engine's own CSV reader, so the file is the same schema the
+parquet path round-trips — covariance included. The
+`_with_non_grav` reader is the one used: the plain reader drops the
+Marsden A1/A2/A3 block, and an orbit that loses its non-gravitational
+parameters on a round trip is silently a different orbit.*/
 #[inline]
 pub unsafe fn empyrean_orbits_read_csv(
     path: *const ::std::os::raw::c_char,
@@ -550,7 +554,14 @@ pub unsafe fn empyrean_orbits_read_csv(
 ) -> i32 {
     unsafe { lib().empyrean_orbits_read_csv(path, out) }
 }
-/** Write an orbit batch to CSV.*/
+/** Write an orbit batch to CSV.
+
+Routed through the engine's writer — the same `Orbits<AU>` the
+parquet path writes — so CSV carries the full column set (state,
+covariance, non-grav including `dt` / `dt_variance`, photometry, SRP)
+rather than a flattened projection of it. A batch carrying a wide
+cross-covariance the row schema cannot express is refused before the
+file is created rather than written short.*/
 #[inline]
 pub unsafe fn empyrean_orbits_write_csv(
     path: *const ::std::os::raw::c_char,
@@ -611,6 +622,33 @@ pub unsafe fn empyrean_events_write_csv(
     num_events: usize,
 ) -> i32 {
     unsafe { lib().empyrean_events_write_csv(path, events_ptr, num_events) }
+}
+/** Write the per-object fit summary to parquet.*/
+#[inline]
+pub unsafe fn empyrean_fit_summary_write_parquet(
+    path: *const ::std::os::raw::c_char,
+    summaries_ptr: *const EmpyreanFitSummary,
+    num_summaries: usize,
+) -> i32 {
+    unsafe { lib().empyrean_fit_summary_write_parquet(path, summaries_ptr, num_summaries) }
+}
+/** Write the per-object fit summary to JSON.*/
+#[inline]
+pub unsafe fn empyrean_fit_summary_write_json(
+    path: *const ::std::os::raw::c_char,
+    summaries_ptr: *const EmpyreanFitSummary,
+    num_summaries: usize,
+) -> i32 {
+    unsafe { lib().empyrean_fit_summary_write_json(path, summaries_ptr, num_summaries) }
+}
+/** Write the per-object fit summary to CSV.*/
+#[inline]
+pub unsafe fn empyrean_fit_summary_write_csv(
+    path: *const ::std::os::raw::c_char,
+    summaries_ptr: *const EmpyreanFitSummary,
+    num_summaries: usize,
+) -> i32 {
+    unsafe { lib().empyrean_fit_summary_write_csv(path, summaries_ptr, num_summaries) }
 }
 /** Write OD residuals to parquet.*/
 #[inline]
@@ -832,12 +870,41 @@ pub unsafe fn empyrean_radar_observations_free(
 ) {
     unsafe { lib().empyrean_radar_observations_free(observations, num) }
 }
-/** Run the full orbit determination pipeline.
+/** Run the full orbit determination pipeline over every object in
+`observations`.
+
+The observations are grouped by ADES object identifier (permID /
+provID / trkSub) and each group is fitted independently, so one call
+determines a whole batch. `results_out` receives one
+[`EmpyreanODObjectResult`] per group, ordered by `object_id`.
 
 When `num_initial_orbits > 0`, the supplied orbits are used as DC
 seeds (one per ADES object_id encountered in `observations`,
 matched by orbit index). Pass `null, 0` to let the IOD pipeline
-produce its own seeds.*/
+produce its own seeds. A seed that matches no group is reported in
+[`EmpyreanDetermineResults::unmatched_orbit_ids`], never dropped.
+
+# Return codes
+
+- `0` — the batch ran and **at least one** object delivered a fit.
+  Individual failures do not abort the batch; check each slot's
+  `delivered` flag. `results_out` is populated.
+- [`EMPYREAN_DETERMINE_NONE_DELIVERED`] (`-4`) — the batch ran but
+  every object failed. `results_out` IS populated with the per-object
+  errors and must still be freed.
+- `-1` — null pointer or malformed input; nothing is written.
+- `-3` — a batch-level failure (an unparseable weighting config, an
+  observation row with no identifier at all) aborted the run before
+  any object was fitted; nothing is written.
+
+A single-object input is not a special case: it produces a
+one-row table.
+
+# Ownership
+
+On `0` and `-4`, release `results_out` with
+[`empyrean_determine_results_free`]. On `-1` / `-3` there is nothing
+to free.*/
 #[inline]
 pub unsafe fn empyrean_determine(
     ctx: *const EmpyreanContext,
@@ -848,7 +915,7 @@ pub unsafe fn empyrean_determine(
     initial_orbits: *const EmpyreanOrbit,
     num_initial_orbits: usize,
     config: *const EmpyreanODConfig,
-    result_out: *mut EmpyreanODResult,
+    results_out: *mut EmpyreanDetermineResults,
 ) -> i32 {
     unsafe {
         lib().empyrean_determine(
@@ -860,11 +927,26 @@ pub unsafe fn empyrean_determine(
             initial_orbits,
             num_initial_orbits,
             config,
-            result_out,
+            results_out,
         )
     }
 }
-/** Free an OD result previously returned by `empyrean_determine()` or `empyrean_refine()`.*/
+/** Free a batch result table previously written by
+`empyrean_determine()`.
+
+Releases every per-object slot (including the fits inside the
+delivered ones), the per-object identifier / error strings, and the
+unmatched-seed list. Safe to call on a table returned with
+[`EMPYREAN_DETERMINE_NONE_DELIVERED`], and idempotent — the table is
+left empty.*/
+#[inline]
+pub unsafe fn empyrean_determine_results_free(results: *mut EmpyreanDetermineResults) {
+    unsafe { lib().empyrean_determine_results_free(results) }
+}
+/** Free an OD result previously returned by `empyrean_refine()`.
+
+Batch `empyrean_determine()` results are released with
+[`empyrean_determine_results_free`] instead.*/
 #[inline]
 pub unsafe fn empyrean_od_result_free(result: *mut EmpyreanODResult) {
     unsafe { lib().empyrean_od_result_free(result) }

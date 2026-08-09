@@ -617,7 +617,7 @@ def test_session_fit_matches_one_shot_fit(label, weighting, fittable_f51_observa
     engine default the session silently substituted.
     """
     cfg = _od_config(weighting)
-    one_shot = determine(fittable_f51_observations, config=cfg)
+    one_shot = determine(fittable_f51_observations, config=cfg).single()
     session_fit = Session(fittable_f51_observations, config=cfg).refine()
     _assert_same_fit(session_fit, one_shot)
 
@@ -654,7 +654,7 @@ def test_session_honors_debiasing_config(fittable_f51_observations):
     obs = fittable_f51_observations
     for enabled in (False, True):
         cfg = _od_config(_uniform(1.0), debiasing_enabled=enabled)
-        _assert_same_fit(Session(obs, config=cfg).refine(), determine(obs, config=cfg))
+        _assert_same_fit(Session(obs, config=cfg).refine(), determine(obs, config=cfg).single())
 
 
 @pytest.mark.parametrize(

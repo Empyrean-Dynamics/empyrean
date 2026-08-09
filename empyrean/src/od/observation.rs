@@ -98,6 +98,18 @@ pub struct Observation {
 }
 
 impl Observation {
+    /// ADES object identifier: `permID`, else `provID`, else `trkSub`.
+    ///
+    /// This is the key [`Context::determine`](crate::Context::determine)
+    /// groups a batch by, so a caller slicing observations per object
+    /// partitions them exactly the way the engine will.
+    pub fn object_id(&self) -> Option<&str> {
+        self.perm_id
+            .as_deref()
+            .or(self.prov_id.as_deref())
+            .or(self.trk_sub.as_deref())
+    }
+
     pub(super) fn from_ffi(o: &empyrean_sys::EmpyreanObservation) -> Self {
         fn cstr_opt(p: *mut std::ffi::c_char) -> Option<String> {
             if p.is_null() {
@@ -220,6 +232,18 @@ pub struct RadarObservation {
 }
 
 impl RadarObservation {
+    /// ADES object identifier: `permID`, else `provID`, else `trkSub`.
+    ///
+    /// This is the key [`Context::determine`](crate::Context::determine)
+    /// groups a batch by, so a caller slicing observations per object
+    /// partitions them exactly the way the engine will.
+    pub fn object_id(&self) -> Option<&str> {
+        self.perm_id
+            .as_deref()
+            .or(self.prov_id.as_deref())
+            .or(self.trk_sub.as_deref())
+    }
+
     pub(super) fn from_ffi(o: &empyrean_sys::EmpyreanRadarObservation) -> Self {
         fn cstr_opt(p: *mut std::ffi::c_char) -> Option<String> {
             if p.is_null() {

@@ -92,7 +92,7 @@ def apophis_fit(apophis_observations):
     is exercised separately below.)
     """
     config = ODConfig(solve_for=SolveForParams.STATE_AND_NONGRAV)
-    fit = determine(apophis_observations, config=config)
+    fit = determine(apophis_observations, config=config).single()
     assert fit.converged, "Apophis non-grav fit did not converge"
     return fit
 
@@ -275,7 +275,7 @@ def test_default_auto_fit_round_trips_non_grav_as_none(apophis_observations):
     runs clean and that non-grav round-trips faithfully as ``None`` rather
     than being fabricated.
     """
-    fit = determine(apophis_observations, config=ODConfig(solve_for=SolveForParams.AUTO))
+    fit = determine(apophis_observations, config=ODConfig(solve_for=SolveForParams.AUTO)).single()
     assert fit.converged
     assert fit.solve_for_used == SolveForParams.STATE_ONLY
     # NonGravParams table is present but every coefficient is null — the

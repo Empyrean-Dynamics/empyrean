@@ -309,33 +309,30 @@ fn handle_determine(
     };
 
     let dir = Path::new(out_dir);
-    if let Err(e) = std::fs::create_dir_all(dir) {
-        return Response::err("failed to create output directory", e.to_string());
+    // The same writer the in-process path uses, so a daemon-served run
+    // and a direct run produce the same artifact set.
+    if let Err(e) = crate::commands::determine::write_batch_outputs(dir, &result, format) {
+        return Response::err("failed to write determine outputs", e.to_string());
     }
 
-    // `result.orbit` is already a re-feedable `Orbit` (state + covariance +
-    // non-grav); write it straight out as a single-entry batch.
-    let fitted_batch = OrbitBatch {
-        orbits: vec![result.orbit.clone()],
-        orbit_ids: vec!["fitted".to_string()],
-        object_ids: vec![None],
-    };
-    if let Err(e) = output::write_orbits(dir, "fitted_orbit", &fitted_batch, format) {
-        return Response::err("failed to write fitted orbit", e.to_string());
-    }
-    let resid_path = dir.join(match format {
-        OutputFormat::Parquet => "residuals.parquet",
-        OutputFormat::Json => "residuals.json",
-        OutputFormat::Csv => "residuals.csv",
-    });
-    if let Err(e) = output::write_residuals(&resid_path, &result.residuals, format) {
-        return Response::err("failed to write residuals", e.to_string());
+    // A partially or wholly failed batch is a failed request: the caller
+    // gets the per-object reasons rather than a success message that
+    // silently describes fewer objects than it was given.
+    let delivered = result.delivered_count();
+    let total = result.len();
+    if delivered < total {
+        let reasons: Vec<String> = result
+            .failures()
+            .map(|f| format!("{}: {}", f.object_id, f.message))
+            .collect();
+        return Response::err(
+            format!("orbit determination delivered {delivered} of {total} object(s)"),
+            reasons.join("; "),
+        );
     }
 
-    let s = &result.summary;
     Response::ok(format!(
-        "OD complete: converged={}, iter={}, RMS_RA={:.2}\", RMS_Dec={:.2}\", obs={}",
-        result.converged, result.iterations, s.rms_ra_arcsec, s.rms_dec_arcsec, s.num_obs,
+        "OD complete: {delivered} of {total} object(s) delivered — see fit_summary for per-object detail"
     ))
 }
 

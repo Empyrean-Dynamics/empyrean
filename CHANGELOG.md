@@ -6,13 +6,14 @@ project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
-C ABI version **3**. Two exported functions change signature and four
-struct sizes change (three grow directly; `EmpyreanEphemerisConfig` grows
-by embedding one of them), so this release is **source-breaking for C
-consumers** — recompile against the version-3 header. Every other symbol
-and every prior field offset is unchanged; struct growth is append-only,
-as always. The sizes are enumerated under the `EMPYREAN_ABI_VERSION`
-entry below.
+C ABI version **3**. Three exported functions change signature, one is
+added, and six struct sizes change (four grow directly;
+`EmpyreanEphemerisConfig` grows by embedding one of them, and
+`EmpyreanODResult` by embedding the widened acceptability report), so
+this release is **source-breaking for C consumers** — recompile against
+the version-3 header. Every other symbol and every prior field offset is
+unchanged; struct growth is append-only, as always. The sizes are
+enumerated under the `EMPYREAN_ABI_VERSION` entry below.
 
 ### Added
 
@@ -106,6 +107,93 @@ entry below.
 
 ### Changed
 
+- **BREAKING — orbit determination is batch-first at every layer.**
+  `determine` groups its observations by ADES object identifier and fits
+  **every** object, returning one result per object instead of one result
+  per call. Previously it ran the same batch internally and then returned
+  a single fit — "the first acceptable one, else the first" — so an
+  N-object arc silently discarded N−1 fits and the caller had no way to
+  know it. Fitting one object is now the one-entry case of the batch
+  call, not a different call.
+
+  The batch keeps the main name at each layer:
+  `empyrean_determine` writes an `EmpyreanDetermineResults` table of
+  `EmpyreanODObjectResult` slots (each carrying its `object_id` and
+  either the full `EmpyreanODResult` or a typed failure), released with
+  the new `empyrean_determine_results_free`; `Context::determine` returns
+  `DetermineResults` with iteration, `len`, by-object lookup, and an
+  `into_single()` that unwraps the one-object case and **refuses** —
+  naming the objects — rather than choosing among several; Python's
+  `determine` returns `.orbits` / `.summary` / `.residuals` and indexes
+  by object identifier, with `single()` as the same loud one-object
+  convenience.
+
+  A failed object never aborts the batch and never disappears: it is a
+  slot with `delivered = 0`, an error string, and an
+  `EMPYREAN_OD_FAILURE_*` classification. Its embedded result is
+  NaN-poisoned — every float NaN, every enumerated code `-1`, every
+  pointer null — so a caller that skips the `delivered` check gets an
+  obviously invalid record rather than a plausible all-zero fit. A batch
+  that delivers nothing at all returns the distinct
+  `EMPYREAN_DETERMINE_NONE_DELIVERED` (`-4`) and **still populates** the
+  table, which the caller must free. Seed orbits that matched no
+  observation group come back in `unmatched_orbit_ids` rather than being
+  dropped.
+- **BREAKING — the CLI's `determine` writes per-object outputs.**
+  `fitted_orbit.<ext>` (always exactly one row, `orbit_id = "fitted"`,
+  no object identity) becomes `fitted_orbits.<ext>` — one row per
+  delivered object, keyed by its ADES designation. Two artifacts join it:
+  `fit_summary.parquet` **and** `fit_summary.csv`, always both, with one
+  row per *input* object whether or not it produced an orbit (its
+  convergence, RMS, acceptability verdicts, the four extrapolation gate
+  axes, and on failure the reason); and `residuals.<ext>`, which gains an
+  `object_id` column so a flat table across a batch stays attributable.
+  stderr becomes a per-object table with the failures listed in full at
+  the end. The exit code is the batch's verdict: `0` only when every
+  object delivered, `3` when some did, `4` when none did.
+- **BREAKING — the residual writers emit the whole residual surface.**
+  `residuals.{parquet,csv,json}` carried five columns — RA / Dec
+  residual, χ², probability, selected — out of the thirty-six the
+  in-memory record holds. Everything else was computed and then dropped
+  at the file boundary: `obs_id` (so the file had no join key at all),
+  `object_id`, the observatory code, catalog and epoch, the entire
+  rejection attribution (reason, criterion, threshold, effective
+  threshold, information loss), the influence diagnostics, the
+  along/cross-track decomposition, and the radar block. All thirty-six
+  now reach disk in all three formats.
+
+  The three formats are emitted from one column table, so they cannot
+  disagree about what a residual file contains. Values are encoded per
+  format where the format forces it: a non-computable number is a
+  literal `NaN` in CSV and `null` in JSON, which has no NaN literal.
+  `rejection_reason` and `radar_kind` are written as names rather than
+  integer codes, matching the Python `ObservationResults` columns.
+- **BREAKING — orbit CSV carries the full column set.** `--format csv`
+  wrote 20 columns and **no covariance**, against parquet's 82 — a
+  silently lossy format choice. The CSV path now goes through the same
+  engine writer the parquet path uses, so the two emit an identical
+  82-column schema (state, covariance, non-grav including `dt` and its
+  variance, photometry, SRP), and a batch carrying a wide
+  cross-covariance the row schema cannot express is refused rather than
+  written short. The reader follows: it keeps the Marsden A1/A2/A3 block
+  that the previous CSV reader dropped.
+- **Python residual writers marshal the whole table.** `write_residuals_*`
+  passed five columns across the boundary and let the rest default, so a
+  residual file written from Python would have had the new columns and
+  no content in them. Every column of `ObservationResults` now crosses,
+  and `rejection_reason` round-trips by name.
+- **The acceptability report carries the four extrapolation gate axes.**
+  `EmpyreanAcceptabilityReport` (and its Rust / Python mirrors) grew
+  `selection_fraction_*`, `selected_arc_coverage_ok` /
+  `selected_arc_days_value` / `selected_arc_fraction_*`,
+  `trailing_gap_*`, and the `radar_fit_ok` tri-state alongside the
+  existing `fractional_sigma_a_*`. These are the axes
+  `extrapolation_acceptable` is the AND of, so a caller can now report
+  *why* a fit is not safe to propagate — a heavily pruned arc, a
+  selected span that no longer covers the requested one, or a rejected
+  recent tail — rather than only that it is not. Every `f64` in the
+  report is NaN when the quantity could not be computed; the `_ok`
+  booleans are always valid.
 - **BREAKING — `empyrean_transform_coordinates` is now the batched form.**
   It takes an array of states and an output array
   (`states`, `num_states`, `states_out`, all caller-owned) and transforms
@@ -136,13 +224,27 @@ entry below.
   request and an untouched consumer are unaffected beyond the recompile.
   `Context::get_observers` takes the two arguments in Rust; `Observer`
   gains the matching fields.
+- **BREAKING — `EmpyreanODConfig` loses `use_stm_cache`, gains two
+  axes.** The STM-cache knob is dead engine-side, so the field was a
+  control that did nothing; it is removed rather than left as a lie.
+  In its place the config exposes `allow_arc_truncation` (forbid the
+  outward-expansion pipeline from truncating a sub-arc it cannot fit, so
+  such an arc fails loudly instead of delivering the reconcilable part)
+  and `coorbital_enabled` (master switch for the co-orbital IOD lane).
+  Both are tri-state at the C ABI — negative means "engine default" — so
+  a zero-initialized struct is never read as a deliberate "off". The
+  engine's radar-annealing and linear-cache policies are solver policy
+  rather than fit definition and stay at their defaults with no C knob.
 - **BREAKING — `EMPYREAN_ABI_VERSION` is now 3.** Bumped once for the
-  whole batch of changes above. Four struct sizes change:
+  whole batch of changes above. Six struct sizes change:
   `EmpyreanPropagationConfig` grew by `ephemeris_overlap_policy`
   (288 → 296 bytes), `EmpyreanEphemerisConfig` by embedding it
   (312 → 320) — easy to miss, since it gained no field of its own —
-  `EmpyreanObserver` by the basis fields (72 → 80), and
-  `EmpyreanTaggedCovariance` by `quality_kappa_state` (520 → 528). Fields
+  `EmpyreanObserver` by the basis fields (72 → 80),
+  `EmpyreanTaggedCovariance` by `quality_kappa_state` (520 → 528),
+  `EmpyreanObservationResult` by `object_id` (264 → 272), and
+  `EmpyreanAcceptabilityReport` by the four gate axes (120 → 208), which
+  also grows the `EmpyreanODResult` that embeds it (7600 → 7688). Fields
   are only ever appended, never reordered or removed.
 
   `empyrean-sys` now **enforces** the handshake the header has always

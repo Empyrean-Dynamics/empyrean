@@ -138,9 +138,10 @@ pub use ephemeris::{
 pub use error::{Error, Result};
 pub use impact::{BPlane, ImpactProbability};
 pub use io::{
-    OrbitBatch, read_orbits_csv, read_orbits_json, read_orbits_parquet, write_ephemeris_csv,
-    write_ephemeris_json, write_ephemeris_parquet, write_events_csv, write_events_json,
-    write_events_parquet, write_orbits_csv, write_orbits_json, write_orbits_parquet,
+    FitSummaryRow, OrbitBatch, read_orbits_csv, read_orbits_json, read_orbits_parquet,
+    write_ephemeris_csv, write_ephemeris_json, write_ephemeris_parquet, write_events_csv,
+    write_events_json, write_events_parquet, write_fit_summary_csv, write_fit_summary_json,
+    write_fit_summary_parquet, write_orbits_csv, write_orbits_json, write_orbits_parquet,
     write_residuals_csv, write_residuals_json, write_residuals_parquet,
 };
 pub use math::{MixtureComponent, eigenvector_max_6x6, split_gaussian};
@@ -148,12 +149,13 @@ pub use observers::Observer;
 pub use od::{
     AcceptabilityReport, AcceptabilityThresholds, AutoEscalationPolicy, BandStat,
     CovarianceRepresentation, CovarianceTrust, DebiasingConfig, DebiasingResolution,
-    DetermineResult, EvaluateResult, GateRecord, IODConfig, ODConfig, Observation,
-    ObservationResidual, Observations, OriginPolicy, OutputEpoch, PhotometryConfig,
-    PhotometryModel, PhotometryResult, RadarMeasurement, RadarObservation, RadarResidual,
-    RadarResidualKind, RejectionConfig, RejectionKind, RejectionReason, ResidualSummary,
-    SigmaPolicy, SolveFor, SolveForParams, SolvedCovariance, StationBias, StationRaDecConfig,
-    TrustGateEvent, WeightingConfig, WeightingLayer, WeightingPreset,
+    DetermineEntry, DetermineFailure, DetermineFailureKind, DetermineResult, DetermineResults,
+    EvaluateResult, GateRecord, IODConfig, ODConfig, Observation, ObservationResidual,
+    Observations, OriginPolicy, OutputEpoch, PhotometryConfig, PhotometryModel, PhotometryResult,
+    RadarMeasurement, RadarObservation, RadarResidual, RadarResidualKind, RejectionConfig,
+    RejectionKind, RejectionReason, ResidualSummary, SigmaPolicy, SolveFor, SolveForParams,
+    SolvedCovariance, StationBias, StationRaDecConfig, TrustGateEvent, WeightingConfig,
+    WeightingLayer, WeightingPreset,
 };
 pub use orbit::{Orbit, PhaseFunction};
 pub use propagate::{

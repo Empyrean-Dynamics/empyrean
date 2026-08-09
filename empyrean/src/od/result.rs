@@ -85,6 +85,15 @@ pub struct ObservationResidual {
     /// ADES `obsID` (or auto-assigned). Use this to cross-match to
     /// your input observations.
     pub obs_id: String,
+    /// ADES object identifier of the fit this row belongs to.
+    ///
+    /// `Some` for rows from [`Context::determine`](crate::Context::determine),
+    /// which fits per object — so residuals from a whole batch can be
+    /// concatenated into one table and stay attributable. `None` for
+    /// [`Context::evaluate`](crate::Context::evaluate) /
+    /// [`Context::refine`](crate::Context::refine), where the caller
+    /// supplied the one orbit and there is no grouping key.
+    pub object_id: Option<String>,
     /// MPC observatory code.
     pub obs_code: String,
     /// Star catalog used for astrometric reduction (ADES `astCat`).
@@ -194,8 +203,17 @@ impl ObservationResidual {
                 .into_owned();
             (!s.is_empty()).then_some(s)
         };
+        let object_id = if r.object_id.is_null() {
+            None
+        } else {
+            let s = unsafe { CStr::from_ptr(r.object_id) }
+                .to_string_lossy()
+                .into_owned();
+            (!s.is_empty()).then_some(s)
+        };
         Self {
             obs_id,
+            object_id,
             obs_code: obs_code_from_bytes(&r.obs_code),
             ast_cat,
             epoch: crate::Epoch::from_mjd_tdb(r.epoch_mjd_tdb),
@@ -532,6 +550,47 @@ pub struct AcceptabilityReport {
     pub fractional_sigma_a_value: f64,
     /// Threshold for σₐ / |a|.
     pub fractional_sigma_a_threshold: f64,
+    /// Did the fit retain enough of its input? `false` means the
+    /// residual bars above describe a heavily pruned subset.
+    ///
+    /// Reproduce the fraction from
+    /// [`selection_fraction_value`](Self::selection_fraction_value), not
+    /// from [`ResidualSummary`] — the summary counts merged radar /
+    /// occultation stub rows that were never candidates for outlier
+    /// pruning, so its ratio is a different (smaller) number.
+    pub selection_fraction_ok: bool,
+    /// Fraction of observations retained (n_selected / n_obs).
+    pub selection_fraction_value: f64,
+    /// Minimum retained fraction the gate required.
+    pub selection_fraction_threshold: f64,
+    /// Do the SELECTED observations still span enough of the arc to
+    /// extrapolate across it? This is the coverage axis
+    /// [`extrapolation_acceptable`](Self::extrapolation_acceptable)
+    /// gates on — a strict tightening of the full-span
+    /// [`arc_coverage_ok`](Self::arc_coverage_ok).
+    pub selected_arc_coverage_ok: bool,
+    /// Arc span (days) over the selected observations only. NaN when
+    /// nothing was selected.
+    pub selected_arc_days_value: f64,
+    /// Selected-span / full-span ratio.
+    pub selected_arc_fraction_value: f64,
+    /// Minimum span ratio the gate required.
+    pub selected_arc_fraction_threshold: f64,
+    /// Were the most-recent observations kept? The asymmetric backstop
+    /// the span ratio cannot provide: it catches a short recent tail
+    /// rejected off a long arc, where the ratio still passes but the
+    /// discarded rows are the ones nearest a forward extrapolation
+    /// target.
+    pub trailing_gap_ok: bool,
+    /// Days between the last selected and the last full-arc
+    /// observation. `0.0` when the last kept observation is the last
+    /// observation; NaN when nothing was selected.
+    pub trailing_gap_days_value: f64,
+    /// Largest trailing gap the gate allowed (days).
+    pub trailing_gap_threshold: f64,
+    /// Radar astrometry joint-fit acceptability. `None` when no radar
+    /// contributed to the fit — which is never the same as `Some(false)`.
+    pub radar_fit_ok: Option<bool>,
 }
 
 impl AcceptabilityReport {
@@ -556,6 +615,21 @@ impl AcceptabilityReport {
             fractional_sigma_a_ok: r.fractional_sigma_a_ok != 0,
             fractional_sigma_a_value: r.fractional_sigma_a_value,
             fractional_sigma_a_threshold: r.fractional_sigma_a_threshold,
+            selection_fraction_ok: r.selection_fraction_ok != 0,
+            selection_fraction_value: r.selection_fraction_value,
+            selection_fraction_threshold: r.selection_fraction_threshold,
+            selected_arc_coverage_ok: r.selected_arc_coverage_ok != 0,
+            selected_arc_days_value: r.selected_arc_days_value,
+            selected_arc_fraction_value: r.selected_arc_fraction_value,
+            selected_arc_fraction_threshold: r.selected_arc_fraction_threshold,
+            trailing_gap_ok: r.trailing_gap_ok != 0,
+            trailing_gap_days_value: r.trailing_gap_days_value,
+            trailing_gap_threshold: r.trailing_gap_threshold,
+            radar_fit_ok: match r.radar_fit_ok {
+                1 => Some(true),
+                0 => Some(false),
+                _ => None,
+            },
         }
     }
 }
@@ -1084,4 +1158,593 @@ pub struct EvaluateResult {
     pub residuals: Vec<ObservationResidual>,
     /// Summary statistics.
     pub summary: ResidualSummary,
+}
+
+/// Why one object's fit failed inside a batch
+/// [`Context::determine`](crate::Context::determine).
+///
+/// Mirrors the engine's `DetermineError` discriminants, so a caller can
+/// branch on the cause instead of matching on message text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetermineFailureKind {
+    /// Observation conversion failed (UTC → TDB, malformed record, …).
+    ObservationConversion,
+    /// Observer position could not be constructed — unknown observatory
+    /// code, epoch outside the loaded kernels, unsupported spacecraft.
+    ObserverConstruction,
+    /// A roving-observer record used an unsupported coordinate system.
+    UnsupportedCoordinateSystem,
+    /// The loaded Earth-orientation (BPC) coverage does not span the
+    /// observations. An engine-configuration failure, not a property of
+    /// the data.
+    EarthOrientationCoverage,
+    /// Initial orbit determination produced no usable seed.
+    IOD,
+    /// The N-body differential correction failed.
+    OD,
+    /// Two observations of this object carried the same observation ID.
+    DuplicateObsIds,
+    /// Radar observations were supplied with no optical astrometry, which
+    /// leaves the two plane-of-sky angular degrees of freedom
+    /// unconstrained.
+    RadarOnly,
+    /// An explicit non-gravitational solve could not recover A1/A2/A3.
+    /// Reported rather than silently degrading to a state-only fit.
+    NonGravNotRecovered,
+    /// A failure code this build of the wrapper does not know. Carries
+    /// the raw code so a newer engine's cause is never flattened away.
+    Unknown(i32),
+}
+
+impl DetermineFailureKind {
+    pub(super) fn from_code(code: i32) -> Self {
+        match code {
+            empyrean_sys::EMPYREAN_OD_FAILURE_OBSERVATION_CONVERSION => Self::ObservationConversion,
+            empyrean_sys::EMPYREAN_OD_FAILURE_OBSERVER_CONSTRUCTION => Self::ObserverConstruction,
+            empyrean_sys::EMPYREAN_OD_FAILURE_UNSUPPORTED_COORDINATE_SYSTEM => {
+                Self::UnsupportedCoordinateSystem
+            }
+            empyrean_sys::EMPYREAN_OD_FAILURE_EARTH_ORIENTATION_COVERAGE => {
+                Self::EarthOrientationCoverage
+            }
+            empyrean_sys::EMPYREAN_OD_FAILURE_IOD => Self::IOD,
+            empyrean_sys::EMPYREAN_OD_FAILURE_OD => Self::OD,
+            empyrean_sys::EMPYREAN_OD_FAILURE_DUPLICATE_OBS_IDS => Self::DuplicateObsIds,
+            empyrean_sys::EMPYREAN_OD_FAILURE_RADAR_ONLY => Self::RadarOnly,
+            empyrean_sys::EMPYREAN_OD_FAILURE_NON_GRAV_NOT_RECOVERED => Self::NonGravNotRecovered,
+            other => Self::Unknown(other),
+        }
+    }
+}
+
+/// One object's failure inside a batch determine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetermineFailure {
+    /// ADES object identifier whose fit failed.
+    pub object_id: String,
+    /// The engine's message.
+    pub message: String,
+    /// Classified cause.
+    pub kind: DetermineFailureKind,
+}
+
+impl std::fmt::Display for DetermineFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.object_id, self.message)
+    }
+}
+
+impl std::error::Error for DetermineFailure {}
+
+/// One object's slot in a batch determine: its identifier and either the
+/// delivered fit or the typed failure.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DetermineEntry {
+    /// ADES object identifier (permID / provID / trkSub) the
+    /// observations were grouped under.
+    pub object_id: String,
+    /// The fit, or why this object did not produce one.
+    pub outcome: std::result::Result<DetermineResult, DetermineFailure>,
+}
+
+impl DetermineEntry {
+    /// The fit, when this object delivered one.
+    pub fn result(&self) -> Option<&DetermineResult> {
+        self.outcome.as_ref().ok()
+    }
+
+    /// The failure, when this object did not deliver.
+    pub fn failure(&self) -> Option<&DetermineFailure> {
+        self.outcome.as_ref().err()
+    }
+
+    /// Did this object produce a fit?
+    pub fn delivered(&self) -> bool {
+        self.outcome.is_ok()
+    }
+}
+
+/// The result of a batch [`Context::determine`](crate::Context::determine)
+/// — one [`DetermineEntry`] per ADES object in the observations, ordered
+/// by `object_id`.
+///
+/// determine is batch-first: fitting one object is the one-entry case of
+/// this type, not a separate call. A failure never removes an object from
+/// the table, so `len()` always equals the number of objects the
+/// observations grouped into.
+///
+/// ```no_run
+/// use empyrean::{Context, ODConfig};
+///
+/// let ctx = Context::from_data_dir(None)?;
+/// let obs = ctx.read_ades("many_objects.psv")?;
+/// let fits = ctx.determine(&obs, None, &ODConfig::default())?;
+///
+/// for entry in fits.iter() {
+///     match &entry.outcome {
+///         Ok(fit) => println!(
+///             "{}: χ²_red={:.2} extrapolable={}",
+///             entry.object_id,
+///             fit.summary.reduced_chi2,
+///             fit.acceptability.extrapolation_acceptable,
+///         ),
+///         Err(e) => eprintln!("{}: FAILED — {}", entry.object_id, e.message),
+///     }
+/// }
+/// # Ok::<(), empyrean::Error>(())
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct DetermineResults {
+    entries: Vec<DetermineEntry>,
+    unmatched_orbit_ids: Vec<String>,
+}
+
+impl DetermineResults {
+    /// Assemble a batch from per-object entries.
+    ///
+    /// The engine builds this from a determine call; it is public so a
+    /// caller that composes its own multi-pass fit (e.g. a seed solve
+    /// followed by a per-object wide refine) can report the composed
+    /// result through the same type, failures included, instead of
+    /// inventing a parallel shape.
+    ///
+    /// Entries are expected in `object_id` order — that is the order the
+    /// engine produces and the order every consumer writes rows in.
+    pub fn from_entries(entries: Vec<DetermineEntry>, unmatched_orbit_ids: Vec<String>) -> Self {
+        Self {
+            entries,
+            unmatched_orbit_ids,
+        }
+    }
+
+    pub(crate) fn new(entries: Vec<DetermineEntry>, unmatched_orbit_ids: Vec<String>) -> Self {
+        Self::from_entries(entries, unmatched_orbit_ids)
+    }
+
+    /// Number of objects the observations grouped into — delivered and
+    /// failed alike.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Were there no objects at all?
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Every slot, in `object_id` order.
+    pub fn iter(&self) -> std::slice::Iter<'_, DetermineEntry> {
+        self.entries.iter()
+    }
+
+    /// Every object identifier, in table order.
+    pub fn object_ids(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().map(|e| e.object_id.as_str())
+    }
+
+    /// The slot for one object, or `None` when the observations carried
+    /// no such identifier.
+    pub fn get(&self, object_id: &str) -> Option<&DetermineEntry> {
+        self.entries.iter().find(|e| e.object_id == object_id)
+    }
+
+    /// Only the objects that produced a fit, paired with their id.
+    pub fn delivered(&self) -> impl Iterator<Item = (&str, &DetermineResult)> {
+        self.entries
+            .iter()
+            .filter_map(|e| e.result().map(|r| (e.object_id.as_str(), r)))
+    }
+
+    /// How many objects produced a fit.
+    pub fn delivered_count(&self) -> usize {
+        self.entries.iter().filter(|e| e.delivered()).count()
+    }
+
+    /// Only the objects that failed.
+    pub fn failures(&self) -> impl Iterator<Item = &DetermineFailure> {
+        self.entries.iter().filter_map(|e| e.failure())
+    }
+
+    /// True when the batch ran but **no** object produced a fit. The
+    /// per-object [`failures`](Self::failures) are the diagnosis.
+    pub fn all_failed(&self) -> bool {
+        !self.entries.is_empty() && self.delivered_count() == 0
+    }
+
+    /// Seed orbits from `initial_orbits` that matched no observation
+    /// group.
+    ///
+    /// A non-empty list means those seeds' identities do not appear in
+    /// the observations, so they constrained nothing. They are reported
+    /// rather than dropped.
+    pub fn unmatched_orbit_ids(&self) -> &[String] {
+        &self.unmatched_orbit_ids
+    }
+
+    /// The one fit, for the common single-object call.
+    ///
+    /// Errors — loudly — when the batch holds anything other than
+    /// exactly one delivered object: zero objects, more than one object
+    /// (naming them, so the caller can pick with [`get`](Self::get)
+    /// instead), or one object whose fit failed. It never chooses among
+    /// several fits on the caller's behalf.
+    pub fn into_single(self) -> crate::error::Result<DetermineResult> {
+        match self.entries.len() {
+            1 => {
+                let entry = self.entries.into_iter().next().expect("length checked");
+                entry.outcome.map_err(|f| {
+                    crate::error::Error::invalid_input(format!(
+                        "orbit determination failed for {}: {}",
+                        f.object_id, f.message
+                    ))
+                })
+            }
+            0 => Err(crate::error::Error::invalid_input(
+                "orbit determination produced no objects: the observations \
+                 carried no rows to group",
+            )),
+            n => {
+                let ids: Vec<&str> = self.object_ids().collect();
+                Err(crate::error::Error::invalid_input(format!(
+                    "orbit determination fitted {n} objects ({}); into_single \
+                     refuses to choose one — iterate the batch or select with \
+                     `get(object_id)`",
+                    ids.join(", ")
+                )))
+            }
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a DetermineResults {
+    type Item = &'a DetermineEntry;
+    type IntoIter = std::slice::Iter<'a, DetermineEntry>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter()
+    }
+}
+
+impl IntoIterator for DetermineResults {
+    type Item = DetermineEntry;
+    type IntoIter = std::vec::IntoIter<DetermineEntry>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.into_iter()
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+    use crate::coordinate::{Frame, Origin};
+    use crate::propagate::ForceModelTier;
+
+    fn summary() -> ResidualSummary {
+        ResidualSummary {
+            num_obs: 42,
+            num_selected: 40,
+            num_rejected: 2,
+            chi2: 38.0,
+            dof: 34,
+            reduced_chi2: 1.12,
+            rms_ra_arcsec: 0.31,
+            rms_dec_arcsec: 0.28,
+            rms_combined_arcsec: 0.30,
+            weighted_rms_ra_arcsec: 0.9,
+            weighted_rms_dec_arcsec: 0.8,
+            weighted_rms_combined_arcsec: 0.85,
+            mean_ra_arcsec: 0.01,
+            mean_dec_arcsec: -0.02,
+            std_ra_arcsec: 0.31,
+            std_dec_arcsec: 0.28,
+            rms_along_track_arcsec: f64::NAN,
+            rms_cross_track_arcsec: f64::NAN,
+        }
+    }
+
+    fn acceptability() -> AcceptabilityReport {
+        AcceptabilityReport {
+            fit_acceptable: true,
+            extrapolation_acceptable: true,
+            converged_ok: true,
+            reduced_chi2_ok: true,
+            reduced_chi2_value: 1.12,
+            reduced_chi2_threshold: 2.0,
+            rms_ok: true,
+            rms_value_arcsec: 0.31,
+            rms_threshold_arcsec: 1.0,
+            residual_isotropy_ok: true,
+            at_ct_ratio_value: f64::NAN,
+            at_ct_ratio_threshold: 3.0,
+            covariance_ok: true,
+            arc_coverage_ok: true,
+            arc_days_value: 900.0,
+            arc_days_threshold: 30.0,
+            fractional_sigma_a_ok: true,
+            fractional_sigma_a_value: 1.0e-6,
+            fractional_sigma_a_threshold: 1.0e-3,
+            selection_fraction_ok: true,
+            selection_fraction_value: 40.0 / 42.0,
+            selection_fraction_threshold: 0.7,
+            selected_arc_coverage_ok: true,
+            selected_arc_days_value: 890.0,
+            selected_arc_fraction_value: 0.99,
+            selected_arc_fraction_threshold: 0.8,
+            trailing_gap_ok: true,
+            trailing_gap_days_value: 0.0,
+            trailing_gap_threshold: 30.0,
+            radar_fit_ok: None,
+        }
+    }
+
+    fn fit() -> DetermineResult {
+        let state = crate::CoordinateState::cartesian(
+            crate::Epoch::from_mjd_tdb(60000.0),
+            [1.0, 0.1, 0.02, -0.003, 0.017, 0.0006],
+            Frame::EclipticJ2000,
+            Origin::Sun,
+        );
+        DetermineResult {
+            orbit: crate::Orbit::new(state),
+            residuals: Vec::new(),
+            summary: summary(),
+            iterations: 5,
+            update_norm: 1.0e-12,
+            converged: true,
+            covariance: [[0.0; 6]; 6],
+            covariance_representation: CovarianceRepresentation::Cartesian,
+            covariance_9x9: None,
+            non_grav_delta: None,
+            rejection_passes: 1,
+            num_oppositions_fit: 3,
+            force_model_used: ForceModelTier::Standard,
+            solve_for_used: SolveForParams::StateOnly,
+            acceptability: acceptability(),
+            station_biases: Vec::new(),
+            solved_covariance: None,
+            dt_delta: None,
+            amrat_delta: None,
+            thrust_delta_m_per_s: Vec::new(),
+            dv_frame: None,
+            photometry: None,
+            covariance_trust: None,
+        }
+    }
+
+    fn delivered(object_id: &str) -> DetermineEntry {
+        DetermineEntry {
+            object_id: object_id.to_string(),
+            outcome: Ok(fit()),
+        }
+    }
+
+    fn failed(object_id: &str, kind: DetermineFailureKind) -> DetermineEntry {
+        DetermineEntry {
+            object_id: object_id.to_string(),
+            outcome: Err(DetermineFailure {
+                object_id: object_id.to_string(),
+                message: "no viable IOD seed".to_string(),
+                kind,
+            }),
+        }
+    }
+
+    /// A failed object stays in the table. Dropping it would leave the
+    /// caller with a shorter batch than they submitted and no signal.
+    #[test]
+    fn failures_stay_in_the_table() {
+        let batch = DetermineResults::new(
+            vec![
+                delivered("2024 YR4"),
+                failed("K25A00B", DetermineFailureKind::IOD),
+                delivered("433"),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(batch.len(), 3, "every input object keeps its row");
+        assert_eq!(batch.delivered_count(), 2);
+        assert_eq!(batch.failures().count(), 1);
+        assert!(!batch.all_failed());
+        assert_eq!(
+            batch.object_ids().collect::<Vec<_>>(),
+            vec!["2024 YR4", "K25A00B", "433"]
+        );
+    }
+
+    #[test]
+    fn lookup_finds_delivered_and_failed_objects() {
+        let batch = DetermineResults::new(
+            vec![
+                delivered("2024 YR4"),
+                failed("K25A00B", DetermineFailureKind::RadarOnly),
+            ],
+            Vec::new(),
+        );
+
+        let hit = batch.get("2024 YR4").expect("delivered object is findable");
+        assert!(hit.delivered());
+        assert!(hit.result().is_some());
+        assert!(hit.failure().is_none());
+
+        let miss = batch.get("K25A00B").expect("failed object is findable");
+        assert!(!miss.delivered());
+        assert!(miss.result().is_none());
+        let f = miss.failure().expect("carries a typed failure");
+        assert_eq!(f.kind, DetermineFailureKind::RadarOnly);
+        assert_eq!(f.object_id, "K25A00B");
+        assert!(f.to_string().contains("K25A00B"));
+
+        assert!(batch.get("1997 XF11").is_none(), "absent object is None");
+    }
+
+    /// The whole point of the batch surface: `into_single` must refuse
+    /// rather than pick, because picking is how N−1 fits used to vanish.
+    #[test]
+    fn into_single_refuses_a_multi_object_batch() {
+        let batch =
+            DetermineResults::new(vec![delivered("2024 YR4"), delivered("433")], Vec::new());
+        let err = batch.into_single().expect_err("must refuse to choose");
+        assert!(err.message.contains("2 objects"), "{}", err.message);
+        // Both identities are named so the caller can select one.
+        assert!(err.message.contains("2024 YR4"), "{}", err.message);
+        assert!(err.message.contains("433"), "{}", err.message);
+    }
+
+    #[test]
+    fn into_single_unwraps_the_one_object_case() {
+        let batch = DetermineResults::new(vec![delivered("2024 YR4")], Vec::new());
+        let fit = batch.into_single().expect("one delivered object unwraps");
+        assert!(fit.converged);
+        assert_eq!(fit.summary.num_obs, 42);
+    }
+
+    #[test]
+    fn into_single_surfaces_the_failure_of_a_lone_failed_object() {
+        let batch = DetermineResults::new(
+            vec![failed("K25A00B", DetermineFailureKind::OD)],
+            Vec::new(),
+        );
+        let err = batch.into_single().expect_err("a failed fit is not a fit");
+        assert!(err.message.contains("K25A00B"), "{}", err.message);
+        assert!(
+            err.message.contains("no viable IOD seed"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn into_single_reports_an_empty_batch_as_such() {
+        let batch = DetermineResults::new(Vec::new(), Vec::new());
+        assert!(batch.is_empty());
+        let err = batch.into_single().expect_err("nothing to unwrap");
+        assert!(err.message.contains("no objects"), "{}", err.message);
+    }
+
+    /// Zero delivered is a state the caller can detect and diagnose, not
+    /// an empty success.
+    #[test]
+    fn all_failed_is_detectable_with_per_object_reasons() {
+        let batch = DetermineResults::new(
+            vec![
+                failed("A", DetermineFailureKind::IOD),
+                failed("B", DetermineFailureKind::EarthOrientationCoverage),
+            ],
+            Vec::new(),
+        );
+        assert!(batch.all_failed());
+        assert_eq!(batch.delivered_count(), 0);
+        let kinds: Vec<_> = batch.failures().map(|f| f.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                DetermineFailureKind::IOD,
+                DetermineFailureKind::EarthOrientationCoverage
+            ]
+        );
+    }
+
+    /// An empty batch is not "all failed" — there was nothing to fail.
+    #[test]
+    fn an_empty_batch_is_not_all_failed() {
+        assert!(!DetermineResults::new(Vec::new(), Vec::new()).all_failed());
+    }
+
+    /// A seed that matched no observation group is reported, not
+    /// silently ignored.
+    #[test]
+    fn unmatched_seeds_are_reported() {
+        let batch =
+            DetermineResults::new(vec![delivered("2024 YR4")], vec!["1997 XF11".to_string()]);
+        assert_eq!(batch.unmatched_orbit_ids(), ["1997 XF11"]);
+    }
+
+    /// An engine failure code this build does not know keeps its raw
+    /// value rather than collapsing into a generic bucket.
+    #[test]
+    fn unknown_failure_codes_keep_their_raw_value() {
+        assert_eq!(
+            DetermineFailureKind::from_code(9999),
+            DetermineFailureKind::Unknown(9999)
+        );
+        assert_eq!(
+            DetermineFailureKind::from_code(empyrean_sys::EMPYREAN_OD_FAILURE_IOD),
+            DetermineFailureKind::IOD
+        );
+        assert_eq!(
+            DetermineFailureKind::from_code(
+                empyrean_sys::EMPYREAN_OD_FAILURE_NON_GRAV_NOT_RECOVERED
+            ),
+            DetermineFailureKind::NonGravNotRecovered
+        );
+    }
+
+    /// Both iteration shapes reach every slot.
+    #[test]
+    fn iteration_covers_every_slot() {
+        let batch = DetermineResults::new(
+            vec![delivered("A"), failed("B", DetermineFailureKind::OD)],
+            Vec::new(),
+        );
+        assert_eq!(batch.iter().count(), 2);
+        assert_eq!((&batch).into_iter().count(), 2);
+        assert_eq!(batch.into_iter().count(), 2);
+    }
+
+    /// The fit summary describes every INPUT object, so a failed fit is
+    /// a row with NaN measurements and a reason — never an absence.
+    #[test]
+    fn fit_summary_rows_cover_failures_with_nan_not_zero() {
+        let batch = DetermineResults::new(
+            vec![
+                delivered("2024 YR4"),
+                failed("K25A00B", DetermineFailureKind::IOD),
+            ],
+            Vec::new(),
+        );
+        let rows = crate::FitSummaryRow::from_results(&batch);
+        assert_eq!(rows.len(), 2, "one row per input object");
+
+        assert_eq!(rows[0].status, "delivered");
+        assert_eq!(rows[0].object_id, "2024 YR4");
+        assert!(rows[0].converged);
+        assert_eq!(rows[0].n_obs, 42);
+        assert_eq!(rows[0].n_selected, 40);
+        assert!(rows[0].error.is_none());
+        assert!(rows[0].extrapolation_acceptable);
+        assert_eq!(rows[0].trailing_gap_days, 0.0);
+        // A state-only fit has no tagged solved covariance; its width is 6.
+        assert_eq!(rows[0].solve_for_width, 6);
+
+        assert_eq!(rows[1].status, "failed");
+        assert_eq!(rows[1].object_id, "K25A00B");
+        assert!(!rows[1].converged);
+        assert!(rows[1].reduced_chi2.is_nan(), "no fit means no χ², not 0");
+        assert!(rows[1].rms_ra_arcsec.is_nan());
+        assert!(rows[1].selection_fraction.is_nan());
+        assert!(rows[1].fractional_sigma_a.is_nan());
+        assert!(!rows[1].fit_acceptable && !rows[1].extrapolation_acceptable);
+        assert_eq!(rows[1].error.as_deref(), Some("no viable IOD seed"));
+    }
 }

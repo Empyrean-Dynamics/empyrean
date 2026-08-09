@@ -8,6 +8,7 @@ tripping through the C ABI.
 """
 
 import math
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TypeAlias
@@ -17,6 +18,7 @@ import numpy as np
 from empyrean.coordinates.enums import Frame, Origin
 from empyrean.od.residuals import (
     AcceptabilityReport,
+    FitSummary,
     ObservationResults,
     ResidualSummary,
     StationBiases,
@@ -646,7 +648,20 @@ class ODConfig:
     output_epoch: OutputEpoch = field(default_factory=OutputEpoch)
     max_iterations: int = 100
     convergence_tol: float = 1e-5
-    use_stm_cache: bool = True
+    allow_arc_truncation: bool = True
+    """Allow the outward-expansion pipeline to truncate a sub-arc it
+    cannot fit as one piece.
+
+    Setting ``False`` makes an arc spanning a dynamical discontinuity
+    FAIL loudly instead of delivering a fit of the reconcilable sub-arc
+    with the rest tagged ``outside_arc``. Per-observation rejection is
+    orthogonal and still runs, and under an ``AUTO`` origin policy the
+    refusal feeds the origin cascade rather than surfacing — pin the
+    origin to get a pure loud failure."""
+    coorbital_enabled: bool = True
+    """Master switch for the co-orbital IOD lane. Enabling it does not
+    route ordinary objects through the lane — it still fires only when
+    every co-orbitality gate passes."""
     solve_for: SolveForParams = SolveForParams.AUTO
     auto_escalation: AutoEscalationPolicy = field(default_factory=AutoEscalationPolicy)
     acceptability: AcceptabilityThresholds = field(default_factory=AcceptabilityThresholds)
@@ -711,7 +726,8 @@ class ODConfig:
             },
             "max_iterations": self.max_iterations,
             "convergence_tol": self.convergence_tol,
-            "use_stm_cache": self.use_stm_cache,
+            "allow_arc_truncation": self.allow_arc_truncation,
+            "coorbital_enabled": self.coorbital_enabled,
             "solve_for": _enum_value(self.solve_for),
             "auto_escalation": {
                 "reduced_chi2": self.auto_escalation.reduced_chi2,
@@ -1078,3 +1094,130 @@ class DetermineResult:
     """Event-aware trust verdict on the delivered covariance. ``None``
     when the call path ran no trust gate — absence of a verdict is not
     trust."""
+
+
+@dataclass
+class DetermineFailure:
+    """Why one object in a batch produced no orbit."""
+
+    object_id: str
+    """ADES object identifier whose fit failed."""
+    message: str
+    """The engine's message."""
+    kind: str
+    """Classified cause, as a stable snake_case name — ``"iod"``,
+    ``"od"``, ``"radar_only"``, ``"observer_construction"``,
+    ``"earth_orientation_coverage"``, ``"observation_conversion"``,
+    ``"unsupported_coordinate_system"``, ``"duplicate_obs_ids"``,
+    ``"non_grav_not_recovered"``, or ``"unknown_<code>"`` for a cause
+    this build of the bindings does not name. Branch on this rather than
+    on :attr:`message`."""
+
+
+@dataclass
+class DetermineResults:
+    """The result of a batch orbit determination — every object the
+    observations grouped into, delivered or not.
+
+    :func:`~empyrean.od.determine.determine` fits **every** object in the
+    input. Three tables describe the run:
+
+    - :attr:`orbits` — one row per object that produced an orbit.
+    - :attr:`summary` — one row per **input** object, so an object that
+      failed is a row saying so rather than an absence.
+    - :attr:`residuals` — every delivered fit's per-observation rows,
+      each tagged with the ``object_id`` it belongs to.
+
+    Index by object identifier for the full single-object view::
+
+        fits = determine(observations)
+        print(len(fits), "object(s);", len(fits.delivered), "delivered")
+        yr4 = fits["2024 YR4"]  # DetermineResult
+        print(yr4.acceptability.extrapolation_acceptable)
+
+    Fitting one object is the one-entry case, not a separate call:
+    :meth:`single` unwraps it and refuses (loudly) if the batch turned
+    out to hold more than one.
+    """
+
+    orbits: OrbitsTable
+    """Fitted orbits — one row per **delivered** object, carrying
+    ``object_id``, covariance, and the fitted non-grav / SRP slots. Feed
+    straight back into propagation or ephemeris generation."""
+    summary: FitSummary
+    """One row per **input** object, delivered or failed."""
+    residuals: ObservationResults
+    """Per-observation residuals of every delivered fit, each row tagged
+    with its ``object_id``."""
+    failures: dict[str, DetermineFailure]
+    """Objects that produced no orbit, keyed by identifier."""
+    unmatched_orbit_ids: list[str]
+    """Seed orbits that matched no observation group and therefore
+    constrained nothing. Reported rather than dropped."""
+    _results: dict[str, DetermineResult] = field(default_factory=dict, repr=False)
+    """Per-object single-fit views, keyed by identifier. Read through
+    :meth:`__getitem__`."""
+
+    def __len__(self) -> int:
+        """Number of objects the observations grouped into — delivered
+        and failed alike."""
+        return len(self.summary)
+
+    def __iter__(self) -> Iterator[str]:
+        """Iterate the object identifiers, in table order."""
+        return iter(self.object_ids)
+
+    def __contains__(self, object_id: str) -> bool:
+        return object_id in self._results or object_id in self.failures
+
+    def __getitem__(self, object_id: str) -> DetermineResult:
+        """The single-object view of one delivered fit.
+
+        Raises ``KeyError`` for an object the batch never saw, and
+        ``ValueError`` — naming the reason — for one that failed. A
+        failed object never returns an empty result.
+        """
+        if object_id in self._results:
+            return self._results[object_id]
+        failure = self.failures.get(object_id)
+        if failure is not None:
+            raise ValueError(f"orbit determination failed for {object_id}: {failure.message}")
+        raise KeyError(f"no object {object_id!r} in this batch; it holds {self.object_ids}")
+
+    @property
+    def object_ids(self) -> list[str]:
+        """Every object identifier, in table order."""
+        ids: list[str] = self.summary.object_id.to_pylist()
+        return ids
+
+    @property
+    def delivered(self) -> list[str]:
+        """Identifiers of the objects that produced an orbit."""
+        return list(self._results)
+
+    @property
+    def all_failed(self) -> bool:
+        """True when the batch ran but no object produced an orbit. The
+        per-object :attr:`failures` are the diagnosis."""
+        return len(self.summary) > 0 and not self._results
+
+    def single(self) -> DetermineResult:
+        """The one fit, for the common single-object call.
+
+        Raises — loudly — when the batch holds anything other than
+        exactly one delivered object: zero objects, more than one (naming
+        them, so the caller can index instead), or one whose fit failed.
+        It never chooses among several fits on the caller's behalf.
+        """
+        ids = self.object_ids
+        if len(ids) == 1:
+            return self[ids[0]]
+        if not ids:
+            raise ValueError(
+                "orbit determination produced no objects: the observations carried no rows to group"
+            )
+        raise ValueError(
+            f"orbit determination fitted {len(ids)} objects "
+            f"({', '.join(ids)}); single() refuses to choose one — "
+            f"iterate the batch or index it by object_id"
+        )

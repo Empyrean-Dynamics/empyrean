@@ -195,6 +195,7 @@ docstring-code-format = true
 testpaths = ["tests"]
 markers = [
     "slow: marks long-running integration tests (deselect with '-m \"not slow\"')",
+    "validation: marks tests that need kernels + the compiled engine and run at the validation gate",
 ]
 
 # mypy's type-check target, NOT the package's runtime support floor (that

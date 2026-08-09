@@ -3740,6 +3740,9 @@ fn add_residuals_to_dict(
 
     // Identification
     let mut obs_ids: Vec<String> = Vec::with_capacity(n);
+    // The grouping key travels with the row so a batch's residuals live
+    // in one table and stay attributable.
+    let mut object_ids: Vec<Option<String>> = Vec::with_capacity(n);
     let mut obs_codes: Vec<String> = Vec::with_capacity(n);
     let mut ast_cats: Vec<Option<String>> = Vec::with_capacity(n);
     let mut epochs = Vec::with_capacity(n);
@@ -3782,6 +3785,7 @@ fn add_residuals_to_dict(
 
     for r in residuals {
         obs_ids.push(r.obs_id.clone());
+        object_ids.push(r.object_id.clone());
         obs_codes.push(r.obs_code.clone());
         ast_cats.push(r.ast_cat.clone());
         epochs.push(r.epoch.mjd_tdb().map_err(to_pyerr)?);
@@ -3826,6 +3830,7 @@ fn add_residuals_to_dict(
     }
 
     dict.set_item("obs_ids", obs_ids)?;
+    dict.set_item("object_ids", object_ids)?;
     dict.set_item("obs_codes", obs_codes)?;
     dict.set_item("ast_cats", ast_cats)?;
     dict.set_item("obs_epochs", PyArray1::from_vec(py, epochs))?;
@@ -3996,6 +4001,48 @@ fn add_acceptability_to_dict(
         format!("{prefix}fractional_sigma_a_threshold"),
         acc.fractional_sigma_a_threshold,
     )?;
+    dict.set_item(
+        format!("{prefix}selection_fraction_ok"),
+        acc.selection_fraction_ok,
+    )?;
+    dict.set_item(
+        format!("{prefix}selection_fraction_value"),
+        acc.selection_fraction_value,
+    )?;
+    dict.set_item(
+        format!("{prefix}selection_fraction_threshold"),
+        acc.selection_fraction_threshold,
+    )?;
+    dict.set_item(
+        format!("{prefix}selected_arc_coverage_ok"),
+        acc.selected_arc_coverage_ok,
+    )?;
+    dict.set_item(
+        format!("{prefix}selected_arc_days_value"),
+        acc.selected_arc_days_value,
+    )?;
+    dict.set_item(
+        format!("{prefix}selected_arc_fraction_value"),
+        acc.selected_arc_fraction_value,
+    )?;
+    dict.set_item(
+        format!("{prefix}selected_arc_fraction_threshold"),
+        acc.selected_arc_fraction_threshold,
+    )?;
+    dict.set_item(format!("{prefix}trailing_gap_ok"), acc.trailing_gap_ok)?;
+    dict.set_item(
+        format!("{prefix}trailing_gap_days_value"),
+        acc.trailing_gap_days_value,
+    )?;
+    dict.set_item(
+        format!("{prefix}trailing_gap_threshold"),
+        acc.trailing_gap_threshold,
+    )?;
+    // Tri-state: omitted entirely when no radar contributed, so "no
+    // radar" can never be read as "radar failed".
+    if let Some(v) = acc.radar_fit_ok {
+        dict.set_item(format!("{prefix}radar_fit_ok"), v)?;
+    }
     Ok(())
 }
 
@@ -4285,11 +4332,54 @@ fn _determine<'py>(
     };
 
     let od_config = build_od_config_from_dict(config_dict)?;
-    let determine_result = py
+    let batch = py
         .detach(|| ctx.determine(&observations, initial_orbits.as_deref(), &od_config))
         .map_err(to_pyerr)?;
 
-    determine_result_to_pydict(py, &determine_result)
+    // Batch-first: one entry per ADES object, delivered or failed. A
+    // failed object is an entry with `delivered = False` and an `error`,
+    // never a missing entry — Python assembles the tables from this.
+    let out = PyDict::new(py);
+    let objects = PyList::empty(py);
+    for entry in batch.iter() {
+        let item = match &entry.outcome {
+            Ok(fit) => {
+                let d = determine_result_to_pydict(py, fit)?;
+                d.set_item("delivered", true)?;
+                d
+            }
+            Err(failure) => {
+                let d = PyDict::new(py);
+                d.set_item("delivered", false)?;
+                d.set_item("error", &failure.message)?;
+                d.set_item("error_kind", determine_failure_kind_str(failure.kind))?;
+                d
+            }
+        };
+        item.set_item("object_id", &entry.object_id)?;
+        objects.append(item)?;
+    }
+    out.set_item("objects", objects)?;
+    out.set_item("unmatched_orbit_ids", batch.unmatched_orbit_ids().to_vec())?;
+    Ok(out)
+}
+
+/// Stable snake_case name for a per-object failure cause, so Python can
+/// branch on the reason without parsing the message.
+fn determine_failure_kind_str(kind: empyrean::DetermineFailureKind) -> String {
+    use empyrean::DetermineFailureKind as K;
+    match kind {
+        K::ObservationConversion => "observation_conversion".to_string(),
+        K::ObserverConstruction => "observer_construction".to_string(),
+        K::UnsupportedCoordinateSystem => "unsupported_coordinate_system".to_string(),
+        K::EarthOrientationCoverage => "earth_orientation_coverage".to_string(),
+        K::IOD => "iod".to_string(),
+        K::OD => "od".to_string(),
+        K::DuplicateObsIds => "duplicate_obs_ids".to_string(),
+        K::RadarOnly => "radar_only".to_string(),
+        K::NonGravNotRecovered => "non_grav_not_recovered".to_string(),
+        K::Unknown(code) => format!("unknown_{code}"),
+    }
 }
 
 // ══════════════════════════════════════════════════════════
@@ -4685,8 +4775,11 @@ fn build_od_config_from_dict(d: &Bound<'_, PyDict>) -> PyResult<empyrean::ODConf
     if let Some(v) = get_f64(d, "convergence_tol")? {
         cfg.convergence_tol = v;
     }
-    if let Some(v) = get_bool(d, "use_stm_cache")? {
-        cfg.use_stm_cache = v;
+    if let Some(v) = get_bool(d, "allow_arc_truncation")? {
+        cfg.allow_arc_truncation = v;
+    }
+    if let Some(v) = get_bool(d, "coorbital_enabled")? {
+        cfg.coorbital_enabled = v;
     }
     if let Some(s) = get_str(d, "solve_for")? {
         cfg.solve_for = match s.to_ascii_lowercase().as_str() {
@@ -5965,72 +6058,157 @@ fn _write_events_csv<'py>(
 // ══════════════════════════════════════════════════════════
 
 fn pydict_to_residuals(dict: &Bound<'_, PyDict>) -> PyResult<Vec<empyrean::ObservationResidual>> {
-    let ra: PyReadonlyArray1<f64> = dict
-        .get_item("ra_residuals_arcsec")?
-        .ok_or_else(|| PyValueError::new_err("missing 'ra_residuals_arcsec'"))?
-        .extract()?;
-    let dec: PyReadonlyArray1<f64> = dict
-        .get_item("dec_residuals_arcsec")?
-        .ok_or_else(|| PyValueError::new_err("missing 'dec_residuals_arcsec'"))?
-        .extract()?;
-    let chi2: PyReadonlyArray1<f64> = dict
-        .get_item("chi2")?
-        .ok_or_else(|| PyValueError::new_err("missing 'chi2'"))?
-        .extract()?;
-    let prob: PyReadonlyArray1<f64> = dict
-        .get_item("probability")?
-        .ok_or_else(|| PyValueError::new_err("missing 'probability'"))?
-        .extract()?;
-    let selected: PyReadonlyArray1<u8> = dict
+    // Every column the ObservationResults table carries crosses here.
+    // A projection would silently write a residual file whose rejection
+    // attribution, influence diagnostics and join keys are all empty.
+    let strs = |key: &str| -> PyResult<Vec<String>> {
+        Ok(match dict.get_item(key)? {
+            Some(v) => v.extract::<Vec<Option<String>>>()?,
+            None => Vec::new(),
+        }
+        .into_iter()
+        .map(|o| o.unwrap_or_default())
+        .collect())
+    };
+    let floats = |key: &str| -> PyResult<Vec<f64>> {
+        Ok(match dict.get_item(key)? {
+            Some(v) => v.extract::<PyReadonlyArray1<f64>>()?.as_array().to_vec(),
+            None => Vec::new(),
+        })
+    };
+
+    let ra = floats("ra_residuals_arcsec")?;
+    let dec = floats("dec_residuals_arcsec")?;
+    let chi2 = floats("chi2")?;
+    let prob = floats("probability")?;
+    let selected: Vec<u8> = dict
         .get_item("selected")?
         .ok_or_else(|| PyValueError::new_err("missing 'selected'"))?
-        .extract()?;
-    let ra = ra.as_array();
-    let dec = dec.as_array();
-    let chi2 = chi2.as_array();
-    let prob = prob.as_array();
-    let selected = selected.as_array();
+        .extract::<PyReadonlyArray1<u8>>()?
+        .as_array()
+        .to_vec();
     let n = ra.len();
+
+    let obs_ids = strs("obs_ids")?;
+    let object_ids = strs("object_ids")?;
+    let obs_codes = strs("obs_codes")?;
+    let ast_cats = strs("ast_cats")?;
+    let rejection_reasons = strs("rejection_reasons")?;
+    let radar_kinds = strs("radar_kinds")?;
+    let epochs = floats("epochs")?;
+    let dofs: Vec<u32> = match dict.get_item("dofs")? {
+        Some(v) => v.extract::<Vec<u32>>()?,
+        None => Vec::new(),
+    };
+    let radar_dofs: Vec<u32> = match dict.get_item("radar_dofs")? {
+        Some(v) => v.extract::<Vec<u32>>()?,
+        None => Vec::new(),
+    };
+    let cov_ra = floats("residual_cov_ras")?;
+    let cov_dec = floats("residual_cov_decs")?;
+    let cov_corr = floats("residual_cov_corrs")?;
+    let rej_crit = floats("rejection_criterions")?;
+    let rej_thr = floats("rejection_thresholds")?;
+    let rej_eff = floats("rejection_effective_thresholds")?;
+    let rej_loss = floats("rejection_information_losses")?;
+    let cooks = floats("cooks_distances")?;
+    let leverage = floats("leverages")?;
+    let frac_info = floats("fractional_informations")?;
+    let at = floats("along_tracks")?;
+    let ct = floats("cross_tracks")?;
+    let at_err = floats("along_track_errors")?;
+    let ct_err = floats("cross_track_errors")?;
+    let pa = floats("track_position_angles")?;
+    let infl_loss = floats("influence_information_losses")?;
+    let at_ct_cov = floats("along_cross_covariances")?;
+    let radar_res = floats("radar_residuals")?;
+    let radar_chi2 = floats("radar_chi2s")?;
+    let radar_prob = floats("radar_probabilities")?;
+    let radar_var = floats("radar_variances")?;
+
+    // A column the caller omitted reads as absent (NaN / empty), never
+    // as a value: `at(i)` is None-shaped rather than 0.0.
+    let f = |v: &[f64], i: usize| v.get(i).copied().unwrap_or(f64::NAN);
+    let t = |v: &[String], i: usize| v.get(i).cloned().unwrap_or_default();
+
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
-        // The Python residuals-write path passes minimal residual data
-        // (RA/Dec/χ²/probability/selected). Everything else fills with
-        // NaN / NotEvaluated so the C ABI sees a uniform absent
-        // sentinel; downstream serializers (parquet/json/csv) treat
-        // NaN as a missing-cell write.
+        let ast_cat = t(&ast_cats, i);
+        let radar_kind = t(&radar_kinds, i);
+        let radar = (!radar_kind.is_empty()).then(|| empyrean::RadarResidual {
+            kind: if radar_kind.eq_ignore_ascii_case("doppler") {
+                empyrean::RadarResidualKind::Doppler
+            } else {
+                empyrean::RadarResidualKind::Delay
+            },
+            residual: f(&radar_res, i),
+            chi2: f(&radar_chi2, i),
+            dof: radar_dofs.get(i).copied().unwrap_or(0),
+            probability: f(&radar_prob, i),
+            variance: {
+                let v = f(&radar_var, i);
+                v.is_finite().then_some(v)
+            },
+        });
         out.push(empyrean::ObservationResidual {
-            obs_id: String::new(),
-            obs_code: String::new(),
-            ast_cat: None,
-            epoch: empyrean::Epoch::from_mjd_tdb(f64::NAN),
-            ra_residual_arcsec: ra[i],
-            dec_residual_arcsec: dec[i],
-            chi2: chi2[i],
-            dof: 2,
-            probability: prob[i],
-            selected: selected[i] != 0,
-            residual_cov_ra: f64::NAN,
-            residual_cov_dec: f64::NAN,
-            residual_cov_corr: f64::NAN,
-            rejection_reason: empyrean::RejectionReason::NotEvaluated,
-            rejection_criterion: f64::NAN,
-            rejection_threshold: f64::NAN,
-            rejection_effective_threshold: f64::NAN,
-            rejection_information_loss: f64::NAN,
-            cooks_distance: f64::NAN,
-            leverage: f64::NAN,
-            fractional_information: f64::NAN,
-            along_track_arcsec: f64::NAN,
-            cross_track_arcsec: f64::NAN,
-            along_track_error_arcsec: f64::NAN,
-            cross_track_error_arcsec: f64::NAN,
-            track_position_angle_deg: f64::NAN,
-            influence_information_loss: f64::NAN,
-            along_cross_covariance_arcsec2: f64::NAN,
-            radar: None,
+            obs_id: t(&obs_ids, i),
+            object_id: {
+                let v = t(&object_ids, i);
+                (!v.is_empty()).then_some(v)
+            },
+            obs_code: t(&obs_codes, i),
+            ast_cat: (!ast_cat.is_empty()).then_some(ast_cat),
+            epoch: empyrean::Epoch::from_mjd_tdb(f(&epochs, i)),
+            ra_residual_arcsec: f(&ra, i),
+            dec_residual_arcsec: f(&dec, i),
+            chi2: f(&chi2, i),
+            dof: dofs.get(i).copied().unwrap_or(2),
+            probability: f(&prob, i),
+            selected: selected.get(i).copied().unwrap_or(0) != 0,
+            residual_cov_ra: f(&cov_ra, i),
+            residual_cov_dec: f(&cov_dec, i),
+            residual_cov_corr: f(&cov_corr, i),
+            rejection_reason: rejection_reason_from_str(&t(&rejection_reasons, i)),
+            rejection_criterion: f(&rej_crit, i),
+            rejection_threshold: f(&rej_thr, i),
+            rejection_effective_threshold: f(&rej_eff, i),
+            rejection_information_loss: f(&rej_loss, i),
+            cooks_distance: f(&cooks, i),
+            leverage: f(&leverage, i),
+            fractional_information: f(&frac_info, i),
+            along_track_arcsec: f(&at, i),
+            cross_track_arcsec: f(&ct, i),
+            along_track_error_arcsec: f(&at_err, i),
+            cross_track_error_arcsec: f(&ct_err, i),
+            track_position_angle_deg: f(&pa, i),
+            influence_information_loss: f(&infl_loss, i),
+            along_cross_covariance_arcsec2: f(&at_ct_cov, i),
+            radar,
         });
     }
     Ok(out)
+}
+
+/// Inverse of the wrapper's rejection-reason naming, so a residual
+/// table that crossed into Python and back keeps its attribution instead
+/// of collapsing to "not evaluated".
+fn rejection_reason_from_str(name: &str) -> empyrean::RejectionReason {
+    use empyrean::RejectionReason as R;
+    match name {
+        "accepted" => R::Accepted,
+        "chi_squared" => R::ChiSquared,
+        "sigma_clip" => R::SigmaClip,
+        "cooks_distance" => R::CooksDistance,
+        "adaptive" => R::Adaptive,
+        "unsupported_observatory" => R::UnsupportedObservatory,
+        "cmc2003" => R::CMC2003,
+        "radar_observations_unsupported" => R::RadarObservationsUnsupported,
+        "occultation_observations_unsupported" => R::OccultationObservationsUnsupported,
+        "outside_arc" => R::OutsideArc,
+        "non_finite_chi2" => R::NonFiniteChi2,
+        "missing_jacobian" => R::MissingJacobian,
+        _ => R::NotEvaluated,
+    }
 }
 
 #[pyfunction]

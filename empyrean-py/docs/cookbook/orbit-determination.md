@@ -10,11 +10,29 @@ import empyrean
 empyrean.initialize()
 
 obs, radar = empyrean.read_ades("apophis_2004_2021.psv")  # optical + radar tables
-fit = empyrean.determine(obs)                             # IOD + DC (optical only)
+fits = empyrean.determine(obs)                            # IOD + DC, every object
+fit = fits.single()                                       # one object in, one fit out
 
 print(f"converged={fit.converged}, "
       f"χ²_red={fit.summary.reduced_chi2:.2f}, "
       f"acceptable={fit.acceptability.fit_acceptable}")
+```
+
+`determine` fits **every** object the observations group into, keyed by
+ADES identifier. `fits.summary` is a row per *input* object — delivered
+or not — `fits.orbits` holds the ones that produced an orbit, and
+`fits.residuals` carries every delivered fit's rows tagged with their
+`object_id`. Index by identifier for the full single-object view:
+
+```python
+fits = empyrean.determine(multi_object_obs)
+print(len(fits), "object(s);", len(fits.delivered), "delivered")
+
+for object_id, failure in fits.failures.items():
+    print(f"{object_id} produced no orbit: {failure.message}")
+
+yr4 = fits["2024 YR4"]
+print(yr4.acceptability.extrapolation_acceptable)
 ```
 
 {func}`~empyrean.determine` runs initial orbit determination on the
@@ -101,7 +119,7 @@ cfg = ODConfig(
     # Per-observation weighting follows Vereš et al. 2017 by default.
 )
 
-fit = empyrean.determine(observations, config=cfg)
+fit = empyrean.determine(observations, config=cfg).single()
 
 # Per-station fitted biases come back as a quivr table on the result.
 biases = fit.station_biases

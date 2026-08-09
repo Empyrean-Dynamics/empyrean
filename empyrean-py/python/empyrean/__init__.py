@@ -51,6 +51,7 @@ from empyrean.od.determine import determine, evaluate, read_ades, refine
 from empyrean.od.radar_observations import ADESRadarObservations
 from empyrean.od.residuals import (
     AcceptabilityReport,
+    FitSummary,
     ObservationResults,
     ResidualSummary,
     StationBiases,
@@ -63,7 +64,9 @@ from empyrean.od.result import (
     CovarianceTrust,
     DebiasingConfig,
     DebiasingResolution,
+    DetermineFailure,
     DetermineResult,
+    DetermineResults,
     EvaluateResult,
     GateRecord,
     IODConfig,

@@ -180,16 +180,38 @@ empyrean propagate --object-id 99942 --epoch 64922.0 --thrust-arcs burn.json --o
 
 ## Orbit determination
 
-`determine` fits an orbit from an ADES PSV and writes the fitted orbit
-(`fitted_orbit.<ext>`) plus per-observation residuals (`residuals.<ext>`)
-under `--out-dir`. The fitted orbit is fully re-feedable — its state,
-covariance, and non-gravitational model carry straight into a follow-on
-`empyrean propagate` / `empyrean ephemeris` with no reconstruction.
+`determine` is batch-first: it groups the ADES PSV by object identifier
+(`permID` → `provID` → `trkSub`) and fits **every** object in the file.
+A file with one object is the one-row case, not a different command.
+
+Three artifacts land under `--out-dir`:
+
+- `fitted_orbits.<ext>` — one row per object that produced an orbit,
+  keyed by its ADES designation. Fully re-feedable: state, covariance,
+  and non-gravitational model carry straight into a follow-on
+  `empyrean propagate` / `empyrean ephemeris` with no reconstruction.
+- `fit_summary.parquet` **and** `fit_summary.csv` — one row per *input*
+  object, delivered or not, with its convergence, residual RMS,
+  acceptability verdicts, and (on failure) the reason. Always written in
+  both formats so a run is readable at a terminal without a parquet tool.
+- `residuals.<ext>` — every delivered fit's per-observation rows, each
+  tagged with the `object_id` it belongs to. The file carries the whole
+  residual surface: join keys, epoch and catalog, the rejection
+  attribution (reason, criterion, thresholds), the influence
+  diagnostics, the along/cross-track decomposition, and the radar block.
+  All three formats emit the same columns; a non-computable number is a
+  literal `NaN` in CSV and `null` in JSON.
+
+An object whose fit fails never removes the others and never disappears:
+it gets a `fit_summary` row saying so. The exit code is the batch's
+verdict — `0` when every object delivered, `3` when some did, `4` when
+none did.
 
 ```sh
 # 6-parameter fit. The default `--solve-for auto` starts state-only and
 # escalates to non-grav automatically on a poor fit.
 empyrean determine apophis.psv --out-dir ./out
+ls out/    # fitted_orbits.parquet  fit_summary.parquet  fit_summary.csv  residuals.parquet
 ```
 
 ### Solving for more than the state

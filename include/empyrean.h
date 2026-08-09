@@ -337,6 +337,49 @@ typedef struct Session Session;
 #define EMPYREAN_REJECTION_OUTSIDE_ARC 9
 
 /**
+ * The observation's χ² against the published orbit is non-finite (NaN
+ * or infinite residual / weight product), so it cannot participate in
+ * any fit statistic. Every summary already excluded it from χ²/dof;
+ * this code makes the exclusion visible instead of letting the row
+ * read as used ("48 of 48 used" for a fit that used 42).
+ */
+#define EMPYREAN_REJECTION_NON_FINITE_CHI2 10
+
+/**
+ * The propagation retained no Jacobian / STM at this observation's
+ * epoch, so the observation contributed no row to the normal equations
+ * — it was never part of the fit and its per-obs χ² is NaN.
+ */
+#define EMPYREAN_REJECTION_MISSING_JACOBIAN 11
+
+/**
+ * The observation's observatory is a spacecraft whose SPK kernel is not
+ * loaded, so its position could not be constructed. Distinct from
+ * [`EMPYREAN_REJECTION_UNSUPPORTED_OBSERVATORY`] (a code the engine does
+ * not model at all): this one is a **data-provisioning** gap the caller
+ * can close by loading the kernel, not a property of the observation.
+ */
+#define EMPYREAN_REJECTION_SPACECRAFT_KERNEL_MISSING 12
+
+/**
+ * The observer position could not be constructed for a reason specific
+ * to this row (bad roving-observer record, epoch outside the loaded
+ * Earth-orientation coverage, …). The engine's per-row explanation is
+ * not carried across the ABI as a string; consult the batch-level error
+ * or the engine log for the detail.
+ */
+#define EMPYREAN_REJECTION_OBSERVER_CONSTRUCTION_FAILED 13
+
+/**
+ * The observation was never absorbed into the fit: it reached no
+ * iteration that could have used it. Distinct from a rejection — no
+ * criterion was ever tested against it — and distinct from
+ * [`EMPYREAN_REJECTION_NOT_EVALUATED`], which means the call path ran
+ * no rejection pass at all.
+ */
+#define EMPYREAN_REJECTION_NEVER_ABSORBED 14
+
+/**
  * Rejection was not evaluated for this observation (e.g. evaluate path).
  */
 #define EMPYREAN_REJECTION_NOT_EVALUATED -1
@@ -462,9 +505,18 @@ typedef struct Session Session;
  * - `empyrean_transform_coordinates` becomes the **batched** entry
  *   point (array in, array out) and the one-state form is renamed
  *   `empyrean_transform_coordinates_single`;
- * - `empyrean_get_observers` gains `frame` / `origin` parameters.
+ * - `empyrean_get_observers` gains `frame` / `origin` parameters;
+ * - `empyrean_determine` becomes the **batched** entry point: it writes
+ *   an [`EmpyreanDetermineResults`] table with one
+ *   [`EmpyreanODObjectResult`] per ADES object instead of a single
+ *   [`EmpyreanODResult`], and its output is released with the new
+ *   [`empyrean_determine_results_free`];
+ * - [`EmpyreanObservationResult`] grows `object_id`, and
+ *   [`EmpyreanAcceptabilityReport`] grows the selection-fraction,
+ *   selected-arc-coverage and trailing-gap gate axes plus the
+ *   `radar_fit_ok` tri-state.
  *
- * Fields are only ever appended, never reordered or removed, so the two
+ * Fields are only ever appended, never reordered or removed, so the
  * signature changes are the only source-breaking ones — a consumer
  * built against an older header must recompile against this one either
  * way.
@@ -507,6 +559,73 @@ typedef struct Session Session;
 #define EMPYREAN_REPRESENTATION_COMETARY 2
 
 #define EMPYREAN_REPRESENTATION_SPHERICAL 3
+
+/**
+ * The object delivered a fit; `error` is null.
+ */
+#define EMPYREAN_OD_FAILURE_NONE 0
+
+/**
+ * Observation conversion failed (UTC → TDB, malformed record, …).
+ */
+#define EMPYREAN_OD_FAILURE_OBSERVATION_CONVERSION 1
+
+/**
+ * Observer position could not be constructed (unknown observatory
+ * code, epoch outside the loaded kernels, unsupported spacecraft).
+ */
+#define EMPYREAN_OD_FAILURE_OBSERVER_CONSTRUCTION 2
+
+/**
+ * A roving-observer record used a coordinate system the engine does
+ * not support.
+ */
+#define EMPYREAN_OD_FAILURE_UNSUPPORTED_COORDINATE_SYSTEM 3
+
+/**
+ * The loaded Earth-orientation (BPC) coverage does not span the
+ * observations. An **engine-configuration** failure, not a property of
+ * the data — the three-Earth-kernel set must be present.
+ */
+#define EMPYREAN_OD_FAILURE_EARTH_ORIENTATION_COVERAGE 4
+
+/**
+ * Initial orbit determination failed to produce a seed.
+ */
+#define EMPYREAN_OD_FAILURE_IOD 5
+
+/**
+ * The N-body differential correction failed.
+ */
+#define EMPYREAN_OD_FAILURE_OD 6
+
+/**
+ * Two observations of this object carried the same observation ID.
+ */
+#define EMPYREAN_OD_FAILURE_DUPLICATE_OBS_IDS 7
+
+/**
+ * Radar observations were supplied with no optical astrometry. Radar
+ * leaves the two plane-of-sky angular degrees of freedom
+ * unconstrained, so the fit is under-determined.
+ */
+#define EMPYREAN_OD_FAILURE_RADAR_ONLY 8
+
+/**
+ * An explicit non-gravitational solve could not recover A1/A2/A3.
+ * Surfaced rather than silently degrading to a state-only fit.
+ */
+#define EMPYREAN_OD_FAILURE_NON_GRAV_NOT_RECOVERED 9
+
+/**
+ * The whole batch ran but **no** object produced a fit.
+ *
+ * `results_out` is still fully populated — every slot carries its
+ * per-object `error` / `error_code` — and MUST be released with
+ * [`empyrean_determine_results_free`]. This is a distinct code from the
+ * batch-level abort (`-3`), which writes nothing.
+ */
+#define EMPYREAN_DETERMINE_NONE_DELIVERED -4
 
 /**
  * Phase-function model selector for [`EmpyreanOrbit`] photometry.
@@ -2458,10 +2577,11 @@ struct EmpyreanOrbitBatch {
  * for the call type (e.g. evaluate doesn't compute rejection or
  * influence diagnostics).
  *
- * `obs_id` is a heap-allocated NUL-terminated UTF-8 string; the
- * pointer is freed by [`empyrean_od_result_free`] /
+ * `obs_id`, `object_id` and `ast_cat` are heap-allocated NUL-terminated
+ * UTF-8 strings; the pointers are freed by
+ * [`empyrean_determine_results_free`] / [`empyrean_od_result_free`] /
  * [`empyrean_evaluate_result_free`] when the parent array is freed.
- * Do NOT free it manually.
+ * Do NOT free them manually.
  */
 struct EmpyreanObservationResult {
     /**
@@ -2469,6 +2589,18 @@ struct EmpyreanObservationResult {
      * — freed by the matching `*_result_free` call.
      */
     char *obs_id;
+    /**
+     * ADES object identifier (permID / provID / trkSub) of the object
+     * this row was fitted against. Populated by
+     * [`empyrean_determine`], which groups by object — so a caller may
+     * concatenate every object's rows into one flat table and still
+     * know which fit each row belongs to.
+     *
+     * Null on the single-object paths (`empyrean_evaluate`,
+     * `empyrean_refine`), where the caller supplied the one orbit and
+     * no grouping key exists. Owned by the parent array.
+     */
+    char *object_id;
     /**
      * MPC observatory code (3-byte + NUL).
      */
@@ -2625,6 +2757,77 @@ struct EmpyreanObservationResult {
      * (1). Only meaningful when `has_radar == 1`.
      */
     uint8_t radar_kind;
+};
+
+/**
+ * One row of the per-object fit summary: what a batch orbit
+ * determination did with **one** input object, delivered or not.
+ *
+ * This is the row shape of the `fit_summary` table every distribution
+ * channel emits, so the file the CLI writes and the table the Python
+ * API returns describe a fit with the same column names.
+ *
+ * A failed object still gets a row — that is the point of the table.
+ * Its numeric columns are NaN (never 0.0, which would read as a
+ * measurement), its `_ok` booleans are false, and `error` carries the
+ * reason. `status` is `"delivered"` or `"failed"`.
+ *
+ * Both string fields are borrowed for the duration of the call: the
+ * writer copies what it needs and frees nothing.
+ */
+struct EmpyreanFitSummary {
+    /**
+     * ADES object identifier. Never null.
+     */
+    const char *object_id;
+    /**
+     * `"delivered"` or `"failed"`. Never null.
+     */
+    const char *status;
+    /**
+     * 1 when the differential correction reached its stopping
+     * criterion. 0 on a failed object.
+     */
+    uint8_t converged;
+    /**
+     * DC iterations used. 0 on a failed object.
+     */
+    uint32_t iterations;
+    /**
+     * Observations this object contributed.
+     */
+    uintptr_t n_obs;
+    /**
+     * Observations the fit retained.
+     */
+    uintptr_t n_selected;
+    double rms_ra_arcsec;
+    double rms_dec_arcsec;
+    double reduced_chi2;
+    uint8_t fit_acceptable;
+    uint8_t extrapolation_acceptable;
+    uint8_t selection_fraction_ok;
+    double selection_fraction;
+    double selection_fraction_threshold;
+    uint8_t selected_arc_coverage_ok;
+    double selected_arc_days;
+    double selected_arc_fraction;
+    double selected_arc_fraction_threshold;
+    uint8_t trailing_gap_ok;
+    double trailing_gap_days;
+    double trailing_gap_threshold_days;
+    uint8_t fractional_sigma_a_ok;
+    double fractional_sigma_a;
+    double fractional_sigma_a_threshold;
+    /**
+     * Width of the solved-parameter set (6 for a state-only fit). 0 on
+     * a failed object.
+     */
+    uint32_t solve_for_width;
+    /**
+     * Failure message. Null on a delivered object.
+     */
+    const char *error;
 };
 
 /**
@@ -3345,9 +3548,32 @@ struct EmpyreanODConfig {
      */
     double convergence_tol;
     /**
-     * Use STM-cached ephemeris updates for iterations 2+. 1 = on (default).
+     * Allow the outward-expansion pipeline to truncate a sub-arc it
+     * cannot fit as one piece. Tri-state: `-1` (or any negative) =
+     * engine default (allowed), `1` = allowed, `0` = **forbidden**.
+     *
+     * Forbidding truncation makes an arc that spans a dynamical
+     * discontinuity FAIL loudly instead of delivering a fit of the
+     * reconcilable sub-arc with the rest tagged
+     * `EMPYREAN_REJECTION_OUTSIDE_ARC`. Two interactions matter before
+     * relying on `0`: per-observation rejection is orthogonal and still
+     * runs (set `rejection.enabled = 0` as well to fit the whole arc or
+     * fail), and under `EMPYREAN_ORIGIN_POLICY_AUTO` the refusal is a
+     * cascade trigger rather than a final answer — pin the origin with
+     * `EMPYREAN_ORIGIN_POLICY_EXPLICIT` to get a pure loud failure.
      */
-    uint8_t use_stm_cache;
+    int8_t allow_arc_truncation;
+    /**
+     * Master switch for the co-orbital IOD lane. Tri-state: `-1` (or any
+     * negative) = engine default (enabled), `1` = enabled, `0` = forced
+     * off (the historical cascade).
+     *
+     * Enabling it does not route ordinary objects through the lane: it
+     * still fires only when every co-orbitality gate passes. The lane's
+     * detection parameters are not exposed here — reach for the
+     * empyrean-core Rust API to tune them.
+     */
+    int8_t coorbital_enabled;
     /**
      * Solve-for parameter set (`EMPYREAN_SOLVE_FOR_*`). Default = Auto.
      */
@@ -3500,11 +3726,31 @@ struct EmpyreanNonGravParams {
  * Acceptability sub-checks computed post-DC.
  *
  * Mirrors scott's [`AcceptabilityReport`](scott::od::AcceptabilityReport).
- * Boolean fields are encoded as `u8` (0/1). When a value is unavailable
- * (e.g. AT/CT ratio with no sky-motion rates), the `_value` is NaN and
- * the corresponding `_ok` flag is 0. Always populated on
+ * Boolean fields are encoded as `u8` (0/1). Always populated on
  * [`EmpyreanODResult`]; on [`EmpyreanEvaluateResult`] the report is
  * filled with NaN/0 because evaluate does not produce a fitted orbit.
+ *
+ * # NaN convention
+ *
+ * **Every `f64` here is NaN when the quantity could not be computed**
+ * (AT/CT ratio with no sky-motion rates, selected-arc spans when the fit
+ * selected nothing, …) — NaN is the only "not computable" marker, never
+ * `0.0`, because a threshold-comparison of `0.0` reads as a real
+ * measurement that happens to be at the floor. The `_ok` booleans are
+ * **always valid**: a gate whose value is NaN reports `0` (did not pass),
+ * so a consumer can branch on the verdict without first testing the value
+ * for NaN.
+ *
+ * # Fit vs. extrapolation
+ *
+ * `fit_acceptable` is the AND of the fit-quality gates (convergence,
+ * positive-definite covariance, reduced χ², RMS, residual isotropy).
+ * `extrapolation_acceptable` additionally requires the four selection /
+ * coverage axes below — `selection_fraction_ok`,
+ * `selected_arc_coverage_ok`, `trailing_gap_ok` and
+ * `fractional_sigma_a_ok`. Those four are deliberately NOT part of
+ * `fit_acceptable`: a heavily pruned fit can still describe its retained
+ * subset well while being unsafe to propagate forward.
  */
 struct EmpyreanAcceptabilityReport {
     uint8_t fit_acceptable;
@@ -3520,12 +3766,70 @@ struct EmpyreanAcceptabilityReport {
     double at_ct_ratio_value;
     double at_ct_ratio_threshold;
     uint8_t covariance_ok;
+    /**
+     * FULL observation span at or above `arc_days_threshold`. Kept for
+     * callers that want the full-arc meaning; `extrapolation_acceptable`
+     * judges coverage on `selected_arc_coverage_ok` instead.
+     */
     uint8_t arc_coverage_ok;
     double arc_days_value;
     double arc_days_threshold;
     uint8_t fractional_sigma_a_ok;
     double fractional_sigma_a_value;
     double fractional_sigma_a_threshold;
+    /**
+     * Fraction of observations retained (n_selected / n_obs) at or above
+     * the configured floor. `false` means the residual bars above
+     * describe a heavily pruned subset. Reproduce the fraction from
+     * `selection_fraction_value`, NOT from
+     * [`EmpyreanResidualSummary`] — the summary counts merged
+     * radar / occultation stub rows that were never candidates for
+     * outlier pruning, so its ratio is a different (smaller) number.
+     */
+    uint8_t selection_fraction_ok;
+    double selection_fraction_value;
+    double selection_fraction_threshold;
+    /**
+     * The SELECTED observations cover enough of the arc to extrapolate
+     * across it: the selected span clears the absolute
+     * `arc_days_threshold` floor AND spans at least
+     * `selected_arc_fraction_threshold` of the full observed span.
+     */
+    uint8_t selected_arc_coverage_ok;
+    /**
+     * Arc span (days) over the selected observations only. NaN when
+     * nothing is selected.
+     */
+    double selected_arc_days_value;
+    /**
+     * Selected-span / full-span ratio.
+     */
+    double selected_arc_fraction_value;
+    double selected_arc_fraction_threshold;
+    /**
+     * The most-recent observations were NOT rejected. The absolute,
+     * asymmetric backstop the span-ratio axis cannot provide: it catches
+     * a short recent tail rejected off a long arc, where the ratio still
+     * passes but the discarded rows are the ones nearest a forward
+     * extrapolation target.
+     */
+    uint8_t trailing_gap_ok;
+    /**
+     * Days between the last selected and the last full-arc observation.
+     * `0.0` when the last kept observation is the last observation; NaN
+     * when nothing is selected.
+     */
+    double trailing_gap_days_value;
+    double trailing_gap_threshold;
+    /**
+     * Radar astrometry joint-fit acceptability, as a tri-state:
+     * `1` = pass, `0` = fail, `-1` = not applicable (no radar
+     * contribution to this fit). Currently always `-1` — upstream
+     * reserves this for when optical and radar both constrain a fit.
+     * `-1` is distinct from `0` on purpose: "no radar" must never read
+     * as "radar failed".
+     */
+    int8_t radar_fit_ok;
 };
 
 /**
@@ -3993,6 +4297,87 @@ struct EmpyreanODResult {
      * `ENCOUNTER_INTERVENES`.
      */
     uint8_t trust_second_order_recoverable;
+};
+
+/**
+ * One object's slot in a batch [`empyrean_determine`] result.
+ *
+ * Exactly one of the two payloads is live, selected by `delivered`:
+ *
+ * - `delivered == 1` — `result` is a fully populated
+ *   [`EmpyreanODResult`], `error` is null and `error_code` is
+ *   [`EMPYREAN_OD_FAILURE_NONE`].
+ * - `delivered == 0` — this object's fit failed. `error` carries the
+ *   engine's message and `error_code` classifies it
+ *   (`EMPYREAN_OD_FAILURE_*`). **`result` is NaN-poisoned**: every
+ *   `f64` is NaN, every pointer null, every count 0, and every
+ *   enumerated `i32` is `-1` (never a valid code), so a caller that
+ *   forgets to check `delivered` gets an obviously invalid record
+ *   rather than a plausible all-zero fit.
+ *
+ * A failed object never aborts the batch — the other objects are still
+ * fitted and delivered.
+ *
+ * `object_id` and `error` are owned by the parent table and freed by
+ * [`empyrean_determine_results_free`]. Do NOT free them manually.
+ */
+struct EmpyreanODObjectResult {
+    /**
+     * ADES object identifier (permID / provID / trkSub) this slot's
+     * observations were grouped under. `"unknown"` when the group's
+     * records carried no identifier at all. Never null.
+     */
+    char *object_id;
+    /**
+     * 1 when `result` carries a delivered fit; 0 when the fit failed.
+     */
+    uint8_t delivered;
+    /**
+     * The fit. Meaningful only when `delivered == 1`; NaN-poisoned
+     * otherwise (see the type-level note).
+     */
+    struct EmpyreanODResult result;
+    /**
+     * Failure message. Null when `delivered == 1`.
+     */
+    char *error;
+    /**
+     * `EMPYREAN_OD_FAILURE_*` classification of `error`.
+     * [`EMPYREAN_OD_FAILURE_NONE`] when `delivered == 1`.
+     */
+    int32_t error_code;
+};
+
+/**
+ * Result table of a batch [`empyrean_determine`] — one
+ * [`EmpyreanODObjectResult`] per ADES object found in the
+ * observations, in ascending `object_id` order.
+ *
+ * Ordering is by identifier rather than by input row order so the same
+ * observation set produces the same table regardless of how the rows
+ * were interleaved, and so a caller can bisect for an object.
+ *
+ * Release with [`empyrean_determine_results_free`] — including when
+ * `empyrean_determine` returned
+ * [`EMPYREAN_DETERMINE_NONE_DELIVERED`], which still populates the
+ * table.
+ */
+struct EmpyreanDetermineResults {
+    /**
+     * Owned array of per-object slots. Null only when
+     * `num_objects == 0`.
+     */
+    struct EmpyreanODObjectResult *objects;
+    uintptr_t num_objects;
+    /**
+     * Initial-orbit keys that matched no observation group. A seed the
+     * caller supplied and the engine could not attach to any object is
+     * reported here rather than dropped: it means the seed's identity
+     * does not match any ADES identifier in the observations. Owned
+     * array of owned C strings.
+     */
+    char **unmatched_orbit_ids;
+    uintptr_t num_unmatched_orbit_ids;
 };
 
 /**
@@ -4993,12 +5378,23 @@ int32_t empyrean_compute_b_planes(const EmpyreanContext *ctx,
 /**
  * Read an orbits CSV file.
  *
- * CSV does not carry covariance (use parquet for covariance round-trip).
+ * Uses the engine's own CSV reader, so the file is the same schema the
+ * parquet path round-trips — covariance included. The
+ * `_with_non_grav` reader is the one used: the plain reader drops the
+ * Marsden A1/A2/A3 block, and an orbit that loses its non-gravitational
+ * parameters on a round trip is silently a different orbit.
  */
  int32_t empyrean_orbits_read_csv(const char *path, struct EmpyreanOrbitBatch *out);
 
 /**
  * Write an orbit batch to CSV.
+ *
+ * Routed through the engine's writer — the same `Orbits<AU>` the
+ * parquet path writes — so CSV carries the full column set (state,
+ * covariance, non-grav including `dt` / `dt_variance`, photometry, SRP)
+ * rather than a flattened projection of it. A batch carrying a wide
+ * cross-covariance the row schema cannot express is refused before the
+ * file is created rather than written short.
  */
  int32_t empyrean_orbits_write_csv(const char *path, const struct EmpyreanOrbitBatch *batch);
 
@@ -5073,6 +5469,30 @@ int32_t empyrean_residuals_write_json(const char *path,
 int32_t empyrean_residuals_write_csv(const char *path,
                                      const struct EmpyreanObservationResult *obs_ptr,
                                      uintptr_t num_obs);
+
+/**
+ * Write the per-object fit summary to parquet.
+ */
+
+int32_t empyrean_fit_summary_write_parquet(const char *path,
+                                           const struct EmpyreanFitSummary *summaries_ptr,
+                                           uintptr_t num_summaries);
+
+/**
+ * Write the per-object fit summary to JSON.
+ */
+
+int32_t empyrean_fit_summary_write_json(const char *path,
+                                        const struct EmpyreanFitSummary *summaries_ptr,
+                                        uintptr_t num_summaries);
+
+/**
+ * Write the per-object fit summary to CSV.
+ */
+
+int32_t empyrean_fit_summary_write_csv(const char *path,
+                                       const struct EmpyreanFitSummary *summaries_ptr,
+                                       uintptr_t num_summaries);
 
 /**
  * Find the dominant eigenvalue and eigenvector of a 6x6 symmetric matrix.
@@ -5238,12 +5658,41 @@ void empyrean_radar_observations_free(struct EmpyreanRadarObservation *observati
                                       uintptr_t num);
 
 /**
- * Run the full orbit determination pipeline.
+ * Run the full orbit determination pipeline over every object in
+ * `observations`.
+ *
+ * The observations are grouped by ADES object identifier (permID /
+ * provID / trkSub) and each group is fitted independently, so one call
+ * determines a whole batch. `results_out` receives one
+ * [`EmpyreanODObjectResult`] per group, ordered by `object_id`.
  *
  * When `num_initial_orbits > 0`, the supplied orbits are used as DC
  * seeds (one per ADES object_id encountered in `observations`,
  * matched by orbit index). Pass `null, 0` to let the IOD pipeline
- * produce its own seeds.
+ * produce its own seeds. A seed that matches no group is reported in
+ * [`EmpyreanDetermineResults::unmatched_orbit_ids`], never dropped.
+ *
+ * # Return codes
+ *
+ * - `0` — the batch ran and **at least one** object delivered a fit.
+ *   Individual failures do not abort the batch; check each slot's
+ *   `delivered` flag. `results_out` is populated.
+ * - [`EMPYREAN_DETERMINE_NONE_DELIVERED`] (`-4`) — the batch ran but
+ *   every object failed. `results_out` IS populated with the per-object
+ *   errors and must still be freed.
+ * - `-1` — null pointer or malformed input; nothing is written.
+ * - `-3` — a batch-level failure (an unparseable weighting config, an
+ *   observation row with no identifier at all) aborted the run before
+ *   any object was fitted; nothing is written.
+ *
+ * A single-object input is not a special case: it produces a
+ * one-row table.
+ *
+ * # Ownership
+ *
+ * On `0` and `-4`, release `results_out` with
+ * [`empyrean_determine_results_free`]. On `-1` / `-3` there is nothing
+ * to free.
  */
 
 int32_t empyrean_determine(const EmpyreanContext *ctx,
@@ -5254,10 +5703,25 @@ int32_t empyrean_determine(const EmpyreanContext *ctx,
                            const struct EmpyreanOrbit *initial_orbits,
                            uintptr_t num_initial_orbits,
                            const struct EmpyreanODConfig *config,
-                           struct EmpyreanODResult *result_out);
+                           struct EmpyreanDetermineResults *results_out);
 
 /**
- * Free an OD result previously returned by `empyrean_determine()` or `empyrean_refine()`.
+ * Free a batch result table previously written by
+ * `empyrean_determine()`.
+ *
+ * Releases every per-object slot (including the fits inside the
+ * delivered ones), the per-object identifier / error strings, and the
+ * unmatched-seed list. Safe to call on a table returned with
+ * [`EMPYREAN_DETERMINE_NONE_DELIVERED`], and idempotent — the table is
+ * left empty.
+ */
+ void empyrean_determine_results_free(struct EmpyreanDetermineResults *results);
+
+/**
+ * Free an OD result previously returned by `empyrean_refine()`.
+ *
+ * Batch `empyrean_determine()` results are released with
+ * [`empyrean_determine_results_free`] instead.
  */
  void empyrean_od_result_free(struct EmpyreanODResult *result);
 

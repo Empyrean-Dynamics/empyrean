@@ -254,7 +254,8 @@ empyrean.initialize()
 
 # 1. One-shot: read ADES PSV, run Gauss + Herget IOD + N-body DC + rejection.
 obs, _radar = empyrean.read_ades("apophis.psv")
-result = empyrean.determine(obs)
+fits = empyrean.determine(obs)          # every object in the file
+result = fits.single()                   # one object in, one fit out
 print(
     f"χ²/dof = {result.summary.reduced_chi2:.3f}, "
     f"RMS = {result.summary.rms_combined_arcsec:.3f}\""
@@ -283,7 +284,7 @@ let cfg = ODConfig::default();
 
 // 1. One-shot.
 let obs = ctx.read_ades("apophis.psv")?;
-let result = ctx.determine(&obs, None, &cfg)?;
+let result = ctx.determine(&obs, None, &cfg)?.into_single()?;
 println!("χ²/dof = {:.3}", result.summary.reduced_chi2);
 
 // 2. Iterative: build a session over the same arc, find the noisy
@@ -317,14 +318,21 @@ println!(
 
 ```sh
 empyrean determine apophis.psv --out-dir ./out
-ls out/    # fitted_orbit.parquet  residuals.parquet
+ls out/    # fitted_orbits.parquet  fit_summary.parquet  fit_summary.csv  residuals.parquet
 ```
 
-The CLI emits two sibling Parquet tables — the fitted orbit (state +
-covariance + any fitted non-gravitational parameters) and the
-per-observation residuals — that you can join in
-pandas / Polars / DuckDB the same way you would the propagation /
-ephemeris outputs.
+Determination is batch-first at every layer: the ADES file is grouped by
+object identifier and every object is fitted, so the CLI emits sibling
+tables — the fitted orbits (state + covariance + any fitted
+non-gravitational parameters, one row per delivered object), a
+per-object fit summary covering every *input* object whether or not it
+produced an orbit, and the per-observation residuals tagged with the
+object they belong to. Every table is written whole — the residual file
+carries the full per-observation surface (join keys, rejection
+attribution, influence diagnostics, sky-motion decomposition), and CSV
+carries the same columns as parquet rather than a lossy projection of
+them. Join them in pandas / Polars / DuckDB the same way you would the
+propagation / ephemeris outputs.
 
 Residual rows are typed by observable. Optical rows carry the RA / Dec
 and along / cross-track residuals with the track-frame pair's full

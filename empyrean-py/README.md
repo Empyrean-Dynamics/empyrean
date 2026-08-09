@@ -72,7 +72,10 @@ for i in range(len(result.events.summary)):
 
 ```python
 obs, radar = empyrean.read_ades("observations.psv")   # (optical, radar)
-result = empyrean.determine(obs)                       # one fit per call
+fits = empyrean.determine(obs)                         # every object in the file
+print(fits.summary)                                    # one row per INPUT object
+
+result = fits.single()                                 # one object in, one fit out
 print(
     f"converged={result.converged}, "
     f"RMS={result.summary.rms_ra_arcsec:.2f}\" RA / "
@@ -158,7 +161,7 @@ codes (`dropped_bands`) — the observations' astrometry is unaffected.
 from empyrean import ODConfig, PhotometryConfig
 
 config = ODConfig(photometry=PhotometryConfig())   # AUTO ladder
-result = empyrean.determine(obs, config=config)
+result = empyrean.determine(obs, config=config).single()
 
 phot = result.photometry               # None if photometry was not requested
 if phot is not None and phot.covariance is not None:

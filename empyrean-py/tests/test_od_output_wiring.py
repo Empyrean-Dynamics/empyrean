@@ -40,7 +40,7 @@ def apophis_observations():
 
 def test_determine_fitted_orbit_carries_identity(apophis_observations):
     """An unseeded fit derives its object id from the observations."""
-    fit = determine(apophis_observations)
+    fit = determine(apophis_observations).single()
     assert fit.converged
     object_id = fit.orbit.object_id.to_pylist()
     orbit_id = fit.orbit.orbit_id.to_pylist()
@@ -50,15 +50,15 @@ def test_determine_fitted_orbit_carries_identity(apophis_observations):
 
 def test_determine_seeded_inherits_seed_identity(apophis_observations):
     """A seeded fit inherits the seed's object id (the initial_orbits key)."""
-    seed = determine(apophis_observations).orbit
-    fit = determine(apophis_observations, initial_orbits={"my-apophis": seed})
+    seed = determine(apophis_observations).single().orbit
+    fit = determine(apophis_observations, initial_orbits={"my-apophis": seed}).single()
     assert fit.orbit.object_id.to_pylist()[0] == "my-apophis"
 
 
 def test_fitted_orbit_predicts_magnitudes(apophis_observations):
     """The post-OD photometric fit is attached to the fitted orbit, so an
     ephemeris generated from that orbit predicts real (non-null) magnitudes."""
-    fit = determine(apophis_observations, config=ODConfig(photometry=PhotometryConfig()))
+    fit = determine(apophis_observations, config=ODConfig(photometry=PhotometryConfig())).single()
     assert fit.converged
     assert fit.photometry is not None, "photometric fit did not run"
 

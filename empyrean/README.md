@@ -65,7 +65,10 @@ non-gravitational parameters — pass it straight back into `propagate`,
 # use empyrean::{Context, ODConfig};
 # let ctx = Context::from_data_dir(None)?;
 let obs = ctx.read_ades("observations.psv")?;   // optical + radar
-let result = ctx.determine(&obs, None, &ODConfig::default())?;
+// `determine` fits EVERY object in the arc and returns the batch;
+// `into_single` unwraps the one-object case and refuses to pick if
+// the file turned out to hold more.
+let result = ctx.determine(&obs, None, &ODConfig::default())?.into_single()?;
 
 println!(
     "converged={}, RMS = {:.2}\" RA / {:.2}\" Dec",
@@ -121,7 +124,7 @@ let obs = ctx.read_ades("comet_67p.psv")?;
 let fit = ctx.determine(&obs, None, &ODConfig {
     solve_for: SolveForParams::StateAndNonGrav,
     ..Default::default()
-})?;
+})?.into_single()?;
 
 // Refine, additionally solving the outgassing time delay DT. Opening DT
 // requires a prior on it — its variance (days²) — carried on the orbit.
@@ -176,7 +179,7 @@ let obs = ctx.read_ades("observations.psv")?;
 let fit = ctx.determine(&obs, None, &ODConfig {
     photometry: Some(PhotometryConfig::default()),
     ..Default::default()
-})?;
+})?.into_single()?;
 
 if let Some(phot) = &fit.photometry {
     let sigma_h = phot.covariance.map(|c| c[0][0].sqrt());

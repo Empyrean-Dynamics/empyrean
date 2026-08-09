@@ -256,7 +256,7 @@ pub unsafe extern "C" fn empyrean_builtsystem_new(
             }
         };
 
-        let mut system = match ctx_ref.built_system(fm, fr) {
+        let mut system = match ctx_ref.built_system(fm.into(), fr) {
             Ok(s) => s,
             Err(e) => {
                 set_last_error(&e.to_string());

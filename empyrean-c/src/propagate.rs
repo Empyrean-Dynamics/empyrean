@@ -924,7 +924,7 @@ pub(crate) fn int_to_force_model(val: i32) -> Result<empyrean_core::ForceModelTi
         0 => Ok(empyrean_core::ForceModelTier::Approximate),
         1 => Ok(empyrean_core::ForceModelTier::Basic),
         2 => Ok(empyrean_core::ForceModelTier::Standard),
-        3 => Err("ForceModelTier::Full is not exposed in v0.7.0 — pass 2 for Standard tier".into()),
+        3 => Err("ForceModelTier::Full is reserved for a future release pending its catalog-scale validation campaign — pass 2 for Standard tier".into()),
         _ => Err(format!("unknown force model tier: {val}")),
     }
 }

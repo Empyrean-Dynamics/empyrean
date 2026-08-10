@@ -118,18 +118,45 @@ fn resolve_lib_path() -> PathBuf {
 
 /// The loaded `libempyrean`, opened lazily on first use.
 ///
-/// Panics if the library cannot be opened. The path is resolved from the host
-/// environment and the build, so a failure here means a broken or incomplete
-/// install (e.g. a prebuilt artifact missing its bundled engine) — surfaced
-/// loudly rather than papered over.
+/// Panics if the library cannot be opened, or if the library that opened is
+/// built to a different [`EMPYREAN_ABI_VERSION`] than this crate. The path is
+/// resolved from the host environment and the build, so a failure here means a
+/// broken or incomplete install (e.g. a prebuilt artifact missing its bundled
+/// engine, or a stale `libempyrean` picked up from `EMPYREAN_LIB` or a leftover
+/// `target/release`) — surfaced loudly rather than papered over.
+///
+/// # The version handshake
+///
+/// `dlsym` matches on symbol **name** only, so a mismatched engine resolves
+/// every symbol and then reads the caller's arguments through the wrong
+/// signature. Up to ABI 2 that could only ever produce wrong values, because
+/// every bump appended struct fields; ABI 3 changes the parameter lists of
+/// `empyrean_transform_coordinates` and `empyrean_get_observers` in place,
+/// where the same mismatch writes through an integer the caller passed by
+/// value. Checking [`empyrean_abi_version`] the moment the library opens is
+/// what that accessor exists for, and it is cheap — one call, once per
+/// process.
 pub fn lib() -> &'static EmpyreanLib {
     LIB.get_or_init(|| {
         let path = resolve_lib_path();
         // SAFETY: opening a shared library by the path resolved above.
-        unsafe {
+        let lib = unsafe {
             EmpyreanLib::new(&path)
                 .unwrap_or_else(|e| panic!("failed to load libempyrean from {path:?}: {e}"))
-        }
+        };
+        // SAFETY: the symbol resolved when the library opened
+        // (`--dynamic-link-require-all`), and takes no arguments, so it is
+        // safe to call regardless of which ABI version answers it.
+        let loaded = unsafe { lib.empyrean_abi_version() };
+        assert_eq!(
+            loaded, EMPYREAN_ABI_VERSION,
+            "libempyrean ABI mismatch: {path:?} reports ABI version {loaded}, but this build of \
+             empyrean-sys was compiled against version {EMPYREAN_ABI_VERSION}. Symbol names are \
+             shared across versions but signatures and struct layouts are not, so continuing \
+             would read arguments through the wrong shape. Point EMPYREAN_LIB at a matching \
+             engine, or rebuild it."
+        );
+        lib
     })
 }
 

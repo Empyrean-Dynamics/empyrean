@@ -18,9 +18,11 @@
 //!
 //! let ctx = Context::from_data_dir(None)?;
 //! let obs = ctx.read_ades("apophis_2004_2021.psv")?;
-//! let cfg = ODConfig::default(); // VFC17 weights + EFCC2020 debias + auto-escalate
+//! let cfg = ODConfig::default(); // VFCC2017 weights + EFCC2020 debias + auto-escalate
 //!
-//! let fit = ctx.determine(&obs, None, &cfg)?;
+//! // `determine` fits every object in the arc; `into_single` unwraps
+//! // the one-object case and refuses (naming them) if there are more.
+//! let fit = ctx.determine(&obs, None, &cfg)?.into_single()?;
 //! println!(
 //!     "converged={}, χ²_red={:.2}, fit_acceptable={}",
 //!     fit.converged, fit.summary.reduced_chi2, fit.acceptability.fit_acceptable,
@@ -34,11 +36,21 @@
 //! fit-quality gates (convergence, positive-definite covariance,
 //! reduced χ², RMS, AT/CT residual isotropy).
 //! [`AcceptabilityReport::extrapolation_acceptable`] is
-//! `fit_acceptable` AND the trustworthy-forward-propagation gates
-//! (arc length, fractional σₐ). Use the first to gate publication;
-//! the second to gate forward propagation, ephemeris generation, or
-//! impact-risk assessment. Tighten thresholds in
+//! `fit_acceptable` AND the four selection / coverage gates: the
+//! fraction of observations the fit retained, the span the *selected*
+//! observations still cover, whether the most-recent observations were
+//! rejected, and fractional σₐ. Use the first to gate publication; the
+//! second to gate forward propagation, ephemeris generation, or
+//! impact-risk assessment — and read the individual axes to say *why*
+//! a fit did not clear it. Tighten thresholds in
 //! [`AcceptabilityThresholds`] for impact-monitoring orbits.
+//!
+//! # Batches
+//!
+//! [`Context::determine`] fits every object the observations group
+//! into and returns a [`DetermineResults`] table; a failed object is an
+//! entry carrying its reason, never a missing one. See that type for
+//! iteration, by-object lookup, and the single-object convenience.
 
 mod config;
 mod debiasing;
@@ -56,10 +68,11 @@ pub use nuisance::StationRaDecConfig;
 pub use observation::{Observation, Observations, RadarMeasurement, RadarObservation};
 pub use rejection::{RejectionConfig, RejectionKind};
 pub use result::{
-    AcceptabilityReport, BandStat, CovarianceRepresentation, CovarianceTrust, DetermineResult,
-    EvaluateResult, GateRecord, ObservationResidual, OriginPolicy, OutputEpoch, PhotometryModel,
-    PhotometryResult, RadarResidual, RadarResidualKind, RejectionReason, ResidualSummary, SolveFor,
-    SolveForParams, SolvedCovariance, StationBias, TrustGateEvent,
+    AcceptabilityReport, BandStat, CovarianceRepresentation, CovarianceTrust, DetermineEntry,
+    DetermineFailure, DetermineFailureKind, DetermineResult, DetermineResults, EvaluateResult,
+    GateRecord, ObservationResidual, OriginPolicy, OutputEpoch, PhotometryModel, PhotometryResult,
+    RadarResidual, RadarResidualKind, RejectionReason, ResidualSummary, SolveFor, SolveForParams,
+    SolvedCovariance, StationBias, TrustGateEvent,
 };
 pub use weighting::{SigmaPolicy, WeightingConfig, WeightingLayer, WeightingPreset};
 
@@ -71,14 +84,31 @@ use crate::orbit::Orbit;
 use crate::propagate::ForceModelTier;
 
 impl Context {
-    /// Parse ADES PSV observations from a file path or a PSV string.
+    /// Parse ADES PSV / MPC80 observations from a file path or from the
+    /// content itself.
     ///
-    /// If `path_or_content` has no newlines, it's treated as a file
-    /// path. Otherwise, it's treated as the PSV content itself.
+    /// A string with no newline that names an existing file is read from
+    /// disk; anything else is parsed as content. No filename can contain
+    /// a newline on POSIX or Windows, so inline multi-line PSV never
+    /// reaches the filesystem. This matches the Python `read_ades`
+    /// resolution rule exactly.
     pub fn read_ades(&self, path_or_content: &str) -> Result<Observations> {
         let _ = self; // reserved for future context-dependent parsing
-        let c_input = CString::new(path_or_content)
-            .map_err(|_| Error::invalid_input("input contains a NUL byte"))?;
+        // The C ABI's `empyrean_read_ades` parses content, so a path has
+        // to be resolved here. Without this the path string itself is
+        // handed to the parser and fails as malformed astrometry.
+        let owned;
+        let input =
+            if !path_or_content.contains('\n') && std::path::Path::new(path_or_content).is_file() {
+                owned = std::fs::read_to_string(path_or_content).map_err(|e| {
+                    Error::invalid_input(format!("failed to read {path_or_content}: {e}"))
+                })?;
+                owned.as_str()
+            } else {
+                path_or_content
+            };
+        let c_input =
+            CString::new(input).map_err(|_| Error::invalid_input("input contains a NUL byte"))?;
         let mut ptr: *mut empyrean_sys::EmpyreanObservation = std::ptr::null_mut();
         let mut num: usize = 0;
         let mut radar_ptr: *mut empyrean_sys::EmpyreanRadarObservation = std::ptr::null_mut();
@@ -98,17 +128,38 @@ impl Context {
         Ok(Observations::from_raw_parts(ptr, num, radar_ptr, radar_num))
     }
 
-    /// Run the full orbit-determination pipeline (IOD → differential correction).
+    /// Run the full orbit-determination pipeline (IOD → differential
+    /// correction) over **every object** in `observations`.
+    ///
+    /// The observations are grouped by ADES object identifier (permID /
+    /// provID / trkSub) and each group is fitted independently, so one
+    /// call determines a whole batch. The returned
+    /// [`DetermineResults`] holds one entry per object, in `object_id`
+    /// order, each carrying either the fit or a typed failure — one
+    /// object failing never removes the others.
+    ///
+    /// Fitting a single object is the one-entry case, not a separate
+    /// call: use [`DetermineResults::into_single`] to unwrap it, which
+    /// refuses (loudly) if the batch turned out to hold more than one.
     ///
     /// Pass `None` for `initial_orbits` to use the internal IOD, or pass
     /// seed orbits to skip IOD and start the differential correction
-    /// from the provided states.
+    /// from the provided states. Seeds that match no observation group
+    /// are reported in [`DetermineResults::unmatched_orbit_ids`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` only for a batch-level failure — malformed input, or
+    /// a configuration the engine rejected before fitting anything. A
+    /// batch in which *every* object failed still returns `Ok`: the
+    /// per-object failures are the diagnosis, and
+    /// [`DetermineResults::all_failed`] reports that state.
     pub fn determine(
         &self,
         observations: &Observations,
         initial_orbits: Option<&[Orbit]>,
         config: &ODConfig,
-    ) -> Result<DetermineResult> {
+    ) -> Result<DetermineResults> {
         let mut _orbit_keep: Vec<crate::orbit::OrbitFfiKeep> = Vec::new();
         let ffi_initial: Option<Vec<_>> = match initial_orbits {
             Some(orbs) => {
@@ -132,7 +183,7 @@ impl Context {
         let (obs_ptr, obs_len) = observations.as_ffi_slice();
         let (radar_ptr, radar_len) = observations.as_radar_ffi_slice();
 
-        let mut result = empyrean_sys::EmpyreanODResult::default();
+        let mut results = empyrean_sys::EmpyreanDetermineResults::default();
         let (ffi_config, _perturbers_keep) = config.to_ffi_with()?;
         let code = unsafe {
             empyrean_sys::empyrean_determine(
@@ -144,15 +195,17 @@ impl Context {
                 init_ptr,
                 init_len,
                 &ffi_config,
-                &mut result,
+                &mut results,
             )
         };
-        if code != 0 {
+        // NONE_DELIVERED still populates (and hands us ownership of) the
+        // table; every other nonzero code writes nothing.
+        if code != 0 && code != empyrean_sys::EMPYREAN_DETERMINE_NONE_DELIVERED {
             return Err(Error::capture(code));
         }
-        let det = ffi_od_result_to_rust(&result);
-        unsafe { empyrean_sys::empyrean_od_result_free(&mut result) };
-        det
+        let batch = ffi_determine_results_to_rust(&results);
+        unsafe { empyrean_sys::empyrean_determine_results_free(&mut results) };
+        batch
     }
 
     /// Evaluate a candidate orbit against observations without fitting.
@@ -222,6 +275,61 @@ impl Context {
         let det = ffi_od_result_to_rust(&result);
         unsafe { empyrean_sys::empyrean_od_result_free(&mut result) };
         det
+    }
+}
+
+/// Marshal the C-ABI batch table into the owned Rust one.
+///
+/// Reads every slot — delivered and failed — so no object is dropped on
+/// the way across.
+fn ffi_determine_results_to_rust(
+    results: &empyrean_sys::EmpyreanDetermineResults,
+) -> Result<DetermineResults> {
+    let slots: &[empyrean_sys::EmpyreanODObjectResult] =
+        if results.objects.is_null() || results.num_objects == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(results.objects, results.num_objects) }
+        };
+
+    let mut entries = Vec::with_capacity(slots.len());
+    for slot in slots {
+        let object_id = ffi_string(slot.object_id);
+        let outcome = if slot.delivered != 0 {
+            Ok(ffi_od_result_to_rust(&slot.result)?)
+        } else {
+            Err(DetermineFailure {
+                object_id: object_id.clone(),
+                message: ffi_string(slot.error),
+                kind: DetermineFailureKind::from_code(slot.error_code),
+            })
+        };
+        entries.push(DetermineEntry { object_id, outcome });
+    }
+
+    let unmatched = if results.unmatched_orbit_ids.is_null() || results.num_unmatched_orbit_ids == 0
+    {
+        Vec::new()
+    } else {
+        unsafe {
+            std::slice::from_raw_parts(results.unmatched_orbit_ids, results.num_unmatched_orbit_ids)
+        }
+        .iter()
+        .map(|p| ffi_string(*p))
+        .collect()
+    };
+
+    Ok(DetermineResults::new(entries, unmatched))
+}
+
+/// An owned `String` from a C-ABI string pointer; empty for null.
+fn ffi_string(p: *mut std::ffi::c_char) -> String {
+    if p.is_null() {
+        String::new()
+    } else {
+        unsafe { std::ffi::CStr::from_ptr(p) }
+            .to_string_lossy()
+            .into_owned()
     }
 }
 

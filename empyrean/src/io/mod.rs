@@ -8,12 +8,15 @@
 //!   round-trip uncertainty).
 //! - **JSON** — human-readable, retains structure (covariance arrays
 //!   when present), good for small batches and config-style use.
-//! - **CSV** — flat row-per-record, drops covariance, easiest to feed
-//!   into spreadsheets or shell pipelines.
+//! - **CSV** — flat row-per-record, easiest to feed into spreadsheets or
+//!   shell pipelines. Carries the same columns as parquet, covariance
+//!   included; the two differ only in how a non-computable number is
+//!   spelled (CSV writes a literal `NaN`, JSON writes `null`, since
+//!   JSON has no NaN literal).
 //!
 //! Orbits support read + write in all three formats; ephemeris,
-//! events, and residuals are write-only — the propagator / OD pipeline
-//! is the canonical producer.
+//! events, residuals, and the per-object fit summary are write-only —
+//! the propagator / OD pipeline is the canonical producer.
 //!
 //! All conversion happens at the FFI boundary; the wrapper returns
 //! Rust-friendly types ([`OrbitBatch`], [`EphemerisEntry`](crate::EphemerisEntry),
@@ -21,11 +24,15 @@
 
 mod ephemeris;
 mod events;
+mod fit_summary;
 mod orbits;
 mod residuals;
 
 pub use ephemeris::{write_ephemeris_csv, write_ephemeris_json, write_ephemeris_parquet};
 pub use events::{write_events_csv, write_events_json, write_events_parquet};
+pub use fit_summary::{
+    FitSummaryRow, write_fit_summary_csv, write_fit_summary_json, write_fit_summary_parquet,
+};
 pub use orbits::{
     OrbitBatch, read_orbits_csv, read_orbits_json, read_orbits_parquet, write_orbits_csv,
     write_orbits_json, write_orbits_parquet,

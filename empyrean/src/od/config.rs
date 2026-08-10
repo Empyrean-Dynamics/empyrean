@@ -147,7 +147,7 @@ pub struct ODConfig {
     pub num_threads: usize,
     /// Output reference frame.
     pub frame: crate::coordinate::Frame,
-    /// Observation weighting pipeline. Default = `enabled` + VFC17
+    /// Observation weighting pipeline. Default = `enabled` + VFCC2017
     /// preset (production hot path).
     pub weighting: WeightingConfig,
     /// Catalog-bias-correction configuration. Default = `enabled` +
@@ -175,8 +175,26 @@ pub struct ODConfig {
     pub max_iterations: u32,
     /// DC convergence tolerance on Δx^T N Δx. 0.0 → engine default (1e-5).
     pub convergence_tol: f64,
-    /// Use STM-cached ephemeris updates for iterations 2+. Default `true`.
-    pub use_stm_cache: bool,
+    /// Allow the outward-expansion pipeline to truncate a sub-arc it
+    /// cannot fit as one piece. Default `true` (the engine default).
+    ///
+    /// Setting `false` makes an arc that spans a dynamical discontinuity
+    /// FAIL loudly instead of delivering a fit of the reconcilable
+    /// sub-arc with the rest tagged
+    /// [`RejectionReason::OutsideArc`](crate::RejectionReason::OutsideArc).
+    /// Two interactions matter before relying on it: per-observation
+    /// [`rejection`](Self::rejection) is orthogonal and still runs (turn
+    /// it off too to fit the whole arc or fail), and under
+    /// [`OriginPolicy::Auto`] the refusal feeds the origin cascade rather
+    /// than surfacing — pin the origin to get a pure loud failure.
+    pub allow_arc_truncation: bool,
+    /// Master switch for the co-orbital IOD lane. Default `true` (the
+    /// engine default).
+    ///
+    /// Enabling it does not route ordinary objects through the lane — it
+    /// still fires only when every co-orbitality gate passes. Set `false`
+    /// to force the historical cascade.
+    pub coorbital_enabled: bool,
     /// Solve-for parameter set.
     pub solve_for: SolveForParams,
     /// Trigger thresholds for [`SolveForParams::Auto`] escalation.
@@ -252,7 +270,7 @@ impl PhotometryConfig {
 impl Default for ODConfig {
     fn default() -> Self {
         // Production hot path:
-        //   - VFC17 station weighting + nightly de-weighting on
+        //   - VFCC2017 station weighting + nightly de-weighting on
         //   - EFCC2020 catalog debiasing on (if `bias.dat` is on disk)
         //   - SolveForParams::Auto (escalates 6→9 params on poor fit)
         //   - Adaptive rejection enabled
@@ -274,7 +292,8 @@ impl Default for ODConfig {
             // path agree at sub-meter level rather than the noise floor a
             // looser tol leaves behind.
             convergence_tol: 1e-5,
-            use_stm_cache: true,
+            allow_arc_truncation: true,
+            coorbital_enabled: true,
             solve_for: SolveForParams::Auto,
             auto_escalation: AutoEscalationPolicy::default(),
             acceptability: AcceptabilityThresholds::default(),
@@ -332,7 +351,7 @@ impl ODConfig {
             enabled: u8::from(self.weighting.enabled),
             preset: match self.weighting.preset {
                 WeightingPreset::None => empyrean_sys::EMPYREAN_WEIGHTING_PRESET_NONE as u8,
-                WeightingPreset::Vfc17 => empyrean_sys::EMPYREAN_WEIGHTING_PRESET_VFC17 as u8,
+                WeightingPreset::VFCC2017 => empyrean_sys::EMPYREAN_WEIGHTING_PRESET_VFCC2017 as u8,
                 WeightingPreset::Neodys => empyrean_sys::EMPYREAN_WEIGHTING_PRESET_NEODYS as u8,
             },
             default_sigma_arcsec: self.weighting.default_sigma_arcsec,
@@ -413,7 +432,11 @@ impl ODConfig {
             },
             max_iterations: self.max_iterations,
             convergence_tol: self.convergence_tol,
-            use_stm_cache: u8::from(self.use_stm_cache),
+            // Tri-state at the ABI: this wrapper always states a value,
+            // so the engine-default branch (negative) is never taken from
+            // here — the Rust surface's own default carries it instead.
+            allow_arc_truncation: i8::from(self.allow_arc_truncation),
+            coorbital_enabled: i8::from(self.coorbital_enabled),
             solve_for: self.solve_for.to_int(),
             auto_escalation: empyrean_sys::EmpyreanAutoEscalationPolicy {
                 reduced_chi2: self.auto_escalation.reduced_chi2,

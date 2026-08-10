@@ -19,6 +19,10 @@ channel rides on. It compiles to a single cdylib (`libempyrean.dylib`
 on macOS / `.so` on Linux / `.dll` on Windows) plus a generated C
 header (`include/empyrean.h`) emitted by `cbindgen`.
 
+Current release: **0.10.0-rc.0**, exporting **ABI version 3**
+(`EMPYREAN_ABI_VERSION`, readable at run time from
+`empyrean_abi_version()`).
+
 It is **not published to crates.io** — Rust callers should use the
 [`empyrean`](https://crates.io/crates/empyrean) safe wrapper crate or
 the [`empyrean-sys`](https://crates.io/crates/empyrean-sys) raw FFI
@@ -65,7 +69,8 @@ int main(void) {
     EmpyreanContext *ctx = empyrean_context_from_data_dir(NULL);
     if (ctx == NULL) return 1;
 
-    /* ... call empyrean_propagate_*, empyrean_query_sbdb, ... */
+    /* ... call empyrean_propagate, empyrean_determine,
+       empyrean_query_sbdb, ... */
 
     empyrean_context_free(ctx);
     return 0;
@@ -84,24 +89,210 @@ cc main.c -I include -L <libdir> -lempyrean -Wl,-rpath,<libdir>
 cc main.c -I include -L <libdir> -lempyrean -Wl,-rpath,<libdir>
 ```
 
+## Data directory & strict offline
+
+`empyrean_context_from_data_dir_with` is the superset of
+`empyrean_context_from_data_dir`: pass an `EmpyreanDataDirOptions` to
+pick the kernel tier (`EMPYREAN_DATA_TIER_*`) or to refuse the network
+with `refresh = EMPYREAN_DATA_REFRESH_OFF`. A `NULL` options pointer (or
+a `memset(0)` struct) is exactly the plain entry point — acquire and load
+the full Standard-tier set, downloading anything missing.
+
+Strict offline resolves the tier's kernels from `data_dir` alone and
+fails if any is absent, naming **every** missing file rather than the
+first — the kernels plus the catalog-debiasing table.
+`empyrean_missing_data_files` hands that list back as structured data
+(release it with `empyrean_missing_data_files_free`), so a caller can
+fetch exactly those names instead of splitting a rendered message. There
+is no lower-tier fallback, no download-just-this-one, and no partially
+loaded context. This entry point reads **no environment variable** to
+decide `refresh` — it honours exactly what the caller passed.
+
+`empyrean_download_data(data_dir)` is the provision-only primitive: the
+same acquire-and-cache pass, stopped at the resolved kernel paths.
+Nothing is parsed and no context is allocated, so a caller that only
+wants to warm a data directory does not pay for a full context build and
+discard. Pass `NULL` for the platform data directory. After it returns
+`0`, a later `empyrean_context_from_data_dir` over the same directory
+loads with no further downloads.
+
 ## Orbit determination & fitting
 
 Beyond propagation, the same cdylib fits orbits to astrometry through
 `empyrean_determine` (cold IOD → differential correction),
 `empyrean_refine` (Bayesian update of a prior orbit), and
 `empyrean_evaluate` (residuals only, no fit). `empyrean_determine`
-additionally accepts radar (delay / Doppler) observations;
-`empyrean_refine` / `empyrean_evaluate` operate on the optical astrometry
-plus the prior orbit. All three read a single `EmpyreanODConfig`. `empyrean_determine` / `empyrean_refine` return an
-`EmpyreanODResult` (fitted orbit + covariance + residuals + a
-covariance-trust verdict);
-`empyrean_evaluate` returns an `EmpyreanEvaluateResult` (the same
-per-observation residual surface, with no fitted orbit). Zero-initialize
-the config and every axis defaults to its upstream value.
+additionally accepts radar (delay / Doppler) observations and folds them
+into the same solve as the optical astrometry — the joint fit that makes
+hard objects tractable; `empyrean_refine` / `empyrean_evaluate` operate
+on the optical astrometry plus the prior orbit. All three read a single
+`EmpyreanODConfig`.
+
+At ABI 3 `empyrean_determine` is **batched**: it writes an
+`EmpyreanDetermineResults` table with one slot per ADES object.
+`empyrean_refine` returns a single `EmpyreanODResult` (fitted orbit +
+covariance + residuals + acceptability report + a covariance-trust
+verdict); `empyrean_evaluate` returns an `EmpyreanEvaluateResult` (the
+same per-observation residual surface, with no fitted orbit and no
+acceptability report).
+
+### Batch determine: one table, one slot per object
+
+`empyrean_determine` groups `observations` by ADES object identifier
+(permID / provID / trkSub), fits each group independently, and returns
+one `EmpyreanODObjectResult` per group in ascending `object_id` order —
+so the same observation set produces the same table however the rows were
+interleaved, and a caller can bisect for an object. A single-object input
+is not a special case: it produces a one-row table.
+
+Each slot is a discriminated union on `delivered`:
+
+- `delivered == 1` — `result` is a fully populated `EmpyreanODResult`,
+  `error` is null, `error_code` is `EMPYREAN_OD_FAILURE_NONE`.
+- `delivered == 0` — this object's fit failed. `error` carries the
+  engine's message and `error_code` classifies it with a typed
+  `EMPYREAN_OD_FAILURE_*` code — `_IOD`, `_OD`, `_RADAR_ONLY`,
+  `_OBSERVATION_CONVERSION`, `_OBSERVER_CONSTRUCTION`,
+  `_UNSUPPORTED_COORDINATE_SYSTEM`, `_EARTH_ORIENTATION_COVERAGE`,
+  `_DUPLICATE_OBS_IDS`, `_NON_GRAV_NOT_RECOVERED`. `result` is
+  **NaN-poisoned**: every `f64` NaN, every pointer null, every count 0,
+  every enumerated `i32` `-1` — a caller that forgets to check
+  `delivered` gets an obviously invalid record rather than a plausible
+  all-zero fit.
+
+A failed object never aborts the batch; the others are still fitted and
+delivered. Caller-supplied seeds are matched to groups by orbit index,
+and a seed that matches no group is reported in `unmatched_orbit_ids`
+rather than dropped.
+
+| return | meaning | `results_out` |
+|--------|---------|---------------|
+| `0` | the batch ran and **at least one** object delivered a fit | populated — free it |
+| `EMPYREAN_DETERMINE_NONE_DELIVERED` (`-4`) | the batch ran and **every** object failed | still fully populated, one typed error per slot — free it |
+| `-1` | null pointer or malformed input | nothing written |
+| `-3` | batch-level abort before any object was fitted | nothing written |
+
+`-4` is deliberately distinct from `-3`: "ran but delivered nothing"
+still hands back every per-object reason, so release the table with
+`empyrean_determine_results_free` on `0` **and** on `-4`. That call frees
+the per-object fits, the identifier / error strings and the
+unmatched-seed list, and is idempotent — it leaves the table empty.
+`empyrean_od_result_free` remains the free for `empyrean_refine`'s single
+result.
+
+Per-observation rows carry `object_id` on the determine path, so a caller
+may concatenate every object's rows into one flat table and still know
+which fit each row belongs to. It is null on the single-object paths
+(`empyrean_refine` / `empyrean_evaluate`), where no grouping key exists.
+
+```c
+#include <stdio.h>
+#include <string.h>
+#include "empyrean.h"
+
+/* ctx from empyrean_context_from_data_dir(...); ades_xml is ADES text. */
+struct EmpyreanObservation *obs = NULL;
+struct EmpyreanRadarObservation *radar = NULL;
+size_t n_obs = 0, n_radar = 0;
+if (empyrean_read_ades(ades_xml, &obs, &n_obs, &radar, &n_radar) != 0)
+    return 1;  /* empyrean_last_error() carries the message */
+
+/* Zero-init is NOT the production weighting config — request it.
+   A NIGHTLY_DEWEIGHTING layer reads only max_gap_days; the
+   ObservatoryRule fields must stay zeroed or the call errors. */
+struct EmpyreanWeightingLayer nightly;
+memset(&nightly, 0, sizeof nightly);
+nightly.kind = EMPYREAN_WEIGHTING_LAYER_NIGHTLY_DEWEIGHTING;
+nightly.max_gap_days = 0.5;
+
+struct EmpyreanODConfig cfg;
+memset(&cfg, 0, sizeof cfg);
+cfg.weighting.enabled = 1;
+cfg.weighting.preset = EMPYREAN_WEIGHTING_PRESET_VFCC2017;
+cfg.weighting.sigma_policy = -1;          /* the preset's own policy */
+cfg.weighting.additional_layers = &nightly;
+cfg.weighting.num_additional_layers = 1;
+cfg.debiasing.enabled = 1;                /* EFCC2020, default path  */
+cfg.allow_arc_truncation = -1;            /* engine default          */
+cfg.coorbital_enabled = -1;               /* engine default          */
+
+struct EmpyreanDetermineResults results;
+memset(&results, 0, sizeof results);
+int32_t rc = empyrean_determine(ctx, obs, n_obs, radar, n_radar,
+                                NULL, 0, &cfg, &results);
+if (rc != 0 && rc != EMPYREAN_DETERMINE_NONE_DELIVERED) {
+    fprintf(stderr, "batch aborted: %s\n", empyrean_last_error());
+    empyrean_observations_free(obs, n_obs);
+    if (radar) empyrean_radar_observations_free(radar, n_radar);
+    return 1;
+}
+
+for (size_t i = 0; i < results.num_objects; ++i) {
+    const struct EmpyreanODObjectResult *o = &results.objects[i];
+    if (!o->delivered) {
+        printf("%-14s FAILED (code %d): %s\n",
+               o->object_id, o->error_code, o->error);
+        continue;
+    }
+    printf("%-14s rms %.3f\"  fit_ok %d  extrap_ok %d\n",
+           o->object_id,
+           o->result.summary.rms_combined_arcsec,
+           o->result.acceptability.fit_acceptable,
+           o->result.acceptability.extrapolation_acceptable);
+}
+for (size_t i = 0; i < results.num_unmatched_orbit_ids; ++i)
+    printf("seed matched no object: %s\n", results.unmatched_orbit_ids[i]);
+
+empyrean_determine_results_free(&results);
+empyrean_observations_free(obs, n_obs);
+if (radar) empyrean_radar_observations_free(radar, n_radar);
+```
+
+### Config sentinels: zero is not always the default
+
+`EmpyreanODConfig` follows a sentinel rule — `0` / `0.0` on a primitive
+field requests the upstream default (`max_iterations = 0` → 100,
+`convergence_tol = 0.0` → 0.1, `epsilon = 0.0` → 1e-9). The exceptions
+are load-bearing and documented inline in the header; four of them are
+worth naming here, because on each a zero-initialized struct is an
+**active choice**, not "unset":
+
+- `weighting` — `enabled = 0` is weighting **disabled** (uniform 1″).
+  The production combination is requested explicitly, as above:
+  `EMPYREAN_WEIGHTING_PRESET_VFCC2017` station floors — Vereš,
+  Farnocchia, Chesley & Chamberlin (2017) — plus one
+  `NIGHTLY_DEWEIGHTING` layer, at the preset's floor-σ policy. A
+  `NIGHTLY_DEWEIGHTING` layer always applies that paper's §3 law (σ
+  unchanged for a batch of N ≤ 4, then σ_eff = σ√(N/4)); the law is not
+  selectable at this ABI. Within the config, `sigma_policy = 0` is
+  `DEFAULT_ONLY` — an active override that replaces a preset's floor
+  policy; `-1` selects the preset's own. `EMPYREAN_WEIGHTING_PRESET_NONE`
+  (`0`) is honoured literally: no preset rules, no silent substitution of
+  the production preset.
+- `debiasing` — `enabled = 0` is catalog debiasing **disabled**; EFCC2020
+  must be asked for.
+- `allow_arc_truncation` — **tri-state `int8_t`**: `-1` (or any negative)
+  = engine default (allowed), `1` = allowed, `0` = **forbidden**.
+  Forbidding truncation makes an arc that spans a dynamical discontinuity
+  fail loudly instead of delivering a fit of the reconcilable sub-arc
+  with the rest tagged `EMPYREAN_REJECTION_OUTSIDE_ARC`. Left at the
+  default, the outward-expansion pass escalates on its own — which is
+  what turns a truncated comet arc into a full-arc fit.
+- `coorbital_enabled` — **tri-state `int8_t`**: `-1` = engine default
+  (enabled), `1` = enabled, `0` = forced off. Enabling it does not route
+  ordinary objects through the co-orbital IOD lane; the lane still fires
+  only when every co-orbitality gate passes, which is what recovers
+  Earth-co-orbital objects (2010 TK7 / 2020 XL5 class) that the ordinary
+  cascade seeds poorly.
+
+The same convention appears on `EmpyreanPropagationConfig` via
+`EMPYREAN_ORIGIN_SWITCHING_DEFAULT` / `_ON` / `_OFF`, where `memset(0)`
+gives `DEFAULT` (currently on) rather than off.
 
 ### Wide-parameter solves
 
-A fit solves for the 6-parameter Cartesian state by default;
+A fit solves for the 6-parameter Cartesian state by default — a
+zero-initialized config selects `EMPYREAN_SOLVE_FOR_STATE_ONLY` (`0`).
 `solve_for` widens the parameter vector:
 
 - `EMPYREAN_SOLVE_FOR_STATE_ONLY` — the 6-state only.
@@ -143,13 +334,87 @@ guessing column order — the width alone is ambiguous:
 
 An axis that was not solved carries `EMPYREAN_SLOT_NONE`. The leading
 `width × width` block of `matrix` is meaningful; rows/columns beyond
-`width` are reserved (zero), not defaulted covariance. A consumer
-compiled against a given `EMPYREAN_SOLVE_WIDTH` should confirm the
-runtime library agrees by checking `empyrean_abi_version()` against
-`EMPYREAN_ABI_VERSION` at load — the v0.9.0 release ships ABI
-version 2. Version 2 grew several result structs — fields are only ever
-appended, never reordered or removed — so a consumer built against the
-version-1 header must recompile against the version-2 header.
+`width` are reserved (zero), not defaulted covariance.
+
+### ABI version 3
+
+A consumer compiled against a given `EMPYREAN_SOLVE_WIDTH` should confirm
+the runtime library agrees by checking `empyrean_abi_version()` against
+`EMPYREAN_ABI_VERSION` at load. Version 2 grew several result structs.
+Version 3 is one batched break:
+
+- `empyrean_determine` becomes the **batched** entry point: it writes an
+  `EmpyreanDetermineResults` table with one `EmpyreanODObjectResult` per
+  ADES object instead of a single `EmpyreanODResult`, and its output is
+  released with the new `empyrean_determine_results_free`;
+- `EmpyreanObservationResult` gains `object_id`, and
+  `EmpyreanAcceptabilityReport` gains the selection-fraction,
+  selected-arc-coverage and trailing-gap gate axes plus the
+  `radar_fit_ok` tri-state;
+- `EmpyreanPropagationConfig` gains `ephemeris_overlap_policy` at its tail (and so
+  does the `EmpyreanEphemerisConfig` that embeds it);
+- `EmpyreanObserver` gains `frame` / `origin` — the basis its state is
+  expressed in, which used to be an undeclared ICRF / SSB assumption;
+- `EmpyreanTaggedCovariance` gains `quality_kappa_state`, the payload of
+  the new `EMPYREAN_COVARIANCE_QUALITY_EXPANSION_SUSPECT` tag;
+- `empyrean_transform_coordinates` becomes the **batched** entry point
+  (array in, array out) and the one-state form is renamed
+  `empyrean_transform_coordinates_single`;
+- `empyrean_get_observers` gains `frame` / `origin` parameters.
+
+Struct fields are only ever appended, never reordered or removed, so the
+three signature changes are the only source-breaking ones — a consumer
+built against an older header must recompile against the current one
+either way.
+
+`ephemeris_overlap_policy` decides what happens when a propagated body is
+also carried by a loaded SPK: `EMPYREAN_EPHEMERIS_OVERLAP_POLICY_SUBSTITUTE_SPK`
+(the `memset(0)` value) serves the kernel's own solution and integrates
+nothing, so there is no dense trajectory, no STM and no sensitivity
+chain — ephemeris generation and the radar forward model therefore fail
+loudly for an overlapped body rather than serving a silently degraded
+answer. `EMPYREAN_EPHEMERIS_OVERLAP_POLICY_EXCLUDE_AND_INTEGRATE` drops
+the overlapped perturber from the force model, integrates the caller's
+own initial conditions, and reports the overlap.
+
+### Acceptability verdicts
+
+Every `EmpyreanODResult` carries an `EmpyreanAcceptabilityReport` with
+**two** verdicts, not one:
+
+- `fit_acceptable` — the AND of the fit-quality gates: convergence,
+  positive-definite covariance, reduced χ², RMS, residual isotropy.
+- `extrapolation_acceptable` — additionally requires the four
+  selection / coverage axes, `selection_fraction_ok`,
+  `selected_arc_coverage_ok`, `trailing_gap_ok` and
+  `fractional_sigma_a_ok`. Those four are deliberately *not* part of
+  `fit_acceptable`: a heavily pruned fit can describe its retained subset
+  well and still be unsafe to propagate forward.
+
+Each gate ships its own value **and** the threshold it was compared
+against — `reduced_chi2_value` / `reduced_chi2_threshold`,
+`rms_value_arcsec` / `rms_threshold_arcsec`, `at_ct_ratio_value` /
+`at_ct_ratio_threshold`, `arc_days_value` / `arc_days_threshold`,
+`fractional_sigma_a_value` / `_threshold`, `selection_fraction_value` /
+`_threshold`, `selected_arc_days_value` + `selected_arc_fraction_value` /
+`_threshold`, `trailing_gap_days_value` / `trailing_gap_threshold` — so a
+caller reports *why* a verdict fell, not just that it did.
+
+`trailing_gap_ok` is the asymmetric backstop the span-ratio axis cannot
+provide: it catches a short recent tail rejected off a long arc, where
+the ratio still passes but the discarded rows are the ones nearest a
+forward extrapolation target.
+
+Every `f64` in the report is NaN when the quantity could not be computed
+— never `0.0`, because a threshold comparison against `0.0` reads as a
+real measurement sitting at the floor. The `_ok` booleans are always
+valid: a gate whose value is NaN reports `0`, so a consumer can branch on
+the verdict without first testing for NaN. `radar_fit_ok` is a **tri-state
+`int8_t`** — `1` pass, `0` fail, `-1` not applicable — where `-1` is
+distinct from `0` on purpose: "no radar" must never read as "radar
+failed". It currently always reports `-1`; the axis is reserved for a
+joint optical+radar acceptability gate, and the radar residuals
+themselves are already on every observation row (below).
 
 ### Covariance trust & per-observation diagnostics
 
@@ -176,6 +441,32 @@ singular — the observation is indispensable); and the along/cross-track
 residual pair carries its off-diagonal covariance
 (`along_cross_covariance_arcsec2`), completing the 2×2. Each of these is
 NaN when its pass did not run — never silently zeroed.
+
+### Typed rejection reasons
+
+No observation is ever dropped anonymously. Every row's
+`rejection_reason` is an `EMPYREAN_REJECTION_*` code that says which
+criterion or which data gap took it out, alongside the
+`rejection_criterion` / `rejection_threshold` /
+`rejection_effective_threshold` values it was judged on:
+
+| code | meaning |
+|------|---------|
+| `ACCEPTED` | passed every criterion |
+| `CHI_SQUARED` / `SIGMA_CLIP` / `COOKS_DISTANCE` / `ADAPTIVE` / `CMC2003` | rejected by that criterion |
+| `UNSUPPORTED_OBSERVATORY` | observatory the engine does not model |
+| `SPACECRAFT_KERNEL_MISSING` | spacecraft observatory whose SPK is not loaded — a provisioning gap the caller can close, not a property of the observation |
+| `OBSERVER_CONSTRUCTION_FAILED` | observer position unbuildable for this row |
+| `RADAR_UNSUPPORTED` / `OCCULTATION_UNSUPPORTED` | `RAD` / `OCC` mode rows the optical residual pass cannot fold |
+| `OUTSIDE_ARC` | belongs to a sub-arc irreconcilable with the converged fit — incompatible dynamics, not necessarily noise |
+| `NON_FINITE_CHI2` | χ² against the fitted orbit is non-finite, so the row cannot enter any fit statistic |
+| `MISSING_JACOBIAN` | no Jacobian / STM was retained at this epoch, so the row contributed no normal-equation row |
+| `NEVER_ABSORBED` | reached no iteration that could have used it — no criterion was ever tested |
+| `NOT_EVALUATED` (`-1`) | the call path ran no rejection pass at all (e.g. `empyrean_evaluate`) |
+
+`NON_FINITE_CHI2` and `MISSING_JACOBIAN` exist so an excluded row cannot
+read as used: a fit that consumed 42 of 48 observations reports 42, and
+names the six.
 
 ### Post-OD photometry
 
@@ -223,7 +514,7 @@ prior.has_non_grav_covariance = 1;   /* opens the Marsden block        */
 
 /* Config: solve state + Marsden + DT explicitly, plus post-OD H/G. */
 struct EmpyreanODConfig cfg;
-memset(&cfg, 0, sizeof cfg);         /* zero-init = upstream defaults   */
+memset(&cfg, 0, sizeof cfg);         /* see the sentinel caveats above  */
 cfg.solve_for = EMPYREAN_SOLVE_FOR_EXPLICIT;
 cfg.solve_for_flags.marsden = 1;
 cfg.solve_for_flags.dt = 1;
@@ -263,10 +554,67 @@ empyrean_observations_free(obs, n_obs);
 if (radar) empyrean_radar_observations_free(radar, n_radar);
 ```
 
-`empyrean_determine` has the same shape but additionally takes an
-initial-orbit seed array (pass `NULL, 0` to let IOD produce its own
-seeds) and the radar array; free either fit's result with
-`empyrean_od_result_free`.
+`empyrean_determine` takes the same `EmpyreanODConfig` and additionally
+accepts an initial-orbit seed array (pass `NULL, 0` to let IOD produce
+its own seeds) and the radar array — but it writes an
+`EmpyreanDetermineResults` table, not a single `EmpyreanODResult`, and is
+freed with `empyrean_determine_results_free`. `empyrean_od_result_free`
+frees an `empyrean_refine` result.
+
+## Reusable force-model handle & guard codes
+
+`empyrean_builtsystem_new` assembles a reusable force-model handle for a
+`(force_model, frame)` pair, freezing `encounter_timescale_divisor` into
+its key, so a caller running many propagations pays the assembly cost
+once. `empyrean_builtsystem_propagate` and
+`empyrean_builtsystem_generate_ephemeris` parallel their one-shot
+equivalents but take `(handle, ctx, ...)`; on a pass their results are
+bit-identical to the one-shot with the same config.
+`empyrean_builtsystem_describe` returns a full reproducibility summary of
+the frozen force model and the kernel manifest captured at construction
+(release it with `empyrean_builtsystem_description_free`; the handle
+itself with `empyrean_builtsystem_free`).
+
+The reuse is only safe because it is **guarded**, and every guard failure
+is a distinct code — never a silently served result:
+
+| code | guard |
+|------|-------|
+| `EMPYREAN_BUILTSYSTEM_OK` (`0`) | the call ran |
+| `EMPYREAN_BUILTSYSTEM_DATA_MISMATCH` (`-20`) | the handle was not built from this context's ephemeris data — it would serve physics from a foreign kernel set |
+| `EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_FRAME` (`-21`) | the per-call config's output frame diverges from the frozen frame |
+| `EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_FORCE_MODEL` (`-22`) | the per-call force-model tier diverges from the frozen tier |
+| `EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_DIVISOR` (`-23`) | the per-call encounter-timescale divisor diverges from the frozen divisor |
+| `EMPYREAN_BUILTSYSTEM_STALE` (`-24`) | a kernel was loaded into the context after the handle was built — rebuild it |
+| `EMPYREAN_BUILTSYSTEM_NULL_POINTER` (`-1`) / `_INVALID_ARGUMENT` (`-2`) / `_PROPAGATION` (`-3`) / `_ALLOC` (`-5`) / `_PANIC` (`-99`) | non-guard failures |
+
+The C-ABI ephemeris config carries no divisor knob, so a handle frozen at
+a non-default divisor is rejected by
+`empyrean_builtsystem_generate_ephemeris` with
+`EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_DIVISOR` rather than served under the
+wrong dynamics — build the handle with the default divisor for ephemeris
+reuse. `empyrean_last_error()` carries the message on every non-zero
+return.
+
+## Impact probability & uncertainty methods
+
+`empyrean_compute_impact_probabilities` and `empyrean_compute_b_planes`
+take an array of `EmpyreanUncertaintyMethod` values and return records
+tagged by the method that produced them (free with
+`empyrean_compute_impact_probabilities_result_free` /
+`empyrean_compute_b_planes_result_free`). The `tag` selects the variant —
+`EMPYREAN_UNCERTAINTY_FIRST`, `_SECOND`, `_SIGMA_POINT`, `_MONTE_CARLO`,
+`_AUTO`, `_MIXTURE` — and each variant reads only its own fields.
+
+A **tuned** `_AUTO` is accepted on this path and its thresholds are
+honoured: `auto_threshold_first`, `auto_threshold_mixture`,
+`auto_threshold_ip_skip`, `auto_gmm_max_depth` and
+`auto_gmm_components_per_split` travel verbatim with the request rather
+than being replaced by upstream values — so set every field the run
+depends on instead of leaning on a zero-init. `_MIXTURE` reuses the
+adaptive-Gaussian-mixture slots (`auto_threshold_mixture`,
+`auto_gmm_max_depth`, `auto_gmm_components_per_split`) as a top-level
+method; `tag` disambiguates.
 
 ## Plan evaluation
 

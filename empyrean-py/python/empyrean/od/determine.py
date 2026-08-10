@@ -27,6 +27,7 @@ from empyrean.od.ades_observations import ADESObservations
 from empyrean.od.radar_observations import ADESRadarObservations
 from empyrean.od.residuals import (
     AcceptabilityReport,
+    FitSummary,
     ObservationResults,
     ResidualSummary,
     StationBiases,
@@ -34,10 +35,13 @@ from empyrean.od.residuals import (
 from empyrean.od.result import (
     BandStat,
     CovarianceTrust,
+    DetermineFailure,
     DetermineResult,
+    DetermineResults,
     EvaluateResult,
     GateRecord,
     ODConfig,
+    OrbitsTable,
     PhotometryModel,
     PhotometryResult,
     SolvedCovariance,
@@ -310,6 +314,9 @@ def _build_observation_results(result: ResultDict) -> ObservationResults:
     return ObservationResults.from_kwargs(
         # Identification
         obs_id=list(result["obs_ids"]),
+        # Present on the batch determine path (one fit per object); null
+        # for the single-object evaluate / refine paths.
+        object_id=list(result.get("object_ids", [None] * len(result["obs_ids"]))),
         obs_code=list(result["obs_codes"]),
         ast_cat=list(result["ast_cats"]),
         epoch_mjd_tdb=np.asarray(result["obs_epochs"]),
@@ -415,6 +422,18 @@ def _build_acceptability_report(
         fractional_sigma_a_ok=bool(result[f"{p}fractional_sigma_a_ok"]),
         fractional_sigma_a_value=float(result[f"{p}fractional_sigma_a_value"]),
         fractional_sigma_a_threshold=float(result[f"{p}fractional_sigma_a_threshold"]),
+        selection_fraction_ok=bool(result[f"{p}selection_fraction_ok"]),
+        selection_fraction_value=float(result[f"{p}selection_fraction_value"]),
+        selection_fraction_threshold=float(result[f"{p}selection_fraction_threshold"]),
+        selected_arc_coverage_ok=bool(result[f"{p}selected_arc_coverage_ok"]),
+        selected_arc_days_value=float(result[f"{p}selected_arc_days_value"]),
+        selected_arc_fraction_value=float(result[f"{p}selected_arc_fraction_value"]),
+        selected_arc_fraction_threshold=float(result[f"{p}selected_arc_fraction_threshold"]),
+        trailing_gap_ok=bool(result[f"{p}trailing_gap_ok"]),
+        trailing_gap_days_value=float(result[f"{p}trailing_gap_days_value"]),
+        trailing_gap_threshold=float(result[f"{p}trailing_gap_threshold"]),
+        # Absent key = no radar contributed; never coerce that to False.
+        radar_fit_ok=result.get(f"{p}radar_fit_ok"),
     )
 
 
@@ -672,31 +691,47 @@ def determine(
     *,
     radar: ADESRadarObservations | None = None,
     config: ODConfig | None = None,
-) -> DetermineResult:
-    """Run the full orbit determination pipeline (IOD + DC).
+) -> DetermineResults:
+    """Run the full orbit determination pipeline (IOD + DC) over every
+    object in ``observations``.
+
+    The observations are grouped by ADES object identifier (``permID``,
+    else ``provID``, else ``trkSub``) and each group is fitted
+    independently, so one call determines a whole batch. Fitting a single
+    object is the one-entry case of the same call, not a separate one.
 
     Parameters
     ----------
     observations : ADESObservations
-        ADES optical observations for a single object.
+        ADES optical observations. May cover any number of objects.
     initial_orbits : dict[str, CartesianOrbits], optional
         Map of object ID to initial seed orbit. When provided, IOD is
-        skipped and the seed becomes the DC starting point.
+        skipped for that object and the seed becomes the DC starting
+        point. Seeds matching no observation group are reported in
+        :attr:`DetermineResults.unmatched_orbit_ids` rather than dropped.
     radar : ADESRadarObservations, optional
-        ADES radar (delay / Doppler) observations for the same object,
-        as returned alongside the optical table by :func:`read_ades`.
-        When omitted or empty, the fit is optical-only — every existing
-        caller keeps working unchanged.
+        ADES radar (delay / Doppler) observations, as returned alongside
+        the optical table by :func:`read_ades`. Grouped by the same
+        identifier and folded into each object's fit. When omitted or
+        empty, the fits are optical-only.
     config : ODConfig, optional
         Pipeline configuration. Default: ``ODConfig()``.
 
     Returns
     -------
-    DetermineResult
-        Single fitted orbit + residuals + summary. The C ABI's
-        determine surface returns one fit per call (single-target);
-        for multi-object batches loop over per-object ADESObservations
-        slices in Python.
+    DetermineResults
+        ``.orbits`` (one row per delivered object), ``.summary`` (one row
+        per **input** object, delivered or failed), ``.residuals`` (every
+        delivered fit's rows, tagged with ``object_id``), and
+        ``.failures``. Index by object identifier for the full
+        single-object :class:`DetermineResult`; call
+        :meth:`DetermineResults.single` for the one-object case.
+
+    Notes
+    -----
+    An object whose fit fails does not abort the batch and does not
+    disappear: it gets a ``.summary`` row with ``status="failed"``, NaN
+    measurements, and the reason in ``error``.
     """
     from empyrean._empyrean_rs import _determine
 
@@ -712,13 +747,155 @@ def determine(
         for oid, orbit in initial_orbits.items():
             initial_orbits_dict[oid] = _orbits_to_dict(orbit)
 
-    result = _determine(obs_dict, config._to_wire_dict(), initial_orbits_dict, radar_dict)
-    # The C ABI hardcodes empty orbit/object ids on the fit; re-attach a real
-    # identity so it propagates to downstream propagate / ephemeris. Prefer the
-    # seed's object id (seeded fit), else derive it from the observations.
-    seed_id = next(iter(initial_orbits)) if initial_orbits else None
-    _inject_identity(result, seed_id or _object_id_from_observations(observations))
-    return _build_determine_result(result)
+    batch = _determine(obs_dict, config._to_wire_dict(), initial_orbits_dict, radar_dict)
+    seed_labels = _seed_labels(observations, list(initial_orbits)) if initial_orbits else {}
+    return _build_determine_results(batch, seed_labels)
+
+
+def _build_determine_results(
+    batch: ResultDict,
+    seed_labels: dict[str, str] | None = None,
+) -> DetermineResults:
+    """Assemble :class:`DetermineResults` from the Rust batch dict.
+
+    Every entry becomes a summary row; delivered entries additionally
+    contribute an orbit row and their residual rows. Nothing is dropped
+    on the way across — a failed object is a row, not an absence.
+
+    ``seed_labels`` maps an ADES group id to the ``initial_orbits`` key
+    that seeded it (see :func:`_seed_labels`); a seeded fit is delivered
+    under that key rather than the ADES designation the engine returns.
+    The batch is still *indexed* by the ADES id — the relabelling applies
+    to the fitted orbit's own identity, which is what flows downstream.
+    """
+    seed_labels = seed_labels or {}
+    results: dict[str, DetermineResult] = {}
+    failures: dict[str, DetermineFailure] = {}
+    summary_rows: list[dict[str, Any]] = []
+    orbit_tables: list[OrbitsTable] = []
+    residual_tables: list[ObservationResults] = []
+
+    for entry in batch["objects"]:
+        object_id = str(entry["object_id"])
+        if entry.get("delivered"):
+            # The C ABI leaves the fitted orbit's identity empty. A seeded
+            # fit takes the caller's seed key; otherwise the batch key (the
+            # ADES designation) is the real one. Re-attach before building.
+            _inject_identity(entry, seed_labels.get(object_id, object_id))
+            fit = _build_determine_result(entry)
+            results[object_id] = fit
+            orbit_tables.append(fit.orbit)
+            residual_tables.append(fit.observations)
+            summary_rows.append(_summary_row_delivered(object_id, fit))
+        else:
+            failure = DetermineFailure(
+                object_id=object_id,
+                message=str(entry.get("error", "")),
+                kind=str(entry.get("error_kind", "unknown")),
+            )
+            failures[object_id] = failure
+            summary_rows.append(_summary_row_failed(object_id, failure))
+
+    orbits = qv.concatenate(orbit_tables) if orbit_tables else CartesianOrbits.empty()
+    residuals = qv.concatenate(residual_tables) if residual_tables else ObservationResults.empty()
+    return DetermineResults(
+        orbits=orbits,
+        summary=_fit_summary_table(summary_rows),
+        residuals=residuals,
+        failures=failures,
+        unmatched_orbit_ids=list(batch.get("unmatched_orbit_ids", [])),
+        _results=results,
+    )
+
+
+def _summary_row_delivered(object_id: str, fit: DetermineResult) -> dict[str, Any]:
+    """The :class:`FitSummary` row for an object that produced an orbit."""
+    a = fit.acceptability
+    return {
+        "object_id": object_id,
+        "status": "delivered",
+        "converged": fit.converged,
+        "iterations": fit.iterations,
+        "n_obs": fit.summary.num_obs,
+        "n_selected": fit.summary.num_selected,
+        "rms_ra_arcsec": fit.summary.rms_ra_arcsec,
+        "rms_dec_arcsec": fit.summary.rms_dec_arcsec,
+        "reduced_chi2": fit.summary.reduced_chi2,
+        "fit_acceptable": a.fit_acceptable,
+        "extrapolation_acceptable": a.extrapolation_acceptable,
+        "selection_fraction_ok": a.selection_fraction_ok,
+        "selection_fraction": a.selection_fraction_value,
+        "selection_fraction_threshold": a.selection_fraction_threshold,
+        "selected_arc_coverage_ok": a.selected_arc_coverage_ok,
+        "selected_arc_days": a.selected_arc_days_value,
+        "selected_arc_fraction": a.selected_arc_fraction_value,
+        "selected_arc_fraction_threshold": a.selected_arc_fraction_threshold,
+        "trailing_gap_ok": a.trailing_gap_ok,
+        "trailing_gap_days": a.trailing_gap_days_value,
+        "trailing_gap_threshold_days": a.trailing_gap_threshold,
+        "fractional_sigma_a_ok": a.fractional_sigma_a_ok,
+        "fractional_sigma_a": a.fractional_sigma_a_value,
+        "fractional_sigma_a_threshold": a.fractional_sigma_a_threshold,
+        # A state-only fit reports no tagged solved covariance; its
+        # solved width is the 6-element state.
+        "solve_for_width": (
+            fit.solved_covariance.width if fit.solved_covariance is not None else 6
+        ),
+        "error": None,
+    }
+
+
+def _summary_row_failed(object_id: str, failure: DetermineFailure) -> dict[str, Any]:
+    """The :class:`FitSummary` row for an object that produced no orbit.
+
+    Every measurement is NaN rather than 0.0: a failed fit has no RMS and
+    no gate values, and a zero would read as a value at the floor.
+    """
+    row: dict[str, Any] = {
+        "object_id": object_id,
+        "status": "failed",
+        "converged": False,
+        "iterations": 0,
+        "n_obs": 0,
+        "n_selected": 0,
+        "solve_for_width": 0,
+        "error": failure.message,
+    }
+    for key in (
+        "rms_ra_arcsec",
+        "rms_dec_arcsec",
+        "reduced_chi2",
+        "selection_fraction",
+        "selection_fraction_threshold",
+        "selected_arc_days",
+        "selected_arc_fraction",
+        "selected_arc_fraction_threshold",
+        "trailing_gap_days",
+        "trailing_gap_threshold_days",
+        "fractional_sigma_a",
+        "fractional_sigma_a_threshold",
+    ):
+        row[key] = np.nan
+    for key in (
+        "fit_acceptable",
+        "extrapolation_acceptable",
+        "selection_fraction_ok",
+        "selected_arc_coverage_ok",
+        "trailing_gap_ok",
+        "fractional_sigma_a_ok",
+    ):
+        row[key] = False
+    return row
+
+
+def _fit_summary_table(rows: list[dict[str, Any]]) -> FitSummary:
+    """Column-orient the summary rows into the quivr table."""
+    if not rows:
+        return FitSummary.empty()
+    columns: dict[str, Any] = {name: [row[name] for row in rows] for name in rows[0]}
+    for name in ("iterations", "n_obs", "n_selected", "solve_for_width"):
+        columns[name] = np.asarray(columns[name], dtype=np.int32)
+    return FitSummary.from_kwargs(**columns)
 
 
 def evaluate(
@@ -932,6 +1109,40 @@ def _object_id_from_observations(observations: ADESObservations) -> str | None:
             if value:
                 return str(value)
     return None
+
+
+def _seed_labels(
+    observations: ADESObservations,
+    seed_keys: list[str],
+) -> dict[str, str]:
+    """Map each seeded observation group's ADES id to the caller's seed key.
+
+    ``initial_orbits`` is a keyed map in Python, but the seeds cross the C
+    ABI as a bare array: ``empyrean_determine`` pairs the i-th seed with
+    the i-th unique ADES object id encountered in the observations, in
+    first-appearance order. The caller's key never reaches the engine, so
+    the fit comes back stamped with the ADES designation.
+
+    Reconstructing that pairing here lets a seeded fit be delivered under
+    the key its caller supplied — the identity the pre-batch single-object
+    path attached (``next(iter(initial_orbits))``) and the one downstream
+    propagate / ephemeris calls are expected to see.
+
+    The group key follows the engine's precedence exactly (``permID``,
+    else ``provID``, else ``trkSub``, else ``"unknown"``); a group with no
+    matching seed is absent from the result and keeps its ADES identity.
+    """
+    groups: list[str] = []
+    for perm, prov, trk in zip(
+        observations.perm_id.to_pylist(),
+        observations.prov_id.to_pylist(),
+        observations.trk_sub.to_pylist(),
+        strict=True,
+    ):
+        key = perm or prov or trk or "unknown"
+        if key not in groups:
+            groups.append(key)
+    return dict(zip(groups, seed_keys, strict=False))
 
 
 def _orbit_identity(orbit: AnyOrbits) -> str | None:

@@ -60,3 +60,73 @@ fn rejection_config_struct_has_cmc2003_fields() {
     let _ = c.chi2_rej;
     let _ = c.chi2_rec;
 }
+
+#[test]
+fn the_loaded_engine_reports_the_abi_version_this_crate_compiled_against() {
+    // `dlsym` matches on symbol name, not signature, so a stale
+    // `libempyrean` resolves every symbol and then reads the caller's
+    // arguments through the wrong shape. Since ABI 3 that includes two
+    // functions whose parameter *lists* changed, where the mismatch
+    // writes a struct through an integer the caller passed by value.
+    // `lib()` asserts the handshake at open time; this pins that the
+    // engine actually reachable from this build agrees.
+    let loaded = unsafe { empyrean_abi_version() };
+    assert_eq!(
+        loaded, EMPYREAN_ABI_VERSION,
+        "the loaded libempyrean is built to a different ABI version than these bindings"
+    );
+}
+
+/// The generated files carry the C ABI's doc text verbatim, and nothing that
+/// compiles them ever reads it: `rustc`, `clippy` and `rustfmt` are all happy
+/// with a doc comment full of garbage, and the CI doc gate runs only on
+/// `-p empyrean`. So a generator that writes the file through a Latin-1 round
+/// trip silently ships mojibake to docs.rs — which is exactly what happened
+/// once, turning every em-dash in `shims.rs` into `â` on the public v3 surface.
+///
+/// A double-encoded character is a Latin-1 high byte followed by one or more
+/// C1 continuation bytes; a correctly encoded `—` is a single `char` above
+/// U+00FF and can never look like one. Check for the shape, not for a list of
+/// known-bad strings.
+#[test]
+fn the_generated_sources_are_not_double_encoded() {
+    fn mojibake_runs(src: &str) -> Vec<String> {
+        let chars: Vec<char> = src.chars().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < chars.len() {
+            // A UTF-8 lead byte re-encoded as a `char` lands in U+00C0..=U+00FF.
+            if ('\u{00c0}'..='\u{00ff}').contains(&chars[i]) {
+                let mut j = i + 1;
+                // Continuation bytes re-encode into U+0080..=U+00BF.
+                while j < chars.len() && ('\u{0080}'..='\u{00bf}').contains(&chars[j]) {
+                    j += 1;
+                }
+                if j > i + 1 {
+                    out.push(chars[i..j].iter().collect());
+                    i = j;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        out
+    }
+
+    for (name, src) in [
+        ("empyrean-sys/src/shims.rs", include_str!("../src/shims.rs")),
+        (
+            "empyrean-sys/src/bindings.rs",
+            include_str!("../src/bindings.rs"),
+        ),
+    ] {
+        let runs = mojibake_runs(src);
+        assert!(
+            runs.is_empty(),
+            "{name} contains {} double-encoded run(s) — the file was written through a \
+             Latin-1 round trip. Regenerate it reading the source as UTF-8. First few: {:?}",
+            runs.len(),
+            &runs[..runs.len().min(5)]
+        );
+    }
+}

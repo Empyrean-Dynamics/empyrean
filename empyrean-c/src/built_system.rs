@@ -256,7 +256,7 @@ pub unsafe extern "C" fn empyrean_builtsystem_new(
             }
         };
 
-        let mut system = match ctx_ref.built_system(fm, fr) {
+        let mut system = match ctx_ref.built_system(fm.into(), fr) {
             Ok(s) => s,
             Err(e) => {
                 set_last_error(&e.to_string());
@@ -1073,6 +1073,9 @@ mod tests {
             vy: 0.0148,
             vz: 0.0064,
             observing_night: -1,
+            // The construction basis ephemeris generation requires.
+            frame: 0,  // ICRF
+            origin: 0, // solar-system barycenter
         }];
 
         // One-shot baseline.

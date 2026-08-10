@@ -39,6 +39,14 @@ class ObservationResults(qv.Table):
     # ── Identification (cross-match) ─────────────────────
     obs_id = qv.LargeStringColumn()
     """ADES `obsID` (or scott auto-assigned) — cross-match key."""
+    object_id = qv.LargeStringColumn(nullable=True)
+    """ADES object identifier of the fit this row belongs to.
+
+    Populated by :func:`~empyrean.od.determine.determine`, which fits per
+    object — so the residuals of a whole batch live in one table and stay
+    attributable. Null for :func:`~empyrean.od.determine.evaluate` /
+    :func:`~empyrean.od.determine.refine`, where the caller supplied the
+    one orbit and there is no grouping key."""
     obs_code = qv.LargeStringColumn()
     """MPC observatory code."""
     ast_cat = qv.LargeStringColumn(nullable=True)
@@ -74,8 +82,8 @@ class ObservationResults(qv.Table):
     ``cooks_distance`` / ``adaptive`` / ``unsupported_observatory`` /
     ``cmc2003`` / ``radar_observations_unsupported`` /
     ``occultation_observations_unsupported`` / ``outside_arc`` /
-    ``not_evaluated``. Mirrors ``scott::rejection::RejectionReason``
-    snake-cased."""
+    ``non_finite_chi2`` / ``missing_jacobian`` / ``not_evaluated``.
+    Mirrors ``scott::rejection::RejectionReason`` snake-cased."""
     rejection_criterion = qv.Float64Column(nullable=True)
     """The criterion value (χ², Cook's D, ...) tested against the threshold."""
     rejection_threshold = qv.Float64Column(nullable=True)
@@ -336,3 +344,130 @@ class AcceptabilityReport:
     """Measured :math:`\\sigma_a / |a|`."""
     fractional_sigma_a_threshold: float
     """Threshold the value was compared against."""
+
+    selection_fraction_ok: bool
+    """Did the fit retain enough of its input? ``False`` means the
+    residual bars above describe a heavily pruned subset. Gates
+    :attr:`extrapolation_acceptable`; deliberately not part of
+    :attr:`fit_acceptable`.
+
+    Reproduce the fraction from :attr:`selection_fraction_value`, not
+    from :class:`ResidualSummary` — the summary counts merged radar /
+    occultation stub rows that were never candidates for outlier
+    pruning, so its ratio is a different (smaller) number."""
+    selection_fraction_value: float
+    """Fraction of observations retained (n_selected / n_obs)."""
+    selection_fraction_threshold: float
+    """Minimum retained fraction the gate required."""
+
+    selected_arc_coverage_ok: bool
+    """Do the **selected** observations still span enough of the arc to
+    extrapolate across it? This is the coverage axis
+    :attr:`extrapolation_acceptable` gates on — a strict tightening of
+    the full-span :attr:`arc_coverage_ok`, which keeps its original
+    meaning for callers that want it."""
+    selected_arc_days_value: float
+    """Arc span (days) over the selected observations only. NaN when
+    nothing was selected."""
+    selected_arc_fraction_value: float
+    """Selected-span / full-span ratio."""
+    selected_arc_fraction_threshold: float
+    """Minimum span ratio the gate required."""
+
+    trailing_gap_ok: bool
+    """Were the most-recent observations kept? The absolute, asymmetric
+    backstop the span ratio cannot provide: it catches a short recent
+    tail rejected off a long arc, where the ratio still passes but the
+    discarded rows are the ones nearest a forward extrapolation
+    target."""
+    trailing_gap_days_value: float
+    """Days between the last selected and the last full-arc observation.
+    ``0.0`` when the last kept observation is the last observation; NaN
+    when nothing was selected."""
+    trailing_gap_threshold: float
+    """Largest trailing gap the gate allowed (days)."""
+
+    radar_fit_ok: bool | None
+    """Radar astrometry joint-fit acceptability. ``None`` when no radar
+    contributed to the fit — which is never the same as ``False``."""
+
+
+class FitSummary(qv.Table):
+    """One row per **input** object of a batch orbit determination —
+    delivered or not.
+
+    :func:`~empyrean.od.determine.determine` fits every object in the
+    observations. ``.orbits`` holds the objects that produced an orbit;
+    this table holds *all* of them, so a partially successful batch is
+    readable rather than silently shorter than its input. A failed
+    object's measurement columns are NaN (never ``0.0``, which would read
+    as a value at the floor) and :attr:`error` says why.
+
+    The column names match the ``fit_summary`` files the CLI writes, so
+    a table read back from ``fit_summary.parquet`` and this one describe
+    a fit identically.
+    """
+
+    object_id = qv.LargeStringColumn()
+    """ADES object identifier (permID / provID / trkSub)."""
+    status = qv.LargeStringColumn()
+    """``"delivered"`` or ``"failed"``."""
+
+    converged = qv.BooleanColumn()
+    """Did the differential correction reach its stopping criterion?"""
+    iterations = qv.Int32Column()
+    """DC iterations used. ``0`` on a failed object."""
+    n_obs = qv.Int32Column()
+    """Observations this object contributed."""
+    n_selected = qv.Int32Column()
+    """Observations the fit retained."""
+
+    rms_ra_arcsec = qv.Float64Column(nullable=True)
+    """RA·cos(Dec) residual RMS (arcsec)."""
+    rms_dec_arcsec = qv.Float64Column(nullable=True)
+    """Dec residual RMS (arcsec)."""
+    reduced_chi2 = qv.Float64Column(nullable=True)
+    r"""Reduced :math:`\chi^2` of the fit."""
+
+    fit_acceptable = qv.BooleanColumn()
+    """Aggregate fit-quality verdict."""
+    extrapolation_acceptable = qv.BooleanColumn()
+    """Aggregate verdict on forward extrapolation: :attr:`fit_acceptable`
+    AND the four selection / coverage axes below."""
+
+    selection_fraction_ok = qv.BooleanColumn()
+    """Did the fit retain enough of its input?"""
+    selection_fraction = qv.Float64Column(nullable=True)
+    """Fraction of observations retained."""
+    selection_fraction_threshold = qv.Float64Column(nullable=True)
+    """Minimum retained fraction the gate required."""
+
+    selected_arc_coverage_ok = qv.BooleanColumn()
+    """Do the selected observations still span enough of the arc?"""
+    selected_arc_days = qv.Float64Column(nullable=True)
+    """Arc span over the selected observations only (days)."""
+    selected_arc_fraction = qv.Float64Column(nullable=True)
+    """Selected-span / full-span ratio."""
+    selected_arc_fraction_threshold = qv.Float64Column(nullable=True)
+    """Minimum span ratio the gate required."""
+
+    trailing_gap_ok = qv.BooleanColumn()
+    """Were the most-recent observations kept?"""
+    trailing_gap_days = qv.Float64Column(nullable=True)
+    """Days between the last selected and the last full-arc
+    observation."""
+    trailing_gap_threshold_days = qv.Float64Column(nullable=True)
+    """Largest trailing gap the gate allowed (days)."""
+
+    fractional_sigma_a_ok = qv.BooleanColumn()
+    r"""Did :math:`\sigma_a / |a|` pass its threshold?"""
+    fractional_sigma_a = qv.Float64Column(nullable=True)
+    r"""Measured :math:`\sigma_a / |a|`."""
+    fractional_sigma_a_threshold = qv.Float64Column(nullable=True)
+    r"""Threshold for :math:`\sigma_a / |a|`."""
+
+    solve_for_width = qv.Int32Column()
+    """Width of the solved-parameter set (6 for a state-only fit). ``0``
+    on a failed object."""
+    error = qv.LargeStringColumn(nullable=True)
+    """Failure message. Null on a delivered object."""

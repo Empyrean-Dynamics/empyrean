@@ -24,7 +24,7 @@ type-check, or RAII-manage the underlying handles.
 
 ```toml
 [dependencies]
-empyrean-sys = "0.9.0"
+empyrean-sys = "0.10.0-rc.0"
 ```
 
 ```rust
@@ -50,12 +50,104 @@ and Rust-native lifetime management.
 ## What the bindings cover
 
 The declarations track the full C ABI at `EMPYREAN_ABI_VERSION`
-(currently `2`), including the v0.9.0 wide-parameter fitting surface
-and the ABI-2 output surface below. ABI 2 grew existing struct shapes
-by appending fields, so consumers must recompile against the matching
-header. Each type below maps 1:1 onto a C struct; consult `include/empyrean.h`
+(currently `3`), including the v0.9.0 wide-parameter fitting surface
+and the ABI-2 output surface below. ABI 2 grew existing struct shapes by
+appending fields only; ABI 3 is the first version to change function
+shapes and struct interiors, so consumers must recompile against the
+matching header.
+
+**Function shapes.** `empyrean_determine` keeps its name and arity, but
+its final out-parameter is now `EmpyreanDetermineResults *` — the batch
+table, one slot per ADES object — rather than a single
+`EmpyreanODResult *`, and it is released with the new
+`empyrean_determine_results_free` (`empyrean_od_result_free` still
+releases `empyrean_refine`'s single result).
+`empyrean_transform_coordinates` becomes the batched (array in / array
+out) entry point, with the one-state form renamed
+`empyrean_transform_coordinates_single`, and `empyrean_get_observers`
+gains `frame` / `origin` parameters. New entry points:
+`empyrean_context_from_data_dir_with` with `empyrean_missing_data_files`
+/ `empyrean_missing_data_files_free`, `empyrean_download_data`, and
+`empyrean_fit_summary_write_parquet` / `_csv` / `_json`. The weighting
+preset constant is now `EMPYREAN_WEIGHTING_PRESET_VFCC2017` (Vereš,
+Farnocchia, Chesley & Chamberlin 2017), replacing the `..._VFC17`
+spelling.
+
+**Struct shapes** (64-bit sizes, every one asserted at compile time in
+the generated bindings): `EmpyreanPropagationConfig` 288 → 296
+(`ephemeris_overlap_policy`), `EmpyreanObserver` 72 → 80 (`frame` /
+`origin`), `EmpyreanTaggedCovariance` 520 → 528
+(`quality_kappa_state`), and `EmpyreanAcceptabilityReport` 120 → 208
+(the new gates), carrying `EmpyreanODResult` 7600 → 7688 with it. Two
+are interior changes rather than appends:
+`EmpyreanObservationResult` 264 → 272 inserts `object_id` right after
+`obs_id`, and `EmpyreanODConfig` stays exactly 432 bytes while
+replacing `use_stm_cache` with `allow_arc_truncation` and
+`coorbital_enabled` at offset 208 — same size, different meaning, which
+no size check would catch. New types: `EmpyreanDetermineResults` (32),
+`EmpyreanODObjectResult` (7720), `EmpyreanFitSummary` (184),
+`EmpyreanDataDirOptions` (8), `EmpyreanMissingDataFiles` (16).
+
+The version handshake is enforced here, not merely documented: the
+loader calls `empyrean_abi_version()` the moment it opens `libempyrean`
+and panics — naming both versions and the resolved path — if the engine
+disagrees with `EMPYREAN_ABI_VERSION`. `dlsym` matches on symbol name
+alone, so a stale engine picked up from `EMPYREAN_LIB` or a leftover
+`target/release` would do worse than return wrong numbers: an ABI-2
+`empyrean_get_observers` reads the caller's `frame` integer as its
+out-pointer, and an ABI-2 `empyrean_determine` writes a 7600-byte
+`EmpyreanODResult` through a pointer the caller sized for a 32-byte
+`EmpyreanDetermineResults`.
+
+Each type below maps 1:1 onto a C struct; consult `include/empyrean.h`
 at the repository root for field-level semantics.
 
+- **Batch orbit determination.** `empyrean_determine` groups the
+  observations by ADES object identifier (permID / provID / trkSub),
+  fits each group, and returns one `EmpyreanODObjectResult` per object
+  in ascending `object_id` order inside `EmpyreanDetermineResults`. Each
+  slot's `delivered` flag selects the live payload: a fully populated
+  `EmpyreanODResult`, or a typed failure carrying the engine's `error`
+  message and an `EMPYREAN_OD_FAILURE_*` `error_code` (`IOD`, `OD`,
+  `RADAR_ONLY`, `DUPLICATE_OBS_IDS`, `OBSERVATION_CONVERSION`,
+  `OBSERVER_CONSTRUCTION`, `EARTH_ORIENTATION_COVERAGE`,
+  `NON_GRAV_NOT_RECOVERED`, `UNSUPPORTED_COORDINATE_SYSTEM`) — with
+  `result` NaN-poisoned so an unchecked read is obviously invalid rather
+  than a plausible all-zero fit. One object's failure never aborts the
+  batch; every object failing returns
+  `EMPYREAN_DETERMINE_NONE_DELIVERED` (`-4`), which still populates the
+  table and still requires freeing it. Seed orbits matching no group
+  come back in `unmatched_orbit_ids` rather than being dropped, and each
+  `EmpyreanObservationResult` in the table carries the `object_id` it
+  was fitted under, so a caller may concatenate every object's rows
+  into one flat table and still know which fit each row belongs to.
+  Radar observations ride the same call as the optical set and are
+  fitted jointly with it.
+- **Acceptability verdicts and typed rejections.**
+  `EmpyreanAcceptabilityReport` carries both `fit_acceptable` and
+  `extrapolation_acceptable` alongside a per-gate `_ok` flag and, where
+  the gate is numeric, the `_value` / `_threshold` pair behind it —
+  convergence, reduced χ², RMS, residual isotropy, covariance, arc
+  coverage, fractional σ_a, selection fraction, selected-arc coverage,
+  trailing gap, and radar fit — so a verdict serializes together with
+  the number that produced it. `EmpyreanFitSummary` is the flat
+  per-object row of that verdict (identity, status, counts, RMS,
+  reduced χ², solved width, and the gates), written by
+  `empyrean_fit_summary_write_parquet` / `_csv` / `_json`. Rejection
+  reasons gained
+  `EMPYREAN_REJECTION_NON_FINITE_CHI2`,
+  `EMPYREAN_REJECTION_MISSING_JACOBIAN`,
+  `EMPYREAN_REJECTION_OBSERVER_CONSTRUCTION_FAILED`,
+  `EMPYREAN_REJECTION_SPACECRAFT_KERNEL_MISSING`, and
+  `EMPYREAN_REJECTION_NEVER_ABSORBED`, so a deselected observation
+  always carries a reason rather than a bare flag.
+- **Hard-object switches.** `EmpyreanODConfig::allow_arc_truncation`
+  and `coorbital_enabled` are tri-state (`-1` engine default, `1` on,
+  `0` off). Forbidding truncation makes an arc spanning a dynamical
+  discontinuity fail loudly instead of delivering a fit of the
+  reconcilable sub-arc with the rest tagged
+  `EMPYREAN_REJECTION_OUTSIDE_ARC`; the co-orbital IOD lane is what
+  recovers 2010 TK7 / 2020 XL5-class Earth co-orbitals.
 - **Wide-parameter OD.** `empyrean_determine` / `empyrean_refine` solve
   beyond the 6-parameter state and the Marsden A1/A2/A3 non-gravitational
   block for the cometary outgassing time delay DT, the SRP area-to-mass
@@ -121,6 +213,19 @@ at the repository root for field-level semantics.
 - **Basis-tagged mixture components.** Each `EmpyreanMixtureComponent`
   is tagged with the reference `frame` and center-body `origin` (NAIF
   id) its mean and covariance are expressed in.
+- **Data provisioning and strict offline.**
+  `empyrean_context_from_data_dir_with` takes `EmpyreanDataDirOptions`
+  (`refresh`, `tier`); a null or zeroed struct reproduces
+  `empyrean_context_from_data_dir` exactly.
+  `refresh = EMPYREAN_DATA_REFRESH_OFF` resolves the tier's kernels
+  from `data_dir` alone and fails naming **every** absent file — no
+  lower-tier fallback, no partially loaded context — with the list
+  retrievable through `empyrean_missing_data_files` as structured
+  entries rather than a string to split (file names may contain the
+  separator); release it with `empyrean_missing_data_files_free`.
+  `empyrean_download_data` provisions a data directory without building
+  a context at all. These entry points read no environment variable:
+  the C ABI honours exactly what the caller passed.
 
 ## Runtime requirement
 

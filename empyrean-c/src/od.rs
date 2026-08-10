@@ -7,9 +7,9 @@ use empyrean_core::convert::{coordinate_state_to_coordinates, frame_to_int};
 use empyrean_core::coordinates::{AU, CoordinateRepresentation, Coordinates, Origin};
 use empyrean_core::determination::{
     AcceptabilityReport, AdaptiveRejectionConfig, BiasKind, BiasScope, CMC2003Config,
-    CovarianceTrust, ODConfig, ODResult, ObservationResidualSummary, ObservationResult,
-    Observations, OriginPolicy, OutputEpoch, RadarMeasurement, RadarObservation, RadarResidual,
-    RejectionReason, SolveFor, SolveForParams, SolvedCovariance, TrustGateEvent,
+    CovarianceTrust, DetermineError, ODConfig, ODResult, ObservationResidualSummary,
+    ObservationResult, Observations, OriginPolicy, OutputEpoch, RadarMeasurement, RadarObservation,
+    RadarResidual, RejectionReason, SolveFor, SolveForParams, SolvedCovariance, TrustGateEvent,
     UpstreamForceModelTier, determine, evaluate_single, refine_single,
 };
 use empyrean_core::io::{ADESObservations, parse_ades};
@@ -271,6 +271,34 @@ pub const EMPYREAN_REJECTION_OCCULTATION_UNSUPPORTED: i32 = 8;
 /// chaotic-capture interior, regime change between pre- and
 /// post-encounter geometry).
 pub const EMPYREAN_REJECTION_OUTSIDE_ARC: i32 = 9;
+/// The observation's χ² against the published orbit is non-finite (NaN
+/// or infinite residual / weight product), so it cannot participate in
+/// any fit statistic. Every summary already excluded it from χ²/dof;
+/// this code makes the exclusion visible instead of letting the row
+/// read as used ("48 of 48 used" for a fit that used 42).
+pub const EMPYREAN_REJECTION_NON_FINITE_CHI2: i32 = 10;
+/// The propagation retained no Jacobian / STM at this observation's
+/// epoch, so the observation contributed no row to the normal equations
+/// — it was never part of the fit and its per-obs χ² is NaN.
+pub const EMPYREAN_REJECTION_MISSING_JACOBIAN: i32 = 11;
+/// The observation's observatory is a spacecraft whose SPK kernel is not
+/// loaded, so its position could not be constructed. Distinct from
+/// [`EMPYREAN_REJECTION_UNSUPPORTED_OBSERVATORY`] (a code the engine does
+/// not model at all): this one is a **data-provisioning** gap the caller
+/// can close by loading the kernel, not a property of the observation.
+pub const EMPYREAN_REJECTION_SPACECRAFT_KERNEL_MISSING: i32 = 12;
+/// The observer position could not be constructed for a reason specific
+/// to this row (bad roving-observer record, epoch outside the loaded
+/// Earth-orientation coverage, …). The engine's per-row explanation is
+/// not carried across the ABI as a string; consult the batch-level error
+/// or the engine log for the detail.
+pub const EMPYREAN_REJECTION_OBSERVER_CONSTRUCTION_FAILED: i32 = 13;
+/// The observation was never absorbed into the fit: it reached no
+/// iteration that could have used it. Distinct from a rejection — no
+/// criterion was ever tested against it — and distinct from
+/// [`EMPYREAN_REJECTION_NOT_EVALUATED`], which means the call path ran
+/// no rejection pass at all.
+pub const EMPYREAN_REJECTION_NEVER_ABSORBED: i32 = 14;
 /// Rejection was not evaluated for this observation (e.g. evaluate path).
 pub const EMPYREAN_REJECTION_NOT_EVALUATED: i32 = -1;
 
@@ -299,9 +327,9 @@ pub const EMPYREAN_REJECTION_KIND_CMC2003: u8 = 1;
 
 /// No weighting preset — only `additional_layers` apply.
 pub const EMPYREAN_WEIGHTING_PRESET_NONE: u8 = 0;
-/// VFC17 — Vereš, Farnocchia, Chesley et al. 2017 station floors +
+/// VFCC2017 — Vereš, Farnocchia, Chesley & Chamberlin 2017 station floors +
 /// nightly de-weighting. The production default.
-pub const EMPYREAN_WEIGHTING_PRESET_VFC17: u8 = 1;
+pub const EMPYREAN_WEIGHTING_PRESET_VFCC2017: u8 = 1;
 /// NEODyS production preset.
 pub const EMPYREAN_WEIGHTING_PRESET_NEODYS: u8 = 2;
 
@@ -351,6 +379,13 @@ pub struct EmpyreanWeightingLayer {
     /// (days). Must be finite and > 0 — the production value is 0.5.
     /// Non-positive or non-finite values are rejected with an error
     /// (0.0 no longer silently maps to 0.5).
+    ///
+    /// The de-weighting **law** is not selectable at this ABI: a
+    /// `NIGHTLY_DEWEIGHTING` layer always applies Vereš, Farnocchia,
+    /// Chesley & Chamberlin (2017) §3 — σ unchanged for a batch of
+    /// N ≤ 4, then σ_eff = σ√(N/4). The pre-2017 σ_eff = σ√N law the
+    /// engine still carries as a historical baseline is deliberately
+    /// not exposed here.
     pub max_gap_days: f64,
 }
 
@@ -365,14 +400,14 @@ pub struct EmpyreanWeightingLayer {
 /// pipeline; the resulting layer chain is `additional_layers`
 /// followed by the preset's layers. Sigma resolution is
 /// first-match-wins, so a user rule overrides the preset for its
-/// station and the preset serves as the fallback (allows e.g. VFC17
+/// station and the preset serves as the fallback (allows e.g. VFCC2017
 /// + per-survey override).
 ///
 /// A **zero-initialized struct is NOT the production default** — it
 /// has `enabled = 0`, i.e. weighting disabled (uniform 1″). The
-/// production combination (VFC17 station floors + nightly
+/// production combination (VFCC2017 station floors + nightly
 /// de-weighting + Floor policy) must be requested explicitly:
-/// `enabled = 1`, `preset = VFC17`, `sigma_policy = -1`, plus one
+/// `enabled = 1`, `preset = VFCC2017`, `sigma_policy = -1`, plus one
 /// `NIGHTLY_DEWEIGHTING` additional layer.
 #[repr(C)]
 pub struct EmpyreanWeightingConfig {
@@ -391,7 +426,7 @@ pub struct EmpyreanWeightingConfig {
     /// 1.0. Ignored when preset != NONE.
     pub default_sigma_arcsec: f64,
     /// Sigma combination policy. -1 = use the preset's policy
-    /// (VFC17 / NEODYS presets use Floor); otherwise one of
+    /// (VFCC2017 / NEODYS presets use Floor); otherwise one of
     /// `EMPYREAN_SIGMA_POLICY_*`. Note `0` is DEFAULT_ONLY — an
     /// **active override**, not "unset": a zero-initialized field
     /// replaces a preset's Floor policy with DefaultOnly. Callers
@@ -488,7 +523,35 @@ pub const EMPYREAN_PHOTOMETRY_MODEL_HG1G2: i32 = 4;
 /// per-crate semver strings in `EmpyreanVersions` (which are provenance).
 /// Consumers compiled against a given `EMPYREAN_SOLVE_WIDTH` check this at
 /// load; any additive change to the frozen structs bumps it.
-pub const EMPYREAN_ABI_VERSION: u32 = 2;
+///
+/// Version 3 (this one) is a single, batched break:
+///
+/// - `EmpyreanPropagationConfig` grows `ephemeris_overlap_policy` at its tail (and
+///   so does the `EmpyreanEphemerisConfig` that embeds it);
+/// - `EmpyreanObserver` grows `frame` / `origin` — the basis the state
+///   is expressed in, which used to be an undeclared ICRF/SSB
+///   assumption;
+/// - `EmpyreanTaggedCovariance` grows `quality_kappa_state`, the payload
+///   of the new `EMPYREAN_COVARIANCE_QUALITY_EXPANSION_SUSPECT` tag;
+/// - `empyrean_transform_coordinates` becomes the **batched** entry
+///   point (array in, array out) and the one-state form is renamed
+///   `empyrean_transform_coordinates_single`;
+/// - `empyrean_get_observers` gains `frame` / `origin` parameters;
+/// - `empyrean_determine` becomes the **batched** entry point: it writes
+///   an [`EmpyreanDetermineResults`] table with one
+///   [`EmpyreanODObjectResult`] per ADES object instead of a single
+///   [`EmpyreanODResult`], and its output is released with the new
+///   [`empyrean_determine_results_free`];
+/// - [`EmpyreanObservationResult`] grows `object_id`, and
+///   [`EmpyreanAcceptabilityReport`] grows the selection-fraction,
+///   selected-arc-coverage and trailing-gap gate axes plus the
+///   `radar_fit_ok` tri-state.
+///
+/// Fields are only ever appended, never reordered or removed, so the
+/// signature changes are the only source-breaking ones — a consumer
+/// built against an older header must recompile against this one either
+/// way.
+pub const EMPYREAN_ABI_VERSION: u32 = 3;
 
 /// Runtime accessor for [`EMPYREAN_ABI_VERSION`] — lets a dynamically
 /// linked consumer confirm the loaded library's frozen-shape contract
@@ -533,15 +596,26 @@ pub const EMPYREAN_REPRESENTATION_SPHERICAL: i32 = 3;
 /// for the call type (e.g. evaluate doesn't compute rejection or
 /// influence diagnostics).
 ///
-/// `obs_id` is a heap-allocated NUL-terminated UTF-8 string; the
-/// pointer is freed by [`empyrean_od_result_free`] /
+/// `obs_id`, `object_id` and `ast_cat` are heap-allocated NUL-terminated
+/// UTF-8 strings; the pointers are freed by
+/// [`empyrean_determine_results_free`] / [`empyrean_od_result_free`] /
 /// [`empyrean_evaluate_result_free`] when the parent array is freed.
-/// Do NOT free it manually.
+/// Do NOT free them manually.
 #[repr(C)]
 pub struct EmpyreanObservationResult {
     /// ADES `obsID` (or scott auto-assigned). Owned by the parent array
     /// — freed by the matching `*_result_free` call.
     pub obs_id: *mut c_char,
+    /// ADES object identifier (permID / provID / trkSub) of the object
+    /// this row was fitted against. Populated by
+    /// [`empyrean_determine`], which groups by object — so a caller may
+    /// concatenate every object's rows into one flat table and still
+    /// know which fit each row belongs to.
+    ///
+    /// Null on the single-object paths (`empyrean_evaluate`,
+    /// `empyrean_refine`), where the caller supplied the one orbit and
+    /// no grouping key exists. Owned by the parent array.
+    pub object_id: *mut c_char,
     /// MPC observatory code (3-byte + NUL).
     pub obs_code: [u8; 4],
     /// Star catalog used for astrometric reduction (ADES `astCat`).
@@ -672,11 +746,31 @@ pub struct EmpyreanResidualSummary {
 /// Acceptability sub-checks computed post-DC.
 ///
 /// Mirrors scott's [`AcceptabilityReport`](scott::od::AcceptabilityReport).
-/// Boolean fields are encoded as `u8` (0/1). When a value is unavailable
-/// (e.g. AT/CT ratio with no sky-motion rates), the `_value` is NaN and
-/// the corresponding `_ok` flag is 0. Always populated on
+/// Boolean fields are encoded as `u8` (0/1). Always populated on
 /// [`EmpyreanODResult`]; on [`EmpyreanEvaluateResult`] the report is
 /// filled with NaN/0 because evaluate does not produce a fitted orbit.
+///
+/// # NaN convention
+///
+/// **Every `f64` here is NaN when the quantity could not be computed**
+/// (AT/CT ratio with no sky-motion rates, selected-arc spans when the fit
+/// selected nothing, …) — NaN is the only "not computable" marker, never
+/// `0.0`, because a threshold-comparison of `0.0` reads as a real
+/// measurement that happens to be at the floor. The `_ok` booleans are
+/// **always valid**: a gate whose value is NaN reports `0` (did not pass),
+/// so a consumer can branch on the verdict without first testing the value
+/// for NaN.
+///
+/// # Fit vs. extrapolation
+///
+/// `fit_acceptable` is the AND of the fit-quality gates (convergence,
+/// positive-definite covariance, reduced χ², RMS, residual isotropy).
+/// `extrapolation_acceptable` additionally requires the four selection /
+/// coverage axes below — `selection_fraction_ok`,
+/// `selected_arc_coverage_ok`, `trailing_gap_ok` and
+/// `fractional_sigma_a_ok`. Those four are deliberately NOT part of
+/// `fit_acceptable`: a heavily pruned fit can still describe its retained
+/// subset well while being unsafe to propagate forward.
 #[repr(C)]
 pub struct EmpyreanAcceptabilityReport {
     pub fit_acceptable: u8,
@@ -692,12 +786,54 @@ pub struct EmpyreanAcceptabilityReport {
     pub at_ct_ratio_value: f64,
     pub at_ct_ratio_threshold: f64,
     pub covariance_ok: u8,
+    /// FULL observation span at or above `arc_days_threshold`. Kept for
+    /// callers that want the full-arc meaning; `extrapolation_acceptable`
+    /// judges coverage on `selected_arc_coverage_ok` instead.
     pub arc_coverage_ok: u8,
     pub arc_days_value: f64,
     pub arc_days_threshold: f64,
     pub fractional_sigma_a_ok: u8,
     pub fractional_sigma_a_value: f64,
     pub fractional_sigma_a_threshold: f64,
+    /// Fraction of observations retained (n_selected / n_obs) at or above
+    /// the configured floor. `false` means the residual bars above
+    /// describe a heavily pruned subset. Reproduce the fraction from
+    /// `selection_fraction_value`, NOT from
+    /// [`EmpyreanResidualSummary`] — the summary counts merged
+    /// radar / occultation stub rows that were never candidates for
+    /// outlier pruning, so its ratio is a different (smaller) number.
+    pub selection_fraction_ok: u8,
+    pub selection_fraction_value: f64,
+    pub selection_fraction_threshold: f64,
+    /// The SELECTED observations cover enough of the arc to extrapolate
+    /// across it: the selected span clears the absolute
+    /// `arc_days_threshold` floor AND spans at least
+    /// `selected_arc_fraction_threshold` of the full observed span.
+    pub selected_arc_coverage_ok: u8,
+    /// Arc span (days) over the selected observations only. NaN when
+    /// nothing is selected.
+    pub selected_arc_days_value: f64,
+    /// Selected-span / full-span ratio.
+    pub selected_arc_fraction_value: f64,
+    pub selected_arc_fraction_threshold: f64,
+    /// The most-recent observations were NOT rejected. The absolute,
+    /// asymmetric backstop the span-ratio axis cannot provide: it catches
+    /// a short recent tail rejected off a long arc, where the ratio still
+    /// passes but the discarded rows are the ones nearest a forward
+    /// extrapolation target.
+    pub trailing_gap_ok: u8,
+    /// Days between the last selected and the last full-arc observation.
+    /// `0.0` when the last kept observation is the last observation; NaN
+    /// when nothing is selected.
+    pub trailing_gap_days_value: f64,
+    pub trailing_gap_threshold: f64,
+    /// Radar astrometry joint-fit acceptability, as a tri-state:
+    /// `1` = pass, `0` = fail, `-1` = not applicable (no radar
+    /// contribution to this fit). Currently always `-1` — upstream
+    /// reserves this for when optical and radar both constrain a fit.
+    /// `-1` is distinct from `0` on purpose: "no radar" must never read
+    /// as "radar failed".
+    pub radar_fit_ok: i8,
 }
 
 /// One per-station bias estimate from a Schur-eliminated nuisance fit.
@@ -1081,6 +1217,100 @@ pub struct EmpyreanODResult {
     pub trust_second_order_recoverable: u8,
 }
 
+// ── Per-object failure codes (EmpyreanODObjectResult::error_code) ──
+/// The object delivered a fit; `error` is null.
+pub const EMPYREAN_OD_FAILURE_NONE: i32 = 0;
+/// Observation conversion failed (UTC → TDB, malformed record, …).
+pub const EMPYREAN_OD_FAILURE_OBSERVATION_CONVERSION: i32 = 1;
+/// Observer position could not be constructed (unknown observatory
+/// code, epoch outside the loaded kernels, unsupported spacecraft).
+pub const EMPYREAN_OD_FAILURE_OBSERVER_CONSTRUCTION: i32 = 2;
+/// A roving-observer record used a coordinate system the engine does
+/// not support.
+pub const EMPYREAN_OD_FAILURE_UNSUPPORTED_COORDINATE_SYSTEM: i32 = 3;
+/// The loaded Earth-orientation (BPC) coverage does not span the
+/// observations. An **engine-configuration** failure, not a property of
+/// the data — the three-Earth-kernel set must be present.
+pub const EMPYREAN_OD_FAILURE_EARTH_ORIENTATION_COVERAGE: i32 = 4;
+/// Initial orbit determination failed to produce a seed.
+pub const EMPYREAN_OD_FAILURE_IOD: i32 = 5;
+/// The N-body differential correction failed.
+pub const EMPYREAN_OD_FAILURE_OD: i32 = 6;
+/// Two observations of this object carried the same observation ID.
+pub const EMPYREAN_OD_FAILURE_DUPLICATE_OBS_IDS: i32 = 7;
+/// Radar observations were supplied with no optical astrometry. Radar
+/// leaves the two plane-of-sky angular degrees of freedom
+/// unconstrained, so the fit is under-determined.
+pub const EMPYREAN_OD_FAILURE_RADAR_ONLY: i32 = 8;
+/// An explicit non-gravitational solve could not recover A1/A2/A3.
+/// Surfaced rather than silently degrading to a state-only fit.
+pub const EMPYREAN_OD_FAILURE_NON_GRAV_NOT_RECOVERED: i32 = 9;
+
+/// One object's slot in a batch [`empyrean_determine`] result.
+///
+/// Exactly one of the two payloads is live, selected by `delivered`:
+///
+/// - `delivered == 1` — `result` is a fully populated
+///   [`EmpyreanODResult`], `error` is null and `error_code` is
+///   [`EMPYREAN_OD_FAILURE_NONE`].
+/// - `delivered == 0` — this object's fit failed. `error` carries the
+///   engine's message and `error_code` classifies it
+///   (`EMPYREAN_OD_FAILURE_*`). **`result` is NaN-poisoned**: every
+///   `f64` is NaN, every pointer null, every count 0, and every
+///   enumerated `i32` is `-1` (never a valid code), so a caller that
+///   forgets to check `delivered` gets an obviously invalid record
+///   rather than a plausible all-zero fit.
+///
+/// A failed object never aborts the batch — the other objects are still
+/// fitted and delivered.
+///
+/// `object_id` and `error` are owned by the parent table and freed by
+/// [`empyrean_determine_results_free`]. Do NOT free them manually.
+#[repr(C)]
+pub struct EmpyreanODObjectResult {
+    /// ADES object identifier (permID / provID / trkSub) this slot's
+    /// observations were grouped under. `"unknown"` when the group's
+    /// records carried no identifier at all. Never null.
+    pub object_id: *mut c_char,
+    /// 1 when `result` carries a delivered fit; 0 when the fit failed.
+    pub delivered: u8,
+    /// The fit. Meaningful only when `delivered == 1`; NaN-poisoned
+    /// otherwise (see the type-level note).
+    pub result: EmpyreanODResult,
+    /// Failure message. Null when `delivered == 1`.
+    pub error: *mut c_char,
+    /// `EMPYREAN_OD_FAILURE_*` classification of `error`.
+    /// [`EMPYREAN_OD_FAILURE_NONE`] when `delivered == 1`.
+    pub error_code: i32,
+}
+
+/// Result table of a batch [`empyrean_determine`] — one
+/// [`EmpyreanODObjectResult`] per ADES object found in the
+/// observations, in ascending `object_id` order.
+///
+/// Ordering is by identifier rather than by input row order so the same
+/// observation set produces the same table regardless of how the rows
+/// were interleaved, and so a caller can bisect for an object.
+///
+/// Release with [`empyrean_determine_results_free`] — including when
+/// `empyrean_determine` returned
+/// [`EMPYREAN_DETERMINE_NONE_DELIVERED`], which still populates the
+/// table.
+#[repr(C)]
+pub struct EmpyreanDetermineResults {
+    /// Owned array of per-object slots. Null only when
+    /// `num_objects == 0`.
+    pub objects: *mut EmpyreanODObjectResult,
+    pub num_objects: usize,
+    /// Initial-orbit keys that matched no observation group. A seed the
+    /// caller supplied and the engine could not attach to any object is
+    /// reported here rather than dropped: it means the seed's identity
+    /// does not match any ADES identifier in the observations. Owned
+    /// array of owned C strings.
+    pub unmatched_orbit_ids: *mut *mut c_char,
+    pub num_unmatched_orbit_ids: usize,
+}
+
 /// Result of orbit evaluation (residuals without fitting).
 ///
 /// Same per-observation surface as [`EmpyreanODResult`] (rejection +
@@ -1252,7 +1482,7 @@ pub struct EmpyreanODConfig {
     pub frame: i32,
     /// Observation weighting pipeline configuration. Zero-init =
     /// `enabled = 0` = weighting DISABLED (uniform 1″); the
-    /// production default (VFC17 + nightly de-weighting at floor-σ
+    /// production default (VFCC2017 + nightly de-weighting at floor-σ
     /// policy) must be requested explicitly. See
     /// [`EmpyreanWeightingConfig`].
     pub weighting: EmpyreanWeightingConfig,
@@ -1282,8 +1512,29 @@ pub struct EmpyreanODConfig {
     pub max_iterations: u32,
     /// DC convergence tolerance on Δx^T N Δx. 0.0 → upstream default (0.1).
     pub convergence_tol: f64,
-    /// Use STM-cached ephemeris updates for iterations 2+. 1 = on (default).
-    pub use_stm_cache: u8,
+    /// Allow the outward-expansion pipeline to truncate a sub-arc it
+    /// cannot fit as one piece. Tri-state: `-1` (or any negative) =
+    /// engine default (allowed), `1` = allowed, `0` = **forbidden**.
+    ///
+    /// Forbidding truncation makes an arc that spans a dynamical
+    /// discontinuity FAIL loudly instead of delivering a fit of the
+    /// reconcilable sub-arc with the rest tagged
+    /// `EMPYREAN_REJECTION_OUTSIDE_ARC`. Two interactions matter before
+    /// relying on `0`: per-observation rejection is orthogonal and still
+    /// runs (set `rejection.enabled = 0` as well to fit the whole arc or
+    /// fail), and under `EMPYREAN_ORIGIN_POLICY_AUTO` the refusal is a
+    /// cascade trigger rather than a final answer — pin the origin with
+    /// `EMPYREAN_ORIGIN_POLICY_EXPLICIT` to get a pure loud failure.
+    pub allow_arc_truncation: i8,
+    /// Master switch for the co-orbital IOD lane. Tri-state: `-1` (or any
+    /// negative) = engine default (enabled), `1` = enabled, `0` = forced
+    /// off (the historical cascade).
+    ///
+    /// Enabling it does not route ordinary objects through the lane: it
+    /// still fires only when every co-orbitality gate passes. The lane's
+    /// detection parameters are not exposed here — reach for the
+    /// empyrean-core Rust API to tune them.
+    pub coorbital_enabled: i8,
     /// Solve-for parameter set (`EMPYREAN_SOLVE_FOR_*`). Default = Auto.
     pub solve_for: i32,
     pub auto_escalation: EmpyreanAutoEscalationPolicy,
@@ -1558,6 +1809,13 @@ pub(crate) fn scott_radar_to_c(r: &RadarObservation) -> EmpyreanRadarObservation
 }
 
 /// Heap-allocate a NUL-terminated C string. Empty input returns null.
+/// Test-only alias so sibling modules can build owned C strings for
+/// fixture rows without duplicating the allocator.
+#[cfg(test)]
+pub(crate) fn alloc_cstring_for_test(s: &str) -> *mut c_char {
+    alloc_cstring(s)
+}
+
 fn alloc_cstring(s: &str) -> *mut c_char {
     if s.is_empty() {
         return std::ptr::null_mut();
@@ -1577,7 +1835,11 @@ unsafe fn free_cstring(p: *mut c_char) {
     }
 }
 
-fn rejection_reason_to_c(reason: RejectionReason) -> i32 {
+/// Map a per-observation rejection reason onto its stable C code.
+///
+/// Takes a reference: [`RejectionReason::ObserverConstructionFailed`]
+/// carries a `String`, so the enum is no longer `Copy`.
+fn rejection_reason_to_c(reason: &RejectionReason) -> i32 {
     match reason {
         RejectionReason::Accepted => EMPYREAN_REJECTION_ACCEPTED,
         RejectionReason::ChiSquared => EMPYREAN_REJECTION_CHI_SQUARED,
@@ -1591,6 +1853,19 @@ fn rejection_reason_to_c(reason: RejectionReason) -> i32 {
             EMPYREAN_REJECTION_OCCULTATION_UNSUPPORTED
         }
         RejectionReason::OutsideArc => EMPYREAN_REJECTION_OUTSIDE_ARC,
+        RejectionReason::SpacecraftKernelMissing => EMPYREAN_REJECTION_SPACECRAFT_KERNEL_MISSING,
+        RejectionReason::ObserverConstructionFailed(_) => {
+            EMPYREAN_REJECTION_OBSERVER_CONSTRUCTION_FAILED
+        }
+        RejectionReason::NeverAbsorbed => EMPYREAN_REJECTION_NEVER_ABSORBED,
+        RejectionReason::RejectionNotRun => EMPYREAN_REJECTION_NOT_EVALUATED,
+        // Forward references: these two variants ship with the scott
+        // observation-guard branch. The codes are already reserved and
+        // published, so the mapping is written now and compiles the
+        // moment the engine grows them — deleting it would silently
+        // re-open the "48 of 48 used" hole they exist to close.
+        RejectionReason::NonFiniteChi2 => EMPYREAN_REJECTION_NON_FINITE_CHI2,
+        RejectionReason::MissingJacobian => EMPYREAN_REJECTION_MISSING_JACOBIAN,
     }
 }
 
@@ -1599,8 +1874,15 @@ fn rejection_reason_to_c(reason: RejectionReason) -> i32 {
 /// Each entry's `obs_id` and `ast_cat` strings are heap-allocated and
 /// owned by the array. The caller frees them with the matching
 /// [`empyrean_od_result_free`] / [`empyrean_evaluate_result_free`].
+/// Marshal scott's per-observation records into the owned C array.
+///
+/// `object_id` is the ADES grouping key every row belongs to — `Some` on
+/// the batch determine path (so a flattened multi-object residual table
+/// stays attributable), `None` on the single-object evaluate / refine
+/// paths, where it is written as a null pointer.
 pub(crate) fn observation_results_to_c(
     observations: &[ObservationResult],
+    object_id: Option<&str>,
 ) -> (*mut EmpyreanObservationResult, usize) {
     let n = observations.len();
     if n == 0 {
@@ -1641,7 +1923,7 @@ pub(crate) fn observation_results_to_c(
         // Rejection decision (None on the evaluate path).
         let (rej_reason, rej_crit, rej_thr, rej_eff, rej_loss) = match &obs.rejection {
             Some(d) => (
-                rejection_reason_to_c(d.reason),
+                rejection_reason_to_c(&d.reason),
                 d.criterion_value,
                 d.threshold,
                 d.effective_threshold.unwrap_or(f64::NAN),
@@ -1700,6 +1982,10 @@ pub(crate) fn observation_results_to_c(
 
         let entry = EmpyreanObservationResult {
             obs_id: alloc_cstring(&obs.obs_id),
+            object_id: match object_id {
+                Some(id) => alloc_cstring(id),
+                None => std::ptr::null_mut(),
+            },
             obs_code: code,
             ast_cat: alloc_cstring(obs.ast_cat.as_deref().unwrap_or("")),
             epoch_mjd_tdb: obs.epoch_mjd_tdb,
@@ -1754,9 +2040,11 @@ unsafe fn free_observation_results(ptr: *mut EmpyreanObservationResult, n: usize
         let entry = unsafe { &mut *ptr.add(i) };
         unsafe {
             free_cstring(entry.obs_id);
+            free_cstring(entry.object_id);
             free_cstring(entry.ast_cat);
         }
         entry.obs_id = std::ptr::null_mut();
+        entry.object_id = std::ptr::null_mut();
         entry.ast_cat = std::ptr::null_mut();
     }
     let layout = std::alloc::Layout::array::<EmpyreanObservationResult>(n)
@@ -1902,6 +2190,189 @@ fn solved_covariance_to_c(sc: &SolvedCovariance) -> EmpyreanSolvedCovariance {
         amrat_slot: slot_to_c(sc.amrat_slot),
         thrust_slots,
         thrust_count: sc.thrust_count as u32,
+    }
+}
+
+/// The `EmpyreanODResult` written into a failed object's slot.
+///
+/// Not a zeroed struct: an all-zero fit is a *plausible* fit (converged
+/// at the origin with a singular covariance), and a caller who forgot to
+/// test `delivered` would carry it forward silently. Every `f64` is NaN,
+/// every enumerated `i32` is `-1` (outside every code's value set), every
+/// count and flag is 0, and every owned pointer is null so the free path
+/// is a no-op for this slot.
+fn poisoned_od_result() -> EmpyreanODResult {
+    EmpyreanODResult {
+        orbit: EmpyreanPropagatedState {
+            epoch_mjd_tdb: f64::NAN,
+            x: f64::NAN,
+            y: f64::NAN,
+            z: f64::NAN,
+            vx: f64::NAN,
+            vy: f64::NAN,
+            vz: f64::NAN,
+            origin: -1,
+            frame: -1,
+            covariance: [[f64::NAN; 6]; 6],
+            has_covariance: 0,
+            stm: [[f64::NAN; 6]; 6],
+            has_stm: 0,
+            stt: [[[f64::NAN; 6]; 6]; 6],
+            has_stt: 0,
+            resolved_kind: 0,
+        },
+        observations: std::ptr::null_mut(),
+        num_observations: 0,
+        summary: EmpyreanResidualSummary {
+            num_obs: 0,
+            num_selected: 0,
+            num_rejected: 0,
+            chi2: f64::NAN,
+            dof: 0,
+            reduced_chi2: f64::NAN,
+            rms_ra_arcsec: f64::NAN,
+            rms_dec_arcsec: f64::NAN,
+            rms_combined_arcsec: f64::NAN,
+            weighted_rms_ra_arcsec: f64::NAN,
+            weighted_rms_dec_arcsec: f64::NAN,
+            weighted_rms_combined_arcsec: f64::NAN,
+            mean_ra_arcsec: f64::NAN,
+            mean_dec_arcsec: f64::NAN,
+            std_ra_arcsec: f64::NAN,
+            std_dec_arcsec: f64::NAN,
+            rms_along_track_arcsec: f64::NAN,
+            rms_cross_track_arcsec: f64::NAN,
+        },
+        iterations: 0,
+        update_norm: f64::NAN,
+        converged: 0,
+        covariance: [[f64::NAN; 6]; 6],
+        covariance_representation: -1,
+        has_covariance_9x9: 0,
+        covariance_9x9: [[f64::NAN; 9]; 9],
+        has_non_grav_delta: 0,
+        non_grav_delta: [f64::NAN; 3],
+        has_non_grav: 0,
+        non_grav: EmpyreanNonGravParams {
+            a1: f64::NAN,
+            a2: f64::NAN,
+            a3: f64::NAN,
+            ng_alpha: f64::NAN,
+            ng_r0: f64::NAN,
+            ng_m: f64::NAN,
+            ng_n: f64::NAN,
+            ng_k: f64::NAN,
+            has_dt: 0,
+            non_grav_dt: f64::NAN,
+            has_covariance: 0,
+            covariance: [[f64::NAN; 3]; 3],
+        },
+        rejection_passes: 0,
+        num_oppositions_fit: 0,
+        force_model_used: -1,
+        solve_for_used: -1,
+        acceptability: poisoned_acceptability_report(),
+        station_biases: std::ptr::null_mut(),
+        num_station_biases: 0,
+        has_solved_covariance: 0,
+        solved_covariance: EmpyreanSolvedCovariance {
+            matrix: [[f64::NAN; EMPYREAN_SOLVE_WIDTH]; EMPYREAN_SOLVE_WIDTH],
+            width: 0,
+            marsden_slot: EMPYREAN_SLOT_NONE,
+            dt_slot: EMPYREAN_SLOT_NONE,
+            amrat_slot: EMPYREAN_SLOT_NONE,
+            thrust_slots: [[EMPYREAN_SLOT_NONE; 3]; 3],
+            thrust_count: 0,
+        },
+        has_dt_delta: 0,
+        dt_delta: f64::NAN,
+        has_amrat_delta: 0,
+        amrat_delta: f64::NAN,
+        thrust_delta_count: 0,
+        thrust_delta_m_per_s: [[f64::NAN; 3]; 3],
+        dv_frame: -1,
+        has_photometry: 0,
+        // Zeroed (not NaN-filled) because the free path walks its owned
+        // arrays: the pointers must be null and the counts 0.
+        photometry: zeroed_photometry_result(),
+        has_srp: 0,
+        srp: EmpyreanSRPParams {
+            amrat: f64::NAN,
+            cr: f64::NAN,
+            has_amrat_variance: 0,
+            amrat_variance: f64::NAN,
+        },
+        covariance_trust: -1,
+        trust_event_kind: -1,
+        trust_event_epoch_mjd_tdb: f64::NAN,
+        trust_event_distance_au: f64::NAN,
+        trust_event_nonlinearity: f64::NAN,
+        trust_event_threshold: f64::NAN,
+        trust_event_body: std::ptr::null_mut(),
+        trust_solved_width: 0,
+        trust_second_order_recoverable: 0,
+    }
+}
+
+/// The acceptability block of a failed object's slot: no gate passed
+/// (every `_ok` is 0, which is the always-valid reading) and no
+/// measurement exists (every value is NaN).
+fn poisoned_acceptability_report() -> EmpyreanAcceptabilityReport {
+    EmpyreanAcceptabilityReport {
+        fit_acceptable: 0,
+        extrapolation_acceptable: 0,
+        converged_ok: 0,
+        reduced_chi2_ok: 0,
+        reduced_chi2_value: f64::NAN,
+        reduced_chi2_threshold: f64::NAN,
+        rms_ok: 0,
+        rms_value_arcsec: f64::NAN,
+        rms_threshold_arcsec: f64::NAN,
+        residual_isotropy_ok: 0,
+        at_ct_ratio_value: f64::NAN,
+        at_ct_ratio_threshold: f64::NAN,
+        covariance_ok: 0,
+        arc_coverage_ok: 0,
+        arc_days_value: f64::NAN,
+        arc_days_threshold: f64::NAN,
+        fractional_sigma_a_ok: 0,
+        fractional_sigma_a_value: f64::NAN,
+        fractional_sigma_a_threshold: f64::NAN,
+        selection_fraction_ok: 0,
+        selection_fraction_value: f64::NAN,
+        selection_fraction_threshold: f64::NAN,
+        selected_arc_coverage_ok: 0,
+        selected_arc_days_value: f64::NAN,
+        selected_arc_fraction_value: f64::NAN,
+        selected_arc_fraction_threshold: f64::NAN,
+        trailing_gap_ok: 0,
+        trailing_gap_days_value: f64::NAN,
+        trailing_gap_threshold: f64::NAN,
+        radar_fit_ok: -1,
+    }
+}
+
+/// Classify a per-object [`DetermineError`] into its stable
+/// `EMPYREAN_OD_FAILURE_*` code.
+///
+/// Exhaustive on purpose: a new upstream variant must fail this match at
+/// compile time rather than fall into a catch-all that reports the wrong
+/// cause.
+fn determine_error_code(e: &DetermineError) -> i32 {
+    match e {
+        DetermineError::ObservationConversion(_) => EMPYREAN_OD_FAILURE_OBSERVATION_CONVERSION,
+        DetermineError::ObserverConstruction { .. } => EMPYREAN_OD_FAILURE_OBSERVER_CONSTRUCTION,
+        DetermineError::UnsupportedCoordinateSystem { .. } => {
+            EMPYREAN_OD_FAILURE_UNSUPPORTED_COORDINATE_SYSTEM
+        }
+        DetermineError::EarthOrientationCoverageIncomplete { .. } => {
+            EMPYREAN_OD_FAILURE_EARTH_ORIENTATION_COVERAGE
+        }
+        DetermineError::IOD(_) => EMPYREAN_OD_FAILURE_IOD,
+        DetermineError::OD(_) => EMPYREAN_OD_FAILURE_OD,
+        DetermineError::DuplicateObsIds(_) => EMPYREAN_OD_FAILURE_DUPLICATE_OBS_IDS,
+        DetermineError::RadarOnly { .. } => EMPYREAN_OD_FAILURE_RADAR_ONLY,
+        DetermineError::NonGravNotRecovered { .. } => EMPYREAN_OD_FAILURE_NON_GRAV_NOT_RECOVERED,
     }
 }
 
@@ -2211,8 +2682,12 @@ pub(crate) unsafe fn write_covariance_trust(
 /// to zero on the other — the failure mode that had the session path
 /// returning an all-zero covariance, `NaN` non-gravitational parameters and
 /// a `solve_for_used` that disagreed with the fit that actually ran.
-pub(crate) unsafe fn write_od_result_fields(result_out: *mut EmpyreanODResult, od: &ODResult) {
-    let (obs_ptr, obs_n) = observation_results_to_c(&od.observations);
+pub(crate) unsafe fn write_od_result_fields(
+    result_out: *mut EmpyreanODResult,
+    od: &ODResult,
+    object_id: Option<&str>,
+) {
+    let (obs_ptr, obs_n) = observation_results_to_c(&od.observations, object_id);
     let summary = summary_to_c(&od.summary);
     let acceptability = acceptability_to_c(&od.acceptability);
 
@@ -2340,6 +2815,23 @@ pub(crate) fn acceptability_to_c(r: &AcceptabilityReport) -> EmpyreanAcceptabili
         fractional_sigma_a_ok: u8::from(r.fractional_sigma_a_ok),
         fractional_sigma_a_value: r.fractional_sigma_a_value,
         fractional_sigma_a_threshold: r.fractional_sigma_a_threshold,
+        selection_fraction_ok: u8::from(r.selection_fraction_ok),
+        selection_fraction_value: r.selection_fraction_value,
+        selection_fraction_threshold: r.selection_fraction_threshold,
+        selected_arc_coverage_ok: u8::from(r.selected_arc_coverage_ok),
+        selected_arc_days_value: r.selected_arc_days_value,
+        selected_arc_fraction_value: r.selected_arc_fraction_value,
+        selected_arc_fraction_threshold: r.selected_arc_fraction_threshold,
+        trailing_gap_ok: u8::from(r.trailing_gap_ok),
+        trailing_gap_days_value: r.trailing_gap_days_value,
+        trailing_gap_threshold: r.trailing_gap_threshold,
+        // Tri-state: -1 = no radar contribution, so "no radar" never
+        // reads as "radar failed".
+        radar_fit_ok: match r.radar_fit_ok {
+            Some(true) => 1,
+            Some(false) => 0,
+            None => -1,
+        },
     }
 }
 
@@ -2588,7 +3080,9 @@ fn int_to_coord_rep(v: i32) -> Result<CoordinateRepresentation, String> {
 fn build_weighting_from_c(
     c: &EmpyreanWeightingConfig,
 ) -> Result<Option<empyrean_core::determination::WeightingConfig>, String> {
-    use empyrean_core::determination::{SigmaPolicy, WeightingConfig, WeightingLayer};
+    use empyrean_core::determination::{
+        FloorsTable, NightlyDeweighting, SigmaPolicy, WeightingConfig, WeightingLayer,
+    };
     use empyrean_core::time::Epoch;
 
     if c.enabled == 0 {
@@ -2598,7 +3092,7 @@ fn build_weighting_from_c(
     // `preset = NONE` means exactly what it says: no preset rules, the
     // caller's `default_sigma_arcsec` applies uniformly (DefaultOnly
     // policy unless `sigma_policy` overrides it). There is NO silent
-    // substitution of the production preset — a caller who wants VFC17
+    // substitution of the production preset — a caller who wants VFCC2017
     // must request it. (A zero-initialized struct never reaches this
     // code: `enabled = 0` returns above, i.e. zero-init = weighting
     // disabled, not the production default.)
@@ -2630,15 +3124,40 @@ fn build_weighting_from_c(
             },
             layers: Vec::new(),
             sigma_policy: SigmaPolicy::default(),
+            // `NONE` builds the layer chain by hand, so it has no
+            // published station-floors table behind it — the identity is
+            // recorded as `FloorsTable::Custom`. The identity is *recorded*,
+            // never inferred, so it stays `Custom` even once user layers
+            // are inserted below: a chain that merely resembles a
+            // published table must not be reported as one. The preset
+            // arms below carry whatever identity their own constructor
+            // set.
+            //
+            // Named directly now that `FloorsTable` is re-exported from
+            // `empyrean_core::determination` (it is part of the public
+            // shape of the re-exported `WeightingConfig`). This is the same
+            // value the engine's own `Default` yields, but spelling the
+            // variant makes the provenance visible at the call site and
+            // fails to compile if the empty-chain identity ever changes;
+            // `weighting_identity_tests` pins it with a direct
+            // variant-equality assertion.
+            //
+            // This arm is the only site that sets the field: it builds an
+            // EMPTY layer chain, so "no published table identity" is the
+            // true provenance. The preset arms below keep whatever
+            // identity their own constructor recorded.
+            floors_table: FloorsTable::Custom,
         },
-        EMPYREAN_WEIGHTING_PRESET_VFC17 => WeightingConfig::veres_farnocchia_chesley_2017(),
+        EMPYREAN_WEIGHTING_PRESET_VFCC2017 => {
+            WeightingConfig::veres_farnocchia_chesley_chamberlin_2017()
+        }
         EMPYREAN_WEIGHTING_PRESET_NEODYS => WeightingConfig::neodys()
             .map_err(|e| format!("failed to load NEODyS weighting preset: {e}"))?,
         other => {
             return Err(format!(
-                "unsupported weighting.preset = {other} (expected NONE = {} / VFC17 = {} / NEODYS = {})",
+                "unsupported weighting.preset = {other} (expected NONE = {} / VFCC2017 = {} / NEODYS = {})",
                 EMPYREAN_WEIGHTING_PRESET_NONE,
-                EMPYREAN_WEIGHTING_PRESET_VFC17,
+                EMPYREAN_WEIGHTING_PRESET_VFCC2017,
                 EMPYREAN_WEIGHTING_PRESET_NEODYS,
             ));
         }
@@ -2780,6 +3299,25 @@ fn build_weighting_from_c(
                     }
                     WeightingLayer::NightlyDeweighting {
                         max_gap_days: layer.max_gap_days,
+                        // The engine admits two published de-weighting
+                        // laws; this ABI exposes only the current one
+                        // (Vereš et al. 2017 §3, σ_eff = σ√(N/4) above
+                        // N = 4). That is a *subset*, not a dropped
+                        // request: `EmpyreanWeightingLayer` carries no
+                        // scheme field, so there is no caller choice to
+                        // discard. The pre-2017 √N law is retained
+                        // upstream as a historical baseline only,
+                        // reachable from the Rust engine API.
+                        //
+                        // Named directly now that `NightlyDeweighting` is
+                        // re-exported from `empyrean_core::determination`.
+                        // This is the same value the engine's own
+                        // `Default` yields, but spelling the variant makes
+                        // the selected law visible at the call site and
+                        // fails to compile if the default ever changes;
+                        // `weighting_identity_tests` pins it with a direct
+                        // variant-equality assertion.
+                        scheme: NightlyDeweighting::VFCC2017,
                     }
                 }
                 other => {
@@ -3038,7 +3576,21 @@ pub(crate) fn build_od_config_from_c(c: &EmpyreanODConfig) -> Result<ODConfig, S
     if c.convergence_tol > 0.0 {
         cfg.convergence_tol = c.convergence_tol;
     }
-    cfg.use_stm_cache = c.use_stm_cache != 0;
+    // Tri-state: negative keeps the engine default, so a zero-initialized
+    // struct is NOT read as "forbid truncation" / "disable the co-orbital
+    // lane". Both knobs pick a documented behaviour, never a silent one.
+    if c.allow_arc_truncation >= 0 {
+        cfg.allow_arc_truncation = c.allow_arc_truncation != 0;
+    }
+    if c.coorbital_enabled >= 0 {
+        cfg.coorbital.enabled = c.coorbital_enabled != 0;
+    }
+    // `radar_annealing` and `linear_cache` are solver policy, not fit
+    // definition: they change how the escalation anneals radar σ and
+    // whether trial evaluations are memoized, never what is delivered.
+    // They stay at their engine defaults with no C-side knob — reach for
+    // the empyrean-core Rust API to tune them.
+
     cfg.solve_for = if c.solve_for == EMPYREAN_SOLVE_FOR_EXPLICIT {
         // Explicit multi-axis request — the coarse code can't name it, so
         // read the per-axis flag struct.
@@ -3606,12 +4158,49 @@ pub unsafe extern "C" fn empyrean_radar_observations_free(
 
 // ── empyrean_determine ──────────────────────────────────────
 
-/// Run the full orbit determination pipeline.
+/// The whole batch ran but **no** object produced a fit.
+///
+/// `results_out` is still fully populated — every slot carries its
+/// per-object `error` / `error_code` — and MUST be released with
+/// [`empyrean_determine_results_free`]. This is a distinct code from the
+/// batch-level abort (`-3`), which writes nothing.
+pub const EMPYREAN_DETERMINE_NONE_DELIVERED: i32 = -4;
+
+/// Run the full orbit determination pipeline over every object in
+/// `observations`.
+///
+/// The observations are grouped by ADES object identifier (permID /
+/// provID / trkSub) and each group is fitted independently, so one call
+/// determines a whole batch. `results_out` receives one
+/// [`EmpyreanODObjectResult`] per group, ordered by `object_id`.
 ///
 /// When `num_initial_orbits > 0`, the supplied orbits are used as DC
 /// seeds (one per ADES object_id encountered in `observations`,
 /// matched by orbit index). Pass `null, 0` to let the IOD pipeline
-/// produce its own seeds.
+/// produce its own seeds. A seed that matches no group is reported in
+/// [`EmpyreanDetermineResults::unmatched_orbit_ids`], never dropped.
+///
+/// # Return codes
+///
+/// - `0` — the batch ran and **at least one** object delivered a fit.
+///   Individual failures do not abort the batch; check each slot's
+///   `delivered` flag. `results_out` is populated.
+/// - [`EMPYREAN_DETERMINE_NONE_DELIVERED`] (`-4`) — the batch ran but
+///   every object failed. `results_out` IS populated with the per-object
+///   errors and must still be freed.
+/// - `-1` — null pointer or malformed input; nothing is written.
+/// - `-3` — a batch-level failure (an unparseable weighting config, an
+///   observation row with no identifier at all) aborted the run before
+///   any object was fitted; nothing is written.
+///
+/// A single-object input is not a special case: it produces a
+/// one-row table.
+///
+/// # Ownership
+///
+/// On `0` and `-4`, release `results_out` with
+/// [`empyrean_determine_results_free`]. On `-1` / `-3` there is nothing
+/// to free.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn empyrean_determine(
     ctx: *const EmpyreanContext,
@@ -3622,10 +4211,10 @@ pub unsafe extern "C" fn empyrean_determine(
     initial_orbits: *const EmpyreanOrbit,
     num_initial_orbits: usize,
     config: *const EmpyreanODConfig,
-    result_out: *mut EmpyreanODResult,
+    results_out: *mut EmpyreanDetermineResults,
 ) -> i32 {
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        if ctx.is_null() || observations.is_null() || config.is_null() || result_out.is_null() {
+        if ctx.is_null() || observations.is_null() || config.is_null() || results_out.is_null() {
             set_last_error("null pointer argument");
             return -1;
         }
@@ -3706,6 +4295,10 @@ pub unsafe extern "C" fn empyrean_determine(
             None
         };
 
+        // Batch-level failure (a row with no permID/provID/trkSub, an invalid
+        // shared weighting config) aborts the whole call rather than producing
+        // per-object results — surface it with its own message instead of
+        // reporting the generic "produced no results".
         let determine_results = determine(
             ctx_ref,
             Observations::new(obs_vec, radar_vec),
@@ -3714,41 +4307,88 @@ pub unsafe extern "C" fn empyrean_determine(
             None,
         );
 
-        // Pick the first acceptable fit, else the first overall.
-        let best = determine_results
-            .results()
-            .iter()
-            .find(|r| match r {
-                Ok(d) => d.od.acceptability.fit_acceptable,
-                Err(_) => false,
-            })
-            .or_else(|| determine_results.results().first());
+        // Sort by object_id so the table is a deterministic function of the
+        // observation set, not of the order its rows happened to arrive in.
+        let mut order: Vec<usize> = (0..determine_results.len()).collect();
+        let ids = determine_results.orbit_ids();
+        order.sort_by(|&a, &b| ids[a].cmp(&ids[b]));
 
-        let det_result = match best {
-            Some(Ok(d)) => d,
-            Some(Err(e)) => {
-                set_last_error(&format!("orbit determination failed: {e}"));
-                return -3;
-            }
-            None => {
-                set_last_error("orbit determination produced no results");
-                return -3;
-            }
-        };
-
-        let prop_state =
-            match od_orbit_to_propagated(&det_result.od.orbit, &det_result.od.covariance) {
-                Ok(s) => s,
+        let mut slots: Vec<EmpyreanODObjectResult> = Vec::with_capacity(order.len());
+        let mut delivered_count = 0usize;
+        let mut failures: Vec<String> = Vec::new();
+        for i in order {
+            let object_id = &ids[i];
+            let slot = match &determine_results.results()[i] {
+                Ok(det) => {
+                    // A fitted orbit whose state cannot be expressed as a
+                    // Cartesian record is a delivery failure for THIS object,
+                    // not for the batch.
+                    match od_orbit_to_propagated(&det.od.orbit, &det.od.covariance) {
+                        Ok(prop_state) => {
+                            let mut result = poisoned_od_result();
+                            result.orbit = prop_state;
+                            unsafe {
+                                write_od_result_fields(&mut result, &det.od, Some(object_id));
+                            }
+                            delivered_count += 1;
+                            EmpyreanODObjectResult {
+                                object_id: alloc_cstring(object_id),
+                                delivered: 1,
+                                result,
+                                error: std::ptr::null_mut(),
+                                error_code: EMPYREAN_OD_FAILURE_NONE,
+                            }
+                        }
+                        Err(e) => {
+                            failures.push(format!("{object_id}: {e}"));
+                            EmpyreanODObjectResult {
+                                object_id: alloc_cstring(object_id),
+                                delivered: 0,
+                                result: poisoned_od_result(),
+                                error: alloc_cstring(&e),
+                                error_code: EMPYREAN_OD_FAILURE_OD,
+                            }
+                        }
+                    }
+                }
                 Err(e) => {
-                    set_last_error(&e);
-                    return -3;
+                    let message = e.to_string();
+                    failures.push(format!("{object_id}: {message}"));
+                    EmpyreanODObjectResult {
+                        object_id: alloc_cstring(object_id),
+                        delivered: 0,
+                        result: poisoned_od_result(),
+                        error: alloc_cstring(&message),
+                        error_code: determine_error_code(e),
+                    }
                 }
             };
+            slots.push(slot);
+        }
 
-        let od = &det_result.od;
+        let (objects_ptr, num_objects) = object_results_to_c(slots);
+        let (unmatched_ptr, num_unmatched) =
+            string_vec_to_c(determine_results.unmatched_orbit_keys());
         unsafe {
-            (*result_out).orbit = prop_state;
-            write_od_result_fields(result_out, od);
+            (*results_out).objects = objects_ptr;
+            (*results_out).num_objects = num_objects;
+            (*results_out).unmatched_orbit_ids = unmatched_ptr;
+            (*results_out).num_unmatched_orbit_ids = num_unmatched;
+        }
+
+        if delivered_count == 0 {
+            // Zero delivered is its own overall error, but the populated
+            // table is the diagnosis — the caller still frees it.
+            set_last_error(&format!(
+                "orbit determination delivered no orbits ({} object(s) attempted): {}",
+                num_objects,
+                if failures.is_empty() {
+                    "no observations to group".to_string()
+                } else {
+                    failures.join("; ")
+                }
+            ));
+            return EMPYREAN_DETERMINE_NONE_DELIVERED;
         }
         0
     }));
@@ -3762,39 +4402,112 @@ pub unsafe extern "C" fn empyrean_determine(
     }
 }
 
-/// Free an OD result previously returned by `empyrean_determine()` or `empyrean_refine()`.
+/// Move per-object slots into an owned C array.
+fn object_results_to_c(slots: Vec<EmpyreanODObjectResult>) -> (*mut EmpyreanODObjectResult, usize) {
+    let n = slots.len();
+    if n == 0 {
+        return (std::ptr::null_mut(), 0);
+    }
+    let layout = std::alloc::Layout::array::<EmpyreanODObjectResult>(n)
+        .unwrap_or(std::alloc::Layout::new::<EmpyreanODObjectResult>());
+    let ptr = unsafe { std::alloc::alloc(layout) } as *mut EmpyreanODObjectResult;
+    if ptr.is_null() {
+        return (std::ptr::null_mut(), 0);
+    }
+    for (i, slot) in slots.into_iter().enumerate() {
+        unsafe { ptr.add(i).write(slot) };
+    }
+    (ptr, n)
+}
+
+/// Release the owned allocations hanging off one [`EmpyreanODResult`].
+///
+/// Shared by [`empyrean_od_result_free`] and
+/// [`empyrean_determine_results_free`] so a slot inside a batch table is
+/// freed exactly the way a standalone result is.
+unsafe fn free_od_result_fields(result: *mut EmpyreanODResult) {
+    let res = unsafe { &*result };
+    let n = res.num_observations;
+    let sb_n = res.num_station_biases;
+    unsafe {
+        free_observation_results(res.observations, n);
+        free_station_biases(res.station_biases, sb_n);
+        // Photometry owned arrays (null / 0 when no photometry ran).
+        free_band_stats(res.photometry.per_band, res.photometry.num_per_band);
+        free_gate_records(res.photometry.gates, res.photometry.num_gates);
+        free_string_array(
+            res.photometry.dropped_bands,
+            res.photometry.num_dropped_bands,
+        );
+        free_cstring(res.trust_event_body);
+        (*result).observations = std::ptr::null_mut();
+        (*result).num_observations = 0;
+        (*result).station_biases = std::ptr::null_mut();
+        (*result).num_station_biases = 0;
+        (*result).photometry.per_band = std::ptr::null_mut();
+        (*result).photometry.num_per_band = 0;
+        (*result).photometry.gates = std::ptr::null_mut();
+        (*result).photometry.num_gates = 0;
+        (*result).photometry.dropped_bands = std::ptr::null_mut();
+        (*result).photometry.num_dropped_bands = 0;
+        (*result).trust_event_body = std::ptr::null_mut();
+    }
+}
+
+/// Free a batch result table previously written by
+/// `empyrean_determine()`.
+///
+/// Releases every per-object slot (including the fits inside the
+/// delivered ones), the per-object identifier / error strings, and the
+/// unmatched-seed list. Safe to call on a table returned with
+/// [`EMPYREAN_DETERMINE_NONE_DELIVERED`], and idempotent — the table is
+/// left empty.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn empyrean_determine_results_free(results: *mut EmpyreanDetermineResults) {
+    let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        if results.is_null() {
+            return;
+        }
+        let res = unsafe { &*results };
+        let n = res.num_objects;
+        if !res.objects.is_null() && n > 0 {
+            for i in 0..n {
+                let slot = unsafe { &mut *res.objects.add(i) };
+                unsafe {
+                    free_od_result_fields(&mut slot.result);
+                    free_cstring(slot.object_id);
+                    free_cstring(slot.error);
+                }
+                slot.object_id = std::ptr::null_mut();
+                slot.error = std::ptr::null_mut();
+            }
+            let layout = std::alloc::Layout::array::<EmpyreanODObjectResult>(n)
+                .unwrap_or(std::alloc::Layout::new::<EmpyreanODObjectResult>());
+            unsafe {
+                std::alloc::dealloc(res.objects as *mut u8, layout);
+            }
+        }
+        unsafe {
+            free_string_array(res.unmatched_orbit_ids, res.num_unmatched_orbit_ids);
+            (*results).objects = std::ptr::null_mut();
+            (*results).num_objects = 0;
+            (*results).unmatched_orbit_ids = std::ptr::null_mut();
+            (*results).num_unmatched_orbit_ids = 0;
+        }
+    }));
+}
+
+/// Free an OD result previously returned by `empyrean_refine()`.
+///
+/// Batch `empyrean_determine()` results are released with
+/// [`empyrean_determine_results_free`] instead.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn empyrean_od_result_free(result: *mut EmpyreanODResult) {
     let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
         if result.is_null() {
             return;
         }
-        let res = unsafe { &*result };
-        let n = res.num_observations;
-        let sb_n = res.num_station_biases;
-        unsafe {
-            free_observation_results(res.observations, n);
-            free_station_biases(res.station_biases, sb_n);
-            // Photometry owned arrays (null / 0 when no photometry ran).
-            free_band_stats(res.photometry.per_band, res.photometry.num_per_band);
-            free_gate_records(res.photometry.gates, res.photometry.num_gates);
-            free_string_array(
-                res.photometry.dropped_bands,
-                res.photometry.num_dropped_bands,
-            );
-            free_cstring(res.trust_event_body);
-            (*result).observations = std::ptr::null_mut();
-            (*result).num_observations = 0;
-            (*result).station_biases = std::ptr::null_mut();
-            (*result).num_station_biases = 0;
-            (*result).photometry.per_band = std::ptr::null_mut();
-            (*result).photometry.num_per_band = 0;
-            (*result).photometry.gates = std::ptr::null_mut();
-            (*result).photometry.num_gates = 0;
-            (*result).photometry.dropped_bands = std::ptr::null_mut();
-            (*result).photometry.num_dropped_bands = 0;
-            (*result).trust_event_body = std::ptr::null_mut();
-        }
+        unsafe { free_od_result_fields(result) };
     }));
 }
 
@@ -3860,7 +4573,9 @@ pub unsafe extern "C" fn empyrean_evaluate(
             }
         };
 
-        let (obs_ptr, obs_n) = observation_results_to_c(&eval_result.observations);
+        // Single-orbit evaluate: no ADES grouping key, so the rows carry a
+        // null object_id (see EmpyreanObservationResult::object_id).
+        let (obs_ptr, obs_n) = observation_results_to_c(&eval_result.observations, None);
         let summary = summary_to_c(&eval_result.summary);
 
         unsafe {
@@ -3970,7 +4685,9 @@ pub unsafe extern "C" fn empyrean_refine(
 
         unsafe {
             (*result_out).orbit = prop_state;
-            write_od_result_fields(result_out, &od_result);
+            // Single-orbit refine: the caller supplied the orbit, so the
+            // rows carry a null object_id.
+            write_od_result_fields(result_out, &od_result, None);
         }
         0
     }));
@@ -4094,7 +4811,7 @@ mod tests {
     fn rejection_reason_cmc2003_maps_to_dedicated_code() {
         // Regression: CMC2003 was previously folded into ADAPTIVE.
         assert_eq!(
-            rejection_reason_to_c(RejectionReason::CMC2003),
+            rejection_reason_to_c(&RejectionReason::CMC2003),
             EMPYREAN_REJECTION_CMC2003
         );
         assert_ne!(EMPYREAN_REJECTION_CMC2003, EMPYREAN_REJECTION_ADAPTIVE);
@@ -4344,7 +5061,7 @@ mod tests {
     /// when the ephemeris is unavailable (so CI without kernels skips the
     /// heavy smoke instead of failing). Resolves `EMPYREAN_DATA_DIR` / XDG
     /// exactly like the production constructor.
-    fn try_context() -> Option<EmpyreanContext> {
+    pub(super) fn try_context() -> Option<EmpyreanContext> {
         empyrean_core::Context::from_data_dir(None).ok()
     }
 
@@ -4355,6 +5072,13 @@ mod tests {
     fn read_eros_observations() -> (*mut EmpyreanObservation, usize) {
         let psv = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/433_eros.psv");
         let content = std::fs::read_to_string(psv).expect("read bundled Eros fixture");
+        read_eros_observations_from(&content)
+    }
+
+    /// The same parse, over caller-supplied ADES content — used by the
+    /// join-back test, which composes a two-object batch out of the same
+    /// bundled arc.
+    pub(super) fn read_eros_observations_from(content: &str) -> (*mut EmpyreanObservation, usize) {
         let c_content = CString::new(content).expect("fixture has no interior NUL");
 
         let mut obs_ptr: *mut EmpyreanObservation = std::ptr::null_mut();
@@ -4385,7 +5109,7 @@ mod tests {
     /// (Approximate is too coarse for an OD smoke). `std::mem::zeroed` is sound
     /// here: every field is `#[repr(C)]` POD and the lone pointer
     /// (`excluded_perturbers_naif`) zero-inits to null with count 0.
-    fn standard_od_config() -> EmpyreanODConfig {
+    pub(super) fn standard_od_config() -> EmpyreanODConfig {
         let mut cfg: EmpyreanODConfig = unsafe { std::mem::zeroed() };
         cfg.force_model = 2; // Standard tier
         cfg
@@ -4460,7 +5184,9 @@ mod tests {
         let cfg = standard_od_config();
 
         // ── Fit Eros via the ABI to get a covariance-bearing orbit ──
-        let mut od_result: EmpyreanODResult = unsafe { std::mem::zeroed() };
+        // determine is batch-first: one slot per ADES object. The Eros
+        // arc is one object, so the table has exactly one row.
+        let mut det_results: EmpyreanDetermineResults = unsafe { std::mem::zeroed() };
         let det_code = unsafe {
             empyrean_determine(
                 ctx_ptr,
@@ -4471,7 +5197,7 @@ mod tests {
                 std::ptr::null(),
                 0,
                 &cfg,
-                &mut od_result,
+                &mut det_results,
             )
         };
         assert_eq!(
@@ -4480,6 +5206,29 @@ mod tests {
             "empyrean_determine must fit Eros (code {det_code}, last_error: {})",
             unsafe { CStr::from_ptr(crate::empyrean_last_error()) }.to_string_lossy()
         );
+        assert_eq!(
+            det_results.num_objects, 1,
+            "the single-object Eros arc must produce a one-row table"
+        );
+        assert_eq!(
+            det_results.num_unmatched_orbit_ids, 0,
+            "no seeds were supplied, so nothing can be unmatched"
+        );
+        let slot = unsafe { &*det_results.objects };
+        assert_eq!(
+            slot.delivered,
+            1,
+            "Eros must deliver (error: {})",
+            unsafe { CStr::from_ptr(slot.error) }.to_string_lossy()
+        );
+        assert_eq!(slot.error_code, EMPYREAN_OD_FAILURE_NONE);
+        assert!(slot.error.is_null(), "a delivered slot carries no error");
+        let object_id = unsafe { CStr::from_ptr(slot.object_id) }.to_string_lossy();
+        assert!(
+            !object_id.is_empty(),
+            "every slot is keyed by its ADES identifier"
+        );
+        let od_result = &slot.result;
         assert!(
             od_result.num_observations > 0,
             "determine must report fitted observations"
@@ -4488,6 +5237,13 @@ mod tests {
         assert_eq!(
             od_result.orbit.has_covariance, 1,
             "fitted orbit must carry covariance for refine's prior"
+        );
+        // Every residual row is attributable to the object it was fit against.
+        let first_row = unsafe { &*od_result.observations };
+        assert_eq!(
+            unsafe { CStr::from_ptr(first_row.object_id) }.to_string_lossy(),
+            object_id,
+            "each residual row carries its own object_id"
         );
 
         // The re-feedable orbit, tagged INTERNALLY as "orbit_0" by the ABI —
@@ -4562,7 +5318,561 @@ mod tests {
         unsafe {
             empyrean_evaluate_result_free(&mut eval_result);
             empyrean_od_result_free(&mut refine_result);
-            empyrean_od_result_free(&mut od_result);
+            empyrean_determine_results_free(&mut det_results);
+            empyrean_observations_free(obs_ptr, obs_n);
+        }
+    }
+}
+
+/// The weighting-config identity fields scott grew (`floors_table` on the
+/// config, `scheme` on a nightly layer) and what this ABI resolves them to.
+///
+/// `build_weighting_from_c` names both directly (`FloorsTable::Custom`,
+/// `NightlyDeweighting::VFCC2017`) now that both are re-exported from
+/// `empyrean_core::determination`. These pin the resolved identities: the
+/// identity a delivered fit reports must be `Custom` for a hand-assembled
+/// chain, and a `NIGHTLY_DEWEIGHTING` layer must apply the current published
+/// law, not the pre-2017 one. Asserted by direct variant equality against
+/// the named types — a compile-time failure if a field's type changes to
+/// another enum with a same-named variant, which `Debug`-string pinning
+/// could not catch.
+#[cfg(test)]
+mod weighting_identity_tests {
+    use super::*;
+    use empyrean_core::determination::{FloorsTable, NightlyDeweighting, WeightingLayer};
+
+    fn enabled_config(preset: u8) -> EmpyreanWeightingConfig {
+        let mut c: EmpyreanWeightingConfig = unsafe { std::mem::zeroed() };
+        c.enabled = 1;
+        c.preset = preset;
+        c.sigma_policy = -1;
+        c
+    }
+
+    /// A `preset = NONE` chain is caller-assembled, so it carries no
+    /// published floors-table identity. Reporting one would let a config
+    /// that merely resembles a published table be delivered as being it.
+    #[test]
+    fn a_hand_assembled_chain_reports_a_custom_floors_table() {
+        let cfg = build_weighting_from_c(&enabled_config(EMPYREAN_WEIGHTING_PRESET_NONE))
+            .expect("preset NONE converts")
+            .expect("weighting is enabled");
+        assert_eq!(
+            cfg.floors_table,
+            FloorsTable::Custom,
+            "a hand-assembled layer chain must not claim a published table"
+        );
+    }
+
+    /// The VFC17 preset's own constructor records its identity; routing
+    /// through this converter must not overwrite it with `Custom`.
+    #[test]
+    fn the_vfc17_preset_keeps_its_recorded_identity() {
+        let cfg = build_weighting_from_c(&enabled_config(EMPYREAN_WEIGHTING_PRESET_VFCC2017))
+            .expect("preset VFC17 converts")
+            .expect("weighting is enabled");
+        assert_eq!(
+            cfg.floors_table,
+            FloorsTable::VFCC2017,
+            "the preset's recorded identity must survive the conversion"
+        );
+    }
+
+    /// A `NIGHTLY_DEWEIGHTING` layer applies Vereš et al. (2017) §3
+    /// (σ unchanged to N = 4, then σ√(N/4)). The engine still carries the
+    /// pre-2017 σ√N law as a historical baseline, and it shipped as a
+    /// library default once — this pins that the ABI does not select it.
+    #[test]
+    fn a_nightly_layer_applies_the_current_published_law() {
+        let layers = [EmpyreanWeightingLayer {
+            kind: EMPYREAN_WEIGHTING_LAYER_NIGHTLY_DEWEIGHTING,
+            obs_code: [0; 4],
+            sigma_ra_arcsec: 0.0,
+            sigma_dec_arcsec: 0.0,
+            start_epoch_mjd_tdb: f64::NAN,
+            end_epoch_mjd_tdb: f64::NAN,
+            scale: 0.0,
+            max_gap_days: 0.5,
+        }];
+        let mut c = enabled_config(EMPYREAN_WEIGHTING_PRESET_NONE);
+        c.num_additional_layers = layers.len();
+        c.additional_layers = layers.as_ptr();
+
+        let cfg = build_weighting_from_c(&c)
+            .expect("a nightly layer converts")
+            .expect("weighting is enabled");
+        let (scheme, max_gap_days) = cfg
+            .layers
+            .iter()
+            .find_map(|l| match l {
+                WeightingLayer::NightlyDeweighting {
+                    scheme,
+                    max_gap_days,
+                } => Some((*scheme, *max_gap_days)),
+                _ => None,
+            })
+            .expect("the nightly layer reaches the engine config");
+        assert_eq!(
+            scheme,
+            NightlyDeweighting::VFCC2017,
+            "a nightly layer must apply the current published law, not the \
+             pre-2017 sqrt(N) baseline"
+        );
+        assert_eq!(max_gap_days, 0.5, "max_gap_days must survive");
+    }
+}
+
+#[cfg(test)]
+mod batch_determine_tests {
+    use super::*;
+
+    /// Build the C-side per-observation record with the fields the free
+    /// path walks. Everything else is zeroed — this fixture exists to
+    /// exercise ownership, not numerics.
+    fn observation_row(obs_id: &str, object_id: Option<&str>) -> EmpyreanObservationResult {
+        let mut row: EmpyreanObservationResult = unsafe { std::mem::zeroed() };
+        row.obs_id = alloc_cstring(obs_id);
+        row.object_id = match object_id {
+            Some(id) => alloc_cstring(id),
+            None => std::ptr::null_mut(),
+        };
+        row.ast_cat = alloc_cstring("Gaia3");
+        row
+    }
+
+    fn read_cstring(p: *mut c_char) -> Option<String> {
+        (!p.is_null()).then(|| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
+    }
+
+    /// A failed object's slot must not look like a converged fit at the
+    /// origin. Every f64 is NaN and every enumerated code is outside its
+    /// own value set, so a caller that skips `delivered` cannot mistake
+    /// the record for a result.
+    #[test]
+    fn poisoned_result_is_nan_not_zero() {
+        let r = poisoned_od_result();
+        assert!(r.update_norm.is_nan(), "update_norm must be NaN, not 0.0");
+        assert!(r.orbit.x.is_nan() && r.orbit.vz.is_nan());
+        assert!(r.orbit.epoch_mjd_tdb.is_nan());
+        assert!(r.covariance.iter().flatten().all(|v| v.is_nan()));
+        assert!(r.summary.reduced_chi2.is_nan() && r.summary.rms_ra_arcsec.is_nan());
+        assert!(r.non_grav.a1.is_nan() && r.srp.amrat.is_nan());
+        assert!(r.dt_delta.is_nan() && r.amrat_delta.is_nan());
+        // Enumerated codes: -1 is not a member of any EMPYREAN_* set.
+        assert_eq!(r.force_model_used, -1);
+        assert_eq!(r.solve_for_used, -1);
+        assert_eq!(r.covariance_representation, -1);
+        assert_eq!(r.dv_frame, -1);
+        assert_eq!(r.covariance_trust, -1);
+        assert_eq!(r.trust_event_kind, -1);
+        assert_eq!(r.orbit.origin, -1);
+        assert_eq!(r.orbit.frame, -1);
+        // Owned pointers null / counts zero so the free path is a no-op.
+        assert!(r.observations.is_null() && r.num_observations == 0);
+        assert!(r.station_biases.is_null() && r.num_station_biases == 0);
+        assert!(r.photometry.per_band.is_null() && r.photometry.num_per_band == 0);
+        assert!(r.photometry.gates.is_null() && r.photometry.num_gates == 0);
+        assert!(r.photometry.dropped_bands.is_null());
+        assert!(r.trust_event_body.is_null());
+        // `converged` reads false, and no acceptability gate passes.
+        assert_eq!(r.converged, 0);
+        assert_eq!(r.acceptability.fit_acceptable, 0);
+        assert_eq!(r.acceptability.extrapolation_acceptable, 0);
+    }
+
+    /// The `_ok` booleans stay readable on a poisoned slot even though
+    /// every measurement is NaN — that is the documented ABI contract.
+    #[test]
+    fn poisoned_acceptability_keeps_ok_flags_valid() {
+        let a = poisoned_acceptability_report();
+        for ok in [
+            a.converged_ok,
+            a.reduced_chi2_ok,
+            a.rms_ok,
+            a.residual_isotropy_ok,
+            a.covariance_ok,
+            a.arc_coverage_ok,
+            a.fractional_sigma_a_ok,
+            a.selection_fraction_ok,
+            a.selected_arc_coverage_ok,
+            a.trailing_gap_ok,
+        ] {
+            assert!(ok == 0 || ok == 1, "an _ok flag must stay a valid bool");
+        }
+        for v in [
+            a.reduced_chi2_value,
+            a.rms_value_arcsec,
+            a.at_ct_ratio_value,
+            a.arc_days_value,
+            a.fractional_sigma_a_value,
+            a.selection_fraction_value,
+            a.selected_arc_days_value,
+            a.selected_arc_fraction_value,
+            a.trailing_gap_days_value,
+        ] {
+            assert!(v.is_nan(), "a non-computable value must be NaN, not 0.0");
+        }
+        // "no radar" must never read as "radar failed".
+        assert_eq!(a.radar_fit_ok, -1);
+    }
+
+    /// Every `DetermineError` variant gets its own code, so a consumer
+    /// can branch on the cause without string-matching the message.
+    #[test]
+    fn failure_codes_are_distinct() {
+        let codes = [
+            EMPYREAN_OD_FAILURE_OBSERVATION_CONVERSION,
+            EMPYREAN_OD_FAILURE_OBSERVER_CONSTRUCTION,
+            EMPYREAN_OD_FAILURE_UNSUPPORTED_COORDINATE_SYSTEM,
+            EMPYREAN_OD_FAILURE_EARTH_ORIENTATION_COVERAGE,
+            EMPYREAN_OD_FAILURE_IOD,
+            EMPYREAN_OD_FAILURE_OD,
+            EMPYREAN_OD_FAILURE_DUPLICATE_OBS_IDS,
+            EMPYREAN_OD_FAILURE_RADAR_ONLY,
+            EMPYREAN_OD_FAILURE_NON_GRAV_NOT_RECOVERED,
+        ];
+        let mut seen: Vec<i32> = codes.to_vec();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), codes.len(), "failure codes must be distinct");
+        assert!(
+            !codes.contains(&EMPYREAN_OD_FAILURE_NONE),
+            "no failure may share the delivered code"
+        );
+
+        // Spot-check the classifier on the variants that are cheap to build.
+        assert_eq!(
+            determine_error_code(&DetermineError::RadarOnly { n_radar: 3 }),
+            EMPYREAN_OD_FAILURE_RADAR_ONLY
+        );
+        assert_eq!(
+            determine_error_code(&DetermineError::DuplicateObsIds(vec!["a".into()])),
+            EMPYREAN_OD_FAILURE_DUPLICATE_OBS_IDS
+        );
+        assert_eq!(
+            determine_error_code(&DetermineError::UnsupportedCoordinateSystem {
+                obs_index: 0,
+                sys: "WGS84".into(),
+            }),
+            EMPYREAN_OD_FAILURE_UNSUPPORTED_COORDINATE_SYSTEM
+        );
+        assert_eq!(
+            determine_error_code(&DetermineError::EarthOrientationCoverageIncomplete {
+                loaded: "none".into(),
+                required: "historical+predict".into(),
+            }),
+            EMPYREAN_OD_FAILURE_EARTH_ORIENTATION_COVERAGE
+        );
+    }
+
+    /// Freeing a table releases the per-object strings, the per-slot
+    /// fits, and the unmatched-seed list — and leaves the table empty so
+    /// a second free is a no-op rather than a double free.
+    #[test]
+    fn determine_results_free_releases_everything_and_is_idempotent() {
+        // One delivered slot owning an observation array, one failed slot.
+        let rows = vec![
+            observation_row("obs-1", Some("2024 YR4")),
+            observation_row("obs-2", Some("2024 YR4")),
+        ];
+        let n_rows = rows.len();
+        let layout = std::alloc::Layout::array::<EmpyreanObservationResult>(n_rows).unwrap();
+        let rows_ptr = unsafe { std::alloc::alloc(layout) } as *mut EmpyreanObservationResult;
+        for (i, row) in rows.into_iter().enumerate() {
+            unsafe { rows_ptr.add(i).write(row) };
+        }
+
+        let mut delivered = poisoned_od_result();
+        delivered.observations = rows_ptr;
+        delivered.num_observations = n_rows;
+        delivered.trust_event_body = alloc_cstring("Earth");
+
+        let slots = vec![
+            EmpyreanODObjectResult {
+                object_id: alloc_cstring("2024 YR4"),
+                delivered: 1,
+                result: delivered,
+                error: std::ptr::null_mut(),
+                error_code: EMPYREAN_OD_FAILURE_NONE,
+            },
+            EmpyreanODObjectResult {
+                object_id: alloc_cstring("K25A00B"),
+                delivered: 0,
+                result: poisoned_od_result(),
+                error: alloc_cstring("IOD failed: no viable seed"),
+                error_code: EMPYREAN_OD_FAILURE_IOD,
+            },
+        ];
+        let (objects, num_objects) = object_results_to_c(slots);
+        let (unmatched, num_unmatched) =
+            string_vec_to_c(&["seed-that-matched-nothing".to_string()]);
+        let mut table = EmpyreanDetermineResults {
+            objects,
+            num_objects,
+            unmatched_orbit_ids: unmatched,
+            num_unmatched_orbit_ids: num_unmatched,
+        };
+
+        assert_eq!(table.num_objects, 2);
+        let first = unsafe { &*table.objects };
+        assert_eq!(read_cstring(first.object_id).as_deref(), Some("2024 YR4"));
+        assert_eq!(first.delivered, 1);
+        assert!(first.error.is_null());
+        let second = unsafe { &*table.objects.add(1) };
+        assert_eq!(second.delivered, 0);
+        assert_eq!(second.error_code, EMPYREAN_OD_FAILURE_IOD);
+        assert!(read_cstring(second.error).unwrap().contains("IOD failed"));
+        // The per-row grouping key survives into the observation array.
+        let row0 = unsafe { &*first.result.observations };
+        assert_eq!(read_cstring(row0.object_id).as_deref(), Some("2024 YR4"));
+
+        unsafe { empyrean_determine_results_free(&mut table) };
+        assert!(table.objects.is_null());
+        assert_eq!(table.num_objects, 0);
+        assert!(table.unmatched_orbit_ids.is_null());
+        assert_eq!(table.num_unmatched_orbit_ids, 0);
+
+        // Idempotent: the emptied table frees again without touching
+        // anything that was already released.
+        unsafe { empyrean_determine_results_free(&mut table) };
+        assert!(table.objects.is_null());
+
+        // Null is accepted.
+        unsafe { empyrean_determine_results_free(std::ptr::null_mut()) };
+    }
+
+    /// A row from the single-object paths carries a null `object_id`;
+    /// freeing must handle both shapes.
+    #[test]
+    fn observation_rows_free_with_and_without_object_id() {
+        for object_id in [Some("2024 YR4"), None] {
+            let n = 1usize;
+            let layout = std::alloc::Layout::array::<EmpyreanObservationResult>(n).unwrap();
+            let ptr = unsafe { std::alloc::alloc(layout) } as *mut EmpyreanObservationResult;
+            unsafe { ptr.write(observation_row("obs-1", object_id)) };
+            assert_eq!(
+                read_cstring(unsafe { &*ptr }.object_id).as_deref(),
+                object_id
+            );
+            unsafe { free_observation_results(ptr, n) };
+        }
+    }
+
+    /// An empty batch produces an empty table, not a null-pointer walk.
+    #[test]
+    fn empty_batch_frees_cleanly() {
+        let (objects, num_objects) = object_results_to_c(Vec::new());
+        assert!(objects.is_null() && num_objects == 0);
+        let mut table = EmpyreanDetermineResults {
+            objects,
+            num_objects,
+            unmatched_orbit_ids: std::ptr::null_mut(),
+            num_unmatched_orbit_ids: 0,
+        };
+        unsafe { empyrean_determine_results_free(&mut table) };
+        assert_eq!(table.num_objects, 0);
+    }
+
+    /// The zero-delivered return code is distinct from both success and
+    /// the batch-level abort, because it is the one case where the
+    /// caller must still free a populated table.
+    #[test]
+    fn none_delivered_code_is_its_own_signal() {
+        assert_ne!(EMPYREAN_DETERMINE_NONE_DELIVERED, 0);
+        assert_ne!(EMPYREAN_DETERMINE_NONE_DELIVERED, -1);
+        assert_ne!(EMPYREAN_DETERMINE_NONE_DELIVERED, -3);
+    }
+}
+
+#[cfg(test)]
+mod residual_join_back_tests {
+    use super::tests::{read_eros_observations_from, standard_od_config, try_context};
+    use super::*;
+
+    /// The bundled single-object arc, plus a copy of it filed under a
+    /// second designation.
+    ///
+    /// Two objects out of one real arc: no new fixture, and the fits are
+    /// necessarily identical, which makes "the rows did not get mixed up
+    /// between objects" checkable rather than merely plausible. The
+    /// `obsID` column is rewritten on the copy so the join key stays
+    /// unique across the batch, exactly as it would be for two genuinely
+    /// different objects.
+    fn two_object_eros_psv() -> String {
+        let psv = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/433_eros.psv");
+        let content = std::fs::read_to_string(psv).expect("read bundled Eros fixture");
+        let mut lines = content.lines();
+        let version = lines.next().expect("version line");
+        let header = lines.next().expect("header line");
+        let rows: Vec<&str> = lines.filter(|l| !l.trim().is_empty()).collect();
+
+        let mut out = format!("{version}\n{header}\n");
+        for row in &rows {
+            out.push_str(row);
+            out.push('\n');
+        }
+        for row in &rows {
+            // permID 433 -> 4330, and obsID gets a suffix so the join key
+            // is unique batch-wide.
+            let mut fields: Vec<String> = row.split('|').map(|s| s.to_string()).collect();
+            fields[0] = "4330".to_string();
+            fields[3] = format!("{}X", fields[3]);
+            out.push_str(&fields.join("|"));
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Residuals written by a multi-object fit join back to the
+    /// observations they came from, on `(object_id, obs_id)`, with the
+    /// rejection attribution intact.
+    ///
+    /// This is the property a five-column residual file could not
+    /// support: without `obs_id` there is no join key at all, and
+    /// without `object_id` a batch's rows are unattributable.
+    #[test]
+    fn residuals_join_back_to_their_observations() {
+        let Some(ctx) = try_context() else {
+            eprintln!("skipping: no engine data directory available");
+            return;
+        };
+        let ctx_ptr: *const EmpyreanContext = &ctx;
+
+        let (obs_ptr, obs_n) = read_eros_observations_from(&two_object_eros_psv());
+        let cfg = standard_od_config();
+
+        let mut results: EmpyreanDetermineResults = unsafe { std::mem::zeroed() };
+        let code = unsafe {
+            empyrean_determine(
+                ctx_ptr,
+                obs_ptr,
+                obs_n,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                &cfg,
+                &mut results,
+            )
+        };
+        assert_eq!(
+            code,
+            0,
+            "the two-object batch must deliver; last_error: {}",
+            unsafe { CStr::from_ptr(crate::empyrean_last_error()) }.to_string_lossy()
+        );
+        assert_eq!(results.num_objects, 2, "one slot per designation");
+
+        // The input join keys, per object.
+        let input: std::collections::HashSet<String> = (0..obs_n)
+            .map(|i| {
+                let o = unsafe { &*obs_ptr.add(i) };
+                let id = |p: *mut c_char| -> String {
+                    if p.is_null() {
+                        String::new()
+                    } else {
+                        unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
+                    }
+                };
+                let object = {
+                    let perm = id(o.perm_id);
+                    if perm.is_empty() {
+                        let prov = id(o.prov_id);
+                        if prov.is_empty() { id(o.trk_sub) } else { prov }
+                    } else {
+                        perm
+                    }
+                };
+                format!("{object}\u{1}{}", id(o.obs_id))
+            })
+            .collect();
+
+        // Flatten every delivered object's rows into one table, which is
+        // exactly what the CLI writes.
+        let mut flat: Vec<EmpyreanObservationResult> = Vec::new();
+        let slots = unsafe { std::slice::from_raw_parts(results.objects, results.num_objects) };
+        let mut delivered = 0usize;
+        for slot in slots {
+            if slot.delivered == 0 {
+                continue;
+            }
+            delivered += 1;
+            let rows = unsafe {
+                std::slice::from_raw_parts(slot.result.observations, slot.result.num_observations)
+            };
+            for r in rows {
+                // Shallow copy: the writer only reads, and the originals
+                // stay owned by the batch table.
+                flat.push(unsafe { std::ptr::read(r) });
+            }
+        }
+        assert_eq!(delivered, 2, "both designations must deliver");
+        assert!(!flat.is_empty(), "a delivered fit reports its residuals");
+
+        let dir = std::env::temp_dir().join(format!("empyrean-join-back-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("residuals.csv");
+        let c_path = CString::new(path.display().to_string()).unwrap();
+        let wcode = unsafe {
+            crate::io::empyrean_residuals_write_csv(c_path.as_ptr(), flat.as_ptr(), flat.len())
+        };
+        assert_eq!(wcode, 0, "residual CSV write must succeed");
+
+        // Read back and join.
+        let text = std::fs::read_to_string(&path).expect("read residuals.csv");
+        let mut lines = text.lines();
+        let header: Vec<&str> = lines.next().expect("header").split(',').collect();
+        let col = |name: &str| header.iter().position(|h| *h == name).expect(name);
+        let (i_object, i_obs, i_reason) =
+            (col("object_id"), col("obs_id"), col("rejection_reason"));
+
+        let known_reasons = [
+            "accepted",
+            "chi_squared",
+            "sigma_clip",
+            "cooks_distance",
+            "adaptive",
+            "unsupported_observatory",
+            "cmc2003",
+            "radar_observations_unsupported",
+            "occultation_observations_unsupported",
+            "outside_arc",
+            "non_finite_chi2",
+            "missing_jacobian",
+            "spacecraft_kernel_missing",
+            "observer_construction_failed",
+            "never_absorbed",
+            "not_evaluated",
+        ];
+
+        let mut seen_objects: std::collections::HashSet<String> = Default::default();
+        let mut n_rows = 0usize;
+        for line in lines.filter(|l| !l.trim().is_empty()) {
+            let f: Vec<&str> = line.split(',').collect();
+            let object = f[i_object];
+            let obs = f[i_obs];
+            let reason = f[i_reason];
+            n_rows += 1;
+            seen_objects.insert(object.to_string());
+            assert!(
+                input.contains(&format!("{object}\u{1}{obs}")),
+                "residual row ({object}, {obs}) joins back to no input observation"
+            );
+            assert!(
+                known_reasons.contains(&reason),
+                "rejection attribution must survive the trip, got {reason:?}"
+            );
+        }
+        assert_eq!(n_rows, flat.len(), "every residual row reached the file");
+        assert_eq!(
+            seen_objects.len(),
+            2,
+            "both designations appear in the flat table: {seen_objects:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        unsafe {
+            empyrean_determine_results_free(&mut results);
             empyrean_observations_free(obs_ptr, obs_n);
         }
     }

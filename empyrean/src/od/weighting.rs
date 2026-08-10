@@ -1,7 +1,7 @@
 //! Per-observation weighting pipeline used by orbit determination.
 //!
-//! The default chain is the production hot path: VFC17 station floors
-//! (Vereš, Farnocchia, Chesley et al. 2017) plus a nightly de-weighting
+//! The default chain is the production hot path: VFCC2017 station floors
+//! (Vereš, Farnocchia, Chesley & Chamberlin 2017) plus a nightly de-weighting
 //! layer (1/√N within 0.5 days). Set `enabled = false` for uniform 1″
 //! weighting, pick a different preset, or append layers for custom
 //! pipelines.
@@ -16,7 +16,7 @@ pub enum SigmaPolicy {
     #[default]
     DefaultOnly,
     /// `σ = max(reported, rule)` — rule acts as a noise floor.
-    /// VFC17 / NEODyS production policy.
+    /// VFCC2017 / NEODyS production policy.
     Floor,
 }
 
@@ -55,25 +55,25 @@ pub enum WeightingLayer {
 pub enum WeightingPreset {
     /// No preset — only `additional_layers` apply.
     None,
-    /// VFC17 — Vereš, Farnocchia, Chesley et al. 2017 station floors
+    /// VFCC2017 — Vereš, Farnocchia, Chesley & Chamberlin 2017 station floors
     /// + nightly de-weighting at floor-σ policy. Production default.
     #[default]
-    Vfc17,
+    VFCC2017,
     /// NEODyS production preset.
     Neodys,
 }
 
 /// Observation weighting pipeline.
 ///
-/// Default = `enabled` + [`WeightingPreset::Vfc17`] + a
+/// Default = `enabled` + [`WeightingPreset::VFCC2017`] + a
 /// [`WeightingLayer::NightlyDeweighting`] layer (the production
-/// combination — VFC17 station floors with 1/√N nightly down-weighting
+/// combination — VFCC2017 station floors with 1/√N nightly down-weighting
 /// chained on top).
 #[derive(Debug, Clone, PartialEq)]
 pub struct WeightingConfig {
     /// `true` → run weighting (default), `false` → uniform 1″.
     pub enabled: bool,
-    /// Preset selector. Default [`WeightingPreset::Vfc17`].
+    /// Preset selector. Default [`WeightingPreset::VFCC2017`].
     pub preset: WeightingPreset,
     /// Default 1σ (arcsec) when no rule applies. Used only when
     /// `preset = None`. Default 1.0.
@@ -94,7 +94,7 @@ pub struct WeightingConfig {
 
 impl Default for WeightingConfig {
     fn default() -> Self {
-        // VFC17 station floors WITH a NightlyDeweighting layer appended.
+        // VFCC2017 station floors WITH a NightlyDeweighting layer appended.
         // The preset alone is just the per-station σ table; nightly
         // de-weighting (1/√N within 0.5 days) is a separate layer that
         // production defaults chain on top, and the FFI surface has to
@@ -103,7 +103,7 @@ impl Default for WeightingConfig {
         // observation clusters.
         Self {
             enabled: true,
-            preset: WeightingPreset::Vfc17,
+            preset: WeightingPreset::VFCC2017,
             default_sigma_arcsec: 1.0,
             sigma_policy: None,
             additional_layers: vec![WeightingLayer::NightlyDeweighting { max_gap_days: 0.5 }],

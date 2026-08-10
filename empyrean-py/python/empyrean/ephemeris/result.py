@@ -76,17 +76,36 @@ class Ephemeris(qv.Table):
 class EphemerisConfig:
     """Configuration for :func:`empyrean.generate_ephemeris`.
 
-    Embeds a :class:`PropagationConfig` — every propagation-side knob
-    (force model, uncertainty method, integrator tolerance, thread
-    count, non-grav, etc.) is set there. Ephemeris-specific fields
-    (light-time iteration limits, diagnostic computation) live on this
-    struct directly.
+    Embeds a :class:`PropagationConfig`. The knobs the integrator
+    consults while bringing each orbit to its observation epoch all
+    apply: ``force_model``, ``excluded_perturbers``,
+    ``uncertainty_method``, ``compute_stm``, ``frame``, ``num_threads``,
+    ``ephemeris_overlap_policy``, and the whole ``advanced`` block.
+    Ephemeris-specific fields (light-time iteration limits, diagnostic
+    computation) live on this struct directly.
+
+    Two sub-configs do **not** apply: ``propagation.events`` and
+    ``propagation.diagnostics``. Ephemeris generation runs with event
+    detection and timeseries diagnostics off, and
+    :class:`EphemerisResult` carries neither, so modifying either one
+    raises a :class:`ValueError` naming the offending fields rather than
+    being silently dropped. Leave them at their defaults and use
+    :func:`empyrean.propagate` when you need them.
+
+    Generating an ephemeris for an SB441-N16 body (1 Ceres, 2 Pallas,
+    4 Vesta, …) at Standard tier needs one of the two escapes from the
+    self-perturbation case: ``propagation.ephemeris_overlap_policy =
+    EphemerisOverlapPolicy.EXCLUDE_AND_INTEGRATE``, or naming the body
+    in ``propagation.excluded_perturbers``. Without either, the engine
+    substitutes the body's own SPK states, produces no dense trajectory,
+    and the call fails.
 
     Parameters
     ----------
     propagation : PropagationConfig
         Inner propagation configuration. Default:
         :class:`PropagationConfig()` (Standard, FirstOrder, etc.).
+        ``events`` and ``diagnostics`` must be left at their defaults.
     max_light_time_iterations : int
         Light-time convergence loop cap. Default 3.
     light_time_tolerance_days : float
@@ -131,8 +150,13 @@ class EphemerisResult:
         epoch) with topocentric coordinates and observation covariance.
     sensitivity : ObservationSensitivities, optional
         Flat per-``(orbit_id, obs_code, epoch)`` sensitivity table —
-        observation Jacobians + optional Hessians. ``None`` when no
-        input covariance was supplied.
+        observation Jacobians + optional Hessians. Populated whenever
+        the propagation traced the state-transition matrix: either the
+        input orbit carried a covariance, or
+        ``config.propagation.compute_stm=True`` requested the trace
+        outright (which works with **no** input covariance — the flag
+        reaches the engine on this path). ``None`` when neither
+        happened.
     warnings : list[str]
         Non-fatal generation warnings, in engine emission order. Empty
         when the run had nothing to report. Messages name the affected

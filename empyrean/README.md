@@ -25,7 +25,7 @@ raw FFI pointers.
 
 ```toml
 [dependencies]
-empyrean = "0.9.0"
+empyrean = "0.10.0-rc.0"
 ```
 
 ## What it does
@@ -33,7 +33,7 @@ empyrean = "0.9.0"
 - **Propagation** — N-body (Sun, planets, Moon, Pluto) with EIH general relativity, Sun J2 and Earth J2–J4 zonal harmonics, 16 asteroid perturbers, and the Marsden non-gravitational model — selectable across Approximate / Basic / Standard force-model tiers (Standard is the default). GR15 and DOP853 integrators. Optional finite-burn thrust arcs — constant-RTN, velocity-tangent, or inertial-fixed steering, with per-arc Δv targeting corrections — layer on as a continuous-thrust force input.
 - **Uncertainty** — First-order (Jet1) state transition matrices; second-order (Jet2) state transition tensors; unscented sigma-point and Monte Carlo sampling; an adaptive Auto mode that escalates the method automatically through close approaches and relaxes it elsewhere. Optional per-epoch tagged-covariance readback.
 - **Ephemeris** — RA/Dec, rates, photometry (H–G, H–G₁G₂, H–G₁₂), light time, phase angle, solar elongation, local horizon. Each row carries the 6×6 sky-plane covariance over (ρ, RA, Dec) and their rates, and the aberrated barycentric ICRF state at the photon-emission epoch with its own 6×6 covariance — both present when the input orbit carries a state covariance.
-- **Orbit determination** — Gauss, Herget, and systematic-ranging (admissible region + Manifold of Variations) IOD → N-body differential correction over optical and radar (delay / Doppler) observations, with STM caching and outlier rejection. Solves beyond the six-element state for the Marsden A1/A2/A3 non-gravitational block, the cometary outgassing time delay DT, the SRP area-to-mass ratio AMRAT, and thrust Δv-correction segments — each partial supplied analytically by the hyperdual integrator — and returns a tagged solved covariance that names every fitted parameter, plus an event-aware trust verdict on the delivered covariance. Optional post-fit photometry recovers H and the phase-function slope. Validated against `find_orb` and JPL SBDB.
+- **Orbit determination** — Gauss, Herget, and systematic-ranging (admissible region + Manifold of Variations) IOD → N-body differential correction over optical and radar (delay / Doppler) observations fitted jointly, with span-grouped Jacobian reuse and outlier rejection. One call fits **every** object in an ADES set and returns per-object results keyed by designation. Solves beyond the six-element state for the Marsden A1/A2/A3 non-gravitational block, the cometary outgassing time delay DT, the SRP area-to-mass ratio AMRAT, and thrust Δv-correction segments — each partial supplied analytically by the hyperdual integrator — and returns a tagged solved covariance that names every fitted parameter, plus an event-aware trust verdict on the delivered covariance. Optional post-fit photometry recovers H and the phase-function slope. Validated against `find_orb` and JPL SBDB.
 - **Events** — Close approach (start/end), periapsis, gravitational capture (start/end), shadow entry/exit, atmospheric entry/exit, impact, and possible impact.
 
 ## Quick start
@@ -55,17 +55,21 @@ println!("{} states, {} events", result.states.len(), result.events.len());
 ## Orbit determination
 
 `determine` runs a full IOD (Gauss / Herget / systematic ranging) → N-body
-differential correction; `refine` is a Bayesian update against a prior orbit;
-`evaluate` returns residuals without fitting. The fitted `result.orbit` is a
-re-feedable [`Orbit`] carrying state, covariance, and any fitted
-non-gravitational parameters — pass it straight back into `propagate`,
-`generate_ephemeris`, or `compute_impact_probabilities`.
+differential correction over **every object** the observations group into;
+`refine` is a Bayesian update against a prior orbit; `evaluate` returns
+residuals without fitting. The fitted `result.orbit` is a re-feedable
+[`Orbit`] carrying state, covariance, and any fitted non-gravitational
+parameters — pass it straight back into `propagate`, `generate_ephemeris`,
+or `compute_impact_probabilities`.
 
 ```rust,no_run
 # use empyrean::{Context, ODConfig};
 # let ctx = Context::from_data_dir(None)?;
 let obs = ctx.read_ades("observations.psv")?;   // optical + radar
-let result = ctx.determine(&obs, None, &ODConfig::default())?;
+// `determine` fits EVERY object in the arc and returns the batch;
+// `into_single` unwraps the one-object case and refuses to pick if
+// the file turned out to hold more.
+let result = ctx.determine(&obs, None, &ODConfig::default())?.into_single()?;
 
 println!(
     "converged={}, RMS = {:.2}\" RA / {:.2}\" Dec",
@@ -83,12 +87,81 @@ D-optimality information loss on removal (+∞ marks an observation whose
 removal makes the normal matrix singular). Radar rows carry a typed
 delay / Doppler block — observed − predicted in seconds / hertz, with
 χ², survival probability, and the combined observed+predicted variance.
+No observation is deselected anonymously: every row carries a typed
+`RejectionReason` next to the criterion value and the threshold it was
+tested against, including `NonFiniteChi2` (the residual χ² was not
+finite, so the row could not enter any fit statistic) and
+`MissingJacobian` (no Jacobian survived at that epoch, so the row never
+contributed to the normal equations).
 `result.covariance_trust` is an event-aware verdict on the delivered
 covariance: `Trusted`, `EncounterIntervenes` (naming the intervening
 close approach or high-nonlinearity crossing, and whether a
 second-order state-only correction can recover it), or
 `WeaklyDeterminedHighN` for wider-than-state fits. `None` means no
 trust gate ran — absence of a verdict is not trust.
+
+`ODConfig::default()` is the production hot path: the **VFCC2017**
+weighting preset — Vereš, Farnocchia, Chesley & Chamberlin (2017)
+per-station σ floors, with 1/√N same-night de-weighting chained on top —
+over EFCC2020 catalog debiasing. `WeightingPreset::Neodys` and
+`WeightingPreset::None` are the alternatives, and
+`WeightingConfig::additional_layers` overrides the preset for named
+stations. Optical and radar astrometry are fitted jointly, which is what
+carries the hard objects; the co-orbital IOD lane (`coorbital_enabled`,
+on by default) is what recovers Earth co-orbitals of the 2010 TK7 /
+2020 XL5 class; and long comet arcs deliver as full-arc fits — set
+`allow_arc_truncation: false` to make an arc that genuinely cannot be
+fitted as one piece fail loudly instead of delivering the reconcilable
+sub-arc with the remainder tagged `RejectionReason::OutsideArc`.
+
+## Fitting a whole ADES set
+
+[`DetermineResults`] is the table `determine` returns: one
+[`DetermineEntry`] per ADES object identifier (permID / provID /
+trkSub), in `object_id` order, each holding either the fit or a typed
+[`DetermineFailure`]. One object failing never aborts the batch and
+never removes the others — a failure is an entry carrying its reason,
+not a gap — so `len()` always equals the number of objects the
+observations grouped into. Iterate the table, look one object up with
+`get(object_id)`, take only the fits with `delivered()`, or only the
+reasons with `failures()`. `all_failed()` reports the batch that ran and
+delivered nothing, and seed orbits that matched no observation group
+come back on `unmatched_orbit_ids()` rather than being dropped.
+
+```rust,no_run
+use empyrean::{Context, ODConfig};
+
+let ctx = Context::from_data_dir(None)?;
+let obs = ctx.read_ades("nightly_batch.psv")?;
+let fits = ctx.determine(&obs, None, &ODConfig::default())?;
+
+for entry in fits.iter() {
+    match &entry.outcome {
+        Ok(fit) => println!(
+            "{}: reduced χ² = {:.2}, extrapolable = {}",
+            entry.object_id,
+            fit.summary.reduced_chi2,
+            fit.acceptability.extrapolation_acceptable,
+        ),
+        // Typed: branch on `kind`, never on the message text.
+        Err(f) => println!("{}: FAILED ({:?}) — {}", entry.object_id, f.kind, f.message),
+    }
+}
+println!("{}/{} delivered", fits.delivered_count(), fits.len());
+# Ok::<(), empyrean::Error>(())
+```
+
+Each fit carries an `AcceptabilityReport`. `fit_acceptable` is the AND
+of the fit-quality gates — convergence, positive-definite covariance,
+reduced χ², RMS, AT/CT residual isotropy. `extrapolation_acceptable` is
+that AND the selection / coverage gates: the fraction of observations
+the fit retained, the span the *selected* observations still cover,
+whether the most recent observations were rejected, and fractional σₐ.
+Every gate reports its measured value beside the threshold it was tested
+against, so a fit that did not clear one says which and by how much. Use
+the first verdict to gate publication and the second to gate forward
+propagation, ephemeris generation, or impact-risk assessment; tighten
+either through `AcceptabilityThresholds`.
 
 ## Wide-parameter fitting
 
@@ -121,7 +194,7 @@ let obs = ctx.read_ades("comet_67p.psv")?;
 let fit = ctx.determine(&obs, None, &ODConfig {
     solve_for: SolveForParams::StateAndNonGrav,
     ..Default::default()
-})?;
+})?.into_single()?;
 
 // Refine, additionally solving the outgassing time delay DT. Opening DT
 // requires a prior on it — its variance (days²) — carried on the orbit.
@@ -176,7 +249,7 @@ let obs = ctx.read_ades("observations.psv")?;
 let fit = ctx.determine(&obs, None, &ODConfig {
     photometry: Some(PhotometryConfig::default()),
     ..Default::default()
-})?;
+})?.into_single()?;
 
 if let Some(phot) = &fit.photometry {
     let sigma_h = phot.covariance.map(|c| c[0][0].sqrt());
@@ -192,14 +265,77 @@ if let Some(phot) = &fit.photometry {
 # Ok::<(), empyrean::Error>(())
 ```
 
+## Writing results
+
+Orbits, residuals, per-object fit summaries, ephemerides, and events all
+write to parquet, JSON, and CSV; orbits read back from all three as well
+(the propagator and the OD pipeline are the canonical producers of the
+rest). The three formats carry the same columns and differ only in how a
+non-computable number is spelled — CSV a literal `NaN`, JSON `null`,
+since JSON has no NaN literal. CSV is not the lossy choice:
+`write_orbits_csv` emits the same column set as `write_orbits_parquet`,
+covariance included.
+
+Residual files carry the **whole** `ObservationResidual` surface — all
+36 fields — not a projection of it: the `obs_id` / `object_id` join
+keys, the observatory code, catalog and epoch, the effective residual
+covariances, the complete rejection attribution (reason, criterion,
+threshold, effective threshold, information loss), the influence
+diagnostics, the along/cross-track decomposition, and the radar block.
+Because `object_id` travels with the row, residuals from a whole batch
+concatenate into one table and stay attributable.
+
+The fit summary is the artifact that makes a partially successful batch
+readable: one row per **input** object, whether or not it produced an
+orbit, carrying its convergence, RMS, both acceptability verdicts with
+each gate's value and threshold, the solved width, and — on a failed
+object — the reason. The orbit file holds only the objects that
+delivered; the summary holds all of them.
+
+```rust,no_run
+use empyrean::{
+    Context, FitSummaryRow, ODConfig, OrbitBatch, write_fit_summary_csv,
+    write_fit_summary_parquet, write_orbits_csv, write_residuals_parquet,
+};
+
+let ctx = Context::from_data_dir(None)?;
+let obs = ctx.read_ades("nightly_batch.psv")?;
+let fits = ctx.determine(&obs, None, &ODConfig::default())?;
+
+// One row per input object — delivered and failed alike.
+let summary = FitSummaryRow::from_results(&fits);
+write_fit_summary_parquet("fit_summary.parquet", &summary)?;
+write_fit_summary_csv("fit_summary.csv", &summary)?;
+
+// The delivered fits: orbits keyed by the designation they were fitted
+// under, and one flat residual table across the batch.
+let mut orbits = Vec::new();
+let mut orbit_ids = Vec::new();
+let mut object_ids = Vec::new();
+let mut residuals = Vec::new();
+for (object_id, fit) in fits.delivered() {
+    orbits.push(fit.orbit.clone());
+    orbit_ids.push(object_id.to_string());
+    object_ids.push(Some(object_id.to_string()));
+    residuals.extend(fit.residuals.iter().cloned());
+}
+
+// CSV carries the covariance too — same columns as parquet.
+write_orbits_csv("fitted_orbits.csv", &OrbitBatch::new(orbits, orbit_ids, object_ids)?)?;
+write_residuals_parquet("residuals.parquet", &residuals)?;
+# Ok::<(), empyrean::Error>(())
+```
+
 ## Ephemeris
 
 ```rust,no_run
-# use empyrean::{Context, EphemerisConfig, Epoch};
+# use empyrean::{Context, EphemerisConfig, Epoch, Frame, Origin};
 # let ctx = Context::from_data_dir(None)?;
 # let orbits = empyrean::query_sbdb(&["Apophis"], None)?.orbits;
 let epochs = vec![Epoch::from_mjd_tdb(65000.0)];
-let observers = ctx.get_observers(&["W84", "F51"], &epochs)?;
+// ICRF / solar-system barycenter is the construction basis — the one
+// ephemeris generation requires, and the one that takes no transform.
+let observers = ctx.get_observers(&["W84", "F51"], &epochs, Frame::ICRF, Origin::SSB)?;
 let eph = ctx.generate_ephemeris(&orbits, &observers, &EphemerisConfig::default())?;
 
 for entry in &eph.entries {
@@ -217,6 +353,25 @@ state covariance. Non-fatal generation warnings (an Earth-orientation
 kernel coverage gap handled by the analytic IAU 2006 fallback, a row
 whose observation-sensitivity chain was skipped) come back on
 `EphemerisResult::warnings` — empty when the run had nothing to report.
+
+A target that is itself one of the loaded perturbers (1 Ceres, 2 Pallas,
+4 Vesta, …) needs `EphemerisOverlapPolicy::ExcludeAndIntegrate` on the
+inner propagation config. The default, `SubstituteSpk`, returns that
+body's own SPK states — exact for the body, but no trajectory is
+produced, and ephemeris generation has no light-time chain to read.
+
+```rust,no_run
+use empyrean::{EphemerisConfig, EphemerisOverlapPolicy, PropagationConfig};
+
+let cfg = EphemerisConfig {
+    propagation: PropagationConfig {
+        ephemeris_overlap_policy: EphemerisOverlapPolicy::ExcludeAndIntegrate,
+        ..Default::default()
+    },
+    ..Default::default()
+};
+# let _ = cfg;
+```
 
 ## Uncertainty
 
@@ -321,6 +476,12 @@ gradient and 6×6 Hessian with respect to the initial state, and the
 adaptive Gaussian-mixture component count — fields a given method didn't
 compute carry NaN / 0 sentinels.
 
+`UncertaintyMethod::auto()` is accepted here alongside the fixed
+methods, and a hand-tuned `Auto { .. }` is carried through with the
+thresholds you set rather than the defaults. Every record is tagged with
+the method that produced it: an `Auto` row reads back tagged `Auto`,
+never relabelled as one of the fixed methods.
+
 ```rust,no_run
 # use empyrean::{Context, Epoch, UncertaintyMethod, Origin};
 # let ctx = Context::from_data_dir(None)?;
@@ -330,7 +491,11 @@ let end = Epoch::from_mjd_tdb(65000.0);
 let ips = ctx.compute_impact_probabilities(
     &orbits,
     end,
-    &[UncertaintyMethod::FirstOrder, UncertaintyMethod::SecondOrder],
+    &[
+        UncertaintyMethod::FirstOrder,
+        UncertaintyMethod::SecondOrder,
+        UncertaintyMethod::auto(),
+    ],
     &[Origin::EARTH, Origin::MOON],
 )?;
 for ip in &ips {
@@ -343,6 +508,61 @@ for bp in &bps {
 }
 # Ok::<(), empyrean::Error>(())
 ```
+
+## Data directory and offline operation
+
+`Context::from_data_dir` loads the Standard-tier kernel set, acquiring
+whatever the tier needs and the directory does not have.
+`Context::from_data_dir_with` is its superset —
+`from_data_dir_with(dir, DataDirOptions::default())` is exactly
+`from_data_dir(dir)` — and `refresh: false` is why it exists. Strict
+offline resolves the tier's kernels from the directory alone (no HTTP
+HEAD, no download, no staleness check) and fails naming **every** file
+the tier needs and the directory lacks, as a list on
+`Error::missing_data_files()` rather than as prose a caller would have
+to split. Nothing is degraded to make an incomplete directory work: no
+lower-tier fallback, no download-just-this-one, no partially loaded
+context.
+
+`download_data` provisions without loading — it downloads and caches the
+kernel set and stops there, so a provisioning step never pays for a
+context assembly it would immediately discard. It is idempotent: files
+already present are kept.
+
+```rust,no_run
+use empyrean::{Context, DataDirOptions, DataTier};
+
+// Provision once, with the network.
+let dir = empyrean::download_data(None)?;
+
+// From here on, never reach for it. Any absent file fails the
+// construction and is named in the error.
+let ctx = Context::from_data_dir_with(
+    Some(&dir),
+    DataDirOptions { refresh: false, tier: DataTier::Standard },
+)
+.inspect_err(|e| {
+    for missing in e.missing_data_files() {
+        eprintln!("absent: {missing}");
+    }
+})?;
+# let _ = ctx;
+# Ok::<(), empyrean::Error>(())
+```
+
+`EMPYREAN_OFFLINE=1` is a floor, never an override: it downgrades a
+requested `refresh: true` to `false` and says so on stderr, and it can
+never turn a `false` into a `true`. Only the exact value `1` asserts it.
+`offline_floor_is_active()` reports whether it is in force, for a caller
+that does network work of its own before building a context.
+`Context::from_data_dir` does not consult it — it predates the variable,
+and quietly reinterpreting it would change the meaning of code written
+before the variable existed — so reach for `from_data_dir_with` when the
+variable should apply.
+
+`DataTier` selects which kernel set has to be on disk — Approximate,
+Basic, or Standard (the default) — and lines up with the
+`ForceModelTier` a propagation then runs under.
 
 ## Runtime requirement
 

@@ -20,14 +20,19 @@ Command-line interface for empyrean — orbit propagation, ephemeris generation,
 empyrean-cli is the command-line interface to empyrean. It publishes
 one binary — `empyrean` — that runs every headline pipeline (orbit
 propagation, ephemeris generation, orbit determination, and event
-detection) and emits Parquet output you can join in pandas / Polars /
-DuckDB.
+detection), emits Parquet output you can join in pandas / Polars /
+DuckDB, and pages through what it wrote without leaving the terminal.
 
 ## Install
 
+Current release: **0.10.0-rc.0** (release candidate).
+
 ```sh
-cargo install empyrean-cli
+cargo install empyrean-cli --version 0.10.0-rc.0
 ```
+
+A release candidate is not selected by a bare `cargo install`, so the
+`--version` is required until the final release.
 
 `cargo install` fetches the closed-source `libempyrean` engine
 automatically (a checksum-pinned download at build time). Prebuilt
@@ -63,8 +68,11 @@ empyrean propagate --object-id 99942 --epoch 64922.0 --out-dir ./out
 # Generate an ephemeris from the same orbit at observatory 568.
 empyrean ephemeris --object-id 99942 --observers 568 --epoch 64922.0 --out-dir ./out
 
-# Fit an orbit from an ADES PSV.
-empyrean determine apophis.psv --out-dir ./out
+# Fit every object in an ADES PSV — one fit per designation, one command.
+empyrean determine observations.psv --out-dir ./out
+
+# Page through what any of them wrote.
+empyrean show --out-dir ./out
 
 # Confirm the build provenance — every binary carries the `<tag>+<sha>`
 # strings of the villeneuve / scott / nolan commits it was built against.
@@ -72,11 +80,14 @@ empyrean version
 ```
 
 The pipeline commands (`propagate` / `ephemeris` / `determine`) emit
-Parquet tables under `--out-dir` by default (`--format json` /
-`--format csv` are also available). The schemas
-match the Python and Rust API outputs exactly — same `orbit_id` /
-`object_id` join keys, same time scales, same physical units — so you
-can mix-and-match channels for the same workflow.
+Parquet tables under `--out-dir` by default; `--format json` and
+`--format csv` are also available, and CSV is no longer a lossy choice —
+it carries the same 82-column orbit schema Parquet does, covariance
+included. The schemas match the Python and Rust API outputs exactly —
+same `orbit_id` / `object_id` join keys, same time scales, same physical
+units — so you can mix-and-match channels for the same workflow.
+
+`empyrean show` browses what they wrote — see [Browsing output](#browsing-output).
 
 Beyond the headline pipelines: `propagate` takes `--uncertainty-method`
 (`first-order` / `second-order` / `sigma-point` / `monte-carlo` /
@@ -86,6 +97,123 @@ manage the API response cache; and `empyrean serve` / `empyrean stop`
 run a daemon that keeps the loaded kernels in memory for faster
 subsequent commands. See `empyrean <command> --help` for the full
 flag surface.
+
+## Running offline
+
+`--no-refresh` is global — it goes on any command, before or after the
+subcommand. It builds the context from `--data-dir` alone and never
+reaches the network: no partial load, no fallback to a smaller kernel
+set. If a required file is absent, the command fails and **names every
+missing file**, which is the remedy rather than a hint at it.
+
+```sh
+# Verify a data directory without downloading anything.
+empyrean --no-refresh init --data-dir /mnt/kernels
+
+# Fit on an air-gapped machine.
+empyrean determine observations.psv --no-refresh --out-dir ./out
+```
+
+`EMPYREAN_OFFLINE=1` in the environment does the same thing and
+announces itself. It is a floor, not a switch: it can only ever turn
+network access off, never back on. On `init` it turns the command into
+a verifier — the kernel download is skipped outright rather than run
+and then discarded.
+
+Under either form, a command that would normally hand its work to a
+running daemon runs in-process instead. The daemon's context was built
+once, under its own policy, and cannot honour a strict-offline request
+after the fact; serving it anyway would ignore the flag without saying
+so.
+
+## Browsing output
+
+`empyrean show` pages through the tables the pipeline commands write —
+Parquet, CSV, or JSON — without leaving the terminal and without a
+notebook.
+
+```sh
+# List an output directory and pick a file to open.
+empyrean show --out-dir ./out
+
+# Straight into one file.
+empyrean show ./out/residuals.parquet
+```
+
+The listing gives each artifact's row count, size, and what it holds,
+then asks which one to open:
+
+```text
+$ empyrean show --out-dir ./out
+./out
+
+    FILE               ROWS  SIZE      DESCRIPTION
+ 1. ephemeris.parquet  96    12.4 KiB  Predicted ephemeris — RA/Dec per observer and epoch
+ 2. events.parquet     3     9.8 KiB   Detected events — close approaches, impacts, and their geometry
+ 3. states.parquet     1     20.1 KiB  Propagated states — position, velocity, covariance at the target epoch
+
+Open [1-3] (q to quit): 1
+```
+
+Parquet row counts come from the file footer, so they are exact and cost
+no decoding; a text file past 64 MiB is sampled instead and its count is
+marked `~`. A file `show` cannot read is skipped rather than failing the
+listing — a stray `README.md` next to the tables does not stop you
+browsing them. Naming an unreadable file *directly* is still a hard
+error, by name, saying what was tried.
+
+In the pager: **space** / **enter** for the next page, **b** for the
+previous one, **←** / **→** to slide the column window (an orbits table
+is 82 columns — most of them a covariance block), **g** / **Home** to
+jump back to the first row, **/** to filter rows by substring, **Esc** to
+drop the filter, **q** to quit. The status line says where you are, and
+declines to guess a total it has not reached yet:
+
+```text
+rows 1-21  ·  cols 1-7 of 21  —  space/b page  ←/→ cols  / filter  q quit
+```
+
+It streams. The first page of a multi-million-row residuals table appears
+immediately and memory does not grow with the file, because rows are
+pulled a record batch at a time rather than loaded. Paging *backward*
+re-reads from the start of the file to reach the target row, so `b` gets
+slower the deeper into a very large file you are; paging forward does not.
+
+Piped, `show` drops the interactivity and writes the whole table as
+aligned text — nothing truncated, since a clipped number on its way into
+`awk` is a wrong number — so it composes:
+
+```sh
+empyrean show ./out/residuals.parquet --columns obs_id,object_id,chi2 | grep -v NaN
+empyrean show ./out/states.parquet --limit 5 --no-header
+empyrean show ./out/fit_summary.csv --columns object_id,status,rms_ra_arcsec,fit_acceptable
+```
+
+```text
+object_id  status     rms_ra_arcsec  fit_acceptable
+99942      delivered  0.32           true
+2010 TK7   delivered  0.41           true
+K25X99Z    failed     NaN            false
+```
+
+Flags: `--limit N` caps the rows, `--columns a,b,c` selects and reorders
+them (a name the file does not have is an error listing the names it
+does), `--filter TEXT` keeps rows containing that text case-insensitively,
+`--no-header` drops the header line, and `--full-precision` prints every
+digit of every float instead of the default six significant figures (the
+default is readable; the flag is exact and round-trips). `--out-dir DIR`
+is the same as passing the directory positionally.
+
+The filter matches the row *as displayed*, so `--filter NaN` finds
+exactly the uncomputable cells: an absent value renders as an empty cell,
+never the text `null`, and cannot be swept up by accident. That
+distinction is kept everywhere — in a residuals table a null `ast_cat`
+means no star catalog was recorded while a NaN `chi2` means a χ² that
+could not be evaluated, and neither must ever read as the other.
+
+`show` reads files and nothing else — it needs no SPICE kernels and never
+loads the `libempyrean` runtime, so it works on a machine that has only
+the CLI and on outputs copied off a cluster.
 
 ## Continuous thrust
 
@@ -125,17 +253,103 @@ empyrean propagate --object-id 99942 --epoch 64922.0 --thrust-arcs burn.json --o
 
 ## Orbit determination
 
-`determine` fits an orbit from an ADES PSV and writes the fitted orbit
-(`fitted_orbit.<ext>`) plus per-observation residuals (`residuals.<ext>`)
-under `--out-dir`. The fitted orbit is fully re-feedable — its state,
-covariance, and non-gravitational model carry straight into a follow-on
-`empyrean propagate` / `empyrean ephemeris` with no reconstruction.
+`determine` is batch-first: it groups the ADES PSV by object identifier
+(`permID` → `provID` → `trkSub`) and fits **every** object in the file.
+A file with one object is the one-row case, not a different command.
+Optical and radar (delay / Doppler) rows in the same file are fitted
+jointly, which is what pulls a hard object's orbit down.
 
 ```sh
-# 6-parameter fit. The default `--solve-for auto` starts state-only and
-# escalates to non-grav automatically on a poor fit.
-empyrean determine apophis.psv --out-dir ./out
+# 6-parameter fit per object. The default `--solve-for auto` starts
+# state-only and escalates to non-grav automatically on a poor fit.
+empyrean determine observations.psv --out-dir ./out
 ```
+
+```text
+Loaded context (2.4s)
+Read 883 observation(s) from observations.psv
+Running orbit determination...
+OD complete (41.7s): 2 of 3 object(s) delivered
+
+  Object           Converged  Iter  RMS_RA" RMS_Dec"    Obs    Sel     Fit  Extrap
+  ------------------------------------------------------------------------------------
+  99942                  yes    11     0.32     0.28    128    126     yes     yes
+  2010 TK7               yes     9     0.41     0.37    318    311     yes      no
+  K25X99Z             FAILED     -        -        -      -      -       -       -
+
+  1 of 3 object(s) produced no orbit:
+    K25X99Z: no viable IOD seed
+
+  ./out/fitted_orbits.parquet (2 rows)
+  ./out/fit_summary.parquet + fit_summary.csv (3 rows)
+  ./out/residuals.parquet (437 rows)
+
+  Output: ./out/
+```
+
+The table is the command's primary human output: one line per object the
+batch *attempted*, so a partially successful run reads as such rather
+than as a success with a shorter orbit file. `Fit` and `Extrap` are the
+two acceptability verdicts — is the fit good, and is it safe to
+extrapolate forward — reported separately because they fail for
+different reasons.
+
+Three artifacts land under `--out-dir`:
+
+- `fitted_orbits.<ext>` — one row per object that produced an orbit,
+  keyed by its ADES designation. Fully re-feedable: state, covariance,
+  and non-gravitational model carry straight into a follow-on
+  `empyrean propagate` / `empyrean ephemeris` with no reconstruction.
+- `fit_summary.parquet` **and** `fit_summary.csv` — one row per *input*
+  object, delivered or not: `status`, convergence, iterations, observation
+  and selected counts, residual RMS, reduced χ², both acceptability
+  verdicts with a value and a threshold column for each gate
+  (`selection_fraction`, `selected_arc_*`, `trailing_gap_*`,
+  `fractional_sigma_a`), the solved width, and on failure the reason.
+  Always written in both formats so a run is readable at a terminal
+  without a parquet tool. A quantity that does not exist is `NaN`, never
+  `0.0` — a failed object has no RMS, and a floor reading is not the same
+  as no reading.
+- `residuals.<ext>` — every delivered fit's per-observation rows, each
+  tagged with the `object_id` it belongs to. The file carries the whole
+  36-column residual surface: the `obs_id` / `object_id` join keys,
+  observatory code, epoch and star catalog, the effective residual
+  covariance, the full rejection attribution (`rejection_reason`,
+  criterion, threshold, effective threshold, information loss), the
+  influence diagnostics (`cooks_distance`, `leverage`,
+  `fractional_information`), the along/cross-track decomposition, and the
+  radar block. All three formats emit the same columns; a non-computable
+  number is a literal `NaN` in CSV and `null` in JSON.
+
+An object whose fit fails never removes the others and never disappears:
+it gets a typed failure and a `fit_summary` row saying so. The exit code
+is the batch's verdict — `0` when every object delivered, `3` when some
+did, `4` when none did — so a script can tell a partial run from a clean
+one without parsing stderr.
+
+```sh
+empyrean determine observations.psv --out-dir ./out
+echo $?    # 3 — some objects delivered, some did not
+ls out/    # fit_summary.csv  fit_summary.parquet  fitted_orbits.parquet  residuals.parquet
+```
+
+Every deselected observation carries a typed reason rather than
+vanishing: `rejection_reason` is written as a name — `chi_squared`,
+`sigma_clip`, `cooks_distance`, `adaptive`, `outside_arc`,
+`unsupported_observatory`, `non_finite_chi2`, `missing_jacobian`, and the
+rest — alongside the criterion and threshold that produced it, so a
+thinned arc can be audited rather than guessed at. Observations are
+weighted with the VFCC2017 preset (Vereš, Farnocchia, Chesley &
+Chamberlin 2017) station floors plus nightly de-weighting, which is the
+default and needs no flag.
+
+Hard objects are the point of the batch path. A comet arc a narrower
+solve cannot reconcile escalates instead of being cut short, so the
+delivered fit spans the whole arc; a co-orbital object of the
+2010 TK7 / 2020 XL5 class is recovered by an IOD lane that fires when the
+co-orbitality gates pass, rather than falling out of the ordinary
+cascade; and radar delay / Doppler rows tighten the same solve the
+optical rows constrain.
 
 ### Solving for more than the state
 
@@ -177,16 +391,19 @@ empyrean determine object.psv --solve-for amrat --amrat 3.0e-3 --amrat-variance 
 empyrean determine maneuvering.psv --solve-for non-grav --thrust-segments 2 --out-dir ./out
 ```
 
-Each fit prints a convergence summary and a readback of exactly the wide
-axes it recovered. A line for an axis appears only when that axis was
-actually solved, so a missing line reads as "not recovered", never a zero:
+After the per-object table, each delivered object gets a readback of
+exactly the wide axes it recovered, under its own designation. A line for
+an axis appears only when that axis was actually solved, so a missing
+line reads as "not recovered", never a zero:
 
 ```text
-  Converged  Iter  RMS_RA"  RMS_Dec"   Obs
-  ----------------------------------------
-  yes           11     0.32      0.28    128
-  Solved covariance width: 10
-  Non-grav time delay  ΔDT = 0.0142 d
+  Object           Converged  Iter  RMS_RA" RMS_Dec"    Obs    Sel     Fit  Extrap
+  ------------------------------------------------------------------------------------
+  1P                     yes    14     0.38     0.35    642    629     yes     yes
+
+  1P:
+    Solved covariance width: 10
+    Non-grav time delay  ΔDT = 0.0142 d
 ```
 
 ### Tagged solved covariance
@@ -198,8 +415,9 @@ column order. The canonical layout is
 `[state 6 | Marsden 3 | DT 1 | AMRAT 1 | thrust 3×k]`, but the width alone
 is ambiguous (a width-9 solve is Marsden-only *or* one thrust segment), so
 each solved axis is located by its tag and reported by name in the
-readback above. The fitted state covariance rides along in
-`fitted_orbit.<ext>`.
+readback above. Its width is also carried per object in `fit_summary`'s
+`solve_for_width` column, and the fitted state covariance rides along in
+`fitted_orbits.<ext>`.
 
 ### Post-OD photometry
 
@@ -218,7 +436,8 @@ empyrean determine apophis.psv --photometry --out-dir ./out
 ```
 
 ```text
-  Photometry: H = 19.234 ± 0.041  G1 = 0.150  (model HG12, chi2_r 1.02)
+  99942:
+    Photometry: H = 19.234 ± 0.041  G1 = 0.150  (model HG12, chi2_r 1.02)
 ```
 
 ## Runtime requirement

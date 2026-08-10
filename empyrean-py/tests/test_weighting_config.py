@@ -6,7 +6,7 @@ pre-fix build (failure signatures recorded per test):
 
 * **preset NONE is honored** — ``preset=NONE`` + empty
   ``additional_layers`` means uniform weighting at the user's
-  ``default_sigma_arcsec``, never a silent VFC17 substitution.
+  ``default_sigma_arcsec``, never a silent VFCC2017 substitution.
 * **user layers beat preset rules** — an additional observatory rule
   for a preset-covered station wins that station (first-match-wins;
   the preset is the fallback).
@@ -72,9 +72,9 @@ _STATE = {
     "vz": 3.99496044422352188e-04,
 }
 
-# VFC17 assigns F51 (Pan-STARRS 1) a 0.2″ station floor; with no
+# VFCC2017 assigns F51 (Pan-STARRS 1) a 0.2″ station floor; with no
 # reported sigmas the preset chi2 is (1/0.2)² = 25× uniform.
-_VFC17_F51_RATIO = 25.0
+_VFCC2017_F51_RATIO = 25.0
 
 _MJD0 = datetime(1858, 11, 17, tzinfo=timezone.utc)
 
@@ -210,7 +210,7 @@ def test_preset_none_empty_layers_equals_uniform_weighting(probe_orbit, f51_obse
     bit-identical to weighting disabled (uniform 1″).
 
     Pre-fix failure signature: the conversion silently substituted the
-    VFC17 preset, whose F51 floor is 0.2″ — measured chi2 ratio to
+    VFCC2017 preset, whose F51 floor is 0.2″ — measured chi2 ratio to
     uniform was 25.000000 (should be 1.0).
     """
     c_uniform = _chi2(probe_orbit, f51_observations, WeightingConfig(enabled=False))
@@ -232,7 +232,7 @@ def test_preset_none_uses_user_default_sigma(probe_orbit, f51_observations):
     default_sigma_arcsec: doubling sigma quarters chi2 exactly.
 
     Pre-fix failure signature: default_sigma_arcsec was ignored
-    entirely (VFC17 substituted) — chi2 ratio to uniform was
+    entirely (VFCC2017 substituted) — chi2 ratio to uniform was
     25.000000 for BOTH sigma=1 and sigma=2 (should be 1.0 and 0.25).
     """
     c_uniform = _chi2(probe_orbit, f51_observations, WeightingConfig(enabled=False))
@@ -251,28 +251,28 @@ def test_preset_none_uses_user_default_sigma(probe_orbit, f51_observations):
 # ── (b) user layers beat preset rules ────────────────────────────────
 
 
-def test_vfc17_preset_station_floor_applies(probe_orbit, f51_observations):
-    """Sanity anchor: the plain VFC17 preset assigns F51 its 0.2″
+def test_vfcc2017_preset_station_floor_applies(probe_orbit, f51_observations):
+    """Sanity anchor: the plain VFCC2017 preset assigns F51 its 0.2″
     floor, so chi2 is exactly 25× uniform on unreported-sigma obs.
     (This was true pre-fix too — it pins the baseline the override
     test below must beat.)"""
     c_uniform = _chi2(probe_orbit, f51_observations, WeightingConfig(enabled=False))
-    c_vfc17 = _chi2(
+    c_vfcc2017 = _chi2(
         probe_orbit,
         f51_observations,
-        WeightingConfig(preset=WeightingPreset.VFC17, additional_layers=[]),
+        WeightingConfig(preset=WeightingPreset.VFCC2017, additional_layers=[]),
     )
-    np.testing.assert_allclose(c_vfc17, c_uniform * _VFC17_F51_RATIO, rtol=1e-12)
+    np.testing.assert_allclose(c_vfcc2017, c_uniform * _VFCC2017_F51_RATIO, rtol=1e-12)
 
 
 def test_user_layer_beats_preset_rule_for_station(probe_orbit, f51_observations):
-    """VFC17 + one additional OBSERVATORY_RULE for F51 (sigma=10″):
+    """VFCC2017 + one additional OBSERVATORY_RULE for F51 (sigma=10″):
     the user rule wins its station — sigma resolution is
     first-match-wins and user layers go ahead of the preset chain.
 
     Pre-fix failure signature: the user layer was appended AFTER the
     (time-unbounded) preset rules, so it could never match — chi2 was
-    identical to the plain VFC17 preset, ratio 25.000000 to uniform
+    identical to the plain VFCC2017 preset, ratio 25.000000 to uniform
     (should be 0.010000 = (1/10)²).
     """
     c_uniform = _chi2(probe_orbit, f51_observations, WeightingConfig(enabled=False))
@@ -284,31 +284,31 @@ def test_user_layer_beats_preset_rule_for_station(probe_orbit, f51_observations)
     c_override = _chi2(
         probe_orbit,
         f51_observations,
-        WeightingConfig(preset=WeightingPreset.VFC17, additional_layers=[user_rule]),
+        WeightingConfig(preset=WeightingPreset.VFCC2017, additional_layers=[user_rule]),
     )
     np.testing.assert_allclose(c_override, c_uniform / 100.0, rtol=1e-12)
     # And it is decisively NOT the preset floor.
-    c_vfc17 = _chi2(
+    c_vfcc2017 = _chi2(
         probe_orbit,
         f51_observations,
-        WeightingConfig(preset=WeightingPreset.VFC17, additional_layers=[]),
+        WeightingConfig(preset=WeightingPreset.VFCC2017, additional_layers=[]),
     )
-    assert c_override < c_vfc17 / 100.0
+    assert c_override < c_vfcc2017 / 100.0
 
 
 def test_nightly_layer_position_does_not_change_station_sigmas(probe_orbit, f51_observations):
     """Regression guard for the reorder: with one observation per
     night the nightly layer is a no-op, so the production default
-    (VFC17 + nightly, now prepended) must match the bare VFC17 preset
+    (VFCC2017 + nightly, now prepended) must match the bare VFCC2017 preset
     exactly. Nightly de-weighting and scale factors are position-
     independent — only sigma-rule precedence changed."""
     c_default = _chi2(probe_orbit, f51_observations, WeightingConfig())
-    c_vfc17 = _chi2(
+    c_vfcc2017 = _chi2(
         probe_orbit,
         f51_observations,
-        WeightingConfig(preset=WeightingPreset.VFC17, additional_layers=[]),
+        WeightingConfig(preset=WeightingPreset.VFCC2017, additional_layers=[]),
     )
-    np.testing.assert_allclose(c_default, c_vfc17, rtol=1e-12)
+    np.testing.assert_allclose(c_default, c_vfcc2017, rtol=1e-12)
 
 
 # ── (c) strict per-kind layer validation ─────────────────────────────
@@ -346,7 +346,7 @@ def test_two_nightly_layers_rejected(probe_orbit, f51_observations):
     silently.
     """
     wcfg = WeightingConfig(
-        preset=WeightingPreset.VFC17,
+        preset=WeightingPreset.VFCC2017,
         additional_layers=[
             WeightingLayer(kind=WeightingLayerKind.NIGHTLY_DEWEIGHTING),
             WeightingLayer(kind=WeightingLayerKind.NIGHTLY_DEWEIGHTING, max_gap_days=0.3),
@@ -462,7 +462,7 @@ def test_raw_wire_duplicate_nightly_rejected_at_engine_boundary(probe_orbit, f51
     the Python-level count check is bypassed."""
     raw = {
         "enabled": True,
-        "preset": "vfc17",
+        "preset": "vfcc2017",
         "additional_layers": [
             {"kind": "nightly_deweighting", "max_gap_days": 0.5},
             {"kind": "nightly_deweighting", "max_gap_days": 0.3},
@@ -585,11 +585,11 @@ def _assert_same_fit(session_fit, one_shot_fit) -> None:
     ("label", "weighting"),
     [
         ("preset_none_uniform_1as", _uniform(1.0)),
-        ("preset_vfc17", WeightingConfig(preset=WeightingPreset.VFC17, additional_layers=[])),
+        ("preset_vfcc2017", WeightingConfig(preset=WeightingPreset.VFCC2017, additional_layers=[])),
         (
-            "vfc17_plus_user_f51_rule",
+            "vfcc2017_plus_user_f51_rule",
             WeightingConfig(
-                preset=WeightingPreset.VFC17,
+                preset=WeightingPreset.VFCC2017,
                 additional_layers=[
                     WeightingLayer(
                         kind=WeightingLayerKind.OBSERVATORY_RULE,
@@ -607,17 +607,17 @@ def test_session_fit_matches_one_shot_fit(label, weighting, fittable_f51_observa
 
     Pre-fix failure signature (``preset_none_uniform_1as``): the session
     constructor never read the weighting config, so the session ran the
-    engine default (VFC17, whose F51 floor is 0.2″) while the one-shot
+    engine default (VFCC2017, whose F51 floor is 0.2″) while the one-shot
     ran the requested uniform 1″ — one-shot chi2 = 0.00974934879161377,
     session chi2 = 0.24373371932879223, ratio 25.000000 (should be
-    1.000000). ``vfc17_plus_user_f51_rule`` failed the same way with
+    1.000000). ``vfcc2017_plus_user_f51_rule`` failed the same way with
     one-shot chi2 = 9.91897809191094e-05 vs the same pinned session
     value (the user layer was discarded along with everything else);
-    ``preset_vfc17`` passed pre-fix only because it happens to be the
+    ``preset_vfcc2017`` passed pre-fix only because it happens to be the
     engine default the session silently substituted.
     """
     cfg = _od_config(weighting)
-    one_shot = determine(fittable_f51_observations, config=cfg)
+    one_shot = determine(fittable_f51_observations, config=cfg).single()
     session_fit = Session(fittable_f51_observations, config=cfg).refine()
     _assert_same_fit(session_fit, one_shot)
 
@@ -633,7 +633,7 @@ def test_session_weighting_change_changes_the_session_fit(fittable_f51_observati
 
     Pre-fix failure signature: sigma=1″ and sigma=4″ both produced
     chi2 = 0.24373371932879223 — bit-identical, ratio 1.000000, the
-    VFC17 default the session substituted for both.
+    VFCC2017 default the session substituted for both.
     """
     obs = fittable_f51_observations
     c1 = Session(obs, config=_od_config(_uniform(1.0))).refine().summary.chi2
@@ -654,7 +654,7 @@ def test_session_honors_debiasing_config(fittable_f51_observations):
     obs = fittable_f51_observations
     for enabled in (False, True):
         cfg = _od_config(_uniform(1.0), debiasing_enabled=enabled)
-        _assert_same_fit(Session(obs, config=cfg).refine(), determine(obs, config=cfg))
+        _assert_same_fit(Session(obs, config=cfg).refine(), determine(obs, config=cfg).single())
 
 
 @pytest.mark.parametrize(
@@ -680,7 +680,7 @@ def test_session_honors_debiasing_config(fittable_f51_observations):
             "duplicate_nightly",
             {
                 "enabled": True,
-                "preset": "vfc17",
+                "preset": "vfcc2017",
                 "additional_layers": [
                     {"kind": "nightly_deweighting", "max_gap_days": 0.5},
                     {"kind": "nightly_deweighting", "max_gap_days": 0.3},

@@ -51,6 +51,7 @@ from empyrean.od.determine import determine, evaluate, read_ades, refine
 from empyrean.od.radar_observations import ADESRadarObservations
 from empyrean.od.residuals import (
     AcceptabilityReport,
+    FitSummary,
     ObservationResults,
     ResidualSummary,
     StationBiases,
@@ -63,7 +64,9 @@ from empyrean.od.result import (
     CovarianceTrust,
     DebiasingConfig,
     DebiasingResolution,
+    DetermineFailure,
     DetermineResult,
+    DetermineResults,
     EvaluateResult,
     GateRecord,
     IODConfig,
@@ -108,7 +111,9 @@ from empyrean.orbits.thrust import (
 )
 from empyrean.propagation.config import (
     AdvancedIntegratorConfig,
+    Auto,
     DiagnosticsConfig,
+    EphemerisOverlapPolicy,
     ForceModelTier,
     GaussianMixture,
     IntegratorChoice,
@@ -358,11 +363,13 @@ def initialize(
     data_dir: str | pathlib.Path | None = None,
     de440_path: str | pathlib.Path | None = None,
     gm_path: str | pathlib.Path | None = None,
+    refresh: bool = True,
 ) -> None:
     """Initialize empyrean with SPICE kernel data.
 
     On first call, loads ephemeris data into a global context. Subsequent
-    calls are no-ops.
+    calls are no-ops — including their ``refresh``, so the first call in
+    a process is the one that decides whether the network is reachable.
 
     If the B612 Foundation data packages (``naif-de440``,
     ``jpl-small-bodies-de441-n16``, ``naif-eop-high-prec``,
@@ -385,6 +392,38 @@ def initialize(
         Explicit path to ``de440.bsp``. Overrides B612 detection.
     gm_path : str, optional
         Explicit path to ``gm_de440.tpc``.
+    refresh : bool
+        Whether initialization may reach the network. ``True``
+        (default) downloads any required kernel that is missing and
+        re-downloads any whose upstream copy moved. ``False`` is
+        **strict offline**: kernels are resolved from the data directory
+        alone and initialization fails, naming every absent file, if any
+        is missing. There is no try-the-network-and-tolerate path and no
+        degrade-to-a-lower-tier path.
+
+        Passing both ``de440_path`` and ``gm_path`` loads exactly those
+        two files and never reaches the network on either value, so
+        ``refresh=False`` is already satisfied on that branch.
+
+        Setting the environment variable ``EMPYREAN_OFFLINE=1`` acts as a
+        **floor**: it downgrades ``refresh=True`` to ``False`` and says so
+        on stderr. It can never turn ``False`` into ``True``, so an
+        operator asserting "this machine must not reach the network"
+        cannot have that reversed by a library call.
+
+    Raises
+    ------
+    FileNotFoundError
+        Under ``refresh=False`` when the data directory is missing a
+        required kernel. The exception carries a ``missing_data_files``
+        attribute — the list of absent filenames — so a caller can fetch
+        or report exactly that set without re-parsing the message.
+    RuntimeError
+        Any other initialization failure.
+
+    Examples
+    --------
+    >>> empyrean.initialize(refresh=False)  # air-gapped / reproducible run
     """
     from empyrean._empyrean_rs import _initialize
 
@@ -397,6 +436,7 @@ def initialize(
         data_dir=None if data_dir is None else str(data_dir),
         de440_path=None if de440_path is None else str(de440_path),
         gm_path=None if gm_path is None else str(gm_path),
+        refresh=refresh,
     )
 
 

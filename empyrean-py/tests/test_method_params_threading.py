@@ -31,6 +31,7 @@ from empyrean.impact import (
 from empyrean.orbits.orbits import CartesianOrbits
 from empyrean.propagation.config import (
     _UNCERTAINTY_PARAM_DEFAULTS,
+    Auto,
     GaussianMixture,
     MonteCarlo,
     SigmaPoint,
@@ -285,3 +286,26 @@ def test_default_specs_lower_to_engine_defaults() -> None:
     )
     assert tags_dc == tags_enum == [2, 3, 5]
     assert params_dc == params_enum
+
+
+def test_tuned_auto_dataclass_is_accepted_and_lowers_its_thresholds() -> None:
+    """PROVING (empyrean-41l4p): a tuned ``Auto`` dataclass used to raise
+    ``TypeError: unsupported method spec: Auto`` from ``_method_to_tag`` on
+    the impact path, while the identical spec flowed through
+    ``propagate()`` — the two surfaces disagreed on the same method
+    vocabulary, and the message never said what the path accepted. ``Auto``
+    now lowers like every other dataclass: tag 4 plus its five threshold
+    columns, so a tuned kappa band reaches the engine instead of raising.
+    """
+    tags, params = _flatten_method_specs([Auto(threshold_first=0.05, threshold_mixture=5.0)])
+    assert tags == [4]
+    assert params["method_auto_threshold_first"] == [0.05]
+    assert params["method_auto_threshold_mixture"] == [5.0]
+
+    # REGRESSION GUARD: a default-constructed Auto and its enum / wire-string
+    # shorthands lower to identical columns — the common case is unchanged.
+    tags_dc, params_dc = _flatten_method_specs([Auto()])
+    tags_enum, params_enum = _flatten_method_specs([UncertaintyMethod.AUTO])
+    tags_str, params_str = _flatten_method_specs(["auto"])
+    assert tags_dc == tags_enum == tags_str == [4]
+    assert params_dc == params_enum == params_str

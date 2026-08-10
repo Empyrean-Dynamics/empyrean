@@ -1,6 +1,10 @@
 //! Free-function shims over the dynamically loaded engine, so callers use
 //! `empyrean_sys::empyrean_*` exactly as with a statically linked library.
-//! GENERATED — regenerated from the C ABI header alongside `bindings.rs`.
+//!
+//! GENERATED — every item here is derived mechanically from the
+//! `impl EmpyreanLib` block in `bindings.rs` (same doc text, same signature
+//! minus the receiver), so the two cannot drift. Regenerate alongside
+//! `bindings.rs`; do not hand-edit.
 use crate::{lib, *};
 /** Return a pointer to the last error message (thread-local, null-terminated).
 
@@ -59,8 +63,9 @@ pub unsafe fn empyrean_context_with_spk(
 
 Loads the full Standard-tier kernel set (DE440, SB441-N16, Earth/Moon
 BPCs, GM, MPC observatory codes) from `data_dir`, downloading any
-missing files. Pass null for `data_dir` to use the platform XDG
-data directory (`~/.empyrean/data` on Linux/macOS).
+missing files. Pass null for `data_dir` to use the platform data
+directory (`~/.local/share/empyrean/data` on Linux,
+`~/Library/Application Support/empyrean/data` on macOS).
 
 Returns a heap-allocated pointer on success, or null on error.
 Call `empyrean_last_error()` to retrieve the error message when null is
@@ -72,6 +77,99 @@ pub unsafe fn empyrean_context_from_data_dir(
 ) -> *mut EmpyreanContext {
     unsafe { lib().empyrean_context_from_data_dir(data_dir) }
 }
+/** Create a new `EmpyreanContext` from a data directory under explicit
+options — the superset of [`empyrean_context_from_data_dir`].
+
+Pass `options = NULL` (or a `memset(0)` struct) for exactly the
+behaviour of [`empyrean_context_from_data_dir`]: acquire and load the
+full Standard-tier kernel set, downloading anything missing.
+
+# Strict offline
+
+`options->refresh = EMPYREAN_DATA_REFRESH_OFF` is the reason this
+entry point exists. It resolves the tier's kernels from `data_dir`
+alone and fails if any is absent, naming **every** missing file
+through [`empyrean_missing_data_files`] — villeneuve's kernels plus
+the catalog-debiasing table — so an offline context can never come up
+silently missing part of its data. No lower-tier fallback, no
+download-just-this-one, no partially-loaded context.
+
+This entry point reads **no environment variable** to decide
+`refresh`. `EMPYREAN_OFFLINE` is a *channel*-level floor applied by
+the layers above (the Rust wrapper, the CLI, the Python package); the
+C ABI honours exactly what the caller passed.
+
+Returns a heap-allocated pointer on success, or null on error. Call
+`empyrean_last_error()` for the message, and
+[`empyrean_missing_data_files`] for the structured file list when the
+failure was a strict-offline shortfall. The caller owns the returned
+pointer and must free it with `empyrean_context_free()`.*/
+#[inline]
+pub unsafe fn empyrean_context_from_data_dir_with(
+    data_dir: *const ::std::os::raw::c_char,
+    options: *const EmpyreanDataDirOptions,
+) -> *mut EmpyreanContext {
+    unsafe { lib().empyrean_context_from_data_dir_with(data_dir, options) }
+}
+/** Provision the complete Standard-tier kernel set into `data_dir`
+**without building a context**.
+
+Runs the same download-and-cache pass
+[`empyrean_context_from_data_dir`] performs, but stops at the resolved
+kernel paths: nothing is loaded or parsed, and no `EmpyreanContext` is
+allocated. This is the cheap provisioning primitive behind the
+wrapper's `download_data` — it exists so a caller that only wants to
+warm a data directory does not pay for a full Standard-tier context
+build (and discard). After it returns `0`, a later
+[`empyrean_context_from_data_dir`] over the same directory loads with
+no further downloads.
+
+Pass `NULL` for `data_dir` to provision the platform data directory
+(`~/.local/share/empyrean/data` on Linux, `~/Library/Application
+Support/empyrean/data` on macOS).
+
+Always reaches the network when a kernel is missing or its upstream
+copy moved (the refreshing path); on a warm, complete directory it
+issues only the staleness checks and downloads nothing.
+
+Returns `0` on success. On failure returns the engine error code —
+`-2` when a required resource could not be obtained, with the
+structured file list available through
+[`empyrean_missing_data_files`]; `-1` for a non-UTF-8 `data_dir` or
+another invalid argument; `-99` on a caught panic. Call
+`empyrean_last_error()` for the message on any non-zero return.*/
+#[inline]
+pub unsafe fn empyrean_download_data(data_dir: *const ::std::os::raw::c_char) -> i32 {
+    unsafe { lib().empyrean_download_data(data_dir) }
+}
+/** Retrieve the structured file list from the most recent
+missing-data-files failure on this thread.
+
+The companion to `empyrean_last_error()`: that returns the rendered
+message, this returns the list the message was rendered from, so a
+caller can fetch or report exactly those names instead of splitting a
+string (file names may contain the separator).
+
+Returns 0 and fills `out` on success. `out->num_files == 0` — with
+`out->files` null — means the last error on this thread was not a
+missing-data-files failure; it is not itself an error. Returns `-1`
+for a null `out`, `-5` on allocation failure, `-99` on a caught panic.
+
+The list is thread-local and is cleared by the next call that records
+an error on this thread, so read it immediately after the failing
+call. **The caller owns `out` and must release it with
+[`empyrean_missing_data_files_free`].***/
+#[inline]
+pub unsafe fn empyrean_missing_data_files(out: *mut EmpyreanMissingDataFiles) -> i32 {
+    unsafe { lib().empyrean_missing_data_files(out) }
+}
+/** Free an [`EmpyreanMissingDataFiles`] populated by
+[`empyrean_missing_data_files`]. Passing a null or zeroed struct is a
+no-op; the struct is left zeroed so a double free is safe.*/
+#[inline]
+pub unsafe fn empyrean_missing_data_files_free(out: *mut EmpyreanMissingDataFiles) {
+    unsafe { lib().empyrean_missing_data_files_free(out) }
+}
 /** Free an `EmpyreanContext` previously returned by `empyrean_context_new()`.
 
 Passing null is a no-op.*/
@@ -82,7 +180,7 @@ pub unsafe fn empyrean_context_free(ctx: *mut EmpyreanContext) {
 /** Return the platform XDG-compliant default data directory as a
 heap-allocated, NUL-terminated UTF-8 string.
 
-Mirrors villeneuve's `DataManager::new` resolution: honors
+Mirrors the engine's `DataManager::new` resolution: honors
 `EMPYREAN_DATA_DIR` first, then falls back to `dirs::data_dir()` —
 `~/.local/share/empyrean/data/` on Linux, `~/Library/Application
 Support/empyrean/data/` on macOS, `%APPDATA%\empyrean\data\` on
@@ -108,7 +206,7 @@ pub unsafe fn empyrean_string_free(s: *mut ::std::os::raw::c_char) {
 }
 /** Multi-line version report — `empyrean-core <ver>\nvilleneuve <ver>\n…`.
 
-Mirrors `empyrean_core::version_string`. Useful for `--version`-style
+Mirrors [`empyrean_core::version_string`]. Useful for `--version`-style
 output and for verifying the build provenance of a deployed cdylib.
 Returns null on allocation failure (extremely unlikely — the strings
 are short and `&'static` underneath); call `empyrean_last_error()` if
@@ -144,10 +242,145 @@ undefined behavior.*/
 pub unsafe fn empyrean_versions_free(versions: *mut EmpyreanVersions) {
     unsafe { lib().empyrean_versions_free(versions) }
 }
+/** Assemble a reusable force-model handle for `(force_model, frame)` from
+`ctx`, freezing `encounter_timescale_divisor` into its key.
+
+- `force_model`: tier code (0=Approximate, 1=Basic, 2=Standard).
+- `frame`: output/integration frame code (0=ICRF, 1=EclipticJ2000, 2=ITRF93).
+- `encounter_timescale_divisor`: pass `0.0` to freeze the engine default;
+  any positive value freezes that divisor into the key *before* it is
+  used to validate calls.
+- `out`: receives the heap-allocated handle on success.
+
+The handle snapshots `ctx`'s kernel manifest at construction so
+[`empyrean_builtsystem_describe`] is self-contained. After you load any
+additional kernel into `ctx`, rebuild the handle — a stale handle is
+rejected loudly by every forward-model call, never silently reused.
+
+Returns [`EMPYREAN_BUILTSYSTEM_OK`] on success; on error, `out` is left
+untouched and `empyrean_last_error()` carries the message. The caller
+owns the returned handle and must free it with
+[`empyrean_builtsystem_free`].*/
+#[inline]
+pub unsafe fn empyrean_builtsystem_new(
+    ctx: *const EmpyreanContext,
+    force_model: i32,
+    frame: i32,
+    encounter_timescale_divisor: f64,
+    out: *mut *mut EmpyreanBuiltSystem,
+) -> i32 {
+    unsafe {
+        lib().empyrean_builtsystem_new(ctx, force_model, frame, encounter_timescale_divisor, out)
+    }
+}
+/** Free a handle previously returned by [`empyrean_builtsystem_new`].
+Passing null is a no-op.*/
+#[inline]
+pub unsafe fn empyrean_builtsystem_free(handle: *mut EmpyreanBuiltSystem) {
+    unsafe { lib().empyrean_builtsystem_free(handle) }
+}
+/** Propagate `orbits` to `times` through the pre-built handle.
+
+Signature parallels the one-shot
+[`empyrean_propagate`](crate::propagate::empyrean_propagate) but takes
+`(handle, ctx, ...)`. Before dispatch the identity guard runs: the handle
+must have been built from `ctx`'s ephemeris data
+([`EMPYREAN_BUILTSYSTEM_DATA_MISMATCH`]); the config must match the frozen
+key ([`EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_FRAME`] /
+`_FORCE_MODEL` / `_DIVISOR`); and the data must be unmutated since build
+([`EMPYREAN_BUILTSYSTEM_STALE`]). On pass, the result is bit-identical to
+the one-shot with the same config.
+
+On success populates `result_out`; free it with
+[`empyrean_propagation_result_free`](crate::propagate::empyrean_propagation_result_free).*/
+#[inline]
+pub unsafe fn empyrean_builtsystem_propagate(
+    handle: *const EmpyreanBuiltSystem,
+    ctx: *const EmpyreanContext,
+    orbits_ptr: *const EmpyreanOrbit,
+    num_orbits: usize,
+    times_ptr: *const f64,
+    num_times: usize,
+    config: *const EmpyreanPropagationConfig,
+    result_out: *mut EmpyreanPropagationResult,
+) -> i32 {
+    unsafe {
+        lib().empyrean_builtsystem_propagate(
+            handle, ctx, orbits_ptr, num_orbits, times_ptr, num_times, config, result_out,
+        )
+    }
+}
+/** Generate predicted ephemeris for `orbits` and `observers` through the
+pre-built handle.
+
+Signature parallels the one-shot
+[`empyrean_generate_ephemeris`](crate::ephemeris::empyrean_generate_ephemeris)
+but takes `(handle, ctx, ...)`. Runs the same identity guard as
+[`empyrean_builtsystem_propagate`] before dispatch; on pass the result is
+bit-identical to the one-shot. Note the C-ABI ephemeris config carries no
+divisor knob, so a handle frozen at a non-default divisor is rejected here
+with [`EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_DIVISOR`] rather than served under
+the wrong dynamics — build the handle with the default divisor for
+ephemeris reuse.
+
+On success populates `result_out`; free it with
+[`empyrean_ephemeris_result_free`](crate::ephemeris::empyrean_ephemeris_result_free).*/
+#[inline]
+pub unsafe fn empyrean_builtsystem_generate_ephemeris(
+    handle: *const EmpyreanBuiltSystem,
+    ctx: *const EmpyreanContext,
+    orbits_ptr: *const EmpyreanOrbit,
+    num_orbits: usize,
+    observers_ptr: *const EmpyreanObserver,
+    num_observers: usize,
+    config: *const EmpyreanEphemerisConfig,
+    result_out: *mut EmpyreanEphemerisResult,
+) -> i32 {
+    unsafe {
+        lib().empyrean_builtsystem_generate_ephemeris(
+            handle,
+            ctx,
+            orbits_ptr,
+            num_orbits,
+            observers_ptr,
+            num_observers,
+            config,
+            result_out,
+        )
+    }
+}
+/** Populate `out` with a full reproducibility summary of the handle's frozen
+force model and its captured kernel manifest.
+
+Every field is populated from the system description and the manifest
+snapshot — no field is left defaulted. Returns
+[`EMPYREAN_BUILTSYSTEM_OK`] on success. The caller owns the heap arrays
+inside `out` and must release them with
+[`empyrean_builtsystem_description_free`].*/
+#[inline]
+pub unsafe fn empyrean_builtsystem_describe(
+    handle: *const EmpyreanBuiltSystem,
+    out: *mut EmpyreanSystemDescription,
+) -> i32 {
+    unsafe { lib().empyrean_builtsystem_describe(handle, out) }
+}
+/** Free the heap arrays inside a description populated by
+[`empyrean_builtsystem_describe`] (the perturber-id array and the kernel
+records with their C strings). After this returns `desc` is
+zero-initialized — safe to drop on the caller's stack. Passing null is a
+no-op.*/
+#[inline]
+pub unsafe fn empyrean_builtsystem_description_free(desc: *mut EmpyreanSystemDescription) {
+    unsafe { lib().empyrean_builtsystem_description_free(desc) }
+}
 /** Generate predicted ephemeris for orbits and observers.
 
 Returns 0 on success, negative error code on failure.
-On success, `result_out` is populated with ephemeris entries.
+On success, `result_out` is populated with ephemeris entries:
+`num_orbits * num_observers` rows, orbit-major, and within each orbit
+in **observer-input order** (sensitivity rows follow the same order).
+Each observer carries its own epoch, so positional pairing against
+the input observers is safe within an orbit block.
 The caller must free the result with `empyrean_ephemeris_result_free()`.*/
 #[inline]
 pub unsafe fn empyrean_generate_ephemeris(
@@ -171,20 +404,20 @@ pub unsafe fn empyrean_generate_ephemeris(
         )
     }
 }
-/// Free an ephemeris result previously returned by `empyrean_generate_ephemeris()`.
+/** Free an ephemeris result previously returned by `empyrean_generate_ephemeris()`.*/
 #[inline]
 pub unsafe fn empyrean_ephemeris_result_free(result: *mut EmpyreanEphemerisResult) {
     unsafe { lib().empyrean_ephemeris_result_free(result) }
 }
-/** Run `empyrean_core::impact::compute_impact_probabilities` over a
-caller-supplied set of `UncertaintyMethod` variants and return
+/** Run [`empyrean_core::impact::compute_impact_probabilities`] over a
+caller-supplied set of [`UncertaintyMethod`] variants and return
 the flattened IP records tagged by method.
 
 Caller is responsible for freeing the result via
 [`empyrean_compute_impact_probabilities_result_free`].
 
 # Returns
-`0` on success, negative on failure (see `crate::set_last_error`).
+`0` on success, negative on failure (see [`crate::set_last_error`]).
 
 # Safety
 All non-null pointer arguments must point to valid arrays of the
@@ -226,8 +459,8 @@ pub unsafe fn empyrean_compute_impact_probabilities_result_free(
 ) {
     unsafe { lib().empyrean_compute_impact_probabilities_result_free(result) }
 }
-/** Run `empyrean_core::impact::compute_b_planes` over a caller-
-supplied set of `UncertaintyMethod` variants and return the
+/** Run [`empyrean_core::impact::compute_b_planes`] over a caller-
+supplied set of [`UncertaintyMethod`] variants and return the
 flattened B-plane records tagged by method.
 
 Caller is responsible for freeing the result via
@@ -262,7 +495,7 @@ pub unsafe fn empyrean_compute_b_planes(
         )
     }
 }
-/// Free the records array allocated by [`empyrean_compute_b_planes`].
+/** Free the records array allocated by [`empyrean_compute_b_planes`].*/
 #[inline]
 pub unsafe fn empyrean_compute_b_planes_result_free(result: *mut EmpyreanBPlanesResult) {
     unsafe { lib().empyrean_compute_b_planes_result_free(result) }
@@ -282,7 +515,7 @@ pub unsafe fn empyrean_orbits_read_parquet(
 ) -> i32 {
     unsafe { lib().empyrean_orbits_read_parquet(path, out) }
 }
-/// Write an orbit batch to a parquet file.
+/** Write an orbit batch to a parquet file.*/
 #[inline]
 pub unsafe fn empyrean_orbits_write_parquet(
     path: *const ::std::os::raw::c_char,
@@ -299,7 +532,7 @@ pub unsafe fn empyrean_orbits_read_json(
 ) -> i32 {
     unsafe { lib().empyrean_orbits_read_json(path, out) }
 }
-/// Write an orbit batch to JSON.
+/** Write an orbit batch to JSON.*/
 #[inline]
 pub unsafe fn empyrean_orbits_write_json(
     path: *const ::std::os::raw::c_char,
@@ -309,7 +542,11 @@ pub unsafe fn empyrean_orbits_write_json(
 }
 /** Read an orbits CSV file.
 
-CSV does not carry covariance (use parquet for covariance round-trip).*/
+Uses the engine's own CSV reader, so the file is the same schema the
+parquet path round-trips — covariance included. The
+`_with_non_grav` reader is the one used: the plain reader drops the
+Marsden A1/A2/A3 block, and an orbit that loses its non-gravitational
+parameters on a round trip is silently a different orbit.*/
 #[inline]
 pub unsafe fn empyrean_orbits_read_csv(
     path: *const ::std::os::raw::c_char,
@@ -317,7 +554,14 @@ pub unsafe fn empyrean_orbits_read_csv(
 ) -> i32 {
     unsafe { lib().empyrean_orbits_read_csv(path, out) }
 }
-/// Write an orbit batch to CSV.
+/** Write an orbit batch to CSV.
+
+Routed through the engine's writer — the same `Orbits<AU>` the
+parquet path writes — so CSV carries the full column set (state,
+covariance, non-grav including `dt` / `dt_variance`, photometry, SRP)
+rather than a flattened projection of it. A batch carrying a wide
+cross-covariance the row schema cannot express is refused before the
+file is created rather than written short.*/
 #[inline]
 pub unsafe fn empyrean_orbits_write_csv(
     path: *const ::std::os::raw::c_char,
@@ -325,7 +569,7 @@ pub unsafe fn empyrean_orbits_write_csv(
 ) -> i32 {
     unsafe { lib().empyrean_orbits_write_csv(path, batch) }
 }
-/// Write ephemeris entries to parquet using the villeneuve schema.
+/** Write ephemeris entries to parquet using the villeneuve schema.*/
 #[inline]
 pub unsafe fn empyrean_ephemeris_write_parquet(
     path: *const ::std::os::raw::c_char,
@@ -334,7 +578,7 @@ pub unsafe fn empyrean_ephemeris_write_parquet(
 ) -> i32 {
     unsafe { lib().empyrean_ephemeris_write_parquet(path, entries_ptr, num_entries) }
 }
-/// Write ephemeris entries to JSON.
+/** Write ephemeris entries to JSON.*/
 #[inline]
 pub unsafe fn empyrean_ephemeris_write_json(
     path: *const ::std::os::raw::c_char,
@@ -343,7 +587,7 @@ pub unsafe fn empyrean_ephemeris_write_json(
 ) -> i32 {
     unsafe { lib().empyrean_ephemeris_write_json(path, entries_ptr, num_entries) }
 }
-/// Write ephemeris entries to CSV.
+/** Write ephemeris entries to CSV.*/
 #[inline]
 pub unsafe fn empyrean_ephemeris_write_csv(
     path: *const ::std::os::raw::c_char,
@@ -352,7 +596,7 @@ pub unsafe fn empyrean_ephemeris_write_csv(
 ) -> i32 {
     unsafe { lib().empyrean_ephemeris_write_csv(path, entries_ptr, num_entries) }
 }
-/// Write events to parquet.
+/** Write events to parquet.*/
 #[inline]
 pub unsafe fn empyrean_events_write_parquet(
     path: *const ::std::os::raw::c_char,
@@ -361,7 +605,7 @@ pub unsafe fn empyrean_events_write_parquet(
 ) -> i32 {
     unsafe { lib().empyrean_events_write_parquet(path, events_ptr, num_events) }
 }
-/// Write events to JSON.
+/** Write events to JSON.*/
 #[inline]
 pub unsafe fn empyrean_events_write_json(
     path: *const ::std::os::raw::c_char,
@@ -370,7 +614,7 @@ pub unsafe fn empyrean_events_write_json(
 ) -> i32 {
     unsafe { lib().empyrean_events_write_json(path, events_ptr, num_events) }
 }
-/// Write events to CSV.
+/** Write events to CSV.*/
 #[inline]
 pub unsafe fn empyrean_events_write_csv(
     path: *const ::std::os::raw::c_char,
@@ -379,7 +623,34 @@ pub unsafe fn empyrean_events_write_csv(
 ) -> i32 {
     unsafe { lib().empyrean_events_write_csv(path, events_ptr, num_events) }
 }
-/// Write OD residuals to parquet.
+/** Write the per-object fit summary to parquet.*/
+#[inline]
+pub unsafe fn empyrean_fit_summary_write_parquet(
+    path: *const ::std::os::raw::c_char,
+    summaries_ptr: *const EmpyreanFitSummary,
+    num_summaries: usize,
+) -> i32 {
+    unsafe { lib().empyrean_fit_summary_write_parquet(path, summaries_ptr, num_summaries) }
+}
+/** Write the per-object fit summary to JSON.*/
+#[inline]
+pub unsafe fn empyrean_fit_summary_write_json(
+    path: *const ::std::os::raw::c_char,
+    summaries_ptr: *const EmpyreanFitSummary,
+    num_summaries: usize,
+) -> i32 {
+    unsafe { lib().empyrean_fit_summary_write_json(path, summaries_ptr, num_summaries) }
+}
+/** Write the per-object fit summary to CSV.*/
+#[inline]
+pub unsafe fn empyrean_fit_summary_write_csv(
+    path: *const ::std::os::raw::c_char,
+    summaries_ptr: *const EmpyreanFitSummary,
+    num_summaries: usize,
+) -> i32 {
+    unsafe { lib().empyrean_fit_summary_write_csv(path, summaries_ptr, num_summaries) }
+}
+/** Write OD residuals to parquet.*/
 #[inline]
 pub unsafe fn empyrean_residuals_write_parquet(
     path: *const ::std::os::raw::c_char,
@@ -388,7 +659,7 @@ pub unsafe fn empyrean_residuals_write_parquet(
 ) -> i32 {
     unsafe { lib().empyrean_residuals_write_parquet(path, obs_ptr, num_obs) }
 }
-/// Write OD residuals to JSON.
+/** Write OD residuals to JSON.*/
 #[inline]
 pub unsafe fn empyrean_residuals_write_json(
     path: *const ::std::os::raw::c_char,
@@ -397,7 +668,7 @@ pub unsafe fn empyrean_residuals_write_json(
 ) -> i32 {
     unsafe { lib().empyrean_residuals_write_json(path, obs_ptr, num_obs) }
 }
-/// Write OD residuals to CSV.
+/** Write OD residuals to CSV.*/
 #[inline]
 pub unsafe fn empyrean_residuals_write_csv(
     path: *const ::std::os::raw::c_char,
@@ -436,11 +707,52 @@ pub unsafe fn empyrean_split_gaussian(
         lib().empyrean_split_gaussian(mean, covariance, k, weights_out, means_out, covariances_out)
     }
 }
-/** Compute observer states for given observatory codes and epochs.
+/** Compute observer states for given observatory codes and epochs, in a
+caller-chosen `(frame, origin)` basis.
 
-Returns 0 on success, negative error code on failure.
-On success, `result_out` is populated with observer states.
-The caller must free the result with `empyrean_observer_result_free()`.*/
+The result is the Cartesian product `obs_codes × epochs`, **code-major**:
+all epochs for `obs_codes[0]`, then all epochs for `obs_codes[1]`, so
+`observers[i * num_epochs + j]` is `(obs_codes[i], epochs[j])`.
+
+# Choosing a basis
+
+`frame = 0` (ICRF) with `origin = 0` (solar-system barycenter) is the
+**construction basis** — the one every consumer of an observer state
+requires, and the one to pass when the observers are headed for
+`empyrean_generate_ephemeris`,
+`empyrean_builtsystem_generate_ephemeris`, or orbit determination.
+Requesting it takes no transform at all: the observers come back
+exactly as constructed, bit for bit. Any other basis rotates and/or
+translates them, which is what a consumer plotting observer geometry
+wants (e.g. heliocentric ecliptic site positions via
+`frame = 1`, `origin = 10`).
+
+Each returned row carries the basis it is expressed in
+([`EmpyreanObserver::frame`] / [`EmpyreanObserver::origin`]), so a
+row is never ambiguous about which basis produced it.
+
+# Returns
+
+`0` on success; `result_out` is populated and the caller must free it
+with `empyrean_observer_result_free()`.
+
+Every rejection aborts the whole call — there is no partial output and
+no silently untransformed entry. The failure codes are split by
+**remedy**, not flattened, because a channel that collapses them tells
+an operator to fix their input when the fix is on disk:
+
+- `-1` — retry with different arguments: an observatory code is not in
+  the registry; `frame` is one an observer cannot be rotated into
+  (anything outside ICRF ↔ EclipticJ2000); `origin` names an MPC site
+  rather than an SPK body; a null pointer or non-UTF-8 code.
+- `-2` — load or fetch data, the arguments are fine: the code names a
+  space telescope whose SPK is not loaded; `origin` has no SPK
+  coverage at a requested epoch; an epoch falls outside the loaded
+  BPC's window, or this context carries no BPC / no observatory
+  registry at all.
+- `-5` — allocation failure. `-99` — a panic was caught at the boundary.
+
+Call `empyrean_last_error()` for the message in every failing case.*/
 #[inline]
 pub unsafe fn empyrean_get_observers(
     ctx: *const EmpyreanContext,
@@ -448,6 +760,8 @@ pub unsafe fn empyrean_get_observers(
     num_codes: usize,
     epochs_mjd_tdb: *const f64,
     num_epochs: usize,
+    frame: i32,
+    origin: i32,
     result_out: *mut EmpyreanObserverResult,
 ) -> i32 {
     unsafe {
@@ -457,6 +771,8 @@ pub unsafe fn empyrean_get_observers(
             num_codes,
             epochs_mjd_tdb,
             num_epochs,
+            frame,
+            origin,
             result_out,
         )
     }
@@ -467,6 +783,13 @@ Passing a zeroed/null result is a no-op.*/
 #[inline]
 pub unsafe fn empyrean_observer_result_free(result: *mut EmpyreanObserverResult) {
     unsafe { lib().empyrean_observer_result_free(result) }
+}
+/** Runtime accessor for [`EMPYREAN_ABI_VERSION`] — lets a dynamically
+linked consumer confirm the loaded library's frozen-shape contract
+matches what it compiled against.*/
+#[inline]
+pub unsafe fn empyrean_abi_version() -> u32 {
+    unsafe { lib().empyrean_abi_version() }
 }
 /** Read ADES PSV / MPC80 data from a string and pack into the C array.
 
@@ -547,12 +870,41 @@ pub unsafe fn empyrean_radar_observations_free(
 ) {
     unsafe { lib().empyrean_radar_observations_free(observations, num) }
 }
-/** Run the full orbit determination pipeline.
+/** Run the full orbit determination pipeline over every object in
+`observations`.
+
+The observations are grouped by ADES object identifier (permID /
+provID / trkSub) and each group is fitted independently, so one call
+determines a whole batch. `results_out` receives one
+[`EmpyreanODObjectResult`] per group, ordered by `object_id`.
 
 When `num_initial_orbits > 0`, the supplied orbits are used as DC
 seeds (one per ADES object_id encountered in `observations`,
 matched by orbit index). Pass `null, 0` to let the IOD pipeline
-produce its own seeds.*/
+produce its own seeds. A seed that matches no group is reported in
+[`EmpyreanDetermineResults::unmatched_orbit_ids`], never dropped.
+
+# Return codes
+
+- `0` — the batch ran and **at least one** object delivered a fit.
+  Individual failures do not abort the batch; check each slot's
+  `delivered` flag. `results_out` is populated.
+- [`EMPYREAN_DETERMINE_NONE_DELIVERED`] (`-4`) — the batch ran but
+  every object failed. `results_out` IS populated with the per-object
+  errors and must still be freed.
+- `-1` — null pointer or malformed input; nothing is written.
+- `-3` — a batch-level failure (an unparseable weighting config, an
+  observation row with no identifier at all) aborted the run before
+  any object was fitted; nothing is written.
+
+A single-object input is not a special case: it produces a
+one-row table.
+
+# Ownership
+
+On `0` and `-4`, release `results_out` with
+[`empyrean_determine_results_free`]. On `-1` / `-3` there is nothing
+to free.*/
 #[inline]
 pub unsafe fn empyrean_determine(
     ctx: *const EmpyreanContext,
@@ -563,7 +915,7 @@ pub unsafe fn empyrean_determine(
     initial_orbits: *const EmpyreanOrbit,
     num_initial_orbits: usize,
     config: *const EmpyreanODConfig,
-    result_out: *mut EmpyreanODResult,
+    results_out: *mut EmpyreanDetermineResults,
 ) -> i32 {
     unsafe {
         lib().empyrean_determine(
@@ -575,16 +927,31 @@ pub unsafe fn empyrean_determine(
             initial_orbits,
             num_initial_orbits,
             config,
-            result_out,
+            results_out,
         )
     }
 }
-/// Free an OD result previously returned by `empyrean_determine()` or `empyrean_refine()`.
+/** Free a batch result table previously written by
+`empyrean_determine()`.
+
+Releases every per-object slot (including the fits inside the
+delivered ones), the per-object identifier / error strings, and the
+unmatched-seed list. Safe to call on a table returned with
+[`EMPYREAN_DETERMINE_NONE_DELIVERED`], and idempotent — the table is
+left empty.*/
+#[inline]
+pub unsafe fn empyrean_determine_results_free(results: *mut EmpyreanDetermineResults) {
+    unsafe { lib().empyrean_determine_results_free(results) }
+}
+/** Free an OD result previously returned by `empyrean_refine()`.
+
+Batch `empyrean_determine()` results are released with
+[`empyrean_determine_results_free`] instead.*/
 #[inline]
 pub unsafe fn empyrean_od_result_free(result: *mut EmpyreanODResult) {
     unsafe { lib().empyrean_od_result_free(result) }
 }
-/// Evaluate residuals for a single orbit against observations.
+/** Evaluate residuals for a single orbit against observations.*/
 #[inline]
 pub unsafe fn empyrean_evaluate(
     ctx: *const EmpyreanContext,
@@ -605,7 +972,7 @@ pub unsafe fn empyrean_evaluate(
         )
     }
 }
-/// Free an evaluate result previously returned by `empyrean_evaluate()`.
+/** Free an evaluate result previously returned by `empyrean_evaluate()`.*/
 #[inline]
 pub unsafe fn empyrean_evaluate_result_free(result: *mut EmpyreanEvaluateResult) {
     unsafe { lib().empyrean_evaluate_result_free(result) }
@@ -676,7 +1043,13 @@ pub unsafe fn empyrean_plan_result_free(result: *mut EmpyreanPlanResult) {
 
 Returns 0 on success, negative error code on failure.
 On success, `result_out` is populated with the propagated states.
-The caller must free the result with `empyrean_propagation_result_free()`.*/
+The caller must free the result with `empyrean_propagation_result_free()`.
+
+States are flat in orbit-major order; within each orbit, rows are in
+**ascending epoch order, always** (engine guarantee since villeneuve
+v1.18.0), regardless of request order. Positional pairing against an
+ascending, duplicate-free request grid is exact; for any other
+request shape, join on `epoch_mjd_tdb`.*/
 #[inline]
 pub unsafe fn empyrean_propagate(
     ctx: *const EmpyreanContext,
@@ -693,7 +1066,7 @@ pub unsafe fn empyrean_propagate(
         )
     }
 }
-/// Free a propagation result previously returned by `empyrean_propagate()`.
+/** Free a propagation result previously returned by `empyrean_propagate()`.*/
 #[inline]
 pub unsafe fn empyrean_propagation_result_free(result: *mut EmpyreanPropagationResult) {
     unsafe { lib().empyrean_propagation_result_free(result) }
@@ -750,7 +1123,7 @@ designations / names / SPK IDs (e.g. `"apophis"`, `"99942"`,
 a directory path where SBDB JSON responses are cached on disk.
 
 On success the populated [`EmpyreanOrbitBatch`] must be released with
-`empyrean_orbits_batch_free`.*/
+[`empyrean_orbits_batch_free`](crate::io::empyrean_orbits_batch_free).*/
 #[inline]
 pub unsafe fn empyrean_query_sbdb(
     object_ids: *const *const ::std::os::raw::c_char,
@@ -769,7 +1142,7 @@ code as a null-terminated string. `times_mjd_tdb` carries
 
 On success populates an [`EmpyreanEphemerisResult`] with one entry
 per `(object_id × epoch)`. Free with
-`empyrean_ephemeris_result_free`.
+[`empyrean_ephemeris_result_free`](crate::ephemeris::empyrean_ephemeris_result_free).
 
 All angular values are converted to **degrees** at the FFI boundary
 (Horizons natively returns radians).*/
@@ -831,7 +1204,7 @@ present in the JSON.
 
 On success `*out_ptr` carries a heap-allocated array of length
 `*out_num`. Free with
-`empyrean_observations_free`.*/
+[`empyrean_observations_free`](crate::od::empyrean_observations_free).*/
 #[inline]
 pub unsafe fn empyrean_query_observations(
     designations: *const *const ::std::os::raw::c_char,
@@ -861,7 +1234,7 @@ records), so radar ships as its own live-query entry point. JPL
 `sb_radar` JSON records are converted to ADES-native scott
 `RadarObservation`s and packed into the C-ABI
 [`EmpyreanRadarObservation`] struct (the same layout
-`empyrean_read_ades` emits): the delay
+[`empyrean_read_ades`](crate::od::empyrean_read_ades) emits): the delay
 value is in seconds, its σ in microseconds, Doppler in Hz, frequency in
 MHz, and the `com` flag is a tri-state i8. `cache_dir` may be null to
 skip caching, or a directory path where `sb_radar` JSON responses are
@@ -874,7 +1247,7 @@ dropped — the whole call fails so no radar quietly goes missing.
 
 On success `*out_ptr` carries a heap-allocated array of length
 `*out_num`. Free with
-`empyrean_radar_observations_free`.*/
+[`empyrean_radar_observations_free`](crate::od::empyrean_radar_observations_free).*/
 #[inline]
 pub unsafe fn empyrean_query_radar(
     designations: *const *const ::std::os::raw::c_char,
@@ -889,6 +1262,14 @@ pub unsafe fn empyrean_query_radar(
 }
 /** Construct a new orbit-determination session over a fixed
 observation set.
+
+`config` is parsed by the same builder the one-shot
+`empyrean_determine` / `empyrean_evaluate` / `empyrean_refine`
+entry points use, so every field — weighting preset and additional
+layers, debiasing, rejection, solve-for, origin and output-epoch
+policy — resolves identically on both surfaces. A malformed
+weighting layer is rejected here, before any fitting: the call
+returns null with the reason in `empyrean_last_error`.
 
 Returns a heap-allocated handle on success, or null on error.
 The caller owns the returned pointer and must free it with
@@ -913,12 +1294,12 @@ Returns 0 if `session` is null.*/
 pub unsafe fn empyrean_session_n_observations(session: *const EmpyreanSession) -> usize {
     unsafe { lib().empyrean_session_n_observations(session) }
 }
-/// Number of observations currently masked.
+/** Number of observations currently masked.*/
 #[inline]
 pub unsafe fn empyrean_session_n_masked(session: *const EmpyreanSession) -> usize {
     unsafe { lib().empyrean_session_n_masked(session) }
 }
-/// Number of observations active (not masked) in the next refine.
+/** Number of observations active (not masked) in the next refine.*/
 #[inline]
 pub unsafe fn empyrean_session_n_active(session: *const EmpyreanSession) -> usize {
     unsafe { lib().empyrean_session_n_active(session) }
@@ -935,7 +1316,7 @@ or out-of-bounds.*/
 pub unsafe fn empyrean_session_unmask(session: *mut EmpyreanSession, idx: usize) -> i32 {
     unsafe { lib().empyrean_session_unmask(session, idx) }
 }
-/// Clear all masks. Returns 0 on success, -1 on null.
+/** Clear all masks. Returns 0 on success, -1 on null.*/
 #[inline]
 pub unsafe fn empyrean_session_unmask_all(session: *mut EmpyreanSession) -> i32 {
     unsafe { lib().empyrean_session_unmask_all(session) }
@@ -953,7 +1334,7 @@ calls, uses the previously-fit orbit as the IOD seed (skipping the
 IOD step). Pushes the new fit onto the session's history.
 
 On success populates `result_out` with the latest fit. The caller
-must free `result_out` with `empyrean_od_result_free`.*/
+must free `result_out` with [`empyrean_od_result_free`](crate::od::empyrean_od_result_free).*/
 #[inline]
 pub unsafe fn empyrean_session_refine(
     session: *mut EmpyreanSession,
@@ -962,14 +1343,14 @@ pub unsafe fn empyrean_session_refine(
 ) -> i32 {
     unsafe { lib().empyrean_session_refine(session, ctx, result_out) }
 }
-/// Number of fits in the session history.
+/** Number of fits in the session history.*/
 #[inline]
 pub unsafe fn empyrean_session_history_len(session: *const EmpyreanSession) -> usize {
     unsafe { lib().empyrean_session_history_len(session) }
 }
 /** Copy the i-th history entry into `result_out`. Returns 0 on
 success, -1 on null/out-of-bounds. Caller frees `result_out` with
-`empyrean_od_result_free`.*/
+[`empyrean_od_result_free`](crate::od::empyrean_od_result_free).*/
 #[inline]
 pub unsafe fn empyrean_session_get_history(
     session: *const EmpyreanSession,
@@ -1030,7 +1411,7 @@ to MJD in the requested target scale.
 
 On success writes the MJD value to `*out_mjd` and returns 0.
 On failure returns a negative code; consult
-`empyrean_last_error`.*/
+[`empyrean_last_error`](crate::empyrean_last_error).*/
 #[inline]
 pub unsafe fn empyrean_iso_to_mjd(
     iso: *const ::std::os::raw::c_char,
@@ -1056,12 +1437,89 @@ pub unsafe fn empyrean_mjd_to_iso(
 ) -> i32 {
     unsafe { lib().empyrean_mjd_to_iso(mjd, scale, out_buf, buf_len) }
 }
-/** Transform a coordinate state to a new representation, frame, and/or origin.
+/** Transform a **batch** of coordinate states to a new representation,
+frame, and/or origin.
+
+The batched form carries the main name; the unit of work is
+[`empyrean_transform_coordinates_single`]. Element `i` of `states_out`
+is **bit-identical** to that function applied to `states[i]` with the
+same target arguments, so batching is a scheduling choice and never a
+numerical one.
+
+`states` and `states_out` are both caller-owned arrays of exactly
+`num_states` elements — nothing is heap-allocated here and there is no
+result to free. They may not overlap. `num_states == 0` is a valid
+no-op call (both pointers are then ignored and may be null).
+
+# What the batch does and does not buy
+
+Two costs in the transform pipeline do not depend on the individual
+state and the engine pays each once per distinct key rather than once
+per state: gravitational-parameter resolution (keyed on the origin)
+and the origin shift (keyed on `(from, to, epoch)`). States sharing an
+epoch — a catalogue snapshot, a sigma-point cloud — reuse one shift.
+
+Note what that does **not** buy: those memos are scoped to the
+context, not to the call, so a loop over
+[`empyrean_transform_coordinates_single`] on the same context hits
+them too. Measured against such a loop the batch is ~17% faster from a
+thousand states up and indistinguishable at one — what it saves is the
+per-call boundary crossing, not the shift. Reach for it for the shape
+(one call, one error, one index) rather than for a large speedup. A
+batch that reuses nothing costs the same as the equivalent
+single-state loop rather than more.
+
+# Returns
+
+`0` on success. `-1` for a null pointer or an unresolvable target
+basis — an argument-shaped failure of the call as a whole; `-2` when
+an individual element fails, whether the input state is malformed,
+the engine refuses it, or its result cannot be marshaled back out.
+**Fail-fast, with the index**: the first failing element aborts the
+batch, `states_out` is left untouched, and `empyrean_last_error()`
+names the zero-based index of the element that failed along with its
+underlying cause. No partial output is ever written — a batch either
+transforms completely or not at all.*/
+#[inline]
+pub unsafe fn empyrean_transform_coordinates(
+    ctx: *const EmpyreanContext,
+    states: *const CoordinateState,
+    num_states: usize,
+    target_representation: i32,
+    target_frame: i32,
+    target_origin: i32,
+    states_out: *mut CoordinateState,
+) -> i32 {
+    unsafe {
+        lib().empyrean_transform_coordinates(
+            ctx,
+            states,
+            num_states,
+            target_representation,
+            target_frame,
+            target_origin,
+            states_out,
+        )
+    }
+}
+/** Transform **one** coordinate state to a new representation, frame,
+and/or origin.
+
+The single-state unit of work; [`empyrean_transform_coordinates`] is
+the batched form that transforms a whole array in one call. Reach for
+the batch when a whole table is going to the same target basis — for
+the call shape (one call, one error, one index), not for a large
+speedup: the engine's memos are scoped to the context, so a loop over
+this function on the same context amortizes them just as well. See
+that function's docs for the measurement.
+
+Covariance is propagated through the Jacobian of the transformation
+when the input state carries one.
 
 Returns 0 on success or a negative error code on failure.
 Call `empyrean_last_error()` to retrieve the error message on failure.*/
 #[inline]
-pub unsafe fn empyrean_transform_coordinates(
+pub unsafe fn empyrean_transform_coordinates_single(
     ctx: *const EmpyreanContext,
     input: *const CoordinateState,
     target_representation: i32,
@@ -1070,7 +1528,7 @@ pub unsafe fn empyrean_transform_coordinates(
     output: *mut CoordinateState,
 ) -> i32 {
     unsafe {
-        lib().empyrean_transform_coordinates(
+        lib().empyrean_transform_coordinates_single(
             ctx,
             input,
             target_representation,
@@ -1079,126 +1537,4 @@ pub unsafe fn empyrean_transform_coordinates(
             output,
         )
     }
-}
-/** Build a reusable force-model handle from a context.
-
-Assembles the force model once (perturber set, GR, harmonics, BPC) and
-captures a kernel-identity snapshot from `ctx`, so the handle can be
-reused across many [`empyrean_builtsystem_propagate`] /
-[`empyrean_builtsystem_generate_ephemeris`] calls and describe itself
-without the context. Pass `0.0` for `encounter_timescale_divisor` to
-freeze the engine default before the key is sealed.
-
-Returns [`EMPYREAN_BUILTSYSTEM_OK`] on success; on error `out` is left
-null. The caller owns the returned handle and must free it with
-[`empyrean_builtsystem_free`].*/
-#[inline]
-pub unsafe fn empyrean_builtsystem_new(
-    ctx: *const EmpyreanContext,
-    force_model: i32,
-    frame: i32,
-    encounter_timescale_divisor: f64,
-    out: *mut *mut EmpyreanBuiltSystem,
-) -> i32 {
-    unsafe {
-        lib().empyrean_builtsystem_new(ctx, force_model, frame, encounter_timescale_divisor, out)
-    }
-}
-/** Free a handle previously returned by [`empyrean_builtsystem_new`].
-Passing null is a no-op.*/
-#[inline]
-pub unsafe fn empyrean_builtsystem_free(handle: *mut EmpyreanBuiltSystem) {
-    unsafe { lib().empyrean_builtsystem_free(handle) }
-}
-/** Propagate `orbits` to `times` through the pre-built handle.
-
-Parallels the one-shot [`empyrean_propagate`] but takes `(handle, ctx,
-...)`. Before dispatch the identity guard runs: the handle must have been
-built from `ctx`'s ephemeris data
-([`EMPYREAN_BUILTSYSTEM_DATA_MISMATCH`]); the config must match the
-frozen key ([`EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_FRAME`] /
-`_FORCE_MODEL` / `_DIVISOR`); and the data must be unmutated since build
-([`EMPYREAN_BUILTSYSTEM_STALE`]). Any mismatch is a loud, distinct error
-— never a silent rebuild. On pass the result is bit-identical to the
-one-shot with the same config. Rebuild the handle after any `load_*`.
-
-On success populates `result_out`; free it with
-[`empyrean_propagation_result_free`].*/
-#[inline]
-pub unsafe fn empyrean_builtsystem_propagate(
-    handle: *const EmpyreanBuiltSystem,
-    ctx: *const EmpyreanContext,
-    orbits_ptr: *const EmpyreanOrbit,
-    num_orbits: usize,
-    times_ptr: *const f64,
-    num_times: usize,
-    config: *const EmpyreanPropagationConfig,
-    result_out: *mut EmpyreanPropagationResult,
-) -> i32 {
-    unsafe {
-        lib().empyrean_builtsystem_propagate(
-            handle, ctx, orbits_ptr, num_orbits, times_ptr, num_times, config, result_out,
-        )
-    }
-}
-/** Generate predicted ephemeris for `orbits` and `observers` through the
-pre-built handle.
-
-Parallels the one-shot [`empyrean_generate_ephemeris`] but takes
-`(handle, ctx, ...)`. Runs the same identity guard as
-[`empyrean_builtsystem_propagate`] before dispatch; on pass the result is
-bit-identical to the one-shot. The ephemeris config carries no divisor
-knob, so a handle frozen at a non-default divisor is rejected here with
-[`EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_DIVISOR`] rather than served under the
-wrong dynamics — build ephemeris-reuse handles at the default divisor.
-
-On success populates `result_out`; free it with
-[`empyrean_ephemeris_result_free`].*/
-#[inline]
-pub unsafe fn empyrean_builtsystem_generate_ephemeris(
-    handle: *const EmpyreanBuiltSystem,
-    ctx: *const EmpyreanContext,
-    orbits_ptr: *const EmpyreanOrbit,
-    num_orbits: usize,
-    observers_ptr: *const EmpyreanObserver,
-    num_observers: usize,
-    config: *const EmpyreanEphemerisConfig,
-    result_out: *mut EmpyreanEphemerisResult,
-) -> i32 {
-    unsafe {
-        lib().empyrean_builtsystem_generate_ephemeris(
-            handle,
-            ctx,
-            orbits_ptr,
-            num_orbits,
-            observers_ptr,
-            num_observers,
-            config,
-            result_out,
-        )
-    }
-}
-/** Populate `out` with a full reproducibility summary of the handle's
-frozen force model and its captured kernel manifest.
-
-Every field is populated from the system description and the manifest
-snapshot — no field is left defaulted. Returns
-[`EMPYREAN_BUILTSYSTEM_OK`] on success. The caller owns the heap arrays
-inside `out` and must release them with
-[`empyrean_builtsystem_description_free`].*/
-#[inline]
-pub unsafe fn empyrean_builtsystem_describe(
-    handle: *const EmpyreanBuiltSystem,
-    out: *mut EmpyreanSystemDescription,
-) -> i32 {
-    unsafe { lib().empyrean_builtsystem_describe(handle, out) }
-}
-/** Free the heap arrays inside a description populated by
-[`empyrean_builtsystem_describe`] (the perturber-id array and the kernel
-records with their C strings). After this returns `desc` is
-zero-initialized — safe to drop on the caller's stack. Passing null is a
-no-op.*/
-#[inline]
-pub unsafe fn empyrean_builtsystem_description_free(desc: *mut EmpyreanSystemDescription) {
-    unsafe { lib().empyrean_builtsystem_description_free(desc) }
 }

@@ -15,7 +15,7 @@ use empyrean_core::time::Epoch;
 use crate::observers::EmpyreanObserver;
 use crate::propagate::{
     EmpyreanOrbit, EmpyreanPropagationConfig, empyrean_orbit_photometric_params,
-    empyrean_orbit_srp_params, empyrean_orbit_thrust_params, int_to_force_model,
+    empyrean_orbit_srp_params, empyrean_orbit_thrust_params,
 };
 use crate::{EmpyreanContext, set_last_error};
 
@@ -225,15 +225,37 @@ pub struct EmpyreanEphemerisResult {
 
 /// Ephemeris-generation configuration.
 ///
-/// Wraps the inner [`EmpyreanPropagationConfig`] (force model,
-/// uncertainty method, output frame) plus the light-time iteration
-/// controls and a diagnostics toggle. The propagation runs internally
-/// to bring each orbit to its observation epoch, so every
-/// propagation-level knob applies here too.
+/// Wraps the inner [`EmpyreanPropagationConfig`] plus the light-time
+/// iteration controls and a diagnostics toggle. The propagation runs
+/// internally to bring each orbit to its observation epoch, so the
+/// propagation-level knobs the integrator consults apply here too:
+/// `force_model`, `excluded_perturbers_naif`, `uncertainty_method`,
+/// `compute_stm`, `frame`, `num_threads`, `ephemeris_overlap_policy`, and the
+/// whole `advanced` block.
+///
+/// Two blocks do **not** apply: `events` and `diagnostics`. Ephemeris
+/// generation runs with event detection and timeseries diagnostics off
+/// and [`EmpyreanEphemerisResult`] carries no channel for either, so
+/// setting a field in either block is refused with an error naming it
+/// rather than accepted and dropped. Leave both zeroed (a `memset(0)`
+/// config is valid); use `empyrean_propagate` when you need them.
+///
+/// # Generating for an SB441-N16 body
+///
+/// `ephemeris_overlap_policy` matters more here than on `empyrean_propagate`.
+/// Under the default `EMPYREAN_EPHEMERIS_OVERLAP_POLICY_SUBSTITUTE_SPK` the engine
+/// skips integration for a target that coincides with one of its own
+/// perturbers — and ephemeris generation reads the dense trajectory that
+/// integration would have produced, so the call **fails** for any
+/// SB441-N16 body at Standard tier. Pass
+/// `EMPYREAN_EPHEMERIS_OVERLAP_POLICY_EXCLUDE_AND_INTEGRATE` (or exclude the body
+/// via `excluded_perturbers_naif`) to generate ephemerides for one.
 #[repr(C)]
 pub struct EmpyreanEphemerisConfig {
     /// Inner propagation configuration applied to the trajectory that
-    /// brings each orbit to its observation epoch.
+    /// brings each orbit to its observation epoch. The `events` and
+    /// `diagnostics` sub-blocks must be left zeroed — see the struct
+    /// docs.
     pub propagation: EmpyreanPropagationConfig,
     /// Maximum iterations for light-time convergence. 0 → use the
     /// upstream default (3).
@@ -402,13 +424,38 @@ pub(crate) fn build_orbits_for_ephemeris(
     Ok(orbits)
 }
 
-/// Build a `Vec<Observer>` from a C-ABI observer slice (SSB-frame Cartesian
-/// station states). Shared by the one-shot and handle ephemeris paths.
+/// Build a `Vec<Observer>` from a C-ABI observer slice. Shared by the
+/// one-shot and handle ephemeris paths.
+///
+/// # Basis
+///
+/// Ephemeris generation requires observers in the **construction basis**
+/// — ICRF, solar-system barycenter — which is what
+/// `empyrean_get_observers` returns for `frame = 0, origin = 0`. A row
+/// tagged with any other basis is refused by name rather than read as if
+/// it were ICRF/SSB: the numbers would be a rotated and/or translated
+/// station state fed to a forward model that assumes otherwise, and the
+/// resulting astrometry would be wrong with no diagnostic. A `memset(0)`
+/// observer is ICRF/SSB, so a caller who never touched the two tail
+/// fields is unaffected.
 pub(crate) fn build_observers_from_c(
     observer_slice: &[EmpyreanObserver],
 ) -> Result<Vec<Observer>, String> {
     let mut observers: Vec<Observer> = Vec::with_capacity(observer_slice.len());
     for (i, obs) in observer_slice.iter().enumerate() {
+        let obs_frame = empyrean_core::convert::int_to_frame(obs.frame)
+            .map_err(|e| format!("observer {i}: {e}"))?;
+        if obs_frame != Frame::ICRF || obs.origin != Origin::SolarSystemBarycenter.naif_id() {
+            return Err(format!(
+                "observer {i}: ephemeris generation requires observers in the \
+                 construction basis (frame = 0 / ICRF, origin = 0 / solar-system \
+                 barycenter); got frame = {}, origin = {}. Re-request the observers \
+                 from empyrean_get_observers with that basis — reading a rotated or \
+                 translated station state as if it were ICRF/SSB would produce wrong \
+                 astrometry with no diagnostic.",
+                obs.frame, obs.origin
+            ));
+        }
         // The engine's observatory registry keys 3-byte MPC codes. A
         // 4th byte must not be dropped: the 3-byte prefix would silently
         // resolve to a DIFFERENT observatory (wrong topocentric geometry,
@@ -451,25 +498,126 @@ pub(crate) fn build_observers_from_c(
     Ok(observers)
 }
 
+/// Propagation fields the C ABI advertises on an ephemeris config that
+/// [`EphemerisPropagationConfig`] has no home for, named individually so
+/// a rejection can say which ones the caller set.
+///
+/// Ephemeris generation builds its inner `PropagationConfig` with
+/// `events` and `diagnostics` pinned to their upstream defaults, and
+/// [`EmpyreanEphemerisResult`] carries neither an event list nor a
+/// diagnostics timeseries. A value set in either block therefore cannot
+/// be honoured *and* cannot be observed. Taking it and dropping it is
+/// exactly the failure mode this converter was rewritten to close, so
+/// the request is refused instead.
+///
+/// Zero is the "not requested" state for both blocks: a `memset(0)`
+/// config passes, and the flags map 1:1 to booleans elsewhere in the
+/// ABI, so a zeroed block is also what the ephemeris path would have
+/// produced anyway.
+fn ephemeris_unsupported_propagation_fields(c: &EmpyreanPropagationConfig) -> Vec<&'static str> {
+    // A float knob counts as requested only when it is finite and
+    // non-zero. `memset(0)` is the documented way to build a C config, so
+    // 0.0 is indistinguishable from "untouched" on this ABI, and NaN is
+    // the ABI's explicit `None`. Both are inert here regardless.
+    fn is_set(v: f64) -> bool {
+        v.is_finite() && v != 0.0
+    }
+    let mut set = Vec::new();
+    let e = &c.events;
+    for (name, on) in [
+        ("events.close_approaches", e.close_approaches != 0),
+        ("events.impacts", e.impacts != 0),
+        ("events.atmospheric", e.atmospheric != 0),
+        ("events.possible_impacts", e.possible_impacts != 0),
+        ("events.shadow_events", e.shadow_events != 0),
+        ("events.dense_output", e.dense_output != 0),
+        (
+            "events.dense_output_cadence_days",
+            is_set(e.dense_output_cadence_days),
+        ),
+        (
+            "events.body_filter_naif",
+            e.num_body_filter > 0 && !e.body_filter_naif.is_null(),
+        ),
+    ] {
+        if on {
+            set.push(name);
+        }
+    }
+    let d = &c.diagnostics;
+    for (name, on) in [
+        ("diagnostics.sensitivity", d.sensitivity != 0),
+        ("diagnostics.nonlinearity", d.nonlinearity != 0),
+        ("diagnostics.lyapunov", d.lyapunov != 0),
+        ("diagnostics.keyholes", d.keyholes != 0),
+        ("diagnostics.bifurcations", d.bifurcations != 0),
+        ("diagnostics.sample_stride", d.sample_stride > 0),
+        (
+            "diagnostics.sensitivity_threshold",
+            is_set(d.sensitivity_threshold),
+        ),
+        (
+            "diagnostics.lyapunov_threshold",
+            is_set(d.lyapunov_threshold),
+        ),
+        (
+            "diagnostics.nonlinearity_threshold",
+            is_set(d.nonlinearity_threshold),
+        ),
+    ] {
+        if on {
+            set.push(name);
+        }
+    }
+    set
+}
+
 /// Build an [`EphemerisConfig`] from the C-ABI ephemeris config, honouring
 /// the shared sentinel rules. The `{force_model, frame, divisor}` triple it
 /// carries is exactly what a [`BuiltSystem`](empyrean_core::propagation::BuiltSystem)'s
 /// frozen key is compared against, so a handle built with the matching key
 /// serves this config identically to the one-shot path.
+///
+/// The propagation block is converted by
+/// [`build_propagation_config_from_c`](crate::propagate::build_propagation_config_from_c) —
+/// the same converter every other C-ABI entry point uses — and then
+/// narrowed to the ephemeris subset field by field. Both halves of that
+/// are load-bearing: hand-rolling the narrow struct here is what silently
+/// discarded `excluded_perturbers_naif`, `compute_stm`, `num_threads`,
+/// `ephemeris_overlap_policy` and the whole `advanced` block from every ephemeris
+/// call, and the narrowing is written without a `..Default::default()`
+/// tail so that a field added to [`EphemerisPropagationConfig`] upstream
+/// breaks this build rather than starting a fresh silent drop.
 pub(crate) fn build_ephemeris_config_from_c(
     cfg_ref: &EmpyreanEphemerisConfig,
 ) -> Result<EphemerisConfig, String> {
-    let fm = int_to_force_model(cfg_ref.propagation.force_model)?;
-    let frame = empyrean_core::convert::int_to_frame(cfg_ref.propagation.frame)
-        .map_err(|e| e.to_string())?;
-    let mut prop = EphemerisPropagationConfig {
-        force_model: fm.into(),
-        frame,
-        ..EphemerisPropagationConfig::default()
+    let unsupported = ephemeris_unsupported_propagation_fields(&cfg_ref.propagation);
+    if !unsupported.is_empty() {
+        return Err(format!(
+            "ephemeris config sets propagation field(s) ephemeris generation cannot honour: \
+             {}. Ephemeris generation runs with event detection and timeseries diagnostics \
+             off and returns no channel for either, so these would be accepted and \
+             discarded. Leave the `events` and `diagnostics` blocks zeroed on an ephemeris \
+             config; call empyrean_propagate when you need them.",
+            unsupported.join(", ")
+        ));
+    }
+
+    let full = crate::propagate::build_propagation_config_from_c(&cfg_ref.propagation)?;
+    // Field by field, no `..Default::default()` tail. The tail is what
+    // turns an upstream field addition into a fresh silent drop; without
+    // it the addition is a compile error here instead.
+    let prop = EphemerisPropagationConfig {
+        force_model: full.force_model,
+        excluded_perturbers: full.excluded_perturbers,
+        detect_ephemeris_overlap: full.detect_ephemeris_overlap,
+        ephemeris_overlap_policy: full.ephemeris_overlap_policy,
+        uncertainty_method: full.uncertainty_method,
+        compute_stm: full.compute_stm,
+        frame: full.frame,
+        num_threads: full.num_threads,
+        advanced: full.advanced,
     };
-    prop.uncertainty_method =
-        crate::propagate::flat_to_uncertainty_method(&cfg_ref.propagation.uncertainty_method)?
-            .into();
     let mut config = EphemerisConfig {
         propagation: prop,
         ..EphemerisConfig::default()
@@ -854,7 +1002,40 @@ mod tests {
             vy: 0.01,
             vz: 0.0,
             observing_night: -1,
+            frame: 0,  // ICRF
+            origin: 0, // solar-system barycenter
         }
+    }
+
+    /// An observer tagged with any basis other than the construction one
+    /// is refused by name. The two tail fields landed at ABI 3; before
+    /// them the ICRF/SSB assumption was implicit, and a rotated station
+    /// state fed to the optical forward model produced wrong astrometry
+    /// with no diagnostic.
+    #[test]
+    fn a_non_construction_basis_observer_is_rejected() {
+        let mut obs = observer_with_code(*b"W68\0");
+        obs.frame = 1; // EclipticJ2000
+        let err = build_observers_from_c(&[obs]).expect_err("ecliptic observer must not convert");
+        assert!(err.contains("construction basis"), "{err}");
+        assert!(err.contains("frame = 1"), "error names what it got: {err}");
+
+        let mut obs = observer_with_code(*b"W68\0");
+        obs.origin = 399; // Earth
+        let err = build_observers_from_c(&[obs]).expect_err("geocentric observer must not convert");
+        assert!(
+            err.contains("origin = 399"),
+            "error names what it got: {err}"
+        );
+    }
+
+    /// A `memset(0)` observer is ICRF/SSB, so a caller who never touched
+    /// the two new tail fields is unaffected by the ABI-3 widening.
+    #[test]
+    fn a_zeroed_basis_is_the_construction_basis() {
+        let mut obs: EmpyreanObserver = unsafe { std::mem::zeroed() };
+        obs.obs_code = *b"W68\0";
+        build_observers_from_c(&[obs]).expect("a zeroed basis must convert");
     }
 
     /// A 4-byte observatory code must be a loud error at the C boundary:
@@ -936,5 +1117,432 @@ mod sensitivity_row_tests {
                 "{name} disagrees between the header and the source"
             );
         }
+    }
+}
+
+/// Contract tests for [`build_ephemeris_config_from_c`] — the seam that
+/// used to hand-roll a three-field subset and silently drop the rest.
+/// Every field the C struct advertises either arrives in the
+/// [`EphemerisConfig`] the engine is handed, or is refused by name;
+/// nothing in between.
+#[cfg(test)]
+mod ephemeris_config_conversion_tests {
+    use super::*;
+    use crate::propagate::{
+        EMPYREAN_EPHEMERIS_OVERLAP_POLICY_EXCLUDE_AND_INTEGRATE, EMPYREAN_INTEGRATOR_DOP853,
+        EMPYREAN_UNCERTAINTY_SECOND, EmpyreanPropagationConfig,
+    };
+    use empyrean_core::propagation::EphemerisOverlapPolicy;
+
+    /// The state a C caller gets from `memset(&cfg, 0, sizeof cfg)`. All
+    /// fields are plain data or raw pointers, so the zero pattern is a
+    /// valid value of the type — and it is the documented way to build a
+    /// config, so it must convert.
+    fn zeroed_config() -> EmpyreanEphemerisConfig {
+        unsafe { std::mem::zeroed::<EmpyreanEphemerisConfig>() }
+    }
+
+    fn prop_of(cfg: &mut EmpyreanEphemerisConfig) -> &mut EmpyreanPropagationConfig {
+        &mut cfg.propagation
+    }
+
+    /// `EphemerisConfig` carries no `Debug`, so `expect_err` cannot name
+    /// the unexpected success — take the message the long way.
+    fn expect_refusal(cfg: &EmpyreanEphemerisConfig, what: &str) -> String {
+        match build_ephemeris_config_from_c(cfg) {
+            Ok(_) => panic!("{what} must not convert"),
+            Err(e) => e,
+        }
+    }
+
+    /// `memset(0)` is a valid ephemeris config: every sentinel resolves
+    /// and neither unsupported block reads as "requested".
+    #[test]
+    fn a_zeroed_config_converts() {
+        build_ephemeris_config_from_c(&zeroed_config()).expect("memset(0) config must convert");
+    }
+
+    /// The headline regression: `excluded_perturbers_naif` is the only
+    /// way a caller can keep an SB441-N16 body out of its own perturber
+    /// set, and no distribution layer could reach the ephemeris path with
+    /// it because this converter never read the field.
+    #[test]
+    fn excluded_perturbers_reach_the_engine_config() {
+        // 2000007 = Origin::Asteroid(7), Iris — an N16 self-perturber.
+        let naif = [2_000_007i32, 2_000_004];
+        let mut cfg = zeroed_config();
+        prop_of(&mut cfg).num_excluded_perturbers = naif.len();
+        prop_of(&mut cfg).excluded_perturbers_naif = naif.as_ptr();
+
+        let built = build_ephemeris_config_from_c(&cfg).expect("config converts");
+        assert_eq!(
+            built.propagation.excluded_perturbers,
+            vec![Origin::Asteroid(7), Origin::Asteroid(4)],
+            "excluded_perturbers_naif must reach EphemerisPropagationConfig in input order"
+        );
+    }
+
+    /// An unknown NAIF id is an error, not a skipped entry — a dropped
+    /// exclusion would leave the body self-perturbing with no diagnostic.
+    #[test]
+    fn an_unknown_excluded_perturber_is_rejected() {
+        let naif = [424_242_424i32];
+        let mut cfg = zeroed_config();
+        prop_of(&mut cfg).num_excluded_perturbers = naif.len();
+        prop_of(&mut cfg).excluded_perturbers_naif = naif.as_ptr();
+
+        let err = expect_refusal(&cfg, "an unknown NAIF id");
+        assert!(err.contains("424242424"), "error names the id: {err}");
+    }
+
+    /// The other blocks that were dropped alongside it: `compute_stm`,
+    /// `num_threads`, `frame`, and the whole `advanced` bag (the divisor
+    /// in which is half of a `BuiltSystem`'s frozen key).
+    #[test]
+    fn the_remaining_dropped_fields_reach_the_engine_config() {
+        let mut cfg = zeroed_config();
+        {
+            let p = prop_of(&mut cfg);
+            p.force_model = 1; // Basic
+            p.frame = 0; // ICRF
+            p.compute_stm = 1;
+            p.num_threads = 3;
+            p.uncertainty_method.tag = EMPYREAN_UNCERTAINTY_SECOND;
+            p.advanced.integrator = EMPYREAN_INTEGRATOR_DOP853;
+            p.advanced.epsilon = 1e-11;
+            p.advanced.dt_initial = f64::NAN;
+            p.advanced.dt_min = 1e-6;
+            p.advanced.encounter_timescale_divisor = 500.0;
+            p.advanced.max_steps = 12_345;
+            p.advanced.max_dense_steps = 6_789;
+        }
+
+        let built = build_ephemeris_config_from_c(&cfg).expect("config converts");
+        let p = &built.propagation;
+        assert!(p.compute_stm, "compute_stm must survive");
+        assert_eq!(
+            p.num_threads.map(|n| n.get()),
+            Some(3),
+            "num_threads must survive"
+        );
+        assert_eq!(p.frame, Frame::ICRF, "frame must survive");
+        assert_eq!(p.advanced.epsilon, 1e-11, "advanced.epsilon must survive");
+        assert_eq!(
+            p.advanced.dt_min,
+            Some(1e-6),
+            "advanced.dt_min must survive"
+        );
+        assert_eq!(
+            p.advanced.encounter_timescale_divisor, 500.0,
+            "the divisor is compared against a BuiltSystem's frozen key — it must survive"
+        );
+        assert_eq!(p.advanced.max_steps, 12_345);
+        assert_eq!(p.advanced.max_dense_steps, 6_789);
+        assert_eq!(
+            format!("{:?}", p.uncertainty_method),
+            "SecondOrder",
+            "uncertainty_method must survive"
+        );
+    }
+
+    /// `ephemeris_overlap_policy` is the ABI-3 tail field, and the ephemeris path
+    /// is where it matters most: the default policy skips integration,
+    /// and ephemeris generation reads the dense trajectory integration
+    /// would have produced. It must reach the narrowed config — the
+    /// narrowing has no `..Default::default()` tail precisely so this
+    /// cannot be forgotten.
+    #[test]
+    fn the_overlap_policy_reaches_the_engine_config() {
+        let mut cfg = zeroed_config();
+        let built = build_ephemeris_config_from_c(&cfg).expect("zeroed config converts");
+        assert_eq!(
+            built.propagation.ephemeris_overlap_policy,
+            EphemerisOverlapPolicy::SubstituteSpk,
+            "memset(0) must keep meaning the historical behaviour"
+        );
+
+        prop_of(&mut cfg).ephemeris_overlap_policy =
+            EMPYREAN_EPHEMERIS_OVERLAP_POLICY_EXCLUDE_AND_INTEGRATE;
+        let built = build_ephemeris_config_from_c(&cfg).expect("config converts");
+        assert_eq!(
+            built.propagation.ephemeris_overlap_policy,
+            EphemerisOverlapPolicy::ExcludeAndIntegrate,
+            "EXCLUDE_AND_INTEGRATE must reach EphemerisPropagationConfig"
+        );
+    }
+
+    /// An unknown policy value is refused rather than resolved to the
+    /// default — and the refusal reaches the ephemeris path because its
+    /// converter routes through the shared one.
+    #[test]
+    fn an_unknown_overlap_policy_is_refused_on_the_ephemeris_path() {
+        let mut cfg = zeroed_config();
+        prop_of(&mut cfg).ephemeris_overlap_policy = 7;
+        let err = expect_refusal(&cfg, "an unknown overlap policy");
+        assert!(err.contains('7'), "error names the value: {err}");
+    }
+
+    /// Event detection has no home on `EphemerisPropagationConfig` and no
+    /// output channel on `EmpyreanEphemerisResult`. Asking for it is
+    /// refused by name rather than accepted and dropped.
+    #[test]
+    fn an_event_request_is_refused_by_name() {
+        let mut cfg = zeroed_config();
+        prop_of(&mut cfg).events.close_approaches = 1;
+        prop_of(&mut cfg).events.dense_output = 1;
+
+        let err = expect_refusal(&cfg, "an event request");
+        assert!(
+            err.contains("events.close_approaches") && err.contains("events.dense_output"),
+            "error names every field the caller set: {err}"
+        );
+        assert!(
+            err.contains("empyrean_propagate"),
+            "error says where event detection does live: {err}"
+        );
+    }
+
+    /// A body filter is a request even when every detection flag is off.
+    #[test]
+    fn an_event_body_filter_is_refused_by_name() {
+        let bodies = [399i32];
+        let mut cfg = zeroed_config();
+        prop_of(&mut cfg).events.num_body_filter = bodies.len();
+        prop_of(&mut cfg).events.body_filter_naif = bodies.as_ptr();
+
+        let err = expect_refusal(&cfg, "an event body filter");
+        assert!(
+            err.contains("events.body_filter_naif"),
+            "error names the field: {err}"
+        );
+    }
+
+    /// Same for the diagnostics timeseries.
+    #[test]
+    fn a_diagnostics_request_is_refused_by_name() {
+        let mut cfg = zeroed_config();
+        prop_of(&mut cfg).diagnostics.lyapunov = 1;
+        prop_of(&mut cfg).diagnostics.sample_stride = 5;
+        prop_of(&mut cfg).diagnostics.sensitivity_threshold = 1e3;
+
+        let err = expect_refusal(&cfg, "a diagnostics request");
+        for field in [
+            "diagnostics.lyapunov",
+            "diagnostics.sample_stride",
+            "diagnostics.sensitivity_threshold",
+        ] {
+            assert!(err.contains(field), "error names {field}: {err}");
+        }
+    }
+
+    /// NaN is the ABI's `None` for the diagnostics thresholds; it is not
+    /// a request and must not trip the refusal.
+    #[test]
+    fn nan_diagnostics_thresholds_are_not_a_request() {
+        let mut cfg = zeroed_config();
+        prop_of(&mut cfg).diagnostics.sensitivity_threshold = f64::NAN;
+        prop_of(&mut cfg).diagnostics.lyapunov_threshold = f64::NAN;
+        prop_of(&mut cfg).diagnostics.nonlinearity_threshold = f64::NAN;
+        build_ephemeris_config_from_c(&cfg).expect("NaN thresholds must convert");
+    }
+
+    /// The ephemeris-specific knobs keep their own sentinel behaviour.
+    #[test]
+    fn light_time_sentinels_still_resolve() {
+        let mut cfg = zeroed_config();
+        cfg.max_light_time_iterations = 7;
+        cfg.light_time_tolerance_days = 1e-12;
+        cfg.compute_diagnostics = 1;
+
+        let built = build_ephemeris_config_from_c(&cfg).expect("config converts");
+        assert_eq!(built.max_light_time_iterations, 7);
+        assert_eq!(built.light_time_tolerance_days, 1e-12);
+        assert!(built.compute_diagnostics);
+    }
+}
+
+/// End-to-end proof that the propagation-level knobs set on a C ephemeris
+/// config reach the force model and change the answer — the behaviour the
+/// hand-rolled converter made unreachable from every distribution layer.
+///
+/// These live in empyrean-c rather than in the Rust wrapper on purpose:
+/// `empyrean-sys` dlopens a *released* `libempyrean`, so a wrapper-level
+/// test would exercise whatever engine binary is cached rather than the
+/// code in this tree, and would keep passing (wrongly) or failing
+/// (spuriously) independent of this crate. Here `empyrean-core` is linked
+/// directly, so the engine under test is the one being built.
+///
+/// Gated on a real data directory; skipped without one.
+#[cfg(test)]
+mod ephemeris_config_end_to_end_tests {
+    use super::*;
+    use crate::propagate::EMPYREAN_UNCERTAINTY_FIRST;
+
+    /// A long enough arc that Jupiter's pull moves the predicted sky
+    /// position well clear of round-off.
+    const IC_EPOCH: f64 = 59000.0;
+    const OBS_EPOCH: f64 = 59200.0;
+    /// NAIF id of the Jupiter system barycenter.
+    const JUPITER_BARYCENTER: i32 = 5;
+
+    fn orbit() -> EmpyreanOrbit {
+        let mut o: EmpyreanOrbit = unsafe { std::mem::zeroed() };
+        o.state = crate::CoordinateState {
+            epoch_mjd_tdb: IC_EPOCH,
+            elements: [1.0, 0.1, 0.05, -0.005, 0.015, 0.001],
+            covariance: [[0.0; 6]; 6],
+            has_covariance: 0,
+            representation: 0, // Cartesian
+            frame: 0,          // ICRF
+            origin: 10,        // Sun
+        };
+        o.non_grav_dt = f64::NAN;
+        o.non_grav_dt_variance = f64::NAN;
+        o.phot_system = -1;
+        o.h_mag = f64::NAN;
+        o.srp_amrat_variance = f64::NAN;
+        o
+    }
+
+    fn observer() -> EmpyreanObserver {
+        EmpyreanObserver {
+            obs_code: *b"500\0",
+            epoch_mjd_tdb: OBS_EPOCH,
+            x: 0.9,
+            y: -0.42,
+            z: -0.18,
+            vx: 0.0075,
+            vy: 0.0148,
+            vz: 0.0064,
+            observing_night: -1,
+            frame: 0,
+            origin: 0,
+        }
+    }
+
+    /// Standard tier, ICRF output. `zeroed` gives the right sentinels
+    /// everywhere except the NaN-means-auto integrator slots.
+    fn config(excluded: &[i32]) -> EmpyreanEphemerisConfig {
+        let mut cfg: EmpyreanEphemerisConfig = unsafe { std::mem::zeroed() };
+        cfg.propagation.force_model = 2; // Standard
+        cfg.propagation.frame = 0; // ICRF
+        cfg.propagation.uncertainty_method.tag = EMPYREAN_UNCERTAINTY_FIRST;
+        cfg.propagation.advanced.dt_initial = f64::NAN;
+        cfg.propagation.advanced.dt_min = f64::NAN;
+        cfg.compute_diagnostics = 1;
+        if !excluded.is_empty() {
+            cfg.propagation.num_excluded_perturbers = excluded.len();
+            cfg.propagation.excluded_perturbers_naif = excluded.as_ptr();
+        }
+        cfg
+    }
+
+    /// Run the full C-side ephemeris path (config conversion → engine)
+    /// and return the single row's (RA, Dec) in degrees.
+    fn ra_dec(ctx: &empyrean_core::Context, cfg: &EmpyreanEphemerisConfig) -> (f64, f64) {
+        let built = build_ephemeris_config_from_c(cfg).expect("config converts");
+        let orbits = build_orbits_for_ephemeris(&[orbit()]).expect("orbits convert");
+        let observers = build_observers_from_c(&[observer()]).expect("observers convert");
+        let result =
+            generate_ephemeris(ctx, &orbits, &observers, &built).expect("ephemeris generates");
+        let row = result
+            .ephemeris
+            .iter()
+            .next()
+            .expect("exactly one ephemeris row");
+        (row.1.lon, row.1.lat)
+    }
+
+    /// Dropping Jupiter from the perturber set must move the answer. Two
+    /// bit-identical results mean the exclusion never reached the force
+    /// model — which is what every distribution layer produced before the
+    /// fix, and what this test exists to catch if it regresses.
+    #[test]
+    fn excluding_jupiter_changes_the_predicted_sky_position() {
+        let Ok(ctx) = empyrean_core::Context::from_data_dir(None) else {
+            eprintln!("skipping excluding_jupiter_changes_the_predicted_sky_position: no data dir");
+            return;
+        };
+        let (ra_full, dec_full) = ra_dec(&ctx, &config(&[]));
+        let excluded = [JUPITER_BARYCENTER];
+        let (ra_excl, dec_excl) = ra_dec(&ctx, &config(&excluded));
+
+        let d_ra = (ra_full - ra_excl).abs();
+        let d_dec = (dec_full - dec_excl).abs();
+        assert!(
+            d_ra > 1e-9 || d_dec > 1e-9,
+            "excluding Jupiter left the prediction unchanged \
+             (dRA = {d_ra:e}, dDec = {d_dec:e}) — excluded_perturbers_naif did not \
+             reach the ephemeris force model"
+        );
+    }
+
+    /// An explicitly empty exclusion list must reproduce the shipped
+    /// default bit-for-bit: routing the config through the shared
+    /// converter must not have changed numbers for callers who asked for
+    /// nothing.
+    #[test]
+    fn an_empty_exclusion_list_is_the_shipped_default() {
+        let Ok(ctx) = empyrean_core::Context::from_data_dir(None) else {
+            eprintln!("skipping an_empty_exclusion_list_is_the_shipped_default: no data dir");
+            return;
+        };
+        let (ra_a, dec_a) = ra_dec(&ctx, &config(&[]));
+        let (ra_b, dec_b) = ra_dec(&ctx, &config(&[]));
+        assert_eq!(ra_a, ra_b, "RA is deterministic");
+        assert_eq!(dec_a, dec_b, "Dec is deterministic");
+    }
+
+    /// `compute_stm` reaching the engine, proved by its observable
+    /// consequence rather than by re-reading the converter: with the flag
+    /// set the run traces `Jet1<6>` and the observation-sensitivity chain
+    /// carries a Jacobian at every epoch; without it (and without an
+    /// input covariance) there is no STM to compose, and the chain comes
+    /// back present-but-empty. The converter routing is the only thing
+    /// between the C field and this behaviour — sabotage it and this test
+    /// goes red.
+    ///
+    /// Counting *Jacobian-bearing epochs*, not chains: a placeholder
+    /// chain is emitted per `(orbit, observer)` either way, so a chain
+    /// count discriminates nothing.
+    #[test]
+    fn compute_stm_reaches_the_engine() {
+        let Ok(ctx) = empyrean_core::Context::from_data_dir(None) else {
+            eprintln!("skipping compute_stm_reaches_the_engine: no data dir");
+            return;
+        };
+        let partials = |compute_stm: u8| {
+            let mut cfg = config(&[]);
+            cfg.propagation.compute_stm = compute_stm;
+            let built = build_ephemeris_config_from_c(&cfg).expect("config converts");
+            let orbits = build_orbits_for_ephemeris(&[orbit()]).expect("orbits convert");
+            let observers = build_observers_from_c(&[observer()]).expect("observers convert");
+            let result =
+                generate_ephemeris(&ctx, &orbits, &observers, &built).expect("ephemeris generates");
+            result
+                .sensitivity
+                .iter()
+                .map(|chain| {
+                    (0..chain.epochs().len())
+                        .filter(|&i| {
+                            chain.jacobian(i).is_some() || chain.jacobian_wide(i).is_some()
+                        })
+                        .count()
+                })
+                .sum::<usize>()
+        };
+        assert_eq!(
+            partials(0),
+            0,
+            "without compute_stm and without an input covariance there is no STM to \
+             compose, so no epoch should carry a Jacobian"
+        );
+        assert!(
+            partials(1) > 0,
+            "compute_stm = 1 must reach the engine and force Jet1<6> integration, which \
+             fills the observation-sensitivity Jacobians — zero partials means the C \
+             field was dropped between build_ephemeris_config_from_c and \
+             EphemerisPropagationConfig"
+        );
     }
 }

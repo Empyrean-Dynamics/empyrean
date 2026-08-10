@@ -85,6 +85,7 @@
    empyrean.AdvancedIntegratorConfig
    empyrean.IntegratorChoice
    empyrean.OriginSwitchingConfig
+   empyrean.EphemerisOverlapPolicy
    empyrean.ForceModelTier
    empyrean.UncertaintyMethod
    empyrean.SigmaPoint

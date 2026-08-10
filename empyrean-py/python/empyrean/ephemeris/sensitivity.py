@@ -92,8 +92,11 @@ class StateSensitivities(qv.Table):
     Matrices are stored row-major flattened in ``LargeListColumn`` s:
 
     - ``stm`` is the 6×6 STM Φ flattened to length 36
-      (``stm[6·r + c] = Φ[r, c]``). ``None`` per row when STMs were not
-      computed for that row.
+      (``stm[6·r + c] = Φ[r, c]``). ``None`` per row when the
+      propagation did not trace an STM for that row — which is the case
+      for a sampling method, and for an analytic method on an orbit with
+      neither an input covariance nor
+      :attr:`~empyrean.PropagationConfig.compute_stm` set.
     - ``stt`` is the 6×6×6 STT Ψ flattened to length 216
       (``stt[36·k + 6·a + b] = Ψ[k, a, b]``). ``None`` when the
       propagation method did not carry STTs (anything other than
@@ -241,8 +244,11 @@ class StateSensitivities(qv.Table):
         stms = self.stms_array()
         if stms is None:
             raise ValueError(
-                "chain has no STMs — propagation method did not compute them "
-                "(Monte Carlo / SigmaPoint, or FirstOrder without input covariance)"
+                "chain has no STMs — the propagation did not trace them (a "
+                "sampling method such as Monte Carlo / SigmaPoint, or an "
+                "analytic method on an orbit with no input covariance and "
+                "compute_stm unset; set PropagationConfig.compute_stm=True to "
+                "trace the STM without a covariance)"
             )
         cov_in = np.asarray(cov_in, dtype=np.float64)
         if cov_in.shape != (6, 6):
@@ -307,7 +313,10 @@ class ObservationSensitivities(qv.Table):
 
     Holds ∂h/∂x₀ at every ephemeris epoch for each ``(orbit, observer)``
     pair, plus the observation Hessians when the underlying propagation
-    carried STTs. The Jacobian composes ∂(obs)/∂(state at t_obs) ·
+    carried STTs. The rows exist whenever that propagation traced the
+    STM — from an input covariance, or from
+    :attr:`~empyrean.PropagationConfig.compute_stm` alone with no
+    covariance at all. The Jacobian composes ∂(obs)/∂(state at t_obs) ·
     Φ(t_obs, t₀) and omits the light-time terms (the −v·∂τ/∂x partial;
     the STM is sampled at t_obs rather than emission t_obs − τ): both
     are O(τ), landing in the velocity columns of the angle rows with
@@ -491,8 +500,11 @@ class ObservationSensitivities(qv.Table):
         jacs = self.jacobians_array()
         if jacs is None:
             raise ValueError(
-                "chain has no Jacobians — ephemeris generation did not carry "
-                "observation partials (likely no input covariance)"
+                "chain has no Jacobians — ephemeris generation did not trace the "
+                "STM for it (the input orbit carried no covariance and "
+                "compute_stm was not set; re-run generate_ephemeris with "
+                "config.propagation.compute_stm=True to request partials "
+                "without one)"
             )
         n_p = jacs.shape[-1]
         cov_in = np.asarray(cov_in, dtype=np.float64)

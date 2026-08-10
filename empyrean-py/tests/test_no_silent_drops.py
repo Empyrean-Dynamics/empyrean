@@ -118,14 +118,16 @@ ALLOWED_ALL_NULL: dict[str, str] = {
     # on the allow-list until the upstream fix lands.
     "BPlanes.ip_linear": "known drop (pending upstream fix)",
     # ── ObservationSensitivities: now wired through the C ABI
-    # — orbit_id key + Jacobian populated (deliberately
-    # NOT listed). The Hessian is Jet2-only (null for the first-order
-    # fixture); object_id is null because villeneuve's sensitivity chain is
-    # keyed by (orbit_id, obs_code) and doesn't carry the optional object_id
-    # the way the Ephemeris table does — a villeneuve-level metadata gap, not
-    # a distribution drop. ──
+    # — orbit_id key + Jacobian populated (deliberately NOT listed).
+    # `object_id` was on this list on the grounds that villeneuve's
+    # sensitivity chain is keyed by (orbit_id, obs_code) and carries no
+    # object_id; the real cause was the binding not applying to the
+    # sensitivity rows the fabricated-index recovery it already applied
+    # to the ephemeris rows beside them. Both ids are now recovered from
+    # the caller's input, so the entry is gone and this test guards it.
+    # The Hessian stays: it is genuinely Jet2-only and null for the
+    # first-order fixture. ──
     "ObservationSensitivities.hessian": "by-design (Jet2 method only)",
-    "ObservationSensitivities.object_id": "villeneuve chain not keyed by object_id",
     # ── Impact probabilities: by-design when method != MonteCarlo ──
     "ImpactProbabilities.mc_n_samples": "by-design (MC method only)",
     "ImpactProbabilities.mc_n_impacts": "by-design (MC method only)",
@@ -139,9 +141,22 @@ ALLOWED_ALL_NULL: dict[str, str] = {
     "ImpactProbabilities.skewness": "by-design (Jet2 method only)",
     "ImpactProbabilities.distance_hessian": "by-design (Jet2 method only)",
     "ImpactProbabilities.agm_components": "by-design (AGM refinement only)",
-    # (impact_latitude_deg / impact_longitude_deg / impact_altitude_km are
-    # populated by the enrichment pass on the fixture — deliberately NOT
-    # allow-listed, so this test re-fails if they regress to all-null.)
+    # ── Impact location: by-design null on a FLY-BY fixture ──
+    # The impact point is not a method-derived quantity: it is the nominal
+    # trajectory's surface crossing, copied from the matching `Impact`
+    # event, and it is therefore identical on every uncertainty method.
+    # It exists only when the nominal trajectory actually strikes the body
+    # (miss_distance_km < effective_radius_km). Apophis passes 38,011 km
+    # from Earth's center against a 6,378 km effective radius — a fly-by,
+    # so it has no impact point and these are null on every row.
+    # (Filling them from the fly-by's periapsis sub-point was the old
+    # behaviour: it asserted a surface site for a 38,000 km miss.)
+    # The C ABI carries all three fields and they ARE populated for a real
+    # impactor — `test_impactor_impact_probabilities_carry_the_surface_point`
+    # below is the wiring guard, so a drop still fails loudly.
+    "ImpactProbabilities.impact_latitude_deg": "by-design (fly-by fixture: no surface strike)",
+    "ImpactProbabilities.impact_longitude_deg": "by-design (fly-by fixture: no surface strike)",
+    "ImpactProbabilities.impact_altitude_km": "by-design (fly-by fixture: no surface strike)",
     # (Periapses.relative_{x,y,z,vx,vy,vz} were once dropped here
     # but are now wired through the C ABI and populated — removed, so this
     # test re-fails if they ever regress to all-null.)
@@ -901,16 +916,21 @@ def test_propagation_state_sensitivities_no_silent_drops() -> None:
 def test_ephemeris_observation_sensitivities_no_silent_drops() -> None:
     """Observation Jacobian/Hessian chains on ``EphemerisResult.sensitivity``.
 
-    Historically dropped at the C ABI — if the table comes back
-    empty, this skips. Once sensitivities are wired through it activates
-    and asserts the columns are populated.
+    Historically dropped at the C ABI: ``build_ephemeris_config_from_c``
+    hand-rolled a three-field subset of the propagation config, so
+    ``compute_stm`` never reached the engine and the table came back
+    empty on every call. It is wired through now, so an empty table is a
+    regression, not a reason to skip — this test is the regression guard
+    and it has to fail if the drop comes back.
     """
     orbits = _full_feature_orbit()
     observers = Observers.from_code("500", [61000.5, 61010.5, 61020.5])
     result = generate_ephemeris(orbits, observers, uncertainty_method=UncertaintyMethod.FIRST_ORDER)
     sens = result.sensitivity
-    if sens is None or len(sens) == 0:
-        pytest.skip("ObservationSensitivities empty (dropped at C ABI).")
+    assert sens is not None and len(sens) > 0, (
+        "EphemerisResult.sensitivity came back empty for an orbit carrying a covariance — "
+        "the observation-sensitivity chain has been dropped at the C ABI again"
+    )
 
     bad_null, bad_not_null = _check_no_silent_drops(sens, "ObservationSensitivities")
     assert not (bad_null or bad_not_null), _format_failures(
@@ -945,6 +965,58 @@ def test_impact_probabilities_no_silent_drops() -> None:
     assert not (bad_null or bad_not_null), _format_failures(
         "ImpactProbabilities", bad_null, bad_not_null
     )
+
+
+def test_impactor_impact_probabilities_carry_the_surface_point() -> None:
+    """The IP channel's impact location, on the fixture that has one.
+
+    ``impact_latitude_deg`` / ``impact_longitude_deg`` /
+    ``impact_altitude_km`` are on :data:`ALLOWED_ALL_NULL` because the
+    Apophis fly-by has no surface strike. That entry would also hide a
+    genuine C-ABI drop, so this is the wiring guard: 2008 TC3 *does*
+    strike the ground, and its row must carry a real surface point.
+
+    Two properties are pinned:
+
+    * **Population is a property of the trajectory, not the method.** The
+      impact point is the nominal trajectory's surface crossing (copied
+      from the matching ``Impact`` event), so every uncertainty method
+      reports the same coordinates — an impacting row is never null and a
+      fly-by row is never non-null, whichever method produced it.
+    * **The coordinates are real.** 2008 TC3 fell over the Nubian Desert
+      in northern Sudan on 2008-10-07 (Jenniskens et al. 2009, *Nature*
+      458, 485 — the Almahata Sitta fall), so the recovered sub-point must
+      land in that region, on the surface.
+    """
+    orbit = _impactor_orbit()
+    for method in (UncertaintyMethod.FIRST_ORDER, UncertaintyMethod.MONTE_CARLO):
+        ips = compute_impact_probabilities(
+            orbit,
+            end_epoch=54747.0,
+            methods=[method],
+            body_filter=[Origin.EARTH],
+        )
+        assert len(ips) > 0, f"impactor fixture produced no IP row under {method.value}"
+
+        miss = ips.miss_distance_km.to_numpy(zero_copy_only=False)
+        radius = ips.effective_radius_km.to_numpy(zero_copy_only=False)
+        assert np.all(miss < radius), (
+            "impactor fixture no longer strikes Earth — the fixture has regressed "
+            f"(miss {miss} km vs effective radius {radius} km)"
+        )
+
+        lat = ips.impact_latitude_deg.to_pylist()
+        lon = ips.impact_longitude_deg.to_pylist()
+        alt = ips.impact_altitude_km.to_pylist()
+        assert all(v is not None for v in lat + lon + alt), (
+            f"impact location dropped at the C ABI under {method.value}: "
+            f"lat={lat} lon={lon} alt={alt}"
+        )
+        # Northern Sudan, on the surface. The band is deliberately regional,
+        # not a fake-precision match to a published sub-point.
+        assert all(18.0 < v < 24.0 for v in lat), f"impact latitude off Sudan: {lat}"
+        assert all(29.0 < v < 36.0 for v in lon), f"impact longitude off Sudan: {lon}"
+        assert all(abs(v) < 1.0 for v in alt), f"impact point is not on the surface: {alt} km"
 
 
 def test_b_planes_no_silent_drops() -> None:

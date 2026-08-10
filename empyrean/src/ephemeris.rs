@@ -5,7 +5,9 @@ use crate::coordinate::Frame;
 use crate::error::{Error, Result};
 use crate::observers::{Observer, obs_code_from_bytes};
 use crate::orbit::Orbit;
-use crate::propagate::{ForceModelTier, PropagationConfig, UncertaintyMethod};
+use crate::propagate::{
+    DiagnosticsConfig, EventConfig, ForceModelTier, PropagationConfig, UncertaintyMethod,
+};
 use std::ffi::CStr;
 
 /// One row of predicted astrometry.
@@ -138,7 +140,12 @@ pub const SENSITIVITY_ROW_VDEC: usize = 5;
 
 /// Observation-sensitivity row: the partial derivatives of the sky-plane
 /// observable w.r.t. the input state, for one `(orbit, observer, epoch)`.
-/// Produced when the ephemeris uncertainty method traced the STM.
+///
+/// Produced whenever the ephemeris propagation traced the STM: from an
+/// input covariance under an analytic uncertainty method, or from
+/// [`PropagationConfig::compute_stm`](crate::PropagationConfig::compute_stm)
+/// on its own. The flag reaches the engine on this path, so partials can
+/// be requested for an orbit that carries no covariance at all.
 ///
 /// The six output rows are the topocentric spherical observable, in the
 /// order given by the `SENSITIVITY_ROW_*` constants — see
@@ -239,13 +246,18 @@ impl ObservationSensitivity {
 
 /// Result of [`Context::generate_ephemeris`]: the per-`(orbit, observer,
 /// epoch)` ephemeris entries plus the observation-sensitivity rows (empty
-/// unless the uncertainty method traced the STM).
+/// unless the propagation traced the STM — see [`ObservationSensitivity`]
+/// for what makes it trace).
 #[derive(Debug, Clone, PartialEq)]
 pub struct EphemerisResult {
     /// Ephemeris entries (RA/Dec + diagnostics), one per observation.
     pub entries: Vec<EphemerisEntry>,
     /// Observation-sensitivity rows (Jacobian/Hessian). Empty on the
-    /// f64-only path.
+    /// f64-only path — the path taken when the orbit carries no
+    /// covariance *and*
+    /// [`PropagationConfig::compute_stm`](crate::PropagationConfig::compute_stm)
+    /// is unset. Setting that flag switches the run to hyperdual
+    /// integration and populates these rows.
     pub sensitivity: Vec<ObservationSensitivity>,
     /// Non-fatal generation warnings, in the order the engine emitted
     /// them. Empty when the run completed with nothing to report. Each
@@ -297,20 +309,88 @@ impl Default for EphemerisConfig {
 impl EphemerisConfig {
     /// Build the C-ABI representation. Returns the FFI struct plus a
     /// keepalive that owns the raw arrays the FFI struct points into.
+    /// Check that the config asks for nothing ephemeris generation
+    /// cannot deliver.
+    ///
+    /// `propagation.events` and `propagation.diagnostics` have no meaning
+    /// here: ephemeris generation runs with event detection and
+    /// timeseries diagnostics off, and [`EphemerisResult`] carries
+    /// neither. [`PropagationConfig`] is the shared struct — it is
+    /// [`Default`]-constructed with event detection *on*, because that is
+    /// right for `propagate` — so leaving those blocks at their defaults
+    /// is not a request, and is simply not sent across the FFI boundary.
+    /// *Changing* one is a request that could only be dropped, so it is
+    /// an error instead.
+    ///
+    /// Called for you by [`Context::generate_ephemeris`]; exposed so a
+    /// caller assembling a config from user input can surface the same
+    /// message before doing the work.
+    pub fn validate(&self) -> Result<()> {
+        if self.propagation.events != EventConfig::default() {
+            return Err(Error::invalid_input(
+                "ephemeris config: propagation.events was modified, but ephemeris \
+                 generation runs with event detection disabled and EphemerisResult \
+                 carries no events — the request could only be dropped. Leave \
+                 propagation.events at its default and call propagate() when you need \
+                 event detection.",
+            ));
+        }
+        if self.propagation.diagnostics != DiagnosticsConfig::default() {
+            return Err(Error::invalid_input(
+                "ephemeris config: propagation.diagnostics was modified, but ephemeris \
+                 generation produces no diagnostics timeseries — the request could only \
+                 be dropped. Leave propagation.diagnostics at its default and call \
+                 propagate() when you need per-trajectory diagnostics.",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Build the C-ABI representation. Returns the FFI struct plus a
+    /// keepalive that owns the raw arrays the FFI struct points into.
+    /// Runs [`validate`](Self::validate) first.
     pub(crate) fn to_ffi_with(
         &self,
-    ) -> (
+    ) -> Result<(
         empyrean_sys::EmpyreanEphemerisConfig,
         crate::propagate::PropConfigKeep,
-    ) {
-        let (prop_ffi, keep) = self.propagation.to_ffi_with();
+    )> {
+        self.validate()?;
+        let (mut prop_ffi, keep) = self.propagation.to_ffi_with();
+        // Send the "not requested" state the C ABI defines for these two
+        // blocks (all-zero, NaN thresholds). Without this the wrapper's
+        // own `EventConfig::default()` — every detection flag on, because
+        // that is the propagate default — would arrive as an explicit
+        // request the C layer is obliged to refuse.
+        prop_ffi.events = empyrean_sys::EmpyreanEventConfig {
+            close_approaches: 0,
+            impacts: 0,
+            atmospheric: 0,
+            possible_impacts: 0,
+            shadow_events: 0,
+            num_body_filter: 0,
+            body_filter_naif: std::ptr::null(),
+            dense_output: 0,
+            dense_output_cadence_days: 0.0,
+        };
+        prop_ffi.diagnostics = empyrean_sys::EmpyreanDiagnosticsConfig {
+            sensitivity: 0,
+            nonlinearity: 0,
+            lyapunov: 0,
+            keyholes: 0,
+            bifurcations: 0,
+            sample_stride: 0,
+            sensitivity_threshold: f64::NAN,
+            lyapunov_threshold: f64::NAN,
+            nonlinearity_threshold: f64::NAN,
+        };
         let cfg = empyrean_sys::EmpyreanEphemerisConfig {
             propagation: prop_ffi,
             max_light_time_iterations: self.max_light_time_iterations,
             light_time_tolerance_days: self.light_time_tolerance_days,
             compute_diagnostics: u8::from(self.compute_diagnostics),
         };
-        (cfg, keep)
+        Ok((cfg, keep))
     }
 
     /// Convenience builder: a config carrying just the requested force
@@ -359,7 +439,7 @@ impl Context {
             warnings: std::ptr::null_mut(),
             num_warnings: 0,
         };
-        let (ffi_config, _config_keep) = config.to_ffi_with();
+        let (ffi_config, _config_keep) = config.to_ffi_with()?;
         let code = unsafe {
             empyrean_sys::empyrean_generate_ephemeris(
                 self.as_raw(),
@@ -413,6 +493,13 @@ pub(crate) fn observers_to_ffi(
                 vy: o.velocity[1],
                 vz: o.velocity[2],
                 observing_night: o.observing_night,
+                // Carried through rather than pinned to ICRF/SSB: the C
+                // ABI refuses any other basis for ephemeris generation,
+                // so an observer that came back in a plotting basis
+                // fails by name here instead of being read as if it
+                // were the construction basis.
+                frame: o.frame as i32,
+                origin: o.origin.naif_id(),
             })
         })
         .collect::<Result<Vec<_>>>()
@@ -518,6 +605,8 @@ mod tests {
             position: [1.0, 0.0, 0.0],
             velocity: [0.0, 0.01, 0.0],
             observing_night: -1,
+            frame: crate::Frame::ICRF,
+            origin: crate::Origin::SSB,
         };
         let err = observers_to_ffi(&[observer])
             .expect_err("4-character observatory code must not marshal");
@@ -538,8 +627,178 @@ mod tests {
             position: [1.0, 0.0, 0.0],
             velocity: [0.0, 0.01, 0.0],
             observing_night: -1,
+            frame: crate::Frame::ICRF,
+            origin: crate::Origin::SSB,
         };
         let ffi = observers_to_ffi(&[observer]).expect("3-character code marshals");
         assert_eq!(&ffi[0].obs_code, b"W68\0");
+    }
+}
+
+/// [`EphemerisConfig::validate`] and the FFI narrowing it guards.
+/// `PropagationConfig` is shared with `propagate`, so its defaults are
+/// the propagate defaults; the question each of these answers is which of
+/// those defaults count as a request.
+#[cfg(test)]
+mod ephemeris_config_validation_tests {
+    use super::*;
+    use crate::coordinate::Origin;
+
+    /// The default config must convert. `EventConfig::default()` has
+    /// every detection flag on because that is right for `propagate`;
+    /// treating that as an ephemeris event request would reject every
+    /// call made without an explicit config.
+    #[test]
+    fn the_default_config_is_not_an_event_request() {
+        EphemerisConfig::default()
+            .validate()
+            .expect("the default config must be usable for ephemeris");
+        EphemerisConfig::with_force_model(ForceModelTier::Standard)
+            .validate()
+            .expect("with_force_model must be usable for ephemeris");
+    }
+
+    /// Setting the perturber exclusion is a supported request and stays
+    /// one — it is the only way to keep an SB441-N16 body out of its own
+    /// perturber set.
+    #[test]
+    fn excluding_a_perturber_is_a_supported_request() {
+        let mut cfg = EphemerisConfig::default();
+        cfg.propagation.excluded_perturbers = vec![Origin::asteroid(7)];
+        cfg.validate().expect("excluded_perturbers is supported");
+
+        let (ffi, _keep) = cfg.to_ffi_with().expect("config marshals");
+        assert_eq!(ffi.propagation.num_excluded_perturbers, 1);
+        assert!(!ffi.propagation.excluded_perturbers_naif.is_null());
+        assert_eq!(
+            unsafe { *ffi.propagation.excluded_perturbers_naif },
+            2_000_007,
+            "the NAIF id must reach the FFI struct"
+        );
+    }
+
+    /// `compute_stm` is a propagation-level knob the ephemeris path
+    /// honours, and the sentence in the config docs claiming so is only
+    /// true if it survives the narrowing. Pinned on the wire.
+    #[test]
+    fn compute_stm_reaches_the_wire() {
+        let mut cfg = EphemerisConfig::default();
+        assert_eq!(
+            cfg.to_ffi_with()
+                .expect("marshals")
+                .0
+                .propagation
+                .compute_stm,
+            0,
+            "off by default"
+        );
+        cfg.propagation.compute_stm = true;
+        assert_eq!(
+            cfg.to_ffi_with()
+                .expect("marshals")
+                .0
+                .propagation
+                .compute_stm,
+            1,
+            "compute_stm must reach the FFI struct — the C layer narrows it into \
+             EphemerisPropagationConfig from there"
+        );
+    }
+
+    /// The overlap policy reaches the wire too. It is the knob that
+    /// decides whether an SB441-N16 body can be generated for at all.
+    #[test]
+    fn the_overlap_policy_reaches_the_wire() {
+        let mut cfg = EphemerisConfig::default();
+        assert_eq!(
+            cfg.to_ffi_with()
+                .expect("marshals")
+                .0
+                .propagation
+                .ephemeris_overlap_policy,
+            empyrean_sys::EMPYREAN_EPHEMERIS_OVERLAP_POLICY_SUBSTITUTE_SPK
+        );
+        cfg.propagation.ephemeris_overlap_policy =
+            crate::EphemerisOverlapPolicy::ExcludeAndIntegrate;
+        assert_eq!(
+            cfg.to_ffi_with()
+                .expect("marshals")
+                .0
+                .propagation
+                .ephemeris_overlap_policy,
+            empyrean_sys::EMPYREAN_EPHEMERIS_OVERLAP_POLICY_EXCLUDE_AND_INTEGRATE
+        );
+    }
+
+    /// Turning a detection flag *off* is still a modification, and still
+    /// unanswerable — the point is that the caller reasoned about events
+    /// on a call that has none.
+    #[test]
+    fn a_modified_event_block_is_refused() {
+        let mut cfg = EphemerisConfig::default();
+        cfg.propagation.events.close_approaches = false;
+        let err = cfg
+            .validate()
+            .expect_err("a modified events block must fail");
+        assert!(
+            err.message.contains("propagation.events"),
+            "error names the field: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn a_modified_diagnostics_block_is_refused() {
+        let mut cfg = EphemerisConfig::default();
+        cfg.propagation.diagnostics.lyapunov = true;
+        let err = cfg
+            .validate()
+            .expect_err("a modified diagnostics block must fail");
+        assert!(
+            err.message.contains("propagation.diagnostics"),
+            "error names the field: {}",
+            err.message
+        );
+    }
+
+    /// The wrapper sends the C ABI's "not requested" state for both
+    /// blocks, so the C layer's refusal never fires on a valid wrapper
+    /// config.
+    #[test]
+    fn the_unsupported_blocks_are_zeroed_on_the_wire() {
+        let cfg = EphemerisConfig::default();
+        let (ffi, _keep) = cfg.to_ffi_with().expect("config marshals");
+        let e = &ffi.propagation.events;
+        assert_eq!(
+            (
+                e.close_approaches,
+                e.impacts,
+                e.atmospheric,
+                e.possible_impacts,
+                e.shadow_events,
+                e.dense_output
+            ),
+            (0, 0, 0, 0, 0, 0)
+        );
+        assert_eq!(e.num_body_filter, 0);
+        assert!(e.body_filter_naif.is_null());
+        assert_eq!(e.dense_output_cadence_days, 0.0);
+
+        let d = &ffi.propagation.diagnostics;
+        assert_eq!(
+            (
+                d.sensitivity,
+                d.nonlinearity,
+                d.lyapunov,
+                d.keyholes,
+                d.bifurcations
+            ),
+            (0, 0, 0, 0, 0)
+        );
+        assert_eq!(d.sample_stride, 0);
+        // NaN is the ABI's explicit `None` for these thresholds.
+        assert!(d.sensitivity_threshold.is_nan());
+        assert!(d.lyapunov_threshold.is_nan());
+        assert!(d.nonlinearity_threshold.is_nan());
     }
 }

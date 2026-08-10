@@ -156,6 +156,54 @@ class GaussianMixture:
     components_per_split: int = 3
 
 
+@dataclass(frozen=True)
+class Auto:
+    """Adaptive per-close-approach uncertainty-method selection.
+
+    The engine escalates the covariance method automatically over each
+    close-approach window and relaxes it elsewhere, choosing among
+    first-order, second-order, and the adaptive Gaussian mixture by the
+    local nonlinearity ``κ``. Each transition is recorded as a
+    :class:`~empyrean.CovarianceRegimeChange` event. Passing
+    :attr:`UncertaintyMethod.AUTO` (or ``"auto"``) selects this method
+    with the engine-default thresholds below; construct :class:`Auto`
+    directly to tune the ``κ`` band edges.
+
+    Parameters
+    ----------
+    threshold_first : float
+        ``κ`` below which the window stays first-order (a second-order
+        Jet2 pass would be overkill). Default ``0.1``.
+    threshold_mixture : float
+        ``κ`` at or above which the adaptive-Gaussian-mixture splitter
+        fires; below it (and above ``threshold_first``) the window
+        resolves to second order. Default ``10.0``.
+    threshold_ip_skip : float
+        Close approaches whose linear impact probability is below this are
+        skipped entirely under the two-pass strategy — there is no
+        higher-order correction worth computing. Default ``1e-12``
+        (Sentry's risk-list inclusion bar).
+    gmm_max_depth : int
+        Maximum recursion depth when the mixture tier fires. Default
+        ``3``.
+    gmm_components_per_split : int
+        Sub-Gaussians produced per split when the mixture tier fires. The
+        DeMars-Bishop-Jah splitting tables are tabulated only for odd
+        counts (``3`` or ``5``). Default ``3``.
+
+    References
+    ----------
+    Park & Scheeres (JGCD 2006); DeMars-Bishop-Jah (JGCD 2013);
+    Roa et al. (AJ 2021, Sentry-II).
+    """
+
+    threshold_first: float = 0.1
+    threshold_mixture: float = 10.0
+    threshold_ip_skip: float = 1e-12
+    gmm_max_depth: int = 3
+    gmm_components_per_split: int = 3
+
+
 # Tag space matches the engine's UncertaintyMethod enum exactly.
 _UNCERTAINTY_METHOD_TO_INT = {
     UncertaintyMethod.FIRST_ORDER: 0,
@@ -193,6 +241,7 @@ _INT_TO_UNCERTAINTY_METHOD = {
 _DATACLASS_TO_INT = {
     SigmaPoint: 2,
     MonteCarlo: 3,
+    Auto: 4,
     GaussianMixture: 5,
 }
 
@@ -216,20 +265,28 @@ class _UncertaintyParams(NamedTuple):
     gm_threshold: float
     gm_max_depth: int
     gm_components_per_split: int
+    auto_threshold_first: float
+    auto_threshold_mixture: float
+    auto_threshold_ip_skip: float
+    auto_gmm_max_depth: int
+    auto_gmm_components_per_split: int
 
 
-_UNCERTAINTY_PARAM_DEFAULTS = _UncertaintyParams(1.0, 8, 1000, 42, 1.0, 3, 3)
+_UNCERTAINTY_PARAM_DEFAULTS = _UncertaintyParams(
+    1.0, 8, 1000, 42, 1.0, 3, 3, 0.1, 10.0, 1e-12, 3, 3
+)
 """Engine-default value for every flat slot.
 
 Each field equals the corresponding dataclass field default
-(:class:`SigmaPoint`, :class:`MonteCarlo`, :class:`GaussianMixture`), which is
-what makes a default-constructed spec a no-op: ``SigmaPoint()`` lowers to
-exactly the same seven values as ``"sigma_point"`` or
-:attr:`UncertaintyMethod.SIGMA_POINT`.
+(:class:`SigmaPoint`, :class:`MonteCarlo`, :class:`GaussianMixture`,
+:class:`Auto`), which is what makes a default-constructed spec a no-op:
+``SigmaPoint()`` lowers to exactly the same values as ``"sigma_point"`` or
+:attr:`UncertaintyMethod.SIGMA_POINT`, and ``Auto()`` to the same values as
+``"auto"`` / :attr:`UncertaintyMethod.AUTO`.
 """
 
 
-UncertaintyMethodLike = UncertaintyMethod | SigmaPoint | MonteCarlo | GaussianMixture | str
+UncertaintyMethodLike = UncertaintyMethod | SigmaPoint | MonteCarlo | GaussianMixture | Auto | str
 """Type alias for inputs accepted by the ``uncertainty_method`` argument."""
 
 
@@ -263,6 +320,14 @@ def _uncertainty_method_params(
             gm_threshold=uncertainty_method.threshold,
             gm_max_depth=uncertainty_method.max_depth,
             gm_components_per_split=uncertainty_method.components_per_split,
+        )
+    if isinstance(uncertainty_method, Auto):
+        return _UNCERTAINTY_PARAM_DEFAULTS._replace(
+            auto_threshold_first=uncertainty_method.threshold_first,
+            auto_threshold_mixture=uncertainty_method.threshold_mixture,
+            auto_threshold_ip_skip=uncertainty_method.threshold_ip_skip,
+            auto_gmm_max_depth=uncertainty_method.gmm_max_depth,
+            auto_gmm_components_per_split=uncertainty_method.gmm_components_per_split,
         )
     return _UNCERTAINTY_PARAM_DEFAULTS
 
@@ -302,6 +367,36 @@ class IntegratorChoice(str, enum.Enum):
     DOP853 = "dop853"
     """Dormand-Prince 8(5,3). ~1.4× faster than GR15 with
     looser median Horizons error (~358 m vs GR15's ~35 m)."""
+
+
+class EphemerisOverlapPolicy(str, enum.Enum):
+    """What to do when the propagated state coincides with an SB441-N16
+    perturber's own SPK ephemeris — the self-perturbation case, where a
+    body is both the thing being propagated and one of the forces
+    acting on it.
+
+    All sixteen SB441-N16 bodies (1 Ceres, 2 Pallas, 4 Vesta, 7 Iris, …)
+    are simultaneously members of the Standard force model and
+    legitimate objects to propagate.
+    """
+
+    SUBSTITUTE_SPK = "substitute_spk"
+    """Return the perturber's own SPK states and skip integration.
+    Default, and the historical behaviour.
+
+    The SPK is the authoritative solution for that body, so for the body
+    itself these states are exact. What it costs: the caller's initial
+    condition is **discarded**, and nothing is integrated, so there is no
+    dense trajectory, no STM, and no sensitivity chain — which is why
+    :func:`empyrean.generate_ephemeris` fails outright for such a body
+    under this policy."""
+
+    EXCLUDE_AND_INTEGRATE = "exclude_and_integrate"
+    """Drop the overlapped perturber from the force model, integrate the
+    caller's own initial conditions, and report the overlap.
+
+    This is what generating an ephemeris for an SB441-N16 body at
+    Standard tier requires."""
 
 
 @dataclass
@@ -376,12 +471,16 @@ class PropagationConfig:
         perturber — exclude it from its own perturber set so it does
         not self-attract. Pass :class:`Origin` instances (e.g.
         ``[Origin.asteroid(1)]``) or canonical names.
-    uncertainty_method : UncertaintyMethod | SigmaPoint | MonteCarlo | GaussianMixture | str
+    uncertainty_method : UncertaintyMethod | SigmaPoint | MonteCarlo | GaussianMixture | Auto | str
         Uncertainty propagation method. See :class:`UncertaintyMethod`
         and the parameterized variants
-        (:class:`SigmaPoint`, :class:`MonteCarlo`, :class:`GaussianMixture`).
+        (:class:`SigmaPoint`, :class:`MonteCarlo`, :class:`GaussianMixture`,
+        :class:`Auto`).
     compute_stm : bool
-        Produce STMs even when the input has no covariance.
+        Produce STMs even when the input has no covariance. Applies on
+        the ephemeris path too — an :class:`EphemerisConfig` carrying
+        ``propagation.compute_stm=True`` comes back with observation
+        Jacobians for an orbit that has no covariance attached.
     frame : Frame
         Output reference frame.
     events : EventConfig
@@ -396,6 +495,16 @@ class PropagationConfig:
         not within a single trajectory.
     advanced : AdvancedIntegratorConfig
         Integrator-tuning knobs (rarely touched).
+    ephemeris_overlap_policy : EphemerisOverlapPolicy
+        What to do when the propagated state coincides with an
+        SB441-N16 perturber's own SPK ephemeris. Default
+        ``SUBSTITUTE_SPK``; see :class:`EphemerisOverlapPolicy`.
+
+        Overlap *detection* is on by default and decides whether this
+        is consulted at all — and the engine suppresses detection
+        whenever ``excluded_perturbers`` is non-empty, so setting
+        ``EXCLUDE_AND_INTEGRATE`` alongside an explicit exclusion does
+        nothing. Use one or the other.
     """
 
     force_model: ForceModelTier = ForceModelTier.STANDARD
@@ -407,6 +516,7 @@ class PropagationConfig:
     diagnostics: DiagnosticsConfig = field(default_factory=DiagnosticsConfig)
     num_threads: int | None = None
     advanced: AdvancedIntegratorConfig = field(default_factory=AdvancedIntegratorConfig)
+    ephemeris_overlap_policy: EphemerisOverlapPolicy = EphemerisOverlapPolicy.SUBSTITUTE_SPK
 
     # ── Back-compat shim ─────────────────────────────────────
     @property
@@ -455,6 +565,12 @@ class PropagationConfig:
             # (threshold / max_depth / components_per_split) ride on the
             # authoritative flat args, so serialize the method name.
             um = "gaussian_mixture"
+        elif isinstance(um_method, Auto):
+            # The wire string only names the method; the per-variant knobs
+            # (threshold_first / threshold_mixture / threshold_ip_skip /
+            # gmm_max_depth / gmm_components_per_split) ride on the
+            # authoritative flat args, so serialize the method name.
+            um = "auto"
         elif isinstance(um_method, bool):
             um = um_method  # not a valid method; falls through to "first_order"
         elif isinstance(um_method, int):
@@ -505,6 +621,7 @@ class PropagationConfig:
                     "hysteresis": adv.origin_switching.hysteresis,
                 },
             },
+            "ephemeris_overlap_policy": _enum_str(self.ephemeris_overlap_policy),
         }
 
 

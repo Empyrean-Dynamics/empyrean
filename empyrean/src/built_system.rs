@@ -343,7 +343,7 @@ impl BuiltSystem {
     ) -> Result<EphemerisResult> {
         let (ffi_orbits, _orbit_keep) = orbits_to_ffi(orbits)?;
         let ffi_observers = observers_to_ffi(observers)?;
-        let (ffi_config, _config_keep) = config.to_ffi_with();
+        let (ffi_config, _config_keep) = config.to_ffi_with()?;
         let mut ffi_result = empyrean_sys::EmpyreanEphemerisResult::default();
         let code = unsafe {
             empyrean_sys::empyrean_builtsystem_generate_ephemeris(
@@ -543,6 +543,7 @@ mod tests {
             let err = Error {
                 code,
                 message: String::new(),
+                missing_data_files: Vec::new(),
             };
             assert_eq!(err.builtsystem_guard(), Some(expected), "code {code}");
         }
@@ -550,6 +551,7 @@ mod tests {
         let ok = Error {
             code: -3,
             message: String::new(),
+            missing_data_files: Vec::new(),
         };
         assert_eq!(ok.builtsystem_guard(), None);
     }
@@ -651,6 +653,8 @@ mod tests {
             position: [0.9, -0.42, -0.18],
             velocity: [0.0075, 0.0148, 0.0064],
             observing_night: -1,
+            frame: crate::Frame::ICRF,
+            origin: crate::Origin::SSB,
         }];
 
         let one_shot = ctx

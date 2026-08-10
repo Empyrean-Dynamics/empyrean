@@ -18,8 +18,11 @@ Uncertainty-first orbit propagation, ephemeris, orbit determination, and event d
 ---
 
 ```bash
-pip install empyrean
+pip install --pre empyrean==0.10.0rc0
 ```
+
+Current release: **0.10.0rc0** (release candidate) — `--pre` is required
+until 0.10.0 is final.
 
 A plain install pulls empyrean
 together with the B612 Foundation's
@@ -33,8 +36,8 @@ Wheels are published for CPython >= 3.10 as a single abi3 stable-ABI
 wheel per architecture — one wheel covers CPython 3.10 and every newer
 version — across four platforms: macOS arm64, macOS x86_64,
 manylinux_2_28 x86_64, and manylinux_2_28 aarch64. There is no source
-distribution, so `pip install --pre empyrean` on other platforms will
-not resolve — use the
+distribution, so the install will not resolve on other platforms — use
+the
 [other distribution channels](https://github.com/Empyrean-Dynamics/empyrean#install)
 in the meantime.
 
@@ -43,7 +46,7 @@ in the meantime.
 - **Propagation** — N-body (Sun, planets, Moon, Pluto) with EIH general relativity, Sun J2 and Earth J2–J4 zonal harmonics, 16 asteroid perturbers, and the Marsden non-gravitational model — selectable across Approximate / Basic / Standard force-model tiers (Standard is the default). GR15 and DOP853 integrators. Optional finite-burn thrust arcs — constant-RTN, velocity-tangent, or inertial-fixed steering, with per-arc Δv targeting corrections — layer on as a continuous-thrust force input.
 - **Uncertainty** — First-order (Jet1) state transition matrices; second-order (Jet2) state transition tensors; unscented sigma-point and Monte Carlo sampling; an adaptive Auto mode that escalates the method automatically through close approaches and relaxes it elsewhere. Optional per-epoch tagged-covariance readback.
 - **Ephemeris** — RA/Dec, rates, photometry (H–G, H–G₁G₂, H–G₁₂), light time, phase angle, solar elongation, local horizon, and the aberrated (light-time corrected) barycentric state per row — with sky-plane and aberrated-state covariances when the input orbit carries one.
-- **Orbit determination** — Gauss, Herget, and systematic-ranging (admissible region + Manifold of Variations) IOD → N-body differential correction over optical and radar (delay / Doppler) observations, with STM caching and outlier rejection. Solves the state — escalating to the Marsden A1/A2/A3 non-gravitational coefficients on a poor fit — plus, on the refine path, the cometary outgassing time delay DT, SRP area-to-mass, and continuous-thrust Δv corrections, all differentiated analytically, returned in a tagged solved covariance. Optional post-OD H–G photometry fit recovers absolute magnitude H with an honest σ. Validated against `find_orb` and JPL SBDB.
+- **Orbit determination** — batch-first: one `determine()` call fits every object in an ADES set and returns per-object results. Gauss, Herget, and systematic-ranging (admissible region + Manifold of Variations) IOD, plus a co-orbital lane that recovers Earth co-orbitals of the 2010 TK7 / 2020 XL5 class → N-body differential correction over optical and radar (delay / Doppler) observations solved jointly rather than in sequence, with STM caching and outlier rejection. Long comet arcs deliver as full-arc fits. Solves the state — escalating to the Marsden A1/A2/A3 non-gravitational coefficients on a poor fit — plus, on the refine path, the cometary outgassing time delay DT, SRP area-to-mass, and continuous-thrust Δv corrections, all differentiated analytically, returned in a tagged solved covariance. Every deselected observation carries a typed reason. Optional post-OD H–G photometry fit recovers absolute magnitude H with an honest σ. Validated against `find_orb` and JPL SBDB.
 - **Events** — Close approach (start/end), periapsis, gravitational capture (start/end), shadow entry/exit, atmospheric entry/exit, impact, and possible impact.
 
 ## Quick start
@@ -70,9 +73,25 @@ for i in range(len(result.events.summary)):
 
 ## Orbit determination
 
+`determine` is batch-first. It groups the observations by ADES object
+identifier (`permID`, else `provID`, else `trkSub`) and fits **every**
+object, so a multi-object file is one call. Radar is optional; when
+supplied it is grouped by the same identifier and fitted jointly with the
+optical astrometry.
+
 ```python
 obs, radar = empyrean.read_ades("observations.psv")   # (optical, radar)
-result = empyrean.determine(obs)                       # one fit per call
+fits = empyrean.determine(obs, radar=radar)            # every object in the file
+
+print(len(fits), "object(s),", len(fits.delivered), "delivered")
+print(fits.orbits)      # one row per DELIVERED object, carrying object_id
+print(fits.summary)     # one row per INPUT object, delivered or failed
+print(fits.residuals)   # every delivered fit's rows, tagged with object_id
+
+for object_id, failure in fits.failures.items():
+    print(f"{object_id}: {failure.kind}: {failure.message}")
+
+result = fits["2024 YR4"]                              # DetermineResult
 print(
     f"converged={result.converged}, "
     f"RMS={result.summary.rms_ra_arcsec:.2f}\" RA / "
@@ -80,18 +99,138 @@ print(
 )
 ```
 
-`result.observations` carries per-observation diagnostics: RA/Dec
-residuals (radar rows instead carry the delay / Doppler residual,
-observed − predicted in seconds / hertz, with its χ², dof, survival
-probability, and combined variance), the along/cross-track
-decomposition with its full 2×2 covariance, and the D-optimality
-information loss on removal (`influence_information_loss` — +inf marks
-an indispensable observation). `result.covariance_trust` is an
+A failed object never aborts the batch and never disappears: it gets a
+`.summary` row with `status="failed"`, NaN measurements (never `0.0`,
+which would read as a value at the floor), the reason in `error`, and a
+typed `DetermineFailure` in `.failures` — branch on its `kind`
+(`"iod"` / `"od"` / `"radar_only"` / `"observer_construction"` /
+`"earth_orientation_coverage"` / …), not on the message text. Seed orbits
+passed as `initial_orbits` that matched no observation group come back in
+`.unmatched_orbit_ids` rather than being dropped.
+
+Fitting one object is the one-entry case of the same call, not a
+different call: `fits.single()` unwraps it and refuses — naming the
+objects — rather than choosing among several.
+
+```python
+result = empyrean.determine(obs).single()              # one object in, one fit out
+```
+
+`fits.orbits` is a `CartesianOrbits` table carrying `object_id`,
+covariance, and the fitted non-grav / SRP slots — feed it straight back
+into `propagate`, `generate_ephemeris`, or `compute_impact_probabilities`.
+
+Underneath, the fit is the engine's: optical and radar are solved jointly
+rather than in sequence, so a hard object's delay and Doppler tighten the
+same covariance the astrometry does; the co-orbital IOD lane recovers
+Earth co-orbitals of the 2010 TK7 / 2020 XL5 class; and long comet arcs
+deliver as full-arc fits. Two `ODConfig` switches turn those lanes off
+when you want the historical behaviour: `coorbital_enabled=False`
+(leaving it on does not route ordinary objects through the lane), and
+`allow_arc_truncation=False`, which makes an arc that genuinely cannot be
+fitted as one piece **fail** rather than deliver its reconcilable part
+with the remainder tagged `outside_arc`. Per-observation rejection is
+orthogonal and still runs.
+
+### Fit summary
+
+`fits.summary` is a `FitSummary` quivr table with one row per **input**
+object, so a partially successful batch is readable rather than silently
+shorter than its input. The column names match the `fit_summary.parquet`
+/ `fit_summary.csv` files the CLI writes, so a table read back off disk
+and this one describe a fit identically.
+
+Both acceptability verdicts are columns on it, and every extrapolation
+gate sits beside the value it measured and the threshold it was compared
+against — so a `False` says which axis failed and by how much:
+
+```python
+s = fits.summary
+
+print(s.object_id.to_pylist(), s.status.to_pylist())   # "delivered" / "failed"
+print(s.fit_acceptable.to_pylist())
+print(s.extrapolation_acceptable.to_pylist())
+
+def col(name):     # value columns are nullable — NaN where not computable
+    return s.column(name).to_numpy(zero_copy_only=False)
+
+print(col("selection_fraction"),    col("selection_fraction_threshold"))
+print(col("selected_arc_fraction"), col("selected_arc_fraction_threshold"))
+print(col("trailing_gap_days"),     col("trailing_gap_threshold_days"))
+print(col("fractional_sigma_a"),    col("fractional_sigma_a_threshold"))
+```
+
+The same verdict in full structured form is `result.acceptability`, an
+`AcceptabilityReport` whose every `*_ok` flag is paired with its
+`*_value` and `*_threshold` — plus `radar_fit_ok`, a tri-state that is
+`None` when no radar contributed, which is never the same as `False`.
+Tune the bounds with `AcceptabilityThresholds` on `ODConfig`.
+
+### Per-observation residuals
+
+`result.observations` (and, batch-wide, `fits.residuals`) is an
+`ObservationResults` table carrying the whole 35-column residual surface,
+not a projection of it: the `obs_id` / `object_id` join keys, observatory
+code, catalog and epoch; the RA/Dec residuals with their effective
+combined covariance (`residual_cov_ra` / `residual_cov_dec` /
+`residual_cov_corr`); the complete rejection block; the influence
+diagnostics; the along/cross-track decomposition with its full 2×2
+covariance; and the radar block. Radar rows carry the delay / Doppler
+residual (observed − predicted in seconds / hertz) with its χ², dof,
+survival probability, and combined variance instead of RA/Dec.
+
+Nothing is deselected silently — `rejection_reason` names the layer that
+dropped each row (`chi_squared`, `sigma_clip`, `cooks_distance`,
+`adaptive`, `cmc2003`, `unsupported_observatory`, `outside_arc`,
+`non_finite_chi2`, `missing_jacobian`, …) alongside the criterion value,
+the static threshold, and the effective threshold it was tested against.
+`influence_information_loss` is the D-optimality information loss on
+removal (+inf marks an indispensable observation).
+
+```python
+print(result.observations.rejected_only().rejection_reason.to_pylist())
+print(result.observations.worst_chi2(5).obs_id.to_pylist())
+print(fits.residuals.select_station("F51").rms_combined_arcsec)
+```
+
+`result.covariance_trust` is an
 event-aware verdict on the delivered covariance: `trusted`,
 `encounter_intervenes` (naming the intervening close-approach or
 high-nonlinearity event and whether a second-order state-only
 correction can recover it), or `weakly_determined_high_n`. It is
 `None` when no trust gate ran — absence of a verdict is not trust.
+
+### Weighting
+
+`ODConfig` ships production defaults: the `VFCC2017` weighting preset
+(Vereš, Farnocchia, Chesley & Chamberlin 2017 station floors) plus
+per-night 1/√N de-weighting, and EFCC2020 catalog debiasing (Eggl,
+Farnocchia, Chamberlin & Chesley 2020). `WeightingConfig` replaces or
+extends the layer chain — first-match-wins, so an entry in
+`additional_layers` overrides the preset for its stations and the preset
+is the fallback.
+
+```python
+from empyrean import (
+    ODConfig, WeightingConfig, WeightingLayer, WeightingLayerKind, WeightingPreset,
+)
+
+config = ODConfig(
+    weighting=WeightingConfig(
+        preset=WeightingPreset.VFCC2017,
+        additional_layers=[
+            WeightingLayer(
+                kind=WeightingLayerKind.OBSERVATORY_RULE,
+                obs_code="F51",
+                sigma=(0.1, 0.1),
+            ),
+            # additional_layers REPLACES the default list — re-include the
+            # nightly layer to keep production behavior.
+            WeightingLayer(kind=WeightingLayerKind.NIGHTLY_DEWEIGHTING),
+        ],
+    )
+)
+```
 
 ### Wide-parameter fitting
 
@@ -158,7 +297,7 @@ codes (`dropped_bands`) — the observations' astrometry is unaffected.
 from empyrean import ODConfig, PhotometryConfig
 
 config = ODConfig(photometry=PhotometryConfig())   # AUTO ladder
-result = empyrean.determine(obs, config=config)
+result = empyrean.determine(obs, config=config).single()
 
 phot = result.photometry               # None if photometry was not requested
 if phot is not None and phot.covariance is not None:
@@ -169,12 +308,22 @@ if phot is not None and phot.covariance is not None:
 ## Ephemeris
 
 ```python
+from empyrean import Frame, Origin
+
 observers = empyrean.get_observer_states(["W84", "F51"], epochs)
 eph = empyrean.generate_ephemeris(orbits, observers)
 
+# Observer states default to the ICRF / SSB construction basis, which is
+# what ephemeris generation and orbit determination require and which is
+# returned untransformed. Pass frame= / origin= when you want the sites
+# somewhere else — e.g. heliocentric ecliptic, for geometry plots:
+sites = empyrean.get_observer_states(
+    ["W84", "F51"], epochs, frame=Frame.ECLIPTICJ2000, origin=Origin.SUN
+)
+
 print(eph.ephemeris.coordinates.lon.to_numpy())   # RA (degrees)
 print(eph.ephemeris.coordinates.lat.to_numpy())   # Dec (degrees)
-print(eph.ephemeris.mag.to_numpy())               # apparent V magnitude
+print(eph.ephemeris.mag.to_numpy(zero_copy_only=False))  # apparent V (nullable)
 
 # Orbits carrying a covariance also get, per row, the 6×6 sky-plane
 # covariance over (rho, RA, Dec + rates) in AU / degree units, and the
@@ -189,6 +338,36 @@ Earth-orientation kernel coverage gap handled by the analytic IAU 2006
 fallback, or rows whose sensitivity chain was skipped — naming the
 affected orbit / observatory / epoch. Empty when the run had nothing
 to report.
+
+### Self-perturbing targets
+
+All sixteen SB441-N16 bodies (1 Ceres, 2 Pallas, 4 Vesta, 7 Iris, …) are
+simultaneously members of the Standard force model and legitimate objects
+to propagate. `ephemeris_overlap_policy` says what the engine does when a
+target coincides with its own perturber: `SUBSTITUTE_SPK` (the default)
+returns the body's authoritative SPK states and integrates nothing — so
+there is no dense trajectory, no STM, and no sensitivity chain, and
+ephemeris generation for such a body fails outright.
+`EXCLUDE_AND_INTEGRATE` drops the overlapped perturber, integrates the
+caller's own initial conditions, and reports the overlap. It is what
+generating an ephemeris for an SB441-N16 body at Standard tier requires.
+
+```python
+from empyrean import EphemerisConfig, EphemerisOverlapPolicy, PropagationConfig
+
+config = EphemerisConfig(
+    propagation=PropagationConfig(
+        ephemeris_overlap_policy=EphemerisOverlapPolicy.EXCLUDE_AND_INTEGRATE,
+    )
+)
+ceres = empyrean.query_sbdb(["Ceres"])
+eph = empyrean.generate_ephemeris(ceres, observers, config=config)
+```
+
+Naming the body in `excluded_perturbers` is the other escape. Use one or
+the other: overlap detection is what decides whether the policy is
+consulted at all, and it is suppressed whenever an explicit exclusion
+list is present.
 
 ## Uncertainty
 
@@ -283,19 +462,49 @@ ips = empyrean.compute_impact_probabilities(
     methods=[UncertaintyMethod.FIRST_ORDER, UncertaintyMethod.SECOND_ORDER],
 )
 ips.epochs.scale                    # "tdb"
-ips.where(pc.field("method") == "second_order").ip_second_order.to_numpy()
+second = ips.where(pc.field("method") == "second_order")
+second.ip_second_order.to_numpy(zero_copy_only=False)   # nullable
 ips.ip_linear.to_numpy()            # always populated
 
 bps = empyrean.compute_b_planes(orbits, 63000.0, [UncertaintyMethod.SECOND_ORDER])
 print(bps.b_dot_t_km.to_numpy())    # B·T (km)
 print(bps.b_dot_r_km.to_numpy())    # B·R (km)
-print(bps.semi_major_3sig_km.to_numpy())  # 3σ ellipse semi-major
+print(bps.semi_major_3sig_km.to_numpy(zero_copy_only=False))  # 3σ semi-major
 ```
 
 Returns typed `ImpactProbabilities` and `BPlanes` quivr tables — one
 row per (method × orbit × body) encounter, with the closest-approach
 time as an embedded `Epochs` sub-table so `.to_utc()` / `.to_tdb()`
 just works.
+
+Each entry carries its own parameters — methods in one call never share
+them. `Auto` is the adaptive method: it escalates the covariance
+treatment over each close-approach window and relaxes it elsewhere,
+choosing among first-order, second-order, and the adaptive Gaussian
+mixture. Pass the `Auto` dataclass instead of the enum to tune its κ band
+edges and mixture knobs, and those are the values the engine runs with:
+
+```python
+from empyrean import Auto, MonteCarlo
+
+ips = empyrean.compute_impact_probabilities(
+    orbits,
+    end_epoch=63000.0,
+    methods=[
+        Auto(threshold_first=0.05, threshold_mixture=5.0, gmm_max_depth=4),
+        MonteCarlo(n_samples=100_000, seed=7),
+    ],
+)
+# ip_agm is populated when the mixture refinement fired; a null means it
+# was a no-op, so use ip_agm when finite and ip_linear otherwise. Never
+# back-fill it — the null is what distinguishes "ran" from "no-op".
+print(ips.ip_agm.to_numpy(zero_copy_only=False))
+print(ips.agm_components.to_numpy(zero_copy_only=False))
+```
+
+`UncertaintyMethod.AUTO` (or `"auto"`) selects the same method with the
+engine-default thresholds; a default-constructed `Auto()` is identical
+to it.
 
 Each `ImpactProbabilities` row also carries the geodetic impact point
 (latitude / longitude / altitude on the body's reference ellipsoid;
@@ -304,6 +513,32 @@ confidence half-width on `ip_mc`, the second-order corrected mean miss
 distance, 1σ miss-distance uncertainty, and skewness, the
 closest-approach distance gradient and 6×6 Hessian with respect to the
 initial state, and the adaptive Gaussian-mixture component count.
+
+## Reading and writing files
+
+`empyrean.io` writes orbits, ephemerides, events, and residuals to
+parquet / JSON / CSV, and reads orbits back.
+
+```python
+empyrean.io.write_orbits_parquet("orbits.parquet", fits.orbits)
+empyrean.io.write_orbits_csv("orbits.csv", fits.orbits)
+empyrean.io.write_residuals_parquet("residuals.parquet", fits.residuals)
+
+orbits = empyrean.io.read_orbits_parquet("orbits.parquet")
+```
+
+Neither writer projects. The residual writers marshal every column of
+`ObservationResults` across the boundary — join keys, rejection
+attribution, influence diagnostics, sky-motion decomposition and radar
+block included — for a 36-column file (the table's 35 plus a `has_radar`
+flag), identical across all three formats; `rejection_reason` and
+`radar_kind` are written as names rather than integer codes, and a
+non-computable number is a literal `NaN` in CSV and `null` in JSON. The
+orbit CSV path goes through the same
+engine writer parquet uses, so the two emit an identical column set
+(state, covariance, non-grav including `dt` and its variance, photometry,
+SRP); a batch carrying a wide cross-covariance the row schema cannot
+express is refused rather than written short.
 
 ## Data files
 
@@ -332,11 +567,43 @@ platform data directory (`~/.local/share/empyrean/data/` on Linux,
 | File | Size | When | Source |
 |------|------|------|--------|
 | `moon_pa_de440_200625.bpc` | 12 MB | first `initialize()` | NAIF — Moon orientation |
-| `bias.dat` | 35 MB | first `initialize()` | Star-catalog debiasing table (Eggl et al. 2020) |
+| `bias.dat` | 35 MB | first `initialize()` | Star-catalog debiasing table (Eggl, Farnocchia, Chamberlin & Chesley 2020) |
 | `jwst_rec.bsp` | 121 MB | on demand, for JWST observers | NAIF — JWST ephemeris |
 
 Any of these can be relocated by pointing `EMPYREAN_DATA_DIR` at a
 directory holding them.
+
+**Provisioning up front**
+
+`empyrean.download_data()` provisions a usable data directory and does
+nothing else — it does not build a context or load anything. It is
+idempotent: files already present are kept, only what is missing is
+fetched, and whatever the installed B612 wheels supply is staged from
+disk with zero network access. It returns the directory it provisioned.
+
+```python
+path = empyrean.download_data()            # or download_data(data_dir=...)
+```
+
+**Running offline**
+
+`empyrean.initialize(refresh=False)` resolves the kernel set from the
+data directory alone — no downloads, no staleness checks. If anything is
+missing it raises `FileNotFoundError` naming *every* absent file, both in
+the message and as a `missing_data_files` list on the exception, so one
+run tells you exactly what to stage. There is no partial load and no
+quiet fall back to a smaller force model.
+
+```python
+try:
+    empyrean.initialize(refresh=False)
+except FileNotFoundError as e:
+    print("stage these first:", e.missing_data_files)
+```
+
+Setting `EMPYREAN_OFFLINE=1` in the environment applies the same policy
+to every `initialize()` in the process and announces itself on stderr. It
+is a floor, not a switch: it can turn network access off, never back on.
 
 ## Accuracy
 

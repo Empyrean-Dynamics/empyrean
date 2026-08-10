@@ -19,7 +19,7 @@ use numpy::{
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyTuple};
+use pyo3::types::{PyDict, PyList, PyTuple};
 use std::sync::OnceLock;
 
 // ══════════════════════════════════════════════════════════
@@ -139,30 +139,91 @@ fn extract_thrust_params(obj: &Bound<'_, PyAny>) -> PyResult<empyrean::ThrustPar
 //  _initialize
 // ══════════════════════════════════════════════════════════
 
+/// Build the process-global context.
+///
+/// `refresh` mirrors [`empyrean::DataDirOptions::refresh`] and is routed
+/// through [`empyrean::Context::from_data_dir_with`], so `refresh=false`
+/// is the same **strict offline** construction the Rust wrapper and the
+/// C ABI perform: the tier's kernels are resolved from the data directory
+/// alone and the call fails, naming every absent file, if any is missing.
+/// There is no try-the-network-and-tolerate path and no degrade-to-a-
+/// lower-tier path.
+///
+/// The two-explicit-paths (`de440_path` + `gm_path`) branch loads exactly
+/// the files it is handed and never reaches the network on either value
+/// of `refresh`, so `refresh=false` is already satisfied there — it is
+/// honoured, not ignored, and `refresh=true` does not make it fetch
+/// anything.
+///
+/// `EMPYREAN_OFFLINE=1` applies to the data-directory branch as the
+/// wrapper's floor: it downgrades `refresh=true` to `false` and announces
+/// itself on stderr. It can never turn a `false` into a `true`.
 #[pyfunction]
-#[pyo3(signature = (data_dir=None, de440_path=None, gm_path=None))]
+#[pyo3(signature = (data_dir=None, de440_path=None, gm_path=None, refresh=true))]
 fn _initialize(
     py: Python<'_>,
     data_dir: Option<&str>,
     de440_path: Option<&str>,
     gm_path: Option<&str>,
+    refresh: bool,
 ) -> PyResult<()> {
     if CONTEXT.get().is_some() {
         return Ok(());
     }
 
-    let ctx = py.detach(|| {
+    let built = py.detach(|| {
         if let (Some(de440), Some(gm)) = (de440_path, gm_path) {
             empyrean::Context::new_minimal(std::path::Path::new(de440), std::path::Path::new(gm))
-                .map_err(to_pyerr)
         } else {
             let dir = data_dir.map(std::path::Path::new);
-            empyrean::Context::from_data_dir(dir).map_err(to_pyerr)
+            let options = empyrean::DataDirOptions {
+                refresh,
+                ..empyrean::DataDirOptions::default()
+            };
+            empyrean::Context::from_data_dir_with(dir, options)
         }
-    })?;
+    });
 
+    let ctx = built.map_err(|e| context_error_to_pyerr(py, &e))?;
     let _ = CONTEXT.set(ctx);
     Ok(())
+}
+
+/// Map a context-construction failure into a Python exception **without
+/// dropping the structured missing-file list**.
+///
+/// [`empyrean::Error::missing_data_files`] is populated only by a strict
+/// offline (`refresh=false`) construction, and it is the actionable half
+/// of that failure: fetch exactly those files and the same call succeeds.
+/// Flattening it into the message would force a caller to split the text
+/// back apart on a separator a filename may itself contain, so it is
+/// carried as a real Python list on the raised exception:
+///
+/// * missing files present — [`FileNotFoundError`] (an `OSError`, which
+///   is what a Python caller reaches for when files are absent) with a
+///   `missing_data_files` attribute holding the list.
+/// * every other failure — `RuntimeError`, exactly as before.
+fn context_error_to_pyerr(py: Python<'_>, e: &empyrean::Error) -> PyErr {
+    let files = e.missing_data_files();
+    if files.is_empty() {
+        return PyRuntimeError::new_err(e.to_string());
+    }
+    let err = pyo3::exceptions::PyFileNotFoundError::new_err(e.to_string());
+    match PyList::new(py, files) {
+        Ok(list) => {
+            if let Err(attach_failed) = err.value(py).setattr("missing_data_files", list) {
+                // Never let the bookkeeping failure mask the real one;
+                // chain it so neither is lost.
+                attach_failed.set_cause(py, Some(err));
+                return attach_failed;
+            }
+        }
+        Err(build_failed) => {
+            build_failed.set_cause(py, Some(err));
+            return build_failed;
+        }
+    }
+    err
 }
 
 // ══════════════════════════════════════════════════════════
@@ -253,39 +314,57 @@ fn _transform_coordinates<'py>(
     let tframe = empyrean::int_to_frame(target_frame).map_err(to_pyerr)?;
     let torigin = origin_from_naif(target_origin)?;
 
-    let results: Vec<empyrean::CoordinateState> = py.detach(|| {
-        let mut out = Vec::with_capacity(n);
-        for i in 0..n {
-            let mut elems = [0.0f64; 6];
-            for j in 0..6 {
-                elems[j] = elements_arr[[i, j]];
-            }
-            let covariance = if has_cov_arr[i] {
-                let mut cov = [[0.0f64; 6]; 6];
-                for r in 0..6 {
-                    for c in 0..6 {
-                        cov[r][c] = covariances_arr[[i, r, c]];
-                    }
-                }
-                Some(cov)
-            } else {
-                None
-            };
-            let state = empyrean::CoordinateState {
-                epoch: empyrean::Epoch::from_mjd_tdb(epochs_arr[i]),
-                elements: elems,
-                covariance,
-                representation: empyrean::int_to_rep(reps_arr[i]).map_err(to_pyerr)?,
-                frame: empyrean::int_to_frame(frames_arr[i]).map_err(to_pyerr)?,
-                origin: origin_from_naif(origins_arr[i])?,
-            };
-            out.push(
-                ctx.transform(&state, trep, tframe, torigin)
-                    .map_err(to_pyerr)?,
-            );
+    // Marshal the whole table first, then hand it to the engine as ONE
+    // batch, matching core's batch-first shape rather than looping the
+    // single-state entry point once per row.
+    //
+    // Element `i` of the result is bit-identical to the single-state call
+    // on row `i`, so this is a call-shape change and never a numerical
+    // one. The win is the per-call boundary crossing plus fail-fast,
+    // index-attributed errors — measured ~17% from a thousand rows up and
+    // nothing at one row. It is deliberately *not* the shared origin
+    // shift: the engine's gravitational-parameter and origin-shift memos
+    // are scoped to the Context, so they already amortized across
+    // successive single-state calls.
+    let mut states: Vec<empyrean::CoordinateState> = Vec::with_capacity(n);
+    for i in 0..n {
+        let mut elems = [0.0f64; 6];
+        for j in 0..6 {
+            elems[j] = elements_arr[[i, j]];
         }
-        Ok::<_, PyErr>(out)
+        let covariance = if has_cov_arr[i] {
+            let mut cov = [[0.0f64; 6]; 6];
+            for r in 0..6 {
+                for c in 0..6 {
+                    cov[r][c] = covariances_arr[[i, r, c]];
+                }
+            }
+            Some(cov)
+        } else {
+            None
+        };
+        states.push(empyrean::CoordinateState {
+            epoch: empyrean::Epoch::from_mjd_tdb(epochs_arr[i]),
+            elements: elems,
+            covariance,
+            representation: empyrean::int_to_rep(reps_arr[i]).map_err(to_pyerr)?,
+            frame: empyrean::int_to_frame(frames_arr[i]).map_err(to_pyerr)?,
+            origin: origin_from_naif(origins_arr[i])?,
+        });
+    }
+
+    let results: Vec<empyrean::CoordinateState> = py.detach(|| {
+        ctx.transform_coordinates(&states, trep, tframe, torigin)
+            .map_err(to_pyerr)
     })?;
+
+    if results.len() != n {
+        return Err(PyRuntimeError::new_err(format!(
+            "batch transform returned {} state(s) for {n} input(s) — the row \
+             correspondence the caller's table depends on is broken",
+            results.len()
+        )));
+    }
 
     let mut out_epochs = Array1::<f64>::zeros(n);
     let mut out_elements = Array2::<f64>::zeros((n, 6));
@@ -589,7 +668,10 @@ fn _query_radar<'py>(
 /// so every distribution channel maps the same tag to the same method with
 /// the same per-variant parameters: `SIGMA_POINT` (2) carries
 /// `sigma_n_sigma` / `sigma_samples_per_plane`, `MONTE_CARLO` (3) carries
-/// `mc_n_samples` / `mc_seed`, and `GAUSSIAN_MIXTURE` (5) carries
+/// `mc_n_samples` / `mc_seed`, `AUTO` (4) carries
+/// `auto_threshold_first` / `auto_threshold_mixture` /
+/// `auto_threshold_ip_skip` / `auto_gmm_max_depth` /
+/// `auto_gmm_components_per_split`, and `GAUSSIAN_MIXTURE` (5) carries
 /// `gm_threshold` / `gm_max_depth` / `gm_components_per_split`. An unknown
 /// tag is a typed `ValueError` naming the supported set — never a silent
 /// downgrade to a different method.
@@ -603,6 +685,11 @@ fn build_uncertainty_method(
     gm_threshold: f64,
     gm_max_depth: usize,
     gm_components_per_split: usize,
+    auto_threshold_first: f64,
+    auto_threshold_mixture: f64,
+    auto_threshold_ip_skip: f64,
+    auto_gmm_max_depth: usize,
+    auto_gmm_components_per_split: usize,
 ) -> PyResult<empyrean::UncertaintyMethod> {
     match tag {
         0 => Ok(empyrean::UncertaintyMethod::FirstOrder),
@@ -615,7 +702,18 @@ fn build_uncertainty_method(
             n_samples: mc_n_samples,
             seed: mc_seed,
         }),
-        4 => Ok(empyrean::UncertaintyMethod::auto()),
+        // AUTO carries its five caller-tunable knobs so a parameterized
+        // `Auto(...)` from Python takes effect instead of silently
+        // collapsing to `auto()`'s engine defaults. A default-constructed
+        // `Auto()` lowers to exactly the `auto()` values, so the common
+        // case is unchanged.
+        4 => Ok(empyrean::UncertaintyMethod::Auto {
+            threshold_first: auto_threshold_first,
+            threshold_mixture: auto_threshold_mixture,
+            threshold_ip_skip: auto_threshold_ip_skip,
+            gmm_max_depth: auto_gmm_max_depth,
+            gmm_components_per_split: auto_gmm_components_per_split,
+        }),
         5 => Ok(empyrean::UncertaintyMethod::Mixture {
             threshold: gm_threshold,
             max_depth: gm_max_depth,
@@ -703,6 +801,11 @@ fn build_uncertainty_method(
     sigma_samples_per_plane = 8,
     mc_n_samples = 1000,
     mc_seed = None,
+    auto_threshold_first = 0.1,
+    auto_threshold_mixture = 10.0,
+    auto_threshold_ip_skip = 1e-12,
+    auto_gmm_max_depth = 3,
+    auto_gmm_components_per_split = 3,
     propagation_config_dict = None,
     with_tagged_covariance = false,
     builtsystem = None,
@@ -770,6 +873,15 @@ fn _propagate<'py>(
     sigma_samples_per_plane: usize,
     mc_n_samples: usize,
     mc_seed: Option<u64>,
+    // AUTO's five caller-tunable knobs. A default-constructed `Auto()`
+    // lowers to these engine defaults, so the common path is unchanged;
+    // a parameterized `Auto(...)` threads its thresholds through instead
+    // of silently collapsing to `auto()` defaults.
+    auto_threshold_first: f64,
+    auto_threshold_mixture: f64,
+    auto_threshold_ip_skip: f64,
+    auto_gmm_max_depth: usize,
+    auto_gmm_components_per_split: usize,
     propagation_config_dict: Option<&Bound<'py, PyDict>>,
     // Opt-in: also fill provenance-tagged resolved-kind covariance
     // readback arrays (aligned 1:1 with `states`) into the result dict.
@@ -961,6 +1073,11 @@ fn _propagate<'py>(
         gm_threshold,
         gm_max_depth,
         gm_components_per_split,
+        auto_threshold_first,
+        auto_threshold_mixture,
+        auto_threshold_ip_skip,
+        auto_gmm_max_depth,
+        auto_gmm_components_per_split,
     )?;
 
     let mut config = empyrean::PropagationConfig {
@@ -1383,13 +1500,22 @@ fn covariance_kind_to_u8(kind: empyrean::CovarianceKind) -> u8 {
     }
 }
 
-/// Map a wrapper [`empyrean::CovarianceQuality`] to its `(u8, min_eig)`
-/// pair: PositiveDefinite=0 (min_eig NaN), Indefinite=1, Repaired=2.
-fn covariance_quality_to_u8(quality: empyrean::CovarianceQuality) -> (u8, f64) {
+/// Map a wrapper [`empyrean::CovarianceQuality`] to its
+/// `(code, min_eig, kappa_state)` triple: PositiveDefinite=0,
+/// Indefinite=1, Repaired=2, ExpansionSuspect=3.
+///
+/// Each variant carries at most one payload, and the one it does not
+/// carry is `NaN` — the presence rule is the tag itself, so no field is
+/// dropped and none is invented. `ExpansionSuspect` gets its own code
+/// rather than folding into PositiveDefinite: the matrix *is* definite,
+/// so a consumer checking only definiteness would take a covariance
+/// whose expansion the engine does not vouch for as a clean one.
+fn covariance_quality_to_u8(quality: empyrean::CovarianceQuality) -> (u8, f64, f64) {
     match quality {
-        empyrean::CovarianceQuality::PositiveDefinite => (0, f64::NAN),
-        empyrean::CovarianceQuality::Indefinite { min_eig } => (1, min_eig),
-        empyrean::CovarianceQuality::Repaired { min_eig } => (2, min_eig),
+        empyrean::CovarianceQuality::PositiveDefinite => (0, f64::NAN, f64::NAN),
+        empyrean::CovarianceQuality::Indefinite { min_eig } => (1, min_eig, f64::NAN),
+        empyrean::CovarianceQuality::Repaired { min_eig } => (2, min_eig, f64::NAN),
+        empyrean::CovarianceQuality::ExpansionSuspect { kappa_state } => (3, f64::NAN, kappa_state),
     }
 }
 
@@ -1434,6 +1560,7 @@ fn fill_tagged_covariance(
     let mut has_mean_shift_input = Array1::<bool>::default(m);
     let mut quality = Array1::<u8>::zeros(m);
     let mut quality_min_eig = Array1::<f64>::from_elem(m, f64::NAN);
+    let mut quality_kappa_state = Array1::<f64>::from_elem(m, f64::NAN);
     let mut non_grav = Array2::<bool>::default((m, 3));
     let mut thrust_segments = Array1::<u32>::zeros(m);
     let mut solved_width = Array1::<u32>::zeros(m);
@@ -1477,9 +1604,10 @@ fn fill_tagged_covariance(
                     mean_shift_input[[i, r]] = shift[r];
                 }
             }
-            let (q, min_eig) = covariance_quality_to_u8(tagged.quality);
+            let (q, min_eig, kappa_state) = covariance_quality_to_u8(tagged.quality);
             quality[i] = q;
             quality_min_eig[i] = min_eig;
+            quality_kappa_state[i] = kappa_state;
             for a in 0..3 {
                 non_grav[[i, a]] = tagged.non_grav[a];
             }
@@ -1518,6 +1646,10 @@ fn fill_tagged_covariance(
     tagged_dict.set_item(
         "quality_min_eig",
         PyArray1::from_owned_array(py, quality_min_eig),
+    )?;
+    tagged_dict.set_item(
+        "quality_kappa_state",
+        PyArray1::from_owned_array(py, quality_kappa_state),
     )?;
     tagged_dict.set_item("non_grav", PyArray2::from_owned_array(py, non_grav))?;
     tagged_dict.set_item(
@@ -1783,8 +1915,9 @@ fn check_method_column_len(name: &str, len: usize, n_tags: usize) -> PyResult<()
 /// Decode the flat method columns into wrapper [`empyrean::UncertaintyMethod`]s.
 ///
 /// One entry per requested method, built from that method's own parameter
-/// slots so a `SigmaPoint` / `MonteCarlo` / `GaussianMixture` spec reaches the
-/// engine with the parameters the caller supplied rather than engine defaults.
+/// slots so a `SigmaPoint` / `MonteCarlo` / `GaussianMixture` / `Auto` spec
+/// reaches the engine with the parameters the caller supplied rather than
+/// engine defaults.
 /// Decoding delegates to [`build_uncertainty_method`], the single tag decoder
 /// shared with `_propagate` — one decoder, one error message, no drift.
 #[allow(clippy::too_many_arguments)]
@@ -1797,6 +1930,11 @@ fn methods_from_flat(
     gm_threshold: &[f64],
     gm_max_depth: &[usize],
     gm_components_per_split: &[usize],
+    auto_threshold_first: &[f64],
+    auto_threshold_mixture: &[f64],
+    auto_threshold_ip_skip: &[f64],
+    auto_gmm_max_depth: &[usize],
+    auto_gmm_components_per_split: &[usize],
 ) -> PyResult<Vec<empyrean::UncertaintyMethod>> {
     let n = tags.len();
     check_method_column_len("method_sigma_n_sigma", sigma_n_sigma.len(), n)?;
@@ -1814,6 +1952,23 @@ fn methods_from_flat(
         gm_components_per_split.len(),
         n,
     )?;
+    check_method_column_len("method_auto_threshold_first", auto_threshold_first.len(), n)?;
+    check_method_column_len(
+        "method_auto_threshold_mixture",
+        auto_threshold_mixture.len(),
+        n,
+    )?;
+    check_method_column_len(
+        "method_auto_threshold_ip_skip",
+        auto_threshold_ip_skip.len(),
+        n,
+    )?;
+    check_method_column_len("method_auto_gmm_max_depth", auto_gmm_max_depth.len(), n)?;
+    check_method_column_len(
+        "method_auto_gmm_components_per_split",
+        auto_gmm_components_per_split.len(),
+        n,
+    )?;
 
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
@@ -1826,6 +1981,11 @@ fn methods_from_flat(
             gm_threshold[i],
             gm_max_depth[i],
             gm_components_per_split[i],
+            auto_threshold_first[i],
+            auto_threshold_mixture[i],
+            auto_threshold_ip_skip[i],
+            auto_gmm_max_depth[i],
+            auto_gmm_components_per_split[i],
         )?);
     }
     Ok(out)
@@ -1844,6 +2004,11 @@ fn methods_from_flat(
     method_gm_threshold,
     method_gm_max_depth,
     method_gm_components_per_split,
+    method_auto_threshold_first,
+    method_auto_threshold_mixture,
+    method_auto_threshold_ip_skip,
+    method_auto_gmm_max_depth,
+    method_auto_gmm_components_per_split,
     body_filter_naif=None,
     ng_alphas=None, ng_r0s=None, ng_ms=None, ng_ns=None, ng_ks=None,
     non_grav_dts=None,
@@ -1881,6 +2046,11 @@ fn _compute_impact_probabilities<'py>(
     method_gm_threshold: Vec<f64>,
     method_gm_max_depth: Vec<usize>,
     method_gm_components_per_split: Vec<usize>,
+    method_auto_threshold_first: Vec<f64>,
+    method_auto_threshold_mixture: Vec<f64>,
+    method_auto_threshold_ip_skip: Vec<f64>,
+    method_auto_gmm_max_depth: Vec<usize>,
+    method_auto_gmm_components_per_split: Vec<usize>,
     body_filter_naif: Option<Vec<i32>>,
     ng_alphas: Option<PyReadonlyArray1<'py, f64>>,
     ng_r0s: Option<PyReadonlyArray1<'py, f64>>,
@@ -1957,6 +2127,11 @@ fn _compute_impact_probabilities<'py>(
         &method_gm_threshold,
         &method_gm_max_depth,
         &method_gm_components_per_split,
+        &method_auto_threshold_first,
+        &method_auto_threshold_mixture,
+        &method_auto_threshold_ip_skip,
+        &method_auto_gmm_max_depth,
+        &method_auto_gmm_components_per_split,
     )?;
     let filter: Vec<empyrean::Origin> = body_filter_naif
         .unwrap_or_default()
@@ -2103,6 +2278,11 @@ fn _compute_impact_probabilities<'py>(
     method_gm_threshold,
     method_gm_max_depth,
     method_gm_components_per_split,
+    method_auto_threshold_first,
+    method_auto_threshold_mixture,
+    method_auto_threshold_ip_skip,
+    method_auto_gmm_max_depth,
+    method_auto_gmm_components_per_split,
     body_filter_naif=None,
     ng_alphas=None, ng_r0s=None, ng_ms=None, ng_ns=None, ng_ks=None,
     non_grav_dts=None,
@@ -2140,6 +2320,11 @@ fn _compute_b_planes<'py>(
     method_gm_threshold: Vec<f64>,
     method_gm_max_depth: Vec<usize>,
     method_gm_components_per_split: Vec<usize>,
+    method_auto_threshold_first: Vec<f64>,
+    method_auto_threshold_mixture: Vec<f64>,
+    method_auto_threshold_ip_skip: Vec<f64>,
+    method_auto_gmm_max_depth: Vec<usize>,
+    method_auto_gmm_components_per_split: Vec<usize>,
     body_filter_naif: Option<Vec<i32>>,
     ng_alphas: Option<PyReadonlyArray1<'py, f64>>,
     ng_r0s: Option<PyReadonlyArray1<'py, f64>>,
@@ -2216,6 +2401,11 @@ fn _compute_b_planes<'py>(
         &method_gm_threshold,
         &method_gm_max_depth,
         &method_gm_components_per_split,
+        &method_auto_threshold_first,
+        &method_auto_threshold_mixture,
+        &method_auto_threshold_ip_skip,
+        &method_auto_gmm_max_depth,
+        &method_auto_gmm_components_per_split,
     )?;
     let filter: Vec<empyrean::Origin> = body_filter_naif
         .unwrap_or_default()
@@ -2295,12 +2485,22 @@ fn _compute_b_planes<'py>(
 //  _get_observers
 // ══════════════════════════════════════════════════════════
 
+/// Observer states for the cross product `obs_codes × epochs` in a
+/// caller-chosen `(frame, origin)` basis.
+///
+/// `frame` / `origin` are the wire ints the rest of this module uses (the
+/// `Frame` enum discriminant and a NAIF id). They are **request**
+/// arguments; the `frame` / `origin` arrays that come back are read off
+/// each returned state rather than echoed, so a row always reports the
+/// basis that actually produced it.
 #[pyfunction]
-#[pyo3(signature = (obs_codes, epochs_mjd_tdb))]
+#[pyo3(signature = (obs_codes, epochs_mjd_tdb, frame, origin))]
 fn _get_observers<'py>(
     py: Python<'py>,
     obs_codes: Vec<String>,
     epochs_mjd_tdb: PyReadonlyArray1<'py, f64>,
+    frame: i32,
+    origin: i32,
 ) -> PyResult<Bound<'py, PyDict>> {
     let ctx = get_context()?;
     let epochs_arr = epochs_mjd_tdb.as_array().to_owned();
@@ -2309,8 +2509,13 @@ fn _get_observers<'py>(
         .iter()
         .map(|&t| empyrean::Epoch::from_mjd_tdb(t))
         .collect();
+    let target_frame = empyrean::int_to_frame(frame).map_err(to_pyerr)?;
+    let target_origin = origin_from_naif(origin)?;
 
-    let observers = py.detach(|| ctx.get_observers(&code_refs, &epochs_vec).map_err(to_pyerr))?;
+    let observers = py.detach(|| {
+        ctx.get_observers(&code_refs, &epochs_vec, target_frame, target_origin)
+            .map_err(to_pyerr)
+    })?;
 
     let total = observers.len();
     let mut out_codes: Vec<String> = Vec::with_capacity(total);
@@ -2322,6 +2527,8 @@ fn _get_observers<'py>(
     let mut out_vy = Array1::<f64>::zeros(total);
     let mut out_vz = Array1::<f64>::zeros(total);
     let mut out_nights = Array1::<i32>::zeros(total);
+    let mut out_frames = Array1::<i32>::zeros(total);
+    let mut out_origins = Array1::<i32>::zeros(total);
 
     for (i, obs) in observers.iter().enumerate() {
         out_codes.push(obs.obs_code.clone());
@@ -2333,6 +2540,8 @@ fn _get_observers<'py>(
         out_vy[i] = obs.velocity[1];
         out_vz[i] = obs.velocity[2];
         out_nights[i] = obs.observing_night;
+        out_frames[i] = empyrean::frame_to_int(obs.frame);
+        out_origins[i] = obs.origin.naif_id();
     }
 
     let dict = PyDict::new(py);
@@ -2348,6 +2557,8 @@ fn _get_observers<'py>(
         "observing_night",
         PyArray1::from_owned_array(py, out_nights),
     )?;
+    dict.set_item("frame", PyArray1::from_owned_array(py, out_frames))?;
+    dict.set_item("origin", PyArray1::from_owned_array(py, out_origins))?;
     Ok(dict)
 }
 
@@ -2374,12 +2585,6 @@ fn _get_observers<'py>(
     phot_system,
     obs_codes,
     obs_epochs,
-    obs_x,
-    obs_y,
-    obs_z,
-    obs_vx,
-    obs_vy,
-    obs_vz,
     force_model,
     epsilon = None,
     uncertainty_method = 0,
@@ -2404,6 +2609,11 @@ fn _get_observers<'py>(
     sigma_samples_per_plane = 8,
     mc_n_samples = 1000,
     mc_seed = None,
+    auto_threshold_first = 0.1,
+    auto_threshold_mixture = 10.0,
+    auto_threshold_ip_skip = 1e-12,
+    auto_gmm_max_depth = 3,
+    auto_gmm_components_per_split = 3,
     ephemeris_config_dict = None,
     builtsystem = None,
 ))]
@@ -2426,12 +2636,6 @@ fn _generate_ephemeris<'py>(
     phot_system: PyReadonlyArray1<'py, i32>,
     obs_codes: Vec<String>,
     obs_epochs: PyReadonlyArray1<'py, f64>,
-    obs_x: PyReadonlyArray1<'py, f64>,
-    obs_y: PyReadonlyArray1<'py, f64>,
-    obs_z: PyReadonlyArray1<'py, f64>,
-    obs_vx: PyReadonlyArray1<'py, f64>,
-    obs_vy: PyReadonlyArray1<'py, f64>,
-    obs_vz: PyReadonlyArray1<'py, f64>,
     force_model: i32,
     epsilon: Option<f64>,
     uncertainty_method: i32,
@@ -2466,6 +2670,15 @@ fn _generate_ephemeris<'py>(
     sigma_samples_per_plane: usize,
     mc_n_samples: usize,
     mc_seed: Option<u64>,
+    // AUTO's five caller-tunable knobs (see `_propagate`). A
+    // default-constructed `Auto()` lowers to these engine defaults; a
+    // parameterized `Auto(...)` threads its thresholds through instead of
+    // collapsing to `auto()` defaults.
+    auto_threshold_first: f64,
+    auto_threshold_mixture: f64,
+    auto_threshold_ip_skip: f64,
+    auto_gmm_max_depth: usize,
+    auto_gmm_components_per_split: usize,
     ephemeris_config_dict: Option<&Bound<'py, PyDict>>,
     // Optional reusable pre-built force-model handle (see `_propagate`).
     // The ephemeris pipeline integrates in EclipticJ2000, so an
@@ -2514,13 +2727,12 @@ fn _generate_ephemeris<'py>(
     let has_ng_cov_arr = has_non_grav_cov.as_ref().map(|a| a.as_array().to_owned());
     let ng_cov_arr = non_grav_cov.as_ref().map(|a| a.as_array().to_owned());
 
+    // The observer table's own state columns are deliberately NOT taken
+    // here: every observer is recomputed from its (code, epoch) below, so
+    // passing them across the boundary would only offer a second, silently
+    // divergent source for the same numbers — which is exactly what the
+    // removed lookup-failure fallback used them for.
     let obs_epochs_arr = obs_epochs.as_array().to_owned();
-    let obs_x_arr = obs_x.as_array().to_owned();
-    let obs_y_arr = obs_y.as_array().to_owned();
-    let obs_z_arr = obs_z.as_array().to_owned();
-    let obs_vx_arr = obs_vx.as_array().to_owned();
-    let obs_vy_arr = obs_vy.as_array().to_owned();
-    let obs_vz_arr = obs_vz.as_array().to_owned();
 
     let n = epochs_arr.len();
     let mut orbits: Vec<empyrean::Orbit> = Vec::with_capacity(n);
@@ -2619,18 +2831,39 @@ fn _generate_ephemeris<'py>(
     for i in 0..n_obs {
         // Recompute the observer fully through `ctx.get_observers` so we
         // get the same `observing_night` and any internal rounding the
-        // rust validation runner sees. Falls back to caller-supplied
-        // arrays if the lookup fails.
+        // rust validation runner sees.
+        //
+        // A failure here is surfaced, never substituted. This used to
+        // fall back to the caller's own position/velocity columns with
+        // `observing_night = -1` on ANY error — which meant a state
+        // outside the loaded BPC's coverage, or an unknown observatory
+        // code, produced astrometry computed from a stale table with a
+        // clean success and no warning, and silently discarded the
+        // nightly grouping the OD weighting depends on. The engine's
+        // errors are split by remedy ("retry with different arguments"
+        // vs "fetch the kernel"); both were being thrown away here, at
+        // the last hop before the user.
         let (pos, vel, night) = match ctx.get_observers(
             &[obs_codes[i].as_str()],
             &[empyrean::Epoch::from_mjd_tdb(obs_epochs_arr[i])],
+            empyrean::Frame::ICRF,
+            empyrean::Origin::SSB,
         ) {
             Ok(v) if !v.is_empty() => (v[0].position, v[0].velocity, v[0].observing_night),
-            _ => (
-                [obs_x_arr[i], obs_y_arr[i], obs_z_arr[i]],
-                [obs_vx_arr[i], obs_vy_arr[i], obs_vz_arr[i]],
-                -1,
-            ),
+            Ok(_) => {
+                return Err(PyRuntimeError::new_err(format!(
+                    "observer lookup for code {:?} at MJD TDB {} returned no state; the \
+                     ephemeris cannot be computed from the observer table's own columns \
+                     without silently substituting a different observer geometry",
+                    obs_codes[i], obs_epochs_arr[i]
+                )));
+            }
+            Err(e) => {
+                return Err(PyRuntimeError::new_err(format!(
+                    "observer lookup for code {:?} at MJD TDB {} failed: {e}",
+                    obs_codes[i], obs_epochs_arr[i]
+                )));
+            }
         };
         observers.push(empyrean::Observer {
             obs_code: obs_codes[i].clone(),
@@ -2638,6 +2871,8 @@ fn _generate_ephemeris<'py>(
             position: pos,
             velocity: vel,
             observing_night: night,
+            frame: empyrean::Frame::ICRF,
+            origin: empyrean::Origin::SSB,
         });
     }
 
@@ -2678,6 +2913,11 @@ fn _generate_ephemeris<'py>(
         gm_threshold,
         gm_max_depth,
         gm_components_per_split,
+        auto_threshold_first,
+        auto_threshold_mixture,
+        auto_threshold_ip_skip,
+        auto_gmm_max_depth,
+        auto_gmm_components_per_split,
     )?;
     // Sampling methods cannot be honored on the ephemeris path: villeneuve
     // derives the sky-plane covariance from a first-order STM projection
@@ -2871,8 +3111,24 @@ fn _generate_ephemeris<'py>(
     let mut s_jacobian: Vec<Option<Vec<f64>>> = Vec::with_capacity(ns);
     let mut s_hessian: Vec<Option<Vec<f64>>> = Vec::with_capacity(ns);
     for row in &eph_result.sensitivity {
-        s_orbit_id.push(row.orbit_id.clone());
-        s_object_id.push(row.object_id.clone());
+        // Same fabricated-index recovery the entries loop above performs.
+        // Without it the sensitivity table carries the C ABI's synthetic
+        // `"orbit_{i}"` while the ephemeris table beside it carries the
+        // caller's real id — and the documented per-chain filter,
+        // `sens.select("orbit_id", oid)`, silently returns an EMPTY table
+        // for every real orbit id.
+        let user_idx = parse_fabricated_orbit_index(&row.orbit_id);
+        s_orbit_id.push(
+            user_idx
+                .and_then(|j| orbit_ids.get(j).cloned())
+                .unwrap_or_else(|| row.orbit_id.clone()),
+        );
+        s_object_id.push(
+            user_idx
+                .and_then(|j| object_ids.get(j).cloned())
+                .filter(|s| !s.is_empty())
+                .or_else(|| row.object_id.clone()),
+        );
         s_obs_code.push(row.obs_code.clone());
         s_epoch.push(row.epoch_mjd_tdb);
         s_n_params.push(row.n_params as u32);
@@ -3469,6 +3725,8 @@ fn rejection_reason_str(r: empyrean::RejectionReason) -> &'static str {
         R::RadarObservationsUnsupported => "radar_observations_unsupported",
         R::OccultationObservationsUnsupported => "occultation_observations_unsupported",
         R::OutsideArc => "outside_arc",
+        R::NonFiniteChi2 => "non_finite_chi2",
+        R::MissingJacobian => "missing_jacobian",
         R::NotEvaluated => "not_evaluated",
     }
 }
@@ -3482,6 +3740,9 @@ fn add_residuals_to_dict(
 
     // Identification
     let mut obs_ids: Vec<String> = Vec::with_capacity(n);
+    // The grouping key travels with the row so a batch's residuals live
+    // in one table and stay attributable.
+    let mut object_ids: Vec<Option<String>> = Vec::with_capacity(n);
     let mut obs_codes: Vec<String> = Vec::with_capacity(n);
     let mut ast_cats: Vec<Option<String>> = Vec::with_capacity(n);
     let mut epochs = Vec::with_capacity(n);
@@ -3524,6 +3785,7 @@ fn add_residuals_to_dict(
 
     for r in residuals {
         obs_ids.push(r.obs_id.clone());
+        object_ids.push(r.object_id.clone());
         obs_codes.push(r.obs_code.clone());
         ast_cats.push(r.ast_cat.clone());
         epochs.push(r.epoch.mjd_tdb().map_err(to_pyerr)?);
@@ -3568,6 +3830,7 @@ fn add_residuals_to_dict(
     }
 
     dict.set_item("obs_ids", obs_ids)?;
+    dict.set_item("object_ids", object_ids)?;
     dict.set_item("obs_codes", obs_codes)?;
     dict.set_item("ast_cats", ast_cats)?;
     dict.set_item("obs_epochs", PyArray1::from_vec(py, epochs))?;
@@ -3738,6 +4001,48 @@ fn add_acceptability_to_dict(
         format!("{prefix}fractional_sigma_a_threshold"),
         acc.fractional_sigma_a_threshold,
     )?;
+    dict.set_item(
+        format!("{prefix}selection_fraction_ok"),
+        acc.selection_fraction_ok,
+    )?;
+    dict.set_item(
+        format!("{prefix}selection_fraction_value"),
+        acc.selection_fraction_value,
+    )?;
+    dict.set_item(
+        format!("{prefix}selection_fraction_threshold"),
+        acc.selection_fraction_threshold,
+    )?;
+    dict.set_item(
+        format!("{prefix}selected_arc_coverage_ok"),
+        acc.selected_arc_coverage_ok,
+    )?;
+    dict.set_item(
+        format!("{prefix}selected_arc_days_value"),
+        acc.selected_arc_days_value,
+    )?;
+    dict.set_item(
+        format!("{prefix}selected_arc_fraction_value"),
+        acc.selected_arc_fraction_value,
+    )?;
+    dict.set_item(
+        format!("{prefix}selected_arc_fraction_threshold"),
+        acc.selected_arc_fraction_threshold,
+    )?;
+    dict.set_item(format!("{prefix}trailing_gap_ok"), acc.trailing_gap_ok)?;
+    dict.set_item(
+        format!("{prefix}trailing_gap_days_value"),
+        acc.trailing_gap_days_value,
+    )?;
+    dict.set_item(
+        format!("{prefix}trailing_gap_threshold"),
+        acc.trailing_gap_threshold,
+    )?;
+    // Tri-state: omitted entirely when no radar contributed, so "no
+    // radar" can never be read as "radar failed".
+    if let Some(v) = acc.radar_fit_ok {
+        dict.set_item(format!("{prefix}radar_fit_ok"), v)?;
+    }
     Ok(())
 }
 
@@ -4027,11 +4332,54 @@ fn _determine<'py>(
     };
 
     let od_config = build_od_config_from_dict(config_dict)?;
-    let determine_result = py
+    let batch = py
         .detach(|| ctx.determine(&observations, initial_orbits.as_deref(), &od_config))
         .map_err(to_pyerr)?;
 
-    determine_result_to_pydict(py, &determine_result)
+    // Batch-first: one entry per ADES object, delivered or failed. A
+    // failed object is an entry with `delivered = False` and an `error`,
+    // never a missing entry — Python assembles the tables from this.
+    let out = PyDict::new(py);
+    let objects = PyList::empty(py);
+    for entry in batch.iter() {
+        let item = match &entry.outcome {
+            Ok(fit) => {
+                let d = determine_result_to_pydict(py, fit)?;
+                d.set_item("delivered", true)?;
+                d
+            }
+            Err(failure) => {
+                let d = PyDict::new(py);
+                d.set_item("delivered", false)?;
+                d.set_item("error", &failure.message)?;
+                d.set_item("error_kind", determine_failure_kind_str(failure.kind))?;
+                d
+            }
+        };
+        item.set_item("object_id", &entry.object_id)?;
+        objects.append(item)?;
+    }
+    out.set_item("objects", objects)?;
+    out.set_item("unmatched_orbit_ids", batch.unmatched_orbit_ids().to_vec())?;
+    Ok(out)
+}
+
+/// Stable snake_case name for a per-object failure cause, so Python can
+/// branch on the reason without parsing the message.
+fn determine_failure_kind_str(kind: empyrean::DetermineFailureKind) -> String {
+    use empyrean::DetermineFailureKind as K;
+    match kind {
+        K::ObservationConversion => "observation_conversion".to_string(),
+        K::ObserverConstruction => "observer_construction".to_string(),
+        K::UnsupportedCoordinateSystem => "unsupported_coordinate_system".to_string(),
+        K::EarthOrientationCoverage => "earth_orientation_coverage".to_string(),
+        K::IOD => "iod".to_string(),
+        K::OD => "od".to_string(),
+        K::DuplicateObsIds => "duplicate_obs_ids".to_string(),
+        K::RadarOnly => "radar_only".to_string(),
+        K::NonGravNotRecovered => "non_grav_not_recovered".to_string(),
+        K::Unknown(code) => format!("unknown_{code}"),
+    }
 }
 
 // ══════════════════════════════════════════════════════════
@@ -4185,7 +4533,7 @@ fn build_od_config_from_dict(d: &Bound<'_, PyDict>) -> PyResult<empyrean::ODConf
         if let Some(s) = get_str(&w, "preset")? {
             wc.preset = match s.to_ascii_lowercase().as_str() {
                 "none" => empyrean::WeightingPreset::None,
-                "vfc17" => empyrean::WeightingPreset::Vfc17,
+                "vfcc2017" => empyrean::WeightingPreset::VFCC2017,
                 "neodys" => empyrean::WeightingPreset::Neodys,
                 other => {
                     return Err(PyValueError::new_err(format!(
@@ -4427,8 +4775,11 @@ fn build_od_config_from_dict(d: &Bound<'_, PyDict>) -> PyResult<empyrean::ODConf
     if let Some(v) = get_f64(d, "convergence_tol")? {
         cfg.convergence_tol = v;
     }
-    if let Some(v) = get_bool(d, "use_stm_cache")? {
-        cfg.use_stm_cache = v;
+    if let Some(v) = get_bool(d, "allow_arc_truncation")? {
+        cfg.allow_arc_truncation = v;
+    }
+    if let Some(v) = get_bool(d, "coorbital_enabled")? {
+        cfg.coorbital_enabled = v;
     }
     if let Some(s) = get_str(d, "solve_for")? {
         cfg.solve_for = match s.to_ascii_lowercase().as_str() {
@@ -4816,6 +5167,18 @@ fn apply_propagation_config_dict(
             }
         }
     }
+    if let Some(s) = get_str(d, "ephemeris_overlap_policy")? {
+        cfg.ephemeris_overlap_policy = match s.to_ascii_lowercase().as_str() {
+            "substitute_spk" => empyrean::EphemerisOverlapPolicy::SubstituteSpk,
+            "exclude_and_integrate" => empyrean::EphemerisOverlapPolicy::ExcludeAndIntegrate,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown ephemeris_overlap_policy: {other:?}; valid choices are \
+                     \"substitute_spk\" and \"exclude_and_integrate\""
+                )));
+            }
+        };
+    }
     Ok(())
 }
 
@@ -4836,6 +5199,14 @@ fn build_ephemeris_config_from_dict(d: &Bound<'_, PyDict>) -> PyResult<empyrean:
     if let Some(v) = d.get_item("compute_diagnostics")? {
         cfg.compute_diagnostics = v.extract()?;
     }
+    // `propagation` is the shared PropagationConfig, so it carries
+    // `events` / `diagnostics` blocks that ephemeris generation has no
+    // home for. Surface that here as a ValueError — the same class the
+    // other unsupported-request rejections on this path use, and the
+    // one `generate_ephemeris`'s own docs promise — rather than letting
+    // it arrive later as a RuntimeError from the FFI call.
+    cfg.validate()
+        .map_err(|e| PyValueError::new_err(e.message))?;
     Ok(cfg)
 }
 
@@ -5687,72 +6058,157 @@ fn _write_events_csv<'py>(
 // ══════════════════════════════════════════════════════════
 
 fn pydict_to_residuals(dict: &Bound<'_, PyDict>) -> PyResult<Vec<empyrean::ObservationResidual>> {
-    let ra: PyReadonlyArray1<f64> = dict
-        .get_item("ra_residuals_arcsec")?
-        .ok_or_else(|| PyValueError::new_err("missing 'ra_residuals_arcsec'"))?
-        .extract()?;
-    let dec: PyReadonlyArray1<f64> = dict
-        .get_item("dec_residuals_arcsec")?
-        .ok_or_else(|| PyValueError::new_err("missing 'dec_residuals_arcsec'"))?
-        .extract()?;
-    let chi2: PyReadonlyArray1<f64> = dict
-        .get_item("chi2")?
-        .ok_or_else(|| PyValueError::new_err("missing 'chi2'"))?
-        .extract()?;
-    let prob: PyReadonlyArray1<f64> = dict
-        .get_item("probability")?
-        .ok_or_else(|| PyValueError::new_err("missing 'probability'"))?
-        .extract()?;
-    let selected: PyReadonlyArray1<u8> = dict
+    // Every column the ObservationResults table carries crosses here.
+    // A projection would silently write a residual file whose rejection
+    // attribution, influence diagnostics and join keys are all empty.
+    let strs = |key: &str| -> PyResult<Vec<String>> {
+        Ok(match dict.get_item(key)? {
+            Some(v) => v.extract::<Vec<Option<String>>>()?,
+            None => Vec::new(),
+        }
+        .into_iter()
+        .map(|o| o.unwrap_or_default())
+        .collect())
+    };
+    let floats = |key: &str| -> PyResult<Vec<f64>> {
+        Ok(match dict.get_item(key)? {
+            Some(v) => v.extract::<PyReadonlyArray1<f64>>()?.as_array().to_vec(),
+            None => Vec::new(),
+        })
+    };
+
+    let ra = floats("ra_residuals_arcsec")?;
+    let dec = floats("dec_residuals_arcsec")?;
+    let chi2 = floats("chi2")?;
+    let prob = floats("probability")?;
+    let selected: Vec<u8> = dict
         .get_item("selected")?
         .ok_or_else(|| PyValueError::new_err("missing 'selected'"))?
-        .extract()?;
-    let ra = ra.as_array();
-    let dec = dec.as_array();
-    let chi2 = chi2.as_array();
-    let prob = prob.as_array();
-    let selected = selected.as_array();
+        .extract::<PyReadonlyArray1<u8>>()?
+        .as_array()
+        .to_vec();
     let n = ra.len();
+
+    let obs_ids = strs("obs_ids")?;
+    let object_ids = strs("object_ids")?;
+    let obs_codes = strs("obs_codes")?;
+    let ast_cats = strs("ast_cats")?;
+    let rejection_reasons = strs("rejection_reasons")?;
+    let radar_kinds = strs("radar_kinds")?;
+    let epochs = floats("epochs")?;
+    let dofs: Vec<u32> = match dict.get_item("dofs")? {
+        Some(v) => v.extract::<Vec<u32>>()?,
+        None => Vec::new(),
+    };
+    let radar_dofs: Vec<u32> = match dict.get_item("radar_dofs")? {
+        Some(v) => v.extract::<Vec<u32>>()?,
+        None => Vec::new(),
+    };
+    let cov_ra = floats("residual_cov_ras")?;
+    let cov_dec = floats("residual_cov_decs")?;
+    let cov_corr = floats("residual_cov_corrs")?;
+    let rej_crit = floats("rejection_criterions")?;
+    let rej_thr = floats("rejection_thresholds")?;
+    let rej_eff = floats("rejection_effective_thresholds")?;
+    let rej_loss = floats("rejection_information_losses")?;
+    let cooks = floats("cooks_distances")?;
+    let leverage = floats("leverages")?;
+    let frac_info = floats("fractional_informations")?;
+    let at = floats("along_tracks")?;
+    let ct = floats("cross_tracks")?;
+    let at_err = floats("along_track_errors")?;
+    let ct_err = floats("cross_track_errors")?;
+    let pa = floats("track_position_angles")?;
+    let infl_loss = floats("influence_information_losses")?;
+    let at_ct_cov = floats("along_cross_covariances")?;
+    let radar_res = floats("radar_residuals")?;
+    let radar_chi2 = floats("radar_chi2s")?;
+    let radar_prob = floats("radar_probabilities")?;
+    let radar_var = floats("radar_variances")?;
+
+    // A column the caller omitted reads as absent (NaN / empty), never
+    // as a value: `at(i)` is None-shaped rather than 0.0.
+    let f = |v: &[f64], i: usize| v.get(i).copied().unwrap_or(f64::NAN);
+    let t = |v: &[String], i: usize| v.get(i).cloned().unwrap_or_default();
+
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
-        // The Python residuals-write path passes minimal residual data
-        // (RA/Dec/χ²/probability/selected). Everything else fills with
-        // NaN / NotEvaluated so the C ABI sees a uniform absent
-        // sentinel; downstream serializers (parquet/json/csv) treat
-        // NaN as a missing-cell write.
+        let ast_cat = t(&ast_cats, i);
+        let radar_kind = t(&radar_kinds, i);
+        let radar = (!radar_kind.is_empty()).then(|| empyrean::RadarResidual {
+            kind: if radar_kind.eq_ignore_ascii_case("doppler") {
+                empyrean::RadarResidualKind::Doppler
+            } else {
+                empyrean::RadarResidualKind::Delay
+            },
+            residual: f(&radar_res, i),
+            chi2: f(&radar_chi2, i),
+            dof: radar_dofs.get(i).copied().unwrap_or(0),
+            probability: f(&radar_prob, i),
+            variance: {
+                let v = f(&radar_var, i);
+                v.is_finite().then_some(v)
+            },
+        });
         out.push(empyrean::ObservationResidual {
-            obs_id: String::new(),
-            obs_code: String::new(),
-            ast_cat: None,
-            epoch: empyrean::Epoch::from_mjd_tdb(f64::NAN),
-            ra_residual_arcsec: ra[i],
-            dec_residual_arcsec: dec[i],
-            chi2: chi2[i],
-            dof: 2,
-            probability: prob[i],
-            selected: selected[i] != 0,
-            residual_cov_ra: f64::NAN,
-            residual_cov_dec: f64::NAN,
-            residual_cov_corr: f64::NAN,
-            rejection_reason: empyrean::RejectionReason::NotEvaluated,
-            rejection_criterion: f64::NAN,
-            rejection_threshold: f64::NAN,
-            rejection_effective_threshold: f64::NAN,
-            rejection_information_loss: f64::NAN,
-            cooks_distance: f64::NAN,
-            leverage: f64::NAN,
-            fractional_information: f64::NAN,
-            along_track_arcsec: f64::NAN,
-            cross_track_arcsec: f64::NAN,
-            along_track_error_arcsec: f64::NAN,
-            cross_track_error_arcsec: f64::NAN,
-            track_position_angle_deg: f64::NAN,
-            influence_information_loss: f64::NAN,
-            along_cross_covariance_arcsec2: f64::NAN,
-            radar: None,
+            obs_id: t(&obs_ids, i),
+            object_id: {
+                let v = t(&object_ids, i);
+                (!v.is_empty()).then_some(v)
+            },
+            obs_code: t(&obs_codes, i),
+            ast_cat: (!ast_cat.is_empty()).then_some(ast_cat),
+            epoch: empyrean::Epoch::from_mjd_tdb(f(&epochs, i)),
+            ra_residual_arcsec: f(&ra, i),
+            dec_residual_arcsec: f(&dec, i),
+            chi2: f(&chi2, i),
+            dof: dofs.get(i).copied().unwrap_or(2),
+            probability: f(&prob, i),
+            selected: selected.get(i).copied().unwrap_or(0) != 0,
+            residual_cov_ra: f(&cov_ra, i),
+            residual_cov_dec: f(&cov_dec, i),
+            residual_cov_corr: f(&cov_corr, i),
+            rejection_reason: rejection_reason_from_str(&t(&rejection_reasons, i)),
+            rejection_criterion: f(&rej_crit, i),
+            rejection_threshold: f(&rej_thr, i),
+            rejection_effective_threshold: f(&rej_eff, i),
+            rejection_information_loss: f(&rej_loss, i),
+            cooks_distance: f(&cooks, i),
+            leverage: f(&leverage, i),
+            fractional_information: f(&frac_info, i),
+            along_track_arcsec: f(&at, i),
+            cross_track_arcsec: f(&ct, i),
+            along_track_error_arcsec: f(&at_err, i),
+            cross_track_error_arcsec: f(&ct_err, i),
+            track_position_angle_deg: f(&pa, i),
+            influence_information_loss: f(&infl_loss, i),
+            along_cross_covariance_arcsec2: f(&at_ct_cov, i),
+            radar,
         });
     }
     Ok(out)
+}
+
+/// Inverse of the wrapper's rejection-reason naming, so a residual
+/// table that crossed into Python and back keeps its attribution instead
+/// of collapsing to "not evaluated".
+fn rejection_reason_from_str(name: &str) -> empyrean::RejectionReason {
+    use empyrean::RejectionReason as R;
+    match name {
+        "accepted" => R::Accepted,
+        "chi_squared" => R::ChiSquared,
+        "sigma_clip" => R::SigmaClip,
+        "cooks_distance" => R::CooksDistance,
+        "adaptive" => R::Adaptive,
+        "unsupported_observatory" => R::UnsupportedObservatory,
+        "cmc2003" => R::CMC2003,
+        "radar_observations_unsupported" => R::RadarObservationsUnsupported,
+        "occultation_observations_unsupported" => R::OccultationObservationsUnsupported,
+        "outside_arc" => R::OutsideArc,
+        "non_finite_chi2" => R::NonFiniteChi2,
+        "missing_jacobian" => R::MissingJacobian,
+        _ => R::NotEvaluated,
+    }
 }
 
 #[pyfunction]

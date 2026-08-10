@@ -1,6 +1,6 @@
 [package]
 name = "empyrean-cli"
-version = "0.9.0"
+version = "0.10.0-rc.0"
 edition = "2024"
 rust-version = "1.90.0"
 authors = ["Joachim Moeyens <joachim@empyrean-dynamics.com>", "Empyrean Dynamics"]
@@ -32,7 +32,7 @@ path = "src/main.rs"
 # CLI is a distribution channel — same closed-source posture as the
 # Python wheel and C SDK. Compute and I/O both go through the empyrean
 # wrapper (which sits over the public C ABI exposed by empyrean-c).
-empyrean = { path = "../empyrean", version = "0.9.0" }
+empyrean = { path = "../empyrean", version = "0.10.0-rc.0" }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
@@ -40,7 +40,22 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
+# `empyrean show` reads the artifacts the pipeline commands write. It is a
+# pure client-side reader — it never calls into libempyrean — so the Parquet
+# path needs its own reader rather than a round-trip through the C ABI.
+# Version 58 matches the writers exactly (files are stamped
+# `parquet-rs version 58.4.0`), so reader and writer move together.
+arrow = "58"
+parquet = "58"
+
+# The pager. crossterm only — raw mode, key events, and cursor/clear
+# sequences are the entire surface used; no TUI framework, no alternate
+# screen, no widget tree. `show` must feel like `more`.
+crossterm = "0.29"
+
 [dev-dependencies]
 # CLI parity test (tests/parity.rs). float_roundtrip makes serde_json parse
 # the shared parity manifest's floats bit-identically to the core oracle.
 serde_json = { version = "1", features = ["float_roundtrip"] }
+# `show` integration tests write fixtures into a scratch directory.
+tempfile = "3"

@@ -13,8 +13,9 @@ use empyrean_core::orbits::Orbits;
 use empyrean_core::photometry::PhotometricParams;
 use empyrean_core::propagation::events::DynamicalEvent;
 use empyrean_core::propagation::{
-    AdvancedIntegratorConfig, DiagnosticsConfig, EventConfig, IntegratorChoice,
-    OriginSwitchingConfig, PropagationConfig, PropagationResult, UncertaintyMethod, propagate,
+    AdvancedIntegratorConfig, DiagnosticsConfig, EphemerisOverlapPolicy, EventConfig,
+    IntegratorChoice, OriginSwitchingConfig, PropagationConfig, PropagationResult,
+    UncertaintyMethod, propagate,
 };
 use empyrean_core::time::Epoch;
 
@@ -523,6 +524,72 @@ pub struct EmpyreanPropagationConfig {
 
     // ── Integrator calibration ─────────────────────────────
     pub advanced: EmpyreanAdvancedIntegratorConfig,
+
+    // ── Ephemeris-overlap policy ───────────────────────────
+    /// What to do when the propagated state coincides with an SB441-N16
+    /// perturber's own SPK ephemeris — see the
+    /// `EMPYREAN_EPHEMERIS_OVERLAP_POLICY_*` constants. `0` = `SUBSTITUTE_SPK`
+    /// (the historical behaviour, so `memset(0)` keeps its meaning);
+    /// `1` = `EXCLUDE_AND_INTEGRATE`. Any other value is rejected.
+    ///
+    /// **When it is consulted.** Overlap detection is on by default and
+    /// is what decides whether this field is read at all — but the engine
+    /// suppresses detection entirely whenever `excluded_perturbers_naif`
+    /// is non-empty, on the grounds that a caller who named exclusions
+    /// has already made the call this policy would make for them. So
+    /// setting `EXCLUDE_AND_INTEGRATE` *together with* any explicit
+    /// exclusion is a no-op: use one or the other, not both. The
+    /// detection toggle itself is not exposed at this ABI.
+    ///
+    /// Appended at the tail of the struct deliberately: growing a
+    /// `#[repr(C)]` config at the end is the only way to extend it
+    /// without moving an existing field's offset.
+    pub ephemeris_overlap_policy: i32,
+}
+
+// ── Ephemeris-overlap policy (EmpyreanPropagationConfig::ephemeris_overlap_policy) ──
+//
+// What happens when a propagated state sits inside the overlap threshold
+// of a perturber's own SPK ephemeris — the SB441-N16 self-perturbation
+// case, where a body is both the thing being propagated and one of the
+// forces acting on it.
+
+/// Substitute the perturber's SPK state and skip integration. The
+/// historical behaviour and the `memset(0)` default.
+///
+/// The SPK is the authoritative solution for that body, so the returned
+/// states are exact *for the body itself* — but the caller's own initial
+/// condition is discarded, and nothing is integrated, so there is no
+/// dense trajectory, no STM, and no sensitivity chain. Ephemeris
+/// generation and the radar forward model both read the dense trajectory
+/// and therefore **fail** for an overlapped body under this policy; pass
+/// [`EMPYREAN_EPHEMERIS_OVERLAP_POLICY_EXCLUDE_AND_INTEGRATE`] there.
+pub const EMPYREAN_EPHEMERIS_OVERLAP_POLICY_SUBSTITUTE_SPK: i32 = 0;
+/// Drop the overlapped perturber from the force model and integrate the
+/// caller's own initial conditions, reporting the overlap.
+pub const EMPYREAN_EPHEMERIS_OVERLAP_POLICY_EXCLUDE_AND_INTEGRATE: i32 = 1;
+
+/// Map [`EmpyreanPropagationConfig::ephemeris_overlap_policy`] onto the engine's
+/// [`EphemerisOverlapPolicy`](empyrean_core::propagation::EphemerisOverlapPolicy).
+///
+/// Both variants are honoured by this engine build; an unrecognised value
+/// is refused by value rather than quietly resolved to the default —
+/// silently answering a request the caller did not make is the defect
+/// class this converter exists to prevent.
+pub(crate) fn int_to_ephemeris_overlap_policy(v: i32) -> Result<EphemerisOverlapPolicy, String> {
+    match v {
+        EMPYREAN_EPHEMERIS_OVERLAP_POLICY_SUBSTITUTE_SPK => {
+            Ok(EphemerisOverlapPolicy::SubstituteSpk)
+        }
+        EMPYREAN_EPHEMERIS_OVERLAP_POLICY_EXCLUDE_AND_INTEGRATE => {
+            Ok(EphemerisOverlapPolicy::ExcludeAndIntegrate)
+        }
+        other => Err(format!(
+            "unknown ephemeris_overlap_policy: {other} (expected \
+             {EMPYREAN_EPHEMERIS_OVERLAP_POLICY_SUBSTITUTE_SPK} = SUBSTITUTE_SPK or \
+             {EMPYREAN_EPHEMERIS_OVERLAP_POLICY_EXCLUDE_AND_INTEGRATE} = EXCLUDE_AND_INTEGRATE)"
+        )),
+    }
 }
 
 /// Resolved-kind tag values for [`EmpyreanPropagatedState::resolved_kind`].
@@ -555,6 +622,20 @@ pub const EMPYREAN_COVARIANCE_QUALITY_INDEFINITE: u8 = 1;
 /// the smallest eigenvalue *before* repair. Never emitted by the
 /// `_cartesian` accessor (which only classifies, never repairs).
 pub const EMPYREAN_COVARIANCE_QUALITY_REPAIRED: u8 = 2;
+/// The matrix is positive definite, **but** the Taylor expansion that
+/// produced it shows signs of having left its validity domain — the
+/// beyond-linear correction is large relative to the linear spread.
+/// `quality_kappa_state` carries the block-wise quadratic/linear ratio
+/// that triggered it; `quality_min_eig` is NaN (there is no negative
+/// eigenvalue — the matrix is definite).
+///
+/// The moments are still the ones that were requested, but they must
+/// **not** be presented as an authoritative Gaussian: an unflagged
+/// second-order result through a deep close approach has been observed
+/// ~10³× wide of the Monte-Carlo truth. Surfaced as its own tag rather
+/// than folded into `POSITIVE_DEFINITE`, which would hide the
+/// degradation behind a clean bill of health.
+pub const EMPYREAN_COVARIANCE_QUALITY_EXPANSION_SUSPECT: u8 = 3;
 
 // ── Target functional (TaggedCovariance.target_functional) ──────────
 /// Generic Cartesian-state second moment.
@@ -588,6 +669,17 @@ pub const EMPYREAN_TAGGED_COV_EPOCH_INDEX_OUT_OF_RANGE: i32 = -8;
 /// propagated state — an internal bookkeeping error, surfaced rather
 /// than degraded.
 pub const EMPYREAN_TAGGED_COV_SAMPLE_COVARIANCE_MISSING: i32 = -9;
+/// The result's sensitivity chains and its per-orbit row counts have
+/// different lengths, so `orbit_index` does not name the same orbit in
+/// both and no row can be addressed for it safely. Refused for the whole
+/// result rather than served with a shifted pairing that is undetectable
+/// per entry.
+pub const EMPYREAN_TAGGED_COV_CHAIN_ORBIT_COUNT_MISMATCH: i32 = -10;
+/// The state row addressed for a sample-based epoch is stamped with a
+/// DIFFERENT epoch than the sensitivity chain names for it (or does not
+/// exist). Refused at the seam: a covariance served under another
+/// epoch's label is invisible in the returned series.
+pub const EMPYREAN_TAGGED_COV_SAMPLE_ROW_EPOCH_MISMATCH: i32 = -11;
 /// A panic was caught at the boundary.
 pub const EMPYREAN_TAGGED_COV_PANIC: i32 = -99;
 
@@ -832,7 +924,7 @@ pub(crate) fn int_to_force_model(val: i32) -> Result<empyrean_core::ForceModelTi
         0 => Ok(empyrean_core::ForceModelTier::Approximate),
         1 => Ok(empyrean_core::ForceModelTier::Basic),
         2 => Ok(empyrean_core::ForceModelTier::Standard),
-        3 => Err("ForceModelTier::Full is not exposed in v0.7.0 — pass 2 for Standard tier".into()),
+        3 => Err("ForceModelTier::Full is reserved for a future release pending its catalog-scale validation campaign — pass 2 for Standard tier".into()),
         _ => Err(format!("unknown force model tier: {val}")),
     }
 }
@@ -1033,6 +1125,10 @@ pub(crate) fn build_propagation_config_from_c(
     cfg.num_threads = std::num::NonZeroUsize::new(c.num_threads);
     cfg.advanced = build_advanced_from_c(&c.advanced);
 
+    // Resolved here (rather than in each entry point) so the ephemeris
+    // path is covered too: its converter routes through this function.
+    cfg.ephemeris_overlap_policy = int_to_ephemeris_overlap_policy(c.ephemeris_overlap_policy)?;
+
     Ok(cfg)
 }
 
@@ -1120,21 +1216,32 @@ pub(crate) fn empyrean_orbit_non_grav_params(orbit: &EmpyreanOrbit) -> Option<No
 /// the same orbit — and, unlike Marsden, is **never value-inferred**:
 /// `has_srp` is the sole trigger. `srp_amrat_variance` finite and > 0 seeds
 /// AMRAT as a fittable parameter (the trigger + Bayesian prior that opens the
-/// AMRAT column in a StateAndAMRAT / StateAndNonGravAndAMRAT fit); NaN or ≤0
-/// leaves the AMRAT column closed and applies SRP as a fixed force.
+/// AMRAT column in a StateAndAMRAT / StateAndNonGravAndAMRAT fit); `0.0` (the
+/// memset zero-init default), NaN, or ∞ leaves the AMRAT column closed and
+/// applies SRP as a fixed force.
 ///
 /// Validates loudly rather than silently degrading:
 /// - SRP value fields set with `has_srp == 0` (a caller who forgot the
-///   switch — never a silent apply nor a silent drop),
+///   switch — never a silent apply nor a silent drop), where a `0.0`
+///   `srp_amrat_variance` is the memset zero-init default and reads as
+///   absent, not as a set field,
 /// - a non-finite or non-positive `srp_amrat` or `srp_cr`,
-/// - a non-positive (but finite) `srp_amrat_variance`.
+/// - a finite **negative** `srp_amrat_variance` (a caller error; `0.0`
+///   reads as "no prior", never as a loud error).
 pub(crate) fn empyrean_orbit_srp_params(
     orbit: &EmpyreanOrbit,
 ) -> Result<Option<SRPForceParams>, String> {
     if orbit.has_srp == 0 {
         // Zero-init = absent. But value fields set without the switch is a
-        // caller mistake, not a silent drop: surface it loudly.
-        if orbit.srp_amrat != 0.0 || orbit.srp_cr != 0.0 || orbit.srp_amrat_variance.is_finite() {
+        // caller mistake, not a silent drop: surface it loudly. A `0.0`
+        // `srp_amrat_variance` is the memset zero-init default, so it must
+        // read as absent (not "set") — otherwise every caller who memsets an
+        // EmpyreanOrbit with `has_srp == 0` has its propagation refused. Only
+        // a non-zero finite variance counts as a genuinely-set field here.
+        if orbit.srp_amrat != 0.0
+            || orbit.srp_cr != 0.0
+            || (orbit.srp_amrat_variance != 0.0 && orbit.srp_amrat_variance.is_finite())
+        {
             return Err(
                 "has_srp = 0 but SRP fields (srp_amrat / srp_cr / srp_amrat_variance) are set — \
                  set has_srp = 1 to apply the SRP slot, or clear the fields"
@@ -1156,13 +1263,19 @@ pub(crate) fn empyrean_orbit_srp_params(
             orbit.srp_cr
         ));
     }
-    // Finite & > 0 ⇒ AMRAT is fittable (prior variance). NaN / ≤0 ⇒ no prior
-    // (fixed-force SRP). A finite but non-positive variance is a loud error.
-    let amrat_variance = if orbit.srp_amrat_variance.is_finite() {
-        if orbit.srp_amrat_variance <= 0.0 {
+    // Finite & > 0 ⇒ AMRAT is fittable (prior variance). `0.0` (the memset
+    // zero-init default), NaN, or ∞ ⇒ no prior (fixed-force SRP) — the same
+    // reading the `has_srp == 0` guard above gives a zero-init variance, so a
+    // caller who memsets an orbit, sets `has_srp = 1` + `srp_amrat` +
+    // `srp_cr`, and leaves the variance untouched gets a fixed-force SRP
+    // rather than a refused fit. A finite *negative* variance is nonsense
+    // (never a zero-init artifact) and stays a loud error.
+    let amrat_variance = if orbit.srp_amrat_variance != 0.0 && orbit.srp_amrat_variance.is_finite()
+    {
+        if orbit.srp_amrat_variance < 0.0 {
             return Err(format!(
-                "srp_amrat_variance must be > 0 when finite (AMRAT prior variance, (m^2/kg)^2); \
-                 got {} — use NaN or ≤0 for no prior",
+                "srp_amrat_variance must be > 0 when set (AMRAT prior variance, (m^2/kg)^2); \
+                 got {} — use NaN or 0.0 (the zero-init default) for no prior",
                 orbit.srp_amrat_variance
             ));
         }
@@ -1899,8 +2012,10 @@ pub struct EmpyreanTaggedCovariance {
     /// `EMPYREAN_COVARIANCE_QUALITY_*`.
     pub quality: u8,
     /// `min_eig` for INDEFINITE / REPAIRED; `f64::NAN` for
-    /// POSITIVE_DEFINITE. **Read-only provenance** — `isnan`-guard before
-    /// any arithmetic; never feed to a clamp.
+    /// POSITIVE_DEFINITE and EXPANSION_SUSPECT (both are definite, so
+    /// there is no negative eigenvalue to report). **Read-only
+    /// provenance** — `isnan`-guard before any arithmetic; never feed to
+    /// a clamp.
     pub quality_min_eig: f64,
     /// `EMPYREAN_REPRESENTATION_*` (always CARTESIAN=0 on this accessor).
     pub representation: i32,
@@ -1918,6 +2033,18 @@ pub struct EmpyreanTaggedCovariance {
     pub solved_width: u32,
     /// `EMPYREAN_TARGET_FUNCTIONAL_*` (always CARTESIAN_STATE on this accessor).
     pub target_functional: u8,
+    /// κ_state — the block-wise quadratic/linear ratio that classified
+    /// this covariance `EMPYREAN_COVARIANCE_QUALITY_EXPANSION_SUSPECT`.
+    /// `f64::NAN` for every other quality (the measure is only computed
+    /// where the expansion validity is in question), and `f64::INFINITY`
+    /// when a zero-spread block carried a nonzero second-order
+    /// correction. **Read-only provenance** — `isnan`-guard before any
+    /// arithmetic.
+    ///
+    /// Appended at the tail of the struct deliberately: growing a
+    /// `#[repr(C)]` result at the end is the only way to extend it
+    /// without moving an existing field's offset.
+    pub quality_kappa_state: f64,
 }
 
 /// Owned series of [`EmpyreanTaggedCovariance`], one entry per output
@@ -1947,14 +2074,29 @@ fn flatten_tagged_covariance(
         CovarianceKind::SigmaPoint => (EMPYREAN_COVARIANCE_KIND_SIGMA_POINT, 0, 0),
     };
 
-    let (quality, quality_min_eig) = match tc.quality {
-        CovarianceQuality::PositiveDefinite => {
-            (EMPYREAN_COVARIANCE_QUALITY_POSITIVE_DEFINITE, f64::NAN)
-        }
+    // Every quality tag gets its own arm and its own payload slot. An
+    // `ExpansionSuspect` folded into `POSITIVE_DEFINITE` would hand the
+    // consumer a degraded covariance wearing a clean bill of health, and
+    // its κ has no meaning in the `min_eig` slot (the matrix is
+    // definite) — so it carries `quality_kappa_state` instead, with the
+    // unused slot NaN on both sides.
+    let (quality, quality_min_eig, quality_kappa_state) = match tc.quality {
+        CovarianceQuality::PositiveDefinite => (
+            EMPYREAN_COVARIANCE_QUALITY_POSITIVE_DEFINITE,
+            f64::NAN,
+            f64::NAN,
+        ),
         CovarianceQuality::Indefinite { min_eig } => {
-            (EMPYREAN_COVARIANCE_QUALITY_INDEFINITE, min_eig)
+            (EMPYREAN_COVARIANCE_QUALITY_INDEFINITE, min_eig, f64::NAN)
         }
-        CovarianceQuality::Repaired { min_eig } => (EMPYREAN_COVARIANCE_QUALITY_REPAIRED, min_eig),
+        CovarianceQuality::Repaired { min_eig } => {
+            (EMPYREAN_COVARIANCE_QUALITY_REPAIRED, min_eig, f64::NAN)
+        }
+        CovarianceQuality::ExpansionSuspect { kappa_state } => (
+            EMPYREAN_COVARIANCE_QUALITY_EXPANSION_SUSPECT,
+            f64::NAN,
+            kappa_state,
+        ),
     };
 
     let (mean_shift_prop, has_mean_shift_prop) = match tc.mean_shift_prop {
@@ -2009,6 +2151,7 @@ fn flatten_tagged_covariance(
         thrust_segments,
         solved_width,
         target_functional,
+        quality_kappa_state,
     })
 }
 
@@ -2023,6 +2166,14 @@ fn cov_series_err_code(e: &empyrean_core::propagation::CovarianceSeriesError) ->
         E::Transform(_) => EMPYREAN_TAGGED_COV_TRANSFORM,
         E::Uncertainty(_) => EMPYREAN_TAGGED_COV_UNCERTAINTY,
         E::SampleCovarianceMissing { .. } => EMPYREAN_TAGGED_COV_SAMPLE_COVARIANCE_MISSING,
+        // Both are row-addressing integrity failures the engine refuses
+        // rather than delivers. They get their own codes instead of
+        // sharing STATE_MISSING: "the row is not there" and "the row is
+        // there but belongs to a different orbit / epoch" have different
+        // remedies, and collapsing them would tell an operator to widen a
+        // coverage window when the pairing is what is wrong.
+        E::ChainOrbitCountMismatch { .. } => EMPYREAN_TAGGED_COV_CHAIN_ORBIT_COUNT_MISMATCH,
+        E::SampleRowEpochMismatch { .. } => EMPYREAN_TAGGED_COV_SAMPLE_ROW_EPOCH_MISMATCH,
     }
 }
 
@@ -3310,13 +3461,46 @@ mod srp_input_tests {
     }
 
     #[test]
-    fn nonpositive_finite_variance_is_loud() {
+    fn negative_finite_variance_is_loud() {
         let mut o = base_orbit();
         o.has_srp = 1;
         o.srp_amrat = 3.0e-3;
         o.srp_cr = 1.0;
-        o.srp_amrat_variance = -1.0e-8; // finite but ≤0 is an error, not "no prior"
+        o.srp_amrat_variance = -1.0e-8; // finite negative is nonsense, not "no prior"
         assert!(empyrean_orbit_srp_params(&o).is_err());
+    }
+
+    /// A memset(0) `EmpyreanOrbit` carries `has_srp = 0` and a `0.0`
+    /// `srp_amrat_variance` (C's zero-init default is 0.0, not NaN). The
+    /// zero-init variance must read as "absent", not as a value-field-set-
+    /// without-the-switch error — otherwise every C caller that memsets the
+    /// struct has its propagation refused (the validation C channel was
+    /// measured dead-on-arrival from exactly this). Regression for the SRP
+    /// zero-init guard.
+    #[test]
+    fn zero_init_srp_fields_are_absent() {
+        let mut o = base_orbit();
+        o.has_srp = 0;
+        o.srp_amrat = 0.0;
+        o.srp_cr = 0.0;
+        o.srp_amrat_variance = 0.0; // the memset value, not NaN
+        assert!(empyrean_orbit_srp_params(&o).unwrap().is_none());
+    }
+
+    /// `has_srp = 1` with a zero-init (`0.0`) variance applies SRP as a fixed
+    /// force (no AMRAT prior), identical to NaN — a memset caller who sets
+    /// only `has_srp` + `srp_amrat` + `srp_cr` must not have the fit refused.
+    #[test]
+    fn zero_init_variance_with_srp_is_fixed_force() {
+        let mut o = base_orbit();
+        o.has_srp = 1;
+        o.srp_amrat = 3.0e-3;
+        o.srp_cr = 1.2;
+        o.srp_amrat_variance = 0.0; // zero-init ⇒ no prior, not a loud error
+        let srp = empyrean_orbit_srp_params(&o).unwrap().unwrap();
+        assert_eq!(srp.amrat, 3.0e-3);
+        assert_eq!(srp.cr, 1.2);
+        assert!(srp.amrat_variance.is_none());
     }
 }
 
@@ -3407,5 +3591,143 @@ mod non_grav_input_tests {
         let mut o = base_orbit();
         o.a2 = -3.0e-14;
         assert!(empyrean_orbit_non_grav_params(&o).is_some());
+    }
+}
+
+/// The `ephemeris_overlap_policy` ABI surface. The field, its constants, and its
+/// mapping ship together with the engine flag they select, so these pin
+/// the whole contract: the memset(0) default is the historical
+/// behaviour, both variants resolve, and an unknown value is refused
+/// rather than quietly resolved.
+#[cfg(test)]
+mod overlap_policy_tests {
+    use super::*;
+
+    /// `memset(0)` must keep meaning "what the engine did before the
+    /// field existed" — a config nobody touched cannot change behaviour.
+    #[test]
+    fn zero_is_the_historical_behaviour() {
+        assert_eq!(EMPYREAN_EPHEMERIS_OVERLAP_POLICY_SUBSTITUTE_SPK, 0);
+        assert_eq!(
+            int_to_ephemeris_overlap_policy(EMPYREAN_EPHEMERIS_OVERLAP_POLICY_SUBSTITUTE_SPK)
+                .expect("0 resolves"),
+            EphemerisOverlapPolicy::SubstituteSpk
+        );
+        assert_eq!(
+            EphemerisOverlapPolicy::default(),
+            EphemerisOverlapPolicy::SubstituteSpk,
+            "the ABI zero must agree with the engine's own default"
+        );
+    }
+
+    /// The variant the earlier ABI had to refuse: the engine flag has
+    /// shipped, so it now resolves rather than erroring.
+    #[test]
+    fn exclude_and_integrate_resolves() {
+        assert_eq!(
+            int_to_ephemeris_overlap_policy(
+                EMPYREAN_EPHEMERIS_OVERLAP_POLICY_EXCLUDE_AND_INTEGRATE
+            )
+            .expect("EXCLUDE_AND_INTEGRATE is supported by this engine build"),
+            EphemerisOverlapPolicy::ExcludeAndIntegrate
+        );
+    }
+
+    #[test]
+    fn an_unknown_policy_is_refused_by_value() {
+        let err =
+            int_to_ephemeris_overlap_policy(7).expect_err("an unknown policy must not be accepted");
+        assert!(err.contains('7'), "error names the value: {err}");
+        assert!(
+            err.contains("SUBSTITUTE_SPK") && err.contains("EXCLUDE_AND_INTEGRATE"),
+            "error names the accepted values: {err}"
+        );
+    }
+
+    /// The mapping runs inside the shared converter, so it covers every
+    /// entry point — including the ephemeris path, which routes through
+    /// this function.
+    #[test]
+    fn the_shared_converter_carries_the_policy() {
+        let mut c: EmpyreanPropagationConfig = unsafe { std::mem::zeroed() };
+        c.advanced.dt_initial = f64::NAN;
+        c.advanced.dt_min = f64::NAN;
+        let cfg = build_propagation_config_from_c(&c).expect("a zeroed config converts");
+        assert_eq!(
+            cfg.ephemeris_overlap_policy,
+            EphemerisOverlapPolicy::SubstituteSpk
+        );
+
+        c.ephemeris_overlap_policy = EMPYREAN_EPHEMERIS_OVERLAP_POLICY_EXCLUDE_AND_INTEGRATE;
+        let cfg = build_propagation_config_from_c(&c).expect("EXCLUDE_AND_INTEGRATE converts");
+        assert_eq!(
+            cfg.ephemeris_overlap_policy,
+            EphemerisOverlapPolicy::ExcludeAndIntegrate,
+            "the policy must reach PropagationConfig, not just validate"
+        );
+
+        c.ephemeris_overlap_policy = 7;
+        // `PropagationConfig` carries no `Debug`, so take the message the
+        // long way rather than through `expect_err`.
+        match build_propagation_config_from_c(&c) {
+            Ok(_) => panic!("an unknown policy must fail the shared converter"),
+            Err(e) => assert!(e.contains('7'), "{e}"),
+        }
+    }
+}
+
+/// The `EMPYREAN_COVARIANCE_QUALITY_*` and `EMPYREAN_TAGGED_COV_*`
+/// surfaces that grew when the engine added an expansion-validity tag and
+/// two row-addressing integrity errors.
+#[cfg(test)]
+mod covariance_quality_tag_tests {
+    use super::*;
+
+    /// The new tag must not collide with the three that shipped, and must
+    /// be distinct from them — folding it into POSITIVE_DEFINITE would
+    /// hand consumers a degraded covariance wearing a clean bill of
+    /// health.
+    #[test]
+    fn the_quality_tags_are_distinct() {
+        let tags = [
+            EMPYREAN_COVARIANCE_QUALITY_POSITIVE_DEFINITE,
+            EMPYREAN_COVARIANCE_QUALITY_INDEFINITE,
+            EMPYREAN_COVARIANCE_QUALITY_REPAIRED,
+            EMPYREAN_COVARIANCE_QUALITY_EXPANSION_SUSPECT,
+        ];
+        for (i, a) in tags.iter().enumerate() {
+            for b in &tags[i + 1..] {
+                assert_ne!(a, b, "quality tags must be distinct");
+            }
+        }
+        assert_eq!(
+            EMPYREAN_COVARIANCE_QUALITY_EXPANSION_SUSPECT, 3,
+            "appended after the three shipped tags"
+        );
+    }
+
+    /// The two new series errors get their own codes rather than sharing
+    /// STATE_MISSING: "the row is not there" and "the row belongs to a
+    /// different orbit / epoch" have different remedies.
+    #[test]
+    fn the_series_error_codes_are_distinct() {
+        let codes = [
+            EMPYREAN_TAGGED_COV_ORBIT_INDEX_OUT_OF_RANGE,
+            EMPYREAN_TAGGED_COV_NO_INITIAL_COVARIANCE,
+            EMPYREAN_TAGGED_COV_NO_DENSE_TRAJECTORY,
+            EMPYREAN_TAGGED_COV_STATE_MISSING,
+            EMPYREAN_TAGGED_COV_TRANSFORM,
+            EMPYREAN_TAGGED_COV_UNCERTAINTY,
+            EMPYREAN_TAGGED_COV_EPOCH_INDEX_OUT_OF_RANGE,
+            EMPYREAN_TAGGED_COV_SAMPLE_COVARIANCE_MISSING,
+            EMPYREAN_TAGGED_COV_CHAIN_ORBIT_COUNT_MISMATCH,
+            EMPYREAN_TAGGED_COV_SAMPLE_ROW_EPOCH_MISMATCH,
+        ];
+        for (i, a) in codes.iter().enumerate() {
+            for b in &codes[i + 1..] {
+                assert_ne!(a, b, "tagged-covariance error codes must be distinct");
+            }
+            assert!(*a < 0, "every failure code is negative");
+        }
     }
 }

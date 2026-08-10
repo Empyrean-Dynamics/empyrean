@@ -24,6 +24,8 @@ from pathlib import Path
 import pytest
 from empyrean import determine, generate_ephemeris, read_ades
 from empyrean.observers.observers import Observers
+from empyrean.od.ades_observations import ADESObservations
+from empyrean.od.determine import _seed_labels
 from empyrean.od.result import ODConfig, PhotometryConfig
 
 DATA_DIR = Path(__file__).parent / "fixtures"
@@ -40,7 +42,7 @@ def apophis_observations():
 
 def test_determine_fitted_orbit_carries_identity(apophis_observations):
     """An unseeded fit derives its object id from the observations."""
-    fit = determine(apophis_observations)
+    fit = determine(apophis_observations).single()
     assert fit.converged
     object_id = fit.orbit.object_id.to_pylist()
     orbit_id = fit.orbit.orbit_id.to_pylist()
@@ -50,15 +52,63 @@ def test_determine_fitted_orbit_carries_identity(apophis_observations):
 
 def test_determine_seeded_inherits_seed_identity(apophis_observations):
     """A seeded fit inherits the seed's object id (the initial_orbits key)."""
-    seed = determine(apophis_observations).orbit
-    fit = determine(apophis_observations, initial_orbits={"my-apophis": seed})
+    seed = determine(apophis_observations).single().orbit
+    fit = determine(apophis_observations, initial_orbits={"my-apophis": seed}).single()
     assert fit.orbit.object_id.to_pylist()[0] == "my-apophis"
+
+
+def _ades_rows(ids: list[tuple[str | None, str | None, str | None]]) -> ADESObservations:
+    """Minimal ADES table carrying only the three identifier columns."""
+    n = len(ids)
+    return ADESObservations.from_kwargs(
+        perm_id=[p for p, _, _ in ids],
+        prov_id=[v for _, v, _ in ids],
+        trk_sub=[t for _, _, t in ids],
+        stn=["500"] * n,
+        obs_time=["2024-01-01T00:00:00Z"] * n,
+        ra=[0.0] * n,
+        dec=[0.0] * n,
+    )
+
+
+def test_seed_labels_pair_positionally_with_first_appearance_groups():
+    """The seed-key pairing that carries a caller's id onto the fit.
+
+    ``initial_orbits`` is keyed in Python but crosses the C ABI as a bare
+    array, so ``empyrean_determine`` pairs the i-th seed with the i-th
+    unique ADES object id in first-appearance order. ``_seed_labels``
+    reconstructs that pairing; if it drifts from the engine's rule a
+    seeded batch fit gets labelled with the *wrong* caller's id, which is
+    worse than not relabelling at all. Pin the rule directly — the
+    Apophis contract above only covers the one-object, one-seed case.
+    """
+    observations = _ades_rows(
+        [
+            ("99942", "2004 MN4", "4X4E25A"),  # permID wins
+            ("", "2024 YR4", "K24Y04R"),  # empty permID falls through to provID
+            ("99942", None, None),  # repeat: must not open a new group
+            (None, None, "TRK-ONLY"),  # trkSub is the last resort
+            (None, None, None),  # no identifier at all
+        ]
+    )
+    groups = ["99942", "2024 YR4", "TRK-ONLY", "unknown"]
+    all_labelled = dict(zip(groups, ["a", "b", "c", "d"], strict=True))
+
+    # One seed labels the first group only; the rest keep their ADES id.
+    assert _seed_labels(observations, ["my-apophis"]) == {"99942": "my-apophis"}
+
+    # Seeds pair in order, across the precedence and the repeat.
+    assert _seed_labels(observations, ["a", "b", "c", "d"]) == all_labelled
+
+    # A seed beyond the last group has nothing to label (the engine reports
+    # it in `unmatched_orbit_ids`); it must not shift the others.
+    assert _seed_labels(observations, ["a", "b", "c", "d", "e"]) == all_labelled
 
 
 def test_fitted_orbit_predicts_magnitudes(apophis_observations):
     """The post-OD photometric fit is attached to the fitted orbit, so an
     ephemeris generated from that orbit predicts real (non-null) magnitudes."""
-    fit = determine(apophis_observations, config=ODConfig(photometry=PhotometryConfig()))
+    fit = determine(apophis_observations, config=ODConfig(photometry=PhotometryConfig())).single()
     assert fit.converged
     assert fit.photometry is not None, "photometric fit did not run"
 

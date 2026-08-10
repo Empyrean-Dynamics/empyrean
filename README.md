@@ -56,7 +56,7 @@ bodies like asteroids and comets, with plans to extend to cislunar space.
 | CLI    | `cargo install empyrean-cli` (or grab a binary from [Releases](https://github.com/Empyrean-Dynamics/empyrean/releases)) |
 | C      | download `libempyrean-<target>.tar.gz` from [Releases](https://github.com/Empyrean-Dynamics/empyrean/releases) — ships the shared library, `empyrean.h`, and LICENSE |
 
-Current release: **0.9.0** — see the [CHANGELOG](CHANGELOG.md).
+Current release: **0.10.0-rc.0** (release candidate) — see the [CHANGELOG](CHANGELOG.md).
 
 Prebuilt binaries — the engine cdylib, the CLI, and the Python wheels —
 target four platforms: macOS arm64 (`macos-aarch64`), macOS x86_64
@@ -74,6 +74,28 @@ All channels pull from the same published cdylib. Run `empyrean version`
 it was built against. For per-run reproducibility, a built system
 handle's `describe()` additionally reports the force-model menu and the
 SHA-256 identity of every kernel that run loaded.
+
+## Channels
+
+Four bindings, one engine binary. The same call makes the same numbers
+wherever you make it; what differs is reach.
+
+| | Python | Rust | C | CLI |
+|---|:--:|:--:|:--:|:--:|
+| Propagation, ephemeris generation, orbit determination | ● | ● | ● | ● |
+| Multi-object `determine` keyed by ADES designation | ● | ● | ● | ● |
+| Iterative `Session` refit — mask / refine / diff | ● | ● | ● | — |
+| Impact probability + B-plane geometry | ● | ● | ● | — |
+| Reusable built-system handle + `describe()` provenance | ● | ● | ● | — |
+| JPL SBDB / Horizons / MPC lookups | ● | ● | ● | ◐ |
+| Strict-offline context construction | ● | ● | ● | ● |
+| Ephemeris overlap policy — SB441-N16 self-perturbers | ● | ● | ● | — |
+| Observation planning — optical + radar candidates | — | — | ● | — |
+| `empyrean show` output browser | — | — | — | ● |
+
+◐ The CLI resolves an SBDB orbit through `--object-id` and Horizons
+state vectors through `empyrean query horizons-vectors`; the MPC
+astrometry and radar lookups are library-side.
 
 ## Quickstart
 
@@ -150,7 +172,8 @@ empyrean init
 # On an air-gapped machine, --no-refresh never touches the network: it
 # loads what --data-dir already holds and fails naming every absent file
 # rather than downloading or quietly loading less. Accepted on every
-# command; `empyrean init --no-refresh` is a pure verifier.
+# command; here it turns init into a pure verifier. See "Data and
+# offline operation" below.
 empyrean --no-refresh init
 
 # Propagate Apophis 10 years past its SBDB epoch (epoch ≈ 61269 → 64922 MJD TDB).
@@ -159,6 +182,9 @@ empyrean propagate --object-id 99942 --epoch 64922.0 --out-dir ./out
 # Inspect the result Parquet — states + events tables, both with the
 # same orbit_id / object_id keys you can join in pandas / Polars / DuckDB.
 ls out/    # states.parquet  events.parquet
+
+# Or page through them without leaving the terminal.
+empyrean show ./out
 ```
 
 ### Ephemeris
@@ -238,12 +264,25 @@ returns its non-fatal warnings — an Earth-orientation kernel coverage
 gap bridged by the analytic IAU 2006 fallback, a row whose sensitivity
 chain was skipped — so a silent run is a clean run.
 
+One case needs a deliberate choice: generating an ephemeris for one of
+the sixteen SB441-N16 bodies (1 Ceres, 2 Pallas, 4 Vesta, 7 Iris, …),
+which at Standard tier are simultaneously the target and part of the
+force model. The default `ephemeris_overlap_policy` returns the body's
+own SPK states and integrates nothing, so the call fails for want of a
+dense trajectory. Set the policy to `exclude_and_integrate` (or name
+the body in `excluded_perturbers`) and the overlapped perturber is
+dropped from the force model, your initial conditions are integrated,
+and the overlap is reported. It lives on the propagation config, so
+Python, Rust, and C all reach it; the CLI exposes no flag for it.
+
 ### Orbit determination (with `Session`)
 
-Fit Apophis's orbit from its full MPC astrometric arc; iterate with
-`Session` to mask a noisy night and compare χ² / DOF before vs after.
-The CLI exposes the one-shot pipeline; the `Session` workflow is
-Python / Rust only.
+Fit Apophis's orbit from its full MPC astrometric arc — optical and
+radar together — then iterate with `Session` to mask a noisy night and
+compare χ² / DOF before vs after. `determine` is multi-object at every
+layer: hand it an ADES set covering many designations and it returns one
+result per object, keyed by designation. The CLI exposes the one-shot
+pipeline; the `Session` workflow is Python, Rust, and C.
 
 #### Python
 
@@ -253,15 +292,23 @@ import empyrean
 empyrean.initialize()
 
 # 1. One-shot: read ADES PSV, run Gauss + Herget IOD + N-body DC + rejection.
-obs, _radar = empyrean.read_ades("apophis.psv")
-fits = empyrean.determine(obs)          # every object in the file
-result = fits.single()                   # one object in, one fit out
+#    A file's radar block is folded into the same fit as the astrometry.
+obs, radar = empyrean.read_ades("apophis.psv")
+fits = empyrean.determine(obs, radar=radar)   # every object in the file
+result = fits.single()                        # one object in, one fit out
 print(
     f"χ²/dof = {result.summary.reduced_chi2:.3f}, "
     f"RMS = {result.summary.rms_combined_arcsec:.3f}\""
 )
 
-# 2. Iterative: mask a noisy night, re-fit, diff χ² against the initial run.
+# 2. A many-object file indexes by ADES designation. Every input object
+#    gets a .summary row whether or not it produced an orbit, and a failed
+#    object carries a typed reason instead of aborting the batch.
+print(f"{len(fits.delivered)} of {len(fits)} delivered")
+for object_id, failure in fits.failures.items():
+    print(f"  {object_id}: {failure.kind} — {failure.message}")
+
+# 3. Iterative: mask a noisy night, re-fit, diff χ² against the initial run.
 sess = empyrean.Session.from_observations(obs)
 sess.refine()                                  # initial fit → history[0]
 
@@ -282,9 +329,16 @@ use empyrean::{Context, ODConfig, Session};
 let ctx = Context::from_data_dir(None)?;
 let cfg = ODConfig::default();
 
-// 1. One-shot.
+// 1. One-shot. `determine` fits every object the file groups into;
+//    `into_single` unwraps the one-object case and refuses — naming
+//    them — rather than choosing among several.
 let obs = ctx.read_ades("apophis.psv")?;
-let result = ctx.determine(&obs, None, &cfg)?.into_single()?;
+let batch = ctx.determine(&obs, None, &cfg)?;
+println!("{} of {} object(s) delivered", batch.delivered_count(), batch.len());
+for f in batch.failures() {
+    println!("  {}: {}", f.object_id, f.message);
+}
+let result = batch.into_single()?;
 println!("χ²/dof = {:.3}", result.summary.reduced_chi2);
 
 // 2. Iterative: build a session over the same arc, find the noisy
@@ -318,21 +372,39 @@ println!(
 
 ```sh
 empyrean determine apophis.psv --out-dir ./out
-ls out/    # fitted_orbits.parquet  fit_summary.parquet  fit_summary.csv  residuals.parquet
+ls out/    # fit_summary.csv  fit_summary.parquet  fitted_orbits.parquet  residuals.parquet
+
+# stderr carries a per-object table — converged, iterations, RA / Dec RMS,
+# observations contributed and kept, and both acceptability verdicts —
+# with every failure named in full underneath it. The exit code is the
+# batch's verdict: 0 when every object delivered, 3 when some did,
+# 4 when none did.
+echo $?
 ```
 
 Determination is batch-first at every layer: the ADES file is grouped by
 object identifier and every object is fitted, so the CLI emits sibling
 tables — the fitted orbits (state + covariance + any fitted
-non-gravitational parameters, one row per delivered object), a
-per-object fit summary covering every *input* object whether or not it
-produced an orbit, and the per-observation residuals tagged with the
-object they belong to. Every table is written whole — the residual file
-carries the full per-observation surface (join keys, rejection
-attribution, influence diagnostics, sky-motion decomposition), and CSV
-carries the same columns as parquet rather than a lossy projection of
-them. Join them in pandas / Polars / DuckDB the same way you would the
-propagation / ephemeris outputs.
+non-gravitational parameters, one row per delivered object, keyed by its
+ADES designation), a per-object fit summary covering every *input* object
+whether or not it produced an orbit, and the per-observation residuals
+carrying an `object_id` column so a flat table across a batch stays
+attributable. `fit_summary` is always written as both parquet and CSV,
+whatever `--format` says, so a partially successful batch can be read at
+a terminal without a parquet tool. Join them in pandas / Polars / DuckDB
+the same way you would the propagation / ephemeris outputs.
+
+Every table is written whole. The residual file carries the complete
+36-field per-observation surface — the `obs_id` / `object_id` join keys,
+observatory code, catalog and epoch, the effective residual covariances,
+the entire typed rejection block (reason, criterion, threshold, effective
+threshold, information loss), the influence diagnostics, the
+along / cross-track decomposition, and the radar block — in parquet, CSV,
+and JSON alike, all three emitted from one column table so they cannot
+disagree. The fitted-orbit CSV carries the same 82-column schema as the
+parquet, covariance included, rather than a lossy projection of it; a
+batch whose wide cross-covariance the row schema cannot express is
+refused rather than written short.
 
 Residual rows are typed by observable. Optical rows carry the RA / Dec
 and along / cross-track residuals with the track-frame pair's full
@@ -341,6 +413,42 @@ and along / cross-track residuals with the track-frame pair's full
 survival probability, and combined variance. Every row also reports
 its D-optimality information loss on removal — +∞ marks an
 observation the fit cannot do without.
+
+No observation is ever dropped without saying why. Every row carries a
+typed `rejection_reason` — `accepted`, `chi_squared`, `sigma_clip`,
+`cooks_distance`, `adaptive`, `cmc2003`, `unsupported_observatory`,
+`outside_arc`, `non_finite_chi2`, `missing_jacobian`, and the rest —
+written as a name rather than an integer code, alongside the criterion
+value that was tested, the threshold it was tested against, and the
+effective threshold when the adaptive layer set one.
+
+Both acceptability verdicts travel with the fit and reach the files.
+`fit_acceptable` is the fit-quality gate; `extrapolation_acceptable` is
+that AND four forward-propagation axes, each writing its own boolean,
+measured value, and threshold: the fraction of observations retained,
+the span the selected observations still cover, the gap between the last
+selected and the last available observation, and σₐ / |a|. A fit that is
+not safe to propagate therefore says *which* axis failed — a heavily
+pruned arc, a selected span that no longer covers the requested one, a
+rejected recent tail — rather than only that it is not. A quantity that
+could not be computed is NaN, never `0.0`, which would read as a
+measurement at the floor.
+
+Underneath, the fit is the engine's, and three of its lanes are what
+carry the hard objects. Optical and radar are solved together rather
+than in sequence — radar rows are grouped by the same object identifier
+and folded into that object's fit, so delay and Doppler tighten the same
+covariance the astrometry does. A co-orbital IOD lane seeds the
+Earth-Trojan-class geometries (2010 TK7, 2020 XL5) the classical cascade
+does not reach; it fires only when every co-orbitality gate passes, and
+`coorbital_enabled` on the OD config turns it off. And the
+outward-expansion pipeline escalates across the dynamical discontinuities
+that break a long comet arc, delivering the full arc where it can and
+tagging what it could not reconcile `outside_arc` where it cannot — set
+`allow_arc_truncation` to false and that fallback becomes a loud failure
+instead of a partial fit. Observation weights default to the VFCC2017
+station floors (Vereš, Farnocchia, Chesley & Chamberlin 2017) with
+nightly de-weighting.
 
 Beyond the six-element state, `determine` and `refine` solve a wider
 parameter set — the Marsden A1/A2/A3 non-gravitational coefficients,
@@ -375,15 +483,76 @@ Magnitudes in bands with no adopted V-band conversion are excluded,
 counted, and their band codes listed — the observations' astrometry
 is unaffected.
 
+### Reading the outputs back
+
+Every pipeline command writes Parquet / CSV / JSON, and `empyrean show`
+reads them at a terminal. It only reads files: no kernels, no engine, so
+it works on a machine that has the CLI and nothing else, and on files
+copied off a cluster.
+
+```sh
+# Point it at an output directory: it lists what is there — file, rows,
+# size, and what each artifact holds — then asks which one to open.
+empyrean show ./out
+
+# Or name a file. It streams a page at a time, so a multi-million-row
+# residual table draws its first screen immediately.
+empyrean show out/residuals.parquet
+
+# In the pager: space / b page, ←/→ slide the column window over a wide
+# table, / filters rows, Esc clears the filter, q quits.
+empyrean show out/fitted_orbits.parquet
+
+# Or narrow it up front. --columns subsets and reorders, --limit caps
+# rows, --full-precision prints every digit so a value round-trips to
+# the same f64.
+empyrean show out/fit_summary.csv \
+  --columns object_id,status,reduced_chi2,extrapolation_acceptable --limit 20
+
+# Piped, it stops paging and writes the whole table as aligned text with
+# nothing truncated — so it composes.
+empyrean show out/residuals.parquet | grep missing_jacobian | head
+```
+
+## Data and offline operation
+
+`empyrean init` (CLI), `empyrean.download_data()` (Python), and
+`empyrean::download_data` (Rust) provision a data directory: files
+already present are kept and only the missing ones are fetched, so
+re-running costs nothing. On Python, kernels supplied by installed data
+packages are staged with no network access at all.
+
+A context can then be built with the network switched off. Strict
+offline resolves the tier's kernel set from the data directory alone and
+fails, **naming every absent file**, if any is missing — there is no
+try-the-network-and-tolerate path and no quiet degrade to a lower tier.
+The absent names come back as a list rather than as prose:
+`Error::missing_data_files()` in Rust, a `missing_data_files` attribute
+on the `FileNotFoundError` Python raises, `empyrean_missing_data_files()`
+in C. It is reachable on every channel — `initialize(refresh=False)`
+(Python), `Context::from_data_dir_with` with `DataDirOptions` (Rust),
+`empyrean_context_from_data_dir_with` with `EmpyreanDataDirOptions` (C),
+and the global `--no-refresh` flag on every CLI command, where
+`empyrean init --no-refresh` becomes a pure verifier that downloads
+nothing and reports exactly what the directory lacks.
+
+`EMPYREAN_OFFLINE=1` in the environment is a floor, not a switch: it
+downgrades a requested refresh to off and announces it on stderr, and it
+can only ever remove network access, never restore it.
+
 ## Validation
 
-Every release is validated against JPL Horizons, ASSIST,
-and `find_orb` on 43 objects across 13 dynamical populations (NEOs,
-MBAs, Trojans, TNOs, comets, and more). Propagated states agree with
-JPL Horizons at the sub-meter level on bounded timescales, and orbit
-determination results are cross-checked against `find_orb` fits and
-JPL SBDB solutions. Per-release changes are tracked in the
-[CHANGELOG](CHANGELOG.md).
+Every release is validated against JPL Horizons, ASSIST, `find_orb`,
+GRSS, and OpenOrb on a curated catalog of 50 objects across 13
+dynamical populations — NEOs, MBAs, SB441-N16 self-perturbers, Jupiter
+/ Neptune / Earth Trojans, TNOs, Centaurs, comets, interstellar objects,
+temporarily-captured objects, confirmed impactors, and short-arc NEOs.
+The same plan runs through all four channels, so cross-channel parity is
+measured rather than assumed. Propagated states agree with JPL Horizons
+at the sub-meter level on bounded timescales; orbit determination
+results are cross-checked against `find_orb` fits and JPL SBDB
+solutions, and radar delay / Doppler residuals against GRSS. Per-release
+changes are tracked in the [CHANGELOG](CHANGELOG.md).
 
 ## Citing
 

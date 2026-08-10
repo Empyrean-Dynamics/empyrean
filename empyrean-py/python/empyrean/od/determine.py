@@ -748,16 +748,27 @@ def determine(
             initial_orbits_dict[oid] = _orbits_to_dict(orbit)
 
     batch = _determine(obs_dict, config._to_wire_dict(), initial_orbits_dict, radar_dict)
-    return _build_determine_results(batch)
+    seed_labels = _seed_labels(observations, list(initial_orbits)) if initial_orbits else {}
+    return _build_determine_results(batch, seed_labels)
 
 
-def _build_determine_results(batch: ResultDict) -> DetermineResults:
+def _build_determine_results(
+    batch: ResultDict,
+    seed_labels: dict[str, str] | None = None,
+) -> DetermineResults:
     """Assemble :class:`DetermineResults` from the Rust batch dict.
 
     Every entry becomes a summary row; delivered entries additionally
     contribute an orbit row and their residual rows. Nothing is dropped
     on the way across — a failed object is a row, not an absence.
+
+    ``seed_labels`` maps an ADES group id to the ``initial_orbits`` key
+    that seeded it (see :func:`_seed_labels`); a seeded fit is delivered
+    under that key rather than the ADES designation the engine returns.
+    The batch is still *indexed* by the ADES id — the relabelling applies
+    to the fitted orbit's own identity, which is what flows downstream.
     """
+    seed_labels = seed_labels or {}
     results: dict[str, DetermineResult] = {}
     failures: dict[str, DetermineFailure] = {}
     summary_rows: list[dict[str, Any]] = []
@@ -767,9 +778,10 @@ def _build_determine_results(batch: ResultDict) -> DetermineResults:
     for entry in batch["objects"]:
         object_id = str(entry["object_id"])
         if entry.get("delivered"):
-            # The C ABI leaves the fitted orbit's identity empty; the
-            # batch key is the real one, so re-attach it before building.
-            _inject_identity(entry, object_id)
+            # The C ABI leaves the fitted orbit's identity empty. A seeded
+            # fit takes the caller's seed key; otherwise the batch key (the
+            # ADES designation) is the real one. Re-attach before building.
+            _inject_identity(entry, seed_labels.get(object_id, object_id))
             fit = _build_determine_result(entry)
             results[object_id] = fit
             orbit_tables.append(fit.orbit)
@@ -1097,6 +1109,40 @@ def _object_id_from_observations(observations: ADESObservations) -> str | None:
             if value:
                 return str(value)
     return None
+
+
+def _seed_labels(
+    observations: ADESObservations,
+    seed_keys: list[str],
+) -> dict[str, str]:
+    """Map each seeded observation group's ADES id to the caller's seed key.
+
+    ``initial_orbits`` is a keyed map in Python, but the seeds cross the C
+    ABI as a bare array: ``empyrean_determine`` pairs the i-th seed with
+    the i-th unique ADES object id encountered in the observations, in
+    first-appearance order. The caller's key never reaches the engine, so
+    the fit comes back stamped with the ADES designation.
+
+    Reconstructing that pairing here lets a seeded fit be delivered under
+    the key its caller supplied — the identity the pre-batch single-object
+    path attached (``next(iter(initial_orbits))``) and the one downstream
+    propagate / ephemeris calls are expected to see.
+
+    The group key follows the engine's precedence exactly (``permID``,
+    else ``provID``, else ``trkSub``, else ``"unknown"``); a group with no
+    matching seed is absent from the result and keeps its ADES identity.
+    """
+    groups: list[str] = []
+    for perm, prov, trk in zip(
+        observations.perm_id.to_pylist(),
+        observations.prov_id.to_pylist(),
+        observations.trk_sub.to_pylist(),
+        strict=True,
+    ):
+        key = perm or prov or trk or "unknown"
+        if key not in groups:
+            groups.append(key)
+    return dict(zip(groups, seed_keys, strict=False))
 
 
 def _orbit_identity(orbit: AnyOrbits) -> str | None:

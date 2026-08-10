@@ -6,6 +6,10 @@ project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+(Nothing yet.)
+
+## [0.10.0-rc.0] — 2026-08-09
+
 C ABI version **3**. Three exported functions change signature, one is
 added, and six struct sizes change (four grow directly;
 `EmpyreanEphemerisConfig` grows by embedding one of them, and

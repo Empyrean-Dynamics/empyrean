@@ -66,6 +66,18 @@ APOPHIS_IP_END_MJD_TDB = 62260.0  # ~2029-05-04
 APOPHIS_2029_MISS_KM_LO = 30_000.0
 APOPHIS_2029_MISS_KM_HI = 45_000.0
 
+# Area-to-mass prior for the explicit-AMRAT solve, in m²/kg. For a sphere
+# A/M = 3 / (4 r ρ); at Apophis's ~340 m diameter and an S-type bulk
+# density of ~3.2 g/cm³ that is ~1.4e-6 m²/kg. The prior is centred there
+# with a 1σ of a third of the mean — loose enough that the arc, not the
+# prior, sets the solution, and physical enough that the fitted delta does
+# not fold the base AMRAT through zero. (A 1e-4 m²/kg seed with a 1σ ten
+# times its own mean does: it is a ~2 m body under no constraint, and the
+# solve crosses zero and meets scott's refuse-not-clamp guard. That is the
+# subject of test_non_physical_amrat_solve_refuses below.)
+_APOPHIS_AMRAT = 1.5e-6
+_APOPHIS_AMRAT_SIGMA = 5.0e-7
+
 
 @pytest.fixture(scope="module")
 def apophis_observations():
@@ -354,13 +366,21 @@ def test_explicit_flag_solve_result_unwraps(apophis_fit, apophis_observations):
     ``_build_determine_result`` *after* the differential correction had
     already converged. This guards every ``SolveFor(amrat=…)`` / ``dt=…``
     fit through the high-level API.
+
+    The AMRAT prior is Apophis-physical (see :data:`_APOPHIS_AMRAT`) so the
+    solve reaches the unwrap this test exists to exercise. The refusal that
+    a non-physical solve raises is covered by
+    :func:`test_non_physical_amrat_solve_refuses`.
     """
-    # Attach a loose AMRAT prior so SolveFor(amrat=True) opens the SRP column.
     primed = CartesianOrbits.from_kwargs(
         orbit_id=apophis_fit.orbit.orbit_id.to_pylist(),
         object_id=apophis_fit.orbit.object_id.to_pylist(),
         coordinates=apophis_fit.orbit.coordinates,
-        srp=SRPParams.from_kwargs(amrat=[1.0e-4], cr=[1.0], amrat_variance=[(1.0e-3) ** 2]),
+        srp=SRPParams.from_kwargs(
+            amrat=[_APOPHIS_AMRAT],
+            cr=[1.0],
+            amrat_variance=[_APOPHIS_AMRAT_SIGMA**2],
+        ),
     )
     config = ODConfig(solve_for_flags=SolveFor(amrat=True))
     result = refine(primed, apophis_observations, config=config)
@@ -368,6 +388,38 @@ def test_explicit_flag_solve_result_unwraps(apophis_fit, apophis_observations):
     # The explicit AMRAT axis opened its column.
     assert result.solved_covariance is not None
     assert result.solved_covariance.amrat_slot is not None
+    # And the solve stayed physical, so the unwrap above is what was tested
+    # (not a refusal that happened to raise before reaching it).
+    assert result.orbit.srp.amrat.to_pylist()[0] > 0.0
+
+
+def test_non_physical_amrat_solve_refuses(apophis_fit, apophis_observations):
+    """A non-physical AMRAT solve refuses with a typed error, not a clamp.
+
+    Seeded with an area-to-mass ratio two orders of magnitude too large for
+    a ~340 m body and a prior so wide it constrains nothing (sigma ten
+    times the mean), the differential correction folds an unconstrained
+    delta onto the base AMRAT and crosses zero. scott refuses rather than
+    clamping — a clamp would silently change the solve and hand back a
+    converged-looking fit built on an impossible body.
+
+    The companion of :func:`test_explicit_flag_solve_result_unwraps`: that
+    one pins the success path through the same explicit-flag machinery,
+    this one pins that the refusal reaches Python intact — as an exception
+    naming the offending value, not a NaN or a silently clamped fit.
+    """
+    unconstrained = CartesianOrbits.from_kwargs(
+        orbit_id=apophis_fit.orbit.orbit_id.to_pylist(),
+        object_id=apophis_fit.orbit.object_id.to_pylist(),
+        coordinates=apophis_fit.orbit.coordinates,
+        srp=SRPParams.from_kwargs(amrat=[1.0e-4], cr=[1.0], amrat_variance=[(1.0e-3) ** 2]),
+    )
+    config = ODConfig(solve_for_flags=SolveFor(amrat=True))
+    with pytest.raises(RuntimeError, match="non-physical area-to-mass ratio") as excinfo:
+        refine(unconstrained, apophis_observations, config=config)
+    # The refusal carries the value it refused, so the caller can see how
+    # far off the solve went without re-running it.
+    assert "-" in str(excinfo.value), f"refusal did not report the negative value: {excinfo.value}"
 
 
 def test_marsden_solve_seeds_from_zero_coefficients(apophis_fit, apophis_observations):

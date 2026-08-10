@@ -109,6 +109,7 @@ fn orbit_batch(n: usize) -> OrbitBatch {
 fn base_residual() -> ObservationResidual {
     ObservationResidual {
         obs_id: String::new(),
+        object_id: None,
         obs_code: "500".into(),
         ast_cat: None,
         epoch: Epoch::from_mjd_tdb(60000.0),
@@ -189,13 +190,12 @@ fn piped_csv_streams_the_whole_table_aligned() {
     let path = dir.path().join("states.csv");
     write_orbits_csv(&path, &orbit_batch(2)).unwrap();
 
-    let (stdout, stderr, ok) =
-        show(&[path.to_str().unwrap(), "--columns", "orbit_id,object_id,e0"]);
+    let (stdout, stderr, ok) = show(&[path.to_str().unwrap(), "--columns", "orbit_id,object_id,x"]);
     assert!(ok, "show failed: {stderr}");
     assert_eq!(
         lines(&stdout),
         vec![
-            "orbit_id  object_id  e0",
+            "orbit_id  object_id  x",
             "orb0      99940      1",
             "orb1                 2",
         ],
@@ -486,19 +486,22 @@ fn an_empty_table_prints_a_header_and_zero_rows() {
     assert!(ok, "an empty table must not fail: {stderr}");
     assert_eq!(lines(&stdout), vec!["chi2  selected", "0 rows"]);
 
-    // An empty CSV is a zero-byte file: the writer emits no header, so
-    // there is no schema to select from. It still reads as an empty
-    // table rather than failing.
+    // The residual CSV writer emits its full header even for zero rows
+    // (column-set parity with parquet), so an empty table is a header
+    // line and no data. It reads as an empty table rather than failing.
     let csv = dir.path().join("residuals.csv");
     write_residuals_csv(&csv, &[]).unwrap();
-    assert_eq!(std::fs::read(&csv).unwrap().len(), 0);
-    let (stdout, stderr, ok) = show(&[csv.to_str().unwrap()]);
+    assert!(!std::fs::read(&csv).unwrap().is_empty(), "header expected");
+    let (stdout, stderr, ok) = show(&[csv.to_str().unwrap(), "--columns", "chi2,selected"]);
     assert!(ok, "an empty csv must not fail: {stderr}");
-    assert_eq!(lines(&stdout), vec!["0 rows"]);
+    assert_eq!(lines(&stdout), vec!["chi2  selected", "0 rows"]);
 
-    // Asking for a column of a file that declares none says why, rather
-    // than printing "Available: " and nothing.
-    let (_, stderr, ok) = show(&[csv.to_str().unwrap(), "--columns", "chi2"]);
+    // A genuinely schemaless file (zero bytes — no writer produces one
+    // any more, so make it by hand) still says why a column selection
+    // cannot work, rather than printing "Available: " and nothing.
+    let bare = dir.path().join("bare.csv");
+    std::fs::write(&bare, b"").unwrap();
+    let (_, stderr, ok) = show(&[bare.to_str().unwrap(), "--columns", "chi2"]);
     assert!(!ok);
     assert!(stderr.contains("declares no columns at all"), "{stderr}");
 }

@@ -141,9 +141,22 @@ ALLOWED_ALL_NULL: dict[str, str] = {
     "ImpactProbabilities.skewness": "by-design (Jet2 method only)",
     "ImpactProbabilities.distance_hessian": "by-design (Jet2 method only)",
     "ImpactProbabilities.agm_components": "by-design (AGM refinement only)",
-    # (impact_latitude_deg / impact_longitude_deg / impact_altitude_km are
-    # populated by the enrichment pass on the fixture — deliberately NOT
-    # allow-listed, so this test re-fails if they regress to all-null.)
+    # ── Impact location: by-design null on a FLY-BY fixture ──
+    # The impact point is not a method-derived quantity: it is the nominal
+    # trajectory's surface crossing, copied from the matching `Impact`
+    # event, and it is therefore identical on every uncertainty method.
+    # It exists only when the nominal trajectory actually strikes the body
+    # (miss_distance_km < effective_radius_km). Apophis passes 38,011 km
+    # from Earth's center against a 6,378 km effective radius — a fly-by,
+    # so it has no impact point and these are null on every row.
+    # (Filling them from the fly-by's periapsis sub-point was the old
+    # behaviour: it asserted a surface site for a 38,000 km miss.)
+    # The C ABI carries all three fields and they ARE populated for a real
+    # impactor — `test_impactor_impact_probabilities_carry_the_surface_point`
+    # below is the wiring guard, so a drop still fails loudly.
+    "ImpactProbabilities.impact_latitude_deg": "by-design (fly-by fixture: no surface strike)",
+    "ImpactProbabilities.impact_longitude_deg": "by-design (fly-by fixture: no surface strike)",
+    "ImpactProbabilities.impact_altitude_km": "by-design (fly-by fixture: no surface strike)",
     # (Periapses.relative_{x,y,z,vx,vy,vz} were once dropped here
     # but are now wired through the C ABI and populated — removed, so this
     # test re-fails if they ever regress to all-null.)
@@ -952,6 +965,58 @@ def test_impact_probabilities_no_silent_drops() -> None:
     assert not (bad_null or bad_not_null), _format_failures(
         "ImpactProbabilities", bad_null, bad_not_null
     )
+
+
+def test_impactor_impact_probabilities_carry_the_surface_point() -> None:
+    """The IP channel's impact location, on the fixture that has one.
+
+    ``impact_latitude_deg`` / ``impact_longitude_deg`` /
+    ``impact_altitude_km`` are on :data:`ALLOWED_ALL_NULL` because the
+    Apophis fly-by has no surface strike. That entry would also hide a
+    genuine C-ABI drop, so this is the wiring guard: 2008 TC3 *does*
+    strike the ground, and its row must carry a real surface point.
+
+    Two properties are pinned:
+
+    * **Population is a property of the trajectory, not the method.** The
+      impact point is the nominal trajectory's surface crossing (copied
+      from the matching ``Impact`` event), so every uncertainty method
+      reports the same coordinates — an impacting row is never null and a
+      fly-by row is never non-null, whichever method produced it.
+    * **The coordinates are real.** 2008 TC3 fell over the Nubian Desert
+      in northern Sudan on 2008-10-07 (Jenniskens et al. 2009, *Nature*
+      458, 485 — the Almahata Sitta fall), so the recovered sub-point must
+      land in that region, on the surface.
+    """
+    orbit = _impactor_orbit()
+    for method in (UncertaintyMethod.FIRST_ORDER, UncertaintyMethod.MONTE_CARLO):
+        ips = compute_impact_probabilities(
+            orbit,
+            end_epoch=54747.0,
+            methods=[method],
+            body_filter=[Origin.EARTH],
+        )
+        assert len(ips) > 0, f"impactor fixture produced no IP row under {method.value}"
+
+        miss = ips.miss_distance_km.to_numpy(zero_copy_only=False)
+        radius = ips.effective_radius_km.to_numpy(zero_copy_only=False)
+        assert np.all(miss < radius), (
+            "impactor fixture no longer strikes Earth — the fixture has regressed "
+            f"(miss {miss} km vs effective radius {radius} km)"
+        )
+
+        lat = ips.impact_latitude_deg.to_pylist()
+        lon = ips.impact_longitude_deg.to_pylist()
+        alt = ips.impact_altitude_km.to_pylist()
+        assert all(v is not None for v in lat + lon + alt), (
+            f"impact location dropped at the C ABI under {method.value}: "
+            f"lat={lat} lon={lon} alt={alt}"
+        )
+        # Northern Sudan, on the surface. The band is deliberately regional,
+        # not a fake-precision match to a published sub-point.
+        assert all(18.0 < v < 24.0 for v in lat), f"impact latitude off Sudan: {lat}"
+        assert all(29.0 < v < 36.0 for v in lon), f"impact longitude off Sudan: {lon}"
+        assert all(abs(v) < 1.0 for v in alt), f"impact point is not on the surface: {alt} km"
 
 
 def test_b_planes_no_silent_drops() -> None:

@@ -30,6 +30,7 @@ import quivr as qv
 from empyrean._convert import (
     AnyOrbits,
     coordinates_to_arrays,
+    extract_joint,
     extract_non_grav_covariance,
     extract_srp,
     validate_non_grav_marsden_only,
@@ -695,6 +696,11 @@ def compute_impact_probabilities(
         srp_amrat_variance=args["srp_amrat_variance"],
         has_non_grav_cov=args["has_non_grav_cov"],
         non_grav_cov=args["non_grav_cov"],
+        # The joint's off-diagonal terms. An impact probability computed
+        # against a block-diagonal covariance understates the tails: it
+        # asserts the state and the parameters were independent when one
+        # fit produced both. No keys at all when no orbit carries any.
+        **extract_joint(orbits),
         ng_alphas=args["ng_alphas"],
         ng_r0s=args["ng_r0s"],
         ng_ms=args["ng_ms"],
@@ -809,6 +815,11 @@ def compute_b_planes(
         srp_amrat_variance=args["srp_amrat_variance"],
         has_non_grav_cov=args["has_non_grav_cov"],
         non_grav_cov=args["non_grav_cov"],
+        # The joint's off-diagonal terms. An impact probability computed
+        # against a block-diagonal covariance understates the tails: it
+        # asserts the state and the parameters were independent when one
+        # fit produced both. No keys at all when no orbit carries any.
+        **extract_joint(orbits),
         ng_alphas=args["ng_alphas"],
         ng_r0s=args["ng_r0s"],
         ng_ms=args["ng_ms"],

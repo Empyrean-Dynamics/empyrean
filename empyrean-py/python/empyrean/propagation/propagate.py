@@ -16,11 +16,14 @@ from empyrean._convert import (
     _COORD_TYPE_MAP,
     AnyOrbits,
     coordinates_to_arrays,
+    extract_joint,
     extract_non_grav_covariance,
     extract_photometry,
     extract_srp,
     int_to_frame,
+    joint_columns_from_result,
     naif_to_origin,
+    non_grav_border_only,
     validate_non_grav_marsden_only,
 )
 from empyrean.coordinates.coordinates import CartesianCoordinates
@@ -209,6 +212,25 @@ def propagate(
     Positional pairing against an ascending, duplicate-free request grid
     is therefore exact; for any other request shape, join on the
     result's ``epoch_mjd_tdb`` column.
+
+    The joint covariance travels in both directions. An input orbit
+    carrying cross terms — on ``non_grav.non_grav_cross`` (the 6x3
+    state-Marsden border) and ``wide_cross`` (everything else) — is
+    propagated against them rather than against its ``6x6`` alone, and
+    every output row carries the propagated cross terms in the same two
+    columns. This is what makes a chained propagation agree with the
+    single-leg answer: the state-parameter columns are non-zero even
+    when the input was block-diagonal, because propagation itself
+    generates that correlation, so a second leg handed only the ``6x6``
+    reports a tighter uncertainty than the first leg supports.
+
+    Cross terms are refused without the parameter blocks they are
+    conditioned on (the non-grav ``3x3``, the DT and AMRAT prior
+    variances). Propagation passes those through unchanged rather than
+    restating them on every output row, so when chaining legs by hand
+    take them from the orbit that started the chain. A row with no cross
+    terms is null, never zero — an absent correlation and a measured
+    zero correlation are different claims.
 
     Examples
     --------
@@ -486,6 +508,12 @@ def propagate(
         srp_amrat_variance=srp_amrat_variance,
         has_non_grav_cov=has_non_grav_cov,
         non_grav_cov=non_grav_cov,
+        # The joint's off-diagonal terms, when the input carries them.
+        # A leg fed its predecessor's joint propagates the covariance
+        # that leg actually computed; fed the 6x6 alone it reports a
+        # tighter uncertainty than the first leg supports. No keys at
+        # all when no orbit carries cross terms.
+        **extract_joint(orbits),
         ng_alphas=ng_alphas,
         ng_r0s=ng_r0s,
         ng_ms=ng_ms,
@@ -677,11 +705,26 @@ def _build_cartesian_orbits(result: dict[str, Any]) -> CartesianOrbits:
     # Convert empty strings to None for nullable object_id
     object_id_list = [s if s else None for s in out_object_ids]
 
-    return CartesianOrbits.from_kwargs(
-        orbit_id=out_orbit_ids,
-        object_id=object_id_list,
-        coordinates=cart_coords,
-    )
+    orbits_kwargs: dict[str, Any] = {
+        "orbit_id": out_orbit_ids,
+        "object_id": object_id_list,
+        "coordinates": cart_coords,
+    }
+
+    # The propagated joint's off-diagonal blocks. `coordinates.covariance`
+    # above is only the state block: propagation generates state-parameter
+    # correlation even from a block-diagonal input, so a chained run built
+    # on the 6x6 alone is a tighter claim than this leg supports. Attached
+    # only when the engine produced cross terms — a gravity-only or
+    # parameter-free orbit leaves both columns unset rather than carrying
+    # rows of zeros.
+    border, wide = joint_columns_from_result(result, m)
+    if border is not None:
+        orbits_kwargs["non_grav"] = non_grav_border_only(border)
+    if wide is not None:
+        orbits_kwargs["wide_cross"] = wide
+
+    return CartesianOrbits.from_kwargs(**orbits_kwargs)
 
 
 def _nullable_float(values: np.ndarray) -> pa.Array | np.ndarray:

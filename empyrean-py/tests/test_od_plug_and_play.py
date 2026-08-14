@@ -382,7 +382,7 @@ def test_explicit_flag_solve_result_unwraps(apophis_fit, apophis_observations):
             amrat_variance=[_APOPHIS_AMRAT_SIGMA**2],
         ),
     )
-    config = ODConfig(solve_for_flags=SolveFor(amrat=True))
+    config = ODConfig(solve_for_flags=SolveFor(amrat="solved"))
     result = refine(primed, apophis_observations, config=config)
     assert result.solve_for_used == SolveForParams.EXPLICIT
     # The explicit AMRAT axis opened its column.
@@ -414,7 +414,7 @@ def test_non_physical_amrat_solve_refuses(apophis_fit, apophis_observations):
         coordinates=apophis_fit.orbit.coordinates,
         srp=SRPParams.from_kwargs(amrat=[1.0e-4], cr=[1.0], amrat_variance=[(1.0e-3) ** 2]),
     )
-    config = ODConfig(solve_for_flags=SolveFor(amrat=True))
+    config = ODConfig(solve_for_flags=SolveFor(amrat="solved"))
     with pytest.raises(RuntimeError, match="non-physical area-to-mass ratio") as excinfo:
         refine(unconstrained, apophis_observations, config=config)
     # The refusal carries the value it refused, so the caller can see how
@@ -449,7 +449,7 @@ def test_marsden_solve_seeds_from_zero_coefficients(apophis_fit, apophis_observa
     )
     # Must not raise "requires a covariance"; the zero-seeded column opens.
     result = refine(
-        zeroed, apophis_observations, config=ODConfig(solve_for_flags=SolveFor(marsden=True))
+        zeroed, apophis_observations, config=ODConfig(solve_for_flags=SolveFor(marsden="solved"))
     )
     assert result.solved_covariance is not None
     assert result.solved_covariance.marsden_slot is not None

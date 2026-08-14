@@ -44,3 +44,18 @@ class NonGravParams(qv.Table):
     # fitted orbit re-feeds into a StateAndNonGrav refine without losing its
     # non-grav prior. Null for SBDB / hand-built / gravity-only.
     covariance = qv.LargeListColumn(qv.Float64Column(), nullable=True)
+
+    # 6x3 row-major state-to-(A1, A2, A3) cross covariance, 18 values, in
+    # the coordinate's own basis AND UNITS (angular rows in degrees for
+    # Cometary / Keplerian / Spherical, matching coordinates.covariance).
+    #
+    # The other half of the matrix whose diagonal block is `covariance`
+    # above, and it requires that block: a cross with no parameter block
+    # to condition is refused by the engine, not merely incomplete.
+    #
+    # Named to match the C ABI's `CoordinateState.non_grav_cross` exactly.
+    # It rides here rather than on the coordinates sub-table (where the C
+    # ABI puts it) because this package's covariance class is 21
+    # synthesized scalar columns with no slot for an 18-value list — a
+    # placement divergence, not a semantic one.
+    non_grav_cross = qv.LargeListColumn(qv.Float64Column(), nullable=True)

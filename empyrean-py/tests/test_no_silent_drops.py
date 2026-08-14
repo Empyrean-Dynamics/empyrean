@@ -41,6 +41,7 @@ from empyrean import (
     NonGravParams,
     Origin,
     PhotometricParams,
+    SRPParams,
     UncertaintyMethod,
     compute_b_planes,
     compute_impact_probabilities,
@@ -240,6 +241,34 @@ def _full_feature_orbit() -> CartesianOrbits:
     )
 
 
+def _wide_layout_orbit() -> CartesianOrbits:
+    """:func:`_full_feature_orbit` plus an SRP slot with an AMRAT prior.
+
+    The fourth solved axis, and what widens the layout past the
+    state+Marsden ``9x9``. A Marsden-only orbit's cross terms fit
+    entirely inside the ``6x3`` border on ``non_grav``, so the
+    ``wide_cross`` columns have no input at all from
+    :func:`_full_feature_orbit` — they would read as a silent drop when
+    they are really an unexercised channel. AMRAT is the cheapest axis
+    that opens them: the SRP slot is additive with the Marsden block, and
+    the state-AMRAT column plus the ``A_i``-AMRAT pairs have no home but
+    the carrier.
+
+    Kept separate from :func:`_full_feature_orbit` rather than folded
+    into it, because an AMRAT prior is not free elsewhere: the
+    second-order propagation path refuses an SRP-AMRAT covariance
+    outright, so the sensitivity walk needs an orbit without one.
+
+    The area-to-mass ratio is Apophis-scale (a ~370 m rock at ~2.7e10 kg)
+    with a ~10% prior sigma.
+    """
+    orbits = _full_feature_orbit()
+    return orbits.set_column(
+        "srp",
+        SRPParams.from_kwargs(amrat=[4.0e-6], cr=[1.0], amrat_variance=[1.6e-13]),
+    )
+
+
 # 2008 TC3 — the first asteroid ever detected before it hit Earth
 # (2008-Oct-07). JPL SBDB cometary elements at MJD 54746.0 TDB, the
 # covariance epoch (lifted from villeneuve/tests/test_jet2.rs so the
@@ -397,7 +426,10 @@ def _format_failures(
 
 
 def test_propagation_states_no_silent_drops() -> None:
-    orbits = _full_feature_orbit()
+    # The wide-layout fixture: the states table carries the propagated
+    # joint, whose carrier columns exist only for a layout past the
+    # state+Marsden 9x9.
+    orbits = _wide_layout_orbit()
     target_epochs = np.array([61000.0 + 60.0 * i for i in range(40)])
     result = empyrean.propagate(orbits, target_epochs)
 

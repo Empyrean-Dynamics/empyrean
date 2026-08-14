@@ -974,7 +974,13 @@ def test_ephemeris_observation_sensitivities_no_silent_drops() -> None:
 
 def test_ephemeris_no_silent_drops() -> None:
     orbits = _full_feature_orbit()
-    observers = Observers.from_code("500", [61000.5, 61010.5, 61020.5])
+    # A real ground site, deliberately: the geocenter (500) has no local
+    # horizon, so its zenith/azimuth/hour-angle columns are legitimately
+    # all-null and this sweep would learn nothing about them. A site in
+    # the registry makes the engine compute all three, so a marshaling
+    # drop of the topocentric block fails here instead of hiding behind
+    # the horizonless case.
+    observers = Observers.from_code("689", [61000.5, 61010.5, 61020.5])
     result = generate_ephemeris(orbits, observers)
 
     if len(result.ephemeris) == 0:

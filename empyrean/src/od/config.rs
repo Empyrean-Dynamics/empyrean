@@ -474,15 +474,7 @@ impl ODConfig {
             output_representation: self.output_representation as i32,
             // Per-axis flags — read by the C ABI only when solve_for == 3
             // (EXPLICIT); harmless for the coarse codes.
-            solve_for_flags: {
-                let f = self.solve_for.flags();
-                empyrean_sys::EmpyreanSolveFor {
-                    marsden: u8::from(f.marsden),
-                    dt: u8::from(f.dt),
-                    amrat: u8::from(f.amrat),
-                    thrust_segments: f.thrust_segments,
-                }
-            },
+            solve_for_flags: self.solve_for.flags().to_ffi(),
             allow_unbracketed_maneuvers: u8::from(self.allow_unbracketed_maneuvers),
             has_photometry: u8::from(self.photometry.is_some()),
             photometry: self.photometry.map(|p| p.to_ffi()).unwrap_or_default(),

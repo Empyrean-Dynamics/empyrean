@@ -10,15 +10,8 @@ members = [
 # Note: the historical `validation/runners/core` workspace member moved
 # to `empyrean-core/src/bin/validate-core.rs` (behind the `validate`
 # feature). The "shared villeneuve.rlib for bit-identical numerics"
-# invariant still holds because every Rust runner here resolves
-# villeneuve through the same `[patch]` overrides below.
-
-# Force the entire dep tree below empyrean-core (which transitively pulls
-# villeneuve / scott / nolan via git-tag pins) to resolve to the primary
-# sibling checkouts. Without this patch we'd get two different copies
-# of each crate in the graph and `EphemerisData` / `Orbits<AU>` /
-# `RejectionStrategy` types would collide between the tagged and the
-# sibling versions.
+# invariant holds because every crate here reaches villeneuve through
+# the single engine generation empyrean-core's release tag pins.
 # Release profile for the published cdylib (empyrean-c → libempyrean.dylib /
 # .so / .dll), the empyrean-py PyO3 wheel, and the empyrean-cli binary.
 # Symbols are stripped so the only names visible in the dynamic symbol
@@ -40,11 +33,3 @@ strip = "symbols"
 # cost: ~3-5× slower release link.
 codegen-units = 1
 lto = "fat"
-
-# No sibling-checkout [patch] overrides: scott and villeneuve are released,
-# so the monorepo consumes their tagged git dependencies via empyrean-core
-# (scott v1.14.0, villeneuve v1.20.0), fetched from GitHub. CI fetches them
-# over HTTPS with the GH_PAT insteadOf rewrite. To co-develop a sibling
-# against this workspace, re-add a `[patch."ssh://…git"] <crate> = { path =
-# "../<repo>" }` block here (cargo only honours [patch] at the workspace
-# root, not from a path-dep's manifest).

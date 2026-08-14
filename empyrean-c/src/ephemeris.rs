@@ -7,7 +7,6 @@ use empyrean_core::coordinates::{AU, CartesianCoordinates, Frame};
 use empyrean_core::ephemeris::{
     EphemerisConfig, EphemerisPropagationConfig, EphemerisResult, generate_ephemeris,
 };
-use empyrean_core::nongrav::{GFunction, NonGravModel, NonGravParams};
 use empyrean_core::observers::Observer;
 use empyrean_core::orbits::Orbits;
 use empyrean_core::time::Epoch;
@@ -363,48 +362,14 @@ pub(crate) fn build_orbits_for_ephemeris(
         let coords =
             coordinate_state_to_coordinates(&state).map_err(|e| format!("orbit {i}: {e}"))?;
         let id = format!("orbit_{i}");
-        orbits
-            .push(id, coords.into_radians())
+        crate::joint::push_orbit_with_joint(&mut orbits, id, coords, orbit)
             .map_err(|e| format!("orbit {i}: {e}"))?;
-        if orbit.a1 != 0.0 || orbit.a2 != 0.0 || orbit.a3 != 0.0 {
-            let g_func = if orbit.ng_alpha == 0.0
-                && orbit.ng_r0 == 0.0
-                && orbit.ng_m == 0.0
-                && orbit.ng_n == 0.0
-                && orbit.ng_k == 0.0
-            {
-                GFunction::inverse_square()
-            } else {
-                GFunction::from_sbdb(
-                    orbit.ng_alpha,
-                    orbit.ng_r0,
-                    orbit.ng_m,
-                    orbit.ng_n,
-                    orbit.ng_k,
-                )
-            };
-            let params = NonGravParams {
-                a1: orbit.a1,
-                a2: orbit.a2,
-                a3: orbit.a3,
-                model: NonGravModel::MarsdenSekanina(g_func),
-                covariance: None,
-                dt: if orbit.non_grav_dt.is_finite() {
-                    Some(orbit.non_grav_dt)
-                } else {
-                    None
-                },
-                // DT is a fittable axis in v1.20.0; carry the DT prior variance
-                // when the input orbit supplies one so it opens the DT column
-                // downstream.
-                dt_variance: if orbit.non_grav_dt_variance.is_finite()
-                    && orbit.non_grav_dt_variance > 0.0
-                {
-                    Some(orbit.non_grav_dt_variance)
-                } else {
-                    None
-                },
-            };
+        // Routed through the shared helper rather than the inline copy
+        // this path used to carry: that copy hardcoded `covariance:
+        // None`, dropping the Marsden 3×3 the ABI has carried since
+        // v0.9.0 — and with the border now supplied, a dropped 3×3 is
+        // also a border with no parameter block to sit against.
+        if let Some(params) = crate::propagate::empyrean_orbit_non_grav_params(orbit) {
             orbits.set_non_grav_params(i, Some(params));
         }
         if let Some(ph) = empyrean_orbit_photometric_params(orbit) {
@@ -1040,7 +1005,7 @@ mod tests {
 
     /// A 4-byte observatory code must be a loud error at the C boundary:
     /// clipped to its 3-byte prefix it would silently alias a different
-    /// observatory (empyrean-agp9).
+    /// observatory.
     #[test]
     fn four_byte_obs_code_is_rejected() {
         let err = build_observers_from_c(&[observer_with_code(*b"W68a")])
@@ -1395,6 +1360,8 @@ mod ephemeris_config_end_to_end_tests {
             representation: 0, // Cartesian
             frame: 0,          // ICRF
             origin: 10,        // Sun
+            has_non_grav_cross: 0,
+            non_grav_cross: [[0.0; 3]; 6],
         };
         o.non_grav_dt = f64::NAN;
         o.non_grav_dt_variance = f64::NAN;

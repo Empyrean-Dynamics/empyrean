@@ -11,6 +11,7 @@ mod built_system;
 mod ephemeris;
 mod impact;
 mod io;
+mod joint;
 mod math;
 mod observers;
 mod od;
@@ -86,13 +87,34 @@ const _: () = {
 
 /// Flat C-ABI compatible coordinate state.
 ///
-/// Field-identical to [`empyrean_core::convert::CoordinateState`]; the
-/// duplicate definition exists so cbindgen (which has `parse_deps =
-/// false`) can emit the matching C struct in `empyrean.h` without
-/// traversing into the empyrean-core crate.
+/// Carries [`empyrean_core::convert::CoordinateState`]'s fields plus the
+/// state↔Marsden border; the duplicate definition exists so cbindgen
+/// (which has `parse_deps = false`) can emit the matching C struct in
+/// `empyrean.h` without traversing into the empyrean-core crate.
 ///
 /// `Copy` is a Rust-side convenience only (the batched transform writes
 /// whole rows into a caller-owned array); the C layout is unaffected.
+///
+/// # The border sits here, beside the 6×6 it borders
+///
+/// [`non_grav_cross`](Self::non_grav_cross) is the \\(6 \times 3\\) half
+/// of one `ExtendedCovariance`, whose other half is the state
+/// [`covariance`](Self::covariance). Putting it one level up on
+/// `EmpyreanOrbit` would split a single matrix across two structs, and
+/// `empyrean_transform_coordinates` takes a `CoordinateState` *without*
+/// its orbit — so the two halves could be transformed apart. Here they
+/// travel together, and the transform rotates the pair.
+///
+/// The orbit's wide **carrier** stays on `EmpyreanOrbit`, mirroring the
+/// engine's own split: a carrier's thrust tags are an orbit-level
+/// concept a coordinate has no business knowing.
+///
+/// One consequence a caller should know: `empyrean_transform_coordinates`
+/// transforms a coordinate and its border, **not a whole joint**. An
+/// orbit's carrier is not in scope at that signature, so an orbit-level
+/// joint cannot be re-expressed in another basis through the C ABI in
+/// this release. Transform the orbit before attaching its carrier, or
+/// supply the joint in the basis you want it consumed in.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CoordinateState {
@@ -103,14 +125,39 @@ pub struct CoordinateState {
     pub representation: i32,
     pub frame: i32,
     pub origin: i32,
+    /// 1 when [`non_grav_cross`](Self::non_grav_cross) carries the
+    /// state↔Marsden border; 0 otherwise. A zero-init state carries no
+    /// border and behaves exactly as it did before this field existed.
+    pub has_non_grav_cross: u8,
+    /// \\(6 \times 3\\) state-to-\\((A_1, A_2, A_3)\\) cross covariance,
+    /// row-major, in the same basis **and the same units** as
+    /// [`covariance`](Self::covariance) — angular rows in degrees for
+    /// Cometary / Keplerian / Spherical.
+    ///
+    /// Only read when `has_non_grav_cross = 1`, and requires the orbit
+    /// to declare `has_non_grav_covariance = 1`: the border and the
+    /// \\(3 \times 3\\) it borders are two halves of one matrix, and the
+    /// engine refuses a border without its parameter block rather than
+    /// substituting a zero one.
+    ///
+    /// A zero-filled border is read as *no border supplied* — the engine
+    /// filters an all-zero cross as absent, because a file row tagged
+    /// with a 9-wide covariance gets one attached whether or not it ever
+    /// had cross terms. Note the deliberate asymmetry with the wide
+    /// carrier, where a supplied all-zero entry counts as *a supplied
+    /// zero correlation* and does engage the joint definiteness gate. If
+    /// you mean "absent" in the carrier, omit the entry.
+    pub non_grav_cross: [[f64; 3]; 6],
 }
 
 impl CoordinateState {
     /// Convert this C-ABI state to an [`empyrean_core::convert::CoordinateState`].
     ///
-    /// Field-by-field copy — both structs are `#[repr(C)]` with
-    /// identical layouts, but we copy explicitly for clarity instead
-    /// of `transmute`.
+    /// Field-by-field copy of the fields the core type has. The border
+    /// is **not** among them: the core conversion produces a bare
+    /// `Coordinates`, and the border is re-seated onto that coordinate
+    /// by the joint-marshaling helper so it converts to radians together
+    /// with the 6×6 it borders.
     pub fn to_empyrean(&self) -> empyrean_core::convert::CoordinateState {
         empyrean_core::convert::CoordinateState {
             epoch_mjd_tdb: self.epoch_mjd_tdb,
@@ -124,6 +171,12 @@ impl CoordinateState {
     }
 
     /// Build a C-ABI state from an [`empyrean_core::convert::CoordinateState`].
+    ///
+    /// Leaves the border absent — the core type does not carry one. A
+    /// caller marshaling a coordinate that HAS a border sets the two
+    /// fields afterwards from the `Coordinates`' own
+    /// `extended_covariance()`; this constructor is for the paths where
+    /// there is nothing to carry.
     pub fn from_empyrean(s: &empyrean_core::convert::CoordinateState) -> Self {
         Self {
             epoch_mjd_tdb: s.epoch_mjd_tdb,
@@ -133,6 +186,50 @@ impl CoordinateState {
             representation: s.representation,
             frame: s.frame,
             origin: s.origin,
+            has_non_grav_cross: 0,
+            non_grav_cross: [[0.0; 3]; 6],
+        }
+    }
+}
+
+/// Test-only helpers shared across this crate's `#[cfg(test)]` modules.
+#[cfg(test)]
+pub(crate) mod testing {
+    /// Build a context, or skip — **unless** the environment says a data
+    /// directory must be present, in which case its absence fails the
+    /// test.
+    ///
+    /// # Why the tripwire exists
+    ///
+    /// A kernel-gated test that returns early when the data directory is
+    /// missing passes *vacuously* in any environment without kernels.
+    /// That is indistinguishable, in the run summary, from a test that
+    /// actually exercised the engine — so a CI job that lost its data
+    /// cache reports green while asserting nothing, and the more
+    /// load-bearing the test, the more damage the false green does.
+    ///
+    /// Setting `EMPYREAN_REQUIRE_DATA=1` turns the skip into a failure.
+    /// CI sets it; a developer without a local kernel set does not, and
+    /// still gets the skip. The default is deliberately the permissive
+    /// one — a tripwire that blocks local `cargo test` gets disabled,
+    /// and a disabled tripwire protects nothing.
+    pub fn context_or_skip(what: &str) -> Option<empyrean_core::Context> {
+        match empyrean_core::Context::from_data_dir(None) {
+            Ok(ctx) => Some(ctx),
+            Err(e) => {
+                if std::env::var("EMPYREAN_REQUIRE_DATA").is_ok_and(|v| v != "0") {
+                    panic!(
+                        "{what}: EMPYREAN_REQUIRE_DATA is set, so a data directory is \
+                         required and this test must not skip. Context construction \
+                         failed: {e}"
+                    );
+                }
+                eprintln!(
+                    "skipping {what}: no data dir ({e}). Set EMPYREAN_REQUIRE_DATA=1 to \
+                     make this a failure instead."
+                );
+                None
+            }
         }
     }
 }

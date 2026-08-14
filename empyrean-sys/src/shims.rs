@@ -1538,3 +1538,18 @@ pub unsafe fn empyrean_transform_coordinates_single(
         )
     }
 }
+
+#[inline]
+pub unsafe fn empyrean_propagation_joint_at(
+    result: *const EmpyreanPropagationResult,
+    orbit_index: usize,
+    epoch_index: usize,
+    out: *mut EmpyreanOrbitCovariance,
+) -> i32 {
+    unsafe { lib().empyrean_propagation_joint_at(result, orbit_index, epoch_index, out) }
+}
+
+#[inline]
+pub unsafe fn empyrean_orbit_covariance_free(cov: *mut EmpyreanOrbitCovariance) {
+    unsafe { lib().empyrean_orbit_covariance_free(cov) }
+}

@@ -300,6 +300,20 @@ pub struct CoordinateState {
     pub frame: Frame,
     /// NAIF body ID of the coordinate origin.
     pub origin: Origin,
+    /// The \\(6 \\times 3\\) state↔Marsden cross-covariance — the
+    /// off-diagonal half of the joint whose state block is
+    /// [`covariance`](Self::covariance).
+    ///
+    /// Rows are the six state elements, columns \\(A_1, A_2, A_3\\), in
+    /// the same basis **and the same units** as `covariance` — degrees
+    /// for the angular rows of a Cometary / Keplerian / Spherical state.
+    ///
+    /// It sits here rather than on [`Orbit`](crate::Orbit) so that the
+    /// two halves of one matrix travel together through a coordinate
+    /// transform, which moves both. Requires the orbit to carry
+    /// [`ng_covariance`](crate::Orbit::ng_covariance): a cross with no
+    /// parameter block to condition is refused by the engine.
+    pub non_grav_cross: Option<[[f64; 3]; 6]>,
 }
 
 impl CoordinateState {
@@ -314,6 +328,7 @@ impl CoordinateState {
             epoch,
             elements,
             covariance: None,
+            non_grav_cross: None,
             representation: Representation::Cartesian,
             frame,
             origin,
@@ -331,6 +346,7 @@ impl CoordinateState {
             epoch,
             elements,
             covariance: None,
+            non_grav_cross: None,
             representation: Representation::Keplerian,
             frame,
             origin,
@@ -343,6 +359,7 @@ impl CoordinateState {
             epoch,
             elements,
             covariance: None,
+            non_grav_cross: None,
             representation: Representation::Cometary,
             frame,
             origin,
@@ -360,6 +377,7 @@ impl CoordinateState {
             epoch,
             elements,
             covariance: None,
+            non_grav_cross: None,
             representation: Representation::Spherical,
             frame,
             origin,
@@ -382,6 +400,8 @@ impl CoordinateState {
             representation: self.representation as i32,
             frame: self.frame as i32,
             origin: self.origin.naif_id(),
+            has_non_grav_cross: self.non_grav_cross.is_some() as u8,
+            non_grav_cross: self.non_grav_cross.unwrap_or([[0.0; 3]; 6]),
         })
     }
 
@@ -407,6 +427,10 @@ impl CoordinateState {
             representation,
             frame,
             origin,
+            // Read back rather than dropped: the transform entry points
+            // rotate the border with the 6x6, so a read-out that left it
+            // behind would return half a joint through a basis change.
+            non_grav_cross: (state.has_non_grav_cross != 0).then_some(state.non_grav_cross),
         })
     }
 }

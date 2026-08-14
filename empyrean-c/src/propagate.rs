@@ -274,6 +274,69 @@ pub struct EmpyreanOrbit {
     /// positive value opens + priors the AMRAT column in a StateAndAMRAT /
     /// StateAndNonGravAndAMRAT fit. Only read when `has_srp == 1`.
     pub srp_amrat_variance: f64,
+
+    // ── Joint solved-parameter covariance (input) ──────────────────
+    //
+    // Everything below is ABSENT in a `memset(0)` orbit and changes
+    // nothing about how such an orbit propagates.
+    //
+    // The joint is supplied in FOUR non-overlapping homes, and one
+    // covariance entry belongs to exactly one of them. The engine
+    // refuses a term with two homes rather than merging or preferring:
+    //
+    //   state x state    -> state.covariance          (6x6)
+    //   A_i x A_j        -> non_grav_covariance       (3x3)
+    //   state x A_i      -> state.non_grav_cross      (6x3, on the
+    //                       CoordinateState, beside the 6x6 it borders)
+    //   dv_i x dv_j, SAME segment
+    //                    -> correction_covariances[i] (3x3)
+    //   everything else  -> state_param_cross / param_pair_cross
+    //
+    // "Everything else" is state x DT, state x AMRAT, state x dv, and
+    // every mixed pair (DT x A2, A1 x AMRAT, AMRAT x dv, segment i x
+    // segment j).
+    //
+    // The state-to-Marsden 6x3 border is NOT here: it lives on `state`,
+    // the embedded `CoordinateState`, whose docs say why.
+    /// State-to-parameter cross columns for every solved parameter that
+    /// is **not** Marsden — state↔DT, state↔AMRAT, state↔Δv.
+    ///
+    /// Null / `n_state_param_cross == 0` ⇒ none. A null pointer with a
+    /// non-zero count is a loud argument error; a non-null pointer with
+    /// a zero count is absent and never read (the `thrust_arcs`
+    /// precedent).
+    ///
+    /// **Ownership:** caller-owned; borrowed read-only for the duration
+    /// of the call. The C ABI never frees it. Note the asymmetry with
+    /// the same arrays on
+    /// [`EmpyreanODResult`](crate::od::EmpyreanODResult), which are
+    /// library-owned: a caller re-feeding a result into a call must
+    /// **copy, not alias**.
+    ///
+    /// Entry order does not matter — entries are identified by their
+    /// `column` tag, never by position. Supplying the same parameter
+    /// twice is a loud error rather than a last-one-wins.
+    pub state_param_cross: *const crate::joint::EmpyreanStateParamCross,
+    /// Number of entries in
+    /// [`state_param_cross`](Self::state_param_cross).
+    pub n_state_param_cross: usize,
+    /// Parameter-to-parameter cross terms with no other home — DT↔\\(A_2\\),
+    /// \\(A_1\\)↔AMRAT, AMRAT↔Δv, segment \\(i\\)↔segment \\(j\\).
+    ///
+    /// Same ownership, absence and ordering rules as
+    /// [`state_param_cross`](Self::state_param_cross). The term is
+    /// symmetric, so supplying both \\((a, b)\\) and \\((b, a)\\) is the
+    /// same loud duplicate error as supplying one of them twice.
+    ///
+    /// Intra-segment Δv pairs do **not** belong here — segment `i`'s own
+    /// `correction_covariances[i]` already supplies its internal pairs,
+    /// and the engine refuses the duplicate home. Cross-segment pairs
+    /// have no other home and do belong here. That is the one place
+    /// where "which 3×3 does this go in" has a non-obvious answer.
+    pub param_pair_cross: *const crate::joint::EmpyreanParamPairCross,
+    /// Number of entries in
+    /// [`param_pair_cross`](Self::param_pair_cross).
+    pub n_param_pair_cross: usize,
 }
 
 /// Origin-switching configuration for trajectory splitting at body
@@ -708,6 +771,37 @@ pub struct EmpyreanPropagatedState {
     /// Defaults to `LINEAR` for non-Auto methods and for Auto epochs
     /// outside CA windows.
     pub resolved_kind: u8,
+    /// The propagated joint's cross terms — the state↔Marsden border and
+    /// the wide carrier at this epoch, in the Cartesian basis of the
+    /// \\(6 \times 6\\) above.
+    ///
+    /// # This is what makes leg chaining possible
+    ///
+    /// [`covariance`](Self::covariance) is only the state block of the
+    /// propagated joint. Feeding leg 2 that block alone hands the engine
+    /// a block-diagonal covariance, and the engine cannot tell — while
+    /// the joint it actually computed has non-zero state↔parameter
+    /// columns **even when leg 1's input was block-diagonal**, because
+    /// propagation itself generates that correlation. A chained
+    /// propagation that drops this is not an approximation of the
+    /// single-leg answer; it is a different and tighter claim.
+    ///
+    /// Re-feed it onto an [`EmpyreanOrbit`] together with the parameter
+    /// blocks the crosses are conditioned on — the orbit's own
+    /// `non_grav_covariance`, `non_grav_dt_variance`,
+    /// `srp_amrat_variance` and `correction_covariances` — which
+    /// propagation carries through unchanged from the input orbit. See
+    /// [`EmpyreanOrbitCovariance`](crate::joint::EmpyreanOrbitCovariance)
+    /// for the field-by-field copy.
+    ///
+    /// Absent (`has_non_grav_cross = 0`, both pointers null) when the
+    /// orbit carried no solved-parameter block, when its layout is
+    /// Marsden-only (the whole border is then in `non_grav_cross` and
+    /// there is no carrier), or when a sigma-point run could not
+    /// reconstruct this row.
+    ///
+    /// **Library-owned**, freed with the parent result.
+    pub orbit_cov: crate::joint::EmpyreanOrbitCovariance,
 }
 
 /// A detected dynamical event from propagation.
@@ -1295,7 +1389,11 @@ pub(crate) fn empyrean_orbit_srp_params(
 /// length paired with a null pointer (in either direction) is a loud
 /// argument error rather than a silent empty read. A zero length is always
 /// treated as "no array" (the pointer is ignored).
-fn validate_side_array_ptr<T>(ptr: *const T, len: usize, field: &str) -> Result<(), String> {
+pub(crate) fn validate_side_array_ptr<T>(
+    ptr: *const T,
+    len: usize,
+    field: &str,
+) -> Result<(), String> {
     if len > 0 && ptr.is_null() {
         return Err(format!(
             "{field}: non-zero length ({len}) with a null pointer"
@@ -1553,8 +1651,7 @@ pub(crate) fn build_orbits_for_propagation(
         let obj = c_str_to_string(orbit.object_id).unwrap_or_default();
         input_orbit_ids.push(id.clone());
         input_object_ids.push(obj);
-        orbits
-            .push(id, coords.into_radians())
+        crate::joint::push_orbit_with_joint(&mut orbits, id, coords, orbit)
             .map_err(|e| format!("orbit {i}: {e}"))?;
         if let Some(params) = empyrean_orbit_non_grav_params(orbit) {
             orbits.set_non_grav_params(i, Some(params));
@@ -1571,6 +1668,58 @@ pub(crate) fn build_orbits_for_propagation(
         }
     }
     Ok((orbits, input_orbit_ids, input_object_ids))
+}
+
+/// Tear down a partially- or fully-built states array and its parallel
+/// ids array: the first `written` rows' carrier allocations and id
+/// strings, then both arrays.
+///
+/// Every allocation-failure exit in [`marshal_propagation_result`] past
+/// the states allocation itself goes through here. Deallocating the
+/// states array alone is NOT sufficient and stopped being sufficient
+/// the moment a row gained owned side arrays: each written row owns two
+/// heap arrays, so an exit that frees only the array orphans `2 ×
+/// written` allocations — and the exits furthest down the function are
+/// the ones where `written == n`, making them the worst case rather
+/// than the mildest.
+///
+/// `written` is how many rows the marshal loop has initialized: `i` for
+/// a failure inside the loop, `n` for any failure after it.
+///
+/// # Safety
+///
+/// `states` and `ids` must be the allocations described by
+/// `states_layout` / `ids_layout`, with exactly `written` initialized
+/// rows, and must not be freed afterwards.
+unsafe fn free_states_and_ids(
+    states: *mut EmpyreanPropagatedState,
+    ids: *mut *mut std::ffi::c_char,
+    written: usize,
+    n: usize,
+    states_layout: std::alloc::Layout,
+) {
+    if !states.is_null() {
+        for k in 0..written {
+            let st = unsafe { &mut *states.add(k) };
+            unsafe { crate::joint::free_orbit_covariance(&mut st.orbit_cov) };
+        }
+        if n > 0 {
+            unsafe { std::alloc::dealloc(states as *mut u8, states_layout) };
+        }
+    }
+    if !ids.is_null() {
+        for k in 0..written {
+            let p = unsafe { *ids.add(k) };
+            if !p.is_null() {
+                drop(unsafe { CString::from_raw(p) });
+            }
+        }
+        if n > 0 {
+            let ids_layout = std::alloc::Layout::array::<*mut std::ffi::c_char>(n)
+                .unwrap_or(std::alloc::Layout::new::<*mut std::ffi::c_char>());
+            unsafe { std::alloc::dealloc(ids as *mut u8, ids_layout) };
+        }
+    }
 }
 
 /// Marshal a [`PropagationResult`] into the C-ABI
@@ -1609,6 +1758,8 @@ pub(crate) fn marshal_propagation_result(
         let ptr = unsafe { std::alloc::alloc(layout) } as *mut *mut std::ffi::c_char;
         if ptr.is_null() {
             set_last_error("allocation failed for object_ids array");
+            // No row has been written yet, so the states array holds no
+            // owned carrier — deallocating it is the whole cleanup.
             unsafe { std::alloc::dealloc(states_ptr as *mut u8, states_layout) };
             return -5;
         }
@@ -1639,6 +1790,22 @@ pub(crate) fn marshal_propagation_result(
             .map(covariance_kind_to_u8)
             .unwrap_or(EMPYREAN_COVARIANCE_KIND_LINEAR);
 
+        // Fallible: an allocation failure here is a failure of the
+        // call, never a silently absent carrier. Unwind the rows already
+        // written — each owns its carrier arrays — before returning.
+        let orbit_cov = match crate::joint::joint_to_c(
+            prop_result.states.extended_covariance(i),
+            prop_result.states.wide_cross(i),
+            "propagated state",
+        ) {
+            Ok(j) => j,
+            Err(e) => {
+                set_last_error(&e);
+                unsafe { free_states_and_ids(states_ptr, ids_ptr, i, n, states_layout) };
+                return -5;
+            }
+        };
+
         let out_state = EmpyreanPropagatedState {
             epoch_mjd_tdb: coord.t.mjd_tdb(),
             x: coord.x,
@@ -1656,6 +1823,11 @@ pub(crate) fn marshal_propagation_result(
             stt,
             has_stt,
             resolved_kind,
+            // The propagated joint's crosses, at THIS row's index. Both
+            // engine accessors are parallel to `covariances`, so they
+            // share the row's provenance: a sampled 6×6 never sits
+            // beside the nominal linear run's border.
+            orbit_cov,
         };
 
         unsafe {
@@ -1693,9 +1865,9 @@ pub(crate) fn marshal_propagation_result(
         let ptr = unsafe { std::alloc::alloc(layout) } as *mut EmpyreanEvent;
         if ptr.is_null() {
             set_last_error("allocation failed for events array");
-            if !states_ptr.is_null() && n > 0 {
-                unsafe { std::alloc::dealloc(states_ptr as *mut u8, states_layout) };
-            }
+            // Every row is written by now, so this teardown releases 2n
+            // carrier arrays and n id strings as well as the two arrays.
+            unsafe { free_states_and_ids(states_ptr, ids_ptr, n, n, states_layout) };
             return -5;
         }
         ptr
@@ -1723,10 +1895,7 @@ pub(crate) fn marshal_propagation_result(
         let ptr = unsafe { std::alloc::alloc(layout) } as *mut EmpyreanMixtureChain;
         if ptr.is_null() {
             set_last_error("allocation failed for mixtures array");
-            if !states_ptr.is_null() && n > 0 {
-                let l = std::alloc::Layout::array::<EmpyreanPropagatedState>(n).unwrap();
-                unsafe { std::alloc::dealloc(states_ptr as *mut u8, l) };
-            }
+            unsafe { free_states_and_ids(states_ptr, ids_ptr, n, n, states_layout) };
             return -5;
         }
         for (mi, mixture_opt) in prop_result.mixtures.iter().enumerate() {
@@ -1873,6 +2042,12 @@ pub unsafe extern "C" fn empyrean_propagation_result_free(result: *mut EmpyreanP
         }
 
         if !res.states.is_null() && n > 0 {
+            // Each row's joint carrier is library-owned, so it is
+            // released before the array holding the pointers to it.
+            for i in 0..n {
+                let st = unsafe { &mut *res.states.add(i) };
+                unsafe { crate::joint::free_orbit_covariance(&mut st.orbit_cov) };
+            }
             let layout = std::alloc::Layout::array::<EmpyreanPropagatedState>(n).unwrap();
             unsafe {
                 std::alloc::dealloc(res.states as *mut u8, layout);
@@ -2286,6 +2461,131 @@ pub unsafe extern "C" fn empyrean_propagation_covariance_series_cartesian(
             EMPYREAN_TAGGED_COV_PANIC
         }
     }
+}
+
+/// The propagated joint's CROSS terms at a single `(orbit_index,
+/// epoch_index)` — the state↔Marsden border and the wide carrier that
+/// [`EmpyreanTaggedCovariance::matrix`] is the state block of.
+///
+/// # Why this is a separate call
+///
+/// [`EmpyreanTaggedCovariance`] is a plain-old-data struct: a caller
+/// declares one on the stack, fills it through
+/// [`empyrean_propagation_covariance_at_cartesian`], and frees nothing.
+/// Putting the carrier on it would have made every such caller — code
+/// that is correct today and recompiles without a murmur — leak two
+/// allocations per call. Nothing would fail; memory would simply grow.
+/// So the joint is opt-in through this call instead, and the tagged
+/// covariance keeps its contract.
+///
+/// The same `(orbit_index, epoch_index)` addresses both surfaces, so a
+/// consumer walking a series
+/// ([`empyrean_propagation_covariance_series_cartesian`]) can ask for
+/// the joint of any entry without the series itself owning anything new.
+///
+/// # Absence is reported, never fabricated
+///
+/// `has_non_grav_cross = 0` with null carrier pointers means the engine
+/// produced no cross terms at this row — not that they were zero. Every
+/// uncertainty method that reaches this accessor carries the payload
+/// when it has one, including the sampled paths, which recover the
+/// state↔parameter columns from the cloud. A row genuinely without a
+/// joint is one whose orbit declared no solved-parameter block.
+///
+/// # Ownership
+///
+/// On success `out` owns two heap arrays; release them with
+/// [`empyrean_orbit_covariance_free`]. On any non-zero return `out` is
+/// untouched and there is nothing to free.
+///
+/// # Returns
+///
+/// The same `EMPYREAN_TAGGED_COV_*` codes as the tagged-covariance
+/// accessors, so a caller branches on one set.
+///
+/// # Safety
+/// `result` and `out` must be valid pointers; `result` from
+/// `empyrean_propagate`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn empyrean_propagation_joint_at(
+    result: *const EmpyreanPropagationResult,
+    orbit_index: usize,
+    epoch_index: usize,
+    out: *mut crate::joint::EmpyreanOrbitCovariance,
+) -> i32 {
+    let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        if result.is_null() || out.is_null() {
+            set_last_error("null pointer argument");
+            return EMPYREAN_TAGGED_COV_NULL_POINTER;
+        }
+        let res = unsafe { &*result };
+        if res.lazy_handle.is_null() {
+            set_last_error("propagation result carries no retained handle");
+            return EMPYREAN_TAGGED_COV_NULL_POINTER;
+        }
+        let handle = unsafe { &*(res.lazy_handle as *const PropagationResultHandle) };
+
+        // The flat row index the two engine accessors are parallel to.
+        // Derived exactly as the marshal loop derives it in reverse, so
+        // the joint returned here always shares provenance with the
+        // covariance the sibling accessor returns for the same pair.
+        let n_times = handle.n_times;
+        let row = if n_times > 0 {
+            orbit_index * n_times + epoch_index
+        } else {
+            orbit_index
+        };
+        if epoch_index >= n_times.max(1) || row >= handle.result.states.len() {
+            set_last_error("orbit or epoch index out of range");
+            return EMPYREAN_TAGGED_COV_EPOCH_INDEX_OUT_OF_RANGE;
+        }
+
+        let joint = match crate::joint::joint_to_c(
+            handle.result.states.extended_covariance(row),
+            handle.result.states.wide_cross(row),
+            "propagated joint",
+        ) {
+            Ok(j) => j,
+            Err(e) => {
+                set_last_error(&e);
+                return EMPYREAN_TAGGED_COV_UNCERTAINTY;
+            }
+        };
+        unsafe {
+            *out = joint;
+        }
+        EMPYREAN_TAGGED_COV_OK
+    }));
+    match r {
+        Ok(code) => code,
+        Err(_) => {
+            set_last_error("panic in empyrean_propagation_joint_at");
+            EMPYREAN_TAGGED_COV_PANIC
+        }
+    }
+}
+
+/// Release the arrays owned by an [`EmpyreanOrbitCovariance`](crate::joint::EmpyreanOrbitCovariance)
+/// written by [`empyrean_propagation_joint_at`].
+///
+/// Idempotent — the pointers are nulled and the counts zeroed — and a
+/// null argument is a no-op. Do **not** call it on the `orbit_cov` of an
+/// OD result or a propagated state: those are owned by their parent and
+/// released by the parent's own free function.
+///
+/// # Safety
+/// `cov` must be null or a struct written by
+/// [`empyrean_propagation_joint_at`] and not already freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn empyrean_orbit_covariance_free(
+    cov: *mut crate::joint::EmpyreanOrbitCovariance,
+) {
+    let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        if cov.is_null() {
+            return;
+        }
+        unsafe { crate::joint::free_orbit_covariance(&mut *cov) };
+    }));
 }
 
 /// Resolved-kind tagged covariance at a single `(orbit_index,
@@ -2931,6 +3231,14 @@ mod tagged_covariance_tests {
             },
             param_list: SolvedParameters::state_only(),
             target_functional: TargetFunctional::CartesianState,
+            // The engine grew a wide payload on this type. A state-only
+            // fixture carries none, and this delivery does not marshal
+            // it — see the report's TaggedCovariance item. Stated
+            // explicitly rather than via `..Default::default()` so the
+            // day it IS marshaled, this fixture is a compile-time
+            // reminder rather than a silently absent block.
+            extended: None,
+            wide_cross: None,
         }
     }
 
@@ -3042,6 +3350,8 @@ mod thrust_input_tests {
                 representation: 0, // Cartesian
                 frame: 0,          // ICRF
                 origin: 10,        // Sun (NAIF)
+                has_non_grav_cross: 0,
+                non_grav_cross: [[0.0; 3]; 6],
             },
             orbit_id: std::ptr::null(),
             object_id: std::ptr::null(),
@@ -3071,6 +3381,10 @@ mod thrust_input_tests {
             srp_amrat: 0.0,
             srp_cr: 0.0,
             srp_amrat_variance: f64::NAN,
+            state_param_cross: std::ptr::null(),
+            n_state_param_cross: 0,
+            param_pair_cross: std::ptr::null(),
+            n_param_pair_cross: 0,
         }
     }
 
@@ -3372,6 +3686,8 @@ mod srp_input_tests {
                 representation: 0,
                 frame: 0,
                 origin: 10,
+                has_non_grav_cross: 0,
+                non_grav_cross: [[0.0; 3]; 6],
             },
             orbit_id: std::ptr::null(),
             object_id: std::ptr::null(),
@@ -3401,6 +3717,10 @@ mod srp_input_tests {
             srp_amrat: 0.0,
             srp_cr: 0.0,
             srp_amrat_variance: f64::NAN,
+            state_param_cross: std::ptr::null(),
+            n_state_param_cross: 0,
+            param_pair_cross: std::ptr::null(),
+            n_param_pair_cross: 0,
         }
     }
 
@@ -3521,6 +3841,8 @@ mod non_grav_input_tests {
                 representation: 0,
                 frame: 0,
                 origin: 10,
+                has_non_grav_cross: 0,
+                non_grav_cross: [[0.0; 3]; 6],
             },
             orbit_id: std::ptr::null(),
             object_id: std::ptr::null(),
@@ -3550,6 +3872,10 @@ mod non_grav_input_tests {
             srp_amrat: 0.0,
             srp_cr: 0.0,
             srp_amrat_variance: f64::NAN,
+            state_param_cross: std::ptr::null(),
+            n_state_param_cross: 0,
+            param_pair_cross: std::ptr::null(),
+            n_param_pair_cross: 0,
         }
     }
 
@@ -3729,5 +4055,296 @@ mod covariance_quality_tag_tests {
             }
             assert!(*a < 0, "every failure code is negative");
         }
+    }
+}
+
+/// The propagation OUTPUT joint, and the leg chain it exists to close.
+///
+/// `covariance` alone is the state block of the propagated joint. The
+/// engine's propagated border is non-zero **even from a block-diagonal
+/// input** — propagation itself generates the state↔parameter
+/// correlation — so a second leg handed only the 6×6 is quoting a
+/// tighter uncertainty than the first leg supports, and cannot tell.
+/// These pin that the rest of the joint reaches the caller and re-feeds
+/// without slot arithmetic.
+#[cfg(test)]
+mod propagated_joint_tests {
+    use super::*;
+
+    /// The thread-local error text the C ABI last set, for assertion
+    /// messages. Local to this module — the sibling test modules keep
+    /// their own private copies.
+    fn last_err() -> String {
+        unsafe {
+            std::ffi::CStr::from_ptr(crate::empyrean_last_error())
+                .to_string_lossy()
+                .into_owned()
+        }
+    }
+
+    fn first_order_config() -> EmpyreanPropagationConfig {
+        // SAFETY: `#[repr(C)]` with scalar fields only; the all-zero
+        // pattern is the documented default for every field except the
+        // NaN-means-auto step sentinels, set below.
+        let mut cfg: EmpyreanPropagationConfig = unsafe { std::mem::zeroed() };
+        cfg.force_model = 2; // Standard
+        cfg.uncertainty_method.tag = EMPYREAN_UNCERTAINTY_FIRST;
+        cfg.advanced.dt_initial = f64::NAN;
+        cfg.advanced.dt_min = f64::NAN;
+        cfg.advanced.cache_integrator_steps = 1;
+        cfg
+    }
+
+    /// A comet-like orbit with a Marsden block AND an AMRAT prior, so
+    /// the wide layout is wider than 9 and BOTH halves of the joint are
+    /// exercised: the Marsden border rides `state.non_grav_cross`, the
+    /// state↔AMRAT column rides the carrier.
+    fn wide_orbit() -> EmpyreanOrbit {
+        // SAFETY: as above — this is the caller-side `memset(0)`.
+        let mut o: EmpyreanOrbit = unsafe { std::mem::zeroed() };
+        o.state = crate::CoordinateState {
+            epoch_mjd_tdb: 59000.0,
+            elements: [1.0, 0.1, 0.05, -0.005, 0.015, 0.001],
+            covariance: {
+                let mut c = [[0.0f64; 6]; 6];
+                for (i, row) in c.iter_mut().enumerate() {
+                    row[i] = 1.0e-10 * (i as f64 + 1.0);
+                }
+                c
+            },
+            has_covariance: 1,
+            representation: 0, // Cartesian
+            frame: 0,
+            origin: 10,
+            has_non_grav_cross: 0,
+            non_grav_cross: [[0.0; 3]; 6],
+        };
+        o.a1 = 1.0e-10;
+        o.a2 = 1.0e-11;
+        o.a3 = 0.0;
+        o.non_grav_dt = f64::NAN;
+        o.non_grav_dt_variance = f64::NAN;
+        o.has_non_grav_covariance = 1;
+        o.non_grav_covariance = [
+            [1.0e-22, 0.0, 0.0],
+            [0.0, 1.0e-24, 0.0],
+            [0.0, 0.0, 1.0e-26],
+        ];
+        o.phot_system = -1;
+        o.h_mag = f64::NAN;
+        o.has_srp = 1;
+        o.srp_amrat = 0.01;
+        o.srp_cr = 1.0;
+        o.srp_amrat_variance = 1.0e-6;
+        o
+    }
+
+    /// Leg chaining, end to end: propagate, re-feed the propagated joint
+    /// onto a fresh orbit, propagate again — and assert the second leg
+    /// received a joint it could not have reconstructed from the 6×6.
+    ///
+    /// The discriminating assertion is the last one: the same chain run
+    /// on the state block ALONE gives a different (tighter) σ. If the
+    /// output joint were dropped, or re-fed as zeros, the two chains
+    /// would agree and this test would pass vacuously.
+    #[test]
+    fn a_propagated_joint_re_feeds_into_a_second_leg() {
+        let Some(ctx) =
+            crate::testing::context_or_skip("a_propagated_joint_re_feeds_into_a_second_leg")
+        else {
+            return;
+        };
+        let ctx_ptr: *const EmpyreanContext = &ctx;
+        let cfg = first_order_config();
+
+        // ── Leg 1 ──
+        let leg1_times = [59000.0f64, 59050.0];
+        let orbits = [wide_orbit()];
+        let mut leg1: EmpyreanPropagationResult = unsafe { std::mem::zeroed() };
+        let code = unsafe {
+            empyrean_propagate(
+                ctx_ptr,
+                orbits.as_ptr(),
+                1,
+                leg1_times.as_ptr(),
+                leg1_times.len(),
+                &cfg,
+                &mut leg1,
+            )
+        };
+        assert_eq!(code, 0, "leg 1 must propagate: {}", last_err());
+        assert_eq!(leg1.num_states, leg1_times.len());
+
+        let last = unsafe { &*leg1.states.add(leg1_times.len() - 1) };
+        assert_eq!(last.has_covariance, 1, "leg 1 must deliver a 6x6");
+
+        // The joint reached the caller. A layout wider than 9 puts the
+        // AMRAT column in the carrier and the Marsden block in the
+        // border, so both halves must be present.
+        assert_eq!(
+            last.orbit_cov.has_non_grav_cross, 1,
+            "the propagated state-Marsden border must reach the caller — it is \
+             non-zero even from a block-diagonal input, because propagation \
+             generates the correlation"
+        );
+        assert!(
+            last.orbit_cov.n_state_param_cross > 0,
+            "the state-AMRAT column has no home but the carrier, and this orbit \
+             declares an AMRAT prior"
+        );
+        let entries = unsafe {
+            std::slice::from_raw_parts(
+                last.orbit_cov.state_param_cross,
+                last.orbit_cov.n_state_param_cross,
+            )
+        };
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.column.kind == crate::joint::EMPYREAN_PARAM_COLUMN_AMRAT),
+            "the carrier must tag its AMRAT column by identity"
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|e| e.values.iter().all(|v| v.is_finite())),
+            "every propagated cross value must be finite"
+        );
+
+        // ── Re-feed: leg 2's input IS leg 1's output ──
+        //
+        // Field copies only. Nothing here inverts a slot map or consults
+        // a layout — that is the whole point of identity tagging.
+        let mut refed = wide_orbit();
+        refed.state.epoch_mjd_tdb = last.epoch_mjd_tdb;
+        refed.state.elements = [last.x, last.y, last.z, last.vx, last.vy, last.vz];
+        refed.state.covariance = last.covariance;
+        refed.state.has_covariance = last.has_covariance;
+        refed.state.has_non_grav_cross = last.orbit_cov.has_non_grav_cross;
+        refed.state.non_grav_cross = last.orbit_cov.non_grav_cross;
+        refed.state_param_cross = last.orbit_cov.state_param_cross;
+        refed.n_state_param_cross = last.orbit_cov.n_state_param_cross;
+        refed.param_pair_cross = last.orbit_cov.param_pair_cross;
+        refed.n_param_pair_cross = last.orbit_cov.n_param_pair_cross;
+
+        // The same orbit, re-fed with the state block ONLY — the chain a
+        // caller was forced into before this release. Rebuilt rather
+        // than copied, since `EmpyreanOrbit` is deliberately not `Clone`
+        // (its side arrays are borrowed pointers).
+        let mut block_diagonal = wide_orbit();
+        block_diagonal.state = refed.state;
+        block_diagonal.state.has_non_grav_cross = 0;
+        block_diagonal.state.non_grav_cross = [[0.0; 3]; 6];
+        block_diagonal.state_param_cross = std::ptr::null();
+        block_diagonal.n_state_param_cross = 0;
+        block_diagonal.param_pair_cross = std::ptr::null();
+        block_diagonal.n_param_pair_cross = 0;
+
+        // ── Leg 2, both ways ──
+        let leg2_times = [last.epoch_mjd_tdb, last.epoch_mjd_tdb + 50.0];
+        let run_leg2 = |orbit: EmpyreanOrbit, what: &str| -> [[f64; 6]; 6] {
+            let orbits = [orbit];
+            let mut out: EmpyreanPropagationResult = unsafe { std::mem::zeroed() };
+            let code = unsafe {
+                empyrean_propagate(
+                    ctx_ptr,
+                    orbits.as_ptr(),
+                    1,
+                    leg2_times.as_ptr(),
+                    leg2_times.len(),
+                    &cfg,
+                    &mut out,
+                )
+            };
+            assert_eq!(code, 0, "leg 2 ({what}) must propagate: {}", last_err());
+            let st = unsafe { &*out.states.add(leg2_times.len() - 1) };
+            assert_eq!(st.has_covariance, 1, "leg 2 ({what}) must deliver a 6x6");
+            let cov = st.covariance;
+            unsafe { empyrean_propagation_result_free(&mut out) };
+            cov
+        };
+
+        let joint_cov = run_leg2(refed, "full joint");
+        let diagonal_cov = run_leg2(block_diagonal, "state block only");
+
+        // Every entry finite — a re-fed joint must assemble, not poison.
+        assert!(
+            joint_cov.iter().flatten().all(|v| v.is_finite()),
+            "the re-fed joint must assemble and propagate"
+        );
+
+        // THE discriminating assertion. If the output joint were dropped
+        // or re-fed as zeros, these two would be identical.
+        let trace = |c: &[[f64; 6]; 6]| (0..3).map(|i| c[i][i]).sum::<f64>();
+        let (with, without) = (trace(&joint_cov), trace(&diagonal_cov));
+        assert!(
+            (with - without).abs() > 0.0,
+            "leg 2 given the full joint must differ from leg 2 given only the state \
+             block ({with:e} vs {without:e}) — equality means the cross terms never \
+             reached the engine, which is the defect this surface exists to remove"
+        );
+
+        unsafe { empyrean_propagation_result_free(&mut leg1) };
+    }
+
+    /// A gravity-only orbit has no solved-parameter block, so its
+    /// propagated states report no joint — absent, not a block of zeros
+    /// a caller would re-feed as a supplied zero correlation.
+    #[test]
+    fn a_gravity_only_orbit_reports_no_propagated_joint() {
+        let Some(ctx) =
+            crate::testing::context_or_skip("a_gravity_only_orbit_reports_no_propagated_joint")
+        else {
+            return;
+        };
+        let ctx_ptr: *const EmpyreanContext = &ctx;
+        let cfg = first_order_config();
+
+        let mut o = wide_orbit();
+        o.a1 = 0.0;
+        o.a2 = 0.0;
+        o.a3 = 0.0;
+        o.has_non_grav_covariance = 0;
+        o.non_grav_covariance = [[0.0; 3]; 3];
+        o.has_srp = 0;
+        o.srp_amrat = 0.0;
+        o.srp_cr = 0.0;
+        o.srp_amrat_variance = f64::NAN;
+
+        let orbits = [o];
+        let times = [59000.0f64, 59010.0];
+        let mut result: EmpyreanPropagationResult = unsafe { std::mem::zeroed() };
+        let code = unsafe {
+            empyrean_propagate(
+                ctx_ptr,
+                orbits.as_ptr(),
+                1,
+                times.as_ptr(),
+                times.len(),
+                &cfg,
+                &mut result,
+            )
+        };
+        assert_eq!(code, 0, "gravity-only must propagate: {}", last_err());
+
+        for i in 0..result.num_states {
+            let st = unsafe { &*result.states.add(i) };
+            assert_eq!(
+                st.orbit_cov.has_non_grav_cross, 0,
+                "row {i}: no solved-parameter block means no border"
+            );
+            assert!(
+                st.orbit_cov.state_param_cross.is_null() && st.orbit_cov.n_state_param_cross == 0,
+                "row {i}: absent, never an array of zeros"
+            );
+            assert!(
+                st.orbit_cov.param_pair_cross.is_null() && st.orbit_cov.n_param_pair_cross == 0,
+                "row {i}: same for the pair array"
+            );
+        }
+
+        // Freeing a result whose joints are all absent is a no-op on
+        // that surface, and must not fault.
+        unsafe { empyrean_propagation_result_free(&mut result) };
     }
 }

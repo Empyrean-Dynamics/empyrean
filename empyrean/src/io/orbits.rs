@@ -211,6 +211,17 @@ fn ffi_orbit_to_owned(o: &empyrean_sys::EmpyreanOrbit) -> Result<Orbit> {
             o.has_srp,
             o.srp_amrat_variance,
         ),
+        // The batch a read produces owns these arrays, so the carrier is
+        // read back here rather than borrowed — the wrapper's `Orbit`
+        // outlives the batch it came from.
+        wide_cross: unsafe {
+            crate::WideCross::from_ffi_arrays(
+                o.state_param_cross,
+                o.n_state_param_cross,
+                o.param_pair_cross,
+                o.n_param_pair_cross,
+            )
+        }?,
     })
 }
 

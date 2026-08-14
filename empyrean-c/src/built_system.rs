@@ -814,6 +814,8 @@ mod tests {
                 representation: 0, // Cartesian
                 frame: 0,          // ICRF
                 origin: 10,        // Sun (NAIF)
+                has_non_grav_cross: 0,
+                non_grav_cross: [[0.0; 3]; 6],
             },
             orbit_id: std::ptr::null(),
             object_id: std::ptr::null(),
@@ -843,6 +845,10 @@ mod tests {
             srp_amrat: 0.0,
             srp_cr: 0.0,
             srp_amrat_variance: f64::NAN,
+            state_param_cross: std::ptr::null(),
+            n_state_param_cross: 0,
+            param_pair_cross: std::ptr::null(),
+            n_param_pair_cross: 0,
         }
     }
 

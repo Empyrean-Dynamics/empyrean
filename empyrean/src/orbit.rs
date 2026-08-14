@@ -146,6 +146,20 @@ pub struct Orbit {
     /// Marsden non-grav above; a `Some` with `amrat_variance` set opens the
     /// AMRAT column in a `StateAndAMRAT` / `StateAndNonGravAndAMRAT` refine.
     pub srp: Option<SrpParams>,
+    /// Cross-covariance terms beyond the state+Marsden \\(9 \\times 9\\) —
+    /// state↔DT, state↔AMRAT, state↔\\(\Delta v\\), and every mixed
+    /// parameter pair.
+    ///
+    /// `None` is an orbit with no such terms, which is what every
+    /// hand-built and SBDB orbit is. Set it from a fit's own
+    /// [`JointCovariance`](crate::JointCovariance) to hand the next leg
+    /// the joint that fit computed rather than its diagonal blocks.
+    ///
+    /// The state↔Marsden border is NOT here — it rides
+    /// [`CoordinateState::non_grav_cross`](crate::CoordinateState::non_grav_cross),
+    /// beside the 6×6 it borders, so the two halves of one matrix travel
+    /// together through a transform.
+    pub wide_cross: Option<crate::WideCross>,
 }
 
 impl Orbit {
@@ -173,6 +187,7 @@ impl Orbit {
             slope2: 0.0,
             thrust: None,
             srp: None,
+            wide_cross: None,
         }
     }
 
@@ -363,6 +378,23 @@ impl Orbit {
         } else {
             correction_covariances.as_ptr()
         };
+        // The wide carrier's two side arrays follow the same
+        // caller-owned / borrowed-for-the-call contract as the thrust
+        // arrays above, and the keepalive owns them for the same reason.
+        let (state_param_cross, param_pair_cross) = match self.wide_cross.as_ref() {
+            Some(w) => w.to_ffi_arrays(),
+            None => (Vec::new(), Vec::new()),
+        };
+        let state_param_cross_ptr = if state_param_cross.is_empty() {
+            std::ptr::null()
+        } else {
+            state_param_cross.as_ptr()
+        };
+        let param_pair_cross_ptr = if param_pair_cross.is_empty() {
+            std::ptr::null()
+        } else {
+            param_pair_cross.as_ptr()
+        };
         let ffi = empyrean_sys::EmpyreanOrbit {
             state: self.state.to_ffi()?,
             orbit_id: orbit_id_ptr,
@@ -405,6 +437,10 @@ impl Orbit {
             srp_amrat: self.srp.map(|s| s.amrat).unwrap_or(0.0),
             srp_cr: self.srp.map(|s| s.cr).unwrap_or(0.0),
             srp_amrat_variance: self.srp.and_then(|s| s.amrat_variance).unwrap_or(f64::NAN),
+            state_param_cross: state_param_cross_ptr,
+            n_state_param_cross: state_param_cross.len(),
+            param_pair_cross: param_pair_cross_ptr,
+            n_param_pair_cross: param_pair_cross.len(),
         };
         let keep = OrbitFfiKeep {
             _orbit_id: orbit_id_cstr,
@@ -412,6 +448,8 @@ impl Orbit {
             _thrust_arcs: thrust_arcs,
             _dv_corrections: dv_corrections,
             _correction_covariances: correction_covariances,
+            _state_param_cross: state_param_cross,
+            _param_pair_cross: param_pair_cross,
         };
         Ok((ffi, keep))
     }
@@ -429,6 +467,10 @@ pub(crate) struct OrbitFfiKeep {
     _dv_corrections: Vec<[f64; 3]>,
     /// Correction-covariance side array the FFI `EmpyreanOrbit` borrows.
     _correction_covariances: Vec<[[f64; 3]; 3]>,
+    /// State↔parameter cross columns the FFI `EmpyreanOrbit` borrows.
+    _state_param_cross: Vec<empyrean_sys::EmpyreanStateParamCross>,
+    /// Parameter↔parameter cross terms the FFI `EmpyreanOrbit` borrows.
+    _param_pair_cross: Vec<empyrean_sys::EmpyreanParamPairCross>,
 }
 
 /// Marshal a batch of orbits into their FFI representation plus the

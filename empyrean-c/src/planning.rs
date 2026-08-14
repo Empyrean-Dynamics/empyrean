@@ -47,6 +47,54 @@ pub struct EmpyreanObservatoryConfig {
     pub max_apparent_mag: f64,
     /// Minimum solar elongation (degrees).
     pub min_elongation_deg: f64,
+    /// Minimum geometric elevation of the target above the site's local
+    /// horizon, in degrees.
+    ///
+    /// The elevation is \\( h = \arcsin(\hat{u} \cdot \hat{s}) \\), with
+    /// \\(\hat{u}\\) the site's geodetic zenith and \\(\hat{s}\\) the
+    /// apparent — light-time- and aberration-corrected — topocentric
+    /// direction to the target. **Atmospheric refraction is ignored**:
+    /// near the horizon refraction lifts a source by roughly
+    /// \\(0.5°\\), and the error falls below \\(0.1°\\) by
+    /// \\(h \approx 10°\\).
+    ///
+    /// `0.0` — the zero-init value — is the geometric horizon, which is
+    /// also the engine's default. That is the least-opinionated
+    /// statement the geometry can make, *not* an observing
+    /// recommendation: airmass at \\(h = 0°\\) is \\(\approx 38\\), and
+    /// real programs cut between \\(20°\\) and \\(30°\\). Set it to the
+    /// site's own pointing or airmass limit — e.g. `30.0` for airmass
+    /// \\(\le 2\\).
+    pub min_elevation_deg: f64,
+    /// 1 when [`max_sun_altitude_deg`](Self::max_sun_altitude_deg)
+    /// carries a darkness threshold; 0 to take the engine's default of
+    /// −18° (astronomical twilight).
+    ///
+    /// This axis needs the switch and
+    /// [`min_elevation_deg`](Self::min_elevation_deg) does not, for one
+    /// reason: `0.0` is a legal and meaningful solar altitude (the Sun's
+    /// centre on the geometric horizon), so a zero-init struct read as a
+    /// literal `0.0` would quietly plan a campaign in daylight. The
+    /// elevation default *is* `0.0`, so its zero-init value is already
+    /// the engine's.
+    pub has_max_sun_altitude_deg: u8,
+    /// Solar altitude at or below which the site counts as dark, in
+    /// degrees. Only read when
+    /// [`has_max_sun_altitude_deg`](Self::has_max_sun_altitude_deg) is 1.
+    ///
+    /// Built from the same site zenith as `min_elevation_deg`, against
+    /// the **geometric** topocentric direction to the Sun — no
+    /// light-time, aberration or refraction correction, each of which is
+    /// a few tens of arcseconds at most against a threshold that
+    /// operates on degrees.
+    ///
+    /// The standard conventions are civil (\\(-6°\\)), nautical
+    /// (\\(-12°\\)) and astronomical (\\(-18°\\), the engine default,
+    /// where the sky background has fallen to its dark-time floor).
+    /// Because refraction is ignored, `0.0` means the Sun's *centre* on
+    /// the geometric horizon, about \\(0.83°\\) later than visible
+    /// sunset. A value above \\(+90°\\) disables the darkness gate.
+    pub max_sun_altitude_deg: f64,
 }
 
 /// A single planned (candidate) observation: an epoch plus either an optical or
@@ -325,6 +373,19 @@ fn build_planned(c: &EmpyreanPlannedObservation) -> Result<PlannedObservation, S
     }
 }
 
+/// The engine's own darkness threshold, read off the engine rather than
+/// restated here.
+///
+/// `EmpyreanObservatoryConfig::has_max_sun_altitude_deg = 0` means "use
+/// the engine default", and the honest way to honour that is to ask the
+/// engine what its default is. A literal `-18.0` in this crate would be
+/// a second copy of a number the engine owns, with nothing linking them:
+/// the day the convention moves, the C channel would keep planning to
+/// the old one and say nothing.
+fn engine_default_max_sun_altitude_deg() -> f64 {
+    ObservatoryConfig::new("", [0.0, 0.0]).max_sun_altitude_deg
+}
+
 fn build_planning_config(c: &EmpyreanPlanningConfig) -> Result<PlanningConfig, String> {
     let force_model = int_to_force_model(c.force_model)?.into();
 
@@ -337,11 +398,21 @@ fn build_planning_config(c: &EmpyreanPlanningConfig) -> Result<PlanningConfig, S
     let mut observatories = Vec::with_capacity(obs_slice.len());
     for o in obs_slice {
         let code = cstr_to_string(o.obs_code, "observatory code")?;
+        // Every field is set explicitly rather than by struct update
+        // from a default, so a field the engine grows is a compile break
+        // here — at the marshal boundary — instead of a silently
+        // defaulted visibility gate.
         observatories.push(ObservatoryConfig {
             obs_code: code,
             sigma_arcsec: [o.sigma_ra_arcsec, o.sigma_dec_arcsec],
             max_apparent_mag: o.max_apparent_mag,
             min_elongation_deg: o.min_elongation_deg,
+            min_elevation_deg: o.min_elevation_deg,
+            max_sun_altitude_deg: if o.has_max_sun_altitude_deg != 0 {
+                o.max_sun_altitude_deg
+            } else {
+                engine_default_max_sun_altitude_deg()
+            },
         });
     }
 
@@ -621,4 +692,135 @@ pub unsafe extern "C" fn empyrean_plan_result_free(result: *mut EmpyreanPlanResu
             (*result).num_ephemeris = 0;
         }
     }));
+}
+
+/// The observatory visibility gates at the boundary.
+///
+/// Two fields with different zero-init stories, and the difference is
+/// the whole point: `min_elevation_deg`'s engine default IS `0.0`, so a
+/// zero-init struct already means it; `max_sun_altitude_deg`'s is
+/// `-18.0` while `0.0` is a legal solar altitude, so a zero-init struct
+/// read literally would quietly plan a campaign in daylight.
+#[cfg(test)]
+mod observatory_gate_tests {
+    use super::*;
+
+    fn zeroed_config() -> EmpyreanObservatoryConfig {
+        // SAFETY: `#[repr(C)]`, scalars plus one pointer that zero-inits
+        // to null — the caller-side `memset(0)` this pins.
+        unsafe { std::mem::zeroed() }
+    }
+
+    /// The engine's own default is what the switch resolves to, read off
+    /// the engine rather than restated here — so this test fails if the
+    /// twilight convention ever moves, instead of enshrining a literal.
+    #[test]
+    fn the_darkness_default_is_read_off_the_engine() {
+        let engine = ObservatoryConfig::new("F51", [0.5, 0.5]);
+        assert_eq!(
+            engine_default_max_sun_altitude_deg(),
+            engine.max_sun_altitude_deg,
+            "the fallback must BE the engine's default, not a copy of it"
+        );
+        assert!(
+            engine.max_sun_altitude_deg < 0.0,
+            "a darkness threshold at or above 0 would mean daylight; the engine's \
+             default is astronomical twilight"
+        );
+    }
+
+    /// `memset(0)` must resolve to the engine's darkness default, not to
+    /// a literal 0.0 — the Sun's centre on the geometric horizon.
+    #[test]
+    fn a_zero_init_config_resolves_to_the_engine_darkness_default() {
+        let c = zeroed_config();
+        assert_eq!(
+            c.has_max_sun_altitude_deg, 0,
+            "zero-init declares no override"
+        );
+        assert_eq!(
+            c.max_sun_altitude_deg, 0.0,
+            "and the value slot is a bare zero"
+        );
+
+        // Drive the PRODUCTION marshal, not a copy of its branch: a
+        // test that re-implements the resolution asserts only that the
+        // test is self-consistent, and would keep passing if the real
+        // site stopped honouring the switch.
+        let code = std::ffi::CString::new("F51").unwrap();
+        let mut c = c;
+        c.obs_code = code.as_ptr();
+        let mut cfg: EmpyreanPlanningConfig = unsafe { std::mem::zeroed() };
+        let obs = [c];
+        cfg.observatories = obs.as_ptr();
+        cfg.num_observatories = 1;
+        cfg.num_threads = -1;
+        let built = build_planning_config(&cfg).expect("a zero-init observatory is well-formed");
+        let resolved = built.observatories[0].max_sun_altitude_deg;
+
+        assert_eq!(
+            resolved,
+            ObservatoryConfig::new("", [0.0, 0.0]).max_sun_altitude_deg,
+            "a zero-init struct must plan under the engine's twilight default"
+        );
+        assert_ne!(
+            resolved, 0.0,
+            "resolving to a literal 0.0 would place the Sun's centre on the horizon — \
+             a campaign planned in daylight, silently"
+        );
+        assert_eq!(
+            built.observatories[0].min_elevation_deg, 0.0,
+            "and the elevation gate stays at the geometric horizon"
+        );
+    }
+
+    /// The elevation field needs no switch: its engine default IS 0.0,
+    /// so zero-init already means the geometric horizon. This pins the
+    /// asymmetry deliberately, so nobody "tidies" a switch onto it or
+    /// off the other.
+    #[test]
+    fn the_elevation_field_needs_no_switch() {
+        assert_eq!(
+            ObservatoryConfig::new("", [0.0, 0.0]).min_elevation_deg,
+            0.0,
+            "the engine's elevation default is the geometric horizon, which IS the \
+             zero-init value — a presence switch here would add a state with no meaning"
+        );
+        assert_eq!(zeroed_config().min_elevation_deg, 0.0);
+    }
+
+    /// An explicit override reaches the engine config unchanged, on both
+    /// axes, and does not disturb the fields beside it.
+    #[test]
+    fn explicit_values_reach_the_engine_config() {
+        let code = std::ffi::CString::new("F51").unwrap();
+        let c = EmpyreanObservatoryConfig {
+            obs_code: code.as_ptr(),
+            sigma_ra_arcsec: 0.3,
+            sigma_dec_arcsec: 0.4,
+            max_apparent_mag: 24.5,
+            min_elongation_deg: 70.0,
+            min_elevation_deg: 30.0,
+            has_max_sun_altitude_deg: 1,
+            max_sun_altitude_deg: -12.0,
+        };
+        let mut cfg: EmpyreanPlanningConfig = unsafe { std::mem::zeroed() };
+        let obs = [c];
+        cfg.observatories = obs.as_ptr();
+        cfg.num_observatories = 1;
+        cfg.num_threads = -1;
+
+        let built = build_planning_config(&cfg).expect("a well-formed observatory config");
+        assert_eq!(built.observatories.len(), 1);
+        let o = &built.observatories[0];
+        assert_eq!(o.obs_code, "F51");
+        assert_eq!(o.min_elevation_deg, 30.0, "airmass ≤ 2, as supplied");
+        assert_eq!(
+            o.max_sun_altitude_deg, -12.0,
+            "nautical twilight, as supplied"
+        );
+        assert_eq!(o.max_apparent_mag, 24.5);
+        assert_eq!(o.min_elongation_deg, 70.0);
+        assert_eq!(o.sigma_arcsec, [0.3, 0.4]);
+    }
 }

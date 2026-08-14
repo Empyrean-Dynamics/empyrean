@@ -26,7 +26,7 @@ use empyrean_core::convert::{
     int_to_representation, representation_to_int,
 };
 use empyrean_core::coordinates::AU;
-use empyrean_core::nongrav::{GFunction, NonGravModel, NonGravParams};
+use empyrean_core::nongrav::{GFunction, NonGravModel};
 use empyrean_core::orbits::Orbits;
 use empyrean_core::propagation::events::DynamicalEvent;
 use serde::{Deserialize, Serialize};
@@ -46,6 +46,18 @@ use crate::{CoordinateState, set_last_error};
 /// `empyrean_orbits_write_*`. `orbit_ids` and `object_ids` are parallel
 /// to `orbits` (same length); each `object_ids[i]` may be null when the
 /// underlying orbit had no object designation.
+///
+/// # Ownership of the wide-carrier side arrays
+///
+/// On a batch the library **hands you**, each orbit's
+/// `state_param_cross` / `param_pair_cross` point into storage this
+/// batch owns, and [`empyrean_orbits_batch_free`] releases them with
+/// everything else. That is the opposite of the same fields on an
+/// `EmpyreanOrbit` you **build**, where they are caller-owned and merely
+/// borrowed for the call — the identical asymmetry `orbit_id` already
+/// has. A caller re-feeding a read orbit into a propagate/OD call before
+/// freeing the batch may pass the pointers straight through; one that
+/// frees the batch first must copy.
 ///
 /// Free with [`empyrean_orbits_batch_free`] when done.
 #[repr(C)]
@@ -69,6 +81,86 @@ impl EmpyreanOrbitBatch {
             orbit_ids: std::ptr::null_mut(),
             object_ids: std::ptr::null_mut(),
             num_orbits: 0,
+        }
+    }
+}
+
+/// Copy a slice into a fresh heap array shaped for the C ABI, returning
+/// `(ptr, len)`.
+///
+/// An empty slice yields `(null, 0)` and allocates nothing, which is the
+/// absent form every side array on [`EmpyreanOrbit`] already uses.
+/// Returns `None` when the allocation fails, so the caller can surface
+/// it rather than write a null pointer beside a non-zero count.
+fn alloc_owned_side_array<T: Copy>(items: &[T]) -> Option<(*mut T, usize)> {
+    if items.is_empty() {
+        return Some((std::ptr::null_mut(), 0));
+    }
+    let layout = std::alloc::Layout::array::<T>(items.len()).ok()?;
+    let ptr = unsafe { std::alloc::alloc(layout) } as *mut T;
+    if ptr.is_null() {
+        return None;
+    }
+    for (i, item) in items.iter().enumerate() {
+        unsafe { ptr.add(i).write(*item) };
+    }
+    Some((ptr, items.len()))
+}
+
+/// Release an array allocated by [`alloc_owned_side_array`]. A null
+/// pointer or a zero length is a no-op.
+///
+/// # Safety
+///
+/// `ptr` must be null or an array of exactly `len` `T` produced by
+/// [`alloc_owned_side_array`], not yet freed.
+pub(crate) unsafe fn free_owned_side_array<T>(ptr: *mut T, len: usize) {
+    if ptr.is_null() || len == 0 {
+        return;
+    }
+    if let Ok(layout) = std::alloc::Layout::array::<T>(len) {
+        unsafe { std::alloc::dealloc(ptr as *mut u8, layout) };
+    }
+}
+
+/// Flatten an engine [`WideCross`] into the two library-owned C arrays
+/// an [`EmpyreanOrbit`] on a read batch carries.
+///
+/// Returns `(state_ptr, state_len, pair_ptr, pair_len)`, or `None` when
+/// an allocation fails. Entry order follows the engine's own sorted
+/// order, which is deterministic but is not contract: every entry names
+/// the parameter it belongs to.
+pub(crate) fn carrier_to_owned_arrays(
+    cross: &empyrean_core::propagation::WideCross,
+) -> Option<(
+    *mut crate::joint::EmpyreanStateParamCross,
+    usize,
+    *mut crate::joint::EmpyreanParamPairCross,
+    usize,
+)> {
+    let state: Vec<crate::joint::EmpyreanStateParamCross> = cross
+        .state_crosses()
+        .map(|(column, values)| crate::joint::EmpyreanStateParamCross {
+            column: crate::joint::param_column_from_engine(column),
+            values: *values,
+        })
+        .collect();
+    let pairs: Vec<crate::joint::EmpyreanParamPairCross> = cross
+        .param_crosses()
+        .map(|(a, b, value)| crate::joint::EmpyreanParamPairCross {
+            a: crate::joint::param_column_from_engine(a),
+            b: crate::joint::param_column_from_engine(b),
+            value,
+        })
+        .collect();
+    let (state_ptr, state_len) = alloc_owned_side_array(&state)?;
+    match alloc_owned_side_array(&pairs) {
+        Some((pair_ptr, pair_len)) => Some((state_ptr, state_len, pair_ptr, pair_len)),
+        None => {
+            // The first array is already live; releasing it here keeps
+            // the failure path from leaking on the way out.
+            unsafe { free_owned_side_array(state_ptr, state_len) };
+            None
         }
     }
 }
@@ -104,6 +196,23 @@ pub unsafe extern "C" fn empyrean_orbits_batch_free(batch: *mut EmpyreanOrbitBat
             unsafe { std::alloc::dealloc(b.object_ids as *mut u8, layout) };
         }
         if !b.orbits.is_null() && n > 0 {
+            // The per-orbit carrier arrays are library-owned on a batch
+            // the library produced, so they are released here rather
+            // than left to the caller. Freed before the orbit array
+            // itself, since the pointers live inside it.
+            for i in 0..n {
+                let o = unsafe { &*b.orbits.add(i) };
+                unsafe {
+                    free_owned_side_array(
+                        o.state_param_cross as *mut crate::joint::EmpyreanStateParamCross,
+                        o.n_state_param_cross,
+                    );
+                    free_owned_side_array(
+                        o.param_pair_cross as *mut crate::joint::EmpyreanParamPairCross,
+                        o.n_param_pair_cross,
+                    );
+                }
+            }
             let layout = std::alloc::Layout::array::<EmpyreanOrbit>(n).unwrap();
             unsafe { std::alloc::dealloc(b.orbits as *mut u8, layout) };
         }
@@ -186,6 +295,13 @@ fn row_to_orbit(row: &OrbitRow) -> Result<(EmpyreanOrbit, String, Option<String>
         representation,
         frame,
         origin: row.origin,
+        // `OrbitRow` is this crate's own flat serde shape for the
+        // legacy JSON transit path, and it carries no covariance beyond
+        // the 6×6 — no Marsden 3×3, so no border to pair one with. The
+        // engine's own file formats (read through
+        // `empyrean_orbits_read_*`) do carry both.
+        has_non_grav_cross: 0,
+        non_grav_cross: [[0.0; 3]; 6],
     };
     // The IO path returns the row's orbit_id / object_id in the tuple
     // alongside the EmpyreanOrbit; the caller binds them via
@@ -239,6 +355,12 @@ fn row_to_orbit(row: &OrbitRow) -> Result<(EmpyreanOrbit, String, Option<String>
         srp_amrat: 0.0,
         srp_cr: 0.0,
         srp_amrat_variance: f64::NAN,
+        // Same `OrbitRow` limitation as the border above: nothing in this
+        // shape can hold a wide carrier, so there is nothing to attach.
+        state_param_cross: std::ptr::null(),
+        n_state_param_cross: 0,
+        param_pair_cross: std::ptr::null(),
+        n_param_pair_cross: 0,
     };
     Ok((orbit, row.orbit_id.clone(), row.object_id.clone()))
 }
@@ -325,6 +447,29 @@ fn batch_to_rows(batch: &EmpyreanOrbitBatch) -> Result<Vec<OrbitRow>, String> {
     let mut rows = Vec::with_capacity(batch.num_orbits);
     for i in 0..batch.num_orbits {
         let orbit = unsafe { &*batch.orbits.add(i) };
+        // This format cannot represent the joint, so it refuses a batch
+        // that carries one rather than writing the row short and
+        // returning success.
+        //
+        // `OrbitRow` is this crate's own flat serde shape: eight scalars
+        // plus the 6×6. It has no slot for the state↔Marsden border or
+        // the wide carrier, and unlike the engine's CSV writer — which
+        // refuses by name — nothing on this path would have noticed.
+        // Silently dropping them writes a file that reads back as a
+        // block-diagonal joint, which is a different and tighter claim
+        // than the one the caller held, and the round trip gives no
+        // signal that it happened.
+        if orbit.state.has_non_grav_cross != 0 {
+            return Err(format!(
+                "orbit {i}: the JSON orbit format cannot represent a state↔Marsden                  cross-covariance (`state.has_non_grav_cross = 1`). Write parquet,                  which carries the full joint; this format holds the 6×6 only."
+            ));
+        }
+        if orbit.n_state_param_cross != 0 || orbit.n_param_pair_cross != 0 {
+            return Err(format!(
+                "orbit {i}: the JSON orbit format cannot represent a wide                  cross-covariance carrier ({} state column(s), {} parameter pair(s)).                  Write parquet, which carries the full joint; this format holds the                  6×6 only.",
+                orbit.n_state_param_cross, orbit.n_param_pair_cross
+            ));
+        }
         let id_ptr = unsafe { *batch.orbit_ids.add(i) };
         if id_ptr.is_null() {
             return Err(format!("null orbit_id at index {i}"));
@@ -379,50 +524,25 @@ pub(crate) fn batch_to_orbits(batch: &EmpyreanOrbitBatch) -> Result<Orbits<AU>, 
             None
         };
         let state = orbit.state.to_empyrean();
-        let coords = coordinate_state_to_coordinates(&state)
-            .map_err(|e| format!("orbit {i}: {e}"))?
-            .into_radians();
-        out.push_with_object(orbit_id, object_id, coords)
+        let coords =
+            coordinate_state_to_coordinates(&state).map_err(|e| format!("orbit {i}: {e}"))?;
+        // The write direction is the fifth site that turns a C-ABI orbit
+        // into an engine `Orbits`, and it lost the covariance in exactly
+        // the same way the four reader paths did. It gets the same
+        // treatment: the joint is attached, and the writers then decide
+        // what they can represent — parquet carries the carrier, the
+        // engine's CSV writer refuses it by name, and a thrust-bearing
+        // carrier is refused wherever it is offered, because no orbit
+        // format can serialize a thrust arc to hang it on. (The JSON
+        // path does not come through here at all: it is this crate's own
+        // flat row shape, and it refuses the joint in `batch_to_rows`.)
+        // Refusing at the writer is the point: a carrier
+        // dropped here would be written short and read back as a
+        // block-diagonal joint.
+        crate::joint::push_orbit_with_joint(&mut out, orbit_id, coords, orbit)
             .map_err(|e| format!("orbit {i}: {e}"))?;
-        if orbit.a1 != 0.0 || orbit.a2 != 0.0 || orbit.a3 != 0.0 {
-            let g_func = if orbit.ng_alpha == 0.0
-                && orbit.ng_r0 == 0.0
-                && orbit.ng_m == 0.0
-                && orbit.ng_n == 0.0
-                && orbit.ng_k == 0.0
-            {
-                GFunction::inverse_square()
-            } else {
-                GFunction::from_sbdb(
-                    orbit.ng_alpha,
-                    orbit.ng_r0,
-                    orbit.ng_m,
-                    orbit.ng_n,
-                    orbit.ng_k,
-                )
-            };
-            let params = NonGravParams {
-                a1: orbit.a1,
-                a2: orbit.a2,
-                a3: orbit.a3,
-                model: NonGravModel::MarsdenSekanina(g_func),
-                covariance: None,
-                dt: if orbit.non_grav_dt.is_finite() {
-                    Some(orbit.non_grav_dt)
-                } else {
-                    None
-                },
-                // DT is a fittable axis in v1.20.0; carry the DT prior variance
-                // when the input orbit supplies one so it opens the DT column
-                // downstream.
-                dt_variance: if orbit.non_grav_dt_variance.is_finite()
-                    && orbit.non_grav_dt_variance > 0.0
-                {
-                    Some(orbit.non_grav_dt_variance)
-                } else {
-                    None
-                },
-            };
+        out.set_object_id(i, object_id);
+        if let Some(params) = crate::propagate::empyrean_orbit_non_grav_params(orbit) {
             out.set_non_grav_params(i, Some(params));
         }
         if let Some(tp) = crate::propagate::empyrean_orbit_thrust_params(orbit)
@@ -439,6 +559,54 @@ pub(crate) fn batch_to_orbits(batch: &EmpyreanOrbitBatch) -> Result<Orbits<AU>, 
     Ok(out)
 }
 
+/// Release a partially-built batch: the carrier arrays and identifier
+/// strings of the first `written` rows, then the three arrays.
+///
+/// The batch's own free function cannot be used here because the batch
+/// struct does not exist yet — the rows are still loose in raw arrays,
+/// and only the first `written` of them are initialized. Freeing the
+/// arrays alone would leak everything they point at.
+///
+/// # Safety
+///
+/// The three pointers must be the allocations described by the two
+/// layouts, with exactly `written` initialized rows.
+unsafe fn free_partial_batch(
+    orbits_ptr: *mut EmpyreanOrbit,
+    orbit_ids_ptr: *mut *mut c_char,
+    object_ids_ptr: *mut *mut c_char,
+    written: usize,
+    orbits_layout: std::alloc::Layout,
+    ids_layout: std::alloc::Layout,
+) {
+    for k in 0..written {
+        let o = unsafe { &*orbits_ptr.add(k) };
+        unsafe {
+            free_owned_side_array(
+                o.state_param_cross as *mut crate::joint::EmpyreanStateParamCross,
+                o.n_state_param_cross,
+            );
+            free_owned_side_array(
+                o.param_pair_cross as *mut crate::joint::EmpyreanParamPairCross,
+                o.n_param_pair_cross,
+            );
+            let id = *orbit_ids_ptr.add(k);
+            if !id.is_null() {
+                drop(CString::from_raw(id));
+            }
+            let obj = *object_ids_ptr.add(k);
+            if !obj.is_null() {
+                drop(CString::from_raw(obj));
+            }
+        }
+    }
+    unsafe {
+        std::alloc::dealloc(orbits_ptr as *mut u8, orbits_layout);
+        std::alloc::dealloc(orbit_ids_ptr as *mut u8, ids_layout);
+        std::alloc::dealloc(object_ids_ptr as *mut u8, ids_layout);
+    }
+}
+
 /// Convert a villeneuve `Orbits<AU>` into an [`EmpyreanOrbitBatch`].
 pub(crate) fn orbits_to_batch(orbits: &Orbits<AU>) -> Result<EmpyreanOrbitBatch, String> {
     let n = orbits.len();
@@ -453,13 +621,34 @@ pub(crate) fn orbits_to_batch(orbits: &Orbits<AU>) -> Result<EmpyreanOrbitBatch,
     if orbits_ptr.is_null() || orbit_ids_ptr.is_null() || object_ids_ptr.is_null() {
         return Err("allocation failed for orbit batch".into());
     }
-    for i in 0..n {
-        let coord = orbits.coordinates()[i].into_angular::<empyrean_core::coordinates::Degrees>();
+    // Rows are written one at a time and each may own two heap arrays,
+    // so every failure past the first write has live allocations to
+    // release. `written` is what the unwind below walks; returning
+    // straight out of the loop would leak every carrier already
+    // marshaled plus the three arrays.
+    let mut written = 0usize;
+    let build = |i: usize| -> Result<(EmpyreanOrbit, *mut c_char, *mut c_char), String> {
+        // The unit-aware read-out: it converts the coordinate AND its
+        // carrier to degrees by the same reciprocal factor. Converting
+        // only the coordinate would hand the caller a degree 6×6 bordered
+        // by a radian carrier — an error that surfaces only on a round
+        // trip and reads as a marshaling bug rather than a unit bug.
+        let (coord, cross) = orbits
+            .coordinates_angular::<empyrean_core::coordinates::Degrees>(i)
+            .ok_or_else(|| format!("orbit {i}: index out of range reading the coordinate"))?;
         // Fallible since the engine stopped panicking on an origin with
         // no NAIF id (an MPC site code). Surface it — a fabricated
         // sentinel written into a Parquet/JSON/CSV orbit file would read
         // back as a different body.
         let cs = coordinates_to_coordinate_state(&coord).map_err(|e| format!("orbit {i}: {e}"))?;
+        let (has_border, border) = crate::joint::border_to_c(coord.extended_covariance());
+        let (state_param_cross, n_state_param_cross, param_pair_cross, n_param_pair_cross) =
+            match cross.as_ref() {
+                Some(wc) => carrier_to_owned_arrays(wc).ok_or_else(|| {
+                    format!("orbit {i}: allocation failed for the wide cross-covariance arrays")
+                })?,
+                None => (std::ptr::null_mut(), 0, std::ptr::null_mut(), 0),
+            };
         let mut orbit = EmpyreanOrbit {
             state: CoordinateState::from_empyrean(&cs),
             // Same as the read path: per-orbit id pointers stay null in
@@ -478,8 +667,14 @@ pub(crate) fn orbits_to_batch(orbits: &Orbits<AU>) -> Result<EmpyreanOrbitBatch,
             ng_k: 0.0,
             non_grav_dt: f64::NAN,
             non_grav_dt_variance: f64::NAN,
-            // Non-grav covariance is an OD-output concept; the read-orbits
-            // path doesn't carry it.
+            // Carried from the villeneuve orbit below when present. It
+            // used to be hardcoded absent, on the reasoning that a
+            // non-grav covariance is an OD-output concept the read path
+            // does not see — but the orbit files have carried a `cov_dim
+            // = 9` state+Marsden joint since long before this change, so
+            // the read path did see one and dropped it. It is also the
+            // parameter block the border below has to sit against: a
+            // border with no 3×3 is refused by the engine.
             has_non_grav_covariance: 0,
             non_grav_covariance: [[0.0; 3]; 3],
             // Photometry is not currently carried through the read-orbits
@@ -504,7 +699,15 @@ pub(crate) fn orbits_to_batch(orbits: &Orbits<AU>) -> Result<EmpyreanOrbitBatch,
             srp_amrat: 0.0,
             srp_cr: 0.0,
             srp_amrat_variance: f64::NAN,
+            // Library-owned on this direction (see the batch's own docs)
+            // and released by `empyrean_orbits_batch_free`.
+            state_param_cross,
+            n_state_param_cross,
+            param_pair_cross,
+            n_param_pair_cross,
         };
+        orbit.state.has_non_grav_cross = has_border;
+        orbit.state.non_grav_cross = border;
         if let Some(ph) = orbits.photometric_params(i) {
             orbit.h_mag = ph.h();
             orbit.phot_system = match ph.phase_function {
@@ -521,6 +724,10 @@ pub(crate) fn orbits_to_batch(orbits: &Orbits<AU>) -> Result<EmpyreanOrbitBatch,
             orbit.a3 = ng.a3;
             orbit.non_grav_dt = ng.dt.unwrap_or(f64::NAN);
             orbit.non_grav_dt_variance = ng.dt_variance.unwrap_or(f64::NAN);
+            if let Some(cov) = ng.covariance {
+                orbit.has_non_grav_covariance = 1;
+                orbit.non_grav_covariance = cov;
+            }
             // NonGravModel is Marsden-only in v1.20.0 — irrefutable.
             let NonGravModel::MarsdenSekanina(g) = &ng.model;
             orbit.ng_alpha = g.alpha;
@@ -529,23 +736,64 @@ pub(crate) fn orbits_to_batch(orbits: &Orbits<AU>) -> Result<EmpyreanOrbitBatch,
             orbit.ng_n = g.n;
             orbit.ng_k = g.k;
         }
+        // A border and the 3×3 it borders are two halves of ONE
+        // `ExtendedCovariance`, so they ship together or not at all.
+        // The reader above back-fills the 3×3 only for a row that
+        // carried an A-coefficient, which leaves one real shape short:
+        // a `cov_dim = 9` row with null a1/a2/a3 — an orbit whose
+        // Marsden block was solved from a zero start. Publishing its
+        // border with `has_non_grav_covariance = 0` would hand the
+        // engine a cross with no parameter block, which it refuses by
+        // name, turning a file that reads today into a hard failure on
+        // the next propagate.
+        //
+        // The value is not fabricated: `params` is the border's own
+        // other half, read from the same row.
+        if has_border != 0
+            && orbit.has_non_grav_covariance == 0
+            && let Some(ext) = coord.extended_covariance()
+        {
+            orbit.has_non_grav_covariance = 1;
+            orbit.non_grav_covariance = ext.params;
+        }
         if let Some(srp) = orbits.srp_params(i) {
             orbit.has_srp = 1;
             orbit.srp_amrat = srp.amrat;
             orbit.srp_cr = srp.cr;
             orbit.srp_amrat_variance = srp.amrat_variance.unwrap_or(f64::NAN);
         }
-        unsafe { orbits_ptr.add(i).write(orbit) };
         let id_c =
             CString::new(orbits.orbit_ids()[i].as_str()).unwrap_or_else(|_| CString::default());
-        unsafe { orbit_ids_ptr.add(i).write(id_c.into_raw()) };
         let obj_ptr = match orbits.object_ids()[i].as_ref() {
             Some(s) => CString::new(s.as_str())
                 .unwrap_or_else(|_| CString::default())
                 .into_raw(),
             None => std::ptr::null_mut(),
         };
-        unsafe { object_ids_ptr.add(i).write(obj_ptr) };
+        Ok((orbit, id_c.into_raw(), obj_ptr))
+    };
+    for i in 0..n {
+        match build(i) {
+            Ok((orbit, id_ptr, obj_ptr)) => unsafe {
+                orbits_ptr.add(i).write(orbit);
+                orbit_ids_ptr.add(i).write(id_ptr);
+                object_ids_ptr.add(i).write(obj_ptr);
+                written += 1;
+            },
+            Err(e) => {
+                unsafe {
+                    free_partial_batch(
+                        orbits_ptr,
+                        orbit_ids_ptr,
+                        object_ids_ptr,
+                        written,
+                        orbits_layout,
+                        ids_layout,
+                    );
+                }
+                return Err(e);
+            }
+        }
     }
     Ok(EmpyreanOrbitBatch {
         orbits: orbits_ptr,
@@ -567,8 +815,19 @@ pub unsafe extern "C" fn empyrean_orbits_read_parquet(
     out: *mut EmpyreanOrbitBatch,
 ) -> i32 {
     file_op(path, out, |p, o| {
-        let orbits: Orbits<AU> = empyrean_core::io::parquet::read_orbits(p)
-            .map_err(|e| format!("parquet read failed: {e:?}"))?;
+        // The `_with_non_grav` reader, for the same reason the CSV path
+        // uses it: the plain reader attaches the `ExtendedCovariance` to
+        // every `cov_dim = 9` row but leaves `NonGravParams` unset, so
+        // the file's own A1/A2/A3 are dropped AND the Marsden 3×3 the
+        // border needs is never back-filled. The row's own g(r)
+        // exponents win; the model passed here is only the fallback for
+        // a row that carried none, and an all-zero exponent set IS the
+        // inverse-square asteroid default.
+        let orbits: Orbits<AU> = empyrean_core::io::parquet::read_orbits_with_non_grav(
+            p,
+            NonGravModel::MarsdenSekanina(GFunction::inverse_square()),
+        )
+        .map_err(|e| format!("parquet read failed: {e:?}"))?;
         *o = orbits_to_batch(&orbits)?;
         Ok(())
     })
@@ -608,6 +867,23 @@ pub unsafe extern "C" fn empyrean_orbits_read_json(
 }
 
 /// Write an orbit batch to JSON.
+///
+/// This is **not** the engine's orbit schema — it is this crate's own
+/// flat row shape (`OrbitRow`), and it is the least capable of the three
+/// orbit formats. It carries the state, the 6×6 and the Marsden
+/// coefficients with their g(r) exponents, and nothing else.
+///
+/// A batch carrying a state↔Marsden border or a wide cross-covariance
+/// carrier is **refused by name**, pointing at parquet — the format is
+/// unable to represent the joint, and writing the row short would
+/// produce a file that reads back as a block-diagonal covariance with no
+/// signal that anything was lost.
+///
+/// Fields this format drops without refusing, because they predate the
+/// joint surface and a refusal would break callers who write them today:
+/// the non-grav DT and its prior variance, the Marsden 3×3, the SRP slot
+/// and the photometric block. Round-trip through parquet if you need
+/// them.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn empyrean_orbits_write_json(
     path: *const c_char,
@@ -1018,6 +1294,9 @@ fn rejection_reason_str(code: i32) -> &'static str {
             "observer_construction_failed"
         }
         crate::od::EMPYREAN_REJECTION_NEVER_ABSORBED => "never_absorbed",
+        crate::od::EMPYREAN_REJECTION_PER_OBSERVATION_SITE_REQUIRED => {
+            "per_observation_site_required"
+        }
         _ => "not_evaluated",
     }
 }
@@ -2457,7 +2736,7 @@ mod residual_writer_tests {
         "radar_kind",
     ];
 
-    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+    pub(super) fn tmp_dir(tag: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!(
             "empyrean-residual-writer-{tag}-{}",
             std::process::id()
@@ -2668,6 +2947,8 @@ mod residual_writer_tests {
             representation: crate::od::EMPYREAN_REPRESENTATION_CARTESIAN,
             frame: 0,
             origin: 10,
+            has_non_grav_cross: 0,
+            non_grav_cross: [[0.0; 3]; 6],
         };
         orbit.non_grav_dt = f64::NAN;
         orbit.non_grav_dt_variance = f64::NAN;
@@ -2687,12 +2968,23 @@ mod residual_writer_tests {
         }
     }
 
-    /// The CSV orbit file is not a lossy projection of the parquet one:
-    /// both carry the same column set, covariance included. CSV used to
-    /// drop it entirely, so `--format csv` silently discarded the
-    /// uncertainty the whole engine exists to propagate.
+    /// The CSV orbit file is not a lossy projection of the parquet one
+    /// **for everything both formats can represent**: the same column
+    /// set, covariance included. CSV used to drop the covariance
+    /// entirely, so `--format csv` silently discarded the uncertainty
+    /// the whole engine exists to propagate.
+    ///
+    /// The wide cross-covariance carrier is the one documented
+    /// exception, and the assertion is split rather than relaxed so the
+    /// exception cannot quietly widen. Parquet carries the carrier in a
+    /// `wcs_*` / `wcp_*` tail; CSV refuses it, because CSV has no null
+    /// and this schema makes null-versus-zero load-bearing — an absent
+    /// cross and a supplied zero cross are different claims, and a
+    /// format that renders both as an empty cell cannot tell them
+    /// apart. A CSV write of a carrier-bearing orbit is refused by name
+    /// upstream rather than written short.
     #[test]
-    fn orbit_csv_and_parquet_carry_the_same_columns() {
+    fn orbit_csv_and_parquet_carry_the_same_columns_except_the_carrier() {
         let dir = tmp_dir("orbit-parity");
         let batch = sample_orbit_batch();
         let pq_path = dir.join("o.parquet");
@@ -2705,19 +2997,39 @@ mod residual_writer_tests {
         assert_eq!(rc_pq, 0, "parquet write");
         assert_eq!(rc_csv, 0, "csv write");
 
-        let mut pq_cols = parquet_columns(&pq_path);
+        let pq_all = parquet_columns(&pq_path);
         let mut csv_cols = csv_columns(&csv_path);
+
+        // The carrier tail, split out by name.
+        let is_carrier = |c: &String| c.starts_with("wcs_") || c.starts_with("wcp_");
+        let carrier: Vec<String> = pq_all.iter().filter(|c| is_carrier(c)).cloned().collect();
+        let mut pq_cols: Vec<String> = pq_all.iter().filter(|c| !is_carrier(c)).cloned().collect();
+
+        assert!(
+            !carrier.is_empty(),
+            "parquet must carry the wide cross tail; it is the format that can \
+             express an absent cross as a null"
+        );
+        assert!(
+            !csv_cols.iter().any(is_carrier),
+            "CSV must NOT carry carrier columns — it cannot distinguish an absent \
+             cross from a supplied zero one. Got: {csv_cols:?}"
+        );
+
         assert_eq!(
             pq_cols.len(),
             csv_cols.len(),
-            "same column count\nparquet: {pq_cols:?}\ncsv: {csv_cols:?}"
+            "same column count outside the carrier tail\nparquet: {pq_cols:?}\ncsv: {csv_cols:?}"
         );
         pq_cols.sort();
         csv_cols.sort();
         // Set equality, not positional: the two engine writers order the
         // photometry and SRP blocks differently at the tail. Both formats
         // are self-describing, so a name-keyed reader is unaffected.
-        assert_eq!(pq_cols, csv_cols, "same column SET");
+        assert_eq!(
+            pq_cols, csv_cols,
+            "same column SET outside the carrier tail"
+        );
 
         // The covariance actually reached the CSV, with a value.
         let header = csv_columns(&csv_path);
@@ -2761,5 +3073,301 @@ mod residual_writer_tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), total, "each code needs its own name");
+    }
+}
+
+/// The orbit-file round trip for a border-bearing row.
+///
+/// The read path is where a border and the 3×3 it borders can come
+/// apart: the engine's plain reader attaches the border to every
+/// `cov_dim = 9` row but leaves `NonGravParams` unset, so a file that
+/// round-trips today would arrive with a cross and no parameter block —
+/// which the engine refuses by name on the next propagate. These pin
+/// that the pair survives, together, out and back.
+#[cfg(test)]
+mod orbit_file_joint_tests {
+    use super::residual_writer_tests::tmp_dir;
+    use super::*;
+
+    /// A one-orbit batch carrying a full state+Marsden joint: the 6×6,
+    /// the 3×3, and the border between them.
+    fn bordered_batch() -> EmpyreanOrbitBatch {
+        // SAFETY: `#[repr(C)]` POD plus pointers that zero-init to null.
+        let mut orbit: EmpyreanOrbit = unsafe { std::mem::zeroed() };
+        orbit.state = CoordinateState {
+            epoch_mjd_tdb: 60320.0,
+            elements: [1.1, 0.2, 0.03, -0.004, 0.017, 0.0006],
+            covariance: {
+                let mut c = [[0.0f64; 6]; 6];
+                for (i, row) in c.iter_mut().enumerate() {
+                    row[i] = 1.0e-9 * (i as f64 + 1.0);
+                }
+                c
+            },
+            has_covariance: 1,
+            representation: crate::od::EMPYREAN_REPRESENTATION_CARTESIAN,
+            frame: 0,
+            origin: 10,
+            has_non_grav_cross: 1,
+            // Built as rho * sigma_state[r] * sigma_A[c] with a small,
+            // per-cell-distinct rho. Distinct so a transposed or shifted
+            // round trip is visible rather than accidentally symmetric;
+            // derived from the diagonals because the assembled 9x9 has
+            // to be a real covariance — the engine gates definiteness
+            // and would refuse an invented cross whose implied
+            // correlation exceeds 1, which is a different failure than
+            // the one this fixture exists to catch.
+            non_grav_cross: {
+                let a_diag = [1.0e-20f64, 2.0e-22, 3.0e-24];
+                let mut b = [[0.0f64; 3]; 6];
+                for (r, row) in b.iter_mut().enumerate() {
+                    let sigma_state = (1.0e-9 * (r as f64 + 1.0)).sqrt();
+                    for (c, v) in row.iter_mut().enumerate() {
+                        let rho = 0.01 * ((r * 3 + c) as f64 + 1.0) / 18.0;
+                        *v = rho * sigma_state * a_diag[c].sqrt();
+                    }
+                }
+                b
+            },
+        };
+        orbit.a1 = 1.0e-10;
+        orbit.a2 = 2.0e-11;
+        orbit.a3 = 3.0e-12;
+        orbit.non_grav_dt = f64::NAN;
+        orbit.non_grav_dt_variance = f64::NAN;
+        orbit.has_non_grav_covariance = 1;
+        orbit.non_grav_covariance = [
+            [1.0e-20, 0.0, 0.0],
+            [0.0, 2.0e-22, 0.0],
+            [0.0, 0.0, 3.0e-24],
+        ];
+        orbit.phot_system = -1;
+        orbit.h_mag = f64::NAN;
+        orbit.slope1 = f64::NAN;
+        orbit.slope2 = f64::NAN;
+        orbit.srp_amrat_variance = f64::NAN;
+
+        let id = crate::od::alloc_cstring_for_test("bordered-orbit");
+        EmpyreanOrbitBatch {
+            orbits: Box::into_raw(Box::new(orbit)),
+            orbit_ids: Box::into_raw(Box::new(id)),
+            object_ids: Box::into_raw(Box::new(std::ptr::null_mut::<c_char>())),
+            num_orbits: 1,
+        }
+    }
+
+    /// Write a bordered orbit to parquet, read it back, and assert the
+    /// border, the 3×3 it borders, and the A coefficients all survive.
+    ///
+    /// # What catches what
+    ///
+    /// Two independent fixes stand behind this row, and the assertions
+    /// are deliberately split so each is pinned by something only it
+    /// can satisfy:
+    ///
+    /// * the **A-coefficient** assertions catch a revert of the reader
+    ///   (`read_orbits` in place of `read_orbits_with_non_grav`) — the
+    ///   plain reader drops A1/A2/A3 outright and nothing downstream
+    ///   reconstructs them;
+    /// * the **3×3** assertion catches a revert of the belt-and-braces
+    ///   in `orbits_to_batch`, which sources the parameter block from
+    ///   the border's own other half.
+    ///
+    /// Reverting only the reader would leave the 3×3 intact via the
+    /// belt-and-braces, so the 3×3 assertion alone would NOT have caught
+    /// it — which is why the A-coefficient checks are load-bearing here
+    /// rather than incidental. The
+    /// `a_border_reaching_the_batch_without_its_3x3_is_impossible` test
+    /// below pins the belt-and-braces directly.
+    #[test]
+    fn a_bordered_orbit_round_trips_through_parquet_with_its_3x3() {
+        let dir = tmp_dir("bordered-parquet");
+        let path = dir.join("bordered.parquet");
+        let c_path = CString::new(path.display().to_string()).unwrap();
+
+        let written = bordered_batch();
+        let rc = unsafe { empyrean_orbits_write_parquet(c_path.as_ptr(), &written) };
+        assert_eq!(rc, 0, "writing a bordered orbit must succeed");
+
+        let mut read_back: EmpyreanOrbitBatch = unsafe { std::mem::zeroed() };
+        let rc = unsafe { empyrean_orbits_read_parquet(c_path.as_ptr(), &mut read_back) };
+        assert_eq!(rc, 0, "reading it back must succeed");
+        assert_eq!(read_back.num_orbits, 1);
+
+        let got = unsafe { &*read_back.orbits };
+        let src = unsafe { &*written.orbits };
+
+        assert_eq!(
+            got.state.has_non_grav_cross, 1,
+            "the state↔Marsden border must survive the round trip"
+        );
+        for r in 0..6 {
+            for c in 0..3 {
+                assert!(
+                    (got.state.non_grav_cross[r][c] - src.state.non_grav_cross[r][c]).abs() < 1e-30,
+                    "border[{r}][{c}] must round-trip exactly"
+                );
+            }
+        }
+
+        // The half that used to go missing.
+        assert_eq!(
+            got.has_non_grav_covariance, 1,
+            "the Marsden 3×3 must come back WITH the border it conditions — a border \
+             without it is refused by the engine, not merely incomplete"
+        );
+        for i in 0..3 {
+            for j in 0..3 {
+                assert!(
+                    (got.non_grav_covariance[i][j] - src.non_grav_covariance[i][j]).abs() < 1e-30,
+                    "the 3×3 must round-trip exactly at [{i}][{j}]"
+                );
+            }
+        }
+        // And the A coefficients the plain reader also dropped.
+        assert!((got.a1 - src.a1).abs() < 1e-30, "A1 must survive");
+        assert!((got.a2 - src.a2).abs() < 1e-30, "A2 must survive");
+        assert!((got.a3 - src.a3).abs() < 1e-30, "A3 must survive");
+
+        unsafe { empyrean_orbits_batch_free(&mut read_back) };
+        unsafe { empyrean_orbits_batch_free(&written as *const _ as *mut _) };
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The belt-and-braces, pinned directly: whatever the reader does,
+    /// a batch must never leave `orbits_to_batch` carrying a border
+    /// without the parameter block that border conditions.
+    ///
+    /// Driven on an `Orbits` built in memory with the border attached
+    /// and `NonGravParams` deliberately absent — the shape a
+    /// `cov_dim = 9` row with null A-coefficients produces, which the
+    /// engine's `_with_non_grav` reader does NOT back-fill because its
+    /// back-fill is gated on an A-coefficient being present.
+    #[test]
+    fn a_border_reaching_the_batch_without_its_3x3_is_impossible() {
+        use empyrean_core::coordinates::ExtendedCovariance;
+
+        let mut orbits: Orbits<AU> = Orbits::empty();
+        let cs = empyrean_core::convert::CoordinateState {
+            epoch_mjd_tdb: 60320.0,
+            elements: [1.1, 0.2, 0.03, -0.004, 0.017, 0.0006],
+            covariance: {
+                let mut c = [[0.0f64; 6]; 6];
+                for (i, row) in c.iter_mut().enumerate() {
+                    row[i] = 1.0e-9 * (i as f64 + 1.0);
+                }
+                c
+            },
+            has_covariance: 1,
+            representation: crate::od::EMPYREAN_REPRESENTATION_CARTESIAN,
+            frame: 0,
+            origin: 10,
+        };
+        let coord = empyrean_core::convert::coordinate_state_to_coordinates(&cs)
+            .expect("well-formed Cartesian state");
+        let params: [[f64; 3]; 3] = [
+            [1.0e-20, 0.0, 0.0],
+            [0.0, 2.0e-22, 0.0],
+            [0.0, 0.0, 3.0e-24],
+        ];
+        let cross = {
+            let mut b = [[0.0f64; 3]; 6];
+            for (r, row) in b.iter_mut().enumerate() {
+                let sigma = (1.0e-9 * (r as f64 + 1.0)).sqrt();
+                for (c, v) in row.iter_mut().enumerate() {
+                    *v = 0.01 * sigma * params[c][c].sqrt();
+                }
+            }
+            b
+        };
+        let bordered = crate::joint::coordinates_with_extended(
+            coord,
+            Some(ExtendedCovariance::new(cross, params)),
+        );
+        orbits
+            .push("no-a-coefficients".to_string(), bordered.into_radians())
+            .expect("push");
+        // Deliberately NOT set: this is the row shape the reader's
+        // back-fill gate skips.
+        assert!(
+            orbits.non_grav_params(0).is_none(),
+            "the fixture must carry no NonGravParams, or it tests nothing"
+        );
+
+        let batch = orbits_to_batch(&orbits).expect("marshal");
+        let out = unsafe { &*batch.orbits };
+        assert_eq!(out.state.has_non_grav_cross, 1, "the border is published");
+        assert_eq!(
+            out.has_non_grav_covariance, 1,
+            "and so is the 3×3 it conditions — sourced from the border's own other \
+             half, because publishing one without the other hands the engine a cross \
+             it refuses by name"
+        );
+        assert_eq!(
+            out.non_grav_covariance, params,
+            "verbatim, not reconstructed"
+        );
+
+        unsafe { empyrean_orbits_batch_free(&batch as *const _ as *mut _) };
+    }
+
+    /// The read → propagate chain, which is what the missing 3×3 broke.
+    ///
+    /// A row read back from parquet must be directly propagatable. This
+    /// is the assertion that fails loudly on the pre-fix reader: the
+    /// engine raises `ExtendedCovarianceWithoutNonGravCovariance` and
+    /// the call returns the engine-error code.
+    #[test]
+    fn an_orbit_read_from_parquet_propagates() {
+        let Some(ctx) = crate::testing::context_or_skip("an_orbit_read_from_parquet_propagates")
+        else {
+            return;
+        };
+        let dir = tmp_dir("bordered-propagate");
+        let path = dir.join("bordered.parquet");
+        let c_path = CString::new(path.display().to_string()).unwrap();
+
+        let written = bordered_batch();
+        assert_eq!(
+            unsafe { empyrean_orbits_write_parquet(c_path.as_ptr(), &written) },
+            0
+        );
+        let mut read_back: EmpyreanOrbitBatch = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { empyrean_orbits_read_parquet(c_path.as_ptr(), &mut read_back) },
+            0
+        );
+
+        let mut cfg: crate::propagate::EmpyreanPropagationConfig = unsafe { std::mem::zeroed() };
+        cfg.force_model = 2;
+        cfg.uncertainty_method.tag = crate::propagate::EMPYREAN_UNCERTAINTY_FIRST;
+        cfg.advanced.dt_initial = f64::NAN;
+        cfg.advanced.dt_min = f64::NAN;
+
+        let times = [60320.0f64, 60330.0];
+        let mut result: crate::propagate::EmpyreanPropagationResult = unsafe { std::mem::zeroed() };
+        let code = unsafe {
+            crate::propagate::empyrean_propagate(
+                &ctx,
+                read_back.orbits,
+                read_back.num_orbits,
+                times.as_ptr(),
+                times.len(),
+                &cfg,
+                &mut result,
+            )
+        };
+        let err = unsafe { CStr::from_ptr(crate::empyrean_last_error()) }.to_string_lossy();
+        assert_eq!(
+            code, 0,
+            "an orbit read straight from parquet must propagate. A refusal naming the \
+             extended covariance means the border came back without its 3×3: {err}"
+        );
+        assert_eq!(result.num_states, times.len());
+
+        unsafe { crate::propagate::empyrean_propagation_result_free(&mut result) };
+        unsafe { empyrean_orbits_batch_free(&mut read_back) };
+        unsafe { empyrean_orbits_batch_free(&written as *const _ as *mut _) };
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

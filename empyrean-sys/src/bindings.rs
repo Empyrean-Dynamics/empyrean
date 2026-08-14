@@ -22,12 +22,26 @@
 //
 // ONE hand edit is re-applied afterwards: bindgen types every `#define <int>`
 // as `u32`, but where a constant names the value set of a struct field it is
-// typed to that field instead, so the natural comparison needs no cast —
-// EMPYREAN_DATA_REFRESH_* as `u8`, and EMPYREAN_DATA_TIER_* /
-// EMPYREAN_COVARIANCE_TRUST_* / EMPYREAN_TRUST_EVENT_* /
-// EMPYREAN_EPHEMERIS_OVERLAP_POLICY_* as `i32`.
+// typed to that field instead, so the natural comparison needs no cast. The
+// full list, which the v4 regeneration found had drifted from what the file
+// actually carried (EMPYREAN_OD_FAILURE_* was already retyped and undocumented
+// here, so a faithful regeneration would have silently reverted it):
 //
-// ONE DELIBERATE EXCEPTION: EMPYREAN_COVARIANCE_QUALITY_* stays at bindgen's
+//   as `u8`  — EMPYREAN_DATA_REFRESH_*, EMPYREAN_PARAM_FIXED / _SOLVED /
+//              _CONSIDERED (the EmpyreanSolveFor disposition bytes);
+//   as `i32` — EMPYREAN_DATA_TIER_*, EMPYREAN_COVARIANCE_TRUST_*,
+//              EMPYREAN_TRUST_EVENT_*, EMPYREAN_EPHEMERIS_OVERLAP_POLICY_*,
+//              EMPYREAN_OD_FAILURE_*, EMPYREAN_PARAM_COLUMN_* (the
+//              EmpyreanParamColumn::kind tags).
+//
+// TWO DELIBERATE EXCEPTIONS, both of the same shape — a family that shipped at
+// bindgen's `u32` before the rule existed keeps it rather than splitting.
+//
+// EMPYREAN_REJECTION_* stays `u32` even though `rejection_reason` is an
+// `int32_t`, because the whole family except the negative NOT_EVALUATED
+// sentinel shipped that way; PER_OBSERVATION_SITE_REQUIRED joins its siblings.
+//
+// EMPYREAN_COVARIANCE_QUALITY_* stays at bindgen's
 // `u32` even though `EmpyreanTaggedCovariance::quality` is a `uint8_t`, so a
 // Rust comparison needs `quality as u32`. Three of the four constants shipped
 // as `u32` before the rule existed and are part of the published empyrean-sys
@@ -63,6 +77,16 @@ pub const EMPYREAN_KERNEL_KIND_OBSCODES: u32 = 4;
 pub const EMPYREAN_KERNEL_PROVENANCE_FILE: u32 = 0;
 pub const EMPYREAN_KERNEL_PROVENANCE_IN_MEMORY: u32 = 1;
 pub const EMPYREAN_KERNEL_PROVENANCE_BUILT_IN: u32 = 2;
+pub const EMPYREAN_SENSITIVITY_ROW_RANGE: u32 = 0;
+pub const EMPYREAN_SENSITIVITY_ROW_RA: u32 = 1;
+pub const EMPYREAN_SENSITIVITY_ROW_DEC: u32 = 2;
+pub const EMPYREAN_SENSITIVITY_ROW_VRANGE: u32 = 3;
+pub const EMPYREAN_SENSITIVITY_ROW_VRA: u32 = 4;
+pub const EMPYREAN_SENSITIVITY_ROW_VDEC: u32 = 5;
+pub const EMPYREAN_PARAM_COLUMN_MARSDEN: i32 = 0;
+pub const EMPYREAN_PARAM_COLUMN_DT: i32 = 1;
+pub const EMPYREAN_PARAM_COLUMN_AMRAT: i32 = 2;
+pub const EMPYREAN_PARAM_COLUMN_THRUST: i32 = 3;
 pub const EMPYREAN_RADAR_KIND_DELAY: u32 = 0;
 pub const EMPYREAN_RADAR_KIND_DOPPLER: u32 = 1;
 pub const EMPYREAN_COVARIANCE_TRUST_NOT_EVALUATED: i32 = 0;
@@ -87,6 +111,7 @@ pub const EMPYREAN_REJECTION_MISSING_JACOBIAN: u32 = 11;
 pub const EMPYREAN_REJECTION_SPACECRAFT_KERNEL_MISSING: u32 = 12;
 pub const EMPYREAN_REJECTION_OBSERVER_CONSTRUCTION_FAILED: u32 = 13;
 pub const EMPYREAN_REJECTION_NEVER_ABSORBED: u32 = 14;
+pub const EMPYREAN_REJECTION_PER_OBSERVATION_SITE_REQUIRED: u32 = 15;
 pub const EMPYREAN_REJECTION_NOT_EVALUATED: i32 = -1;
 pub const EMPYREAN_REJECTION_KIND_ADAPTIVE: u32 = 0;
 pub const EMPYREAN_REJECTION_KIND_CMC2003: u32 = 1;
@@ -106,12 +131,16 @@ pub const EMPYREAN_SOLVE_FOR_AUTO: u32 = 2;
 pub const EMPYREAN_SOLVE_FOR_EXPLICIT: u32 = 3;
 pub const EMPYREAN_SOLVE_WIDTH: u32 = 20;
 pub const EMPYREAN_SLOT_NONE: u32 = 4294967295;
+pub const EMPYREAN_PARAM_FIXED: u8 = 0;
+pub const EMPYREAN_PARAM_SOLVED: u8 = 1;
+pub const EMPYREAN_PARAM_CONSIDERED: u8 = 2;
+pub const EMPYREAN_MAX_THRUST_SEGMENTS: u32 = 3;
 pub const EMPYREAN_PHOTOMETRY_MODEL_AUTO: u32 = 0;
 pub const EMPYREAN_PHOTOMETRY_MODEL_HONLY: u32 = 1;
 pub const EMPYREAN_PHOTOMETRY_MODEL_HG: u32 = 2;
 pub const EMPYREAN_PHOTOMETRY_MODEL_HG12: u32 = 3;
 pub const EMPYREAN_PHOTOMETRY_MODEL_HG1G2: u32 = 4;
-pub const EMPYREAN_ABI_VERSION: u32 = 3;
+pub const EMPYREAN_ABI_VERSION: u32 = 4;
 pub const EMPYREAN_ORIGIN_POLICY_AUTO: u32 = 0;
 pub const EMPYREAN_ORIGIN_POLICY_EXPLICIT: u32 = 1;
 pub const EMPYREAN_OUTPUT_EPOCH_MID_ARC: u32 = 0;
@@ -279,7 +308,7 @@ impl Default for EmpyreanVersions {
         }
     }
 }
-#[doc = " Flat C-ABI compatible coordinate state.\n\n Field-identical to [`empyrean_core::convert::CoordinateState`]; the\n duplicate definition exists so cbindgen (which has `parse_deps =\n false`) can emit the matching C struct in `empyrean.h` without\n traversing into the empyrean-core crate.\n\n `Copy` is a Rust-side convenience only (the batched transform writes\n whole rows into a caller-owned array); the C layout is unaffected."]
+#[doc = " Flat C-ABI compatible coordinate state.\n\n Carries [`empyrean_core::convert::CoordinateState`]'s fields plus the\n state↔Marsden border; the duplicate definition exists so cbindgen\n (which has `parse_deps = false`) can emit the matching C struct in\n `empyrean.h` without traversing into the empyrean-core crate.\n\n `Copy` is a Rust-side convenience only (the batched transform writes\n whole rows into a caller-owned array); the C layout is unaffected.\n\n # The border sits here, beside the 6×6 it borders\n\n [`non_grav_cross`](Self::non_grav_cross) is the \\\\(6 \\times 3\\\\) half\n of one `ExtendedCovariance`, whose other half is the state\n [`covariance`](Self::covariance). Putting it one level up on\n `EmpyreanOrbit` would split a single matrix across two structs, and\n `empyrean_transform_coordinates` takes a `CoordinateState` *without*\n its orbit — so the two halves could be transformed apart. Here they\n travel together, and the transform rotates the pair.\n\n The orbit's wide **carrier** stays on `EmpyreanOrbit`, mirroring the\n engine's own split: a carrier's thrust tags are an orbit-level\n concept a coordinate has no business knowing.\n\n One consequence a caller should know: `empyrean_transform_coordinates`\n transforms a coordinate and its border, **not a whole joint**. An\n orbit's carrier is not in scope at that signature, so an orbit-level\n joint cannot be re-expressed in another basis through the C ABI in\n this release. Transform the orbit before attaching its carrier, or\n supply the joint in the basis you want it consumed in."]
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
 pub struct CoordinateState {
@@ -290,10 +319,14 @@ pub struct CoordinateState {
     pub representation: i32,
     pub frame: i32,
     pub origin: i32,
+    #[doc = " 1 when [`non_grav_cross`](Self::non_grav_cross) carries the\n state↔Marsden border; 0 otherwise. A zero-init state carries no\n border and behaves exactly as it did before this field existed."]
+    pub has_non_grav_cross: u8,
+    #[doc = " \\\\(6 \\times 3\\\\) state-to-\\\\((A_1, A_2, A_3)\\\\) cross covariance,\n row-major, in the same basis **and the same units** as\n [`covariance`](Self::covariance) — angular rows in degrees for\n Cometary / Keplerian / Spherical.\n\n Only read when `has_non_grav_cross = 1`, and requires the orbit\n to declare `has_non_grav_covariance = 1`: the border and the\n \\\\(3 \\times 3\\\\) it borders are two halves of one matrix, and the\n engine refuses a border without its parameter block rather than\n substituting a zero one.\n\n A zero-filled border is read as *no border supplied* — the engine\n filters an all-zero cross as absent, because a file row tagged\n with a 9-wide covariance gets one attached whether or not it ever\n had cross terms. Note the deliberate asymmetry with the wide\n carrier, where a supplied all-zero entry counts as *a supplied\n zero correlation* and does engage the joint definiteness gate. If\n you mean \"absent\" in the carrier, omit the entry."]
+    pub non_grav_cross: [[f64; 3usize]; 6usize],
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of CoordinateState"][::std::mem::size_of::<CoordinateState>() - 360usize];
+    ["Size of CoordinateState"][::std::mem::size_of::<CoordinateState>() - 512usize];
     ["Alignment of CoordinateState"][::std::mem::align_of::<CoordinateState>() - 8usize];
     ["Offset of field: CoordinateState::epoch_mjd_tdb"]
         [::std::mem::offset_of!(CoordinateState, epoch_mjd_tdb) - 0usize];
@@ -309,6 +342,10 @@ const _: () = {
         [::std::mem::offset_of!(CoordinateState, frame) - 352usize];
     ["Offset of field: CoordinateState::origin"]
         [::std::mem::offset_of!(CoordinateState, origin) - 356usize];
+    ["Offset of field: CoordinateState::has_non_grav_cross"]
+        [::std::mem::offset_of!(CoordinateState, has_non_grav_cross) - 360usize];
+    ["Offset of field: CoordinateState::non_grav_cross"]
+        [::std::mem::offset_of!(CoordinateState, non_grav_cross) - 368usize];
 };
 #[doc = " A single continuous-thrust arc, mirroring\n [`empyrean_core::nongrav::ThrustArc`] as a flat `#[repr(C)]` record.\n\n Arcs are supplied through [`EmpyreanOrbit::thrust_arcs`] as a\n caller-owned side array borrowed read-only for the duration of the call.\n\n The acceleration during the arc is\n \\\\[ \\mathbf{a}(t) = \\sigma(t)\\,\\frac{F}{m(t)}\\,\\hat{d} \\\\]\n with a smooth \\\\(\\tanh\\\\) switch \\\\(\\sigma(t)\\\\) of width set by\n `sharpness`, steering direction \\\\(\\hat{d}\\\\) from `steering_law`, and\n mass \\\\(m(t)\\\\) that depletes when `isp_s` is finite."]
 #[repr(C)]
@@ -363,6 +400,74 @@ const _: () = {
         [::std::mem::offset_of!(EmpyreanThrustArc, sharpness) - 88usize];
     ["Offset of field: EmpyreanThrustArc::central_body_naif_id"]
         [::std::mem::offset_of!(EmpyreanThrustArc, central_body_naif_id) - 96usize];
+};
+#[doc = " The identity of one solved-parameter column, independent of the wide\n slot it happens to occupy on any particular orbit.\n\n The fields a given `kind` does not read must be **zero**. A non-zero\n value there is refused rather than ignored, so a caller who sets\n `segment` on a `DT` column learns immediately instead of silently\n getting a different column than they named."]
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct EmpyreanParamColumn {
+    #[doc = " One of the `EMPYREAN_PARAM_COLUMN_*` tags. Any other value is a\n loud argument error."]
+    pub kind: i32,
+    #[doc = " MARSDEN: 0, 1 or 2, selecting \\\\(A_1\\\\), \\\\(A_2\\\\) or \\\\(A_3\\\\).\n Must be 0 for every other kind."]
+    pub index: u32,
+    #[doc = " THRUST: index into `EmpyreanOrbit::correction_covariances`. Must\n be 0 for every other kind."]
+    pub segment: u32,
+    #[doc = " THRUST: 0, 1 or 2, selecting x, y or z of that segment's\n \\\\(\\Delta v\\\\). Must be 0 for every other kind."]
+    pub component: u32,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of EmpyreanParamColumn"][::std::mem::size_of::<EmpyreanParamColumn>() - 16usize];
+    ["Alignment of EmpyreanParamColumn"][::std::mem::align_of::<EmpyreanParamColumn>() - 4usize];
+    ["Offset of field: EmpyreanParamColumn::kind"]
+        [::std::mem::offset_of!(EmpyreanParamColumn, kind) - 0usize];
+    ["Offset of field: EmpyreanParamColumn::index"]
+        [::std::mem::offset_of!(EmpyreanParamColumn, index) - 4usize];
+    ["Offset of field: EmpyreanParamColumn::segment"]
+        [::std::mem::offset_of!(EmpyreanParamColumn, segment) - 8usize];
+    ["Offset of field: EmpyreanParamColumn::component"]
+        [::std::mem::offset_of!(EmpyreanParamColumn, component) - 12usize];
+};
+#[doc = " One state-to-parameter cross column: the 6-vector of covariances\n between the six state elements and one solved parameter.\n\n Rows are in the coordinate's own element order, representation, frame\n and angular unit — the same basis AND THE SAME UNITS as the\n \\\\(6 \\times 6\\\\) in `state.covariance` that this borders. Cartesian:\n \\\\((x, y, z, v_x, v_y, v_z)\\\\) in AU and AU/day. Cometary:\n \\\\((q, e, i, \\Omega, \\omega, t_p)\\\\) with the three angular rows in\n DEGREES. Supplying radians here and degrees there is a silent factor\n of \\\\(180/\\pi\\\\) on those rows.\n\n The engine rotates these with the state when the orbit is transformed."]
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct EmpyreanStateParamCross {
+    #[doc = " Which parameter this column covaries the state with."]
+    pub column: EmpyreanParamColumn,
+    #[doc = " \\\\(\\mathrm{Cov}(\\text{element } r, \\text{parameter})\\\\), \\\\(r\\\\) in\n \\\\(0..6\\\\)."]
+    pub values: [f64; 6usize],
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of EmpyreanStateParamCross"][::std::mem::size_of::<EmpyreanStateParamCross>() - 64usize];
+    ["Alignment of EmpyreanStateParamCross"]
+        [::std::mem::align_of::<EmpyreanStateParamCross>() - 8usize];
+    ["Offset of field: EmpyreanStateParamCross::column"]
+        [::std::mem::offset_of!(EmpyreanStateParamCross, column) - 0usize];
+    ["Offset of field: EmpyreanStateParamCross::values"]
+        [::std::mem::offset_of!(EmpyreanStateParamCross, values) - 16usize];
+};
+#[doc = " One parameter-to-parameter cross term.\n\n Symmetric: \\\\((a, b)\\\\) and \\\\((b, a)\\\\) are the same entry, and\n supplying both is a loud error rather than a merge or a\n last-one-wins."]
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct EmpyreanParamPairCross {
+    #[doc = " One end of the pair."]
+    pub a: EmpyreanParamColumn,
+    #[doc = " The other end. Must not name the same parameter as `a`."]
+    pub b: EmpyreanParamColumn,
+    #[doc = " \\\\(\\mathrm{Cov}(a, b)\\\\)."]
+    pub value: f64,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of EmpyreanParamPairCross"][::std::mem::size_of::<EmpyreanParamPairCross>() - 40usize];
+    ["Alignment of EmpyreanParamPairCross"]
+        [::std::mem::align_of::<EmpyreanParamPairCross>() - 8usize];
+    ["Offset of field: EmpyreanParamPairCross::a"]
+        [::std::mem::offset_of!(EmpyreanParamPairCross, a) - 0usize];
+    ["Offset of field: EmpyreanParamPairCross::b"]
+        [::std::mem::offset_of!(EmpyreanParamPairCross, b) - 16usize];
+    ["Offset of field: EmpyreanParamPairCross::value"]
+        [::std::mem::offset_of!(EmpyreanParamPairCross, value) - 32usize];
 };
 #[doc = " An orbit with optional non-gravitational parameters, continuous-thrust\n arcs, and photometry.\n\n Thrust: when `n_thrust_arcs > 0`, [`thrust_arcs`](Self::thrust_arcs)\n (plus the optional [`dv_corrections`](Self::dv_corrections) /\n [`correction_covariances`](Self::correction_covariances) side arrays)\n build a [`ThrustParams`] for this orbit. All-zero `a1/a2/a3` and\n `n_thrust_arcs == 0` is a pure-gravity orbit.\n\n `a1/a2/a3` are the Marsden–Sekanina RTN coefficients (radial,\n transverse, normal) in AU/day². `ng_alpha … ng_k` parameterize the\n g(r) distance-dependent scaling:\n \\\\[ g(r) = \\alpha \\\\, (r/r_0)^{-m} \\\\, (1 + (r/r_0)^n)^{-k} \\\\].\n All-zeros for the g-function fields selects the inverse-square\n default (Yarkovsky / SRP asteroid case): \\\\(\\alpha = r_0 = 1\\\\),\n \\\\(m = 2\\\\), \\\\(n = k = 0\\\\). Comets typically pass SBDB's\n Marsden water-ice values\n (\\\\(\\alpha = 0.1113, r_0 = 2.808, m = 2.15, n = 5.093, k = 4.6142\\\\)).\n\n Photometry: when `phot_system` is one of the `EMPYREAN_PHASE_FUNCTION_*`\n non-`NONE` constants, ephemeris generation produces apparent magnitude\n using the (`H`, `slope1`, `slope2`) triple per the chosen phase function:\n\n | Model | `H` | `slope1` | `slope2` |\n |-------|-----|----------|----------|\n | `HG`     | absolute magnitude | G    | unused (0)  |\n | `HG1G2`  | absolute magnitude | G₁   | G₂          |\n | `HG12`   | absolute magnitude | G₁₂  | unused (0)  |"]
 #[repr(C)]
@@ -425,66 +530,82 @@ pub struct EmpyreanOrbit {
     pub srp_cr: f64,
     #[doc = " Prior variance on AMRAT ((m²/kg)²). NaN or ≤0 = no prior (the AMRAT\n column stays closed; SRP is applied as a fixed force). A finite\n positive value opens + priors the AMRAT column in a StateAndAMRAT /\n StateAndNonGravAndAMRAT fit. Only read when `has_srp == 1`."]
     pub srp_amrat_variance: f64,
+    #[doc = " State-to-parameter cross columns for every solved parameter that\n is **not** Marsden — state↔DT, state↔AMRAT, state↔Δv.\n\n Null / `n_state_param_cross == 0` ⇒ none. A null pointer with a\n non-zero count is a loud argument error; a non-null pointer with\n a zero count is absent and never read (the `thrust_arcs`\n precedent).\n\n **Ownership:** caller-owned; borrowed read-only for the duration\n of the call. The C ABI never frees it. Note the asymmetry with\n the same arrays on\n [`EmpyreanODResult`](crate::od::EmpyreanODResult), which are\n library-owned: a caller re-feeding a result into a call must\n **copy, not alias**.\n\n Entry order does not matter — entries are identified by their\n `column` tag, never by position. Supplying the same parameter\n twice is a loud error rather than a last-one-wins."]
+    pub state_param_cross: *const EmpyreanStateParamCross,
+    #[doc = " Number of entries in\n [`state_param_cross`](Self::state_param_cross)."]
+    pub n_state_param_cross: usize,
+    #[doc = " Parameter-to-parameter cross terms with no other home — DT↔\\\\(A_2\\\\),\n \\\\(A_1\\\\)↔AMRAT, AMRAT↔Δv, segment \\\\(i\\\\)↔segment \\\\(j\\\\).\n\n Same ownership, absence and ordering rules as\n [`state_param_cross`](Self::state_param_cross). The term is\n symmetric, so supplying both \\\\((a, b)\\\\) and \\\\((b, a)\\\\) is the\n same loud duplicate error as supplying one of them twice.\n\n Intra-segment Δv pairs do **not** belong here — segment `i`'s own\n `correction_covariances[i]` already supplies its internal pairs,\n and the engine refuses the duplicate home. Cross-segment pairs\n have no other home and do belong here. That is the one place\n where \"which 3×3 does this go in\" has a non-obvious answer."]
+    pub param_pair_cross: *const EmpyreanParamPairCross,
+    #[doc = " Number of entries in\n [`param_pair_cross`](Self::param_pair_cross)."]
+    pub n_param_pair_cross: usize,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of EmpyreanOrbit"][::std::mem::size_of::<EmpyreanOrbit>() - 648usize];
+    ["Size of EmpyreanOrbit"][::std::mem::size_of::<EmpyreanOrbit>() - 832usize];
     ["Alignment of EmpyreanOrbit"][::std::mem::align_of::<EmpyreanOrbit>() - 8usize];
     ["Offset of field: EmpyreanOrbit::state"]
         [::std::mem::offset_of!(EmpyreanOrbit, state) - 0usize];
     ["Offset of field: EmpyreanOrbit::orbit_id"]
-        [::std::mem::offset_of!(EmpyreanOrbit, orbit_id) - 360usize];
+        [::std::mem::offset_of!(EmpyreanOrbit, orbit_id) - 512usize];
     ["Offset of field: EmpyreanOrbit::object_id"]
-        [::std::mem::offset_of!(EmpyreanOrbit, object_id) - 368usize];
-    ["Offset of field: EmpyreanOrbit::a1"][::std::mem::offset_of!(EmpyreanOrbit, a1) - 376usize];
-    ["Offset of field: EmpyreanOrbit::a2"][::std::mem::offset_of!(EmpyreanOrbit, a2) - 384usize];
-    ["Offset of field: EmpyreanOrbit::a3"][::std::mem::offset_of!(EmpyreanOrbit, a3) - 392usize];
+        [::std::mem::offset_of!(EmpyreanOrbit, object_id) - 520usize];
+    ["Offset of field: EmpyreanOrbit::a1"][::std::mem::offset_of!(EmpyreanOrbit, a1) - 528usize];
+    ["Offset of field: EmpyreanOrbit::a2"][::std::mem::offset_of!(EmpyreanOrbit, a2) - 536usize];
+    ["Offset of field: EmpyreanOrbit::a3"][::std::mem::offset_of!(EmpyreanOrbit, a3) - 544usize];
     ["Offset of field: EmpyreanOrbit::ng_alpha"]
-        [::std::mem::offset_of!(EmpyreanOrbit, ng_alpha) - 400usize];
+        [::std::mem::offset_of!(EmpyreanOrbit, ng_alpha) - 552usize];
     ["Offset of field: EmpyreanOrbit::ng_r0"]
-        [::std::mem::offset_of!(EmpyreanOrbit, ng_r0) - 408usize];
+        [::std::mem::offset_of!(EmpyreanOrbit, ng_r0) - 560usize];
     ["Offset of field: EmpyreanOrbit::ng_m"]
-        [::std::mem::offset_of!(EmpyreanOrbit, ng_m) - 416usize];
+        [::std::mem::offset_of!(EmpyreanOrbit, ng_m) - 568usize];
     ["Offset of field: EmpyreanOrbit::ng_n"]
-        [::std::mem::offset_of!(EmpyreanOrbit, ng_n) - 424usize];
+        [::std::mem::offset_of!(EmpyreanOrbit, ng_n) - 576usize];
     ["Offset of field: EmpyreanOrbit::ng_k"]
-        [::std::mem::offset_of!(EmpyreanOrbit, ng_k) - 432usize];
+        [::std::mem::offset_of!(EmpyreanOrbit, ng_k) - 584usize];
     ["Offset of field: EmpyreanOrbit::non_grav_dt"]
-        [::std::mem::offset_of!(EmpyreanOrbit, non_grav_dt) - 440usize];
+        [::std::mem::offset_of!(EmpyreanOrbit, non_grav_dt) - 592usize];
     ["Offset of field: EmpyreanOrbit::non_grav_dt_variance"]
-        [::std::mem::offset_of!(EmpyreanOrbit, non_grav_dt_variance) - 448usize];
+        [::std::mem::offset_of!(EmpyreanOrbit, non_grav_dt_variance) - 600usize];
     ["Offset of field: EmpyreanOrbit::has_non_grav_covariance"]
-        [::std::mem::offset_of!(EmpyreanOrbit, has_non_grav_covariance) - 456usize];
+        [::std::mem::offset_of!(EmpyreanOrbit, has_non_grav_covariance) - 608usize];
     ["Offset of field: EmpyreanOrbit::non_grav_covariance"]
-        [::std::mem::offset_of!(EmpyreanOrbit, non_grav_covariance) - 464usize];
+        [::std::mem::offset_of!(EmpyreanOrbit, non_grav_covariance) - 616usize];
     ["Offset of field: EmpyreanOrbit::phot_system"]
-        [::std::mem::offset_of!(EmpyreanOrbit, phot_system) - 536usize];
+        [::std::mem::offset_of!(EmpyreanOrbit, phot_system) - 688usize];
     ["Offset of field: EmpyreanOrbit::h_mag"]
-        [::std::mem::offset_of!(EmpyreanOrbit, h_mag) - 544usize];
+        [::std::mem::offset_of!(EmpyreanOrbit, h_mag) - 696usize];
     ["Offset of field: EmpyreanOrbit::slope1"]
-        [::std::mem::offset_of!(EmpyreanOrbit, slope1) - 552usize];
+        [::std::mem::offset_of!(EmpyreanOrbit, slope1) - 704usize];
     ["Offset of field: EmpyreanOrbit::slope2"]
-        [::std::mem::offset_of!(EmpyreanOrbit, slope2) - 560usize];
+        [::std::mem::offset_of!(EmpyreanOrbit, slope2) - 712usize];
     ["Offset of field: EmpyreanOrbit::thrust_arcs"]
-        [::std::mem::offset_of!(EmpyreanOrbit, thrust_arcs) - 568usize];
+        [::std::mem::offset_of!(EmpyreanOrbit, thrust_arcs) - 720usize];
     ["Offset of field: EmpyreanOrbit::n_thrust_arcs"]
-        [::std::mem::offset_of!(EmpyreanOrbit, n_thrust_arcs) - 576usize];
+        [::std::mem::offset_of!(EmpyreanOrbit, n_thrust_arcs) - 728usize];
     ["Offset of field: EmpyreanOrbit::dv_corrections"]
-        [::std::mem::offset_of!(EmpyreanOrbit, dv_corrections) - 584usize];
+        [::std::mem::offset_of!(EmpyreanOrbit, dv_corrections) - 736usize];
     ["Offset of field: EmpyreanOrbit::n_dv_corrections"]
-        [::std::mem::offset_of!(EmpyreanOrbit, n_dv_corrections) - 592usize];
+        [::std::mem::offset_of!(EmpyreanOrbit, n_dv_corrections) - 744usize];
     ["Offset of field: EmpyreanOrbit::correction_covariances"]
-        [::std::mem::offset_of!(EmpyreanOrbit, correction_covariances) - 600usize];
+        [::std::mem::offset_of!(EmpyreanOrbit, correction_covariances) - 752usize];
     ["Offset of field: EmpyreanOrbit::n_correction_covariances"]
-        [::std::mem::offset_of!(EmpyreanOrbit, n_correction_covariances) - 608usize];
+        [::std::mem::offset_of!(EmpyreanOrbit, n_correction_covariances) - 760usize];
     ["Offset of field: EmpyreanOrbit::has_srp"]
-        [::std::mem::offset_of!(EmpyreanOrbit, has_srp) - 616usize];
+        [::std::mem::offset_of!(EmpyreanOrbit, has_srp) - 768usize];
     ["Offset of field: EmpyreanOrbit::srp_amrat"]
-        [::std::mem::offset_of!(EmpyreanOrbit, srp_amrat) - 624usize];
+        [::std::mem::offset_of!(EmpyreanOrbit, srp_amrat) - 776usize];
     ["Offset of field: EmpyreanOrbit::srp_cr"]
-        [::std::mem::offset_of!(EmpyreanOrbit, srp_cr) - 632usize];
+        [::std::mem::offset_of!(EmpyreanOrbit, srp_cr) - 784usize];
     ["Offset of field: EmpyreanOrbit::srp_amrat_variance"]
-        [::std::mem::offset_of!(EmpyreanOrbit, srp_amrat_variance) - 640usize];
+        [::std::mem::offset_of!(EmpyreanOrbit, srp_amrat_variance) - 792usize];
+    ["Offset of field: EmpyreanOrbit::state_param_cross"]
+        [::std::mem::offset_of!(EmpyreanOrbit, state_param_cross) - 800usize];
+    ["Offset of field: EmpyreanOrbit::n_state_param_cross"]
+        [::std::mem::offset_of!(EmpyreanOrbit, n_state_param_cross) - 808usize];
+    ["Offset of field: EmpyreanOrbit::param_pair_cross"]
+        [::std::mem::offset_of!(EmpyreanOrbit, param_pair_cross) - 816usize];
+    ["Offset of field: EmpyreanOrbit::n_param_pair_cross"]
+        [::std::mem::offset_of!(EmpyreanOrbit, n_param_pair_cross) - 824usize];
 };
 impl Default for EmpyreanOrbit {
     fn default() -> Self {
@@ -785,9 +906,54 @@ impl Default for EmpyreanPropagationConfig {
         }
     }
 }
+#[doc = " A joint cross-covariance the library HANDS BACK — the half of a\n covariance that is not a diagonal block.\n\n # Why this exists as output at all\n\n A propagated or fitted state's uncertainty is one\n \\\\((6+P) \\times (6+P)\\\\) matrix. Until this struct the C ABI reported\n only its diagonal blocks, so a caller chaining one leg into the next\n necessarily handed the engine a block-diagonal covariance — a\n physically unmotivated claim that the state and \\\\(A_2\\\\) are\n independent, when a single fit or a single propagation produced both.\n The engine's own propagated border is non-zero **even from a\n block-diagonal input**, because propagation itself generates the\n correlation: that is precisely why a second leg must not be handed a\n block-diagonal covariance.\n\n # One shape, two producers\n\n [`EmpyreanODResult::orbit`](crate::od::EmpyreanODResult::orbit) and\n every row of a propagation result carry this same struct, with the\n same field names and the same ownership. That is what makes leg\n chaining uniform: whatever produced the state, its joint is read the\n same way and re-fed the same way.\n\n Each block is read off the object the engine already made coherent —\n the fitted orbit, or the propagated state row — never re-derived from\n a slot-tagged matrix. That matters: a slot-tagged covariance indexes\n the *solved* layout, while a re-fed orbit's layout is derived from\n what it *declares*, and the two disagree whenever the fit did not\n solve every axis the orbit declares. Copying columns between them\n would attach one parameter's correlations to another with every\n number finite and every gate passed.\n\n # Basis\n\n The state-side rows are in the same basis **and the same units** as\n the \\\\(6 \\times 6\\\\) sitting beside this struct — Cartesian AU and\n AU/day on a propagated state, and the fitted result's\n `covariance_representation` on an OD result.\n\n # Re-feeding\n\n Assign across to the input orbit field by field — the result nests\n what the orbit flattens:\n\n ```c\n orbit.state.has_non_grav_cross = st->orbit_cov.has_non_grav_cross;\n memcpy(orbit.state.non_grav_cross,\n        st->orbit_cov.non_grav_cross, sizeof(double) * 18);\n orbit.state_param_cross        = st->orbit_cov.state_param_cross;\n orbit.n_state_param_cross      = st->orbit_cov.n_state_param_cross;\n orbit.param_pair_cross         = st->orbit_cov.param_pair_cross;\n orbit.n_param_pair_cross       = st->orbit_cov.n_param_pair_cross;\n\n // ...and the diagonal blocks those crosses are conditioned on:\n orbit.has_non_grav_covariance  = res->non_grav.has_covariance;\n memcpy(orbit.non_grav_covariance,\n        res->non_grav.covariance, sizeof(double) * 9);\n orbit.non_grav_dt_variance     = res->non_grav.dt_variance;\n orbit.has_srp                  = res->has_srp;\n orbit.srp_amrat_variance       = res->srp.amrat_variance;\n ```\n\n # Ownership\n\n The two carrier arrays are **library-owned** and released with the\n parent result — the opposite of the identically-named fields on\n [`EmpyreanOrbit`], which are caller-owned and borrowed for the call.\n So the pointer assignments above are valid only while the result\n outlives the orbit; **copy them if it does not.**"]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct EmpyreanOrbitCovariance {
+    #[doc = " 1 when [`non_grav_cross`](Self::non_grav_cross) carries the\n state↔Marsden border; 0 when there is none."]
+    pub has_non_grav_cross: u8,
+    #[doc = " \\\\(6 \\times 3\\\\) state-to-\\\\((A_1, A_2, A_3)\\\\) cross covariance,\n row-major, in the same basis and units as the \\\\(6 \\times 6\\\\)\n beside it. Zeroed when `has_non_grav_cross = 0`."]
+    pub non_grav_cross: [[f64; 3usize]; 6usize],
+    #[doc = " State-to-parameter cross columns for every parameter that is not\n Marsden. Null with a zero count when there are none.\n **Library-owned** — see the struct docs."]
+    pub state_param_cross: *mut EmpyreanStateParamCross,
+    #[doc = " Number of entries in\n [`state_param_cross`](Self::state_param_cross)."]
+    pub n_state_param_cross: usize,
+    #[doc = " Parameter-to-parameter cross terms with no other home. Null with\n a zero count when there are none. **Library-owned** — see the\n struct docs."]
+    pub param_pair_cross: *mut EmpyreanParamPairCross,
+    #[doc = " Number of entries in\n [`param_pair_cross`](Self::param_pair_cross)."]
+    pub n_param_pair_cross: usize,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of EmpyreanOrbitCovariance"]
+        [::std::mem::size_of::<EmpyreanOrbitCovariance>() - 184usize];
+    ["Alignment of EmpyreanOrbitCovariance"]
+        [::std::mem::align_of::<EmpyreanOrbitCovariance>() - 8usize];
+    ["Offset of field: EmpyreanOrbitCovariance::has_non_grav_cross"]
+        [::std::mem::offset_of!(EmpyreanOrbitCovariance, has_non_grav_cross) - 0usize];
+    ["Offset of field: EmpyreanOrbitCovariance::non_grav_cross"]
+        [::std::mem::offset_of!(EmpyreanOrbitCovariance, non_grav_cross) - 8usize];
+    ["Offset of field: EmpyreanOrbitCovariance::state_param_cross"]
+        [::std::mem::offset_of!(EmpyreanOrbitCovariance, state_param_cross) - 152usize];
+    ["Offset of field: EmpyreanOrbitCovariance::n_state_param_cross"]
+        [::std::mem::offset_of!(EmpyreanOrbitCovariance, n_state_param_cross) - 160usize];
+    ["Offset of field: EmpyreanOrbitCovariance::param_pair_cross"]
+        [::std::mem::offset_of!(EmpyreanOrbitCovariance, param_pair_cross) - 168usize];
+    ["Offset of field: EmpyreanOrbitCovariance::n_param_pair_cross"]
+        [::std::mem::offset_of!(EmpyreanOrbitCovariance, n_param_pair_cross) - 176usize];
+};
+impl Default for EmpyreanOrbitCovariance {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
 #[doc = " A single propagated Cartesian state."]
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
+#[derive(Debug, Copy, Clone)]
 pub struct EmpyreanPropagatedState {
     pub epoch_mjd_tdb: f64,
     pub x: f64,
@@ -808,11 +974,13 @@ pub struct EmpyreanPropagatedState {
     pub has_stt: u8,
     #[doc = " Resolved [`CovarianceKind`](empyrean_core::propagation::CovarianceKind)\n at this output epoch — see `EMPYREAN_COVARIANCE_KIND_*`.\n Defaults to `LINEAR` for non-Auto methods and for Auto epochs\n outside CA windows."]
     pub resolved_kind: u8,
+    #[doc = " The propagated joint's cross terms — the state↔Marsden border and\n the wide carrier at this epoch, in the Cartesian basis of the\n \\\\(6 \\times 6\\\\) above.\n\n # This is what makes leg chaining possible\n\n [`covariance`](Self::covariance) is only the state block of the\n propagated joint. Feeding leg 2 that block alone hands the engine\n a block-diagonal covariance, and the engine cannot tell — while\n the joint it actually computed has non-zero state↔parameter\n columns **even when leg 1's input was block-diagonal**, because\n propagation itself generates that correlation. A chained\n propagation that drops this is not an approximation of the\n single-leg answer; it is a different and tighter claim.\n\n Re-feed it onto an [`EmpyreanOrbit`] together with the parameter\n blocks the crosses are conditioned on — the orbit's own\n `non_grav_covariance`, `non_grav_dt_variance`,\n `srp_amrat_variance` and `correction_covariances` — which\n propagation carries through unchanged from the input orbit. See\n [`EmpyreanOrbitCovariance`](crate::joint::EmpyreanOrbitCovariance)\n for the field-by-field copy.\n\n Absent (`has_non_grav_cross = 0`, both pointers null) when the\n orbit carried no solved-parameter block, when its layout is\n Marsden-only (the whole border is then in `non_grav_cross` and\n there is no carrier), or when a sigma-point run could not\n reconstruct this row.\n\n **Library-owned**, freed with the parent result."]
+    pub orbit_cov: EmpyreanOrbitCovariance,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of EmpyreanPropagatedState"]
-        [::std::mem::size_of::<EmpyreanPropagatedState>() - 2392usize];
+        [::std::mem::size_of::<EmpyreanPropagatedState>() - 2576usize];
     ["Alignment of EmpyreanPropagatedState"]
         [::std::mem::align_of::<EmpyreanPropagatedState>() - 8usize];
     ["Offset of field: EmpyreanPropagatedState::epoch_mjd_tdb"]
@@ -847,7 +1015,18 @@ const _: () = {
         [::std::mem::offset_of!(EmpyreanPropagatedState, has_stt) - 2384usize];
     ["Offset of field: EmpyreanPropagatedState::resolved_kind"]
         [::std::mem::offset_of!(EmpyreanPropagatedState, resolved_kind) - 2385usize];
+    ["Offset of field: EmpyreanPropagatedState::orbit_cov"]
+        [::std::mem::offset_of!(EmpyreanPropagatedState, orbit_cov) - 2392usize];
 };
+impl Default for EmpyreanPropagatedState {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
 #[doc = " A detected dynamical event from propagation.\n\n For `event_type = \"covariance_regime_change\"` the audit-trail\n fields (`previous_kind`, `resolved_kind`, `kappa`,\n `threshold_below`, `threshold_above`) carry the\n [`CovarianceRegimeChange`](empyrean_core::propagation::events::DynamicalEvent::CovarianceRegimeChange)\n payload and the body / distance / velocity fields are zeroed\n (regime changes don't carry a body or geometry — they're audit\n markers from\n [`UncertaintyMethod::Auto`](empyrean_core::propagation::UncertaintyMethod::Auto)).\n For all other events these fields are sentinel-filled\n (`0xFF` / NaN).\n\n Field names mirror empyrean-core's variant fields for the\n regime-change payload — no per-variant prefix."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -1338,7 +1517,7 @@ impl Default for EmpyreanEphemerisEntry {
         }
     }
 }
-#[doc = " One observation-sensitivity row — the partial derivatives of the\n sky-plane observable w.r.t. the input state, for a single\n `(orbit, observer, epoch)`. One row per observation epoch within each\n `(orbit_id, obs_code)` chain. Owning struct: free\n the whole result with [`empyrean_ephemeris_result_free`].\n\n The Jacobian composes d(obs)/d(state at t_obs) * Phi(t_obs, t0) and\n omits the light-time terms (the -v * dtau/dx partial; the STM is\n sampled at t_obs rather than emission t_obs - tau): both are O(tau),\n landing in the velocity columns of the angle rows with fractional\n error ~ tau/dt (tau ~ 0.006-0.017 d) — negligible for multi-night\n arcs, growing as the arc shrinks toward intra-night."]
+#[doc = " One observation-sensitivity row — the partial derivatives of the\n sky-plane observable w.r.t. the input state, for a single\n `(orbit, observer, epoch)`. One row per observation epoch within each\n `(orbit_id, obs_code)` chain. Owning struct: free\n the whole result with [`empyrean_ephemeris_result_free`].\n\n The Jacobian composes d(obs)/d(state at t_obs) * Phi(t_obs, t0) and\n omits the light-time terms (the -v * dtau/dx partial; the STM is\n sampled at t_obs rather than emission t_obs - tau): both are O(tau),\n landing in the velocity columns of the angle rows with fractional\n error ~ tau/dt (tau ~ 0.006-0.017 d) — negligible for multi-night\n arcs, growing as the arc shrinks toward intra-night.\n\n The six output rows are the topocentric spherical observable, in the\n order given by the `EMPYREAN_SENSITIVITY_ROW_*` constants. Index with\n those rather than by hand — the row order is part of this ABI and the\n range row sits ahead of the angles, so a hand-written `0` reads range\n where RA was meant."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct EmpyreanObservationSensitivity {
@@ -1352,11 +1531,11 @@ pub struct EmpyreanObservationSensitivity {
     pub epoch_mjd_tdb: f64,
     #[doc = " Solved-parameter dimension: 6 (state) or 9 (state + non-grav)."]
     pub n_params: u8,
-    #[doc = " Jacobian ∂(observable)/∂(input), row-major `[6][n_params]` flattened\n (length `6 * n_params`). Null when this epoch carries no Jacobian."]
+    #[doc = " Jacobian ∂(observable)/∂(input), row-major `[6][n_params]` flattened\n (length `6 * n_params`). Null when this epoch carries no Jacobian.\n\n Element `(row, col)` is `jacobian[row * n_params + col]`. Columns\n `0..6` are the input Cartesian state, in the frame and origin the\n `frame` / `origin` fields tag; any further columns are the extra\n solved-for parameters `n_params` counts.\n\n The six rows, in order — see `EMPYREAN_SENSITIVITY_ROW_*`:\n\n - `0` range, AU per input unit\n - `1` RA, deg per input unit\n - `2` Dec, deg per input unit\n - `3` range rate, AU/day per input unit\n - `4` RA rate, deg/day per input unit (dRA/dt, NOT scaled by cos Dec)\n - `5` Dec rate, deg/day per input unit"]
     pub jacobian: *mut f64,
     #[doc = " Length of `jacobian` (`6 * n_params`), 0 when null."]
     pub jacobian_len: usize,
-    #[doc = " Hessian ∂²(observable)/∂(input)², row-major `[6][n_params][n_params]`\n flattened (length `6 * n_params * n_params`). Null unless a\n second-order method (Jet2) ran."]
+    #[doc = " Hessian ∂²(observable)/∂(input)², row-major `[6][n_params][n_params]`\n flattened (length `6 * n_params * n_params`). Null unless a\n second-order method (Jet2) ran.\n\n Leading index is the observable, in the same order and the same\n units-per-input-unit as `jacobian` — index it with the same\n `EMPYREAN_SENSITIVITY_ROW_*` constants. Element `(row, i, j)` is\n `hessian[(row * n_params + i) * n_params + j]`."]
     pub hessian: *mut f64,
     #[doc = " Length of `hessian` (`6 * n_params²`), 0 when null."]
     pub hessian_len: usize,
@@ -1796,7 +1975,7 @@ impl Default for EmpyreanBPlanesResult {
         }
     }
 }
-#[doc = " A batch of orbits with their identifiers.\n\n Returned by every `empyrean_orbits_read_*` and consumed by every\n `empyrean_orbits_write_*`. `orbit_ids` and `object_ids` are parallel\n to `orbits` (same length); each `object_ids[i]` may be null when the\n underlying orbit had no object designation.\n\n Free with [`empyrean_orbits_batch_free`] when done."]
+#[doc = " A batch of orbits with their identifiers.\n\n Returned by every `empyrean_orbits_read_*` and consumed by every\n `empyrean_orbits_write_*`. `orbit_ids` and `object_ids` are parallel\n to `orbits` (same length); each `object_ids[i]` may be null when the\n underlying orbit had no object designation.\n\n # Ownership of the wide-carrier side arrays\n\n On a batch the library **hands you**, each orbit's\n `state_param_cross` / `param_pair_cross` point into storage this\n batch owns, and [`empyrean_orbits_batch_free`] releases them with\n everything else. That is the opposite of the same fields on an\n `EmpyreanOrbit` you **build**, where they are caller-owned and merely\n borrowed for the call — the identical asymmetry `orbit_id` already\n has. A caller re-feeding a read orbit into a propagate/OD call before\n freeing the batch may pass the pointers straight through; one that\n frees the batch first must copy.\n\n Free with [`empyrean_orbits_batch_free`] when done."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct EmpyreanOrbitBatch {
@@ -2658,31 +2837,31 @@ const _: () = {
     ["Offset of field: EmpyreanRejectionConfig::max_passes"]
         [::std::mem::offset_of!(EmpyreanRejectionConfig, max_passes) - 48usize];
 };
-#[doc = " Result of orbit determination (determine or refine).\n\n Per-axis solve-for flags (mirrors scott's `SolveFor`). Read only when\n [`EmpyreanODConfig::solve_for`] is [`EMPYREAN_SOLVE_FOR_EXPLICIT`]; the\n three coarse `EMPYREAN_SOLVE_FOR_*` codes cover the common shapes\n without it. Each flag turns on a wide-STM axis, subject to its own\n precondition (a declared prior on the orbit) enforced by scott."]
+#[doc = " Result of orbit determination (determine or refine).\n\n Per-axis parameter **dispositions** (mirrors scott's `SolveFor`).\n Read only when [`EmpyreanODConfig::solve_for`] is\n [`EMPYREAN_SOLVE_FOR_EXPLICIT`]; the three coarse\n `EMPYREAN_SOLVE_FOR_*` codes cover the common shapes without it.\n\n # A disposition, not a flag\n\n Each axis says what the fit **does** with that parameter, and the\n three answers are different operations with different mathematics:\n\n - [`EMPYREAN_PARAM_FIXED`] — marginalized out of the prior in\n   covariance space. Contributes nothing; changes no number.\n - [`EMPYREAN_PARAM_SOLVED`] — estimated from the data. Occupies a\n   solved slot and comes back with a posterior variance.\n - [`EMPYREAN_PARAM_CONSIDERED`] — not estimated, but its prior\n   uncertainty reaches the posterior through its measurement partials\n   (Schmidt–Kalman consider analysis), so the reported σ accounts for\n   an error source the fit did not absorb.\n\n A considered axis is **not** a safety margin. Under an uncorrelated\n prior the correction strictly widens the posterior, but when the\n orbit supplies cross terms between the considered axis and the solved\n ones the cross-dependent terms are sign-indefinite and the posterior\n can come back **tighter**.\n\n Solving or considering an axis still requires its own precondition —\n a declared prior on the orbit — enforced by scott.\n\n # Zero-init and the version handshake\n\n `0` is `FIXED` and `1` is `SOLVED`, which is exactly what the `0` /\n `1` of the pre-v4 boolean flags meant, so a `memset(0)` config and\n every value an older caller could have written are unchanged.\n\n The widening is only safe in that direction. A caller writing `2`\n for CONSIDERED against a library built before v4 would hit a bare\n non-zero test and get the axis **silently solved** — a wider solved\n set, a different fitted answer, and no error anywhere. Two things\n prevent it: this boundary refuses any value outside `0 | 1 | 2` by\n name and value, so a future fourth value fails loudly here rather\n than degrading silently; and the tri-state rides the\n [`EMPYREAN_ABI_VERSION`] 4 bump, so\n [`empyrean_abi_version`] is what makes the mismatch legible to a\n caller compiled against 4 and dynamically loaded against 3."]
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
 pub struct EmpyreanSolveFor {
-    #[doc = " Solve the Marsden A1/A2/A3 block (requires a non-grav covariance)."]
+    #[doc = " Disposition of the Marsden A1/A2/A3 block (3 columns when\n solved). Solving or considering it requires the orbit to carry a\n non-grav covariance."]
     pub marsden: u8,
-    #[doc = " Solve the non-grav time delay DT (requires `marsden` + a DT prior)."]
+    #[doc = " Disposition of the non-grav time delay DT (1 column when solved).\n Solving it requires `marsden` solved plus a DT value and prior\n variance on the orbit."]
     pub dt: u8,
-    #[doc = " Solve the SRP AMRAT (requires an SRP AMRAT prior)."]
+    #[doc = " Disposition of the SRP AMRAT (1 column when solved). Requires an\n SRP slot carrying an AMRAT prior variance."]
     pub amrat: u8,
-    #[doc = " Number of thrust Δv segments to solve (3 columns each; 0 = none)."]
-    pub thrust_segments: u32,
+    #[doc = " Disposition of each declared thrust Δv segment, **positional with\n the orbit's `correction_covariances`** — entry `i` governs\n declared segment `i`.\n\n Positional rather than a count, because a considered or fixed\n segment sits *between* solved ones as readily as after them: a\n three-segment orbit with only the middle burn solved is not\n expressible as a count. Entries beyond the orbit's declared\n segment count must be [`EMPYREAN_PARAM_FIXED`].\n\n The solved count is derivable from this array, which is why the\n former `thrust_segments` count is gone rather than kept beside\n it — two spellings of one fact are two facts that can disagree."]
+    pub thrust_dispositions: [u8; 3usize],
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of EmpyreanSolveFor"][::std::mem::size_of::<EmpyreanSolveFor>() - 8usize];
-    ["Alignment of EmpyreanSolveFor"][::std::mem::align_of::<EmpyreanSolveFor>() - 4usize];
+    ["Size of EmpyreanSolveFor"][::std::mem::size_of::<EmpyreanSolveFor>() - 6usize];
+    ["Alignment of EmpyreanSolveFor"][::std::mem::align_of::<EmpyreanSolveFor>() - 1usize];
     ["Offset of field: EmpyreanSolveFor::marsden"]
         [::std::mem::offset_of!(EmpyreanSolveFor, marsden) - 0usize];
     ["Offset of field: EmpyreanSolveFor::dt"]
         [::std::mem::offset_of!(EmpyreanSolveFor, dt) - 1usize];
     ["Offset of field: EmpyreanSolveFor::amrat"]
         [::std::mem::offset_of!(EmpyreanSolveFor, amrat) - 2usize];
-    ["Offset of field: EmpyreanSolveFor::thrust_segments"]
-        [::std::mem::offset_of!(EmpyreanSolveFor, thrust_segments) - 4usize];
+    ["Offset of field: EmpyreanSolveFor::thrust_dispositions"]
+        [::std::mem::offset_of!(EmpyreanSolveFor, thrust_dispositions) - 3usize];
 };
 #[doc = " Post-OD photometric-fit request (mirrors scott's `PhotometryConfig`).\n Enabled by [`EmpyreanODConfig::has_photometry`]; the fit runs after the\n orbit is solved and never touches the state (photometry has no\n astrometric partials). Zero-init reproduces scott's defaults."]
 #[repr(C)]
@@ -2776,7 +2955,7 @@ pub struct EmpyreanODConfig {
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of EmpyreanODConfig"][::std::mem::size_of::<EmpyreanODConfig>() - 432usize];
+    ["Size of EmpyreanODConfig"][::std::mem::size_of::<EmpyreanODConfig>() - 424usize];
     ["Alignment of EmpyreanODConfig"][::std::mem::align_of::<EmpyreanODConfig>() - 8usize];
     ["Offset of field: EmpyreanODConfig::force_model"]
         [::std::mem::offset_of!(EmpyreanODConfig, force_model) - 0usize];
@@ -2831,11 +3010,11 @@ const _: () = {
     ["Offset of field: EmpyreanODConfig::solve_for_flags"]
         [::std::mem::offset_of!(EmpyreanODConfig, solve_for_flags) - 384usize];
     ["Offset of field: EmpyreanODConfig::allow_unbracketed_maneuvers"]
-        [::std::mem::offset_of!(EmpyreanODConfig, allow_unbracketed_maneuvers) - 392usize];
+        [::std::mem::offset_of!(EmpyreanODConfig, allow_unbracketed_maneuvers) - 390usize];
     ["Offset of field: EmpyreanODConfig::has_photometry"]
-        [::std::mem::offset_of!(EmpyreanODConfig, has_photometry) - 393usize];
+        [::std::mem::offset_of!(EmpyreanODConfig, has_photometry) - 391usize];
     ["Offset of field: EmpyreanODConfig::photometry"]
-        [::std::mem::offset_of!(EmpyreanODConfig, photometry) - 400usize];
+        [::std::mem::offset_of!(EmpyreanODConfig, photometry) - 392usize];
 };
 impl Default for EmpyreanODConfig {
     fn default() -> Self {
@@ -2940,10 +3119,14 @@ pub struct EmpyreanNonGravParams {
     pub has_covariance: u8,
     #[doc = " Fitted non-grav 3×3 covariance for (A1, A2, A3), row-major. Only\n meaningful when `has_covariance = 1`. Re-feeding it onto an input\n orbit lets a fitted orbit flow into a StateAndNonGrav refine without\n losing its non-grav prior."]
     pub covariance: [[f64; 3usize]; 3usize],
+    #[doc = " 1 when `dt_variance` carries a meaningful DT variance (the fitted\n posterior when DT was solved, else the carried-through prior); 0\n otherwise."]
+    pub has_dt_variance: u8,
+    #[doc = " Prior/posterior variance on the non-grav time delay DT (days²).\n Only meaningful when `has_dt_variance = 1`.\n\n The DT posterior had no wire at all before v4: the fitted\n variance existed on the orbit and simply could not cross the ABI,\n so a solved-DT fit round-tripped with its DT column closed. Copy\n it onto `EmpyreanOrbit::non_grav_dt_variance` to re-open and\n prior that column in a follow-on refine."]
+    pub dt_variance: f64,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of EmpyreanNonGravParams"][::std::mem::size_of::<EmpyreanNonGravParams>() - 160usize];
+    ["Size of EmpyreanNonGravParams"][::std::mem::size_of::<EmpyreanNonGravParams>() - 176usize];
     ["Alignment of EmpyreanNonGravParams"]
         [::std::mem::align_of::<EmpyreanNonGravParams>() - 8usize];
     ["Offset of field: EmpyreanNonGravParams::a1"]
@@ -2970,6 +3153,10 @@ const _: () = {
         [::std::mem::offset_of!(EmpyreanNonGravParams, has_covariance) - 80usize];
     ["Offset of field: EmpyreanNonGravParams::covariance"]
         [::std::mem::offset_of!(EmpyreanNonGravParams, covariance) - 88usize];
+    ["Offset of field: EmpyreanNonGravParams::has_dt_variance"]
+        [::std::mem::offset_of!(EmpyreanNonGravParams, has_dt_variance) - 160usize];
+    ["Offset of field: EmpyreanNonGravParams::dt_variance"]
+        [::std::mem::offset_of!(EmpyreanNonGravParams, dt_variance) - 168usize];
 };
 #[doc = " Acceptability sub-checks computed post-DC.\n\n Mirrors scott's [`AcceptabilityReport`](scott::od::AcceptabilityReport).\n Boolean fields are encoded as `u8` (0/1). Always populated on\n [`EmpyreanODResult`]; on [`EmpyreanEvaluateResult`] the report is\n filled with NaN/0 because evaluate does not produce a fitted orbit.\n\n # NaN convention\n\n **Every `f64` here is NaN when the quantity could not be computed**\n (AT/CT ratio with no sky-motion rates, selected-arc spans when the fit\n selected nothing, …) — NaN is the only \"not computable\" marker, never\n `0.0`, because a threshold-comparison of `0.0` reads as a real\n measurement that happens to be at the floor. The `_ok` booleans are\n **always valid**: a gate whose value is NaN reports `0` (did not pass),\n so a consumer can branch on the verdict without first testing the value\n for NaN.\n\n # Fit vs. extrapolation\n\n `fit_acceptable` is the AND of the fit-quality gates (convergence,\n positive-definite covariance, reduced χ², RMS, residual isotropy).\n `extrapolation_acceptable` additionally requires the four selection /\n coverage axes below — `selection_fraction_ok`,\n `selected_arc_coverage_ok`, `trailing_gap_ok` and\n `fractional_sigma_a_ok`. Those four are deliberately NOT part of\n `fit_acceptable`: a heavily pruned fit can still describe its retained\n subset well while being unsafe to propagate forward."]
 #[repr(C)]
@@ -3428,7 +3615,7 @@ pub struct EmpyreanODResult {
     pub num_oppositions_fit: u32,
     #[doc = " Force model tier actually used (0=Approximate, 1=Basic, 2=Standard)."]
     pub force_model_used: i32,
-    #[doc = " Solve-for parameter set requested on the driving config\n (`EMPYREAN_SOLVE_FOR_*`). Together with `has_covariance_9x9`\n disambiguates Auto outcomes."]
+    #[doc = " Solve-for parameter set requested on the driving config\n (`EMPYREAN_SOLVE_FOR_*`). Together with `has_covariance_9x9`\n disambiguates Auto outcomes.\n\n This is the coarse code, and it names a **solved** set: a fit\n that considers an axis reports `EXPLICIT` rather than the code\n its solved set alone would suggest, because a considered axis\n contributes to the delivered σ. Read\n [`dispositions`](Self::dispositions) for what the fit did with\n each axis."]
     pub solve_for_used: i32,
     #[doc = " Structured fit-quality verdict. The `acceptable` flags can be\n checked directly; per-check values + thresholds are exposed for\n reporting and downstream sub-classification."]
     pub acceptability: EmpyreanAcceptabilityReport,
@@ -3447,9 +3634,9 @@ pub struct EmpyreanODResult {
     pub has_amrat_delta: u8,
     #[doc = " Cumulative SRP AMRAT correction (m²/kg)."]
     pub amrat_delta: f64,
-    #[doc = " Number of fitted thrust Δv segments (0..=3); 0 = no thrust solve."]
+    #[doc = " Number of **declared** thrust Δv segments (0..=3); 0 = the orbit\n declared no thrust.\n\n **Deprecated, and identical to\n [`n_thrust_segments`](Self::n_thrust_segments)** — read that one.\n Kept populated for one deprecation window, exactly as\n `covariance_9x9` is, so a consumer that reads the array bound\n off the field beside the array still compiles and still reads\n the right bound.\n\n Two names for one number is the defect that removed\n `EmpyreanSolveFor::thrust_segments` in this same release; this\n one survives only because it is a *published* field whose\n meaning changed rather than a new one, and deleting it in the\n same bump that re-indexed its array would leave a consumer no\n compiling intermediate state."]
     pub thrust_delta_count: u32,
-    #[doc = " Per-segment fitted Δv in m/s, expressed in\n [`dv_frame`](EmpyreanODResult::dv_frame). Entries\n `0..thrust_delta_count` meaningful."]
+    #[doc = " Per-segment fitted Δv in m/s, expressed in\n [`dv_frame`](EmpyreanODResult::dv_frame), **indexed by declared\n segment**. Entries `0..thrust_delta_count` meaningful.\n\n A segment this fit did not solve has no correction and its entry\n is **NaN-filled**, exactly as its posterior covariance is. Read\n `dispositions.thrust_dispositions[i]` before the value.\n\n The index space changed in v4, from solved order to declared\n order, so that this array, `thrust_correction_covariances` and\n `dispositions.thrust_dispositions` share one index. Under the old\n pairing a fit with a considered burn between two solved ones\n returned a Δv attributed to the wrong burn's covariance."]
     pub thrust_delta_m_per_s: [[f64; 3usize]; 3usize],
     #[doc = " Integration frame the Δv components are expressed in (0=ICRF,\n 1=EclipticJ2000). Only meaningful when `thrust_delta_count > 0`."]
     pub dv_frame: i32,
@@ -3479,99 +3666,119 @@ pub struct EmpyreanODResult {
     pub trust_solved_width: u32,
     #[doc = " 1 when a second-order (state-only) correction can recover the\n encounter (solved width 6); 0 otherwise. Meaningful only for\n `ENCOUNTER_INTERVENES`."]
     pub trust_second_order_recoverable: u8,
+    #[doc = " What this fit did with each parameter axis the orbit declared —\n solved, considered or fixed, in the same encoding\n [`EmpyreanODConfig::solve_for_flags`] uses.\n\n Without it a covariance is ambiguous. An axis the fit\n **considered** already has its uncertainty inside the delivered\n 6×6, so re-attaching a prior to it double-counts; an axis the fit\n held **fixed** contributed nothing, so attaching a prior to it is\n conservative and correct. Same covariance, opposite conclusions.\n\n Reports the request as resolved against the orbit, so under\n [`EMPYREAN_SOLVE_FOR_AUTO`] it names the width the fit actually\n ran at rather than the width that was requested."]
+    pub dispositions: EmpyreanSolveFor,
+    #[doc = " Number of **declared** thrust Δv segments — the length of the\n meaningful prefix of\n [`thrust_delta_m_per_s`](Self::thrust_delta_m_per_s),\n [`thrust_correction_covariances`](Self::thrust_correction_covariances)\n and `dispositions.thrust_dispositions`, which all share one index\n space.\n\n This is the count the orbit's own `correction_covariances`\n declares, **not** the number of segments solved — the two differ\n exactly when a segment is considered or fixed. Read\n `dispositions.thrust_dispositions[i]` to learn which."]
+    pub n_thrust_segments: u32,
+    #[doc = " Per-segment fitted Δv correction covariances (AU/day)²,\n row-major, **indexed by declared segment**. Entries\n `0..n_thrust_segments` meaningful.\n\n A segment this fit did not solve carries no posterior and its 3×3\n is **NaN-filled** rather than echoing the prior: republishing a\n prior block under a posterior's name is the two-provenance defect\n this whole surface exists to remove. Read the disposition before\n the block.\n\n Re-feed by copying into `EmpyreanOrbit::correction_covariances`,\n which is caller-owned and borrowed — copy, do not alias."]
+    pub thrust_correction_covariances: [[[f64; 3usize]; 3usize]; 3usize],
+    #[doc = " Non-fatal conditions the fit reports about itself — chiefly\n supplied covariance it deliberately did not use.\n\n Heap array of `num_warnings` NUL-terminated UTF-8 strings; null\n when `num_warnings == 0`, which is the common case. One list per\n fit, not per observation. Display-serialized so the ABI stays\n stable as the engine's warning taxonomy grows.\n\n These are delivered scientific payload, not log lines: a supplied\n prior cross term that had to be dropped changes how the σ for\n that slot should be read. Owned by the result and freed with it."]
+    pub warnings: *mut *mut ::std::os::raw::c_char,
+    #[doc = " Number of warning strings. 0 when the fit used everything it was\n given."]
+    pub num_warnings: usize,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of EmpyreanODResult"][::std::mem::size_of::<EmpyreanODResult>() - 7688usize];
+    ["Size of EmpyreanODResult"][::std::mem::size_of::<EmpyreanODResult>() - 8128usize];
     ["Alignment of EmpyreanODResult"][::std::mem::align_of::<EmpyreanODResult>() - 8usize];
     ["Offset of field: EmpyreanODResult::orbit"]
         [::std::mem::offset_of!(EmpyreanODResult, orbit) - 0usize];
     ["Offset of field: EmpyreanODResult::observations"]
-        [::std::mem::offset_of!(EmpyreanODResult, observations) - 2392usize];
+        [::std::mem::offset_of!(EmpyreanODResult, observations) - 2576usize];
     ["Offset of field: EmpyreanODResult::num_observations"]
-        [::std::mem::offset_of!(EmpyreanODResult, num_observations) - 2400usize];
+        [::std::mem::offset_of!(EmpyreanODResult, num_observations) - 2584usize];
     ["Offset of field: EmpyreanODResult::summary"]
-        [::std::mem::offset_of!(EmpyreanODResult, summary) - 2408usize];
+        [::std::mem::offset_of!(EmpyreanODResult, summary) - 2592usize];
     ["Offset of field: EmpyreanODResult::iterations"]
-        [::std::mem::offset_of!(EmpyreanODResult, iterations) - 2552usize];
+        [::std::mem::offset_of!(EmpyreanODResult, iterations) - 2736usize];
     ["Offset of field: EmpyreanODResult::update_norm"]
-        [::std::mem::offset_of!(EmpyreanODResult, update_norm) - 2560usize];
+        [::std::mem::offset_of!(EmpyreanODResult, update_norm) - 2744usize];
     ["Offset of field: EmpyreanODResult::converged"]
-        [::std::mem::offset_of!(EmpyreanODResult, converged) - 2568usize];
+        [::std::mem::offset_of!(EmpyreanODResult, converged) - 2752usize];
     ["Offset of field: EmpyreanODResult::covariance"]
-        [::std::mem::offset_of!(EmpyreanODResult, covariance) - 2576usize];
+        [::std::mem::offset_of!(EmpyreanODResult, covariance) - 2760usize];
     ["Offset of field: EmpyreanODResult::covariance_representation"]
-        [::std::mem::offset_of!(EmpyreanODResult, covariance_representation) - 2864usize];
+        [::std::mem::offset_of!(EmpyreanODResult, covariance_representation) - 3048usize];
     ["Offset of field: EmpyreanODResult::has_covariance_9x9"]
-        [::std::mem::offset_of!(EmpyreanODResult, has_covariance_9x9) - 2868usize];
+        [::std::mem::offset_of!(EmpyreanODResult, has_covariance_9x9) - 3052usize];
     ["Offset of field: EmpyreanODResult::covariance_9x9"]
-        [::std::mem::offset_of!(EmpyreanODResult, covariance_9x9) - 2872usize];
+        [::std::mem::offset_of!(EmpyreanODResult, covariance_9x9) - 3056usize];
     ["Offset of field: EmpyreanODResult::has_non_grav_delta"]
-        [::std::mem::offset_of!(EmpyreanODResult, has_non_grav_delta) - 3520usize];
+        [::std::mem::offset_of!(EmpyreanODResult, has_non_grav_delta) - 3704usize];
     ["Offset of field: EmpyreanODResult::non_grav_delta"]
-        [::std::mem::offset_of!(EmpyreanODResult, non_grav_delta) - 3528usize];
+        [::std::mem::offset_of!(EmpyreanODResult, non_grav_delta) - 3712usize];
     ["Offset of field: EmpyreanODResult::has_non_grav"]
-        [::std::mem::offset_of!(EmpyreanODResult, has_non_grav) - 3552usize];
+        [::std::mem::offset_of!(EmpyreanODResult, has_non_grav) - 3736usize];
     ["Offset of field: EmpyreanODResult::non_grav"]
-        [::std::mem::offset_of!(EmpyreanODResult, non_grav) - 3560usize];
+        [::std::mem::offset_of!(EmpyreanODResult, non_grav) - 3744usize];
     ["Offset of field: EmpyreanODResult::rejection_passes"]
-        [::std::mem::offset_of!(EmpyreanODResult, rejection_passes) - 3720usize];
+        [::std::mem::offset_of!(EmpyreanODResult, rejection_passes) - 3920usize];
     ["Offset of field: EmpyreanODResult::num_oppositions_fit"]
-        [::std::mem::offset_of!(EmpyreanODResult, num_oppositions_fit) - 3724usize];
+        [::std::mem::offset_of!(EmpyreanODResult, num_oppositions_fit) - 3924usize];
     ["Offset of field: EmpyreanODResult::force_model_used"]
-        [::std::mem::offset_of!(EmpyreanODResult, force_model_used) - 3728usize];
+        [::std::mem::offset_of!(EmpyreanODResult, force_model_used) - 3928usize];
     ["Offset of field: EmpyreanODResult::solve_for_used"]
-        [::std::mem::offset_of!(EmpyreanODResult, solve_for_used) - 3732usize];
+        [::std::mem::offset_of!(EmpyreanODResult, solve_for_used) - 3932usize];
     ["Offset of field: EmpyreanODResult::acceptability"]
-        [::std::mem::offset_of!(EmpyreanODResult, acceptability) - 3736usize];
+        [::std::mem::offset_of!(EmpyreanODResult, acceptability) - 3936usize];
     ["Offset of field: EmpyreanODResult::station_biases"]
-        [::std::mem::offset_of!(EmpyreanODResult, station_biases) - 3944usize];
+        [::std::mem::offset_of!(EmpyreanODResult, station_biases) - 4144usize];
     ["Offset of field: EmpyreanODResult::num_station_biases"]
-        [::std::mem::offset_of!(EmpyreanODResult, num_station_biases) - 3952usize];
+        [::std::mem::offset_of!(EmpyreanODResult, num_station_biases) - 4152usize];
     ["Offset of field: EmpyreanODResult::has_solved_covariance"]
-        [::std::mem::offset_of!(EmpyreanODResult, has_solved_covariance) - 3960usize];
+        [::std::mem::offset_of!(EmpyreanODResult, has_solved_covariance) - 4160usize];
     ["Offset of field: EmpyreanODResult::solved_covariance"]
-        [::std::mem::offset_of!(EmpyreanODResult, solved_covariance) - 3968usize];
+        [::std::mem::offset_of!(EmpyreanODResult, solved_covariance) - 4168usize];
     ["Offset of field: EmpyreanODResult::has_dt_delta"]
-        [::std::mem::offset_of!(EmpyreanODResult, has_dt_delta) - 7224usize];
+        [::std::mem::offset_of!(EmpyreanODResult, has_dt_delta) - 7424usize];
     ["Offset of field: EmpyreanODResult::dt_delta"]
-        [::std::mem::offset_of!(EmpyreanODResult, dt_delta) - 7232usize];
+        [::std::mem::offset_of!(EmpyreanODResult, dt_delta) - 7432usize];
     ["Offset of field: EmpyreanODResult::has_amrat_delta"]
-        [::std::mem::offset_of!(EmpyreanODResult, has_amrat_delta) - 7240usize];
+        [::std::mem::offset_of!(EmpyreanODResult, has_amrat_delta) - 7440usize];
     ["Offset of field: EmpyreanODResult::amrat_delta"]
-        [::std::mem::offset_of!(EmpyreanODResult, amrat_delta) - 7248usize];
+        [::std::mem::offset_of!(EmpyreanODResult, amrat_delta) - 7448usize];
     ["Offset of field: EmpyreanODResult::thrust_delta_count"]
-        [::std::mem::offset_of!(EmpyreanODResult, thrust_delta_count) - 7256usize];
+        [::std::mem::offset_of!(EmpyreanODResult, thrust_delta_count) - 7456usize];
     ["Offset of field: EmpyreanODResult::thrust_delta_m_per_s"]
-        [::std::mem::offset_of!(EmpyreanODResult, thrust_delta_m_per_s) - 7264usize];
+        [::std::mem::offset_of!(EmpyreanODResult, thrust_delta_m_per_s) - 7464usize];
     ["Offset of field: EmpyreanODResult::dv_frame"]
-        [::std::mem::offset_of!(EmpyreanODResult, dv_frame) - 7336usize];
+        [::std::mem::offset_of!(EmpyreanODResult, dv_frame) - 7536usize];
     ["Offset of field: EmpyreanODResult::has_photometry"]
-        [::std::mem::offset_of!(EmpyreanODResult, has_photometry) - 7340usize];
+        [::std::mem::offset_of!(EmpyreanODResult, has_photometry) - 7540usize];
     ["Offset of field: EmpyreanODResult::photometry"]
-        [::std::mem::offset_of!(EmpyreanODResult, photometry) - 7344usize];
+        [::std::mem::offset_of!(EmpyreanODResult, photometry) - 7544usize];
     ["Offset of field: EmpyreanODResult::has_srp"]
-        [::std::mem::offset_of!(EmpyreanODResult, has_srp) - 7592usize];
+        [::std::mem::offset_of!(EmpyreanODResult, has_srp) - 7792usize];
     ["Offset of field: EmpyreanODResult::srp"]
-        [::std::mem::offset_of!(EmpyreanODResult, srp) - 7600usize];
+        [::std::mem::offset_of!(EmpyreanODResult, srp) - 7800usize];
     ["Offset of field: EmpyreanODResult::covariance_trust"]
-        [::std::mem::offset_of!(EmpyreanODResult, covariance_trust) - 7632usize];
+        [::std::mem::offset_of!(EmpyreanODResult, covariance_trust) - 7832usize];
     ["Offset of field: EmpyreanODResult::trust_event_kind"]
-        [::std::mem::offset_of!(EmpyreanODResult, trust_event_kind) - 7636usize];
+        [::std::mem::offset_of!(EmpyreanODResult, trust_event_kind) - 7836usize];
     ["Offset of field: EmpyreanODResult::trust_event_epoch_mjd_tdb"]
-        [::std::mem::offset_of!(EmpyreanODResult, trust_event_epoch_mjd_tdb) - 7640usize];
+        [::std::mem::offset_of!(EmpyreanODResult, trust_event_epoch_mjd_tdb) - 7840usize];
     ["Offset of field: EmpyreanODResult::trust_event_distance_au"]
-        [::std::mem::offset_of!(EmpyreanODResult, trust_event_distance_au) - 7648usize];
+        [::std::mem::offset_of!(EmpyreanODResult, trust_event_distance_au) - 7848usize];
     ["Offset of field: EmpyreanODResult::trust_event_nonlinearity"]
-        [::std::mem::offset_of!(EmpyreanODResult, trust_event_nonlinearity) - 7656usize];
+        [::std::mem::offset_of!(EmpyreanODResult, trust_event_nonlinearity) - 7856usize];
     ["Offset of field: EmpyreanODResult::trust_event_threshold"]
-        [::std::mem::offset_of!(EmpyreanODResult, trust_event_threshold) - 7664usize];
+        [::std::mem::offset_of!(EmpyreanODResult, trust_event_threshold) - 7864usize];
     ["Offset of field: EmpyreanODResult::trust_event_body"]
-        [::std::mem::offset_of!(EmpyreanODResult, trust_event_body) - 7672usize];
+        [::std::mem::offset_of!(EmpyreanODResult, trust_event_body) - 7872usize];
     ["Offset of field: EmpyreanODResult::trust_solved_width"]
-        [::std::mem::offset_of!(EmpyreanODResult, trust_solved_width) - 7680usize];
+        [::std::mem::offset_of!(EmpyreanODResult, trust_solved_width) - 7880usize];
     ["Offset of field: EmpyreanODResult::trust_second_order_recoverable"]
-        [::std::mem::offset_of!(EmpyreanODResult, trust_second_order_recoverable) - 7684usize];
+        [::std::mem::offset_of!(EmpyreanODResult, trust_second_order_recoverable) - 7884usize];
+    ["Offset of field: EmpyreanODResult::dispositions"]
+        [::std::mem::offset_of!(EmpyreanODResult, dispositions) - 7885usize];
+    ["Offset of field: EmpyreanODResult::n_thrust_segments"]
+        [::std::mem::offset_of!(EmpyreanODResult, n_thrust_segments) - 7892usize];
+    ["Offset of field: EmpyreanODResult::thrust_correction_covariances"]
+        [::std::mem::offset_of!(EmpyreanODResult, thrust_correction_covariances) - 7896usize];
+    ["Offset of field: EmpyreanODResult::warnings"]
+        [::std::mem::offset_of!(EmpyreanODResult, warnings) - 8112usize];
+    ["Offset of field: EmpyreanODResult::num_warnings"]
+        [::std::mem::offset_of!(EmpyreanODResult, num_warnings) - 8120usize];
 };
 impl Default for EmpyreanODResult {
     fn default() -> Self {
@@ -3599,7 +3806,7 @@ pub struct EmpyreanODObjectResult {
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of EmpyreanODObjectResult"][::std::mem::size_of::<EmpyreanODObjectResult>() - 7720usize];
+    ["Size of EmpyreanODObjectResult"][::std::mem::size_of::<EmpyreanODObjectResult>() - 8160usize];
     ["Alignment of EmpyreanODObjectResult"]
         [::std::mem::align_of::<EmpyreanODObjectResult>() - 8usize];
     ["Offset of field: EmpyreanODObjectResult::object_id"]
@@ -3609,9 +3816,9 @@ const _: () = {
     ["Offset of field: EmpyreanODObjectResult::result"]
         [::std::mem::offset_of!(EmpyreanODObjectResult, result) - 16usize];
     ["Offset of field: EmpyreanODObjectResult::error"]
-        [::std::mem::offset_of!(EmpyreanODObjectResult, error) - 7704usize];
+        [::std::mem::offset_of!(EmpyreanODObjectResult, error) - 8144usize];
     ["Offset of field: EmpyreanODObjectResult::error_code"]
-        [::std::mem::offset_of!(EmpyreanODObjectResult, error_code) - 7712usize];
+        [::std::mem::offset_of!(EmpyreanODObjectResult, error_code) - 8152usize];
 };
 impl Default for EmpyreanODObjectResult {
     fn default() -> Self {
@@ -3791,11 +3998,17 @@ pub struct EmpyreanObservatoryConfig {
     pub max_apparent_mag: f64,
     #[doc = " Minimum solar elongation (degrees)."]
     pub min_elongation_deg: f64,
+    #[doc = " Minimum geometric elevation of the target above the site's local\n horizon, in degrees.\n\n The elevation is \\\\( h = \\arcsin(\\hat{u} \\cdot \\hat{s}) \\\\), with\n \\\\(\\hat{u}\\\\) the site's geodetic zenith and \\\\(\\hat{s}\\\\) the\n apparent — light-time- and aberration-corrected — topocentric\n direction to the target. **Atmospheric refraction is ignored**:\n near the horizon refraction lifts a source by roughly\n \\\\(0.5°\\\\), and the error falls below \\\\(0.1°\\\\) by\n \\\\(h \\approx 10°\\\\).\n\n `0.0` — the zero-init value — is the geometric horizon, which is\n also the engine's default. That is the least-opinionated\n statement the geometry can make, *not* an observing\n recommendation: airmass at \\\\(h = 0°\\\\) is \\\\(\\approx 38\\\\), and\n real programs cut between \\\\(20°\\\\) and \\\\(30°\\\\). Set it to the\n site's own pointing or airmass limit — e.g. `30.0` for airmass\n \\\\(\\le 2\\\\)."]
+    pub min_elevation_deg: f64,
+    #[doc = " 1 when [`max_sun_altitude_deg`](Self::max_sun_altitude_deg)\n carries a darkness threshold; 0 to take the engine's default of\n −18° (astronomical twilight).\n\n This axis needs the switch and\n [`min_elevation_deg`](Self::min_elevation_deg) does not, for one\n reason: `0.0` is a legal and meaningful solar altitude (the Sun's\n centre on the geometric horizon), so a zero-init struct read as a\n literal `0.0` would quietly plan a campaign in daylight. The\n elevation default *is* `0.0`, so its zero-init value is already\n the engine's."]
+    pub has_max_sun_altitude_deg: u8,
+    #[doc = " Solar altitude at or below which the site counts as dark, in\n degrees. Only read when\n [`has_max_sun_altitude_deg`](Self::has_max_sun_altitude_deg) is 1.\n\n Built from the same site zenith as `min_elevation_deg`, against\n the **geometric** topocentric direction to the Sun — no\n light-time, aberration or refraction correction, each of which is\n a few tens of arcseconds at most against a threshold that\n operates on degrees.\n\n The standard conventions are civil (\\\\(-6°\\\\)), nautical\n (\\\\(-12°\\\\)) and astronomical (\\\\(-18°\\\\), the engine default,\n where the sky background has fallen to its dark-time floor).\n Because refraction is ignored, `0.0` means the Sun's *centre* on\n the geometric horizon, about \\\\(0.83°\\\\) later than visible\n sunset. A value above \\\\(+90°\\\\) disables the darkness gate."]
+    pub max_sun_altitude_deg: f64,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of EmpyreanObservatoryConfig"]
-        [::std::mem::size_of::<EmpyreanObservatoryConfig>() - 40usize];
+        [::std::mem::size_of::<EmpyreanObservatoryConfig>() - 64usize];
     ["Alignment of EmpyreanObservatoryConfig"]
         [::std::mem::align_of::<EmpyreanObservatoryConfig>() - 8usize];
     ["Offset of field: EmpyreanObservatoryConfig::obs_code"]
@@ -3808,6 +4021,12 @@ const _: () = {
         [::std::mem::offset_of!(EmpyreanObservatoryConfig, max_apparent_mag) - 24usize];
     ["Offset of field: EmpyreanObservatoryConfig::min_elongation_deg"]
         [::std::mem::offset_of!(EmpyreanObservatoryConfig, min_elongation_deg) - 32usize];
+    ["Offset of field: EmpyreanObservatoryConfig::min_elevation_deg"]
+        [::std::mem::offset_of!(EmpyreanObservatoryConfig, min_elevation_deg) - 40usize];
+    ["Offset of field: EmpyreanObservatoryConfig::has_max_sun_altitude_deg"]
+        [::std::mem::offset_of!(EmpyreanObservatoryConfig, has_max_sun_altitude_deg) - 48usize];
+    ["Offset of field: EmpyreanObservatoryConfig::max_sun_altitude_deg"]
+        [::std::mem::offset_of!(EmpyreanObservatoryConfig, max_sun_altitude_deg) - 56usize];
 };
 impl Default for EmpyreanObservatoryConfig {
     fn default() -> Self {
@@ -4563,6 +4782,13 @@ pub struct EmpyreanLib {
         orbit_index: usize,
         out_series: *mut *mut EmpyreanTaggedCovarianceSeries,
     ) -> i32,
+    pub empyrean_propagation_joint_at: unsafe extern "C" fn(
+        result: *const EmpyreanPropagationResult,
+        orbit_index: usize,
+        epoch_index: usize,
+        out: *mut EmpyreanOrbitCovariance,
+    ) -> i32,
+    pub empyrean_orbit_covariance_free: unsafe extern "C" fn(cov: *mut EmpyreanOrbitCovariance),
     pub empyrean_propagation_covariance_at_cartesian: unsafe extern "C" fn(
         result: *const EmpyreanPropagationResult,
         orbit_index: usize,
@@ -4863,6 +5089,12 @@ impl EmpyreanLib {
         let empyrean_propagation_covariance_series_cartesian = __library
             .get(b"empyrean_propagation_covariance_series_cartesian\0")
             .map(|sym| *sym)?;
+        let empyrean_propagation_joint_at = __library
+            .get(b"empyrean_propagation_joint_at\0")
+            .map(|sym| *sym)?;
+        let empyrean_orbit_covariance_free = __library
+            .get(b"empyrean_orbit_covariance_free\0")
+            .map(|sym| *sym)?;
         let empyrean_propagation_covariance_at_cartesian = __library
             .get(b"empyrean_propagation_covariance_at_cartesian\0")
             .map(|sym| *sym)?;
@@ -4991,6 +5223,8 @@ impl EmpyreanLib {
             empyrean_propagate,
             empyrean_propagation_result_free,
             empyrean_propagation_covariance_series_cartesian,
+            empyrean_propagation_joint_at,
+            empyrean_orbit_covariance_free,
             empyrean_propagation_covariance_at_cartesian,
             empyrean_tagged_covariance_series_free,
             empyrean_query_sbdb,
@@ -5273,7 +5507,7 @@ impl EmpyreanLib {
     ) -> i32 {
         (self.empyrean_orbits_read_json)(path, out)
     }
-    #[doc = " Write an orbit batch to JSON."]
+    #[doc = " Write an orbit batch to JSON.\n\n This is **not** the engine's orbit schema — it is this crate's own\n flat row shape (`OrbitRow`), and it is the least capable of the three\n orbit formats. It carries the state, the 6×6 and the Marsden\n coefficients with their g(r) exponents, and nothing else.\n\n A batch carrying a state↔Marsden border or a wide cross-covariance\n carrier is **refused by name**, pointing at parquet — the format is\n unable to represent the joint, and writing the row short would\n produce a file that reads back as a block-diagonal covariance with no\n signal that anything was lost.\n\n Fields this format drops without refusing, because they predate the\n joint surface and a refusal would break callers who write them today:\n the non-grav DT and its prior variance, the Marsden 3×3, the SRP slot\n and the photometric block. Round-trip through parquet if you need\n them."]
     pub unsafe fn empyrean_orbits_write_json(
         &self,
         path: *const ::std::os::raw::c_char,
@@ -5542,7 +5776,7 @@ impl EmpyreanLib {
     pub unsafe fn empyrean_od_result_free(&self, result: *mut EmpyreanODResult) {
         (self.empyrean_od_result_free)(result)
     }
-    #[doc = " Evaluate residuals for a single orbit against observations."]
+    #[doc = " Evaluate residuals for a single orbit against observations.\n\n # A supplied joint covariance changes nothing here\n\n Evaluation measures how well a FIXED orbit predicts observations; it\n forms no prior and performs no estimation, so an orbit carrying a\n state↔Marsden border or a wide carrier scores exactly as the same\n orbit without one. Nothing is dropped — there is simply nothing for\n the joint to affect, and this result type carries no orbit to echo\n one back on. The nine other orbit-reading entry points consume it."]
     pub unsafe fn empyrean_evaluate(
         &self,
         ctx: *const EmpyreanContext,
@@ -5636,6 +5870,20 @@ impl EmpyreanLib {
         out_series: *mut *mut EmpyreanTaggedCovarianceSeries,
     ) -> i32 {
         (self.empyrean_propagation_covariance_series_cartesian)(result, orbit_index, out_series)
+    }
+    #[doc = " The propagated joint's CROSS terms at a single `(orbit_index,\n epoch_index)` — the state↔Marsden border and the wide carrier that\n [`EmpyreanTaggedCovariance::matrix`] is the state block of.\n\n # Why this is a separate call\n\n [`EmpyreanTaggedCovariance`] is a plain-old-data struct: a caller\n declares one on the stack, fills it through\n [`empyrean_propagation_covariance_at_cartesian`], and frees nothing.\n Putting the carrier on it would have made every such caller — code\n that is correct today and recompiles without a murmur — leak two\n allocations per call. Nothing would fail; memory would simply grow.\n So the joint is opt-in through this call instead, and the tagged\n covariance keeps its contract.\n\n The same `(orbit_index, epoch_index)` addresses both surfaces, so a\n consumer walking a series\n ([`empyrean_propagation_covariance_series_cartesian`]) can ask for\n the joint of any entry without the series itself owning anything new.\n\n # Absence is reported, never fabricated\n\n `has_non_grav_cross = 0` with null carrier pointers means the engine\n produced no cross terms at this row — not that they were zero. Every\n uncertainty method that reaches this accessor carries the payload\n when it has one, including the sampled paths, which recover the\n state↔parameter columns from the cloud. A row genuinely without a\n joint is one whose orbit declared no solved-parameter block.\n\n # Ownership\n\n On success `out` owns two heap arrays; release them with\n [`empyrean_orbit_covariance_free`]. On any non-zero return `out` is\n untouched and there is nothing to free.\n\n # Returns\n\n The same `EMPYREAN_TAGGED_COV_*` codes as the tagged-covariance\n accessors, so a caller branches on one set.\n\n # Safety\n `result` and `out` must be valid pointers; `result` from\n `empyrean_propagate`."]
+    pub unsafe fn empyrean_propagation_joint_at(
+        &self,
+        result: *const EmpyreanPropagationResult,
+        orbit_index: usize,
+        epoch_index: usize,
+        out: *mut EmpyreanOrbitCovariance,
+    ) -> i32 {
+        (self.empyrean_propagation_joint_at)(result, orbit_index, epoch_index, out)
+    }
+    #[doc = " Release the arrays owned by an [`EmpyreanOrbitCovariance`](crate::joint::EmpyreanOrbitCovariance)\n written by [`empyrean_propagation_joint_at`].\n\n Idempotent — the pointers are nulled and the counts zeroed — and a\n null argument is a no-op. Do **not** call it on the `orbit_cov` of an\n OD result or a propagated state: those are owned by their parent and\n released by the parent's own free function.\n\n # Safety\n `cov` must be null or a struct written by\n [`empyrean_propagation_joint_at`] and not already freed."]
+    pub unsafe fn empyrean_orbit_covariance_free(&self, cov: *mut EmpyreanOrbitCovariance) {
+        (self.empyrean_orbit_covariance_free)(cov)
     }
     #[doc = " Resolved-kind tagged covariance at a single `(orbit_index,\n epoch_index)`, Cartesian basis (the gm-free point query). `out` is\n written on success.\n\n # Safety\n `result` and `out` must be valid pointers; `result` from `empyrean_propagate`."]
     pub unsafe fn empyrean_propagation_covariance_at_cartesian(

@@ -31,9 +31,9 @@ empyrean = "0.10.0-rc.0"
 ## What it does
 
 - **Propagation** — N-body (Sun, planets, Moon, Pluto) with EIH general relativity, Sun J2 and Earth J2–J4 zonal harmonics, 16 asteroid perturbers, and the Marsden non-gravitational model — selectable across Approximate / Basic / Standard force-model tiers (Standard is the default). GR15 and DOP853 integrators. Optional finite-burn thrust arcs — constant-RTN, velocity-tangent, or inertial-fixed steering, with per-arc Δv targeting corrections — layer on as a continuous-thrust force input.
-- **Uncertainty** — First-order (Jet1) state transition matrices; second-order (Jet2) state transition tensors; unscented sigma-point and Monte Carlo sampling; an adaptive Auto mode that escalates the method automatically through close approaches and relaxes it elsewhere. Optional per-epoch tagged-covariance readback.
+- **Uncertainty** — First-order (Jet1) state transition matrices; second-order (Jet2) state transition tensors; unscented sigma-point and Monte Carlo sampling; an adaptive Auto mode that escalates the method automatically through close approaches and relaxes it elsewhere. Optional per-epoch tagged-covariance readback. A fit over the state and *P* parameters produces one (6+*P*)×(6+*P*) covariance, and the **off-diagonal** blocks travel with it — onto the fitted orbit, through propagation, and into impact probability, B-planes and ephemeris — so a chained calculation is conditioned on the covariance the fit actually computed rather than on its diagonal blocks.
 - **Ephemeris** — RA/Dec, rates, photometry (H–G, H–G₁G₂, H–G₁₂), light time, phase angle, solar elongation, local horizon. Each row carries the 6×6 sky-plane covariance over (ρ, RA, Dec) and their rates, and the aberrated barycentric ICRF state at the photon-emission epoch with its own 6×6 covariance — both present when the input orbit carries a state covariance.
-- **Orbit determination** — Gauss, Herget, and systematic-ranging (admissible region + Manifold of Variations) IOD → N-body differential correction over optical and radar (delay / Doppler) observations fitted jointly, with span-grouped Jacobian reuse and outlier rejection. One call fits **every** object in an ADES set and returns per-object results keyed by designation. Solves beyond the six-element state for the Marsden A1/A2/A3 non-gravitational block, the cometary outgassing time delay DT, the SRP area-to-mass ratio AMRAT, and thrust Δv-correction segments — each partial supplied analytically by the hyperdual integrator — and returns a tagged solved covariance that names every fitted parameter, plus an event-aware trust verdict on the delivered covariance. Optional post-fit photometry recovers H and the phase-function slope. Validated against `find_orb` and JPL SBDB.
+- **Orbit determination** — Gauss, Herget, and systematic-ranging (admissible region + Manifold of Variations) IOD → N-body differential correction over optical and radar (delay / Doppler) observations fitted jointly, with span-grouped Jacobian reuse and outlier rejection. One call fits **every** object in an ADES set and returns per-object results keyed by designation. Solves beyond the six-element state for the Marsden A1/A2/A3 non-gravitational block, the cometary outgassing time delay DT, the SRP area-to-mass ratio AMRAT, and thrust Δv-correction segments — each partial supplied analytically by the hyperdual integrator, and each axis carrying a *disposition* (solved / considered / fixed) rather than a flag — and returns a tagged solved covariance that names every fitted parameter, a re-feedable orbit carrying that covariance's off-diagonal blocks, and an event-aware trust verdict on the delivered covariance. Optional post-fit photometry recovers H and the phase-function slope. Validated against `find_orb` and JPL SBDB.
 - **Events** — Close approach (start/end), periapsis, gravitational capture (start/end), shadow entry/exit, atmospheric entry/exit, impact, and possible impact.
 
 ## Quick start
@@ -174,10 +174,48 @@ than finite differences. Choose the axes with `SolveForParams`: `StateOnly`,
 automatically on a poor fit), or `Explicit(SolveFor { .. })` for the wider
 axes the coarse variants can't name.
 
+Each axis on `SolveFor` carries a `ParamDisposition`, not a flag:
+`Solved` estimates it, `Considered` does not estimate it but still lets its
+prior uncertainty reach the posterior through its measurement partials
+(Schmidt–Kalman consider analysis; Tapley, Byron D., Schutz, Bob E., and
+Born, George H., *Statistical Orbit Determination*, Elsevier Academic Press,
+2004, ch. 6), and `Fixed` marginalizes it out. Both of the last two produce a
+well-formed covariance, so `false` could not say which was meant — there is
+deliberately no `From<bool>` and no `Default` on the enum itself.
+`DetermineResult::dispositions` reports the partition the fit actually ran,
+which is what tells you whether re-attaching a prior to an axis would
+double-count it: a considered axis already has its uncertainty inside the
+delivered 6×6, a fixed one does not. Same covariance, opposite conclusions.
+
+**Consider analysis is not a conservatism knob.** Under an uncorrelated
+prior the consider correction strictly widens the posterior, but the fits
+that need it are the ones with cross terms between the considered axis and
+the solved ones — and there the correction is sign-indefinite. A considered
+axis can come back *tighter*. Report it as what it is (an unestimated error
+source folded through its partials), never as a safety margin.
+
+`SolveFor::thrust` is `[ParamDisposition; MAX_THRUST_SEGMENTS]`, positional
+with the orbit's declared Δv-correction segments rather than a count — a
+considered or fixed burn sits between two solved ones as readily as after
+them, and a count cannot say which burn is which. `with_leading_thrust(n)`
+opens the leading *n* burns and **refuses** an over-budget request rather
+than saturating; `solved_thrust_segments()` / `considered_thrust_segments()`
+count them back.
+
 DT, AMRAT, and thrust are refine-path solves: the input orbit must carry a
 prior — the variance that *opens* the parameter. Request an axis without its
 prior and the fit errors loudly; it never hands back a zeroed or defaulted
-column.
+column. Covariance the fit was handed and deliberately did **not** use comes
+back on `DetermineResult::warnings` — delivered payload rather than a log
+line, because a dropped prior cross term changes how the σ for that slot
+should be read. It is empty on a fit that used everything it was given.
+
+Per-segment thrust results are indexed by **declared** segment and are
+`Option`-valued: `thrust_delta_m_per_s[i]` and
+`thrust_correction_covariances[i]` are `None` where segment *i* was not
+solved, because a zero there would read as a fitted Δv of exactly zero, and
+echoing a considered burn's prior would republish it under a posterior's
+name. Read `dispositions.thrust[i]` before the value.
 
 Every wide fit reports a `SolvedCovariance` whose fitted-parameter identities
 travel with the matrix. Read a parameter's variance by its slot (`marsden_slot`,
@@ -185,7 +223,7 @@ travel with the matrix. Read a parameter's variance by its slot (`marsden_slot`,
 `width` alone is ambiguous (a 9×9 is Marsden-only *or* one thrust segment).
 
 ```rust,no_run
-use empyrean::{Context, ODConfig, SolveFor, SolveForParams};
+use empyrean::{Context, ODConfig, ParamDisposition, SolveFor, SolveForParams};
 
 let ctx = Context::from_data_dir(None)?;
 let obs = ctx.read_ades("comet_67p.psv")?;
@@ -204,8 +242,8 @@ let prior = fit.orbit
     .with_non_grav_dt_variance(Some(100.0));
 let refined = ctx.refine(&prior, &obs, &ODConfig {
     solve_for: SolveForParams::Explicit(SolveFor {
-        marsden: true,
-        dt: true,
+        marsden: ParamDisposition::Solved,
+        dt: ParamDisposition::Solved,
         ..Default::default()
     }),
     ..Default::default()
@@ -223,6 +261,159 @@ if let Some(cov) = &refined.solved_covariance {
 }
 # Ok::<(), empyrean::Error>(())
 ```
+
+## The joint covariance
+
+A wide fit produces one (6+*P*)×(6+*P*) matrix. Its diagonal blocks — the 6×6
+state covariance, the Marsden 3×3, a DT variance, an AMRAT variance, a
+per-segment thrust 3×3 — have always crossed the boundary. The
+**off-diagonal** blocks are what `JointCovariance` and `WideCross` carry, and
+they ride the fitted orbit, propagation (in both directions), impact
+probability, B-planes and ephemeris.
+
+Dropping them is not a conservative simplification. A block-diagonal
+covariance asserts that the data which produced the state and the data which
+produced A2 were independent, when they are the same observations through the
+same fit. Worse, the *propagated* joint has non-zero state↔parameter columns
+**even from a block-diagonal input**, because propagation itself generates the
+correlation — so a second leg handed only the 6×6 reports a *tighter*
+uncertainty than the first leg supports.
+
+### The four homes
+
+One covariance entry belongs to exactly one place, and supplying it in two is
+refused rather than merged:
+
+| block | home |
+|---|---|
+| state ↔ state | `CoordinateState::covariance` |
+| Aᵢ ↔ Aⱼ | `Orbit::ng_covariance` |
+| state ↔ Aᵢ | `CoordinateState::non_grav_cross` (6×3) |
+| Δvᵢ ↔ Δvⱼ, same segment | that segment's own 3×3 on `ThrustParams` |
+| everything else | `Orbit::wide_cross` (a `WideCross`) |
+
+The state↔Marsden border sits on the **coordinate**, beside the 6×6 it
+borders, so a coordinate transform moves both halves of one matrix together;
+`transform_coordinates` rotates the border with the state rather than leaving
+it in the old basis. Everything else — state↔DT, state↔AMRAT, state↔Δv, and
+the mixed parameter pairs — sits on the orbit.
+
+Entries in a `WideCross` are keyed by `ParamColumn` (`Marsden(i)`, `Dt`,
+`Amrat`, `Thrust { segment, component }`), never by column index, because
+which column a parameter occupies depends on what *else* the orbit declares —
+adding an SRP AMRAT shifts the thrust columns by one. An index recorded
+against one orbit is wrong against the next, and the failure is silent: every
+number finite, every gate passed, one parameter's correlations attached to
+another. `ParamColumn::as_tag` / `from_tag` render and parse the canonical
+strings (`"A1"`, `"DT"`, `"AMRAT"`, `"thrust[0].x"`) that the file formats and
+the other language channels carry.
+
+A `Thrust` segment index is the **declared** segment, not the solved one — the
+same index space as `SolveFor::thrust` and the orbit's own correction
+covariances.
+
+### Absence is not zero
+
+`WideCross::is_empty` reports entry *count*, not values: an entry whose six
+numbers are all zero is a supplied zero correlation and makes it return
+`false`. Omitting the entry is the only way to say "absent". The distinction
+is load-bearing in both directions — the engine's definiteness gate engages on
+a supplied zero — so a producer never emits a zero block to stand in for a
+missing one, and `JointCovariance::non_grav_cross` is `Option`-typed for the
+same reason.
+
+### Reading it, and handing it on
+
+```rust,no_run
+use empyrean::{
+    Context, Epoch, ODConfig, ParamColumn, PropagationConfig, SolveForParams,
+};
+
+let ctx = Context::from_data_dir(None)?;
+let obs = ctx.read_ades("comet_67p.psv")?;
+let fit = ctx.determine(&obs, None, &ODConfig {
+    solve_for: SolveForParams::StateAndNonGrav,
+    ..Default::default()
+})?.into_single()?;
+
+// The fitted orbit carries the fit's own off-diagonal blocks, in the two
+// homes above. No reconstruction: `fit.orbit` is already the input type.
+let border = fit.orbit.state.non_grav_cross;          // Option<[[f64; 3]; 6]>
+if let Some(wide) = &fit.orbit.wide_cross {
+    if let Some(col) = wide.state_cross(ParamColumn::Amrat) {
+        println!("cov(x, AMRAT) = {:e}", col[0]);
+    }
+    for (a, b, value) in wide.param_crosses() {
+        println!("cov({}, {}) = {value:e}", a.as_tag(), b.as_tag());
+    }
+}
+
+// Propagate it. The joint goes in with the orbit and comes back per epoch.
+let epochs = vec![Epoch::from_mjd_tdb(65000.0)];
+let leg1 = ctx.propagate(&[fit.orbit.clone()], &epochs, &PropagationConfig::default())?;
+let end = &leg1.states[0];
+println!("joint present at the end of leg 1: {}", !end.joint.is_empty());
+# let _ = border;
+# Ok::<(), empyrean::Error>(())
+```
+
+Chaining a second leg by hand is three field copies onto the next orbit —
+`state.covariance`, `state.non_grav_cross`, `wide_cross` — plus the parameter
+blocks the cross terms are *conditioned* on:
+
+```rust,no_run
+# use empyrean::{Context, CoordinateState, Epoch, PropagationConfig};
+# let ctx = Context::from_data_dir(None)?;
+# let seed = empyrean::query_sbdb(&["Apophis"], None)?.orbits.remove(0);
+# let epochs = vec![Epoch::from_mjd_tdb(65000.0)];
+# let leg1 = ctx.propagate(&[seed.clone()], &epochs, &PropagationConfig::default())?;
+let end = &leg1.states[0];
+
+let mut next = seed.clone();   // carries the parameter blocks unchanged
+next.state = CoordinateState::cartesian(
+    end.epoch,
+    [
+        end.position[0], end.position[1], end.position[2],
+        end.velocity[0], end.velocity[1], end.velocity[2],
+    ],
+    end.frame,
+    end.origin,
+);
+next.state.covariance = end.covariance;
+next.state.non_grav_cross = end.joint.non_grav_cross;
+next.wide_cross = end.joint.wide_cross.clone();
+
+let leg2 = ctx.propagate(&[next], &epochs, &PropagationConfig::default())?;
+# let _ = leg2;
+# Ok::<(), empyrean::Error>(())
+```
+
+The parameter blocks come from the orbit that *started* the chain, not from
+the propagated row: propagation passes the non-grav 3×3, the DT variance and
+the AMRAT variance through unchanged rather than restating them on every
+output epoch. A border supplied without the parameter block it conditions is
+refused by the engine, not quietly ignored — a cross term with no diagonal
+block to sit against is half a matrix.
+
+`PropagationResult::joint_at(orbit_index, epoch_index)` reads the same cross
+terms alongside the tagged-covariance accessors, for callers working from
+indices rather than iterating `states`. It is a separate call rather than a
+field on the tagged covariance so that the C ABI's equivalent struct stays
+free of owned storage; Rust callers get the engine's arrays copied into owned
+values and released before it returns.
+
+`PropagatedState` is **no longer `Copy`** as a consequence — it now owns heap
+storage — though it is still `Clone`, and copying a struct that already
+carried a 1728-byte state-transition tensor was never cheap. Call sites that
+relied on an implicit copy need an explicit `.clone()`.
+
+### Downstream consumers
+
+`compute_impact_probabilities`, `compute_b_planes` and `generate_ephemeris`
+all read the joint off the orbits they are given. An impact probability
+computed against a block-diagonal covariance materially understates the tails,
+for the same reason chaining does: it asserts an independence the fit never
+found. Pass the fitted orbit through whole and the question does not arise.
 
 ## Post-fit photometry
 
@@ -272,9 +463,24 @@ write to parquet, JSON, and CSV; orbits read back from all three as well
 (the propagator and the OD pipeline are the canonical producers of the
 rest). The three formats carry the same columns and differ only in how a
 non-computable number is spelled — CSV a literal `NaN`, JSON `null`,
-since JSON has no NaN literal. CSV is not the lossy choice:
-`write_orbits_csv` emits the same column set as `write_orbits_parquet`,
-covariance included.
+since JSON has no NaN literal. CSV is not the lossy choice for the ordinary
+column set: `write_orbits_csv` emits the same columns as
+`write_orbits_parquet`, covariance included.
+
+The **joint** is where the three formats genuinely differ. Parquet carries the
+state↔Marsden border and the wide carrier in a tagged tail, so a fitted orbit
+round-trips through a parquet file holding the covariance the fit computed
+rather than its diagonal blocks. It is the only orbit format here that can,
+and the other two refuse such a batch **by name** rather than writing it
+short: the JSON orbit format is a flat row shape carrying the 6×6 and nothing
+beyond it, and CSV cannot express the difference between an absent cross and a
+supplied zero cross — it renders both as an empty cell, and that difference is
+load-bearing. A carrier holding thrust Δv terms is refused wherever it is
+offered, because no orbit-file format can serialize the thrust arcs those
+terms hang on. Refusing at the writer is the point: a silently dropped carrier
+produces a file that reads back as a block-diagonal joint, which is a
+different and tighter claim than the one you held, with nothing in the round
+trip to signal it happened.
 
 Residual files carry the **whole** `ObservationResidual` surface — all
 36 fields — not a projection of it: the `obs_id` / `object_id` join
@@ -508,6 +714,28 @@ for bp in &bps {
 }
 # Ok::<(), empyrean::Error>(())
 ```
+
+`PlanningConfig::observatories` takes `ObservatoryConfig` values — the MPC
+code, the assumed 1σ (RA·cosδ, Dec), a limiting apparent magnitude, a minimum
+solar elongation, plus the two visibility limits: `min_elevation_deg`
+(geometric elevation above the site's local horizon, ignoring refraction;
+`0.0` is the geometric horizon and the engine's default — the
+least-opinionated statement the geometry can make, not an observing
+recommendation, since airmass there is about 38 and real programs cut between
+20° and 30°) and `max_sun_altitude_deg` (an `Option<f64>`; `None` takes the
+engine's default of −18°, astronomical twilight, with civil at −6° and
+nautical at −12°, and above +90° disabling the gate — an `Option` because
+`0.0` is a legal solar altitude, the Sun's centre on the geometric horizon, so
+a defaulted zero would quietly plan a campaign in daylight). The struct's
+fields carry no defaults, so a config cannot be half-specified without saying
+so.
+`evaluate_plan` **does not consult** any of it: the field refuses a non-empty
+list, each optical candidate's σ comes from its own `PlannedObservation`, and
+the observability filters on that entry point are engine-set rather than
+caller-configurable. The type is documented here because it is part of the
+shared planning configuration and becomes live the day a surface that reads it
+is exposed — not because this release reads it.
+
 
 ## Data directory and offline operation
 

@@ -1,0 +1,14 @@
+# Recorded decisions: C-ABI exports that are deliberately NOT consumed by the
+# safe Rust wrapper (`empyrean/src`). One entry per line, `name | reason`.
+# Blank lines and `#` comments are ignored.
+#
+# This list is REVERSE-ENFORCED by tests/capability_parity.rs: an entry whose
+# symbol has since been wrapped fails the gate so the stale line is removed,
+# and an entry naming a symbol that is not in tests/abi_surface.txt fails too.
+# A reason is mandatory — the point of the list is the recorded decision, not
+# the exemption.
+#
+# Adding a line here is a decision to ship an export with no higher-layer
+# consumer. Prefer wiring the wrapper.
+
+empyrean_abi_version | The load-time ABI handshake, consumed inside empyrean-sys itself (`src/lib.rs`, `lib()`): the engine's reported ABI version is compared against `EMPYREAN_ABI_VERSION` the moment `libempyrean` opens, because `dlsym` matches on symbol name only and a mismatched engine would otherwise read arguments through the wrong shape. Wrapping it in the safe layer would expose a check that has already run and cannot fail by the time a caller could reach it.

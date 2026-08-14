@@ -185,6 +185,37 @@ blocks alongside the 6×6 state block.
    empyrean.BPlanes
 ```
 
+## Observation planning
+
+```{eval-rst}
+.. autosummary::
+   :toctree: _generated
+   :nosignatures:
+
+   empyrean.evaluate_plan
+   empyrean.PlanResult
+   empyrean.PlanMetrics
+   empyrean.PlanCandidates
+   empyrean.PlanEphemeris
+```
+
+### Planning configuration
+
+```{eval-rst}
+.. autosummary::
+   :toctree: _generated
+   :nosignatures:
+
+   empyrean.PlanningConfig
+   empyrean.ObservatoryConfig
+   empyrean.STAGE_PRIOR
+   empyrean.STAGE_POSTERIOR
+   empyrean.PlannedObservation
+   empyrean.PlannedObservationKind
+   empyrean.RadarMode
+   empyrean.RadarStation
+```
+
 ## Math primitives
 
 ```{eval-rst}

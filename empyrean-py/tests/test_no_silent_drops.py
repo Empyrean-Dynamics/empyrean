@@ -41,10 +41,12 @@ from empyrean import (
     NonGravParams,
     Origin,
     PhotometricParams,
+    PlannedObservation,
     SRPParams,
     UncertaintyMethod,
     compute_b_planes,
     compute_impact_probabilities,
+    evaluate_plan,
     generate_ephemeris,
     transform_coordinates,
 )
@@ -1228,3 +1230,162 @@ def test_ng_covariance_threads_through_ephemeris_and_impact() -> None:
         np.isfinite(ips.sigma_distance_km.to_numpy(zero_copy_only=False))
     )
     assert len(bps) > 0
+
+
+# ── Observation planning ──────────────────────────────────────────────
+#
+# The plan's output surface has two blocks that are null by construction
+# on the wrong kind of row (sky-plane geometry on radar, the radar block
+# on optical), so the fixture below carries BOTH kinds — the allow-list
+# is a last resort and neither block needs an entry.
+
+
+def _plan_orbit_barycentric() -> CartesianOrbits:
+    """Apophis with a covariance, shifted to the barycentric basis the
+    planner evaluates in.
+
+    Derived from :data:`APOPHIS_STATE` through
+    :func:`transform_coordinates` so the two fixtures cannot drift; the
+    origin shift is a pure translation, so the covariance carries over
+    unchanged.
+    """
+    orbits = _full_feature_orbit()
+    coords = transform_coordinates(orbits.coordinates, CartesianCoordinates, origin="SSB")
+    return CartesianOrbits.from_kwargs(
+        orbit_id=["PLAN_TEST"],
+        object_id=["forcing_test_obj"],
+        coordinates=coords,
+    )
+
+
+def _plan_candidates() -> list[PlannedObservation]:
+    """Two optical sites, a caller-supplied-SNR radar run, and one that
+    has to derive its SNR from the link budget.
+
+    Every output block has an input that populates it: without the radar
+    rows the radar block would be uniformly null, without the optical
+    rows the sky-plane block would be, and without the link-budget row
+    ``radar_provenance`` would be empty everywhere.
+    """
+    t0 = APOPHIS_STATE["epoch"]
+    return [
+        PlannedObservation.optical(t0 + 10.0, "F51", (0.2, 0.2)),
+        PlannedObservation.optical(t0 + 12.0, "568", (0.3, 0.3)),
+        PlannedObservation.radar(
+            t0 + 15.0,
+            radar_bandwidth_hz=1.0e5,
+            radar_freq_resolution_hz=0.1,
+            radar_snr=50.0,
+        ),
+        PlannedObservation.radar(
+            t0 + 20.0,
+            radar_bandwidth_hz=1.0e5,
+            radar_freq_resolution_hz=0.1,
+            radar_target_h_mag=19.7,
+            radar_target_visual_albedo=0.23,
+            radar_target_radar_albedo=0.15,
+            radar_integration_s=600.0,
+        ),
+    ]
+
+
+# (attribute, class name) for every quivr table hanging off PlanResult.
+_PLAN_SUBTABLES: list[tuple[str, str]] = [
+    ("metrics", "PlanMetrics"),
+    ("candidates", "PlanCandidates"),
+    ("ephemeris", "PlanEphemeris"),
+]
+
+
+def test_plan_subtables_coverage_is_complete() -> None:
+    """Forcing function: every quivr table declared on ``PlanResult`` must
+    be in :data:`_PLAN_SUBTABLES`, so the silent-drop walk can't miss one.
+
+    Static (reads ``PlanResult.__annotations__`` — no engine call). The
+    failure mode it guards is a new output table landing upstream without
+    anyone extending the walk, leaving it silently unchecked.
+    """
+    import empyrean.planning.result as _planmod
+
+    def class_name(t: object) -> str:
+        # `from __future__ import annotations` makes these strings.
+        return t if isinstance(t, str) else getattr(t, "__name__", str(t))
+
+    # The two labels (orbit_id, active_width) are scalars, not tables.
+    scalars = {"orbit_id", "active_width"}
+    declared = {
+        name: class_name(t)
+        for name, t in _planmod.PlanResult.__annotations__.items()
+        if name not in scalars
+    }
+    walked = dict(_PLAN_SUBTABLES)
+
+    missing = set(declared) - set(walked)
+    extra = set(walked) - set(declared)
+    renamed = [
+        (a, walked[a], declared[a]) for a in set(walked) & set(declared) if walked[a] != declared[a]
+    ]
+
+    problems = []
+    if missing:
+        problems.append(
+            f"PlanResult table(s) NOT walked by test_no_silent_drops: {sorted(missing)} "
+            "— add them to _PLAN_SUBTABLES so they're checked for silent drops."
+        )
+    if extra:
+        problems.append(
+            f"_PLAN_SUBTABLES lists table(s) not on PlanResult: {sorted(extra)} "
+            "— remove the stale entries (renamed/removed upstream)."
+        )
+    if renamed:
+        problems.append(f"_PLAN_SUBTABLES class-name mismatch vs PlanResult: {renamed}")
+    assert not problems, "\n".join(problems)
+
+
+def test_plan_metrics_no_silent_drops() -> None:
+    plan = evaluate_plan(_plan_orbit_barycentric(), _plan_candidates())
+
+    assert len(plan.metrics) == 2, (
+        f"metrics brackets the campaign with a prior and a posterior row, got {len(plan.metrics)}"
+    )
+    bad_null, bad_not_null = _check_no_silent_drops(plan.metrics, "PlanMetrics")
+    assert not (bad_null or bad_not_null), _format_failures("PlanMetrics", bad_null, bad_not_null)
+
+
+def test_plan_candidates_no_silent_drops() -> None:
+    plan = evaluate_plan(_plan_orbit_barycentric(), _plan_candidates())
+
+    # `_check_no_silent_drops` skips zero-row columns, so without this the
+    # whole walk passes vacuously on an empty table — and PlanCandidates
+    # is the table the surface exists to produce.
+    assert len(plan.candidates) == len(_plan_candidates()), (
+        f"expected one row per submitted candidate, got {len(plan.candidates)}"
+    )
+    bad_null, bad_not_null = _check_no_silent_drops(plan.candidates, "PlanCandidates")
+    assert not (bad_null or bad_not_null), _format_failures(
+        "PlanCandidates", bad_null, bad_not_null
+    )
+
+
+def test_plan_ephemeris_no_silent_drops() -> None:
+    plan = evaluate_plan(_plan_orbit_barycentric(), _plan_candidates())
+
+    assert len(plan.ephemeris) > 0, "optical candidates must produce an ephemeris"
+    bad_null, bad_not_null = _check_no_silent_drops(plan.ephemeris, "PlanEphemeris")
+    assert not (bad_null or bad_not_null), _format_failures("PlanEphemeris", bad_null, bad_not_null)
+
+
+def test_plan_radar_provenance_is_carried_not_summarized() -> None:
+    """The link-budget notes are the wiring guard for the one output the
+    C ABI ships as a ragged array of owned strings: a drop there would
+    leave the derived-SNR row claiming an assumption-free budget.
+    """
+    plan = evaluate_plan(_plan_orbit_barycentric(), _plan_candidates())
+
+    provenance = plan.candidates.radar_provenance.to_pylist()
+    non_empty = [notes for notes in provenance if notes]
+    assert len(non_empty) == 1, (
+        f"exactly one candidate derives its SNR from the link budget, so "
+        f"exactly one may carry notes; got {provenance}"
+    )
+    assert all(isinstance(n, str) and n.strip() for n in non_empty[0]), non_empty[0]

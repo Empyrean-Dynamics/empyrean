@@ -72,6 +72,7 @@
 //! | Stateful, mask-and-refit OD            | [`Session`]                                      |
 //! | Impact probability                     | [`Context::compute_impact_probabilities`]        |
 //! | B-plane geometry                       | [`Context::compute_b_planes`]                    |
+//! | Rank candidate follow-up observations  | [`Context::evaluate_plan`]                       |
 //! | Convert between coordinate types       | [`Context::transform_coordinates`] (batch) / [`Context::transform_coordinates_single`] |
 //! | Body / observer states                 | [`Context::get_states`] / [`Context::get_observers`] |
 //! | Pull an orbit from JPL SBDB            | [`query_sbdb`]                                   |
@@ -111,6 +112,7 @@ mod math;
 mod observers;
 mod od;
 mod orbit;
+mod planning;
 mod propagate;
 mod query;
 mod session;
@@ -160,6 +162,11 @@ pub use od::{
     TrustGateEvent, WeightingConfig, WeightingLayer, WeightingPreset,
 };
 pub use orbit::{Orbit, PhaseFunction};
+pub use planning::{
+    CandidateKind, CovarianceMetrics, ObservatoryConfig, PlanCandidate, PlanEphemerisPoint,
+    PlanResult, PlannedObservation, PlannedObservationKind, PlanningConfig, RadarMode,
+    RadarPlanSpec, RadarStation, TargetRadarProperties,
+};
 pub use propagate::{
     AdvancedIntegratorConfig, CovarianceKind, CovarianceQuality, DiagnosticsConfig,
     EphemerisOverlapPolicy, Event, EventConfig, ForceModelTier, IntegratorChoice,

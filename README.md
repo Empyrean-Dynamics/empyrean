@@ -87,15 +87,12 @@ wherever you make it; what differs is reach.
 | Iterative `Session` refit — mask / refine / diff | ● | ● | ● | — |
 | Impact probability + B-plane geometry | ● | ● | ● | — |
 | Reusable built-system handle + `describe()` provenance | ● | ● | ● | — |
-| JPL SBDB / Horizons / MPC lookups | ● | ● | ● | ◐ |
+| Query APIs — SBDB / Horizons / MPC astrometry + radar | ● | ● | ● | — |
+| SBDB orbit input by id + Horizons state vectors | ● | ● | ● | ● |
 | Strict-offline context construction | ● | ● | ● | ● |
 | Ephemeris overlap policy — SB441-N16 self-perturbers | ● | ● | ● | — |
-| Observation planning — optical + radar candidates | — | — | ● | — |
+| Observation planning — optical + radar candidates | ● | ● | ● | — |
 | `empyrean show` output browser | — | — | — | ● |
-
-◐ The CLI resolves an SBDB orbit through `--object-id` and Horizons
-state vectors through `empyrean query horizons-vectors`; the MPC
-astrometry and radar lookups are library-side.
 
 ## Quickstart
 

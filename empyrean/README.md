@@ -715,6 +715,32 @@ for bp in &bps {
 # Ok::<(), empyrean::Error>(())
 ```
 
+## Observation planning
+
+Given an orbit that already carries a covariance, `Context::evaluate_plan`
+ranks candidate follow-up observations by how much each would tighten it.
+Optical candidates contribute sky-plane information; radar candidates
+contribute the line-of-sight range and range-rate that angles-only
+astrometry cannot supply, with a measurement σ set by the Cramér-Rao
+bound over the waveform bandwidth and the effective SNR — supplied, or
+derived from a link budget whose assumptions come back on the candidate.
+
+The orbit must be referenced to the Solar System barycenter; the frame is
+free. An origin shift is a pure translation, so the covariance and every
+metric derived from it are unchanged by the conversion.
+
+Candidates come back in ascending epoch order, and each one's marginal
+gain is measured against the covariance that already contains every
+earlier candidate — the gains are conditional on that sequence, not
+standalone scores. Every submitted candidate is folded, including one
+reported unobservable, so `posterior` prices the plan as submitted.
+`observable` is a real engine verdict on an optical row and always `true`
+on a radar row, where no feasibility test runs. The non-gravitational
+(σ(A2)) planning variant, the visibility survey, batch evaluation, and
+the encounter B-plane are not exposed here; an orbit carrying non-grav
+parameters is evaluated state-only, with the non-grav acceleration still
+acting in the dynamics.
+
 `PlanningConfig::observatories` takes `ObservatoryConfig` values — the MPC
 code, the assumed 1σ (RA·cosδ, Dec), a limiting apparent magnitude, a minimum
 solar elongation, plus the two visibility limits: `min_elevation_deg`
@@ -729,6 +755,7 @@ nautical at −12°, and above +90° disabling the gate — an `Option` because
 a defaulted zero would quietly plan a campaign in daylight). The struct's
 fields carry no defaults, so a config cannot be half-specified without saying
 so.
+
 `evaluate_plan` **does not consult** any of it: the field refuses a non-empty
 list, each optical candidate's σ comes from its own `PlannedObservation`, and
 the observability filters on that entry point are engine-set rather than
@@ -736,6 +763,46 @@ caller-configurable. The type is documented here because it is part of the
 shared planning configuration and becomes live the day a surface that reads it
 is exposed — not because this release reads it.
 
+```rust,no_run
+# use empyrean::{
+#     Context, Epoch, Frame, Origin, PlannedObservation, PlanningConfig, RadarMode,
+#     RadarPlanSpec, RadarStation, Representation,
+# };
+# let ctx = Context::from_data_dir(None)?;
+# let mut orbit = empyrean::query_sbdb(&["Apophis"], None)?.orbits[0].clone();
+orbit.state = ctx.transform_coordinates_single(
+    &orbit.state,
+    Representation::Cartesian,
+    Frame::EclipticJ2000,
+    Origin::SSB,
+)?;
+let t0 = orbit.state.epoch.mjd_tdb()?;
+
+let planned = vec![
+    PlannedObservation::optical("F51", [0.2, 0.2], Epoch::from_mjd_tdb(t0 + 30.0)),
+    PlannedObservation::radar(
+        RadarPlanSpec::given(
+            RadarStation::GoldstoneDSS14,
+            RadarStation::GoldstoneDSS14,
+            RadarMode::Both,
+            1.0e5,
+            0.1,
+            50.0,
+        ),
+        Epoch::from_mjd_tdb(t0 + 45.0),
+    ),
+];
+
+let plan = ctx.evaluate_plan(&orbit, Some("apophis"), &planned, &PlanningConfig::default())?;
+println!(
+    "position σ {:.1} km → {:.1} km",
+    plan.prior.position_sigma_km, plan.posterior.position_sigma_km,
+);
+for c in &plan.candidates {
+    println!("{}: {:.1}%", c.obs_code, 100.0 * c.marginal_position_improvement);
+}
+# Ok::<(), empyrean::Error>(())
+```
 
 ## Data directory and offline operation
 

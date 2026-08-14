@@ -1,8 +1,9 @@
 //! PyO3 bindings for the empyrean v0.7.0 safe wrapper.
 //!
 //! Surfaces the v0.7.0 public API: propagation, ephemeris, orbit
-//! determination, transforms. Thrust, planning/visibility, and the
-//! Full force-model tier are not exposed in this release.
+//! determination, transforms, and observation-plan evaluation. Thrust,
+//! the visibility survey, and the Full force-model tier are not exposed
+//! in this release.
 
 // PyO3 `#[pyfunction]` signatures mirror the Python API surface one-to-one, so
 // several take more than clippy's 7-argument threshold by design. The numpy
@@ -4904,6 +4905,420 @@ fn _refine_single<'py>(
 }
 
 // ══════════════════════════════════════════════════════════
+//  PlanningConfig dict ↔ Rust struct
+// ══════════════════════════════════════════════════════════
+
+/// Build an [`empyrean::PlanningConfig`] from a Python-side dict.
+///
+/// Keys mirror the dataclass one-for-one: `force_model` (lowercase wire
+/// string), `epsilon`, `num_threads` (`-1` = every available core, the C
+/// ABI's convention), and `observatories` (a list of per-site dicts).
+/// Missing keys keep the wrapper default.
+fn build_planning_config_from_dict(d: &Bound<'_, PyDict>) -> PyResult<empyrean::PlanningConfig> {
+    let mut cfg = empyrean::PlanningConfig::default();
+
+    if let Some(v) = d.get_item("force_model")? {
+        let s: String = v.extract()?;
+        cfg.force_model = match s.to_ascii_lowercase().as_str() {
+            "approximate" => empyrean::ForceModelTier::Approximate,
+            "basic" => empyrean::ForceModelTier::Basic,
+            "standard" => empyrean::ForceModelTier::Standard,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown force_model: {other}"
+                )));
+            }
+        };
+    }
+    if let Some(v) = d.get_item("epsilon")? {
+        cfg.epsilon = v.extract()?;
+    }
+    if let Some(v) = d.get_item("num_threads")? {
+        let n: i32 = v.extract()?;
+        cfg.num_threads = if n < 0 { None } else { Some(n as usize) };
+    }
+    if let Some(v) = d.get_item("observatories")? {
+        let entries: Vec<Bound<'_, PyDict>> = v.extract()?;
+        let mut observatories = Vec::with_capacity(entries.len());
+        for (i, e) in entries.iter().enumerate() {
+            let obs_code: String = e
+                .get_item("obs_code")?
+                .ok_or_else(|| {
+                    PyValueError::new_err(format!("observatories[{i}] is missing obs_code"))
+                })?
+                .extract()?;
+            let get_f64 = |key: &str| -> PyResult<f64> {
+                e.get_item(key)?
+                    .ok_or_else(|| {
+                        PyValueError::new_err(format!("observatories[{i}] is missing {key}"))
+                    })?
+                    .extract()
+            };
+            observatories.push(empyrean::ObservatoryConfig {
+                obs_code,
+                sigma_arcsec: [get_f64("sigma_ra_arcsec")?, get_f64("sigma_dec_arcsec")?],
+                max_apparent_mag: get_f64("max_apparent_mag")?,
+                min_elongation_deg: get_f64("min_elongation_deg")?,
+                // Optional: absent means the engine's own default (the
+                // geometric horizon, and astronomical twilight). A
+                // defaulted 0.0 for the sun altitude would silently plan
+                // in daylight, so it is an Option rather than a bare f64.
+                min_elevation_deg: e
+                    .get_item("min_elevation_deg")?
+                    .map(|v| v.extract::<f64>())
+                    .transpose()?
+                    .unwrap_or(0.0),
+                max_sun_altitude_deg: e
+                    .get_item("max_sun_altitude_deg")?
+                    .map(|v| v.extract::<f64>())
+                    .transpose()?,
+            });
+        }
+        cfg.observatories = observatories;
+    }
+
+    Ok(cfg)
+}
+
+// ══════════════════════════════════════════════════════════
+//  PlannedObservation columns → Vec<PlannedObservation>
+// ══════════════════════════════════════════════════════════
+
+/// Assert that a planned-observation column is positionally aligned with
+/// the `kinds` discriminator column.
+///
+/// The columns are consumed by index, never by `zip`: a short column
+/// would silently truncate the plan and a long one would silently ignore
+/// the tail. A mismatch is a `ValueError` naming the column and both
+/// lengths.
+fn check_planned_column_len(name: &str, len: usize, n: usize) -> PyResult<()> {
+    if len != n {
+        return Err(PyValueError::new_err(format!(
+            "{name} must be positionally aligned with kinds: got {len} \
+             entries for {n} planned observations"
+        )));
+    }
+    Ok(())
+}
+
+/// Decode the parallel planned-observation columns into wrapper
+/// [`empyrean::PlannedObservation`]s.
+fn build_planned_observations(
+    d: &Bound<'_, PyDict>,
+) -> PyResult<Vec<empyrean::PlannedObservation>> {
+    fn req<'py>(d: &Bound<'py, PyDict>, key: &str) -> PyResult<Bound<'py, PyAny>> {
+        d.get_item(key)?
+            .ok_or_else(|| PyRuntimeError::new_err(format!("missing {key}")))
+    }
+    fn col_f64(d: &Bound<'_, PyDict>, key: &str, n: usize) -> PyResult<Vec<f64>> {
+        let v: Vec<f64> = req(d, key)?.extract()?;
+        check_planned_column_len(key, v.len(), n)?;
+        Ok(v)
+    }
+    fn col_u8(d: &Bound<'_, PyDict>, key: &str, n: usize) -> PyResult<Vec<u8>> {
+        let v: Vec<u8> = req(d, key)?.extract()?;
+        check_planned_column_len(key, v.len(), n)?;
+        Ok(v)
+    }
+
+    let kinds: Vec<u8> = req(d, "kinds")?.extract()?;
+    let n = kinds.len();
+
+    let epochs = col_f64(d, "epochs", n)?;
+    let optical_codes: Vec<String> = req(d, "optical_codes")?.extract()?;
+    check_planned_column_len("optical_codes", optical_codes.len(), n)?;
+    let optical_sigma_ra = col_f64(d, "optical_sigma_ra_arcsec", n)?;
+    let optical_sigma_dec = col_f64(d, "optical_sigma_dec_arcsec", n)?;
+    let tx = col_u8(d, "radar_transmit_stations", n)?;
+    let rx = col_u8(d, "radar_receive_stations", n)?;
+    let modes = col_u8(d, "radar_modes", n)?;
+    let bandwidth = col_f64(d, "radar_bandwidth_hz", n)?;
+    let freq_resolution = col_f64(d, "radar_freq_resolution_hz", n)?;
+    let snr = col_f64(d, "radar_snr", n)?;
+    let h_mag = col_f64(d, "radar_target_h_mag", n)?;
+    let visual_albedo = col_f64(d, "radar_target_visual_albedo", n)?;
+    let radar_albedo = col_f64(d, "radar_target_radar_albedo", n)?;
+    let diameter_km = col_f64(d, "radar_target_diameter_km", n)?;
+    let spin_period_hours = col_f64(d, "radar_target_spin_period_hours", n)?;
+    let integration_s = col_f64(d, "radar_integration_s", n)?;
+
+    fn station_from_int(code: u8, role: &str, i: usize) -> PyResult<empyrean::RadarStation> {
+        match code {
+            0 => Ok(empyrean::RadarStation::GoldstoneDSS14),
+            1 => Ok(empyrean::RadarStation::GreenBank),
+            2 => Ok(empyrean::RadarStation::Arecibo),
+            other => Err(PyValueError::new_err(format!(
+                "planned observation {i}: unknown radar {role} station {other} \
+                 (0=Goldstone DSS-14, 1=Green Bank, 2=Arecibo)"
+            ))),
+        }
+    }
+
+    let mut planned = Vec::with_capacity(n);
+    for i in 0..n {
+        let epoch = empyrean::Epoch::from_mjd_tdb(epochs[i]);
+        match kinds[i] {
+            0 => planned.push(empyrean::PlannedObservation::optical(
+                optical_codes[i].as_str(),
+                [optical_sigma_ra[i], optical_sigma_dec[i]],
+                epoch,
+            )),
+            1 => {
+                let mode = match modes[i] {
+                    0 => empyrean::RadarMode::Delay,
+                    1 => empyrean::RadarMode::Doppler,
+                    2 => empyrean::RadarMode::Both,
+                    other => {
+                        return Err(PyValueError::new_err(format!(
+                            "planned observation {i}: unknown radar mode {other} \
+                             (0=delay, 1=doppler, 2=both)"
+                        )));
+                    }
+                };
+                let transmit = station_from_int(tx[i], "transmit", i)?;
+                let receive = station_from_int(rx[i], "receive", i)?;
+                // NaN SNR is the "derive it from the link budget"
+                // discriminant, not a missing value.
+                let spec = if snr[i].is_nan() {
+                    empyrean::RadarPlanSpec::link_budget(
+                        transmit,
+                        receive,
+                        empyrean::TargetRadarProperties {
+                            h_mag: nan_to_opt(h_mag[i]),
+                            visual_albedo: nan_to_opt(visual_albedo[i]),
+                            radar_albedo: nan_to_opt(radar_albedo[i]),
+                            diameter_km: nan_to_opt(diameter_km[i]),
+                            spin_period_hours: nan_to_opt(spin_period_hours[i]),
+                        },
+                        integration_s[i],
+                        mode,
+                        bandwidth[i],
+                        freq_resolution[i],
+                    )
+                } else {
+                    empyrean::RadarPlanSpec::given(
+                        transmit,
+                        receive,
+                        mode,
+                        bandwidth[i],
+                        freq_resolution[i],
+                        snr[i],
+                    )
+                };
+                planned.push(empyrean::PlannedObservation::radar(spec, epoch));
+            }
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "planned observation {i}: unknown kind {other} (0=optical, 1=radar)"
+                )));
+            }
+        }
+    }
+    Ok(planned)
+}
+
+/// NaN sentinel → `Option`, the inverse of [`nan_to_value`].
+fn nan_to_opt(v: f64) -> Option<f64> {
+    if v.is_nan() { None } else { Some(v) }
+}
+
+// ══════════════════════════════════════════════════════════
+//  _evaluate_plan
+// ══════════════════════════════════════════════════════════
+
+/// Write one [`empyrean::CovarianceMetrics`] into the output dict as five
+/// scalar entries under a shared prefix.
+fn add_covariance_metrics_to_dict(
+    dict: &Bound<'_, PyDict>,
+    metrics: &empyrean::CovarianceMetrics,
+    prefix: &str,
+) -> PyResult<()> {
+    dict.set_item(
+        format!("{prefix}position_sigma_km"),
+        metrics.position_sigma_km,
+    )?;
+    dict.set_item(
+        format!("{prefix}velocity_sigma_m_s"),
+        metrics.velocity_sigma_m_s,
+    )?;
+    dict.set_item(format!("{prefix}semi_major_km"), metrics.semi_major_km)?;
+    dict.set_item(format!("{prefix}semi_minor_km"), metrics.semi_minor_km)?;
+    dict.set_item(format!("{prefix}log_det"), metrics.log_det)?;
+    Ok(())
+}
+
+#[pyfunction]
+#[pyo3(signature = (orbit_dict, planned_dict, config_dict, orbit_id = None))]
+fn _evaluate_plan<'py>(
+    py: Python<'py>,
+    orbit_dict: &Bound<'py, PyDict>,
+    planned_dict: &Bound<'py, PyDict>,
+    config_dict: &Bound<'py, PyDict>,
+    orbit_id: Option<&str>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let ctx = get_context()?;
+    let orbit = build_orbit_from_dict(orbit_dict)?;
+    let planned = build_planned_observations(planned_dict)?;
+    let cfg = build_planning_config_from_dict(config_dict)?;
+
+    let plan = py
+        .detach(|| ctx.evaluate_plan(&orbit, orbit_id, &planned, &cfg))
+        .map_err(to_pyerr)?;
+
+    let n = plan.candidates.len();
+    let mut index = Array1::<u64>::zeros(n);
+    let mut kind = Array1::<u8>::zeros(n);
+    let mut observable = vec![false; n];
+    let mut obs_code: Vec<String> = Vec::with_capacity(n);
+    let mut along_track = Array1::<f64>::from_elem(n, f64::NAN);
+    let mut cross_track = Array1::<f64>::from_elem(n, f64::NAN);
+    let mut ra_sigma = Array1::<f64>::from_elem(n, f64::NAN);
+    let mut dec_sigma = Array1::<f64>::from_elem(n, f64::NAN);
+    let mut position_angle = Array1::<f64>::from_elem(n, f64::NAN);
+    let mut volume_reduction = Array1::<f64>::from_elem(n, f64::NAN);
+    let mut position_improvement = Array1::<f64>::from_elem(n, f64::NAN);
+    let mut post_along_track = Array1::<f64>::from_elem(n, f64::NAN);
+    let mut post_cross_track = Array1::<f64>::from_elem(n, f64::NAN);
+    let mut cum_position_sigma = Array1::<f64>::from_elem(n, f64::NAN);
+    let mut cum_velocity_sigma = Array1::<f64>::from_elem(n, f64::NAN);
+    let mut cum_semi_major = Array1::<f64>::from_elem(n, f64::NAN);
+    let mut cum_semi_minor = Array1::<f64>::from_elem(n, f64::NAN);
+    let mut cum_log_det = Array1::<f64>::from_elem(n, f64::NAN);
+    let mut active_width = Array1::<u64>::zeros(n);
+    let mut radar_snr = Array1::<f64>::from_elem(n, f64::NAN);
+    let mut radar_range_km = Array1::<f64>::from_elem(n, f64::NAN);
+    // -1 is the C ABI's optical sentinel for the radar mode tag.
+    let mut radar_mode = Array1::<i32>::from_elem(n, -1);
+    let mut radar_provenance: Vec<Vec<String>> = Vec::with_capacity(n);
+
+    for (i, c) in plan.candidates.iter().enumerate() {
+        index[i] = c.index as u64;
+        obs_code.push(c.obs_code.clone());
+        observable[i] = c.observable;
+        along_track[i] = nan_to_value(c.along_track_sigma_arcsec);
+        cross_track[i] = nan_to_value(c.cross_track_sigma_arcsec);
+        ra_sigma[i] = nan_to_value(c.ra_sigma_arcsec);
+        dec_sigma[i] = nan_to_value(c.dec_sigma_arcsec);
+        position_angle[i] = nan_to_value(c.position_angle_deg);
+        volume_reduction[i] = c.marginal_volume_reduction;
+        position_improvement[i] = c.marginal_position_improvement;
+        post_along_track[i] = nan_to_value(c.post_along_track_sigma_arcsec);
+        post_cross_track[i] = nan_to_value(c.post_cross_track_sigma_arcsec);
+        cum_position_sigma[i] = c.cumulative.position_sigma_km;
+        cum_velocity_sigma[i] = c.cumulative.velocity_sigma_m_s;
+        cum_semi_major[i] = c.cumulative.semi_major_km;
+        cum_semi_minor[i] = c.cumulative.semi_minor_km;
+        cum_log_det[i] = c.cumulative.log_det;
+        active_width[i] = c.active_width as u64;
+        match &c.kind {
+            empyrean::CandidateKind::Optical => {
+                kind[i] = 0;
+                radar_provenance.push(Vec::new());
+            }
+            empyrean::CandidateKind::Radar {
+                mode,
+                snr,
+                range_km,
+                provenance,
+            } => {
+                kind[i] = 1;
+                radar_snr[i] = *snr;
+                radar_range_km[i] = *range_km;
+                radar_mode[i] = match mode {
+                    empyrean::RadarMode::Delay => 0,
+                    empyrean::RadarMode::Doppler => 1,
+                    empyrean::RadarMode::Both => 2,
+                };
+                radar_provenance.push(provenance.clone());
+            }
+        }
+    }
+
+    let n_eph = plan.ephemeris.len();
+    let mut eph_epoch = Array1::<f64>::from_elem(n_eph, f64::NAN);
+    let mut eph_ra = Array1::<f64>::from_elem(n_eph, f64::NAN);
+    let mut eph_dec = Array1::<f64>::from_elem(n_eph, f64::NAN);
+    for (i, p) in plan.ephemeris.iter().enumerate() {
+        eph_epoch[i] = p.epoch.mjd_tdb().map_err(to_pyerr)?;
+        eph_ra[i] = p.ra_deg;
+        eph_dec[i] = p.dec_deg;
+    }
+
+    let dict = PyDict::new(py);
+    dict.set_item("orbit_id", plan.orbit_id)?;
+    dict.set_item("active_width", plan.active_width)?;
+    add_covariance_metrics_to_dict(&dict, &plan.prior, "prior_")?;
+    add_covariance_metrics_to_dict(&dict, &plan.posterior, "posterior_")?;
+
+    dict.set_item("candidate_index", index.into_pyarray(py))?;
+    dict.set_item("candidate_obs_code", obs_code)?;
+    dict.set_item("candidate_kind", kind.into_pyarray(py))?;
+    dict.set_item("candidate_observable", observable)?;
+    dict.set_item(
+        "candidate_along_track_sigma_arcsec",
+        along_track.into_pyarray(py),
+    )?;
+    dict.set_item(
+        "candidate_cross_track_sigma_arcsec",
+        cross_track.into_pyarray(py),
+    )?;
+    dict.set_item("candidate_ra_sigma_arcsec", ra_sigma.into_pyarray(py))?;
+    dict.set_item("candidate_dec_sigma_arcsec", dec_sigma.into_pyarray(py))?;
+    dict.set_item(
+        "candidate_position_angle_deg",
+        position_angle.into_pyarray(py),
+    )?;
+    dict.set_item(
+        "candidate_marginal_volume_reduction",
+        volume_reduction.into_pyarray(py),
+    )?;
+    dict.set_item(
+        "candidate_marginal_position_improvement",
+        position_improvement.into_pyarray(py),
+    )?;
+    dict.set_item(
+        "candidate_post_along_track_sigma_arcsec",
+        post_along_track.into_pyarray(py),
+    )?;
+    dict.set_item(
+        "candidate_post_cross_track_sigma_arcsec",
+        post_cross_track.into_pyarray(py),
+    )?;
+    dict.set_item(
+        "candidate_cumulative_position_sigma_km",
+        cum_position_sigma.into_pyarray(py),
+    )?;
+    dict.set_item(
+        "candidate_cumulative_velocity_sigma_m_s",
+        cum_velocity_sigma.into_pyarray(py),
+    )?;
+    dict.set_item(
+        "candidate_cumulative_semi_major_km",
+        cum_semi_major.into_pyarray(py),
+    )?;
+    dict.set_item(
+        "candidate_cumulative_semi_minor_km",
+        cum_semi_minor.into_pyarray(py),
+    )?;
+    dict.set_item("candidate_cumulative_log_det", cum_log_det.into_pyarray(py))?;
+    dict.set_item("candidate_active_width", active_width.into_pyarray(py))?;
+    dict.set_item("candidate_radar_snr", radar_snr.into_pyarray(py))?;
+    dict.set_item("candidate_radar_range_km", radar_range_km.into_pyarray(py))?;
+    dict.set_item("candidate_radar_mode", radar_mode.into_pyarray(py))?;
+    // Ragged per-candidate notes ship as a native list-of-lists: joining
+    // them on a separator would silently mangle any future note that
+    // contains it, and a code mapping would drop notes the engine adds
+    // later.
+    dict.set_item("candidate_radar_provenance", radar_provenance)?;
+
+    dict.set_item("ephemeris_epoch_mjd_tdb", eph_epoch.into_pyarray(py))?;
+    dict.set_item("ephemeris_ra_deg", eph_ra.into_pyarray(py))?;
+    dict.set_item("ephemeris_dec_deg", eph_dec.into_pyarray(py))?;
+
+    Ok(dict)
+}
+
+// ══════════════════════════════════════════════════════════
 //  ODConfig dict ↔ Rust struct
 // ══════════════════════════════════════════════════════════
 
@@ -7502,6 +7917,7 @@ fn _empyrean_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_determine, m)?)?;
     m.add_function(wrap_pyfunction!(_evaluate_single, m)?)?;
     m.add_function(wrap_pyfunction!(_refine_single, m)?)?;
+    m.add_function(wrap_pyfunction!(_evaluate_plan, m)?)?;
     m.add_function(wrap_pyfunction!(_convert_epochs, m)?)?;
     m.add_function(wrap_pyfunction!(_iso_to_mjd, m)?)?;
     m.add_function(wrap_pyfunction!(_mjd_to_iso, m)?)?;

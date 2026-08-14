@@ -633,6 +633,132 @@ distance, 1σ miss-distance uncertainty, and skewness, the
 closest-approach distance gradient and 6×6 Hessian with respect to the
 initial state, and the adaptive Gaussian-mixture component count.
 
+## Observation planning
+
+Given an orbit that already carries a covariance, `evaluate_plan` ranks
+candidate follow-up observations by how much each one would tighten it —
+before you spend the telescope time:
+
+```python
+import empyrean
+from empyrean import (
+    CartesianCoordinates,
+    PlannedObservation,
+    transform_coordinates,
+)
+
+# The planner consumes a Cartesian, barycentric covariance and converts
+# neither, so both are required. One call does both; the origin half is a
+# pure translation, so the covariance and its metrics come across unchanged.
+coords = transform_coordinates(fit.orbit.coordinates, CartesianCoordinates, origin="SSB")
+orbit = fit.orbit.set_column("coordinates", coords)
+t0 = float(coords.epoch.to_numpy()[0])
+
+plan = empyrean.evaluate_plan(
+    orbit,
+    [
+        PlannedObservation.optical(t0 + 30.0, "F51", (0.2, 0.2)),
+        PlannedObservation.optical(t0 + 31.0, "568", (0.3, 0.3)),
+        PlannedObservation.radar(
+            t0 + 45.0,
+            radar_bandwidth_hz=1.0e5,
+            radar_freq_resolution_hz=0.1,
+            radar_snr=50.0,
+        ),
+    ],
+)
+
+plan.metrics.to_dataframe()                 # two rows: "prior", "posterior"
+plan.metrics.prior().position_sigma_km[0].as_py()      # before any candidate
+plan.metrics.posterior().position_sigma_km[0].as_py()  # after all of them
+plan.candidates.best_by_information_gain(3).obs_code.to_pylist()
+```
+
+`plan.metrics` is a two-row `PlanMetrics` table with a `stage` column
+(`"prior"` / `"posterior"`) plus the five covariance summary metrics —
+RSS position and velocity σ, the 1σ position-ellipsoid semi-axes, and
+`log_det`. Keeping it a table means plans concatenate and join like any
+other output; `prior()` / `posterior()` are the one-row views.
+
+`plan.candidates` is a `PlanCandidates` quivr table — one row per
+candidate, carrying `marginal_volume_reduction` (the per-dimension
+generalized-variance ratio `(det Σ_post / det Σ_prior)^(1/6)` over the
+6×6 state covariance — a D-optimality score normalized to one dimension,
+so it reads as a linear scale factor; the 1σ ellipsoid volume ratio is
+that value cubed), the fractional position-σ improvement, and the running
+covariance metrics after that candidate and every one folded before it.
+`plan.ephemeris` is the predicted sky position at each optical
+candidate's epoch, with the epoch as an embedded `Epochs` sub-table; an
+optical row's `index` is its row there. A radar row has no epoch of its
+own — its `index` is its rank among the radar candidates, ordered by
+epoch.
+
+Rows come back in ascending epoch order, and each candidate's marginal
+gain is measured against the covariance that already contains every
+earlier one. The gains are therefore **conditional**: two identical
+observations do not score identically, and
+`best_by_information_gain` ranks contributions within one campaign rather
+than standalone candidate value. To compare candidates head to head,
+evaluate a one-candidate plan for each.
+
+`observable` means different things per kind. On an optical row it is a
+real engine verdict — today a solar-elongation test and nothing else,
+since the target's absolute magnitude does not reach the planner, so the
+limiting-magnitude filter cannot fire. On a radar row it is always
+`True`: no radar feasibility test runs here, not even the antenna
+elevation limit, so `True` means "not assessed". Either way the filters
+are engine-set and not caller-configurable, and `observable` **does not
+gate the fold** — an unobservable candidate still contributes to
+`posterior` and to every later `cumulative_*` row. What does gate it is
+whether the engine could compute the candidate's observation partials; a
+candidate for which it could not reports a `marginal_volume_reduction` of
+exactly 1 and leaves the covariance untouched. `observable_only()` filters
+rows, not information; to price the observable subset, drop those
+candidates from the plan and evaluate again.
+
+Not exposed in this release, recorded so the omissions are not mistaken
+for oversights: the non-gravitational planning variant that solves over
+state ⊕ (A1, A2, A3) and reports the σ(A2) tightening a radar campaign
+buys, the visibility survey, batch evaluation across many orbits, and the
+encounter B-plane. An orbit carrying non-gravitational parameters is
+accepted and evaluated state-only — the acceleration still acts in the
+dynamics, but the solve-for set stays 6×6 and no σ(A2) is reported.
+
+Optical and radar candidates fill different blocks and the cross-block is
+null, never zero: sky-plane geometry (`along_track_sigma_arcsec`,
+`position_angle_deg`, …) is populated only on optical rows, and
+`radar_mode` / `radar_snr` / `radar_range_km` only on radar rows. Radar
+adds the line-of-sight range and range-rate that angles-only astrometry
+cannot supply; its measurement σ is the Cramér-Rao bound set by the
+waveform bandwidth and the effective SNR.
+
+Leave `radar_snr` at `None` and the SNR is derived from a link budget over
+the target's physical properties instead. That path never substitutes a
+value it was not given — a missing property it needs is a loud refusal,
+and anything it *derived or adjusted* comes back on `radar_provenance`.
+Supplying an SNR selects the other request shape, so the link-budget
+inputs are refused alongside it rather than dropped:
+
+```python
+plan = empyrean.evaluate_plan(
+    orbit,
+    [
+        PlannedObservation.radar(
+            t0 + 45.0,
+            radar_bandwidth_hz=1.0e5,
+            radar_freq_resolution_hz=0.1,
+            radar_target_h_mag=19.7,
+            radar_target_visual_albedo=0.23,
+            radar_target_radar_albedo=0.15,
+            radar_integration_s=600.0,
+        )
+    ],
+)
+plan.candidates.radar_provenance.to_pylist()
+# [['diameter derived from H + p_V',
+#   'spin period unknown — coherent integration uncapped']]
+```
+
 ## Reading and writing files
 
 `empyrean.io` writes orbits, ephemerides, events, and residuals to

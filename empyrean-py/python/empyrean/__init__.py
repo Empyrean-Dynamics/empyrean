@@ -111,6 +111,21 @@ from empyrean.orbits.thrust import (
     VelocityTangent,
 )
 from empyrean.orbits.wide_cross import WideCross
+from empyrean.planning.plan import evaluate_plan
+from empyrean.planning.result import (
+    STAGE_POSTERIOR,
+    STAGE_PRIOR,
+    ObservatoryConfig,
+    PlanCandidates,
+    PlanEphemeris,
+    PlanMetrics,
+    PlannedObservation,
+    PlannedObservationKind,
+    PlanningConfig,
+    PlanResult,
+    RadarMode,
+    RadarStation,
+)
 from empyrean.propagation.config import (
     AdvancedIntegratorConfig,
     Auto,

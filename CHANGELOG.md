@@ -21,6 +21,15 @@ enumerated under the `EMPYREAN_ABI_VERSION` entry below.
 
 ### Added
 
+- **`empyrean show` — a streaming pager over output artifacts.** Point it
+  at a results directory to list the artifacts and pick one, or at a file
+  directly; page like `more`, slide a horizontal column window across wide
+  tables (a covariance block alone is 45 columns), filter rows, and pipe
+  it — non-interactive output is a plain aligned stream that composes
+  with `grep` and `head`. Streams parquet by record batch, CSV and JSON
+  by row: constant memory at any file size. `--limit`, `--columns`,
+  `--no-header`, `--full-precision`.
+
 - **Strict-offline context construction.** A context can be built with
   the network switched off: it resolves the tier's kernel set from the
   data directory alone and fails, **naming every absent file**, if any is
@@ -110,6 +119,12 @@ enumerated under the `EMPYREAN_ABI_VERSION` entry below.
   collapsed onto a shared one — the two have different remedies.
 
 ### Changed
+
+- **A tuned `Auto` uncertainty spec is accepted on the impact path.** The
+  same dataclass `propagate` takes now lowers through
+  `compute_impact_probabilities` / `compute_b_planes` with its κ
+  thresholds honored, instead of raising `unsupported method spec`. The
+  remaining unsupported-spec error names what the path accepts.
 
 - **BREAKING — orbit determination is batch-first at every layer.**
   `determine` groups its observations by ADES object identifier and fits
@@ -280,6 +295,16 @@ enumerated under the `EMPYREAN_ABI_VERSION` entry below.
   same places, `init`'s download included.
 
 ### Fixed
+
+- **A seeded fit delivers under the seed's identity.** Supplying
+  `initial_orbits={"my-name": orbit}` labels the fitted orbit
+  `"my-name"` again, as documented — the batch rework had returned the
+  ADES designation instead. Batch indexing is unchanged; only the fitted
+  orbit's own identity is relabelled.
+- **`read_ades` resolves file paths on the Rust wrapper.** The
+  documented path-or-content detection handed the path itself to the
+  content parser, so `empyrean determine <file>` failed parsing its own
+  argument as MPC80.
 
 - **`compute_stm` reaches the engine on the ephemeris path.** The C-ABI
   ephemeris-config converter hand-rolled its narrow config instead of

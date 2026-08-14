@@ -97,13 +97,17 @@ project adheres to [Semantic Versioning](https://semver.org).
   daylight — the switch resolves it to the engine's astronomical-twilight
   default).
 
-  **No entry point exported by this ABI reads them yet.** The engine
-  applies both in its visibility computation, which has no C entry point;
-  `empyrean_evaluate_plan`, the one exported function that consumes this
-  struct, does not call it. The fields ride the struct now so that
-  exposing visibility later needs no further ABI break — stated plainly
-  because a config field that looks live and is inert is worse than an
-  absent one.
+  **No entry point exported by this ABI applies them.** Both values are
+  marshaled across in full and reach the engine's own observatory config
+  — but the gates that read them belong to the engine's visibility
+  survey, which has no C entry point. `empyrean_evaluate_plan`, the one
+  exported function that consumes this struct, consults the
+  site-invariant pair alone, so setting either limit changes no number it
+  returns and a candidate reported `observable` may still sit under that
+  site's horizon or in its daylight. The fields ride
+  the struct now so that exposing the survey later needs no further ABI
+  break — stated plainly because a config field that looks live and is
+  inert is worse than an absent one.
 
 - **`EMPYREAN_REJECTION_PER_OBSERVATION_SITE_REQUIRED` (15).** The
   roving-observer codes `247` / `270` and the occultation code `275`
@@ -131,8 +135,9 @@ project adheres to [Semantic Versioning](https://semver.org).
   pointers means the engine produced no cross terms at that row, never
   that they were zero.
 
-  These are the only two symbols this release's ABI adds; every other change in it
-  is a struct, a struct field, or a constant.
+  These are the only two symbols this release's ABI adds, taking the
+  exported surface from 92 to 94; every other change in it is a struct, a
+  struct field, or a constant.
 
 - **The joint reaches Python, in both directions.** Every orbit table
   gains a `wide_cross` sub-table and `NonGravParams` gains
@@ -181,7 +186,7 @@ project adheres to [Semantic Versioning](https://semver.org).
   release — a recorded subsetting decision, not an omission.
 
 - **A capability-parity gate.** `empyrean-sys` now carries a committed
-  manifest of the C ABI's 92 exported functions and five tests over it: the
+  manifest of the C ABI's 94 exported functions and five tests over it: the
   manifest must match the **compiled engine's actual exported symbols**
   (`nm` on the shipped library — an anchor no generated file can fake) and
   the generated shim surface; every export must have a call-form consumer in
@@ -191,19 +196,37 @@ project adheres to [Semantic Versioning](https://semver.org).
   duplicate entries fail by line number; and the consumption scanner's own
   discrimination (calls count; comments, strings, imports, and test-gated
   code do not) is pinned by a fixture test. The gate exists because
-  `empyrean_evaluate_plan` shipped for three releases with no consumer in
-  any channel and nothing noticed. The allow-list opens with a single entry:
-  the load-time ABI handshake, consumed by `empyrean-sys` itself.
+  `empyrean_evaluate_plan` shipped in every release of this distribution —
+  the eight this changelog records, 0.7.0-rc.4 through 0.10.0-rc.0 — with no
+  consumer in any channel, and nothing noticed. The allow-list opens with a
+  single entry: the load-time ABI handshake, consumed by `empyrean-sys`
+  itself.
+
+  **The gate measures the Rust wrapper channel only.** Check 3 scans
+  `empyrean/src` for call-form consumers, and `not_yet_wrapped.txt` records
+  what that channel deliberately leaves unconsumed. Python and CLI
+  consumption are not measured by any test here — the CLI's decision not to
+  gain a `plan` command in this release is prose above, not a gated entry —
+  so a symbol wired in one channel and forgotten in another is still a
+  manual check. Widening the scanner to the other source roots is follow-up
+  work.
 
 ### Fixed
 
 - **The impact and B-plane paths dropped the caller's non-grav DT.**
-  Both marshaled the DT *prior variance* while hardcoding the DT *value*
-  absent, so a DT comet's \(g(r)\) was evaluated at zero delay on the
-  two entry points where an understated joint does the most damage.
-  Those paths also dropped the Marsden 3×3, as did the ephemeris path;
-  all three now route through the shared marshaling helper that the
-  propagation and OD paths already used.
+  Both entry points — `empyrean_compute_impact_probabilities` and
+  `empyrean_compute_b_planes` — share one orbit-marshaling routine, and
+  it carried the DT *prior variance* while hardcoding the DT *value*
+  absent. A DT comet's \(g(r)\) was therefore evaluated at zero delay on
+  the two entry points where an understated joint does the most damage.
+
+  That same routine also dropped the Marsden 3×3, as did the second
+  inline copy on the ephemeris side, which serves
+  `empyrean_generate_ephemeris` and
+  `empyrean_builtsystem_generate_ephemeris`. So: two inline copies, four
+  exported entry points, with the DT drop confined to the first copy and
+  the Marsden drop common to both. Both now route through the shared
+  marshaling helper that the propagation and OD paths already used.
 
   One behaviour change rides that routing and is called out rather than
   folded in: those three paths and the orbit-file writer now share the
@@ -241,36 +264,51 @@ project adheres to [Semantic Versioning](https://semver.org).
   full validation catalog (61/61 orbit-determination rows, 8958/8958
   propagation and ephemeris rows), so existing results do not move.
 
-- **Struct sizes and the one shrink.** Nine frozen structs change size:
-  `CoordinateState` by the border (360 → 512), `EmpyreanOrbit` by the
-  carrier arrays (648 → 832), `EmpyreanPropagatedState` by `orbit_cov`
-  (2392 → 2576), `EmpyreanNonGravParams` by the DT variance pair
-  (160 → 176), `EmpyreanObservatoryConfig` by the visibility fields
-  (40 → 64), `EmpyreanODResult` by the joint, dispositions, thrust
-  posteriors and warnings (7688 → 8128) — which also grows the
-  `EmpyreanODObjectResult` that embeds it (7720 → 8160) — and
-  `EmpyreanSolveFor` **shrinks** 8 → 6.
+- **Struct sizes and the two shrinks.** Nine frozen structs change size
+  — seven grow, two shrink. The seven: `CoordinateState` by the border
+  (360 → 512), `EmpyreanOrbit` by the carrier arrays (648 → 832),
+  `EmpyreanPropagatedState` by `orbit_cov` (2392 → 2576),
+  `EmpyreanNonGravParams` by the DT variance pair (160 → 176),
+  `EmpyreanObservatoryConfig` by the visibility fields (40 → 64), and
+  `EmpyreanODResult` by the joint, dispositions, thrust posteriors and
+  warnings (7688 → 8128) — which also grows the
+  `EmpyreanODObjectResult` that embeds it (7720 → 8160). The two:
+  `EmpyreanSolveFor` **shrinks** 8 → 6, and the `EmpyreanODConfig` that
+  embeds it shrinks 432 → 424 with it.
 
-  That last one is the exception to a rule every previous version of
-  this ABI could state without qualification. Replacing
-  `thrust_segments` (a `u32`) with `thrust_dispositions[3]` (three
-  `u8`s) also drops the struct's alignment from 4 to 1, so every field
-  after `solve_for_flags` inside `EmpyreanODConfig` shifts —
+  Those two are the exception to a rule every previous version of this
+  ABI could state without qualification. Replacing `thrust_segments` (a
+  `u32`) with `thrust_dispositions[3]` (three `u8`s) also drops
+  `EmpyreanSolveFor`'s alignment from 4 to 1, so every field after
+  `solve_for_flags` inside `EmpyreanODConfig` shifts —
   `allow_unbracketed_maneuvers` 392 → 390, `has_photometry` 393 → 391,
-  `photometry` 400 → 392 — and that config shrinks 432 → 424. **It is
-  the first struct on this ABI to get smaller.** A consumer with a
-  hand-mirrored `EmpyreanODConfig` must re-derive its whole layout
-  rather than appending to it: keeping the old prefix writes
-  `photometry` eight bytes past where the library reads it, corrupting
-  it and the two bytes before it with no diagnostic. Every other struct
-  above grows at the tail.
+  `photometry` 400 → 392 — which is what takes that config from 432 to
+  424. **They are the first structs on this ABI to get smaller.** A
+  consumer with a hand-mirrored `EmpyreanODConfig` must re-derive its
+  whole layout rather than appending to it: keeping the old prefix
+  writes `photometry` eight bytes past where the library reads it,
+  corrupting it and the two bytes before it with no diagnostic. The
+  other seven grow at the tail.
 
 - **The C ABI is now versioned by the distribution release.**
   `EMPYREAN_ABI_VERSION` encodes the distribution's own version as
-  `major * 10000 + minor * 100 + patch` — 0.10.0 reports `1000` — and
-  advances with every release whether or not any boundary type changed.
-  Values below 1000 are the retired independent counter, which reached 3
-  at 0.10.0-rc.0. This release's break is a single batched one; two
+  `major * 10000 + minor * 100 + patch` and advances with every release
+  whether or not any boundary type changed. The scheme **begins with
+  0.10.0**, which reports `1000`; every release before it — through
+  0.10.0-rc.0 — reported the retired independent counter instead, which
+  reached 3. Values below 1000 are therefore counter-era, not release
+  numbers, and no library has ever reported anything between the two.
+
+  The consequence for consumers is that the number no longer says
+  anything about layout: the only reading it supports is equality. A
+  difference means a different release — rebuild against that release's
+  header, or repoint at the matching engine — and a value that did not
+  move is no longer a promise that no struct did. The distribution's own
+  release string is not exported; a build is identified by the artifact
+  or tag it was installed from, while `empyrean_version_string()` reports
+  the engine crates' build provenance instead.
+
+  This release's break is a single batched one; two
   changes are semantic rather than additive and are called out here
   rather than left to be discovered:
 

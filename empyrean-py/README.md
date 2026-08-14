@@ -41,6 +41,15 @@ the
 [other distribution channels](https://github.com/Empyrean-Dynamics/empyrean#install)
 in the meantime.
 
+Each wheel bundles the `libempyrean` engine built for its own release,
+and the binding checks that pairing when the library opens: it reads the
+engine's ABI version and compares it against the one the wheel was built
+against, failing immediately — naming both numbers — if they differ. The
+version is per release, so an engine from a different release is rejected
+rather than used through a layout that may have moved. Nothing to
+configure; the bundled engine always matches. It matters only if you
+point the loader at an engine of your own.
+
 ## What it does
 
 - **Propagation** — N-body (Sun, planets, Moon, Pluto) with EIH general relativity, Sun J2 and Earth J2–J4 zonal harmonics, 16 asteroid perturbers, and the Marsden non-gravitational model — selectable across Approximate / Basic / Standard force-model tiers (Standard is the default). GR15 and DOP853 integrators. Optional finite-burn thrust arcs — constant-RTN, velocity-tangent, or inertial-fixed steering, with per-arc Δv targeting corrections — layer on as a continuous-thrust force input.

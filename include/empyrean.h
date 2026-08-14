@@ -567,8 +567,17 @@ typedef struct Session Session;
 /**
  * Integer handshake on the frozen-ABI shape contract, distinct from the
  * per-crate semver strings in `EmpyreanVersions` (which are provenance).
- * Consumers compiled against a given `EMPYREAN_SOLVE_WIDTH` check this at
- * load; any additive change to the frozen structs bumps it.
+ * A consumer checks it the moment it opens the library and requires
+ * **equality**, never an ordering or a range: the value names the
+ * distribution release that built the library (see *The version scheme*
+ * at the end of this comment), so any difference at all means a
+ * different release, and the remedy is to rebuild against that
+ * release's header or to repoint at the matching engine. A difference
+ * is therefore no longer evidence that a frozen struct moved, and an
+ * equal value is what licenses the layouts below — `dlsym` resolves on
+ * symbol name alone, and the names are stable across releases while the
+ * shapes behind them are not, so a mismatch allowed to proceed reads
+ * the caller's arguments through the wrong layout instead of failing.
  *
  * This release's ABI (0.10.0) is a single, batched break carrying the joint
  * solved-parameter covariance across the boundary in both directions,
@@ -607,7 +616,7 @@ typedef struct Session Session;
  * allocations per call, with no error and no wrong number to notice.
  * Opt-in ownership at a new entry point costs one extra symbol and
  * makes the acquisition explicit. `EmpyreanTaggedCovariance` is
- * therefore unchanged in v4.
+ * therefore unchanged in the 0.10.0 ABI.
  *
  * **New constants**, all nine of them:
  *
@@ -691,11 +700,13 @@ typedef struct Session Session;
  * - [`EmpyreanObservatoryConfig`](crate::planning::EmpyreanObservatoryConfig)
  *   grows `min_elevation_deg` plus `has_max_sun_altitude_deg` /
  *   `max_sun_altitude_deg`, matching the engine's own observatory
- *   config. **No entry point exported by this ABI reads them yet** —
- *   the engine applies them in its visibility computation, which has
- *   no C entry point, and `empyrean_evaluate_plan` (the one exported
- *   consumer of this struct) does not call it. They ride the struct so
- *   that exposing visibility later needs no further break;
+ *   config. Both are marshaled across in full, and **no entry point
+ *   exported by this ABI applies them**: the gates that read them
+ *   belong to the engine's visibility survey, which has no C entry
+ *   point, while `empyrean_evaluate_plan` — the one exported consumer
+ *   of this struct — consults the site-invariant filters alone. They
+ *   ride the struct so that exposing the survey later needs no further
+ *   break;
  * - the impact and B-plane paths marshal the caller's non-grav DT
  *   value and Marsden 3×3, both of which they silently dropped — the
  *   DT drop meant those two entry points evaluated a DT comet's
@@ -714,9 +725,9 @@ typedef struct Session Session;
  *   the carrier onto [`EmpyreanOrbitBatch`](crate::io::EmpyreanOrbitBatch)
  *   rather than reporting them absent.
  *
- * **Layout: appended everywhere but one, and that one SHRINKS a
- * struct.** Every earlier release of this ABI could say "fields are only
- * ever appended, never reordered or removed". This one cannot, and
+ * **Layout: appended everywhere but one, and that one SHRINKS two
+ * structs.** Every earlier release of this ABI could say "fields are
+ * only ever appended, never reordered or removed". This one cannot, and
  * the exception is stated here rather than left for a consumer to
  * discover by corruption: replacing `EmpyreanSolveFor::thrust_segments`
  * (a `u32`) with `thrust_dispositions[3]` (three `u8`s) takes that
@@ -724,8 +735,9 @@ typedef struct Session Session;
  * every field after `solve_for_flags` inside the
  * [`EmpyreanODConfig`] that embeds it —
  * `allow_unbracketed_maneuvers` 392→390, `has_photometry` 393→391,
- * `photometry` 400→392 — and shrinks that config 432→424. It is the
- * first struct on this ABI to get SMALLER.
+ * `photometry` 400→392 — and shrinks that config 432→424 in turn.
+ * `EmpyreanSolveFor` and `EmpyreanODConfig` are the first structs on
+ * this ABI to get SMALLER.
  *
  * A consumer with a hand-mirrored `EmpyreanODConfig` must therefore
  * re-derive its whole layout, not just append: keeping an existing
@@ -744,14 +756,22 @@ typedef struct Session Session;
  * the physics.
  *
  * **The version scheme.** The C ABI carries the distribution's own
- * version, encoded \(\text{major} \times 10000 + \text{minor}
- * \times 100 + \text{patch}\) — 0.10.0 is `1000`. It advances with
- * every distribution release whether or not any boundary type changed:
- * the ABI is versioned by the release that ships it, not by an
- * independent counter. Values below 1000 are the retired independent
- * counter, which reached 3 at 0.10.0-rc.0. Pre-releases of a version
- * share its number; the full release string, including any pre-release
- * suffix, is `empyrean_version_string()`.
+ * version, encoded \\(\text{major} \times 10000 + \text{minor} \times
+ * 100 + \text{patch}\\). It advances with every distribution release
+ * whether or not any boundary type changed: the ABI is versioned by the
+ * release that ships it, not by an independent counter.
+ *
+ * **The scheme begins with 0.10.0**, which reports `1000` — the
+ * smallest value it can produce. Every release before it, through
+ * 0.10.0-rc.0, reported the retired independent counter instead, which
+ * reached 3; that is why values below 1000 are counter-era and are not
+ * release numbers.
+ *
+ * The distribution's own release string is not exported. A consumer
+ * identifies the build it is running by the artifact or tag it
+ * installed; `empyrean_version_string()` reports something else — the
+ * build provenance of the closed-source engine crates behind this
+ * boundary, not this distribution's version.
  */
 #define EMPYREAN_ABI_VERSION 1000
 
@@ -4884,10 +4904,10 @@ struct EmpyreanODResult {
      * is **NaN-filled**, exactly as its posterior covariance is. Read
      * `dispositions.thrust_dispositions[i]` before the value.
      *
-     * The index space changed in v4, from solved order to declared
-     * order, so that this array, `thrust_correction_covariances` and
-     * `dispositions.thrust_dispositions` share one index. Under the old
-     * pairing a fit with a considered burn between two solved ones
+     * The index space changed in the 0.10.0 ABI, from solved order to
+     * declared order, so that this array, `thrust_correction_covariances`
+     * and `dispositions.thrust_dispositions` share one index. Under the
+     * old pairing a fit with a considered burn between two solved ones
      * returned a Δv attributed to the wrong burn's covariance.
      */
     double thrust_delta_m_per_s[EMPYREAN_MAX_THRUST_SEGMENTS][3];
@@ -5206,6 +5226,30 @@ struct EmpyreanPlannedObservation {
 
 /**
  * Per-observatory assumptions: astrometric σ + observability filters.
+ *
+ * # Which filters this ABI applies
+ *
+ * [`empyrean_evaluate_plan`] is the only exported function that reads
+ * this struct, and it consults **two** of the four filters below:
+ * `max_apparent_mag` and `min_elongation_deg`, the site-invariant pair.
+ * A candidate's `observable` flag is their conjunction and nothing
+ * else. In practice only the elongation test can fire, because the
+ * target's absolute magnitude does not reach the planner on this entry
+ * point, so the magnitude test passes vacuously.
+ *
+ * [`min_elevation_deg`](EmpyreanObservatoryConfig::min_elevation_deg)
+ * and
+ * [`max_sun_altitude_deg`](EmpyreanObservatoryConfig::max_sun_altitude_deg)
+ * are marshaled across this boundary in full — they reach the engine's
+ * own observatory config with the values set here — but the gates that
+ * read them belong to the engine's **visibility survey**, which this
+ * ABI does not export. Setting either therefore changes no number
+ * `empyrean_evaluate_plan` returns, on any release of this ABI so far.
+ * They ride the struct now so that exposing the survey later needs no
+ * further break, and it is said here rather than left to be discovered:
+ * a plan whose candidates are `observable` may still include epochs at
+ * which the target is under that site's horizon or the sky above it is
+ * bright.
  */
 struct EmpyreanObservatoryConfig {
     /**
@@ -5244,9 +5288,15 @@ struct EmpyreanObservatoryConfig {
      * also the engine's default. That is the least-opinionated
      * statement the geometry can make, *not* an observing
      * recommendation: airmass at \\(h = 0°\\) is \\(\approx 38\\), and
-     * real programs cut between \\(20°\\) and \\(30°\\). Set it to the
-     * site's own pointing or airmass limit — e.g. `30.0` for airmass
-     * \\(\le 2\\).
+     * real programs cut between \\(20°\\) and \\(30°\\). The site's own
+     * pointing or airmass limit is the value to carry here — e.g.
+     * `30.0` for airmass \\(\le 2\\).
+     *
+     * **No exported entry point applies it.** The value is marshaled
+     * into the engine's observatory config, but the elevation gate that
+     * reads it lives in the visibility survey this ABI does not export;
+     * [`empyrean_evaluate_plan`] consults the site-invariant pair
+     * alone. See the struct-level docs.
      */
     double min_elevation_deg;
     /**
@@ -5280,6 +5330,12 @@ struct EmpyreanObservatoryConfig {
      * Because refraction is ignored, `0.0` means the Sun's *centre* on
      * the geometric horizon, about \\(0.83°\\) later than visible
      * sunset. A value above \\(+90°\\) disables the darkness gate.
+     *
+     * **No exported entry point applies it**, on the same terms as
+     * [`min_elevation_deg`](Self::min_elevation_deg): the value reaches
+     * the engine's observatory config, and the darkness gate that reads
+     * it belongs to the unexported visibility survey. See the
+     * struct-level docs.
      */
     double max_sun_altitude_deg;
 };
@@ -5357,7 +5413,16 @@ struct EmpyreanPlanCandidate {
      */
     uint8_t kind;
     /**
-     * 1 if observable at this epoch (passes the filters / has positive SNR).
+     * 1 if this candidate passes the **site-invariant** filters at this
+     * epoch — solar elongation and apparent magnitude, and nothing else
+     * (radar candidates report 1 unconditionally, and the magnitude test
+     * passes vacuously here because the target's absolute magnitude does
+     * not reach the planner).
+     *
+     * Read it as "not ruled out from Earth", not "schedulable from this
+     * site": the target's elevation above the site's horizon and the
+     * Sun's altitude there are not tested here. See
+     * [`EmpyreanObservatoryConfig`].
      */
     uint8_t observable;
     /**
@@ -5377,7 +5442,14 @@ struct EmpyreanPlanCandidate {
      */
     double dec_sigma_arcsec;
     /**
-     * Position angle of the sky-plane uncertainty ellipse (degrees).
+     * Position angle of the predicted **sky motion** (degrees, east of
+     * north) — the axis the along/cross-track σ above are projected
+     * onto. Optical only.
+     *
+     * Kinematic, and not a function of the covariance: it is *not* the
+     * orientation of the sky-plane uncertainty ellipse. The range is
+     * \\((-180, 180]\\); add 360 **to negative values** for the
+     * conventional \\([0, 360)\\) convention.
      */
     double position_angle_deg;
     /**
@@ -5861,7 +5933,9 @@ EmpyreanContext *empyrean_context_from_data_dir_with(const char *data_dir,
  void empyrean_missing_data_files_free(struct EmpyreanMissingDataFiles *out);
 
 /**
- * Free an `EmpyreanContext` previously returned by `empyrean_context_new()`.
+ * Free an `EmpyreanContext` previously returned by
+ * `empyrean_context_from_data_dir`, `empyrean_context_from_data_dir_with`
+ * or `empyrean_context_new_minimal`.
  *
  * Passing null is a no-op.
  */

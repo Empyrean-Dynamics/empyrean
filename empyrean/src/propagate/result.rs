@@ -750,8 +750,7 @@ mod tests {
     use super::CovarianceKind;
 
     /// Every covariance kind round-trips through its C-ABI tag, and the
-    /// new sample-based kinds map to the tags the engine emits
-    /// (empyrean-2hza).
+    /// new sample-based kinds map to the tags the engine emits.
     #[test]
     fn covariance_kind_round_trips_c_tags() {
         for kind in [

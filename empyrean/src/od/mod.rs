@@ -489,7 +489,15 @@ fn ffi_od_result_orbit(result: &empyrean_sys::EmpyreanODResult) -> crate::error:
         let rep = result.covariance_representation;
         if rep != empyrean_sys::EMPYREAN_REPRESENTATION_CARTESIAN as i32 {
             return Err(Error::invalid_input(format!(
-                "this fit reports its covariance in representation {rep}, not Cartesian,                  while its state is Cartesian — the two cannot be assembled into one                  re-feedable orbit without the representation Jacobian, and the                  non-Cartesian covariance is additionally in radians rather than the                  degrees this crate's inputs use. Re-run the fit with a Cartesian                  output representation, or read `covariance` and                  `covariance_representation` off the result directly and transform                  them yourself."
+                "this fit reports its covariance in representation {rep}, not \
+                 Cartesian, while its state is Cartesian — the two cannot be \
+                 assembled into one re-feedable orbit without the \
+                 representation Jacobian, and the non-Cartesian covariance is \
+                 additionally in radians rather than the degrees this crate's \
+                 inputs use. Re-run the fit with a Cartesian output \
+                 representation, or read `covariance` and \
+                 `covariance_representation` off the result directly and \
+                 transform them yourself."
             )));
         }
         state = state.with_covariance(s.covariance);
@@ -517,8 +525,8 @@ fn ffi_od_result_orbit(result: &empyrean_sys::EmpyreanODResult) -> crate::error:
             orbit = orbit.with_nongrav_covariance(Some(ng.covariance));
         }
     }
-    // The DT posterior. It had no wire before ABI v4, so a solved-DT fit
-    // used to round-trip with its DT column closed.
+    // The DT posterior. It had no wire before the 0.10.0 ABI, so a solved-DT
+    // fit used to round-trip with its DT column closed.
     if result.has_non_grav != 0 && result.non_grav.has_dt_variance != 0 {
         orbit = orbit.with_non_grav_dt_variance(Some(result.non_grav.dt_variance));
     }

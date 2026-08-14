@@ -1,15 +1,26 @@
 //! Capability-parity gate: nothing reaches the C ABI without a consumer above
 //! it or a recorded decision to have none.
 //!
-//! `empyrean_evaluate_plan` and `empyrean_plan_result_free` shipped for three
-//! releases as dead planning surface — exported from the engine, declared in
-//! the public header, mirrored into these bindings, and reachable from no
-//! other channel: no safe Rust wrapper, no Python binding, no CLI subcommand.
-//! Nothing failed, because nothing anywhere compared the exported set against
-//! what the layers above it actually call. Dead ABI surface is worse than a
-//! missing feature: it is documented, header-visible and effectively frozen
-//! (no exported symbol has ever been removed), and every release spends review
-//! effort re-discovering that it goes nowhere.
+//! `empyrean_evaluate_plan` and `empyrean_plan_result_free` shipped in every
+//! release of this distribution as dead planning surface — exported from the
+//! engine, declared in the public header, mirrored into these bindings, and
+//! reachable from no other channel: no safe Rust wrapper, no Python binding,
+//! no CLI subcommand. Nothing failed, because nothing anywhere compared the
+//! exported set against what the layers above it actually call. Dead ABI
+//! surface is worse than a missing feature: it is documented, header-visible
+//! and effectively frozen (no exported symbol has ever been removed), and
+//! every release spends review effort re-discovering that it goes nowhere.
+//!
+//! # Scope: the Rust wrapper channel
+//!
+//! What this gate measures is consumption by the **safe Rust wrapper**, and
+//! only that. Check 3 scans one source root, `empyrean/src`, and
+//! `not_yet_wrapped.txt` records what that channel deliberately leaves
+//! unconsumed. Python (`empyrean-py/src`) and the CLI (`empyrean-cli/src`)
+//! are not scanned by any test here, so a symbol wired in the wrapper and
+//! forgotten in one of them stays green. Widening the scanner is a matter of
+//! running `consumed_symbols` over the other roots and giving the allow-list
+//! a channel column; until then, that pairing is a manual check.
 //!
 //! # What is authoritative here
 //!
@@ -115,9 +126,9 @@ fn sys_crate_dir() -> PathBuf {
 /// Hard-required, never skipped: the gate runs from the repo workspace, where
 /// `../empyrean/src` always exists, and a gate that quietly turns itself off
 /// when its input is missing is not a gate — it is exactly the silence that
-/// let the planning surface sit unwrapped for three releases. (`tests/` is not
-/// in the crate's `include` list, so there is no published-package context in
-/// which this path is legitimately absent.)
+/// let the planning surface sit unwrapped for every release so far. (`tests/`
+/// is not in the crate's `include` list, so there is no published-package
+/// context in which this path is legitimately absent.)
 fn wrapper_src_dir() -> PathBuf {
     let dir = sys_crate_dir().join("../empyrean/src");
     assert!(
@@ -545,7 +556,8 @@ fn every_exported_symbol_is_consumed_or_carries_a_recorded_decision() {
          for each one: wire a consumer in the safe wrapper (and mirror it into empyrean-py / \
          empyrean-cli under the API-parity rule), or record the decision by adding \
          `<name> | <reason>` to empyrean-sys/tests/not_yet_wrapped.txt. Shipping an export \
-         with neither is how the planning surface stayed dead for three releases."
+         with neither is how the planning surface stayed dead for every release \
+         so far."
     );
 }
 

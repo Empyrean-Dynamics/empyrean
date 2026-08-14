@@ -496,9 +496,25 @@ class ObservatoryConfig:
     configuration, and becomes live if a surface that reads it is
     exposed.
 
-    Mirrors ``empyrean::ObservatoryConfig``, whose fields carry no
-    defaults — none are invented here either, so a config cannot be
-    half-specified without saying so.
+    Two of the four filters below stay inert even then.
+    :attr:`min_elevation_deg` and :attr:`max_sun_altitude_deg` are
+    applied by the engine's **visibility survey**, which no channel of
+    this distribution exposes; plan evaluation gates each candidate on
+    apparent magnitude and solar elongation alone. So
+    :attr:`PlanCandidates.observable` means "not ruled out from Earth",
+    never "schedulable from this site".
+
+    Mirrors ``empyrean::ObservatoryConfig`` field for field. The four
+    astrometric and site-invariant fields carry no defaults on either
+    side, so a config cannot be half-specified without saying so.
+
+    The two visibility limits are optional here, and ``None`` on either
+    means "take the engine's own default" — a deliberate deferral, not a
+    number invented on this side. That is a spelling difference from
+    Rust, which states ``min_elevation_deg`` as a plain float (its
+    default, ``0.0``, being the geometric horizon a zero already means)
+    and only ``max_sun_altitude_deg`` as an ``Option``. Both spellings
+    reach the same engine values.
     """
 
     obs_code: str
@@ -509,20 +525,46 @@ class ObservatoryConfig:
     """Limiting apparent magnitude."""
     min_elongation_deg: float
     """Minimum solar elongation (degrees)."""
+    min_elevation_deg: float | None = None
+    """Minimum geometric elevation of the target above the site's local
+    horizon (degrees), ignoring atmospheric refraction.
+
+    ``None`` takes the engine's default of ``0.0``, the geometric horizon
+    — the least-opinionated statement the geometry can make, not an
+    observing recommendation: airmass there is about 38, and real
+    programs cut between 20° and 30°."""
+    max_sun_altitude_deg: float | None = None
+    """Solar altitude at or below which the site counts as dark
+    (degrees). ``None`` takes the engine's default of −18°, astronomical
+    twilight.
+
+    Optional rather than a plain float because ``0.0`` is a legal solar
+    altitude — the Sun's centre on the geometric horizon — so a defaulted
+    zero would quietly plan a campaign in daylight. The other conventions
+    are civil (−6°) and nautical (−12°); above +90° disables the gate."""
 
     def _to_wire_dict(self) -> dict[str, WireValue]:
         """Serialize to the dict shape the binding consumes.
 
         Internal — called by :meth:`PlanningConfig._to_wire_dict`. For
         user-facing serialization, use :func:`dataclasses.asdict`.
+
+        A ``None`` visibility limit is **omitted** rather than sent as
+        null: an absent key is exactly how the binding spells "use the
+        engine's default", while a null would fail extraction as a float.
         """
-        return {
+        wire: dict[str, WireValue] = {
             "obs_code": self.obs_code,
             "sigma_ra_arcsec": float(self.sigma_arcsec[0]),
             "sigma_dec_arcsec": float(self.sigma_arcsec[1]),
             "max_apparent_mag": float(self.max_apparent_mag),
             "min_elongation_deg": float(self.min_elongation_deg),
         }
+        if self.min_elevation_deg is not None:
+            wire["min_elevation_deg"] = float(self.min_elevation_deg)
+        if self.max_sun_altitude_deg is not None:
+            wire["max_sun_altitude_deg"] = float(self.max_sun_altitude_deg)
+        return wire
 
 
 @dataclass
@@ -808,7 +850,8 @@ class PlanCandidates(qv.Table):
 
     This is kinematic and does not depend on the covariance: it is not
     the orientation of the sky-plane uncertainty ellipse. The range is
-    :math:`(-180, 180]`; add 360 for the conventional :math:`[0, 360)`
+    :math:`(-180, 180]`; add 360 **to negative values** (equivalently
+    ``numpy.mod(pa, 360.0)``) for the conventional :math:`[0, 360)`
     position-angle convention."""
     post_along_track_sigma_arcsec = qv.Float64Column(nullable=True)
     """Along-track 1σ after folding this observation **and every one

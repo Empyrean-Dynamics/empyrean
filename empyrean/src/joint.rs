@@ -586,7 +586,7 @@ mod tests {
         }
         assert!(ParamDisposition::from_tag("true").is_err());
         assert!(ParamDisposition::from_ffi(3, "marsden").is_err());
-        // `0`/`1` keep the meaning the pre-v4 booleans had.
+        // `0`/`1` keep the meaning the pre-0.10.0 booleans had.
         assert_eq!(
             ParamDisposition::from_ffi(0, "x").unwrap(),
             ParamDisposition::Fixed

@@ -503,12 +503,13 @@ mod batch_contract_tests {
 
     /// The border survives a basis change rather than being dropped.
     ///
-    /// `CoordinateState` gained the state↔Marsden border in v4, and both
-    /// transform entry points take a bare `CoordinateState` — so the
-    /// natural implementation (flatten through the core type, which has
-    /// no border) would silently return half a joint through every
-    /// representation change. The engine rotates the border with the 6×6
-    /// it borders; this pins that it reaches the caller.
+    /// `CoordinateState` gained the state↔Marsden border in the 0.10.0
+    /// ABI, and both transform entry points take a bare
+    /// `CoordinateState` — so the natural implementation (flatten
+    /// through the core type, which has no border) would silently return
+    /// half a joint through every representation change. The engine
+    /// rotates the border with the 6×6 it borders; this pins that it
+    /// reaches the caller.
     #[test]
     fn the_marsden_border_survives_a_basis_change() {
         let Some(ctx) =

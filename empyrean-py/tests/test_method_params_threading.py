@@ -289,7 +289,7 @@ def test_default_specs_lower_to_engine_defaults() -> None:
 
 
 def test_tuned_auto_dataclass_is_accepted_and_lowers_its_thresholds() -> None:
-    """PROVING (empyrean-41l4p): a tuned ``Auto`` dataclass used to raise
+    """PROVING: a tuned ``Auto`` dataclass used to raise
     ``TypeError: unsupported method spec: Auto`` from ``_method_to_tag`` on
     the impact path, while the identical spec flowed through
     ``propagate()`` — the two surfaces disagreed on the same method

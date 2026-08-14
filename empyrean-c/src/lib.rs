@@ -838,7 +838,9 @@ pub unsafe extern "C" fn empyrean_missing_data_files_free(out: *mut EmpyreanMiss
     }));
 }
 
-/// Free an `EmpyreanContext` previously returned by `empyrean_context_new()`.
+/// Free an `EmpyreanContext` previously returned by
+/// `empyrean_context_from_data_dir`, `empyrean_context_from_data_dir_with`
+/// or `empyrean_context_new_minimal`.
 ///
 /// Passing null is a no-op.
 #[unsafe(no_mangle)]

@@ -49,15 +49,26 @@ and Rust-native lifetime management.
 
 ## What the bindings cover
 
-The declarations track the full C ABI at `EMPYREAN_ABI_VERSION`
-(currently `4`), including the v0.9.0 wide-parameter fitting surface
-and the output surface below. ABI 2 grew existing struct shapes by
-appending fields only; ABI 3 was the first version to change function
-shapes and struct interiors; ABI 4 adds the joint covariance and is the
-first to make a frozen struct **smaller**. Consumers must recompile
-against the matching header.
+The declarations track the full C ABI of **this crate's own release**,
+including the v0.9.0 wide-parameter fitting surface and the output
+surface below.
 
-### ABI 4 — the joint covariance
+`EMPYREAN_ABI_VERSION` carries that release, encoded
+`major * 10000 + minor * 100 + patch` — the 0.10.0 ABI reports `1000` —
+and it advances with **every** release, whether or not any boundary type
+changed. So the number no longer tells you anything about layout, and
+the only reading it supports is equality: if the loaded engine reports a
+different value, it is a different release, and the fix is to rebuild
+against the matching header or repoint at the matching engine. There is
+no compatible range to reason about, and a value that did not move is no
+longer a promise that nothing did.
+
+The scheme begins with 0.10.0. Every release before it — through
+0.10.0-rc.0 — reported an independent counter instead, now retired,
+which reached 3; that counter is the subject of the historical notes
+below, and no library has ever reported a value between 3 and 1000.
+
+### The 0.10.0 ABI — the joint covariance
 
 The boundary now carries the **off-diagonal** blocks of a fit's
 `(6+P) × (6+P)` covariance, not only its diagonal blocks. Input side,
@@ -102,11 +113,13 @@ config 432 → 424. A consumer with a hand-mirrored config must re-derive its
 whole layout rather than append: keeping the old prefix and writing
 `photometry` at its former offset lands eight bytes past where the library
 reads it, corrupting that config and the two bytes before it with no
-diagnostic. Every other v4 change is an append: `CoordinateState` 360 → 512,
-`EmpyreanOrbit` 648 → 832, `EmpyreanPropagatedState` 2392 → 2576,
-`EmpyreanNonGravParams` 160 → 176 (`has_dt_variance` / `dt_variance`, which
-had no wire at all before), `EmpyreanObservatoryConfig` 40 → 64 (the
-visibility fields, which no exported entry point reads yet), and
+diagnostic. Every other change in this release is an append:
+`CoordinateState` 360 → 512, `EmpyreanOrbit` 648 → 832,
+`EmpyreanPropagatedState` 2392 → 2576, `EmpyreanNonGravParams` 160 → 176
+(`has_dt_variance` / `dt_variance`, which had no wire at all before),
+`EmpyreanObservatoryConfig` 40 → 64 (the visibility fields, which are
+marshaled in full but which no exported entry point applies — the gates that
+read them live in the engine's unexported visibility survey), and
 `EmpyreanODResult` 7688 → 8128 (the joint, `dispositions`, the per-segment
 thrust posteriors and the `warnings` channel), carrying
 `EmpyreanODObjectResult` 7720 → 8160 with it.
@@ -121,10 +134,11 @@ it shares one index space with the new `thrust_correction_covariances` and
 with `dispositions.thrust_dispositions`. An unsolved segment is NaN-filled in
 both arrays.
 
-### ABI 3
+### ABI 3 — the last of the retired counter
 
-Still in force, and repeated here because a consumer upgrading from ABI 2
-crosses both breaks at once.
+Historical: `3` was the final value of the independent counter, shipped by
+0.10.0-rc.0. Its changes are still in force, and repeated here because a
+consumer upgrading from an ABI-2 library crosses both breaks at once.
 
 **Function shapes.** `empyrean_determine` keeps its name and arity, but
 its final out-parameter is now `EmpyreanDetermineResults *` — the batch
@@ -163,16 +177,26 @@ no size check would catch. New types: `EmpyreanDetermineResults` (32),
 It is enforced here, not merely documented: the loader calls
 `empyrean_abi_version()` the moment it opens `libempyrean` and panics —
 naming both versions and the resolved path — if the engine disagrees with
-`EMPYREAN_ABI_VERSION`. `dlsym` matches on symbol name alone, so a stale
-engine picked up from `EMPYREAN_LIB` or a leftover `target/release` would do
-worse than return wrong numbers. An ABI-2 `empyrean_get_observers` reads the
-caller's `frame` integer as its out-pointer; an ABI-2 `empyrean_determine`
-writes a 7600-byte `EmpyreanODResult` through a pointer the caller sized for
-a 32-byte `EmpyreanDetermineResults`; and an ABI-3 `empyrean_refine` reads
-its `EmpyreanODConfig`'s photometry block eight bytes past where a v4 caller
-wrote it. Every struct size named above is additionally asserted at compile
-time in the generated bindings, so a header/binding drift fails the build
-rather than the physics.
+`EMPYREAN_ABI_VERSION`. Any inequality panics; there is no tolerated
+range, because the value is a release identity rather than a layout
+generation.
+
+`dlsym` matches on symbol name alone, so a stale engine picked up from
+`EMPYREAN_LIB` or a leftover `target/release` would do worse than return
+wrong numbers. An ABI-2 `empyrean_get_observers` reads the caller's
+`frame` integer as its out-pointer; an ABI-2 `empyrean_determine` writes a
+7600-byte `EmpyreanODResult` through a pointer the caller sized for a
+32-byte `EmpyreanDetermineResults`; and an ABI-3 `empyrean_refine` reads
+its `EmpyreanODConfig`'s photometry block eight bytes past where a 0.10.0
+caller wrote it. Every struct size named above is additionally asserted at
+compile time in the generated bindings, so a header/binding drift fails the
+build rather than the physics.
+
+The engine binary this crate resolves is version-pinned by construction:
+the checksummed download in `build.rs` targets the `v{crate version}` tag,
+and the copy bundled in the Python wheel ships beside the wheel's own
+bindings. A manual `EMPYREAN_LIB` is the one path that can pair mismatched
+releases.
 
 Each type below maps 1:1 onto a C struct; consult `include/empyrean.h`
 at the repository root for field-level semantics.
@@ -349,7 +373,8 @@ inside the published Python wheel. The path is resolved from the
 `EMPYREAN_LIB` environment variable if set, else a `libempyrean.*`
 sitting next to the loaded module, else a build-time location — an
 `EMPYREAN_LIB_DIR` override, a sibling `../target/release` build, or
-a checksum-pinned download from the GitHub release (in that order).
+a checksum-pinned download from the GitHub release tagged
+`v{crate version}` (in that order).
 The FFI bindings are pre-generated and committed, so no C header,
 libclang, or bindgen is needed to build.
 

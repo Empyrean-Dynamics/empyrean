@@ -488,6 +488,14 @@ sitting next to the binary, else a build-time location — an
 a checksum-pinned prebuilt downloaded from the GitHub release (in
 that order); no system library path setup is needed.
 
+"Matching" above means the same release: the loader reads the engine's
+ABI version when it opens the library and refuses — naming both numbers
+and the resolved path — if it differs from the one this binary was built
+against. The ABI version encodes the release, so a `libempyrean` from a
+different release is rejected rather than driven through a layout that
+may have moved. Download both tarballs from the same release page and
+this cannot arise.
+
 ## License
 
 Source code in this crate is licensed under the

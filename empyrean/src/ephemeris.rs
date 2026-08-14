@@ -565,7 +565,7 @@ mod tests {
     /// The row order is a contract shared with the C ABI, so the values
     /// are pinned rather than merely self-consistent: rotating them
     /// silently re-points every consumer's index at a different
-    /// observable, in a different unit (empyrean-9666l).
+    /// observable, in a different unit.
     #[test]
     fn sensitivity_row_constants_have_their_contract_values() {
         assert_eq!(SENSITIVITY_ROW_RANGE, 0);
@@ -596,7 +596,7 @@ mod tests {
 
     /// A 4-character observatory code must be a loud error at the FFI
     /// boundary: clipped to 3 bytes it would silently alias a different
-    /// observatory (empyrean-agp9).
+    /// observatory.
     #[test]
     fn four_char_obs_code_is_rejected() {
         let observer = Observer {

@@ -572,8 +572,17 @@ pub const EMPYREAN_PHOTOMETRY_MODEL_HG1G2: i32 = 4;
 
 /// Integer handshake on the frozen-ABI shape contract, distinct from the
 /// per-crate semver strings in `EmpyreanVersions` (which are provenance).
-/// Consumers compiled against a given `EMPYREAN_SOLVE_WIDTH` check this at
-/// load; any additive change to the frozen structs bumps it.
+/// A consumer checks it the moment it opens the library and requires
+/// **equality**, never an ordering or a range: the value names the
+/// distribution release that built the library (see *The version scheme*
+/// at the end of this comment), so any difference at all means a
+/// different release, and the remedy is to rebuild against that
+/// release's header or to repoint at the matching engine. A difference
+/// is therefore no longer evidence that a frozen struct moved, and an
+/// equal value is what licenses the layouts below — `dlsym` resolves on
+/// symbol name alone, and the names are stable across releases while the
+/// shapes behind them are not, so a mismatch allowed to proceed reads
+/// the caller's arguments through the wrong layout instead of failing.
 ///
 /// This release's ABI (0.10.0) is a single, batched break carrying the joint
 /// solved-parameter covariance across the boundary in both directions,
@@ -612,7 +621,7 @@ pub const EMPYREAN_PHOTOMETRY_MODEL_HG1G2: i32 = 4;
 /// allocations per call, with no error and no wrong number to notice.
 /// Opt-in ownership at a new entry point costs one extra symbol and
 /// makes the acquisition explicit. `EmpyreanTaggedCovariance` is
-/// therefore unchanged in v4.
+/// therefore unchanged in the 0.10.0 ABI.
 ///
 /// **New constants**, all nine of them:
 ///
@@ -696,11 +705,13 @@ pub const EMPYREAN_PHOTOMETRY_MODEL_HG1G2: i32 = 4;
 /// - [`EmpyreanObservatoryConfig`](crate::planning::EmpyreanObservatoryConfig)
 ///   grows `min_elevation_deg` plus `has_max_sun_altitude_deg` /
 ///   `max_sun_altitude_deg`, matching the engine's own observatory
-///   config. **No entry point exported by this ABI reads them yet** —
-///   the engine applies them in its visibility computation, which has
-///   no C entry point, and `empyrean_evaluate_plan` (the one exported
-///   consumer of this struct) does not call it. They ride the struct so
-///   that exposing visibility later needs no further break;
+///   config. Both are marshaled across in full, and **no entry point
+///   exported by this ABI applies them**: the gates that read them
+///   belong to the engine's visibility survey, which has no C entry
+///   point, while `empyrean_evaluate_plan` — the one exported consumer
+///   of this struct — consults the site-invariant filters alone. They
+///   ride the struct so that exposing the survey later needs no further
+///   break;
 /// - the impact and B-plane paths marshal the caller's non-grav DT
 ///   value and Marsden 3×3, both of which they silently dropped — the
 ///   DT drop meant those two entry points evaluated a DT comet's
@@ -719,9 +730,9 @@ pub const EMPYREAN_PHOTOMETRY_MODEL_HG1G2: i32 = 4;
 ///   the carrier onto [`EmpyreanOrbitBatch`](crate::io::EmpyreanOrbitBatch)
 ///   rather than reporting them absent.
 ///
-/// **Layout: appended everywhere but one, and that one SHRINKS a
-/// struct.** Every earlier release of this ABI could say "fields are only
-/// ever appended, never reordered or removed". This one cannot, and
+/// **Layout: appended everywhere but one, and that one SHRINKS two
+/// structs.** Every earlier release of this ABI could say "fields are
+/// only ever appended, never reordered or removed". This one cannot, and
 /// the exception is stated here rather than left for a consumer to
 /// discover by corruption: replacing `EmpyreanSolveFor::thrust_segments`
 /// (a `u32`) with `thrust_dispositions[3]` (three `u8`s) takes that
@@ -729,8 +740,9 @@ pub const EMPYREAN_PHOTOMETRY_MODEL_HG1G2: i32 = 4;
 /// every field after `solve_for_flags` inside the
 /// [`EmpyreanODConfig`] that embeds it —
 /// `allow_unbracketed_maneuvers` 392→390, `has_photometry` 393→391,
-/// `photometry` 400→392 — and shrinks that config 432→424. It is the
-/// first struct on this ABI to get SMALLER.
+/// `photometry` 400→392 — and shrinks that config 432→424 in turn.
+/// `EmpyreanSolveFor` and `EmpyreanODConfig` are the first structs on
+/// this ABI to get SMALLER.
 ///
 /// A consumer with a hand-mirrored `EmpyreanODConfig` must therefore
 /// re-derive its whole layout, not just append: keeping an existing
@@ -749,15 +761,62 @@ pub const EMPYREAN_PHOTOMETRY_MODEL_HG1G2: i32 = 4;
 /// the physics.
 ///
 /// **The version scheme.** The C ABI carries the distribution's own
-/// version, encoded \(\text{major} \times 10000 + \text{minor}
-/// \times 100 + \text{patch}\) — 0.10.0 is `1000`. It advances with
-/// every distribution release whether or not any boundary type changed:
-/// the ABI is versioned by the release that ships it, not by an
-/// independent counter. Values below 1000 are the retired independent
-/// counter, which reached 3 at 0.10.0-rc.0. Pre-releases of a version
-/// share its number; the full release string, including any pre-release
-/// suffix, is `empyrean_version_string()`.
+/// version, encoded \\(\text{major} \times 10000 + \text{minor} \times
+/// 100 + \text{patch}\\). It advances with every distribution release
+/// whether or not any boundary type changed: the ABI is versioned by the
+/// release that ships it, not by an independent counter.
+///
+/// **The scheme begins with 0.10.0**, which reports `1000` — the
+/// smallest value it can produce. Every release before it, through
+/// 0.10.0-rc.0, reported the retired independent counter instead, which
+/// reached 3; that is why values below 1000 are counter-era and are not
+/// release numbers.
+///
+/// The distribution's own release string is not exported. A consumer
+/// identifies the build it is running by the artifact or tag it
+/// installed; `empyrean_version_string()` reports something else — the
+/// build provenance of the closed-source engine crates behind this
+/// boundary, not this distribution's version.
 pub const EMPYREAN_ABI_VERSION: u32 = 1000;
+
+/// The constant above is the crate's own version, encoded — and this
+/// assertion is what keeps it that way. Under the retired counter the
+/// value only had to move when a boundary type changed, which is a
+/// reviewed event; it now has to move on every release, including the
+/// release that changes nothing at the boundary and so gives nobody a
+/// reason to open this file. A forgotten bump would leave
+/// `empyrean_abi_version()` reporting a version the library is not,
+/// which is undetectable from either side of the handshake — both sides
+/// descend from this one literal.
+///
+/// `CARGO_PKG_VERSION_MAJOR` / `_MINOR` / `_PATCH` drop any pre-release
+/// suffix, so `0.10.0-rc.0` and `0.10.0` both encode to `1000`, exactly
+/// as the scheme above says pre-releases of a version do.
+const fn encoded_crate_version() -> u32 {
+    const fn parse_u32(s: &str) -> u32 {
+        let bytes = s.as_bytes();
+        let mut value = 0u32;
+        let mut i = 0;
+        while i < bytes.len() {
+            assert!(
+                bytes[i] >= b'0' && bytes[i] <= b'9',
+                "a version component of this crate is not a plain integer"
+            );
+            value = value * 10 + (bytes[i] - b'0') as u32;
+            i += 1;
+        }
+        value
+    }
+    parse_u32(env!("CARGO_PKG_VERSION_MAJOR")) * 10000
+        + parse_u32(env!("CARGO_PKG_VERSION_MINOR")) * 100
+        + parse_u32(env!("CARGO_PKG_VERSION_PATCH"))
+}
+const _: () = assert!(
+    EMPYREAN_ABI_VERSION == encoded_crate_version(),
+    "EMPYREAN_ABI_VERSION no longer encodes this crate's version: the ABI is \
+     versioned by the distribution release that ships it, so a release bump \
+     must carry the constant with it (major * 10000 + minor * 100 + patch)"
+);
 
 /// Runtime accessor for [`EMPYREAN_ABI_VERSION`] — lets a dynamically
 /// linked consumer confirm the loaded library's frozen-shape contract
@@ -1473,10 +1532,10 @@ pub struct EmpyreanODResult {
     /// is **NaN-filled**, exactly as its posterior covariance is. Read
     /// `dispositions.thrust_dispositions[i]` before the value.
     ///
-    /// The index space changed in v4, from solved order to declared
-    /// order, so that this array, `thrust_correction_covariances` and
-    /// `dispositions.thrust_dispositions` share one index. Under the old
-    /// pairing a fit with a considered burn between two solved ones
+    /// The index space changed in the 0.10.0 ABI, from solved order to
+    /// declared order, so that this array, `thrust_correction_covariances`
+    /// and `dispositions.thrust_dispositions` share one index. Under the
+    /// old pairing a fit with a considered burn between two solved ones
     /// returned a Δv attributed to the wrong burn's covariance.
     pub thrust_delta_m_per_s: [[f64; 3]; EMPYREAN_MAX_THRUST_SEGMENTS],
     /// Integration frame the Δv components are expressed in (0=ICRF,
@@ -1524,7 +1583,7 @@ pub struct EmpyreanODResult {
     /// `ENCOUNTER_INTERVENES`.
     pub trust_second_order_recoverable: u8,
 
-    // ── Joint posterior + partition (v4) ──────────────────────────
+    // ── Joint posterior + partition (0.10.0) ──────────────────────
     //
     // The fitted joint's CROSS terms live on `orbit.orbit_cov`, not
     // here. One home: a propagated state and a fitted orbit carry the
@@ -3197,7 +3256,7 @@ unsafe fn populate_wide_fitting_fields(
 /// # One index space, deliberately
 ///
 /// All three per-segment arrays on the result — Δv, covariance,
-/// disposition — are indexed by **declared** segment. Before v4 the Δv
+/// disposition — are indexed by **declared** segment. Before 0.10.0 the Δv
 /// array was indexed by *solved* segment while nothing else was, which
 /// was invisible while declared ≡ solved was an enforced invariant. It
 /// no longer is: a considered or fixed burn is declared-but-unsolved,
@@ -6761,7 +6820,7 @@ mod parameter_partition_tests {
     }
 
     /// Every rejection reason maps to a distinct code, including the one
-    /// added in v4. A collision would merge two causes in the
+    /// added in this release. A collision would merge two causes in the
     /// attribution census — which is the hole the reserved-code
     /// discipline exists to keep closed.
     #[test]

@@ -23,7 +23,7 @@
 // ONE hand edit is re-applied afterwards: bindgen types every `#define <int>`
 // as `u32`, but where a constant names the value set of a struct field it is
 // typed to that field instead, so the natural comparison needs no cast. The
-// full list, which the v4 regeneration found had drifted from what the file
+// full list, which the 0.10.0 regeneration found had drifted from what the file
 // actually carried (EMPYREAN_OD_FAILURE_* was already retyped and undocumented
 // here, so a faithful regeneration would have silently reverted it):
 //
@@ -3636,7 +3636,7 @@ pub struct EmpyreanODResult {
     pub amrat_delta: f64,
     #[doc = " Number of **declared** thrust Δv segments (0..=3); 0 = the orbit\n declared no thrust.\n\n **Deprecated, and identical to\n [`n_thrust_segments`](Self::n_thrust_segments)** — read that one.\n Kept populated for one deprecation window, exactly as\n `covariance_9x9` is, so a consumer that reads the array bound\n off the field beside the array still compiles and still reads\n the right bound.\n\n Two names for one number is the defect that removed\n `EmpyreanSolveFor::thrust_segments` in this same release; this\n one survives only because it is a *published* field whose\n meaning changed rather than a new one, and deleting it in the\n same bump that re-indexed its array would leave a consumer no\n compiling intermediate state."]
     pub thrust_delta_count: u32,
-    #[doc = " Per-segment fitted Δv in m/s, expressed in\n [`dv_frame`](EmpyreanODResult::dv_frame), **indexed by declared\n segment**. Entries `0..thrust_delta_count` meaningful.\n\n A segment this fit did not solve has no correction and its entry\n is **NaN-filled**, exactly as its posterior covariance is. Read\n `dispositions.thrust_dispositions[i]` before the value.\n\n The index space changed in v4, from solved order to declared\n order, so that this array, `thrust_correction_covariances` and\n `dispositions.thrust_dispositions` share one index. Under the old\n pairing a fit with a considered burn between two solved ones\n returned a Δv attributed to the wrong burn's covariance."]
+    #[doc = " Per-segment fitted Δv in m/s, expressed in\n [`dv_frame`](EmpyreanODResult::dv_frame), **indexed by declared\n segment**. Entries `0..thrust_delta_count` meaningful.\n\n A segment this fit did not solve has no correction and its entry\n is **NaN-filled**, exactly as its posterior covariance is. Read\n `dispositions.thrust_dispositions[i]` before the value.\n\n The index space changed in the 0.10.0 ABI, from solved order to\n declared order, so that this array, `thrust_correction_covariances`\n and `dispositions.thrust_dispositions` share one index. Under the\n old pairing a fit with a considered burn between two solved ones\n returned a Δv attributed to the wrong burn's covariance."]
     pub thrust_delta_m_per_s: [[f64; 3usize]; 3usize],
     #[doc = " Integration frame the Δv components are expressed in (0=ICRF,\n 1=EclipticJ2000). Only meaningful when `thrust_delta_count > 0`."]
     pub dv_frame: i32,
@@ -3984,7 +3984,7 @@ impl Default for EmpyreanPlannedObservation {
         }
     }
 }
-#[doc = " Per-observatory assumptions: astrometric σ + observability filters."]
+#[doc = " Per-observatory assumptions: astrometric σ + observability filters.\n\n # Which filters this ABI applies\n\n [`empyrean_evaluate_plan`] is the only exported function that reads\n this struct, and it consults **two** of the four filters below:\n `max_apparent_mag` and `min_elongation_deg`, the site-invariant pair.\n A candidate's `observable` flag is their conjunction and nothing\n else. In practice only the elongation test can fire, because the\n target's absolute magnitude does not reach the planner on this entry\n point, so the magnitude test passes vacuously.\n\n [`min_elevation_deg`](EmpyreanObservatoryConfig::min_elevation_deg)\n and\n [`max_sun_altitude_deg`](EmpyreanObservatoryConfig::max_sun_altitude_deg)\n are marshaled across this boundary in full — they reach the engine's\n own observatory config with the values set here — but the gates that\n read them belong to the engine's **visibility survey**, which this\n ABI does not export. Setting either therefore changes no number\n `empyrean_evaluate_plan` returns, on any release of this ABI so far.\n They ride the struct now so that exposing the survey later needs no\n further break, and it is said here rather than left to be discovered:\n a plan whose candidates are `observable` may still include epochs at\n which the target is under that site's horizon or the sky above it is\n bright."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct EmpyreanObservatoryConfig {
@@ -3998,11 +3998,11 @@ pub struct EmpyreanObservatoryConfig {
     pub max_apparent_mag: f64,
     #[doc = " Minimum solar elongation (degrees)."]
     pub min_elongation_deg: f64,
-    #[doc = " Minimum geometric elevation of the target above the site's local\n horizon, in degrees.\n\n The elevation is \\\\( h = \\arcsin(\\hat{u} \\cdot \\hat{s}) \\\\), with\n \\\\(\\hat{u}\\\\) the site's geodetic zenith and \\\\(\\hat{s}\\\\) the\n apparent — light-time- and aberration-corrected — topocentric\n direction to the target. **Atmospheric refraction is ignored**:\n near the horizon refraction lifts a source by roughly\n \\\\(0.5°\\\\), and the error falls below \\\\(0.1°\\\\) by\n \\\\(h \\approx 10°\\\\).\n\n `0.0` — the zero-init value — is the geometric horizon, which is\n also the engine's default. That is the least-opinionated\n statement the geometry can make, *not* an observing\n recommendation: airmass at \\\\(h = 0°\\\\) is \\\\(\\approx 38\\\\), and\n real programs cut between \\\\(20°\\\\) and \\\\(30°\\\\). Set it to the\n site's own pointing or airmass limit — e.g. `30.0` for airmass\n \\\\(\\le 2\\\\)."]
+    #[doc = " Minimum geometric elevation of the target above the site's local\n horizon, in degrees.\n\n The elevation is \\\\( h = \\arcsin(\\hat{u} \\cdot \\hat{s}) \\\\), with\n \\\\(\\hat{u}\\\\) the site's geodetic zenith and \\\\(\\hat{s}\\\\) the\n apparent — light-time- and aberration-corrected — topocentric\n direction to the target. **Atmospheric refraction is ignored**:\n near the horizon refraction lifts a source by roughly\n \\\\(0.5°\\\\), and the error falls below \\\\(0.1°\\\\) by\n \\\\(h \\approx 10°\\\\).\n\n `0.0` — the zero-init value — is the geometric horizon, which is\n also the engine's default. That is the least-opinionated\n statement the geometry can make, *not* an observing\n recommendation: airmass at \\\\(h = 0°\\\\) is \\\\(\\approx 38\\\\), and\n real programs cut between \\\\(20°\\\\) and \\\\(30°\\\\). The site's own\n pointing or airmass limit is the value to carry here — e.g.\n `30.0` for airmass \\\\(\\le 2\\\\).\n\n **No exported entry point applies it.** The value is marshaled\n into the engine's observatory config, but the elevation gate that\n reads it lives in the visibility survey this ABI does not export;\n [`empyrean_evaluate_plan`] consults the site-invariant pair\n alone. See the struct-level docs."]
     pub min_elevation_deg: f64,
     #[doc = " 1 when [`max_sun_altitude_deg`](Self::max_sun_altitude_deg)\n carries a darkness threshold; 0 to take the engine's default of\n −18° (astronomical twilight).\n\n This axis needs the switch and\n [`min_elevation_deg`](Self::min_elevation_deg) does not, for one\n reason: `0.0` is a legal and meaningful solar altitude (the Sun's\n centre on the geometric horizon), so a zero-init struct read as a\n literal `0.0` would quietly plan a campaign in daylight. The\n elevation default *is* `0.0`, so its zero-init value is already\n the engine's."]
     pub has_max_sun_altitude_deg: u8,
-    #[doc = " Solar altitude at or below which the site counts as dark, in\n degrees. Only read when\n [`has_max_sun_altitude_deg`](Self::has_max_sun_altitude_deg) is 1.\n\n Built from the same site zenith as `min_elevation_deg`, against\n the **geometric** topocentric direction to the Sun — no\n light-time, aberration or refraction correction, each of which is\n a few tens of arcseconds at most against a threshold that\n operates on degrees.\n\n The standard conventions are civil (\\\\(-6°\\\\)), nautical\n (\\\\(-12°\\\\)) and astronomical (\\\\(-18°\\\\), the engine default,\n where the sky background has fallen to its dark-time floor).\n Because refraction is ignored, `0.0` means the Sun's *centre* on\n the geometric horizon, about \\\\(0.83°\\\\) later than visible\n sunset. A value above \\\\(+90°\\\\) disables the darkness gate."]
+    #[doc = " Solar altitude at or below which the site counts as dark, in\n degrees. Only read when\n [`has_max_sun_altitude_deg`](Self::has_max_sun_altitude_deg) is 1.\n\n Built from the same site zenith as `min_elevation_deg`, against\n the **geometric** topocentric direction to the Sun — no\n light-time, aberration or refraction correction, each of which is\n a few tens of arcseconds at most against a threshold that\n operates on degrees.\n\n The standard conventions are civil (\\\\(-6°\\\\)), nautical\n (\\\\(-12°\\\\)) and astronomical (\\\\(-18°\\\\), the engine default,\n where the sky background has fallen to its dark-time floor).\n Because refraction is ignored, `0.0` means the Sun's *centre* on\n the geometric horizon, about \\\\(0.83°\\\\) later than visible\n sunset. A value above \\\\(+90°\\\\) disables the darkness gate.\n\n **No exported entry point applies it**, on the same terms as\n [`min_elevation_deg`](Self::min_elevation_deg): the value reaches\n the engine's observatory config, and the darkness gate that reads\n it belongs to the unexported visibility survey. See the\n struct-level docs."]
     pub max_sun_altitude_deg: f64,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
@@ -4119,7 +4119,7 @@ pub struct EmpyreanPlanCandidate {
     pub obs_code: *mut ::std::os::raw::c_char,
     #[doc = " 0 = optical, 1 = radar."]
     pub kind: u8,
-    #[doc = " 1 if observable at this epoch (passes the filters / has positive SNR)."]
+    #[doc = " 1 if this candidate passes the **site-invariant** filters at this\n epoch — solar elongation and apparent magnitude, and nothing else\n (radar candidates report 1 unconditionally, and the magnitude test\n passes vacuously here because the target's absolute magnitude does\n not reach the planner).\n\n Read it as \"not ruled out from Earth\", not \"schedulable from this\n site\": the target's elevation above the site's horizon and the\n Sun's altitude there are not tested here. See\n [`EmpyreanObservatoryConfig`]."]
     pub observable: u8,
     #[doc = " Sky-plane along-track 1σ (arcsec) — optical geometry (NaN for radar)."]
     pub along_track_sigma_arcsec: f64,
@@ -4129,7 +4129,7 @@ pub struct EmpyreanPlanCandidate {
     pub ra_sigma_arcsec: f64,
     #[doc = " Predicted Dec 1σ (arcsec)."]
     pub dec_sigma_arcsec: f64,
-    #[doc = " Position angle of the sky-plane uncertainty ellipse (degrees)."]
+    #[doc = " Position angle of the predicted **sky motion** (degrees, east of\n north) — the axis the along/cross-track σ above are projected\n onto. Optical only.\n\n Kinematic, and not a function of the covariance: it is *not* the\n orientation of the sky-plane uncertainty ellipse. The range is\n \\\\((-180, 180]\\\\); add 360 **to negative values** for the\n conventional \\\\([0, 360)\\\\) convention."]
     pub position_angle_deg: f64,
     #[doc = " Marginal covariance-volume reduction factor from this observation (≤ 1)."]
     pub marginal_volume_reduction: f64,
@@ -5300,7 +5300,7 @@ impl EmpyreanLib {
     pub unsafe fn empyrean_missing_data_files_free(&self, out: *mut EmpyreanMissingDataFiles) {
         (self.empyrean_missing_data_files_free)(out)
     }
-    #[doc = " Free an `EmpyreanContext` previously returned by `empyrean_context_new()`.\n\n Passing null is a no-op."]
+    #[doc = " Free an `EmpyreanContext` previously returned by\n `empyrean_context_from_data_dir`, `empyrean_context_from_data_dir_with`\n or `empyrean_context_new_minimal`.\n\n Passing null is a no-op."]
     pub unsafe fn empyrean_context_free(&self, ctx: *mut EmpyreanContext) {
         (self.empyrean_context_free)(ctx)
     }

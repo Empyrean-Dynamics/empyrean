@@ -461,12 +461,18 @@ fn batch_to_rows(batch: &EmpyreanOrbitBatch) -> Result<Vec<OrbitRow>, String> {
         // signal that it happened.
         if orbit.state.has_non_grav_cross != 0 {
             return Err(format!(
-                "orbit {i}: the JSON orbit format cannot represent a state↔Marsden                  cross-covariance (`state.has_non_grav_cross = 1`). Write parquet,                  which carries the full joint; this format holds the 6×6 only."
+                "orbit {i}: the JSON orbit format cannot represent a \
+                 state↔Marsden cross-covariance \
+                 (`state.has_non_grav_cross = 1`). Write parquet, which \
+                 carries the full joint; this format holds the 6×6 only."
             ));
         }
         if orbit.n_state_param_cross != 0 || orbit.n_param_pair_cross != 0 {
             return Err(format!(
-                "orbit {i}: the JSON orbit format cannot represent a wide                  cross-covariance carrier ({} state column(s), {} parameter pair(s)).                  Write parquet, which carries the full joint; this format holds the                  6×6 only.",
+                "orbit {i}: the JSON orbit format cannot represent a wide \
+                 cross-covariance carrier ({} state column(s), {} parameter \
+                 pair(s)). Write parquet, which carries the full joint; this \
+                 format holds the 6×6 only.",
                 orbit.n_state_param_cross, orbit.n_param_pair_cross
             ));
         }

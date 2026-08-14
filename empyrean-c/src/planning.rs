@@ -35,6 +35,30 @@ use crate::{EmpyreanContext, set_last_error};
 // ── Input structs ───────────────────────────────────────────────────
 
 /// Per-observatory assumptions: astrometric σ + observability filters.
+///
+/// # Which filters this ABI applies
+///
+/// [`empyrean_evaluate_plan`] is the only exported function that reads
+/// this struct, and it consults **two** of the four filters below:
+/// `max_apparent_mag` and `min_elongation_deg`, the site-invariant pair.
+/// A candidate's `observable` flag is their conjunction and nothing
+/// else. In practice only the elongation test can fire, because the
+/// target's absolute magnitude does not reach the planner on this entry
+/// point, so the magnitude test passes vacuously.
+///
+/// [`min_elevation_deg`](EmpyreanObservatoryConfig::min_elevation_deg)
+/// and
+/// [`max_sun_altitude_deg`](EmpyreanObservatoryConfig::max_sun_altitude_deg)
+/// are marshaled across this boundary in full — they reach the engine's
+/// own observatory config with the values set here — but the gates that
+/// read them belong to the engine's **visibility survey**, which this
+/// ABI does not export. Setting either therefore changes no number
+/// `empyrean_evaluate_plan` returns, on any release of this ABI so far.
+/// They ride the struct now so that exposing the survey later needs no
+/// further break, and it is said here rather than left to be discovered:
+/// a plan whose candidates are `observable` may still include epochs at
+/// which the target is under that site's horizon or the sky above it is
+/// bright.
 #[repr(C)]
 pub struct EmpyreanObservatoryConfig {
     /// MPC observatory code (null-terminated UTF-8).
@@ -62,9 +86,15 @@ pub struct EmpyreanObservatoryConfig {
     /// also the engine's default. That is the least-opinionated
     /// statement the geometry can make, *not* an observing
     /// recommendation: airmass at \\(h = 0°\\) is \\(\approx 38\\), and
-    /// real programs cut between \\(20°\\) and \\(30°\\). Set it to the
-    /// site's own pointing or airmass limit — e.g. `30.0` for airmass
-    /// \\(\le 2\\).
+    /// real programs cut between \\(20°\\) and \\(30°\\). The site's own
+    /// pointing or airmass limit is the value to carry here — e.g.
+    /// `30.0` for airmass \\(\le 2\\).
+    ///
+    /// **No exported entry point applies it.** The value is marshaled
+    /// into the engine's observatory config, but the elevation gate that
+    /// reads it lives in the visibility survey this ABI does not export;
+    /// [`empyrean_evaluate_plan`] consults the site-invariant pair
+    /// alone. See the struct-level docs.
     pub min_elevation_deg: f64,
     /// 1 when [`max_sun_altitude_deg`](Self::max_sun_altitude_deg)
     /// carries a darkness threshold; 0 to take the engine's default of
@@ -94,6 +124,12 @@ pub struct EmpyreanObservatoryConfig {
     /// Because refraction is ignored, `0.0` means the Sun's *centre* on
     /// the geometric horizon, about \\(0.83°\\) later than visible
     /// sunset. A value above \\(+90°\\) disables the darkness gate.
+    ///
+    /// **No exported entry point applies it**, on the same terms as
+    /// [`min_elevation_deg`](Self::min_elevation_deg): the value reaches
+    /// the engine's observatory config, and the darkness gate that reads
+    /// it belongs to the unexported visibility survey. See the
+    /// struct-level docs.
     pub max_sun_altitude_deg: f64,
 }
 
@@ -204,7 +240,16 @@ pub struct EmpyreanPlanCandidate {
     pub obs_code: *mut c_char,
     /// 0 = optical, 1 = radar.
     pub kind: u8,
-    /// 1 if observable at this epoch (passes the filters / has positive SNR).
+    /// 1 if this candidate passes the **site-invariant** filters at this
+    /// epoch — solar elongation and apparent magnitude, and nothing else
+    /// (radar candidates report 1 unconditionally, and the magnitude test
+    /// passes vacuously here because the target's absolute magnitude does
+    /// not reach the planner).
+    ///
+    /// Read it as "not ruled out from Earth", not "schedulable from this
+    /// site": the target's elevation above the site's horizon and the
+    /// Sun's altitude there are not tested here. See
+    /// [`EmpyreanObservatoryConfig`].
     pub observable: u8,
     /// Sky-plane along-track 1σ (arcsec) — optical geometry (NaN for radar).
     pub along_track_sigma_arcsec: f64,
@@ -214,7 +259,14 @@ pub struct EmpyreanPlanCandidate {
     pub ra_sigma_arcsec: f64,
     /// Predicted Dec 1σ (arcsec).
     pub dec_sigma_arcsec: f64,
-    /// Position angle of the sky-plane uncertainty ellipse (degrees).
+    /// Position angle of the predicted **sky motion** (degrees, east of
+    /// north) — the axis the along/cross-track σ above are projected
+    /// onto. Optical only.
+    ///
+    /// Kinematic, and not a function of the covariance: it is *not* the
+    /// orientation of the sky-plane uncertainty ellipse. The range is
+    /// \\((-180, 180]\\); add 360 **to negative values** for the
+    /// conventional \\([0, 360)\\) convention.
     pub position_angle_deg: f64,
     /// Marginal covariance-volume reduction factor from this observation (≤ 1).
     pub marginal_volume_reduction: f64,

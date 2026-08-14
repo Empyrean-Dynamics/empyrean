@@ -288,11 +288,14 @@ def test_unread_config_knobs_set_after_construction_are_still_refused_as_valueer
 
 
 def test_observatory_config_lowers_every_field():
+    """Both visibility limits round-trip when set, by value and by name."""
     wire = ObservatoryConfig(
         obs_code="F51",
         sigma_arcsec=(0.2, 0.3),
         max_apparent_mag=23.5,
         min_elongation_deg=45.0,
+        min_elevation_deg=30.0,
+        max_sun_altitude_deg=-12.0,
     )._to_wire_dict()
     assert wire == {
         "obs_code": "F51",
@@ -300,7 +303,66 @@ def test_observatory_config_lowers_every_field():
         "sigma_dec_arcsec": 0.3,
         "max_apparent_mag": 23.5,
         "min_elongation_deg": 45.0,
+        "min_elevation_deg": 30.0,
+        "max_sun_altitude_deg": -12.0,
     }
+
+
+def test_observatory_config_omits_unset_visibility_limits():
+    """``None`` means "use the engine's default", spelled as an absent key.
+
+    The binding reads a present key as a float, so sending ``None``
+    through would raise rather than defer. Absence is what
+    ``build_planning_config_from_dict`` reads as the deferral, and it is
+    the only spelling that reaches the engine's own ``0.0`` horizon and
+    −18° twilight rather than a number invented on this side.
+    """
+    wire = ObservatoryConfig(
+        obs_code="F51",
+        sigma_arcsec=(0.2, 0.3),
+        max_apparent_mag=23.5,
+        min_elongation_deg=45.0,
+    )._to_wire_dict()
+    assert "min_elevation_deg" not in wire
+    assert "max_sun_altitude_deg" not in wire
+    assert set(wire) == {
+        "obs_code",
+        "sigma_ra_arcsec",
+        "sigma_dec_arcsec",
+        "max_apparent_mag",
+        "min_elongation_deg",
+    }
+
+
+def test_observatory_config_lowering_covers_every_dataclass_field():
+    """Forcing function: a new ObservatoryConfig field must reach the wire.
+
+    The twin of the PlanningConfig check below. This class drifted once
+    already — it mirrored four of the Rust struct's six fields, and the
+    two it dropped were the ones with no test naming them.
+
+    Every field is set here, so an optional that lowers only when set is
+    still required to appear.
+    """
+    declared = {f.name for f in dataclasses.fields(ObservatoryConfig)}
+    # sigma_arcsec is a pair that splits into two wire columns.
+    declared.discard("sigma_arcsec")
+    lowered = set(
+        ObservatoryConfig(
+            obs_code="F51",
+            sigma_arcsec=(0.2, 0.3),
+            max_apparent_mag=23.5,
+            min_elongation_deg=45.0,
+            min_elevation_deg=30.0,
+            max_sun_altitude_deg=-12.0,
+        )._to_wire_dict()
+    )
+    missing = declared - lowered
+    assert not missing, (
+        f"ObservatoryConfig field(s) never reach the wire: {sorted(missing)} — "
+        f"add them to ObservatoryConfig._to_wire_dict and to the binding's "
+        f"build_planning_config_from_dict."
+    )
 
 
 def test_config_lowering_covers_every_dataclass_field():

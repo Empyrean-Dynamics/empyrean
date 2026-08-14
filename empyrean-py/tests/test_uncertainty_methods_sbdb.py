@@ -60,9 +60,9 @@ def sbdb_grid(sbdb_orbit) -> np.ndarray:
 def sbdb_orbit_cartesian(sbdb_orbit, sbdb_grid) -> CartesianOrbits:
     """The same SBDB record as a Cartesian orbit (state + covariance at
     the epoch), obtained by propagating to its own epoch. Originally the
-    workaround for the non-Cartesian sigma-point engine limitation
-    (empyrean-r2dq); retained after the fix as a second representation
-    exercising the same property."""
+    workaround for the non-Cartesian sigma-point engine limitation;
+    retained after the fix as a second representation exercising the
+    same property."""
     t0 = sbdb_grid[0]
     r0 = empyrean.propagate(
         sbdb_orbit, np.array([t0]), uncertainty_method=UncertaintyMethod.FIRST_ORDER
@@ -127,7 +127,7 @@ def _assert_sigma_point_is_not_linear(res_fo, res_sp) -> None:
         )
         assert not np.array_equal(a, b), (
             f"sigma-point covariance is bit-identical to the first-order one at "
-            f"epoch {i} — tagged 'sigma_point' but never resampled (empyrean-r2dq)"
+            f"epoch {i} — tagged 'sigma_point' but never resampled"
         )
 
 

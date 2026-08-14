@@ -19,11 +19,14 @@ channel rides on. It compiles to a single cdylib (`libempyrean.dylib`
 on macOS / `.so` on Linux / `.dll` on Windows) plus a generated C
 header (`include/empyrean.h`) emitted by `cbindgen`.
 
-Current release: **0.10.0-rc.0**. The C ABI carries the distribution's
-own version — `EMPYREAN_ABI_VERSION` encodes it as
-`major * 10000 + minor * 100 + patch` (0.10.0 is `1000`), readable at
-run time from `empyrean_abi_version()`, and it advances with every
-release whether or not any boundary type changed.
+The C ABI carries the distribution's own version:
+`EMPYREAN_ABI_VERSION` encodes it as
+`major * 10000 + minor * 100 + patch`, readable at run time from
+`empyrean_abi_version()`, and it advances with every release whether or
+not any boundary type changed. **The scheme begins with 0.10.0**, which
+reports `1000`. Every release before it — through 0.10.0-rc.0, the last
+one published — reported the retired independent counter instead, which
+reached 3. This tree ships the 0.10.0 ABI, reporting `1000`.
 
 It is **not published to crates.io** — Rust callers should use the
 [`empyrean`](https://crates.io/crates/empyrean) safe wrapper crate or
@@ -397,7 +400,7 @@ border is non-zero **even from a block-diagonal input**, because propagation
 itself generates the correlation. A chained propagation built on the 6×6 alone
 is not an approximation of the single-leg answer; it is a tighter claim.
 
-ABI 4 carries the off-diagonal blocks in both directions.
+The 0.10.0 ABI carries the off-diagonal blocks in both directions.
 
 **Input side** — caller-owned, borrowed for the call, following the
 `thrust_arcs` template:
@@ -441,7 +444,7 @@ preserve that struct's plain-old-data contract: a caller declares one on the
 stack and frees nothing, so giving it owned arrays would have turned code that
 is correct today — recompiling without a diagnostic — into a leaking caller,
 two allocations per call, with no error and no wrong number to notice.
-`EmpyreanTaggedCovariance` is unchanged in v4.
+`EmpyreanTaggedCovariance` is unchanged in the 0.10.0 ABI.
 
 Re-feeding is a field-by-field assignment, because the result *nests* what the
 orbit *flattens*:
@@ -483,12 +486,19 @@ run could not reconstruct that row.
 
 ### The 0.10.0 ABI
 
-A consumer compiled against a given `EMPYREAN_SOLVE_WIDTH` should confirm
-the runtime library agrees by checking `empyrean_abi_version()` against
-`EMPYREAN_ABI_VERSION` at load. The ABI is versioned by the distribution
-release that ships it (the retired independent counter reached 3 at
+A consumer should confirm at load that the runtime library agrees, by
+checking `empyrean_abi_version()` against the `EMPYREAN_ABI_VERSION` it
+compiled with. The contract is **equality**, not an ordering or a
+compatible range: the number carries the distribution release, so any
+difference at all means a different release — rebuild against that
+release's header, or repoint at the matching engine. A difference is no
+longer evidence that a frozen struct moved, and matching numbers are
+what license the layouts below.
+
+The ABI is versioned by the distribution release that ships it. Before
+0.10.0 it was an independent counter, now retired, which reached 3 at
 0.10.0-rc.0: version 2 grew several result structs; version 3 made
-`empyrean_determine` and `empyrean_transform_coordinates` batched).
+`empyrean_determine` and `empyrean_transform_coordinates` batched.
 0.10.0's ABI is one batched break carrying the joint covariance across
 the boundary, plus the riders queued behind a break:
 
@@ -530,7 +540,7 @@ the boundary, plus the riders queued behind a break:
   non-grav 3×3, the border and the carrier onto `EmpyreanOrbitBatch` rather
   than reporting them absent.
 
-**Layout: appended everywhere but one, and that one SHRINKS a struct.** Every
+**Layout: appended everywhere but one, and that one SHRINKS two structs.** Every
 earlier version of this ABI could say "fields are only ever appended, never
 reordered or removed". The 0.10.0 ABI cannot. Replacing
 `EmpyreanSolveFor::thrust_segments` (a `uint32_t`) with
@@ -538,8 +548,8 @@ reordered or removed". The 0.10.0 ABI cannot. Replacing
 6 and its alignment from 4 to 1, which shifts every field after
 `solve_for_flags` inside the `EmpyreanODConfig` that embeds it —
 `allow_unbracketed_maneuvers` 392→390, `has_photometry` 393→391, `photometry`
-400→392 — and shrinks that config 432→424. It is the first struct on this ABI
-to get smaller.
+400→392 — and shrinks that config 432→424 in turn. `EmpyreanSolveFor` and
+`EmpyreanODConfig` are the first structs on this ABI to get smaller.
 
 A consumer with a hand-mirrored `EmpyreanODConfig` must therefore re-derive
 its whole layout, not merely append: keeping an existing prefix and writing
@@ -856,7 +866,7 @@ degrees, ICRF), one point per optical candidate — radar candidates carry
 no sky-plane prediction. Free the result with
 `empyrean_plan_result_free`.
 
-`EmpyreanObservatoryConfig` gained two visibility limits in v4:
+`EmpyreanObservatoryConfig` gained two visibility limits in the 0.10.0 ABI:
 `min_elevation_deg` (geometric elevation above the site's local horizon,
 ignoring refraction — `0.0` is the geometric horizon and the engine's default,
 the least-opinionated statement the geometry can make rather than an observing
@@ -868,11 +878,27 @@ at or below which the site counts as dark; unset takes the engine's default of
 centre on the geometric horizon — so a defaulted zero would quietly plan a
 campaign in daylight.
 
-**No entry point exported by this ABI reads them yet.** The engine applies
-them in its visibility computation, which has no C entry point, and
-`empyrean_evaluate_plan` — the one exported consumer of this struct — does not
-call it. They ride the struct so that exposing visibility later needs no
-further ABI break.
+**No entry point exported by this ABI applies them.** Both values are
+marshaled across in full and reach the engine's own observatory config, but
+the gates that read them belong to the engine's visibility survey, which has
+no C entry point. `empyrean_evaluate_plan` — the one exported consumer of this
+struct — consults the site-invariant pair alone (solar elongation and, on
+this entry point vacuously, apparent magnitude), so
+`EmpyreanPlanCandidate::observable` means "not ruled out from Earth", not
+"schedulable from this site": a candidate can be observable at an epoch when
+the target is under that site's horizon or the sky above it is bright.
+Setting either limit therefore changes no number this ABI returns.
+They ride the struct so that exposing the survey later needs no further ABI
+break.
+
+The struct's other two filters — `max_apparent_mag` and `min_elongation_deg` —
+are the ones `empyrean_evaluate_plan` does consult.
+
+One channel difference worth knowing before porting: this ABI accepts a
+populated `EmpyreanPlanningConfig::observatories` array and marshals it, while
+the safe Rust wrapper and the Python package **refuse** a non-empty list by
+name. The three agree on what the call computes; they differ in whether a
+config the entry point does not fully consult is an error.
 
 ## Basis-tagged mixture components
 

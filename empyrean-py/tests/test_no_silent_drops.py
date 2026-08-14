@@ -1068,7 +1068,7 @@ def test_b_planes_no_silent_drops() -> None:
     assert not (bad_null or bad_not_null), _format_failures("BPlanes", bad_null, bad_not_null)
 
 
-# ── Non-grav covariance reaches the engine (empyrean-3qoe) ────────────
+# ── Non-grav covariance reaches the engine ───────────────────────────
 #
 # The forward-model marshals (propagate / generate_ephemeris / impact) used to
 # silently drop the fitted non-grav 3x3 covariance (`ng_covariance`) that the

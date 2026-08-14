@@ -410,7 +410,10 @@ impl SolveFor {
     pub fn with_leading_thrust(mut self, segments: usize) -> crate::error::Result<Self> {
         if segments > MAX_THRUST_SEGMENTS {
             return Err(crate::error::Error::invalid_input(format!(
-                "requested {segments} thrust segments but the engine's maximum is                  {MAX_THRUST_SEGMENTS} — the 17-column wide budget is shared across                  the state, Marsden, DT, AMRAT and thrust axes"
+                "requested {segments} thrust segments but the engine's \
+                 maximum is {MAX_THRUST_SEGMENTS} — the 17-column wide budget \
+                 is shared across the state, Marsden, DT, AMRAT and thrust \
+                 axes"
             )));
         }
         for d in self.thrust.iter_mut().take(segments) {

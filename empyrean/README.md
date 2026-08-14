@@ -871,6 +871,16 @@ sitting next to the loaded module, else a build-time location — an
 a checksum-pinned prebuilt downloaded from the GitHub release (in
 that order); no system library path setup is required.
 
+Whichever path resolves, the library must be the one built for **this
+crate's version**. empyrean-sys calls `empyrean_abi_version()` the moment
+it opens `libempyrean` and compares it against the `EMPYREAN_ABI_VERSION`
+it compiled with; any mismatch fails there and then, naming both numbers
+and the resolved path, rather than reading your arguments through a
+layout that moved. The number encodes the release, so pairing across
+releases is exactly what it rejects (pre-releases of a version share its
+number). The bundled and downloaded artifacts satisfy this by
+construction — only a hand-set `EMPYREAN_LIB` can pair the wrong two.
+
 Prebuilt engine binaries are currently published for four targets —
 macOS arm64 (`macos-aarch64`), macOS x86_64 (`macos-x86_64`), Linux
 x86_64 (`linux-x86_64`), and Linux aarch64 (`linux-aarch64`); on other

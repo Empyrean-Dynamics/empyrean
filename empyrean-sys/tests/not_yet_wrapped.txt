@@ -2,6 +2,11 @@
 # safe Rust wrapper (`empyrean/src`). One entry per line, `name | reason`.
 # Blank lines and `#` comments are ignored.
 #
+# SCOPE: the Rust wrapper channel only. This file records what `empyrean/src`
+# leaves unconsumed — nothing here says anything about the Python binding or
+# the CLI, and tests/capability_parity.rs scans no source root but this one.
+# A symbol wired in the wrapper and forgotten in another channel passes.
+#
 # This list is REVERSE-ENFORCED by tests/capability_parity.rs: an entry whose
 # symbol has since been wrapped fails the gate so the stale line is removed,
 # and an entry naming a symbol that is not in tests/abi_surface.txt fails too.

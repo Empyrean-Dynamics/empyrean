@@ -402,9 +402,20 @@ threshold, information loss), the influence diagnostics, the
 along / cross-track decomposition, and the radar block — in parquet, CSV,
 and JSON alike, all three emitted from one column table so they cannot
 disagree. The fitted-orbit CSV carries the same 82-column schema as the
-parquet, covariance included, rather than a lossy projection of it; a
-batch whose wide cross-covariance the row schema cannot express is
-refused rather than written short.
+parquet, covariance included, rather than a lossy projection of it.
+
+Parquet additionally carries the **wide cross-covariance** — the
+state↔parameter and parameter↔parameter terms beyond the state+Marsden
+9×9 — in a tagged tail, so a fitted orbit round-trips through a parquet
+file with the joint the fit actually computed rather than its diagonal
+blocks. It is the only orbit format here that can, and the other two
+refuse such a batch by name rather than writing it short — both pointing
+at parquet. CSV cannot because the schema makes the difference between
+an absent cross and a supplied zero cross load-bearing, and CSV renders
+both as an empty cell; the JSON orbit format is this crate's own flat
+row shape, carrying the 6×6 and nothing beyond it. A carrier holding
+thrust Δv terms is refused wherever it is offered, because no orbit-file
+format can serialize the thrust arcs those terms describe.
 
 Residual rows are typed by observable. Optical rows carry the RA / Dec
 and along / cross-track residuals with the track-frame pair's full

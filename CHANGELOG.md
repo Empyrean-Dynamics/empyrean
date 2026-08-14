@@ -6,7 +6,250 @@ project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
-(Nothing yet.)
+### Added
+
+- **The joint solved-parameter covariance crosses the boundary, in both
+  directions.** A fit over the state and its parameters produces one
+  \((6+P) \times (6+P)\) matrix, and until now only its diagonal blocks
+  could cross the C ABI — the 6×6, the Marsden 3×3, a DT variance, an
+  AMRAT variance, a per-segment thrust 3×3. A caller who fitted an orbit
+  and re-propagated it therefore handed the engine a block-diagonal
+  covariance, which is not a conservative approximation of the real one
+  but a different claim: that the data producing the state and the data
+  producing \(A_2\) were independent, when they are the same
+  observations through the same fit.
+  `CoordinateState` now carries the state↔Marsden border
+  (`has_non_grav_cross` / `non_grav_cross`), placed beside the 6×6 it
+  borders so a coordinate transform moves the pair together.
+  `EmpyreanOrbit` carries the rest as two identity-tagged side arrays,
+  `state_param_cross` and `param_pair_cross`. Entries name the
+  *parameter* — `EMPYREAN_PARAM_COLUMN_MARSDEN` / `_DT` / `_AMRAT` /
+  `_THRUST` — never a column index, because which column a parameter
+  occupies depends on which *other* parameters the orbit declares:
+  adding an SRP AMRAT shifts the thrust columns by one, and an
+  index-keyed input would attach one parameter's correlations to another
+  with every number finite and every gate passed. Entry order is
+  therefore not contract, and a repeated entry (including a pair in its
+  swapped form) is refused rather than resolved last-one-wins.
+  Nine of the ten orbit-reading entry points consume it; the tenth,
+  `empyrean_evaluate`, forms no prior — it measures residuals against a
+  fixed orbit — so a supplied joint affects no output there and is
+  returned unchanged rather than dropped. The file writers receive it.
+- **Propagation reports the joint it computed, so legs chain.** Every
+  `EmpyreanPropagatedState` gains `orbit_cov` — the propagated
+  state↔Marsden border and wide carrier at that epoch — and
+  `EmpyreanODResult::orbit` carries the same struct under the same name.
+  `covariance` alone is only the state block; the joint the engine
+  computes has non-zero state↔parameter columns **even when the input
+  was block-diagonal**, because propagation itself generates that
+  correlation. Chaining legs on the 6×6 alone therefore quoted a tighter
+  uncertainty than the propagation supports, and there was no way to
+  read the rest out. Now leg 2's input is leg 1's output, field for
+  field, with no slot arithmetic: `propagate → propagate` and
+  `determine → propagate` are the same copy. The posterior blocks are
+  read off the object the engine already made coherent — the fitted
+  orbit, or the propagated row — never re-derived from a slot-tagged
+  matrix, whose *solved* layout disagrees with a re-fed orbit's
+  *declared* one the moment the fit did not solve every declared axis.
+
+- **Parameter dispositions replace solve-for flags.** Each axis on
+  `EmpyreanSolveFor` now says what the fit *does* with that parameter:
+  `EMPYREAN_PARAM_FIXED` (marginalized out, changes no number),
+  `EMPYREAN_PARAM_SOLVED` (estimated), or `EMPYREAN_PARAM_CONSIDERED`
+  (not estimated, but its prior uncertainty reaches the posterior
+  through its measurement partials). A considered axis is not a safety
+  margin: with a correlated prior the cross-dependent terms are
+  sign-indefinite and the posterior can come back *tighter*.
+  `EmpyreanODResult::dispositions` echoes the partition the fit actually
+  ran, which is what tells a caller whether re-attaching a prior to an
+  axis double-counts it.
+
+- **A structured warning channel on OD results.**
+  `EmpyreanODResult::warnings` reports supplied covariance a fit
+  deliberately did not use — delivered payload rather than a log line,
+  since a dropped prior cross term changes how the σ for that slot
+  should be read.
+
+- **Parquet orbit files carry the wide cross-covariance.** It gains a
+  tagged tail for the state↔parameter and parameter↔parameter terms, and
+  it is the only orbit format here that can carry them. The other two
+  refuse by name rather than writing a row short:
+
+  CSV refuses because this schema makes the difference between an absent
+  cross and a supplied zero cross load-bearing, and CSV renders both as
+  an empty cell. The JSON orbit format — this crate's own flat row
+  shape, not the engine's schema — refuses because it holds the 6×6 and
+  nothing beyond it; both refusals name parquet. A carrier holding
+  thrust terms is refused everywhere, since no orbit format can
+  serialize the thrust arcs those terms describe.
+
+  Silence was the alternative worth avoiding: a file written short reads
+  back as a block-diagonal joint, which is a tighter claim than the
+  caller held, with nothing in the round trip to signal it.
+
+- **`EmpyreanObservatoryConfig` matches the engine's observatory
+  config.** It gains `min_elevation_deg` and `max_sun_altitude_deg`
+  (behind `has_max_sun_altitude_deg`, since `0.0` is a legal solar
+  altitude and a zero-init struct must not quietly plan a campaign in
+  daylight — the switch resolves it to the engine's astronomical-twilight
+  default).
+
+  **No entry point exported by this ABI reads them yet.** The engine
+  applies both in its visibility computation, which has no C entry point;
+  `empyrean_evaluate_plan`, the one exported function that consumes this
+  struct, does not call it. The fields ride the struct now so that
+  exposing visibility later needs no further ABI break — stated plainly
+  because a config field that looks live and is inert is worse than an
+  absent one.
+
+- **`EMPYREAN_REJECTION_PER_OBSERVATION_SITE_REQUIRED` (15).** The
+  roving-observer codes `247` / `270` and the occultation code `275`
+  name sites whose position travels with each observation. Distinct from
+  `UNSUPPORTED_OBSERVATORY` (the code is well known) and from
+  `SPACECRAFT_KERNEL_MISSING` (nothing needs loading): the fix is to
+  supply the coordinates the ADES record already carries per
+  observation.
+
+- **Two new entry points read the propagated joint:
+  `empyrean_propagation_joint_at` and `empyrean_orbit_covariance_free`.**
+  The first returns the state↔Marsden border and the wide carrier at one
+  `(orbit_index, epoch_index)` — the cross terms that
+  `EmpyreanTaggedCovariance::matrix` is the state block of; the second
+  releases the two arrays it allocates.
+
+  They are a separate call rather than fields on the tagged-covariance
+  struct because that struct is plain old data: a caller declares one on
+  the stack, fills it through `empyrean_propagation_covariance_at_cartesian`,
+  and frees nothing. Hanging owned arrays off it would have made every
+  such caller — code that is correct today and recompiles without a
+  murmur — leak two allocations per call. Nothing would fail; memory
+  would simply grow. So the joint is opt-in, and the tagged covariance
+  keeps its contract. `has_non_grav_cross = 0` with null carrier
+  pointers means the engine produced no cross terms at that row, never
+  that they were zero.
+
+  These are the only two symbols ABI v4 adds; every other change in it
+  is a struct, a struct field, or a constant.
+
+- **The joint reaches Python, in both directions.** Every orbit table
+  gains a `wide_cross` sub-table and `NonGravParams` gains
+  `non_grav_cross`, the 6×3 state↔Marsden border. Both are populated
+  from the engine — on a fit's returned orbit, on every propagated
+  state, and on the provenance-tagged covariance readback — and both are
+  consumed on the way back in by `propagate`, `determine`, `evaluate`
+  and `refine`, so a Python chain carries the joint the engine computed
+  instead of its diagonal blocks. A chained propagation now reproduces
+  the single-leg answer; on the same input, dropping the cross terms
+  understates the propagated position variance.
+
+  Entries are keyed by parameter name (`"AMRAT"`, `"thrust[0].x"`)
+  through `WideCross.state_cross` / `.param_cross`, which refuse to
+  reshape a row whose tags and payload disagree rather than attaching
+  one parameter's covariances to another. Absence is a null row, never a
+  row of zeros: an absent correlation and a measured zero correlation
+  are different claims, and only the second is one the engine's
+  definiteness gate should see. `SolveFor` axes take
+  `ParamDisposition` tags in place of booleans, and a bool is refused by
+  name — `False` cannot say whether an axis was considered or fixed.
+
+
+
+
+### Fixed
+
+- **The impact and B-plane paths dropped the caller's non-grav DT.**
+  Both marshaled the DT *prior variance* while hardcoding the DT *value*
+  absent, so a DT comet's \(g(r)\) was evaluated at zero delay on the
+  two entry points where an understated joint does the most damage.
+  Those paths also dropped the Marsden 3×3, as did the ephemeris path;
+  all three now route through the shared marshaling helper that the
+  propagation and OD paths already used.
+
+  One behaviour change rides that routing and is called out rather than
+  folded in: those three paths and the orbit-file writer now share the
+  propagation path's non-grav **presence rule**, under which an orbit
+  declaring a non-grav covariance or a DT prior carries a non-grav model
+  even with all-zero A coefficients. That opens Marsden columns these
+  paths previously left closed.
+
+- **The orbit-file read path reported no non-grav covariance.** Orbit
+  files have carried a `cov_dim = 9` state+Marsden joint since long
+  before this release, and `empyrean_orbits_read_*` discarded it. The
+  batch now carries it, along with the border and the carrier.
+
+- **A solved DT posterior had no wire.** `EmpyreanNonGravParams` gains
+  `has_dt_variance` / `dt_variance`; a solved-DT fit used to round-trip
+  with its DT column closed.
+
+- **Posterior blocks are sourced from the fitted orbit.** The non-grav
+  3×3, the DT variance and the AMRAT variance previously came from
+  `covariance_9x9`, which is populated only for the width-9 Marsden fit
+  — while every fit carrying a wide joint is wider than 9 by
+  construction. The two sets are disjoint, so the old source reported an
+  absent covariance and a zero 3×3 for every such fit while the fitted
+  orbit held the posterior. `covariance_9x9` remains populated for its
+  deprecation window and is no longer a source.
+
+### Changed
+
+- **The engine pin advances to empyrean-core v0.10.1.** The release
+  that carries everything above: the wide cross-covariance wire format
+  and its units channel, the correlated joint prior with full
+  Schmidt–Kalman consider analysis, the tri-state solve partition, and
+  the per-site elevation and darkness visibility gates. Cross-free
+  fits are bit-identical to the previous engine generation over the
+  full validation catalog (61/61 orbit-determination rows, 8958/8958
+  propagation and ephemeris rows), so existing results do not move.
+
+- **Struct sizes and the one shrink.** Nine frozen structs change size:
+  `CoordinateState` by the border (360 → 512), `EmpyreanOrbit` by the
+  carrier arrays (648 → 832), `EmpyreanPropagatedState` by `orbit_cov`
+  (2392 → 2576), `EmpyreanNonGravParams` by the DT variance pair
+  (160 → 176), `EmpyreanObservatoryConfig` by the visibility fields
+  (40 → 64), `EmpyreanODResult` by the joint, dispositions, thrust
+  posteriors and warnings (7688 → 8128) — which also grows the
+  `EmpyreanODObjectResult` that embeds it (7720 → 8160) — and
+  `EmpyreanSolveFor` **shrinks** 8 → 6.
+
+  That last one is the exception to a rule every previous version of
+  this ABI could state without qualification. Replacing
+  `thrust_segments` (a `u32`) with `thrust_dispositions[3]` (three
+  `u8`s) also drops the struct's alignment from 4 to 1, so every field
+  after `solve_for_flags` inside `EmpyreanODConfig` shifts —
+  `allow_unbracketed_maneuvers` 392 → 390, `has_photometry` 393 → 391,
+  `photometry` 400 → 392 — and that config shrinks 432 → 424. **It is
+  the first struct on this ABI to get smaller.** A consumer with a
+  hand-mirrored `EmpyreanODConfig` must re-derive its whole layout
+  rather than appending to it: keeping the old prefix writes
+  `photometry` eight bytes past where the library reads it, corrupting
+  it and the two bytes before it with no diagnostic. Every other struct
+  above grows at the tail.
+
+- **`EMPYREAN_ABI_VERSION` is 4**, a single batched break. Two changes
+  are semantic rather than additive and are called out here rather than
+  left to be discovered:
+
+  `EmpyreanSolveFor`'s `marsden` / `dt` / `amrat` become the tri-state
+  above. `0` and `1` keep their exact former meaning, so `memset(0)` and
+  every value an older caller could write are unchanged — but a *new*
+  caller writing `2` against a library built before v4 would hit a bare
+  non-zero test and get the axis silently solved, so the boundary
+  validates `0 | 1 | 2` strictly and the version handshake is what makes
+  a dynamically-loaded mismatch fail at the check rather than in the
+  physics. `EmpyreanSolveFor::thrust_segments` (a count) is replaced by
+  `thrust_dispositions[3]` (one per declared segment): two counts cannot
+  say *which* burn is considered, and a three-segment orbit with only
+  the middle burn solved is now a routine case.
+
+  `EmpyreanODResult::thrust_delta_m_per_s` is re-indexed from solved to
+  declared segment order, and `thrust_delta_count` becomes the declared
+  count. Every per-segment array on the result — Δv, covariance,
+  disposition — now shares one index space, and an unsolved segment's Δv
+  is NaN-filled exactly as its covariance is. Under the old pairing a
+  consumer reading `thrust_delta_m_per_s[i]` beside
+  `thrust_correction_covariances[i]` would have attributed a Δv to the
+  wrong burn's covariance the moment any segment was considered or
+  fixed.
 
 ## [0.10.0-rc.0] — 2026-08-09
 

@@ -567,7 +567,7 @@ mod batch_contract_tests {
         );
     }
 
-    /// A state with no border transforms exactly as it did before v4 —
+    /// A state with no border transforms exactly as it did before 0.10.0 —
     /// the zero-init contract, exercised through the shipped entry
     /// point rather than asserted about the struct.
     #[test]

@@ -19,9 +19,11 @@ channel rides on. It compiles to a single cdylib (`libempyrean.dylib`
 on macOS / `.so` on Linux / `.dll` on Windows) plus a generated C
 header (`include/empyrean.h`) emitted by `cbindgen`.
 
-Current release: **0.10.0-rc.0**, exporting **ABI version 4**
-(`EMPYREAN_ABI_VERSION`, readable at run time from
-`empyrean_abi_version()`).
+Current release: **0.10.0-rc.0**. The C ABI carries the distribution's
+own version — `EMPYREAN_ABI_VERSION` encodes it as
+`major * 10000 + minor * 100 + patch` (0.10.0 is `1000`), readable at
+run time from `empyrean_abi_version()`, and it advances with every
+release whether or not any boundary type changed.
 
 It is **not published to crates.io** — Rust callers should use the
 [`empyrean`](https://crates.io/crates/empyrean) safe wrapper crate or
@@ -479,14 +481,16 @@ no solved-parameter block, when its layout is Marsden-only (the whole border
 is then in `non_grav_cross` and there is no carrier), or when a sigma-point
 run could not reconstruct that row.
 
-### ABI version 4
+### The 0.10.0 ABI
 
 A consumer compiled against a given `EMPYREAN_SOLVE_WIDTH` should confirm
 the runtime library agrees by checking `empyrean_abi_version()` against
-`EMPYREAN_ABI_VERSION` at load. Version 2 grew several result structs;
-version 3 made `empyrean_determine` and `empyrean_transform_coordinates`
-batched. Version 4 is one batched break carrying the joint covariance across
-the boundary, plus the riders queued behind a version bump:
+`EMPYREAN_ABI_VERSION` at load. The ABI is versioned by the distribution
+release that ships it (the retired independent counter reached 3 at
+0.10.0-rc.0: version 2 grew several result structs; version 3 made
+`empyrean_determine` and `empyrean_transform_coordinates` batched).
+0.10.0's ABI is one batched break carrying the joint covariance across
+the boundary, plus the riders queued behind a break:
 
 - **The joint**, input and output, as described above — plus
   `EmpyreanNonGravParams` gaining `has_dt_variance` / `dt_variance`, which had
@@ -528,7 +532,7 @@ the boundary, plus the riders queued behind a version bump:
 
 **Layout: appended everywhere but one, and that one SHRINKS a struct.** Every
 earlier version of this ABI could say "fields are only ever appended, never
-reordered or removed". Version 4 cannot. Replacing
+reordered or removed". The 0.10.0 ABI cannot. Replacing
 `EmpyreanSolveFor::thrust_segments` (a `uint32_t`) with
 `thrust_dispositions[3]` (three `uint8_t`s) takes that struct from 8 bytes to
 6 and its alignment from 4 to 1, which shifts every field after

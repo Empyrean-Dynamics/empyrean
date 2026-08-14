@@ -520,7 +520,7 @@ pub const EMPYREAN_SLOT_NONE: u32 = 0xFFFF_FFFF;
 
 // ── Per-axis parameter dispositions ───────────────────────────────
 // The tri-state on `EmpyreanSolveFor` and the per-segment thrust
-// disposition arrays. `0` and `1` are what the pre-v4 boolean flags
+// disposition arrays. `0` and `1` are what the retired boolean flags
 // meant, so `memset(0)` is unchanged; `2` is new.
 /// The axis is marginalized out of the prior in covariance space. It
 /// contributes nothing and changes no number. The zero-init default,
@@ -575,7 +575,7 @@ pub const EMPYREAN_PHOTOMETRY_MODEL_HG1G2: i32 = 4;
 /// Consumers compiled against a given `EMPYREAN_SOLVE_WIDTH` check this at
 /// load; any additive change to the frozen structs bumps it.
 ///
-/// Version 4 (this one) is a single, batched break carrying the joint
+/// This release's ABI (0.10.0) is a single, batched break carrying the joint
 /// solved-parameter covariance across the boundary in both directions,
 /// plus the riders that were queued behind a version bump. Every change,
 /// in full:
@@ -720,8 +720,8 @@ pub const EMPYREAN_PHOTOMETRY_MODEL_HG1G2: i32 = 4;
 ///   rather than reporting them absent.
 ///
 /// **Layout: appended everywhere but one, and that one SHRINKS a
-/// struct.** Every other version of this ABI could say "fields are only
-/// ever appended, never reordered or removed". Version 4 cannot, and
+/// struct.** Every earlier release of this ABI could say "fields are only
+/// ever appended, never reordered or removed". This one cannot, and
 /// the exception is stated here rather than left for a consumer to
 /// discover by corruption: replacing `EmpyreanSolveFor::thrust_segments`
 /// (a `u32`) with `thrust_dispositions[3]` (three `u8`s) takes that
@@ -747,7 +747,17 @@ pub const EMPYREAN_PHOTOMETRY_MODEL_HG1G2: i32 = 4;
 /// one either way, and `empyrean_abi_version()` is what makes a
 /// dynamically-loaded mismatch fail at the version check rather than in
 /// the physics.
-pub const EMPYREAN_ABI_VERSION: u32 = 4;
+///
+/// **The version scheme.** The C ABI carries the distribution's own
+/// version, encoded \(\text{major} \times 10000 + \text{minor}
+/// \times 100 + \text{patch}\) — 0.10.0 is `1000`. It advances with
+/// every distribution release whether or not any boundary type changed:
+/// the ABI is versioned by the release that ships it, not by an
+/// independent counter. Values below 1000 are the retired independent
+/// counter, which reached 3 at 0.10.0-rc.0. Pre-releases of a version
+/// share its number; the full release string, including any pre-release
+/// suffix, is `empyrean_version_string()`.
+pub const EMPYREAN_ABI_VERSION: u32 = 1000;
 
 /// Runtime accessor for [`EMPYREAN_ABI_VERSION`] — lets a dynamically
 /// linked consumer confirm the loaded library's frozen-shape contract
@@ -1099,7 +1109,7 @@ pub struct EmpyreanNonGravParams {
     /// Prior/posterior variance on the non-grav time delay DT (days²).
     /// Only meaningful when `has_dt_variance = 1`.
     ///
-    /// The DT posterior had no wire at all before v4: the fitted
+    /// The DT posterior had no wire at all before 0.10.0: the fitted
     /// variance existed on the orbit and simply could not cross the ABI,
     /// so a solved-DT fit round-tripped with its DT column closed. Copy
     /// it onto `EmpyreanOrbit::non_grav_dt_variance` to re-open and
@@ -1167,19 +1177,20 @@ pub struct EmpyreanSRPParams {
 /// # Zero-init and the version handshake
 ///
 /// `0` is `FIXED` and `1` is `SOLVED`, which is exactly what the `0` /
-/// `1` of the pre-v4 boolean flags meant, so a `memset(0)` config and
+/// `1` of the retired boolean flags meant, so a `memset(0)` config and
 /// every value an older caller could have written are unchanged.
 ///
 /// The widening is only safe in that direction. A caller writing `2`
-/// for CONSIDERED against a library built before v4 would hit a bare
+/// for CONSIDERED against a pre-0.10.0 library would hit a bare
 /// non-zero test and get the axis **silently solved** — a wider solved
 /// set, a different fitted answer, and no error anywhere. Two things
 /// prevent it: this boundary refuses any value outside `0 | 1 | 2` by
 /// name and value, so a future fourth value fails loudly here rather
 /// than degrading silently; and the tri-state rides the
-/// [`EMPYREAN_ABI_VERSION`] 4 bump, so
+/// [`EMPYREAN_ABI_VERSION`] break at 0.10.0, so
 /// [`empyrean_abi_version`] is what makes the mismatch legible to a
-/// caller compiled against 4 and dynamically loaded against 3.
+/// caller compiled against 0.10.0's ABI and dynamically loaded
+/// against an earlier library.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct EmpyreanSolveFor {
@@ -6794,7 +6805,7 @@ mod parameter_partition_tests {
     /// land on the same index — 1 — and the two unsolved neighbours are
     /// NaN in both.
     ///
-    /// Under the pre-v4 pairing the Δv array was in SOLVED order, so the
+    /// Under the retired pairing the Δv array was in SOLVED order, so the
     /// single solved burn's Δv sat at index 0 while its covariance sat
     /// at index 1: a consumer reading `thrust_delta_m_per_s[i]` beside
     /// `thrust_correction_covariances[i]` would have attributed the
@@ -7155,7 +7166,7 @@ mod od_output_joint_tests {
         unsafe { empyrean_determine_results_free(&mut results) };
     }
 
-    /// The DT variance wire, both directions: it had none before v4, so
+    /// The DT variance wire, both directions: it had none before 0.10.0, so
     /// a solved-DT fit round-tripped with its DT column closed. Pinned
     /// on the marshal contract rather than on a DT fit, which needs a
     /// comet arc this crate does not bundle.

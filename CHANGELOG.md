@@ -131,7 +131,7 @@ project adheres to [Semantic Versioning](https://semver.org).
   pointers means the engine produced no cross terms at that row, never
   that they were zero.
 
-  These are the only two symbols ABI v4 adds; every other change in it
+  These are the only two symbols this release's ABI adds; every other change in it
   is a struct, a struct field, or a constant.
 
 - **The joint reaches Python, in both directions.** Every orbit table
@@ -265,14 +265,19 @@ project adheres to [Semantic Versioning](https://semver.org).
   it and the two bytes before it with no diagnostic. Every other struct
   above grows at the tail.
 
-- **`EMPYREAN_ABI_VERSION` is 4**, a single batched break. Two changes
-  are semantic rather than additive and are called out here rather than
-  left to be discovered:
+- **The C ABI is now versioned by the distribution release.**
+  `EMPYREAN_ABI_VERSION` encodes the distribution's own version as
+  `major * 10000 + minor * 100 + patch` — 0.10.0 reports `1000` — and
+  advances with every release whether or not any boundary type changed.
+  Values below 1000 are the retired independent counter, which reached 3
+  at 0.10.0-rc.0. This release's break is a single batched one; two
+  changes are semantic rather than additive and are called out here
+  rather than left to be discovered:
 
   `EmpyreanSolveFor`'s `marsden` / `dt` / `amrat` become the tri-state
   above. `0` and `1` keep their exact former meaning, so `memset(0)` and
   every value an older caller could write are unchanged — but a *new*
-  caller writing `2` against a library built before v4 would hit a bare
+  caller writing `2` against a pre-0.10.0 library would hit a bare
   non-zero test and get the axis silently solved, so the boundary
   validates `0 | 1 | 2` strictly and the version handshake is what makes
   a dynamically-loaded mismatch fail at the check rather than in the

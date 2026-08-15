@@ -156,7 +156,9 @@ jobs:
       # intra-doc links or other warnings — catches dangling [`Foo`]
       # references in /// comments before they become broken HTML.
       - name: Build rustdoc (deny warnings)
-        run: cargo doc --no-deps -p empyrean -p empyrean-c
+        run: |
+          cargo doc --no-deps -p empyrean-c
+          cargo doc --no-deps -p empyrean
         env:
           RUSTDOCFLAGS: --html-in-header docs/katex-header.html -D warnings
           EMPYREAN_DATA_DIR: ${{ github.workspace }}/data
@@ -296,7 +298,7 @@ jobs:
         run: curl -LsSf https://astral.sh/uv/install.sh | sh
 
       - name: Install Python dependencies
-        run: uv pip install --system maturin numpy pyarrow quivr pytest pytest-benchmark pandas astropy==8.0.1 ruff==0.16.0
+        run: uv pip install --system maturin numpy pyarrow quivr pytest pytest-benchmark pandas "astropy==8.0.1; python_version >= '3.11'" "astropy==6.1.7; python_version < '3.11'" ruff==0.16.0
 
       - name: Lint Python (ruff check + ruff format --check)
         run: |

@@ -449,6 +449,26 @@ project adheres to [Semantic Versioning](https://semver.org).
   wrong burn's covariance the moment any segment was considered or
   fixed.
 
+## [0.10.0-rc.1] — 2026-08-15
+
+### Fixed
+
+- **The v0.10.0-rc.0 GitHub release served 0.9.0-era engine binaries.** The
+  release pipeline reuses the tarballs prepared by `prepare-release.yml` and
+  verifies them against the committed `empyrean-sys/checksums.txt`; the
+  Prepare step was not run for rc.0, so the latest prepared tarballs — and
+  the committed pins they hash-match — were both from v0.9.0, and the
+  fail-closed verification passed on a stale-but-consistent pair. Rust
+  consumers of the rc.0 crates build successfully and then fail at the
+  first `Context` construction with a missing-symbol error; the PyPI wheels
+  are unaffected (they embed their own engine library). rc.1 is a rebuild
+  and republish of the same rc.0 library surface — no library-code changes.
+- **The release workflow now checks pin currency, not just consistency**:
+  it refuses to publish unless `checksums.txt` is stamped for the exact tag
+  being released, and unless the header bundled in every served tarball is
+  byte-identical to `include/empyrean.h` in the tagged tree.
+
+
 ## [0.10.0-rc.0] — 2026-08-09
 
 C ABI version **3**. Three exported functions change signature, nine are

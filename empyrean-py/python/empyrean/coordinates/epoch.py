@@ -2,6 +2,7 @@
 
 import enum
 from collections.abc import Sequence
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -54,6 +55,12 @@ class Epochs(qv.Table):
     string (``"utc"`` / ``"tdb"``, case-insensitive) or a
     :class:`TimeScale` enum value.
 
+    Every empyrean entry point that takes a time takes one of these.
+    A bare list, array or float is refused: it carries no time scale,
+    and the same number read as UTC and as TDB names two instants
+    about 69 seconds apart. Naming the scale is the point — see
+    :func:`from_mjd`, whose ``scale`` argument is required.
+
     Parameters
     ----------
     mjd : array-like
@@ -76,8 +83,13 @@ class Epochs(qv.Table):
     def to_tdb(self) -> "Epochs":
         """Convert to TDB.
 
-        Returns self unchanged if already TDB. Uses villeneuve's
-        leap-second + TDB-TT secular term conversion.
+        Returns self unchanged if already TDB. Applies the engine's
+        leap-second table for UTC↔TAI↔TT and the full periodic
+        Fairhead & Bretagnon (1990) series for TT↔TDB — not a
+        secular-only truncation, so the few-millisecond annual term is
+        carried. Cross-validated against astropy (ERFA) in
+        ``tests/test_time_scale_astropy_parity.py``, where the two agree
+        bit for bit over the modern era.
         """
         if self.scale == TimeScale.TDB.value:
             return self
@@ -316,9 +328,18 @@ class Epochs(qv.Table):
         start: float,
         end: float,
         num: int = 50,
-        scale: ScaleArg = TimeScale.TDB,
+        *,
+        scale: ScaleArg,
     ) -> "Epochs":
-        """Create evenly spaced epochs between ``start`` and ``end``."""
+        """Create evenly spaced epochs between ``start`` and ``end``.
+
+        ``start`` and ``end`` are MJD in ``scale``, which is required
+        (see :meth:`from_mjd`) and keyword-only here because ``num``
+        sits between them.
+
+        >>> Epochs.linspace(60500.0, 60510.0, 11, scale="tdb").scale
+        'tdb'
+        """
         scale_str = _scale_str(scale)
         mjd = np.linspace(float(start), float(end), num)
         return cls.from_kwargs(mjd=mjd, scale=scale_str)
@@ -329,9 +350,18 @@ class Epochs(qv.Table):
         start: float,
         end: float,
         step: float = 1.0,
-        scale: ScaleArg = TimeScale.TDB,
+        *,
+        scale: ScaleArg,
     ) -> "Epochs":
-        """Create epochs from ``start`` to ``end`` (exclusive) with a fixed step."""
+        """Create epochs from ``start`` to ``end`` (exclusive) with a fixed step.
+
+        ``start``, ``end`` and ``step`` are MJD (and days) in ``scale``,
+        which is required (see :meth:`from_mjd`) and keyword-only here
+        because ``step`` sits between them.
+
+        >>> Epochs.arange(60500.0, 60505.0, 1.0, scale="tdb").scale
+        'tdb'
+        """
         scale_str = _scale_str(scale)
         mjd = np.arange(float(start), float(end), float(step))
         return cls.from_kwargs(mjd=mjd, scale=scale_str)
@@ -368,14 +398,22 @@ class Epochs(qv.Table):
     def from_mjd(
         cls,
         mjd: float | Sequence[float] | np.ndarray,
-        scale: ScaleArg = TimeScale.TDB,
+        scale: ScaleArg,
     ) -> "Epochs":
         """Construct from MJD values + an explicit scale.
 
         Single-line shorthand for ``Epochs.from_kwargs(mjd=..., scale=...)``.
 
-        >>> Epochs.from_mjd(60500.0)
-        >>> Epochs.from_mjd([60500.0, 60501.0], scale="utc")
+        ``scale`` is required and has no default. A Modified Julian Date
+        is a clock reading, not an instant: 61000.5 UTC and 61000.5 TDB
+        are about 69 seconds apart today, and the gap grows with every
+        leap second. Which one you mean is a modelling statement, so it
+        is stated here rather than inherited from a default.
+
+        >>> Epochs.from_mjd(60500.0, scale="tdb").scale
+        'tdb'
+        >>> Epochs.from_mjd([60500.0, 60501.0], scale="utc").scale
+        'utc'
         """
         scale_str = _scale_str(scale)
         arr = np.atleast_1d(np.asarray(mjd, dtype=np.float64))
@@ -385,9 +423,15 @@ class Epochs(qv.Table):
     def from_jd(
         cls,
         jd: float | Sequence[float] | np.ndarray,
-        scale: ScaleArg = TimeScale.TDB,
+        scale: ScaleArg,
     ) -> "Epochs":
-        """Construct from Julian Date values (converts to MJD = JD - 2400000.5)."""
+        """Construct from Julian Date values (converts to MJD = JD - 2400000.5).
+
+        ``scale`` is required, for the reason given on :meth:`from_mjd`.
+
+        >>> Epochs.from_jd(2460500.5, scale="tdb").scale
+        'tdb'
+        """
         scale_str = _scale_str(scale)
         arr = np.atleast_1d(np.asarray(jd, dtype=np.float64)) - _JD_MJD_OFFSET
         return cls.from_kwargs(mjd=arr, scale=scale_str)
@@ -397,10 +441,9 @@ class Epochs(qv.Table):
         """Construct a single-row Epochs at "right now" in the requested scale.
 
         Uses the system clock (``datetime.now(timezone.utc)``) and the
-        native ISO→MJD converter — no astropy dependency.
+        native ISO→MJD converter — no astropy dependency. ``scale``
+        keeps its ``"utc"`` default: the operation names its own clock.
         """
-        from datetime import datetime, timezone
-
         scale_str = _scale_str(scale)
         iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
         return cls.from_iso([iso], scale=scale_str)
@@ -421,3 +464,67 @@ class Epochs(qv.Table):
             [np.asarray(e.mjd.to_numpy(zero_copy_only=False), dtype=np.float64) for e in epochs]
         )
         return cls.from_kwargs(mjd=mjd, scale=scale)
+
+
+# ── Time inputs are Epochs, never bare numbers ────────────────────────
+#
+# Every public entry point that takes a time takes an `Epochs` table.
+# There is deliberately no coercion from a bare list / array / float,
+# and no "assume TDB" fallback: a bare number carries no time scale, so
+# accepting one would let a call site inherit a modelling statement
+# rather than make it. The refusal below is what the caller sees, and it
+# names the fix.
+
+
+def _bare_time_refusal(value: object, where: str, *, single: bool) -> str:
+    """The message for a time input that is not an :class:`Epochs`.
+
+    ``where`` names the offending parameter at its entry point (e.g.
+    ``"propagate() epochs"``). ``single`` picks the single-row wording.
+    """
+    got = type(value).__name__
+    want = "a single-row Epochs table" if single else "an Epochs table"
+    if isinstance(value, str):
+        fix = (
+            "Pass Epochs.from_iso([value]) for an ISO-8601 UTC timestamp "
+            "(the trailing 'Z' is required)"
+        )
+    elif isinstance(value, datetime):
+        fix = "Pass Epochs.from_iso([value.isoformat()]), or Epochs.from_astropy(...)"
+    else:
+        example = "[value]" if single else "values"
+        fix = (
+            f"Pass Epochs.from_mjd({example}, scale='utc') or "
+            f"Epochs.from_mjd({example}, scale='tdb')"
+        )
+    return (
+        f"{where} must be {want}, not a {got}: a bare value carries no time "
+        f"scale. {fix} — the scale is a modelling statement, and 61000.5 UTC "
+        f"and 61000.5 TDB are ~69 seconds apart."
+    )
+
+
+def _require_epochs(value: object, where: str) -> Epochs:
+    """Return ``value`` if it is an :class:`Epochs`, else refuse by name."""
+    if isinstance(value, Epochs):
+        return value
+    raise TypeError(_bare_time_refusal(value, where, single=False))
+
+
+def _require_single_epoch(value: object, where: str) -> float:
+    """Coerce a length-1 :class:`Epochs` to a scalar MJD TDB.
+
+    Refuses anything that is not an :class:`Epochs`, and any
+    :class:`Epochs` that does not hold exactly one row.
+    """
+    if not isinstance(value, Epochs):
+        raise TypeError(_bare_time_refusal(value, where, single=True))
+    mjd = value.to_tdb().mjd.to_numpy(zero_copy_only=False)
+    if len(mjd) != 1:
+        raise ValueError(f"{where} must hold exactly one epoch, got {len(mjd)}")
+    return float(mjd[0])
+
+
+def _epochs_mjd_tdb(value: object, where: str) -> np.ndarray:
+    """Coerce a required :class:`Epochs` input to an MJD TDB array."""
+    return _require_epochs(value, where).mjd_tdb()

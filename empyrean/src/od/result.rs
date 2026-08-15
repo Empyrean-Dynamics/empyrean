@@ -366,7 +366,7 @@ pub const MAX_THRUST_SEGMENTS: usize = 3;
 ///
 /// Used to request an explicit multi-axis fit via
 /// [`SolveForParams::Explicit`], and reported back on
-/// [`OdResult::dispositions`] as what the fit actually ran.
+/// [`DetermineResult::dispositions`] as what the fit actually ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SolveFor {
     /// Disposition of the Marsden A1/A2/A3 block. Solving or considering
@@ -437,7 +437,7 @@ impl SolveFor {
     /// Only ever reports `Solved` or `Fixed`: a solved-covariance's slot
     /// tags record what occupied a column, and a considered axis
     /// occupies none. A result's true partition — including which axes
-    /// were considered — is [`OdResult::dispositions`], which the engine
+    /// were considered — is [`DetermineResult::dispositions`], which the engine
     /// reports directly.
     fn from_covariance(cov: &SolvedCovariance) -> Self {
         let d = |present: bool| {

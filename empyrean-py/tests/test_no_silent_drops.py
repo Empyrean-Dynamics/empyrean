@@ -37,6 +37,7 @@ from empyrean import (
     CartesianCoordinates,
     CartesianOrbits,
     CometaryCoordinates,
+    Epochs,
     KeplerianCoordinates,
     NonGravParams,
     Origin,
@@ -432,7 +433,7 @@ def test_propagation_states_no_silent_drops() -> None:
     # joint, whose carrier columns exist only for a layout past the
     # state+Marsden 9x9.
     orbits = _wide_layout_orbit()
-    target_epochs = np.array([61000.0 + 60.0 * i for i in range(40)])
+    target_epochs = Epochs.from_mjd(np.array([61000.0 + 60.0 * i for i in range(40)]), scale="tdb")
     result = empyrean.propagate(orbits, target_epochs)
 
     bad_null, bad_not_null = _check_no_silent_drops(result.states, "PropagatedStates")
@@ -443,7 +444,7 @@ def test_propagation_states_no_silent_drops() -> None:
 
 def test_propagation_events_summary_no_silent_drops() -> None:
     orbits = _full_feature_orbit()
-    target_epochs = np.array([61000.0 + 60.0 * i for i in range(40)])
+    target_epochs = Epochs.from_mjd(np.array([61000.0 + 60.0 * i for i in range(40)]), scale="tdb")
     result = empyrean.propagate(orbits, target_epochs)
 
     if len(result.events.summary) == 0:
@@ -526,7 +527,7 @@ def test_propagation_event_subtables_no_silent_drops() -> None:
     the historical periapsis ``relative_*`` drop.
     """
     orbits = _full_feature_orbit()
-    target_epochs = np.array([61000.0 + 60.0 * i for i in range(40)])
+    target_epochs = Epochs.from_mjd(np.array([61000.0 + 60.0 * i for i in range(40)]), scale="tdb")
     result = empyrean.propagate(orbits, target_epochs)
     events = result.events
 
@@ -564,7 +565,7 @@ def test_impactor_event_subtables_no_silent_drops() -> None:
     orbit = _impactor_orbit()
     # Last day before impact (~MJD 54746.116), fine steps so the encounter
     # is bracketed.
-    target_epochs = np.array([54746.0 + 0.04 * i for i in range(26)])
+    target_epochs = Epochs.from_mjd(np.array([54746.0 + 0.04 * i for i in range(26)]), scale="tdb")
     result = empyrean.propagate(orbit, target_epochs)
     events = result.events
 
@@ -621,10 +622,14 @@ def _grazing_flyby_orbit() -> tuple[CartesianOrbits, np.ndarray]:
     epoch = _GRAZER_EPOCH
 
     # Earth and Sun heliocentric (SSB-centered) ecliptic states at the epoch.
-    earth = empyrean.get_states(Origin.EARTH, Origin.SSB, [epoch], Frame.ECLIPTICJ2000)
+    earth = empyrean.get_states(
+        Origin.EARTH, Origin.SSB, Epochs.from_mjd([epoch], scale="tdb"), Frame.ECLIPTICJ2000
+    )
     e_r = np.array([earth.x[0].as_py(), earth.y[0].as_py(), earth.z[0].as_py()])
     e_v = np.array([earth.vx[0].as_py(), earth.vy[0].as_py(), earth.vz[0].as_py()])
-    sun = empyrean.get_states(Origin.SUN, Origin.SSB, [epoch], Frame.ECLIPTICJ2000)
+    sun = empyrean.get_states(
+        Origin.SUN, Origin.SSB, Epochs.from_mjd([epoch], scale="tdb"), Frame.ECLIPTICJ2000
+    )
     s_r = np.array([sun.x[0].as_py(), sun.y[0].as_py(), sun.z[0].as_py()])
     s_v = np.array([sun.vx[0].as_py(), sun.vy[0].as_py(), sun.vz[0].as_py()])
 
@@ -682,7 +687,7 @@ def _grazing_flyby_orbit() -> tuple[CartesianOrbits, np.ndarray]:
     big_f = np.arcsinh(np.sin(nu) * np.sqrt(e_orb**2 - 1.0) / (1.0 + e_orb * np.cos(nu)))
     mean_anom = e_orb * np.sinh(big_f) - big_f
     t_to_peri = -mean_anom / np.sqrt(_MU_EARTH / a**3)
-    target_epochs = epoch + np.linspace(0.0, 2.4 * t_to_peri, 200)
+    target_epochs = Epochs.from_mjd(epoch + np.linspace(0.0, 2.4 * t_to_peri, 200), scale="tdb")
     return orbits, target_epochs
 
 
@@ -788,7 +793,7 @@ def test_capture_event_subtables_no_silent_drops() -> None:
     # Coarse 50-day grid over the real 2017-2020 CD3 capture window. Capture
     # detection runs on the main integration grid, so a coarse target grid is
     # sufficient.
-    target_epochs = np.array([57000.0 + 50.0 * i for i in range(41)])
+    target_epochs = Epochs.from_mjd(np.array([57000.0 + 50.0 * i for i in range(41)]), scale="tdb")
     result = empyrean.propagate(orbit, target_epochs, config=config)
     events = result.events
 
@@ -876,7 +881,9 @@ def test_covariance_regime_changes_fire_under_auto() -> None:
     """
     orbits = _auto_escalation_orbit()
     t_ca = 62240.0  # ~2029-04-13 Earth flyby
-    target_epochs = np.array([t_ca - 30.0, t_ca - 5.0, t_ca, t_ca + 5.0, t_ca + 30.0])
+    target_epochs = Epochs.from_mjd(
+        np.array([t_ca - 30.0, t_ca - 5.0, t_ca, t_ca + 5.0, t_ca + 30.0]), scale="tdb"
+    )
     result = empyrean.propagate(
         orbits,
         target_epochs,
@@ -911,14 +918,20 @@ def test_auto_method_label_round_trips_in_ip_and_bplane() -> None:
         (UncertaintyMethod.AUTO, "auto"),
     ):
         ips = compute_impact_probabilities(
-            orbits, end_epoch=62300.0, methods=[method], body_filter=[Origin.EARTH]
+            orbits,
+            end_epoch=Epochs.from_mjd([62300.0], scale="tdb"),
+            methods=[method],
+            body_filter=[Origin.EARTH],
         )
         if len(ips) > 0:
             assert set(ips.method.to_pylist()) == {expected}, (
                 f"IP method label for {method.value}: got {set(ips.method.to_pylist())}"
             )
         bps = compute_b_planes(
-            orbits, end_epoch=62300.0, methods=[method], body_filter=[Origin.EARTH]
+            orbits,
+            end_epoch=Epochs.from_mjd([62300.0], scale="tdb"),
+            methods=[method],
+            body_filter=[Origin.EARTH],
         )
         if len(bps) > 0:
             assert set(bps.method.to_pylist()) == {expected}, (
@@ -934,7 +947,7 @@ def test_propagation_state_sensitivities_no_silent_drops() -> None:
     regression that drops an STM/STT column fails loudly.
     """
     orbits = _full_feature_orbit()
-    target_epochs = np.array([61000.0 + 60.0 * i for i in range(40)])
+    target_epochs = Epochs.from_mjd(np.array([61000.0 + 60.0 * i for i in range(40)]), scale="tdb")
     result = empyrean.propagate(
         orbits, target_epochs, uncertainty_method=UncertaintyMethod.SECOND_ORDER
     )
@@ -958,7 +971,9 @@ def test_ephemeris_observation_sensitivities_no_silent_drops() -> None:
     and it has to fail if the drop comes back.
     """
     orbits = _full_feature_orbit()
-    observers = Observers.from_code("500", [61000.5, 61010.5, 61020.5])
+    observers = Observers.from_code(
+        "500", Epochs.from_mjd([61000.5, 61010.5, 61020.5], scale="tdb")
+    )
     result = generate_ephemeris(orbits, observers, uncertainty_method=UncertaintyMethod.FIRST_ORDER)
     sens = result.sensitivity
     assert sens is not None and len(sens) > 0, (
@@ -980,7 +995,9 @@ def test_ephemeris_no_silent_drops() -> None:
     # the registry makes the engine compute all three, so a marshaling
     # drop of the topocentric block fails here instead of hiding behind
     # the horizonless case.
-    observers = Observers.from_code("689", [61000.5, 61010.5, 61020.5])
+    observers = Observers.from_code(
+        "689", Epochs.from_mjd([61000.5, 61010.5, 61020.5], scale="tdb")
+    )
     result = generate_ephemeris(orbits, observers)
 
     if len(result.ephemeris) == 0:
@@ -994,7 +1011,7 @@ def test_impact_probabilities_no_silent_drops() -> None:
     orbits = _full_feature_orbit()
     ips = compute_impact_probabilities(
         orbits,
-        end_epoch=63000.0,
+        end_epoch=Epochs.from_mjd([63000.0], scale="tdb"),
         methods=[UncertaintyMethod.FIRST_ORDER],
         body_filter=[Origin.EARTH],
     )
@@ -1032,7 +1049,7 @@ def test_impactor_impact_probabilities_carry_the_surface_point() -> None:
     for method in (UncertaintyMethod.FIRST_ORDER, UncertaintyMethod.MONTE_CARLO):
         ips = compute_impact_probabilities(
             orbit,
-            end_epoch=54747.0,
+            end_epoch=Epochs.from_mjd([54747.0], scale="tdb"),
             methods=[method],
             body_filter=[Origin.EARTH],
         )
@@ -1063,7 +1080,7 @@ def test_b_planes_no_silent_drops() -> None:
     orbits = _full_feature_orbit()
     bps = compute_b_planes(
         orbits,
-        end_epoch=63000.0,
+        end_epoch=Epochs.from_mjd([63000.0], scale="tdb"),
         methods=[UncertaintyMethod.FIRST_ORDER],
         body_filter=[Origin.EARTH],
     )
@@ -1150,7 +1167,7 @@ def test_ng_covariance_reaches_propagated_covariance() -> None:
     deterministic (control: re-running it reproduces the covariance exactly, so
     the difference in (1) is attributable to ``ng_covariance``, not noise).
     """
-    target_epochs = np.array([61000.0 + 30.0 * i for i in range(6)])
+    target_epochs = Epochs.from_mjd(np.array([61000.0 + 30.0 * i for i in range(6)]), scale="tdb")
 
     with_cov = empyrean.propagate(
         _non_grav_solved_orbit(with_cov=True),
@@ -1213,19 +1230,21 @@ def test_ng_covariance_threads_through_ephemeris_and_impact() -> None:
     """
     orbits = _non_grav_solved_orbit(with_cov=True)
 
-    observers = Observers.from_code("500", [61000.5, 61010.5, 61020.5])
+    observers = Observers.from_code(
+        "500", Epochs.from_mjd([61000.5, 61010.5, 61020.5], scale="tdb")
+    )
     eph = generate_ephemeris(orbits, observers)
     assert len(eph.ephemeris) > 0, "ephemeris path produced no rows with ng_covariance present"
 
     ips = compute_impact_probabilities(
         orbits,
-        end_epoch=62300.0,
+        end_epoch=Epochs.from_mjd([62300.0], scale="tdb"),
         methods=[UncertaintyMethod.FIRST_ORDER],
         body_filter=[Origin.EARTH],
     )
     bps = compute_b_planes(
         orbits,
-        end_epoch=62300.0,
+        end_epoch=Epochs.from_mjd([62300.0], scale="tdb"),
         methods=[UncertaintyMethod.FIRST_ORDER],
         body_filter=[Origin.EARTH],
     )

@@ -19,7 +19,7 @@ from __future__ import annotations
 import empyrean
 import numpy as np
 import pytest
-from empyrean import UncertaintyMethod
+from empyrean import Epochs, UncertaintyMethod
 from empyrean.coordinates.coordinates import CartesianCoordinates
 from empyrean.coordinates.covariance import CartesianCovariance
 from empyrean.orbits.orbits import CartesianOrbits
@@ -63,7 +63,9 @@ def test_ephemeris_uncertainty_covariance_is_finite(orbit: CartesianOrbits) -> N
     every ephemeris row — never all-NaN. This is the exact regression
     v0.9.0-rc.0 shipped."""
     t0 = float(orbit.coordinates.epoch.to_numpy()[0])
-    observers = empyrean.get_observer_states(["500"], np.array([t0, t0 + 30.0, t0 + 365.0]))
+    observers = empyrean.get_observer_states(
+        ["500"], Epochs.from_mjd(np.array([t0, t0 + 30.0, t0 + 365.0]), scale="tdb")
+    )
     for method in (UncertaintyMethod.FIRST_ORDER, UncertaintyMethod.SECOND_ORDER):
         eph = empyrean.generate_ephemeris(orbit, observers, uncertainty_method=method)
         cov = eph.ephemeris.coordinates.covariance
@@ -86,7 +88,7 @@ def test_propagate_covariance_is_finite(orbit: CartesianOrbits) -> None:
     t0 = float(orbit.coordinates.epoch.to_numpy()[0])
     result = empyrean.propagate(
         orbit,
-        np.array([t0, t0 + 30.0, t0 + 365.0]),
+        Epochs.from_mjd(np.array([t0, t0 + 30.0, t0 + 365.0]), scale="tdb"),
         uncertainty_method=UncertaintyMethod.FIRST_ORDER,
     )
     m = result.states.coordinates.covariance.to_matrix()

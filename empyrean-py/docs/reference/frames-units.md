@@ -13,13 +13,33 @@ exposes at the API boundary:
 
 | Scale  | Use                                                                 |
 |--------|---------------------------------------------------------------------|
-| `TDB`  | Barycentric Dynamical Time — the integration time scale. **Default everywhere in empyrean.** All raw MJD floats at the API boundary are MJD TDB unless documented otherwise. |
+| `TDB`  | Barycentric Dynamical Time — the integration time scale, and what everything converts to internally. |
 | `UTC`  | Coordinated Universal Time — leap-second-aware. Use for human-readable epochs (ISO strings) and observation timestamps. |
 
-:class:`~empyrean.Epochs` carries the scale as a `StringAttribute` and
-exposes `.to_tdb()` / `.to_utc()` / `.to_scale(...)` for conversion.
-UTC↔TDB conversion (leap seconds plus the TDB−TT periodic terms) is
-built into the engine — no separate leap-second kernel is installed.
+**Every time you hand to empyrean is an :class:`~empyrean.Epochs` table,
+and every `Epochs` states its scale.** There is no bare-MJD entry point
+and no default scale to fall back on: a plain `61000.5` does not say
+which clock it was read from, and read as UTC rather than TDB it names an
+instant about 69 seconds earlier — a difference that grows with every
+leap second, and one that is easily large enough to move a close-approach
+geometry. Passing a bare list, array or float where a time is expected
+raises `TypeError` naming the fix.
+
+```python
+epochs = empyrean.Epochs.from_mjd([61000.5, 61010.5], scale="tdb")
+epochs = empyrean.Epochs.from_mjd([61000.5, 61010.5], scale="utc")   # not the same instants
+epochs = empyrean.Epochs.from_iso(["2026-01-01T12:00:00.000Z"])      # ISO is UTC by format
+```
+
+`Epochs` carries the scale as a `StringAttribute` and exposes
+`.to_tdb()` / `.to_utc()` / `.to_scale(...)` for conversion, plus
+`.mjd_tdb()` / `.mjd_utc()` to read the values back out in a named
+scale. UTC↔TDB conversion (leap seconds plus the TDB−TT periodic terms)
+is built into the engine — no separate leap-second kernel is installed.
+
+Columns named `mjd_tdb` (and arguments named `epoch_mjd_tdb`) are the
+one place plain floats remain: the name pins the scale, so nothing is
+left unstated.
 
 Earth-rotation kernels are stored on the TT scale internally; the
 TT ↔ TDB difference is small — a quasi-periodic term with peak
@@ -99,7 +119,7 @@ its segment.
 | Position              | astronomical units (AU)    | At the public API boundary.            |
 | Velocity              | AU / day                   | Same.                                  |
 | Time                  | days                       | Propagation step sizes, durations, etc. |
-| Epoch                 | MJD (TDB by default)       | See above on time scales.              |
+| Epoch                 | `Epochs` (MJD + its scale) | Inputs are always `Epochs`; output columns are MJD TDB. See above. |
 | Angle                 | degrees                    | At the boundary; converted to radians internally. |
 | Astrometric residuals | arcseconds                 | RA·cos(δ), Dec, AT/CT decompositions.   |
 | Track position angle  | degrees (East of North)    | On {class}`~empyrean.ObservationResults`. |

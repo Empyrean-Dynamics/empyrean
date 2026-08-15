@@ -8,7 +8,7 @@ import quivr as qv
 from empyrean._convert import frame_to_int, int_to_frame, naif_to_origin, origin_to_naif
 from empyrean.coordinates.coordinates import CartesianCoordinates
 from empyrean.coordinates.enums import Frame, Origin
-from empyrean.coordinates.epoch import Epochs
+from empyrean.coordinates.epoch import Epochs, _epochs_mjd_tdb, _require_epochs
 
 
 class Observers(qv.Table):
@@ -40,7 +40,7 @@ class Observers(qv.Table):
     def from_code(
         cls,
         obs_code: str,
-        epochs: Epochs | np.ndarray | Sequence[float],
+        epochs: Epochs,
         frame: Frame | str | int = Frame.ICRF,
         origin: Origin | str | int = Origin.SSB,
     ) -> "Observers":
@@ -52,9 +52,11 @@ class Observers(qv.Table):
         ----------
         obs_code : str
             MPC observatory code (e.g. ``"W84"``, ``"F51"``, ``"274"``).
-        epochs : Epochs | array-like
-            ``N`` observation epochs. An :class:`Epochs` table is
-            converted to TDB internally; an array is treated as MJD TDB.
+        epochs : Epochs
+            ``N`` observation epochs, converted to TDB internally. Build
+            one with ``Epochs.from_mjd(values, scale="tdb")`` (or
+            ``scale="utc"``); a bare array is refused, as it carries no
+            time scale.
         frame : Frame | str | int
             Reference frame for the returned states. Default
             :attr:`Frame.ICRF`. See :meth:`from_codes`.
@@ -69,18 +71,21 @@ class Observers(qv.Table):
 
         Examples
         --------
-        >>> times = Epochs.from_mjd([60500.0, 60501.0])
+        >>> times = Epochs.from_mjd([60500.0, 60501.0], scale="tdb")
         >>> obs = Observers.from_code("W84", times)
         >>> len(obs)
         2
         """
+        # Validated here rather than only in `from_codes` so the refusal
+        # names the entry point the caller actually used.
+        _require_epochs(epochs, "Observers.from_code() epochs")
         return cls.from_codes([obs_code], epochs, frame=frame, origin=origin)
 
     @classmethod
     def from_codes(
         cls,
         obs_codes: Sequence[str],
-        epochs: Epochs | np.ndarray | Sequence[float],
+        epochs: Epochs,
         frame: Frame | str | int = Frame.ICRF,
         origin: Origin | str | int = Origin.SSB,
     ) -> "Observers":
@@ -96,9 +101,11 @@ class Observers(qv.Table):
         ----------
         obs_codes : list[str]
             ``N`` MPC observatory codes.
-        epochs : Epochs | array-like
-            ``M`` observation epochs. An :class:`Epochs` table is
-            converted to TDB internally; an array is treated as MJD TDB.
+        epochs : Epochs
+            ``M`` observation epochs, converted to TDB internally. Build
+            one with ``Epochs.from_mjd(values, scale="tdb")`` (or
+            ``scale="utc"``); a bare array is refused, as it carries no
+            time scale.
         frame : Frame | str | int
             Reference frame for the returned states. Default
             :attr:`Frame.ICRF`.
@@ -127,7 +134,7 @@ class Observers(qv.Table):
 
         Examples
         --------
-        >>> times = Epochs.from_mjd([60000.0, 60001.0])
+        >>> times = Epochs.from_mjd([60000.0, 60001.0], scale="tdb")
         >>> obs = Observers.from_codes(["W84", "F51", "274"], times)
         >>> len(obs)
         6
@@ -136,11 +143,7 @@ class Observers(qv.Table):
         """
         from empyrean._empyrean_rs import _get_observers
 
-        if isinstance(epochs, Epochs):
-            tdb = epochs.to_tdb()
-            epochs_mjd = np.asarray(tdb.mjd.to_numpy(zero_copy_only=False), dtype=np.float64)
-        else:
-            epochs_mjd = np.asarray(epochs, dtype=np.float64)
+        epochs_mjd = _epochs_mjd_tdb(epochs, "Observers.from_codes() epochs")
 
         result = _get_observers(
             list(obs_codes), epochs_mjd, frame_to_int(frame), origin_to_naif(origin)

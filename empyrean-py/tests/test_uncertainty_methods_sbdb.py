@@ -23,6 +23,7 @@ import empyrean
 import numpy as np
 import pytest
 from empyrean import (
+    Epochs,
     GaussianMixture,
     MonteCarlo,
     Origin,
@@ -65,7 +66,9 @@ def sbdb_orbit_cartesian(sbdb_orbit, sbdb_grid) -> CartesianOrbits:
     same property."""
     t0 = sbdb_grid[0]
     r0 = empyrean.propagate(
-        sbdb_orbit, np.array([t0]), uncertainty_method=UncertaintyMethod.FIRST_ORDER
+        sbdb_orbit,
+        Epochs.from_mjd(np.array([t0]), scale="tdb"),
+        uncertainty_method=UncertaintyMethod.FIRST_ORDER,
     )
     c = r0.states.coordinates
     cov0 = c.covariance.to_matrix()[0]
@@ -101,7 +104,9 @@ def test_sbdb_propagate_sampling_methods_do_not_raise(sbdb_orbit, sbdb_grid) -> 
         UncertaintyMethod.SIGMA_POINT,
         MonteCarlo(n_samples=64, seed=7),
     ):
-        res = empyrean.propagate(sbdb_orbit, sbdb_grid, uncertainty_method=method)
+        res = empyrean.propagate(
+            sbdb_orbit, Epochs.from_mjd(sbdb_grid, scale="tdb"), uncertainty_method=method
+        )
         assert len(res.states) == len(sbdb_grid)
 
 
@@ -137,13 +142,13 @@ def test_sbdb_cartesian_sigma_point_is_genuine(sbdb_orbit_cartesian, sbdb_grid) 
     the linear first-order one — the fix's core value."""
     res_fo = empyrean.propagate(
         sbdb_orbit_cartesian,
-        sbdb_grid,
+        Epochs.from_mjd(sbdb_grid, scale="tdb"),
         uncertainty_method=UncertaintyMethod.FIRST_ORDER,
         tagged_covariance=True,
     )
     res_sp = empyrean.propagate(
         sbdb_orbit_cartesian,
-        sbdb_grid,
+        Epochs.from_mjd(sbdb_grid, scale="tdb"),
         uncertainty_method=UncertaintyMethod.SIGMA_POINT,
         tagged_covariance=True,
     )
@@ -179,7 +184,11 @@ def test_agm_impact_probability_fires_and_labels_correctly() -> None:
         pytest.skip("SBDB record for 2024 YR4 carries no covariance")
 
     t0 = float(orb.coordinates.epoch.to_numpy(zero_copy_only=False)[0])
-    r0 = empyrean.propagate(orb, np.array([t0]), uncertainty_method=UncertaintyMethod.FIRST_ORDER)
+    r0 = empyrean.propagate(
+        orb,
+        Epochs.from_mjd(np.array([t0]), scale="tdb"),
+        uncertainty_method=UncertaintyMethod.FIRST_ORDER,
+    )
     c = r0.states.coordinates
     cov0 = c.covariance.to_matrix()[0]
 
@@ -208,7 +217,7 @@ def test_agm_impact_probability_fires_and_labels_correctly() -> None:
     # 2032-12-22 encounter is ≈ MJD 63588.5; end a few days past it.
     ips = compute_impact_probabilities(
         yr4,
-        end_epoch=63594.0,
+        end_epoch=Epochs.from_mjd([63594.0], scale="tdb"),
         methods=[UncertaintyMethod.FIRST_ORDER, GaussianMixture()],
         body_filter=[Origin.EARTH],
     )
@@ -242,13 +251,13 @@ def test_sbdb_cometary_sigma_point_is_genuine(sbdb_orbit, sbdb_grid) -> None:
     """
     res_fo = empyrean.propagate(
         sbdb_orbit,
-        sbdb_grid,
+        Epochs.from_mjd(sbdb_grid, scale="tdb"),
         uncertainty_method=UncertaintyMethod.FIRST_ORDER,
         tagged_covariance=True,
     )
     res_sp = empyrean.propagate(
         sbdb_orbit,
-        sbdb_grid,
+        Epochs.from_mjd(sbdb_grid, scale="tdb"),
         uncertainty_method=UncertaintyMethod.SIGMA_POINT,
         tagged_covariance=True,
     )
@@ -260,7 +269,7 @@ def test_sbdb_cometary_sigma_point_is_genuine(sbdb_orbit, sbdb_grid) -> None:
 def test_sbdb_generate_ephemeris_rejects_sampling(sbdb_orbit, sbdb_grid) -> None:
     """generate_ephemeris rejects the sampling methods with a typed error
     (the silent-ignore fix), on a real SBDB orbit + observer."""
-    observers = empyrean.get_observer_states(["500"], sbdb_grid)
+    observers = empyrean.get_observer_states(["500"], Epochs.from_mjd(sbdb_grid, scale="tdb"))
     for method in (UncertaintyMethod.SIGMA_POINT, UncertaintyMethod.MONTE_CARLO):
         with pytest.raises(ValueError, match="sampling uncertainty methods"):
             empyrean.generate_ephemeris(sbdb_orbit, observers, uncertainty_method=method)

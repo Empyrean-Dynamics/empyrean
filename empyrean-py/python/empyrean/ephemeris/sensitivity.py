@@ -25,7 +25,6 @@ Helper accessors on the filtered table (``stms_array``,
 ``kappa``) reshape the flat lists back to numpy matrices on demand.
 """
 
-from datetime import datetime
 from typing import Literal
 
 import numpy as np
@@ -38,12 +37,7 @@ import quivr as qv
 # checker can resolve it.
 from pyarrow._compute import call_function
 
-from empyrean.coordinates.epoch import Epochs
-
-EpochLike = float | str | datetime | Epochs
-"""Anything :func:`StateSensitivities.index_at` accepts — a scalar MJD
-TDB, a length-1 :class:`Epochs`, an ISO-8601 string, or a ``datetime``."""
-
+from empyrean.coordinates.epoch import Epochs, _require_single_epoch
 
 # ── Observation-sensitivity row order ─────────────────────────────────
 #
@@ -85,7 +79,8 @@ class StateSensitivities(qv.Table):
     per-chain accessors::
 
         chain = sens.select("orbit_id", "2020 CD3")
-        phi = chain.stms_array()[chain.index_at(60750.0)]
+        t = Epochs.from_mjd([60750.0], scale="tdb")
+        phi = chain.stms_array()[chain.index_at(t)]
 
     Notes
     -----
@@ -182,16 +177,20 @@ class StateSensitivities(qv.Table):
 
     # ── Epoch lookup ──────────────────────────────────────────
 
-    def index_at(self, epoch: EpochLike, *, atol: float = 1e-9) -> int:
+    def index_at(self, epoch: Epochs, *, atol: float = 1e-9) -> int:
         """Row index at the given epoch.
 
-        ``epoch`` is converted to MJD TDB and matched within ``atol``.
+        ``epoch`` is a length-1 :class:`Epochs` in any time scale; it is
+        converted to MJD TDB and matched within ``atol``. Build one with
+        ``Epochs.from_mjd([value], scale="tdb")`` (or ``scale="utc"``) —
+        a bare float carries no time scale and is refused.
+
         Raises :class:`ValueError` if no row matches, or if the table
         holds more than one unique ``orbit_id`` — filter via ``select``
         first.
         """
         _require_single_state_chain(self, "index_at")
-        target = _to_mjd_tdb(epoch)
+        target = _require_single_epoch(epoch, "StateSensitivities.index_at() epoch")
         mjd = self.column("epoch_mjd_tdb").to_numpy(zero_copy_only=False)
         diffs = np.abs(mjd - target)
         i = int(np.argmin(diffs))
@@ -203,9 +202,12 @@ class StateSensitivities(qv.Table):
             )
         return i
 
-    def up_to(self, epoch: EpochLike) -> "StateSensitivities":
-        """Subset including rows with ``epoch_mjd_tdb ≤`` the target."""
-        target = _to_mjd_tdb(epoch)
+    def up_to(self, epoch: Epochs) -> "StateSensitivities":
+        """Subset including rows with ``epoch_mjd_tdb ≤`` the target.
+
+        ``epoch`` is a length-1 :class:`Epochs` in any time scale.
+        """
+        target = _require_single_epoch(epoch, "StateSensitivities.up_to() epoch")
         mask = call_function("less_equal", [self.column("epoch_mjd_tdb"), target])
         return self.apply_mask(mask)
 
@@ -326,7 +328,8 @@ class ObservationSensitivities(qv.Table):
     per-chain accessors::
 
         chain = obs.select("orbit_id", oid).select("obs_code", "F51")
-        H = chain.jacobians_array()[chain.index_at(60750.0)]
+        t = Epochs.from_mjd([60750.0], scale="tdb")
+        H = chain.jacobians_array()[chain.index_at(t)]
 
     Notes
     -----
@@ -365,7 +368,8 @@ class ObservationSensitivities(qv.Table):
 
         from empyrean import SENSITIVITY_ROW_DEC, SENSITIVITY_ROW_RA
 
-        J = chain.jacobians_array()[chain.index_at(60750.0)]
+        t = Epochs.from_mjd([60750.0], scale="tdb")
+        J = chain.jacobians_array()[chain.index_at(t)]
         h_ra = J[SENSITIVITY_ROW_RA, :6]
         h_dec = J[SENSITIVITY_ROW_DEC, :6]
     """
@@ -448,14 +452,16 @@ class ObservationSensitivities(qv.Table):
 
     # ── Epoch lookup ──────────────────────────────────────────
 
-    def index_at(self, epoch: EpochLike, *, atol: float = 1e-9) -> int:
+    def index_at(self, epoch: Epochs, *, atol: float = 1e-9) -> int:
         """Row index at the given epoch.
 
-        Filter to a single chain via two ``select`` calls first if
-        epochs repeat across chains.
+        ``epoch`` is a length-1 :class:`Epochs` in any time scale (a bare
+        float carries no time scale and is refused). Filter to a single
+        chain via two ``select`` calls first if epochs repeat across
+        chains.
         """
         _require_single_obs_chain(self, "index_at")
-        target = _to_mjd_tdb(epoch)
+        target = _require_single_epoch(epoch, "ObservationSensitivities.index_at() epoch")
         mjd = self.column("epoch_mjd_tdb").to_numpy(zero_copy_only=False)
         diffs = np.abs(mjd - target)
         i = int(np.argmin(diffs))
@@ -467,9 +473,12 @@ class ObservationSensitivities(qv.Table):
             )
         return i
 
-    def up_to(self, epoch: EpochLike) -> "ObservationSensitivities":
-        """Subset including rows with ``epoch_mjd_tdb ≤`` the target."""
-        target = _to_mjd_tdb(epoch)
+    def up_to(self, epoch: Epochs) -> "ObservationSensitivities":
+        """Subset including rows with ``epoch_mjd_tdb ≤`` the target.
+
+        ``epoch`` is a length-1 :class:`Epochs` in any time scale.
+        """
+        target = _require_single_epoch(epoch, "ObservationSensitivities.up_to() epoch")
         mask = call_function("less_equal", [self.column("epoch_mjd_tdb"), target])
         return self.apply_mask(mask)
 
@@ -535,21 +544,6 @@ class ObservationSensitivities(qv.Table):
 
 
 # ── Internal helpers ──────────────────────────────────────────────────
-
-
-def _to_mjd_tdb(epoch: EpochLike) -> float:
-    """Coerce any accepted epoch input to a scalar MJD TDB."""
-    if isinstance(epoch, Epochs):
-        if len(epoch) != 1:
-            raise ValueError(f"expected a single-row Epochs, got length {len(epoch)}")
-        return float(epoch.to_tdb().mjd.to_numpy(zero_copy_only=False)[0])
-    if isinstance(epoch, str):
-        return float(Epochs.from_iso([epoch]).to_tdb().mjd.to_numpy(zero_copy_only=False)[0])
-    if isinstance(epoch, datetime):
-        return float(
-            Epochs.from_iso([epoch.isoformat()]).to_tdb().mjd.to_numpy(zero_copy_only=False)[0]
-        )
-    return float(epoch)
 
 
 def _require_single_state_chain(table: StateSensitivities, method: str) -> None:

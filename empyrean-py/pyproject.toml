@@ -80,6 +80,10 @@ test = [
     "pytest>=7",
     "pytest-benchmark>=4",
     "pandas>=2.0",
+    # Independent reference for the time-scale conversions. Test-only:
+    # the package itself never imports astropy outside the optional
+    # Epochs.from_astropy / to_astropy interop above.
+    "astropy>=5.0",
 ]
 lint = [
     # Pinned exact: ruff is unpinned-latest in CI, so a minor bump that adds
@@ -106,7 +110,6 @@ dev = [
     {include-group = "test"},
     {include-group = "lint"},
     {include-group = "docs"},
-    "astropy>=5.0",
 ]
 
 # [project.urls] left intentionally unset — fill in once public homepage

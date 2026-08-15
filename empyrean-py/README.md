@@ -62,14 +62,14 @@ point the loader at an engine of your own.
 
 ```python
 import empyrean
-from empyrean import Epochs, TimeScale
+from empyrean import Epochs
 
 empyrean.download_data()   # SPICE kernels, first run only
 empyrean.initialize()
 
 # Query SBDB for Apophis and propagate through its 2029 Earth flyby
 orbits = empyrean.query_sbdb(["Apophis"])
-epochs = Epochs.from_kwargs(mjd=[65000.0], scale=TimeScale.TDB)
+epochs = Epochs.from_mjd([65000.0], scale="tdb")
 result = empyrean.propagate(orbits, epochs)
 
 # Event timeline
@@ -79,6 +79,14 @@ for i in range(len(result.events.summary)):
           f"{ev.body.to_pylist()[i]:8s} "
           f"MJD {ev.epoch.to_numpy()[i]:.2f}")
 ```
+
+Every time you hand to empyrean is an `Epochs`, and every `Epochs`
+states its scale. A bare list or array is refused: `61000.5` read as UTC
+and `61000.5` read as TDB are about 69 seconds apart — easily enough to
+move an encounter geometry — so which one you mean is stated rather than
+defaulted. Build them with `Epochs.from_mjd(values, scale="tdb")` /
+`scale="utc"`, `Epochs.from_jd`, or `Epochs.from_iso([...])` for ISO-8601
+UTC timestamps.
 
 ## Orbit determination
 
@@ -584,9 +592,11 @@ import pyarrow.compute as pc
 
 from empyrean import UncertaintyMethod
 
+end_epoch = empyrean.Epochs.from_mjd([63000.0], scale="tdb")
+
 ips = empyrean.compute_impact_probabilities(
     orbits,
-    end_epoch=63000.0,
+    end_epoch=end_epoch,
     methods=[UncertaintyMethod.FIRST_ORDER, UncertaintyMethod.SECOND_ORDER],
 )
 ips.epochs.scale                    # "tdb"
@@ -594,7 +604,7 @@ second = ips.where(pc.field("method") == "second_order")
 second.ip_second_order.to_numpy(zero_copy_only=False)   # nullable
 ips.ip_linear.to_numpy()            # always populated
 
-bps = empyrean.compute_b_planes(orbits, 63000.0, [UncertaintyMethod.SECOND_ORDER])
+bps = empyrean.compute_b_planes(orbits, end_epoch, [UncertaintyMethod.SECOND_ORDER])
 print(bps.b_dot_t_km.to_numpy())    # B·T (km)
 print(bps.b_dot_r_km.to_numpy())    # B·R (km)
 print(bps.semi_major_3sig_km.to_numpy(zero_copy_only=False))  # 3σ semi-major
@@ -617,7 +627,7 @@ from empyrean import Auto, MonteCarlo
 
 ips = empyrean.compute_impact_probabilities(
     orbits,
-    end_epoch=63000.0,
+    end_epoch=empyrean.Epochs.from_mjd([63000.0], scale="tdb"),
     methods=[
         Auto(threshold_first=0.05, threshold_mixture=5.0, gmm_max_depth=4),
         MonteCarlo(n_samples=100_000, seed=7),

@@ -62,6 +62,9 @@ $$
 $$
 
 ```python
+t_a = empyrean.Epochs.from_mjd([61000.0], scale="tdb")
+t_b = empyrean.Epochs.from_mjd([61500.0], scale="tdb")
+
 i_a, i_b = chain.index_at(t_a), chain.index_at(t_b)
 phi_ba = chain.stms_array()[i_b] @ np.linalg.inv(chain.stms_array()[i_a])
 ```

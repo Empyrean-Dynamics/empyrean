@@ -121,7 +121,6 @@ SBDB epoch.
 
 ```python
 import empyrean
-import numpy as np
 
 empyrean.download_data()   # SPICE kernels, first run only
 empyrean.initialize()
@@ -129,9 +128,10 @@ empyrean.initialize()
 # 1. Pull Apophis from SBDB (Cometary orbits with covariance + non-grav).
 orbits = empyrean.query_sbdb(["99942"])
 
-# 2. Propagate 10 years past the SBDB epoch.
+# 2. Propagate 10 years past the SBDB epoch. Times are always Epochs, and
+#    the scale is always stated — a bare MJD would not say which clock.
 t0 = orbits.coordinates.epoch.to_numpy()[0]
-epochs = np.array([t0 + 10.0 * 365.25])
+epochs = empyrean.Epochs.from_mjd([t0 + 10.0 * 365.25], scale="tdb")
 result = empyrean.propagate(orbits, epochs)
 
 counts = result.events.count_by_type()
@@ -193,7 +193,6 @@ Mauna Kea (MPC observatory code 568) for the next three months.
 
 ```python
 import empyrean
-import numpy as np
 
 empyrean.initialize()
 
@@ -201,7 +200,7 @@ orbits = empyrean.query_sbdb(["99942"])
 
 # Sample at SBDB epoch + {0, 30, 60} days.
 t0 = orbits.coordinates.epoch.to_numpy()[0]
-times = np.array([t0, t0 + 30.0, t0 + 60.0])
+times = empyrean.Epochs.from_mjd([t0, t0 + 30.0, t0 + 60.0], scale="tdb")
 
 observers = empyrean.get_observer_states(["568"], times)
 result = empyrean.generate_ephemeris(orbits, observers)

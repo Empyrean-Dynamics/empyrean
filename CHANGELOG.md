@@ -255,6 +255,88 @@ project adheres to [Semantic Versioning](https://semver.org).
 
 ### Changed
 
+- **Python time inputs are `Epochs`, and every `Epochs` states its
+  scale.** *Breaking.* Every public entry point in the `empyrean` Python
+  package that takes a time now takes an `Epochs` table and nothing
+  else. A bare list, array, float or numpy scalar is refused at the
+  entry point with a `TypeError` that names the fix — not a deprecation
+  warning, and never a silent assumption of TDB.
+
+  A Modified Julian Date is a clock reading, not an instant. `61000.5`
+  read as UTC and `61000.5` read as TDB name two moments about 69
+  seconds apart, and that gap has grown with every leap second since
+  1972. Which one a caller meant is a modelling statement, and the old
+  signatures — `epochs: Epochs | np.ndarray | Sequence[float]`, with
+  arrays taken as TDB — let a call site inherit that statement instead
+  of making it. Sixty-nine seconds is not a rounding error: mislabelling
+  one scale as the other moves a heliocentric state by roughly 360 km
+  before any encounter amplifies it, and an object crossing the Earth's
+  sphere of influence covers several hundred kilometres in that time.
+
+  Thirteen signatures change: `propagate` and `BuiltSystem.propagate`,
+  `get_states`, `get_observer_states`, `Observers.from_code` /
+  `from_codes`, `query_horizons`, `compute_impact_probabilities` and
+  `compute_b_planes` (whose `end_epoch` is now a length-1 `Epochs`
+  rather than a float), and `index_at` / `up_to` on both
+  `StateSensitivities` and `ObservationSensitivities`. To migrate, wrap
+  the values you already had and say what they were — they were TDB:
+
+  ```python
+  # before
+  empyrean.propagate(orbits, [61000.5, 61010.5])
+  # after
+  empyrean.propagate(orbits, Epochs.from_mjd([61000.5, 61010.5], scale="tdb"))
+  ```
+
+  `Epochs.from_mjd` and `Epochs.from_jd` accordingly **require**
+  `scale`; it no longer defaults to TDB. `Epochs.linspace` and
+  `Epochs.arange` require it as a keyword. `Epochs.now` keeps its
+  `"utc"` default, because there the operation names its own clock, and
+  `Epochs.from_iso` keeps its output-scale default, because an ISO
+  timestamp's trailing `Z` already states the input's scale.
+
+  Columns named `mjd_tdb`, and the arguments named `epoch_mjd_tdb` that
+  mirror the core signatures (`PlannedObservation.optical` / `.radar`,
+  `query_horizons_vectors`), are unchanged: there the name pins the
+  scale, so nothing is left unstated. Output tables are unaffected.
+
+  The Rust channel keeps `f64` times, and its time parameters name their
+  scale explicitly — every one is either a typed `Epoch` that carries
+  its own `TimeScale` or a parameter named `*_mjd_tdb`, and the two
+  `empyrean-cli` flags that take a time (`propagate --epoch`,
+  `ephemeris --epoch`) state "(MJD TDB)" in their help text. An audit of
+  every public function in `empyrean/src` found no ambiguous time
+  parameter, so no signature changed there.
+
+- **The time-scale conversions are cross-validated against astropy.**
+  `Epochs.to_tdb` / `to_utc` are now checked against astropy's ERFA path
+  across four regimes — the modern era, every leap-second boundary,
+  the pre-1972 "rubber second" era, and epochs past the last tabulated
+  leap second. Off leap-second days the two agree **bit for bit**, so
+  the tests assert exact equality rather than a tolerance, and the
+  leap-second tables are compared entry for entry (27 days, identical)
+  so that either side falling behind IERS fails loudly instead of
+  drifting quietly. astropy is a test-only dependency; no package code
+  imports it outside the existing optional `Epochs.from_astropy` /
+  `to_astropy` interop.
+
+  The comparison also corrects the documentation: the TT↔TDB conversion
+  carries the **full periodic** Fairhead & Bretagnon (1990) series, not
+  the secular-only truncation the docstrings claimed. The measured
+  TDB−UTC offset varies by 3.3148 ms peak-to-peak over a decade, matching
+  astropy's to the microsecond.
+
+  The comparison surfaced one genuine defect, which this release
+  **documents rather than fixes**: on the 27 UTC days that contain a
+  leap second (and on pre-1972 rubber-second days), a *fractional* MJD
+  converts as if the day were 86400 s long rather than 86401, so the
+  error ramps linearly from zero at 00:00 to a full second at 24:00 —
+  900 ms at 21:36, on every affected day. Midnight boundaries and every
+  other day are exact, and no other regime is affected. It is pinned by
+  a strict-`xfail` test that names its magnitude and turns red the
+  moment the behavior changes, so it cannot be resolved silently. The
+  fix is engine-side and is not in this release.
+
 - **The engine pin advances to empyrean-core v0.10.1.** The release
   that carries everything above: the wide cross-covariance wire format
   and its units channel, the correlated joint prior with full

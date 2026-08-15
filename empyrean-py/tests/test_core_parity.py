@@ -46,6 +46,7 @@ import numpy as np
 from empyrean import (
     CartesianCoordinates,
     CartesianOrbits,
+    Epochs,
     NonGravParams,
     Origin,
     UncertaintyMethod,
@@ -255,7 +256,7 @@ def _channel_fingerprint() -> dict[str, float | None]:
         orbit = _build_orbit(s)
 
         # propagate -> events
-        events = empyrean.propagate(orbit, np.array(s["grid"])).events
+        events = empyrean.propagate(orbit, Epochs.from_mjd(np.array(s["grid"]), scale="tdb")).events
         for table, fields in TABLE_FIELDS.items():
             t = getattr(events, table)
             if len(t) == 0:
@@ -272,7 +273,7 @@ def _channel_fingerprint() -> dict[str, float | None]:
         # standalone compute_impact_probabilities (fully wired)
         ips = compute_impact_probabilities(
             orbit,
-            end_epoch=s["ip_end"],
+            end_epoch=Epochs.from_mjd([s["ip_end"]], scale="tdb"),
             methods=[UncertaintyMethod.FIRST_ORDER],
             body_filter=[Origin.EARTH],
         )
@@ -289,7 +290,7 @@ def _channel_fingerprint() -> dict[str, float | None]:
         # standalone compute_b_planes (fully wired)
         bps = compute_b_planes(
             orbit,
-            end_epoch=s["ip_end"],
+            end_epoch=Epochs.from_mjd([s["ip_end"]], scale="tdb"),
             methods=[UncertaintyMethod.FIRST_ORDER],
             body_filter=[Origin.EARTH],
         )
@@ -305,7 +306,9 @@ def _channel_fingerprint() -> dict[str, float | None]:
 
         # generate_ephemeris sky-position scalars (per-manifest obs code/epochs)
         if s["eph_obs_code"] and s["eph_epochs"]:
-            observers = Observers.from_code(s["eph_obs_code"], s["eph_epochs"])
+            observers = Observers.from_code(
+                s["eph_obs_code"], Epochs.from_mjd(s["eph_epochs"], scale="tdb")
+            )
             eph = generate_ephemeris(orbit, observers).ephemeris
             if len(eph) > 0:
                 cols = {f: np.asarray(getattr(eph.coordinates, f)) for f in EPH_COORD_FIELDS}

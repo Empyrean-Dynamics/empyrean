@@ -15,7 +15,7 @@ import dataclasses
 import empyrean
 import numpy as np
 import pytest
-from empyrean import Auto
+from empyrean import Auto, Epochs
 from empyrean.coordinates.enums import Origin
 from empyrean.propagation.config import (
     _DATACLASS_TO_INT,
@@ -113,7 +113,9 @@ def test_auto_threshold_first_reaches_the_engine(_apophis) -> None:
     reached the engine rather than being replaced by the 0.1 default.
     """
     t_ca = 62240.0  # ~2029-04-13 Earth flyby
-    epochs = np.array([t_ca - 30.0, t_ca - 5.0, t_ca, t_ca + 5.0, t_ca + 30.0])
+    epochs = Epochs.from_mjd(
+        np.array([t_ca - 30.0, t_ca - 5.0, t_ca, t_ca + 5.0, t_ca + 30.0]), scale="tdb"
+    )
     events = EventConfig(body_filter=[Origin.EARTH])
 
     default = empyrean.propagate(_apophis, epochs, uncertainty_method=Auto(), events=events)

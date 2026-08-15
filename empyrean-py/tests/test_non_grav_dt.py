@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import empyrean
 import numpy as np
-from empyrean import Origin
+from empyrean import Epochs, Origin
 from empyrean.coordinates.coordinates import CartesianCoordinates
 from empyrean.orbits.nongrav import NonGravParams
 from empyrean.orbits.orbits import CartesianOrbits
@@ -64,7 +64,7 @@ def test_non_grav_dt_changes_propagated_state() -> None:
     orbits_no_dt = _make_comet_orbit(dt=None)
     orbits_with_dt = _make_comet_orbit(dt=45.689)  # 67P value
 
-    target_epochs = np.array([60365.0])
+    target_epochs = Epochs.from_mjd(np.array([60365.0]), scale="tdb")
     result_no_dt = empyrean.propagate(orbits_no_dt, target_epochs)
     result_with_dt = empyrean.propagate(orbits_with_dt, target_epochs)
 
@@ -93,7 +93,7 @@ def test_non_grav_dt_zero_delay_matches_no_dt() -> None:
     orbits_no_dt = _make_comet_orbit(dt=None)
     orbits_zero_dt = _make_comet_orbit(dt=0.0)
 
-    target_epochs = np.array([60100.0])
+    target_epochs = Epochs.from_mjd(np.array([60100.0]), scale="tdb")
     r1 = empyrean.propagate(orbits_no_dt, target_epochs).states.coordinates
     r2 = empyrean.propagate(orbits_zero_dt, target_epochs).states.coordinates
 

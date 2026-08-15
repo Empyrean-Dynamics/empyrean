@@ -1,7 +1,8 @@
 //! Time scale conversions: ISO 8601 ↔ MJD in UTC or TDB.
 //!
 //! Native (no astropy required) round-trip via villeneuve's leap-second
-//! table and Fairhead & Bretagnon (1990) TDB-TT secular term.
+//! table and the full periodic Fairhead & Bretagnon (1990) TDB-TT
+//! series — the annual term is carried, not truncated away.
 
 use std::ffi::{CStr, CString};
 
@@ -99,8 +100,10 @@ impl Epoch {
     /// Return the MJD value converted to TDB.
     ///
     /// No-op when the epoch is already TDB; otherwise round-trips
-    /// through the wrapper's ISO conversion path so the leap-second
-    /// table and TDB-TT secular term are applied consistently.
+    /// through the wrapper's ISO conversion path (nanosecond-precision
+    /// formatting, so the round trip is not the precision limiter) so
+    /// the leap-second table and the periodic TDB-TT series are applied
+    /// consistently.
     pub fn mjd_tdb(&self) -> Result<f64> {
         match self.scale {
             TimeScale::TDB => Ok(self.mjd),

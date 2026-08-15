@@ -149,7 +149,8 @@ def test_offline_init_succeeds_against_a_complete_directory():
         out = {{}}
         try:
             empyrean.initialize(data_dir={str(data_dir)!r}, refresh=False)
-            obs = empyrean.Observers.from_code("500", [60000.0])
+            epochs = empyrean.Epochs.from_mjd([60000.0], scale="tdb")
+            obs = empyrean.Observers.from_code("500", epochs)
             out["outcome"] = "ok"
             out["rows"] = len(obs)
             out["finite"] = bool(np.isfinite(obs.coordinates.x.to_numpy()).all())

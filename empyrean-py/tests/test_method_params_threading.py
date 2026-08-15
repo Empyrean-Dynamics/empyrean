@@ -23,6 +23,7 @@ import pytest
 from empyrean.coordinates.coordinates import CartesianCoordinates, CometaryCoordinates
 from empyrean.coordinates.covariance import CartesianCovariance
 from empyrean.coordinates.enums import Origin
+from empyrean.coordinates.epoch import Epochs
 from empyrean.impact import (
     _flatten_method_specs,
     compute_b_planes,
@@ -137,7 +138,7 @@ def test_non_default_sigma_point_is_rejected(compute) -> None:
     with pytest.raises(Exception, match=r"[Ss]igma"):
         compute(
             _heliocentric_orbit(),
-            end_epoch=60010.0,
+            end_epoch=Epochs.from_mjd([60010.0], scale="tdb"),
             methods=[SigmaPoint(n_sigma=2.0)],
             body_filter=[Origin.EARTH],
         )
@@ -162,7 +163,7 @@ def test_monte_carlo_n_samples_reaches_engine(impactor: CartesianOrbits) -> None
     """
     ips = compute_impact_probabilities(
         impactor,
-        end_epoch=_TC3_END_MJD_TDB,
+        end_epoch=Epochs.from_mjd([_TC3_END_MJD_TDB], scale="tdb"),
         methods=[MonteCarlo(n_samples=16, seed=11)],
         body_filter=[Origin.EARTH],
     )
@@ -195,7 +196,7 @@ def test_gaussian_mixture_params_reach_engine(impactor: CartesianOrbits) -> None
     """
     ips = compute_impact_probabilities(
         impactor,
-        end_epoch=_TC3_END_MJD_TDB,
+        end_epoch=Epochs.from_mjd([_TC3_END_MJD_TDB], scale="tdb"),
         methods=[GaussianMixture(threshold=0.0, max_depth=1, components_per_split=5)],
         body_filter=[Origin.EARTH],
     )

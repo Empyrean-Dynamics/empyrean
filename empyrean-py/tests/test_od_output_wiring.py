@@ -22,7 +22,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from empyrean import determine, generate_ephemeris, read_ades
+from empyrean import Epochs, determine, generate_ephemeris, read_ades
 from empyrean.observers.observers import Observers
 from empyrean.od.ades_observations import ADESObservations
 from empyrean.od.determine import _seed_labels
@@ -116,7 +116,7 @@ def test_fitted_orbit_predicts_magnitudes(apophis_observations):
     assert h and h[0] is not None, "fitted H was not attached to the orbit"
 
     epoch0 = fit.orbit.coordinates.epoch.to_pylist()[0]
-    epochs = [epoch0 + 1.0, epoch0 + 10.0]
+    epochs = Epochs.from_mjd([epoch0 + 1.0, epoch0 + 10.0], scale="tdb")
     eph = generate_ephemeris(fit.orbit, Observers.from_code("500", epochs)).ephemeris
     mags = eph.mag.to_pylist()
     assert all(m is not None for m in mags), f"fitted-orbit ephemeris mag was None: {mags}"

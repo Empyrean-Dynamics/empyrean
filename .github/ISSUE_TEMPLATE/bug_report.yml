@@ -94,11 +94,11 @@ body:
       placeholder: |
         # repro.py — Apophis 10y propagation returns NaN at the close approach.
         import empyrean
-        import numpy as np
 
         orbits = empyrean.query_sbdb(["99942"])
         t0 = orbits.coordinates.epoch.to_numpy()[0]
-        result = empyrean.propagate(orbits, np.array([t0 + 10 * 365.25]))
+        epochs = empyrean.Epochs.from_mjd([t0 + 10 * 365.25], scale="tdb")
+        result = empyrean.propagate(orbits, epochs)
         print(result.states.position.to_numpy())   # observed: [nan, nan, nan]
     validations:
       required: true

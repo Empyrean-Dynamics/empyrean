@@ -16,6 +16,7 @@ import pytest
 from empyrean import (
     CartesianCoordinates,
     CartesianOrbits,
+    Epochs,
     NonGravParams,
     Origin,
     SRPParams,
@@ -241,7 +242,7 @@ def _gravity_only_orbit() -> CartesianOrbits:
     )
 
 
-_EPOCHS = np.array([61000.0 + 30.0 * i for i in range(4)])
+_EPOCHS = Epochs.from_mjd(np.array([61000.0 + 30.0 * i for i in range(4)]), scale="tdb")
 
 
 class TestPropagatedJoint:
@@ -528,11 +529,15 @@ def test_a_second_leg_consumes_the_first_legs_joint() -> None:
     assert not with_joint.wide_cross.row_is_empty(0)
     without_joint = _strip_joint(with_joint)
 
-    leg2_epochs = np.array([handover, handover + 60.0])
+    leg2_epochs = Epochs.from_mjd(np.array([handover, handover + 60.0]), scale="tdb")
     chained = _position_variance(propagate(with_joint, leg2_epochs).states, 1)
     block_diagonal = _position_variance(propagate(without_joint, leg2_epochs).states, 1)
     single_leg = _position_variance(
-        propagate(seed, np.array([APOPHIS_STATE["epoch"], handover + 60.0])).states, 1
+        propagate(
+            seed,
+            Epochs.from_mjd(np.array([APOPHIS_STATE["epoch"], handover + 60.0]), scale="tdb"),
+        ).states,
+        1,
     )
 
     assert np.isfinite(chained) and chained > 0.0
@@ -562,11 +567,14 @@ def test_a_chained_leg_carries_its_own_joint_onward() -> None:
     leg1 = propagate(seed, _EPOCHS).states
     leg2 = propagate(
         _relink(leg1, len(leg1) - 1, seed),
-        np.array(
-            [
-                leg1.coordinates.epoch[len(leg1) - 1].as_py(),
-                leg1.coordinates.epoch[len(leg1) - 1].as_py() + 60.0,
-            ]
+        Epochs.from_mjd(
+            np.array(
+                [
+                    leg1.coordinates.epoch[len(leg1) - 1].as_py(),
+                    leg1.coordinates.epoch[len(leg1) - 1].as_py() + 60.0,
+                ]
+            ),
+            scale="tdb",
         ),
     ).states
     assert not leg2.wide_cross.row_is_empty(1)
@@ -641,7 +649,7 @@ def test_a_fitted_joint_survives_a_file_round_trip_into_propagation(amrat_fit, t
     # month the two answers agree to eight digits, so a short window
     # would leave this assertion unable to see a dropped joint.
     epoch = reloaded.coordinates.epoch[0].as_py()
-    epochs = np.array([epoch, epoch + 3650.0])
+    epochs = Epochs.from_mjd(np.array([epoch, epoch + 3650.0]), scale="tdb")
     with_joint = propagate(reloaded, epochs).states
 
     # The control keeps the AMRAT prior and drops only the cross terms,
@@ -691,9 +699,9 @@ def joint_bearing_orbit() -> CartesianOrbits:
     return _relink(leg1, len(leg1) - 1, seed)
 
 
-def _window_end(orbits: CartesianOrbits) -> float:
+def _window_end(orbits: CartesianOrbits) -> Epochs:
     """A close-approach window long enough to reach Apophis's encounter."""
-    return orbits.coordinates.epoch[0].as_py() + 3000.0
+    return Epochs.from_mjd([orbits.coordinates.epoch[0].as_py() + 3000.0], scale="tdb")
 
 
 def test_impact_probabilities_condition_on_the_joint(joint_bearing_orbit) -> None:
@@ -811,15 +819,16 @@ def test_the_forward_model_validates_the_joint_it_is_given(joint_bearing_orbit) 
         wide_cross=joint_bearing_orbit.wide_cross,
     )
     epoch = poisoned.coordinates.epoch[0].as_py()
-    observers = Observers.from_code("500", [epoch + 100.0])
+    observers = Observers.from_code("500", Epochs.from_mjd([epoch + 100.0], scale="tdb"))
+    window_end = Epochs.from_mjd([epoch + 3000.0], scale="tdb")
 
     for what, call in (
         ("generate_ephemeris", lambda: generate_ephemeris(poisoned, observers)),
         (
             "compute_impact_probabilities",
-            lambda: compute_impact_probabilities(poisoned, epoch + 3000.0, ["first_order"]),
+            lambda: compute_impact_probabilities(poisoned, window_end, ["first_order"]),
         ),
-        ("compute_b_planes", lambda: compute_b_planes(poisoned, epoch + 3000.0, ["first_order"])),
+        ("compute_b_planes", lambda: compute_b_planes(poisoned, window_end, ["first_order"])),
     ):
         with pytest.raises(RuntimeError, match="positive semi-definite") as excinfo:
             call()
@@ -836,7 +845,9 @@ def test_an_ephemeris_of_a_joint_bearing_orbit_is_finite(joint_bearing_orbit) ->
     columns neither crash the call nor turn a covariance into NaN.
     """
     epoch = joint_bearing_orbit.coordinates.epoch[0].as_py()
-    observers = Observers.from_code("500", [epoch + 100.0, epoch + 400.0])
+    observers = Observers.from_code(
+        "500", Epochs.from_mjd([epoch + 100.0, epoch + 400.0], scale="tdb")
+    )
     ephemeris = generate_ephemeris(joint_bearing_orbit, observers).ephemeris
 
     assert len(ephemeris) == 2

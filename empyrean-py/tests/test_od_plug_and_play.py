@@ -35,6 +35,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from empyrean import (
+    Epochs,
     Origin,
     SolveFor,
     SRPParams,
@@ -201,7 +202,7 @@ def test_non_grav_survives_propagation_refeed(apophis_fit):
     """
     orbit = apophis_fit.orbit
     epoch0 = orbit.coordinates.epoch[0].as_py()
-    targets = np.array([APOPHIS_2029_MJD_TDB])
+    targets = Epochs.from_mjd(np.array([APOPHIS_2029_MJD_TDB]), scale="tdb")
 
     # Strip the force model: same state and covariance, but A1/A2/A3 all
     # zero under the inverse-square asteroid g(r) — i.e. gravity-only.
@@ -252,7 +253,7 @@ def test_compute_impact_probabilities_accepts_fit_orbit(apophis_fit):
     """
     ips = compute_impact_probabilities(
         apophis_fit.orbit,
-        APOPHIS_IP_END_MJD_TDB,
+        Epochs.from_mjd([APOPHIS_IP_END_MJD_TDB], scale="tdb"),
         methods=[UncertaintyMethod.FIRST_ORDER],
         body_filter=[Origin.EARTH],
     )

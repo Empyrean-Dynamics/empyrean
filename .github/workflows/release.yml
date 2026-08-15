@@ -549,10 +549,18 @@ jobs:
           while IFS= read -r t; do
             hdr_seen=$((hdr_seen + 1))
             d=$(mktemp -d)
-            tar -xzf "$t" -C "$d"
-            h=$(find "$d" -name empyrean.h | head -1)
-            if [ -z "$h" ] || ! cmp -s "$h" include/empyrean.h; then
-              echo "::error::$(basename "$t"): bundled empyrean.h missing or differs from include/empyrean.h at ${tag} — this artifact was not built from the tagged tree. Re-run prepare-release."
+            # Root-level extraction is deliberate: prepare-release places
+            # empyrean.h at the tarball root (cp include/empyrean.h dist/),
+            # so root-position is part of the provenance this check guards —
+            # a header anywhere else means prepare-release did not build
+            # this artifact, and finding it there would defeat the check.
+            if ! tar -xzf "$t" -C "$d" empyrean.h 2>/dev/null; then
+              echo "::error::$(basename "$t"): no root-level empyrean.h — this artifact was not produced by prepare-release. Re-run prepare-release."
+              hdr_fail=1
+              continue
+            fi
+            if ! cmp -s "$d/empyrean.h" include/empyrean.h; then
+              echo "::error::$(basename "$t"): bundled empyrean.h differs from include/empyrean.h at ${tag} — this artifact was not built from the tagged tree. Re-run prepare-release."
               hdr_fail=1
             fi
           done < <(find libempyrean-dist -name 'libempyrean-*.tar.gz')

@@ -37,8 +37,6 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-import numpy as np
-
 from empyrean._convert import frame_to_int, int_to_frame
 from empyrean.coordinates.enums import Frame
 from empyrean.propagation.config import (
@@ -264,7 +262,7 @@ class BuiltSystem:
     def propagate(
         self,
         orbits: AnyOrbits,
-        epochs: Epochs | np.ndarray | Sequence[float],
+        epochs: Epochs,
         config: PropagationConfig | None = None,
         *,
         tagged_covariance: bool = False,
@@ -291,7 +289,12 @@ class BuiltSystem:
         -------
         PropagationResult
         """
+        from empyrean.coordinates.epoch import _require_epochs
         from empyrean.propagation.propagate import propagate as _propagate_fn
+
+        # Validated here rather than only in `propagate` so the refusal
+        # names the entry point the caller actually used.
+        _require_epochs(epochs, "BuiltSystem.propagate() epochs")
 
         if config is None:
             config = PropagationConfig(force_model=self._force_model, frame=self._frame)

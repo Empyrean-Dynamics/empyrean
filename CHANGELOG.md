@@ -6,20 +6,477 @@ project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
-(Nothing yet.)
+### Added
+
+- **The joint solved-parameter covariance crosses the boundary, in both
+  directions.** A fit over the state and its parameters produces one
+  \((6+P) \times (6+P)\) matrix, and until now only its diagonal blocks
+  could cross the C ABI — the 6×6, the Marsden 3×3, a DT variance, an
+  AMRAT variance, a per-segment thrust 3×3. A caller who fitted an orbit
+  and re-propagated it therefore handed the engine a block-diagonal
+  covariance, which is not a conservative approximation of the real one
+  but a different claim: that the data producing the state and the data
+  producing \(A_2\) were independent, when they are the same
+  observations through the same fit.
+
+  `CoordinateState` now carries the state↔Marsden border
+  (`has_non_grav_cross` / `non_grav_cross`), placed beside the 6×6 it
+  borders so a coordinate transform moves the pair together.
+  `EmpyreanOrbit` carries the rest as two identity-tagged side arrays,
+  `state_param_cross` and `param_pair_cross`. Entries name the
+  *parameter* — `EMPYREAN_PARAM_COLUMN_MARSDEN` / `_DT` / `_AMRAT` /
+  `_THRUST` — never a column index, because which column a parameter
+  occupies depends on which *other* parameters the orbit declares:
+  adding an SRP AMRAT shifts the thrust columns by one, and an
+  index-keyed input would attach one parameter's correlations to another
+  with every number finite and every gate passed. Entry order is
+  therefore not contract, and a repeated entry (including a pair in its
+  swapped form) is refused rather than resolved last-one-wins.
+
+  Nine of the ten orbit-reading entry points consume it; the tenth,
+  `empyrean_evaluate`, forms no prior — it measures residuals against a
+  fixed orbit — so a supplied joint affects no output there and is
+  returned unchanged rather than dropped. The file writers receive it.
+
+- **Propagation reports the joint it computed, so legs chain.** Every
+  `EmpyreanPropagatedState` gains `orbit_cov` — the propagated
+  state↔Marsden border and wide carrier at that epoch — and
+  `EmpyreanODResult::orbit` carries the same struct under the same name.
+  `covariance` alone is only the state block; the joint the engine
+  computes has non-zero state↔parameter columns **even when the input
+  was block-diagonal**, because propagation itself generates that
+  correlation. Chaining legs on the 6×6 alone therefore quoted a tighter
+  uncertainty than the propagation supports, and there was no way to
+  read the rest out. Now leg 2's input is leg 1's output, field for
+  field, with no slot arithmetic: `propagate → propagate` and
+  `determine → propagate` are the same copy. The posterior blocks are
+  read off the object the engine already made coherent — the fitted
+  orbit, or the propagated row — never re-derived from a slot-tagged
+  matrix, whose *solved* layout disagrees with a re-fed orbit's
+  *declared* one the moment the fit did not solve every declared axis.
+
+- **Parameter dispositions replace solve-for flags.** Each axis on
+  `EmpyreanSolveFor` now says what the fit *does* with that parameter:
+  `EMPYREAN_PARAM_FIXED` (marginalized out, changes no number),
+  `EMPYREAN_PARAM_SOLVED` (estimated), or `EMPYREAN_PARAM_CONSIDERED`
+  (not estimated, but its prior uncertainty reaches the posterior
+  through its measurement partials). A considered axis is not a safety
+  margin: with a correlated prior the cross-dependent terms are
+  sign-indefinite and the posterior can come back *tighter*.
+  `EmpyreanODResult::dispositions` echoes the partition the fit actually
+  ran, which is what tells a caller whether re-attaching a prior to an
+  axis double-counts it.
+
+- **A structured warning channel on OD results.**
+  `EmpyreanODResult::warnings` reports supplied covariance a fit
+  deliberately did not use — delivered payload rather than a log line,
+  since a dropped prior cross term changes how the σ for that slot
+  should be read.
+
+- **Parquet orbit files carry the wide cross-covariance.** It gains a
+  tagged tail for the state↔parameter and parameter↔parameter terms, and
+  it is the only orbit format here that can carry them. The other two
+  refuse by name rather than writing a row short:
+
+  CSV refuses because this schema makes the difference between an absent
+  cross and a supplied zero cross load-bearing, and CSV renders both as
+  an empty cell. The JSON orbit format — this crate's own flat row
+  shape, not the engine's schema — refuses because it holds the 6×6 and
+  nothing beyond it; both refusals name parquet. A carrier holding
+  thrust terms is refused everywhere, since no orbit format can
+  serialize the thrust arcs those terms describe.
+
+  Silence was the alternative worth avoiding: a file written short reads
+  back as a block-diagonal joint, which is a tighter claim than the
+  caller held, with nothing in the round trip to signal it.
+
+- **`EmpyreanObservatoryConfig` matches the engine's observatory
+  config.** It gains `min_elevation_deg` and `max_sun_altitude_deg`
+  (behind `has_max_sun_altitude_deg`, since `0.0` is a legal solar
+  altitude and a zero-init struct must not quietly plan a campaign in
+  daylight — the switch resolves it to the engine's astronomical-twilight
+  default).
+
+  **No entry point exported by this ABI applies them.** Both values are
+  marshaled across in full and reach the engine's own observatory config
+  — but the gates that read them belong to the engine's visibility
+  survey, which has no C entry point. `empyrean_evaluate_plan`, the one
+  exported function that consumes this struct, consults the
+  site-invariant pair alone, so setting either limit changes no number it
+  returns and a candidate reported `observable` may still sit under that
+  site's horizon or in its daylight. The fields ride
+  the struct now so that exposing the survey later needs no further ABI
+  break — stated plainly because a config field that looks live and is
+  inert is worse than an absent one.
+
+- **`EMPYREAN_REJECTION_PER_OBSERVATION_SITE_REQUIRED` (15).** The
+  roving-observer codes `247` / `270` and the occultation code `275`
+  name sites whose position travels with each observation. Distinct from
+  `UNSUPPORTED_OBSERVATORY` (the code is well known) and from
+  `SPACECRAFT_KERNEL_MISSING` (nothing needs loading): the fix is to
+  supply the coordinates the ADES record already carries per
+  observation.
+
+- **Two new entry points read the propagated joint:
+  `empyrean_propagation_joint_at` and `empyrean_orbit_covariance_free`.**
+  The first returns the state↔Marsden border and the wide carrier at one
+  `(orbit_index, epoch_index)` — the cross terms that
+  `EmpyreanTaggedCovariance::matrix` is the state block of; the second
+  releases the two arrays it allocates.
+
+  They are a separate call rather than fields on the tagged-covariance
+  struct because that struct is plain old data: a caller declares one on
+  the stack, fills it through `empyrean_propagation_covariance_at_cartesian`,
+  and frees nothing. Hanging owned arrays off it would have made every
+  such caller — code that is correct today and recompiles without a
+  murmur — leak two allocations per call. Nothing would fail; memory
+  would simply grow. So the joint is opt-in, and the tagged covariance
+  keeps its contract. `has_non_grav_cross = 0` with null carrier
+  pointers means the engine produced no cross terms at that row, never
+  that they were zero.
+
+  These are the only two symbols this release's ABI adds, taking the
+  exported surface from 92 to 94; every other change in it is a struct, a
+  struct field, or a constant.
+
+- **The joint reaches Python, in both directions.** Every orbit table
+  gains a `wide_cross` sub-table and `NonGravParams` gains
+  `non_grav_cross`, the 6×3 state↔Marsden border. Both are populated
+  from the engine — on a fit's returned orbit, on every propagated
+  state, and on the provenance-tagged covariance readback — and both are
+  consumed on the way back in by `propagate`, `determine`, `evaluate`
+  and `refine`, so a Python chain carries the joint the engine computed
+  instead of its diagonal blocks. A chained propagation now reproduces
+  the single-leg answer; on the same input, dropping the cross terms
+  understates the propagated position variance.
+
+  How much it understates by is fixture-specific, so here is one
+  measured case rather than a general claim. On the wide-layout orbit in
+  `empyrean-py/tests/test_wide_cross.py` — propagated, re-linked so the
+  cross terms are the engine's own, then carried 3000 days to its
+  close approach — dropping them understates the close-approach σ by
+  about 19% and the B-plane covariance by about 34%. Both figures are
+  pinned by bands in that file, so they turn red rather than drift
+  silently if an engine pin moves them.
+
+  Entries are keyed by parameter name (`"AMRAT"`, `"thrust[0].x"`)
+  through `WideCross.state_cross` / `.param_cross`, which refuse to
+  reshape a row whose tags and payload disagree rather than attaching
+  one parameter's covariances to another. Absence is a null row, never a
+  row of zeros: an absent correlation and a measured zero correlation
+  are different claims, and only the second is one the engine's
+  definiteness gate should see. `SolveFor` axes take
+  `ParamDisposition` tags in place of booleans, and a bool is refused by
+  name — `False` cannot say whether an axis was considered or fixed.
+
+- **Observation planning reaches Rust and Python.** `empyrean_evaluate_plan`
+  has been carried by the C ABI since v0.7.0-rc.4 with no consumer in any
+  other channel; both now exist. Rust gains `Context::evaluate_plan` with typed
+  inputs (`PlannedObservation::optical` / `::radar`, `RadarPlanSpec::given` /
+  `::link_budget`, `PlanningConfig`) and owned results. Python gains
+  `empyrean.evaluate_plan`, taking one covariance-bearing orbit plus
+  `PlannedObservation` candidates and returning quivr tables: `PlanMetrics`
+  (two rows, `stage` = `"prior"` / `"posterior"`), `PlanCandidates`
+  (per-candidate marginal information gain; sky-plane geometry null on radar
+  rows, the radar block null on optical rows; link-budget provenance notes
+  carried verbatim, never summarized to a code), and `PlanEphemeris`
+  (predicted sky positions with epochs as an `Epochs` sub-table). Candidates
+  return in ascending epoch order regardless of the order supplied; an
+  optical row joins its epoch and sky position through `index` into
+  `PlanEphemeris`, and a radar row's `index` is its rank among the radar
+  candidates in that same order.
+
+  The planner requires a barycentric prior and refuses anything else by
+  naming the fix — a heliocentric `determine` fit converts with
+  `transform_coordinates(..., origin="SSB")`, a pure translation that leaves
+  the covariance and every metric unchanged. Sky-plane fields the engine
+  reports as structural zeros on radar rows surface as nulls, never as
+  measured-looking numbers. The CLI does not gain a `plan` command in this
+  release — a recorded subsetting decision, not an omission.
+
+- **A capability-parity gate.** `empyrean-sys` now carries a committed
+  manifest of the C ABI's 94 exported functions and five tests over it: the
+  manifest must match the **compiled engine's actual exported symbols**
+  (`nm` on the shipped library — an anchor no generated file can fake) and
+  the generated shim surface; every export must have a call-form consumer in
+  the Rust wrapper or an entry in a committed allow-list of recorded
+  decisions, each with its reason; the allow-list is reverse-enforced — an
+  entry whose symbol gains a consumer fails as stale until removed, and
+  duplicate entries fail by line number; and the consumption scanner's own
+  discrimination (calls count; comments, strings, imports, and test-gated
+  code do not) is pinned by a fixture test. The gate exists because
+  `empyrean_evaluate_plan` shipped in every published release of this
+  distribution, from 0.7.0-rc.4 through 0.9.0, with no consumer in any
+  channel, and nothing noticed. The allow-list opens with a
+  single entry: the load-time ABI handshake, consumed by `empyrean-sys`
+  itself.
+
+  **The gate measures the Rust wrapper channel only.** Check 3 scans
+  `empyrean/src` for call-form consumers, and `not_yet_wrapped.txt` records
+  what that channel deliberately leaves unconsumed. Python and CLI
+  consumption are not measured by any test here — the CLI's decision not to
+  gain a `plan` command in this release is prose above, not a gated entry —
+  so a symbol wired in one channel and forgotten in another is still a
+  manual check. Widening the scanner to the other source roots is follow-up
+  work.
+
+### Fixed
+
+- **The impact and B-plane paths dropped the caller's non-grav DT.**
+  Both entry points — `empyrean_compute_impact_probabilities` and
+  `empyrean_compute_b_planes` — share one orbit-marshaling routine, and
+  it carried the DT *prior variance* while hardcoding the DT *value*
+  absent. A DT comet's \(g(r)\) was therefore evaluated at zero delay on
+  the two entry points where an understated joint does the most damage.
+
+  That same routine also dropped the Marsden 3×3, as did the second
+  inline copy on the ephemeris side, which serves
+  `empyrean_generate_ephemeris` and
+  `empyrean_builtsystem_generate_ephemeris`. So: two inline copies, four
+  exported entry points, with the DT drop confined to the first copy and
+  the Marsden drop common to both. Both now route through the shared
+  marshaling helper that the propagation and OD paths already used.
+
+  One behaviour change rides that routing and is called out rather than
+  folded in: those three paths and the orbit-file writer now share the
+  propagation path's non-grav **presence rule**, under which an orbit
+  declaring a non-grav covariance or a DT prior carries a non-grav model
+  even with all-zero A coefficients. That opens Marsden columns these
+  paths previously left closed.
+
+- **The orbit-file read path reported no non-grav covariance.** Orbit
+  files have carried a `cov_dim = 9` state+Marsden joint since long
+  before this release, and `empyrean_orbits_read_*` discarded it. The
+  batch now carries it, along with the border and the carrier.
+
+- **A solved DT posterior had no wire.** `EmpyreanNonGravParams` gains
+  `has_dt_variance` / `dt_variance`; a solved-DT fit used to round-trip
+  with its DT column closed.
+
+- **Posterior blocks are sourced from the fitted orbit.** The non-grav
+  3×3, the DT variance and the AMRAT variance previously came from
+  `covariance_9x9`, which is populated only for the width-9 Marsden fit
+  — while every fit carrying a wide joint is wider than 9 by
+  construction. The two sets are disjoint, so the old source reported an
+  absent covariance and a zero 3×3 for every such fit while the fitted
+  orbit held the posterior. `covariance_9x9` remains populated for its
+  deprecation window and is no longer a source.
+
+### Changed
+
+- **Python time inputs are `Epochs`, and every `Epochs` states its
+  scale.** *Breaking.* Every public entry point in the `empyrean` Python
+  package that takes a time now takes an `Epochs` table and nothing
+  else. A bare list, array, float or numpy scalar is refused at the
+  entry point with a `TypeError` that names the fix — not a deprecation
+  warning, and never a silent assumption of TDB.
+
+  The scale-pinned carve-outs are unchanged and stay plain floats,
+  because their scale is fixed by definition rather than by the caller:
+  columns named `mjd_tdb`, arguments named `epoch_mjd_tdb`, and the
+  `epoch` column on the four coordinate tables, which is MJD TDB. That
+  column is one you read rather than a time you hand in; converting it
+  for reuse is `Epochs.from_mjd(..., scale="tdb")`, or
+  `Epochs.from_orbits(orbits, offsets)` which offsets and tags in one
+  step.
+
+  A Modified Julian Date is a clock reading, not an instant. `61000.5`
+  read as UTC and `61000.5` read as TDB name two moments about 69
+  seconds apart, and that gap has grown with every leap second since
+  1972. Which one a caller meant is a modelling statement, and the old
+  signatures — `epochs: Epochs | np.ndarray | Sequence[float]`, with
+  arrays taken as TDB — let a call site inherit that statement instead
+  of making it. Sixty-nine seconds is not a rounding error. Mislabelling
+  one scale as the other displaces a heliocentric state along track by
+  \(|v| \times 69.18\,\text{s}\) — about 1460 km for a body at 2 AU
+  (21.1 km/s) and about 2060 km at 1 AU (29.8 km/s) — before any
+  encounter amplifies it; an object crossing the Earth's sphere of
+  influence covers roughly 350 to 1040 km in that time, at a geocentric
+  5 to 15 km/s.
+
+  Thirteen signatures change: `propagate` and `BuiltSystem.propagate`,
+  `get_states`, `get_observer_states`, `Observers.from_code` /
+  `from_codes`, `query_horizons`, `compute_impact_probabilities` and
+  `compute_b_planes` (whose `end_epoch` is now a length-1 `Epochs`
+  rather than a float), and `index_at` / `up_to` on both
+  `StateSensitivities` and `ObservationSensitivities`. To migrate, wrap
+  the values you already had and say what they were — they were TDB:
+
+  ```python
+  # before
+  empyrean.propagate(orbits, [61000.5, 61010.5])
+  # after
+  empyrean.propagate(orbits, Epochs.from_mjd([61000.5, 61010.5], scale="tdb"))
+  ```
+
+  `Epochs.from_mjd` and `Epochs.from_jd` accordingly **require**
+  `scale`; it no longer defaults to TDB. `Epochs.linspace` and
+  `Epochs.arange` require it as a keyword. `Epochs.now` keeps its
+  `"utc"` default, because there the operation names its own clock, and
+  `Epochs.from_iso` keeps its output-scale default, because an ISO
+  timestamp's trailing `Z` already states the input's scale.
+
+  Columns named `mjd_tdb`, and the arguments named `epoch_mjd_tdb` that
+  mirror the **C ABI's** flattened fields (`PlannedObservation.optical` /
+  `.radar`, `query_horizons_vectors`), are unchanged: there the name pins
+  the scale, so nothing is left unstated. The Rust forms of those same
+  constructors take a typed `Epoch` instead — the flattening is the C
+  boundary's, not a divergence. Output tables are unaffected.
+
+  The Rust channel keeps `f64` times, and its time parameters name their
+  scale explicitly — every one is either a typed `Epoch` that carries
+  its own `TimeScale` or a parameter named `*_mjd_tdb`, and the three
+  `empyrean-cli` flags that take a time (`propagate --epoch`,
+  `ephemeris --epoch`, `query horizons-vectors --epoch-mjd-tdb`) all name
+  MJD TDB in their help text. An audit of
+  every public function in `empyrean/src` found no ambiguous time
+  parameter, so no signature changed there.
+
+- **The time-scale conversions are cross-validated against astropy.**
+  `Epochs.to_tdb` / `to_utc` are now checked against astropy's ERFA path
+  across four regimes — the modern era, every leap-second boundary,
+  the pre-1972 "rubber second" era, and epochs past the last tabulated
+  leap second. Off leap-second days the two agree **bit for bit**, so
+  the tests assert exact equality rather than a tolerance, and the
+  leap-second tables are compared entry for entry (27 days, identical)
+  so that either side falling behind IERS fails loudly instead of
+  drifting quietly. astropy is a test-only dependency; no package code
+  imports it outside the existing optional `Epochs.from_astropy` /
+  `to_astropy` interop.
+
+  The comparison also corrects the documentation: the TT↔TDB conversion
+  carries the **full periodic** Fairhead & Bretagnon (1990) series, not
+  the secular-only truncation the docstrings claimed. The measured
+  TDB−UTC offset varies by 3.3148 ms peak-to-peak over the six-year grid
+  the test samples (MJD 60300–62500), matching
+  astropy's to the microsecond.
+
+  The comparison surfaced one genuine defect, which this release
+  **documents rather than fixes**: on the 27 UTC days that contain a
+  leap second (and on pre-1972 rubber-second days), a *fractional* MJD
+  converts as if the day were 86400 s long rather than 86401, so the
+  error ramps linearly from zero at 00:00 to a full second at 24:00 —
+  900 ms at 21:36, on every affected day. Midnight boundaries and every
+  other day are exact, and no other regime is affected. It is pinned by
+  a strict-`xfail` test that names its magnitude and turns red the
+  moment the behavior changes, so it cannot be resolved silently. The
+  fix is engine-side and is not in this release.
+
+- **The engine pin advances to empyrean-core v0.10.1.** The release
+  that carries everything above: the wide cross-covariance wire format
+  and its units channel, the correlated joint prior with full
+  Schmidt–Kalman consider analysis, the tri-state solve partition, and
+  the per-site elevation and darkness visibility gates. Cross-free
+  fits are bit-identical to the previous engine generation over the
+  full validation catalog (61/61 orbit-determination rows, 8958/8958
+  propagation and ephemeris rows), so existing results do not move.
+
+- **Struct sizes and the two shrinks.** Nine frozen structs change size
+  — seven grow, two shrink. The seven: `CoordinateState` by the border
+  (360 → 512), `EmpyreanOrbit` by the carrier arrays (648 → 832),
+  `EmpyreanPropagatedState` by `orbit_cov` (2392 → 2576),
+  `EmpyreanNonGravParams` by the DT variance pair (160 → 176),
+  `EmpyreanObservatoryConfig` by the visibility fields (40 → 64), and
+  `EmpyreanODResult` by the joint, dispositions, thrust posteriors and
+  warnings (7688 → 8128) — which also grows the
+  `EmpyreanODObjectResult` that embeds it (7720 → 8160). The two:
+  `EmpyreanSolveFor` **shrinks** 8 → 6, and the `EmpyreanODConfig` that
+  embeds it shrinks 432 → 424 with it.
+
+  Those two are the exception to a rule every previous version of this
+  ABI could state without qualification. Replacing `thrust_segments` (a
+  `u32`) with `thrust_dispositions[3]` (three `u8`s) also drops
+  `EmpyreanSolveFor`'s alignment from 4 to 1, so every field after
+  `solve_for_flags` inside `EmpyreanODConfig` shifts —
+  `allow_unbracketed_maneuvers` 392 → 390, `has_photometry` 393 → 391,
+  `photometry` 400 → 392 — which is what takes that config from 432 to
+  424. **They are the first structs on this ABI to get smaller.** A
+  consumer with a hand-mirrored `EmpyreanODConfig` must re-derive its
+  whole layout rather than appending to it: keeping the old prefix
+  writes `photometry` eight bytes past where the library reads it,
+  corrupting it and the two bytes before it with no diagnostic. The
+  other seven grow at the tail.
+
+- **The C ABI is now versioned by the distribution release.**
+  `EMPYREAN_ABI_VERSION` encodes the distribution's own version as
+  `major * 10000 + minor * 100 + patch` and advances with every release
+  whether or not any boundary type changed. The scheme **begins with
+  0.10.0**, which reports `1000`; every release before it reported the
+  retired independent counter instead, whose last published value is 2
+  (v0.9.0). Values below 1000 are therefore counter-era, not release
+  numbers, and no library has ever reported anything between the two.
+
+  Only the **base** version is encoded — the pre-release suffix is not,
+  so `0.10.0-rc.1` and `0.10.0` both report `1000`. The number separates
+  one version from another and never a version from its own
+  pre-releases, so a boundary type that moves inside a pre-release cycle
+  is not caught by the handshake and both sides must be rebuilt
+  together. Within a version's pre-releases the installed artifact or
+  tag is what identifies the exact build.
+
+  The consequence for consumers is that the number no longer says
+  anything about layout: the only reading it supports is equality. A
+  difference means a different release — rebuild against that release's
+  header, or repoint at the matching engine — and a value that did not
+  move is no longer a promise that no struct did. The distribution's own
+  release string is not exported; a build is identified by the artifact
+  or tag it was installed from, while `empyrean_version_string()` reports
+  the engine crates' build provenance instead.
+
+  This release's break is a single batched one; two
+  changes are semantic rather than additive and are called out here
+  rather than left to be discovered:
+
+  `EmpyreanSolveFor`'s `marsden` / `dt` / `amrat` become the tri-state
+  above. `0` and `1` keep their exact former meaning, so `memset(0)` and
+  every value an older caller could write are unchanged — but a *new*
+  caller writing `2` against a pre-0.10.0 library would hit a bare
+  non-zero test and get the axis silently solved, so the boundary
+  validates `0 | 1 | 2` strictly and the version handshake is what makes
+  a dynamically-loaded mismatch fail at the check rather than in the
+  physics. `EmpyreanSolveFor::thrust_segments` (a count) is replaced by
+  `thrust_dispositions[3]` (one per declared segment): two counts cannot
+  say *which* burn is considered, and a three-segment orbit with only
+  the middle burn solved is now a routine case.
+
+  `EmpyreanODResult::thrust_delta_m_per_s` is re-indexed from solved to
+  declared segment order, and `thrust_delta_count` becomes the declared
+  count. Every per-segment array on the result — Δv, covariance,
+  disposition — now shares one index space, and an unsolved segment's Δv
+  is NaN-filled exactly as its covariance is. Under the old pairing a
+  consumer reading `thrust_delta_m_per_s[i]` beside
+  `thrust_correction_covariances[i]` would have attributed a Δv to the
+  wrong burn's covariance the moment any segment was considered or
+  fixed.
 
 ## [0.10.0-rc.0] — 2026-08-09
 
-C ABI version **3**. Three exported functions change signature, one is
-added, and six struct sizes change (four grow directly;
-`EmpyreanEphemerisConfig` grows by embedding one of them, and
+C ABI version **3**. Three exported functions change signature, nine are
+added, and seven struct sizes change (five grow directly;
+`EmpyreanEphemerisConfig` grows by embedding the propagation config, and
 `EmpyreanODResult` by embedding the widened acceptability report), so
 this release is **source-breaking for C consumers** — recompile against
-the version-3 header. Every other symbol and every prior field offset is
-unchanged; struct growth is append-only, as always. The sizes are
-enumerated under the `EMPYREAN_ABI_VERSION` entry below.
+the version-3 header. Growth is appended at the tail in four of the five
+directly-grown structs; the exceptions, spelled out so no binding trusts
+a stale layout: `EmpyreanObservationResult` **inserts** `object_id` at
+field index 1, shifting every following field by 8 bytes; the two
+structs that grow by embedding shift every field after the embedded
+member; and the dead `use_stm_cache` byte in `EmpyreanODConfig` gives
+its slot to `allow_arc_truncation` (its own entry below). Recompiling
+against the new header handles all of it — hand-mirrored layouts must
+not assume any prefix survived. The sizes are enumerated under the
+`EMPYREAN_ABI_VERSION` entry below.
 
 ### Added
+
+- **`empyrean show` — a streaming pager over output artifacts.** Point it
+  at a results directory to list the artifacts and pick one, or at a file
+  directly; page like `more`, slide a horizontal column window across wide
+  tables (a covariance block alone is 45 columns), filter rows, and pipe
+  it — non-interactive output is a plain aligned stream that composes
+  with `grep` and `head`. Streams parquet by record batch, CSV and JSON
+  by row: constant memory at any file size. `--limit`, `--columns`,
+  `--no-header`, `--full-precision`.
 
 - **Strict-offline context construction.** A context can be built with
   the network switched off: it resolves the tier's kernel set from the
@@ -67,6 +524,19 @@ enumerated under the `EMPYREAN_ABI_VERSION` entry below.
   states to branch on. A process that genuinely must reach the network on
   such a machine unsets the variable for itself. Every downgrade is
   announced on stderr.
+- **`empyrean_download_data` — provisioning without a context.**
+  `download_data` used to build a full Standard-tier context and discard
+  it just to trigger the kernel fetch. The C ABI now exports the
+  engine's provision-only path directly; the Rust wrapper routes through
+  it with an unchanged public signature, and Python inherits the same
+  chain. On a warm, complete directory it issues only the staleness
+  checks and downloads nothing; on failure the structured missing-file
+  list is available through `empyrean_missing_data_files`.
+- **The C ABI writes fit summaries.**
+  `empyrean_fit_summary_write_parquet` / `_csv` / `_json` take an
+  `EmpyreanFitSummary` array and emit the same per-object fit-summary
+  artifact the CLI writes, so a C consumer is not the one channel that
+  cannot produce it.
 - **Ephemeris overlap policy.** `EmpyreanPropagationConfig` gains
   `ephemeris_overlap_policy`, selecting what the engine does when a target
   coincides with one of its own perturbers:
@@ -91,6 +561,32 @@ enumerated under the `EMPYREAN_ABI_VERSION` entry below.
   alongside an explicit `excluded_perturbers` entry does nothing. Use one
   or the other. The detection toggle itself is not exposed at any
   distribution layer.
+- **The sampling uncertainty methods, wired through.** `SIGMA_POINT` and
+  `MONTE_CARLO` are honored on `propagate` — previously they were
+  accepted and silently ignored — and `generate_ephemeris` now rejects
+  them **by name** with a typed error rather than ignoring them. The
+  adaptive Gaussian mixture joins the method set as
+  `EMPYREAN_UNCERTAINTY_MIXTURE` (`5`, a new constant with no
+  struct-layout change), and the impact-probability tables carry the
+  `ip_agm` / `ip_mc` columns those methods produce.
+- **The engine capabilities arriving with the empyrean-core v0.10.0
+  pin.** Joint optical + radar orbit determination — radar delay and
+  Doppler fold into escalated fits through a deterministic continuation,
+  delivered only at true weight. The co-orbital initial-orbit-
+  determination lane for Earth-resonant objects, on by default with its
+  own config switch. Full-arc comet fits that escalate to the
+  non-gravitational model instead of structurally truncating
+  apparitions. Five new per-observation rejection codes —
+  `EMPYREAN_REJECTION_NON_FINITE_CHI2` (`10`), `_MISSING_JACOBIAN`
+  (`11`), `_SPACECRAFT_KERNEL_MISSING` (`12`),
+  `_OBSERVER_CONSTRUCTION_FAILED` (`13`), `_NEVER_ABSORBED` (`14`).
+  Nightly de-weighting follows Vereš, Farnocchia, Chesley & Chamberlin
+  (2017) under the VFCC2017 preset, with the Carpino, Milani & Chesley
+  (2003) rejection defaults at the papers' values. And the engine now
+  refuses to run without all three Earth-orientation kernels —
+  historical, high-precision, and long-term predict — with epochs before
+  the historical floor falling back to the analytic IAU model behind a
+  loud accuracy statement.
 - **Observer states in a caller-chosen basis.** Observatory-code lookups
   can be returned in any supported `(frame, origin)` rather than only the
   ICRF / SSB construction basis — `frame` / `origin` arguments on
@@ -110,6 +606,21 @@ enumerated under the `EMPYREAN_ABI_VERSION` entry below.
   collapsed onto a shared one — the two have different remedies.
 
 ### Changed
+
+- **BREAKING — the weighting configuration is honored as written.**
+  Preset `NONE` means none; user-supplied layers insert ahead of the
+  preset chain instead of behind it; malformed values meet typed errors
+  instead of silent clamps or `obs_code` repairs. A zero-initialized
+  `EmpyreanWeightingConfig` / `EmpyreanDebiasingConfig` now means
+  **disabled** — the production defaults (VFCC2017 weighting, EFCC2020
+  debiasing) must be requested explicitly rather than being what
+  `memset(0)` silently selected.
+
+- **A tuned `Auto` uncertainty spec is accepted on the impact path.** The
+  same dataclass `propagate` takes now lowers through
+  `compute_impact_probabilities` / `compute_b_planes` with its κ
+  thresholds honored, instead of raising `unsupported method spec`. The
+  remaining unsupported-spec error names what the path accepts.
 
 - **BREAKING — orbit determination is batch-first at every layer.**
   `determine` groups its observations by ADES object identifier and fits
@@ -190,9 +701,11 @@ enumerated under the `EMPYREAN_ABI_VERSION` entry below.
   `EmpyreanAcceptabilityReport` (and its Rust / Python mirrors) grew
   `selection_fraction_*`, `selected_arc_coverage_ok` /
   `selected_arc_days_value` / `selected_arc_fraction_*`,
-  `trailing_gap_*`, and the `radar_fit_ok` tri-state alongside the
-  existing `fractional_sigma_a_*`. These are the axes
-  `extrapolation_acceptable` is the AND of, so a caller can now report
+  `trailing_gap_*`, and the reserved `radar_fit_ok` tri-state — always
+  `-1` / not-evaluated today, since radar-fit acceptability is not yet
+  assessed — alongside the existing `fractional_sigma_a_*`. The four
+  gate axes are what `extrapolation_acceptable` ANDs together on top of
+  `fit_acceptable`, so a caller can now report
   *why* a fit is not safe to propagate — a heavily pruned arc, a
   selected span that no longer covers the requested one, or a rejected
   recent tail — rather than only that it is not. Every `f64` in the
@@ -240,7 +753,7 @@ enumerated under the `EMPYREAN_ABI_VERSION` entry below.
   engine's radar-annealing and linear-cache policies are solver policy
   rather than fit definition and stay at their defaults with no C knob.
 - **BREAKING — `EMPYREAN_ABI_VERSION` is now 3.** Bumped once for the
-  whole batch of changes above. Six struct sizes change:
+  whole batch of changes above. Seven struct sizes change:
   `EmpyreanPropagationConfig` grew by `ephemeris_overlap_policy`
   (288 → 296 bytes), `EmpyreanEphemerisConfig` by embedding it
   (312 → 320) — easy to miss, since it gained no field of its own —
@@ -248,8 +761,13 @@ enumerated under the `EMPYREAN_ABI_VERSION` entry below.
   `EmpyreanTaggedCovariance` by `quality_kappa_state` (520 → 528),
   `EmpyreanObservationResult` by `object_id` (264 → 272), and
   `EmpyreanAcceptabilityReport` by the four gate axes (120 → 208), which
-  also grows the `EmpyreanODResult` that embeds it (7600 → 7688). Fields
-  are only ever appended, never reordered or removed.
+  also grows the `EmpyreanODResult` that embeds it (7600 → 7688). Growth
+  is at the tail except where called out: `object_id` is inserted at
+  `EmpyreanObservationResult` index 1 (every following field shifts by
+  8 bytes), the embedding growers shift everything after the embedded
+  member, and the `use_stm_cache` slot is repurposed per its own entry.
+  The constant space also grows: `EMPYREAN_UNCERTAINTY_MIXTURE` (`5`)
+  and the five rejection codes `10`–`14` listed in their entries above.
 
   `empyrean-sys` now **enforces** the handshake the header has always
   documented: it calls `empyrean_abi_version()` the moment it opens
@@ -281,6 +799,33 @@ enumerated under the `EMPYREAN_ABI_VERSION` entry below.
 
 ### Fixed
 
+- **The six observation-sensitivity rows are named constants at every
+  layer** rather than an undocumented ordering a consumer had to know.
+- **Photometry rides the fitted orbit.** A `determine` result carries
+  the arc's fitted photometry on the orbit itself, so a downstream
+  ephemeris predicts apparent magnitudes instead of returning none.
+- **A seeded fit delivers under the seed's identity.** Supplying
+  `initial_orbits={"my-name": orbit}` labels the fitted orbit
+  `"my-name"` again, as documented — the batch rework had returned the
+  ADES designation instead. Batch indexing is unchanged; only the fitted
+  orbit's own identity is relabelled.
+- **`read_ades` resolves file paths on the Rust wrapper.** The
+  documented path-or-content detection handed the path itself to the
+  content parser, so `empyrean determine <file>` failed parsing its own
+  argument as MPC80.
+
+- **`Epochs.to_iso` no longer relabels time scales.** The `scale`
+  keyword was documented as cross-scale formatting but implemented as a
+  source reinterpretation, so `to_iso(scale="utc")` on TDB epochs
+  printed the TDB clock under a UTC label — 69 seconds wrong, silently.
+  The method always emits UTC wall-clock for the stored instant; a
+  mismatched `scale` argument now raises with directions to convert
+  first.
+- **Absent impact probabilities are Arrow nulls.** In the
+  possible-impacts events table they marshaled as NaN while the
+  dedicated IP tables used nulls, so an `is not None` gate never fired.
+  The typed `Impacts` table also gains the body-relative
+  `relative_velocity` column the flat surface already carried.
 - **`compute_stm` reaches the engine on the ephemeris path.** The C-ABI
   ephemeris-config converter hand-rolled its narrow config instead of
   routing through the shared propagation converter, so every

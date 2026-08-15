@@ -24,6 +24,7 @@ import numpy as np
 import pytest
 from empyrean import (
     CartesianOrbits,
+    Epochs,
     NonGravParams,
     Origin,
     SRPParams,
@@ -223,11 +224,13 @@ def test_unknown_non_grav_model_rejected() -> None:
 
 def test_model_srp_rejected_by_propagate() -> None:
     with pytest.raises(ValueError, match=r"orbits\.srp"):
-        empyrean.propagate(_orbit_with_srp_model(), np.array([60000.0, 60010.0]))
+        empyrean.propagate(
+            _orbit_with_srp_model(), Epochs.from_mjd(np.array([60000.0, 60010.0]), scale="tdb")
+        )
 
 
 def test_model_srp_rejected_by_generate_ephemeris() -> None:
-    observers = Observers.from_code("500", [60000.5])
+    observers = Observers.from_code("500", Epochs.from_mjd([60000.5], scale="tdb"))
     with pytest.raises(ValueError, match=r"orbits\.srp"):
         generate_ephemeris(_orbit_with_srp_model(), observers)
 
@@ -236,7 +239,7 @@ def test_model_srp_rejected_by_compute_impact_probabilities() -> None:
     with pytest.raises(ValueError, match=r"orbits\.srp"):
         compute_impact_probabilities(
             _orbit_with_srp_model(),
-            end_epoch=60100.0,
+            end_epoch=Epochs.from_mjd([60100.0], scale="tdb"),
             methods=[UncertaintyMethod.FIRST_ORDER],
             body_filter=[Origin.EARTH],
         )
@@ -246,7 +249,7 @@ def test_model_srp_rejected_by_compute_b_planes() -> None:
     with pytest.raises(ValueError, match=r"orbits\.srp"):
         compute_b_planes(
             _orbit_with_srp_model(),
-            end_epoch=60100.0,
+            end_epoch=Epochs.from_mjd([60100.0], scale="tdb"),
             methods=[UncertaintyMethod.FIRST_ORDER],
             body_filter=[Origin.EARTH],
         )
@@ -303,5 +306,5 @@ def test_fitted_srp_reconstructed_from_result() -> None:
 def test_propagate_accepts_srp_orbit() -> None:
     """A fixed-force SRP orbit propagates without error (SRP is additive)."""
     orbits = _orbit_with_srp(amrat=3.0e-3, cr=1.2)
-    result = empyrean.propagate(orbits, np.array([60000.0, 60030.0]))
+    result = empyrean.propagate(orbits, Epochs.from_mjd(np.array([60000.0, 60030.0]), scale="tdb"))
     assert len(result.states) == 2

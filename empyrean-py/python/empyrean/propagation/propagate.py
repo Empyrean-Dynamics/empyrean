@@ -16,11 +16,14 @@ from empyrean._convert import (
     _COORD_TYPE_MAP,
     AnyOrbits,
     coordinates_to_arrays,
+    extract_joint,
     extract_non_grav_covariance,
     extract_photometry,
     extract_srp,
     int_to_frame,
+    joint_columns_from_result,
     naif_to_origin,
+    non_grav_border_only,
     validate_non_grav_marsden_only,
 )
 from empyrean.coordinates.coordinates import CartesianCoordinates
@@ -28,7 +31,7 @@ from empyrean.coordinates.covariance import (
     CartesianCovariance as _CartesianCovariance,
 )
 from empyrean.coordinates.covariance import _CovarianceTable
-from empyrean.coordinates.epoch import Epochs
+from empyrean.coordinates.epoch import Epochs, _epochs_mjd_tdb
 from empyrean.orbits.orbits import CartesianOrbits
 from empyrean.propagation.config import (
     _DATACLASS_TO_INT,
@@ -80,7 +83,7 @@ UncertaintyMethodLike = UncertaintyMethod | SigmaPoint | MonteCarlo | GaussianMi
 
 def propagate(
     orbits: AnyOrbits,
-    epochs: Epochs | np.ndarray | Sequence[float],
+    epochs: Epochs,
     config: PropagationConfig | None = None,
     *,
     # ── Sugar for quick, inline overrides ─────────────────────
@@ -114,9 +117,11 @@ def propagate(
     orbits : CartesianOrbits | CometaryOrbits | KeplerianOrbits | SphericalOrbits
         Input orbits with optional covariance and non-gravitational
         parameters.
-    epochs : Epochs | array-like
-        Target epochs. An :class:`~empyrean.types.Epochs` table (converted
-        to TDB internally), or a 1-D array of MJD TDB values.
+    epochs : Epochs
+        Target epochs as an :class:`~empyrean.types.Epochs` table,
+        converted to TDB internally. Build one with
+        ``Epochs.from_mjd(values, scale="tdb")`` (or ``scale="utc"``); a
+        bare array is refused, as it carries no time scale.
     config : PropagationConfig, optional
         Full propagation configuration. Construct with
         ``PropagationConfig(force_model=..., uncertainty_method=...)``
@@ -210,10 +215,35 @@ def propagate(
     is therefore exact; for any other request shape, join on the
     result's ``epoch_mjd_tdb`` column.
 
+    The joint covariance travels in both directions. An input orbit
+    carrying cross terms — on ``non_grav.non_grav_cross`` (the 6x3
+    state-Marsden border) and ``wide_cross`` (everything else) — is
+    propagated against them rather than against its ``6x6`` alone, and
+    every output row carries the propagated cross terms in the same two
+    columns. This is what makes a chained propagation agree with the
+    single-leg answer: the state-parameter columns are non-zero even
+    when the input was block-diagonal, because propagation itself
+    generates that correlation, so a second leg handed only the ``6x6``
+    reports a tighter uncertainty than the first leg supports.
+
+    Cross terms are refused without the parameter blocks they are
+    conditioned on (the non-grav ``3x3``, the DT and AMRAT prior
+    variances). Propagation passes those through unchanged rather than
+    restating them on every output row, so when chaining legs by hand
+    take them from the orbit that started the chain. A row with no cross
+    terms is null, never zero — an absent correlation and a measured
+    zero correlation are different claims.
+
+    Raises
+    ------
+    TypeError
+        ``epochs`` is not an :class:`Epochs` table.
+
     Examples
     --------
     Defaults (Standard force model, FirstOrder uncertainty):
 
+    >>> times = Epochs.from_mjd([60500.0, 60501.0], scale="tdb")
     >>> result = empyrean.propagate(orbits, times)
 
     With a config object:
@@ -230,6 +260,10 @@ def propagate(
     >>> result = empyrean.propagate(orbits, times, force_model="standard")
     """
     from empyrean._empyrean_rs import _propagate
+
+    # Refused here, at the entry point, before any orbit is marshaled —
+    # a bare array is a caller error, not a modelling result.
+    times_mjd_tdb = _epochs_mjd_tdb(epochs, "propagate() epochs")
 
     # ── Assemble PropagationConfig ────────────────────────────
     if config is None:
@@ -376,14 +410,6 @@ def propagate(
     has_non_grav_cov: np.ndarray | None = has_ng_cov_arr if has_ng_cov_arr.any() else None
     non_grav_cov: np.ndarray | None = ng_cov_arr if has_ng_cov_arr.any() else None
 
-    # ── Extract times ────────────────────────────────────────
-    if isinstance(epochs, Epochs):
-        # Convert to TDB if needed
-        tdb = epochs.to_tdb()
-        times_mjd_tdb = np.asarray(tdb.mjd.to_numpy(zero_copy_only=False), dtype=np.float64)
-    else:
-        times_mjd_tdb = np.asarray(epochs, dtype=np.float64)
-
     # ── Map force model to int ───────────────────────────────
     if isinstance(force_model, str):
         fm_int = _FORCE_MODEL_TO_INT.get(force_model.lower())
@@ -486,6 +512,12 @@ def propagate(
         srp_amrat_variance=srp_amrat_variance,
         has_non_grav_cov=has_non_grav_cov,
         non_grav_cov=non_grav_cov,
+        # The joint's off-diagonal terms, when the input carries them.
+        # A leg fed its predecessor's joint propagates the covariance
+        # that leg actually computed; fed the 6x6 alone it reports a
+        # tighter uncertainty than the first leg supports. No keys at
+        # all when no orbit carries cross terms.
+        **extract_joint(orbits),
         ng_alphas=ng_alphas,
         ng_r0s=ng_r0s,
         ng_ms=ng_ms,
@@ -677,11 +709,26 @@ def _build_cartesian_orbits(result: dict[str, Any]) -> CartesianOrbits:
     # Convert empty strings to None for nullable object_id
     object_id_list = [s if s else None for s in out_object_ids]
 
-    return CartesianOrbits.from_kwargs(
-        orbit_id=out_orbit_ids,
-        object_id=object_id_list,
-        coordinates=cart_coords,
-    )
+    orbits_kwargs: dict[str, Any] = {
+        "orbit_id": out_orbit_ids,
+        "object_id": object_id_list,
+        "coordinates": cart_coords,
+    }
+
+    # The propagated joint's off-diagonal blocks. `coordinates.covariance`
+    # above is only the state block: propagation generates state-parameter
+    # correlation even from a block-diagonal input, so a chained run built
+    # on the 6x6 alone is a tighter claim than this leg supports. Attached
+    # only when the engine produced cross terms — a gravity-only or
+    # parameter-free orbit leaves both columns unset rather than carrying
+    # rows of zeros.
+    border, wide = joint_columns_from_result(result, m)
+    if border is not None:
+        orbits_kwargs["non_grav"] = non_grav_border_only(border)
+    if wide is not None:
+        orbits_kwargs["wide_cross"] = wide
+
+    return CartesianOrbits.from_kwargs(**orbits_kwargs)
 
 
 def _nullable_float(values: np.ndarray) -> pa.Array | np.ndarray:

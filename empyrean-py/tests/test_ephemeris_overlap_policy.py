@@ -27,12 +27,13 @@ from empyrean import (
     DiagnosticsConfig,
     EphemerisConfig,
     EphemerisOverlapPolicy,
+    Epochs,
     EventConfig,
     Observers,
     PropagationConfig,
 )
 
-CERES_EPOCHS = [61000.5, 61010.5]
+CERES_EPOCHS = Epochs.from_mjd([61000.5, 61010.5], scale="tdb")
 
 
 @pytest.fixture(scope="module")

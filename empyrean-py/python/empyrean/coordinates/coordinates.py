@@ -58,7 +58,17 @@ def _stack(*cols: FloatArray) -> FloatArray:
 class CartesianCoordinates(qv.Table):
     """Cartesian state vectors."""
 
-    epoch = qv.Float64Column()  # MJD TDB
+    epoch = qv.Float64Column()
+    """Epoch of this row, **MJD TDB by definition**.
+
+    The one input column that stays a plain float rather than an
+    :class:`~empyrean.Epochs`: the scale is fixed by the column's
+    definition, so there is nothing here for a caller to state. It is
+    therefore *not* a time input in the sense the rest of the package
+    uses — to hand this epoch back to empyrean as a time, convert it with
+    ``Epochs.from_mjd(values, scale="tdb")``, or offset it into a target
+    grid with :meth:`~empyrean.Epochs.from_orbits`.
+    """
     x = qv.Float64Column()  # AU
     y = qv.Float64Column()  # AU
     z = qv.Float64Column()  # AU
@@ -129,7 +139,17 @@ class CartesianCoordinates(qv.Table):
 class KeplerianCoordinates(qv.Table):
     """Keplerian orbital elements."""
 
-    epoch = qv.Float64Column()  # MJD TDB
+    epoch = qv.Float64Column()
+    """Epoch of this row, **MJD TDB by definition**.
+
+    The one input column that stays a plain float rather than an
+    :class:`~empyrean.Epochs`: the scale is fixed by the column's
+    definition, so there is nothing here for a caller to state. It is
+    therefore *not* a time input in the sense the rest of the package
+    uses — to hand this epoch back to empyrean as a time, convert it with
+    ``Epochs.from_mjd(values, scale="tdb")``, or offset it into a target
+    grid with :meth:`~empyrean.Epochs.from_orbits`.
+    """
     a = qv.Float64Column()  # semi-major axis (AU)
     e = qv.Float64Column()  # eccentricity
     i = qv.Float64Column()  # inclination (deg)
@@ -174,7 +194,17 @@ class KeplerianCoordinates(qv.Table):
 class CometaryCoordinates(qv.Table):
     """Cometary orbital elements."""
 
-    epoch = qv.Float64Column()  # MJD TDB
+    epoch = qv.Float64Column()
+    """Epoch of this row, **MJD TDB by definition**.
+
+    The one input column that stays a plain float rather than an
+    :class:`~empyrean.Epochs`: the scale is fixed by the column's
+    definition, so there is nothing here for a caller to state. It is
+    therefore *not* a time input in the sense the rest of the package
+    uses — to hand this epoch back to empyrean as a time, convert it with
+    ``Epochs.from_mjd(values, scale="tdb")``, or offset it into a target
+    grid with :meth:`~empyrean.Epochs.from_orbits`.
+    """
     q = qv.Float64Column()  # perihelion distance (AU)
     e = qv.Float64Column()  # eccentricity
     i = qv.Float64Column()  # inclination (deg)
@@ -220,7 +250,17 @@ class CometaryCoordinates(qv.Table):
 class SphericalCoordinates(qv.Table):
     """Spherical coordinates (topocentric / observer-centric)."""
 
-    epoch = qv.Float64Column()  # MJD TDB
+    epoch = qv.Float64Column()
+    """Epoch of this row, **MJD TDB by definition**.
+
+    The one input column that stays a plain float rather than an
+    :class:`~empyrean.Epochs`: the scale is fixed by the column's
+    definition, so there is nothing here for a caller to state. It is
+    therefore *not* a time input in the sense the rest of the package
+    uses — to hand this epoch back to empyrean as a time, convert it with
+    ``Epochs.from_mjd(values, scale="tdb")``, or offset it into a target
+    grid with :meth:`~empyrean.Epochs.from_orbits`.
+    """
     rho = qv.Float64Column()  # radial distance (AU)
     lon = qv.Float64Column()  # longitude / RA (deg)
     lat = qv.Float64Column()  # latitude / Dec (deg)

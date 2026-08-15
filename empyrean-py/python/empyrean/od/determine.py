@@ -13,9 +13,12 @@ from empyrean._convert import (
     _COORD_TYPE_MAP,
     AnyOrbits,
     coordinates_to_arrays,
+    extract_joint,
     extract_srp,
     int_to_frame,
+    joint_columns_from_result,
     naif_to_origin,
+    non_grav_border_only,
     validate_non_grav_marsden_only,
 )
 from empyrean.coordinates.coordinates import CartesianCoordinates
@@ -45,6 +48,7 @@ from empyrean.od.result import (
     PhotometryModel,
     PhotometryResult,
     SolvedCovariance,
+    SolveFor,
     TrustGateEvent,
 )
 from empyrean.orbits.orbits import CartesianOrbits
@@ -291,6 +295,11 @@ def _orbits_to_dict(orbits: AnyOrbits) -> dict[str, list[Any] | np.ndarray]:
         "srp_amrat_variance": srp_amrat_variance,
         "has_non_grav_cov": has_non_grav_cov,
         "non_grav_cov": non_grav_cov,
+        # The joint's off-diagonal terms, when the seed orbit carries
+        # them — so a fitted orbit re-fed into evaluate / refine is
+        # conditioned on the joint its fit produced rather than on the
+        # diagonal blocks of it. No keys at all when it carries none.
+        **extract_joint(orbits),
     }
 
 
@@ -486,6 +495,15 @@ def _build_cartesian_orbits_single(result: ResultDict, prefix: str = "") -> Cart
         "coordinates": cart_coords,
     }
 
+    # The fit's joint — the off-diagonal blocks of the same matrix whose
+    # state block is the 6x6 above. Read before the non-grav block below
+    # because the border rides that sub-table, and a fit can produce a
+    # border with zero A coefficients (a solved Marsden block whose
+    # coefficients came out at zero is still a solved block).
+    border, wide = joint_columns_from_result(result, 1, prefix=p)
+    if wide is not None:
+        orbits_kwargs["wide_cross"] = wide
+
     # Fitted **absolute** non-grav, so the returned orbit is re-feedable
     # into propagate / evaluate / refine / compute_b_planes without silently
     # dropping the force model. The Rust wrapper folds A1/A2/A3 + g(r) + dt
@@ -520,7 +538,17 @@ def _build_cartesian_orbits_single(result: ResultDict, prefix: str = "") -> Cart
             k=[k],
             dt=[dt],
             covariance=[list(ng_cov) if ng_cov is not None else None],
+            # The other half of the matrix whose diagonal block is
+            # `covariance` beside it, in the fitted covariance's own
+            # basis and units.
+            non_grav_cross=border if border is not None else [None],
         )
+    elif border is not None:
+        # A border with no A coefficients to report: the Marsden block
+        # was solved and came out at zero, or the fit carried the block
+        # as a prior. The border still belongs on the orbit — dropping it
+        # would hand the next leg half a joint.
+        orbits_kwargs["non_grav"] = non_grav_border_only(border)
 
     # Fitted / carried SRP slot — absolute AMRAT + fixed Cr, and the fitted
     # AMRAT posterior variance when AMRAT was solved. Independent of the
@@ -1201,6 +1229,26 @@ def _build_covariance_trust(d: dict[str, Any] | None) -> CovarianceTrust | None:
     )
 
 
+def _dispositions_from_result(result: ResultDict) -> SolveFor:
+    """Decode the partition the fit actually ran.
+
+    Absent on a result from a build that reports none, in which case the
+    axes read as fixed — the state-only set, which is what every
+    unreported axis was. Thrust dispositions are DECLARED-indexed, so
+    the list is positional with the orbit's correction covariances
+    rather than a count of solved burns.
+    """
+    disp = result.get("dispositions")
+    if disp is None:
+        return SolveFor()
+    return SolveFor(
+        marsden=disp["marsden"],
+        dt=disp["dt"],
+        amrat=disp["amrat"],
+        thrust=list(disp.get("thrust", [])),
+    )
+
+
 def _build_determine_result(result: ResultDict) -> DetermineResult:
     """Assemble a :class:`DetermineResult` from a Rust _determine /
     _refine result dict."""
@@ -1294,4 +1342,9 @@ def _build_determine_result(result: ResultDict) -> DetermineResult:
         dv_frame=dv_frame,
         photometry=photometry,
         covariance_trust=covariance_trust,
+        dispositions=_dispositions_from_result(result),
+        # Payload, not a log line: a fit that declined to use covariance
+        # it was handed says so here, because that changes how the sigma
+        # for the affected slot should be read.
+        warnings=list(result.get("warnings", [])),
     )

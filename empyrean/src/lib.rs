@@ -72,6 +72,7 @@
 //! | Stateful, mask-and-refit OD            | [`Session`]                                      |
 //! | Impact probability                     | [`Context::compute_impact_probabilities`]        |
 //! | B-plane geometry                       | [`Context::compute_b_planes`]                    |
+//! | Rank candidate follow-up observations  | [`Context::evaluate_plan`]                       |
 //! | Convert between coordinate types       | [`Context::transform_coordinates`] (batch) / [`Context::transform_coordinates_single`] |
 //! | Body / observer states                 | [`Context::get_states`] / [`Context::get_observers`] |
 //! | Pull an orbit from JPL SBDB            | [`query_sbdb`]                                   |
@@ -106,10 +107,12 @@ mod ephemeris;
 mod error;
 mod impact;
 mod io;
+mod joint;
 mod math;
 mod observers;
 mod od;
 mod orbit;
+mod planning;
 mod propagate;
 mod query;
 mod session;
@@ -144,20 +147,26 @@ pub use io::{
     write_fit_summary_parquet, write_orbits_csv, write_orbits_json, write_orbits_parquet,
     write_residuals_csv, write_residuals_json, write_residuals_parquet,
 };
+pub use joint::{JointCovariance, ParamColumn, ParamDisposition, WideCross};
 pub use math::{MixtureComponent, eigenvector_max_6x6, split_gaussian};
 pub use observers::Observer;
 pub use od::{
     AcceptabilityReport, AcceptabilityThresholds, AutoEscalationPolicy, BandStat,
     CovarianceRepresentation, CovarianceTrust, DebiasingConfig, DebiasingResolution,
     DetermineEntry, DetermineFailure, DetermineFailureKind, DetermineResult, DetermineResults,
-    EvaluateResult, GateRecord, IODConfig, ODConfig, Observation, ObservationResidual,
-    Observations, OriginPolicy, OutputEpoch, PhotometryConfig, PhotometryModel, PhotometryResult,
-    RadarMeasurement, RadarObservation, RadarResidual, RadarResidualKind, RejectionConfig,
-    RejectionKind, RejectionReason, ResidualSummary, SigmaPolicy, SolveFor, SolveForParams,
-    SolvedCovariance, StationBias, StationRaDecConfig, TrustGateEvent, WeightingConfig,
-    WeightingLayer, WeightingPreset,
+    EvaluateResult, GateRecord, IODConfig, MAX_THRUST_SEGMENTS, ODConfig, Observation,
+    ObservationResidual, Observations, OriginPolicy, OutputEpoch, PhotometryConfig,
+    PhotometryModel, PhotometryResult, RadarMeasurement, RadarObservation, RadarResidual,
+    RadarResidualKind, RejectionConfig, RejectionKind, RejectionReason, ResidualSummary,
+    SigmaPolicy, SolveFor, SolveForParams, SolvedCovariance, StationBias, StationRaDecConfig,
+    TrustGateEvent, WeightingConfig, WeightingLayer, WeightingPreset,
 };
 pub use orbit::{Orbit, PhaseFunction};
+pub use planning::{
+    CandidateKind, CovarianceMetrics, ObservatoryConfig, PlanCandidate, PlanEphemerisPoint,
+    PlanResult, PlannedObservation, PlannedObservationKind, PlanningConfig, RadarMode,
+    RadarPlanSpec, RadarStation, TargetRadarProperties,
+};
 pub use propagate::{
     AdvancedIntegratorConfig, CovarianceKind, CovarianceQuality, DiagnosticsConfig,
     EphemerisOverlapPolicy, Event, EventConfig, ForceModelTier, IntegratorChoice,

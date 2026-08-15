@@ -129,12 +129,20 @@ fn resolve_lib_path() -> PathBuf {
 ///
 /// `dlsym` matches on symbol **name** only, so a mismatched engine resolves
 /// every symbol and then reads the caller's arguments through the wrong
-/// signature. Up to ABI 2 that could only ever produce wrong values, because
-/// every bump appended struct fields; ABI 3 changes the parameter lists of
-/// `empyrean_transform_coordinates` and `empyrean_get_observers` in place,
-/// where the same mismatch writes through an integer the caller passed by
-/// value. Checking [`empyrean_abi_version`] the moment the library opens is
-/// what that accessor exists for, and it is cheap — one call, once per
+/// signature. The check is an equality: [`EMPYREAN_ABI_VERSION`] carries
+/// the distribution release that built this crate and advances with every
+/// release, so a different value is a different release and nothing about
+/// the layouts behind the shared names can be assumed.
+///
+/// The damage a tolerated mismatch does has grown with the ABI. Under the
+/// retired counter, up to its version 2, it could only ever produce wrong
+/// values, because every bump appended struct fields; version 3 changed the
+/// parameter lists of `empyrean_transform_coordinates` and
+/// `empyrean_get_observers` in place, where the same mismatch writes through
+/// an integer the caller passed by value; the 0.10.0 ABI shrinks
+/// `EmpyreanSolveFor` and shifts the tail of the `EmpyreanODConfig` that
+/// embeds it. Checking [`empyrean_abi_version`] the moment the library opens
+/// is what that accessor exists for, and it is cheap — one call, once per
 /// process.
 pub fn lib() -> &'static EmpyreanLib {
     LIB.get_or_init(|| {

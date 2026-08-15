@@ -42,6 +42,7 @@ import pytest
 from empyrean import (
     CartesianCoordinates,
     CartesianOrbits,
+    Epochs,
     Origin,
     Session,
     determine,
@@ -111,7 +112,7 @@ def f51_observations(probe_orbit) -> ADESObservations:
     nightly de-weighting a no-op where it appears.
     """
     epochs = [61001.1 + i for i in range(6)]
-    observers = Observers.from_code("F51", epochs)
+    observers = Observers.from_code("F51", Epochs.from_mjd(epochs, scale="tdb"))
     eph = generate_ephemeris(probe_orbit, observers, force_model=ForceModelTier.APPROXIMATE)
     ra = eph.ephemeris.coordinates.lon.to_numpy(zero_copy_only=False)
     dec = eph.ephemeris.coordinates.lat.to_numpy(zero_copy_only=False)
@@ -145,7 +146,7 @@ def fittable_f51_observations(probe_orbit) -> ADESObservations:
     can actually fail on the axis it names.
     """
     epochs = [61001.1 + 30.0 * i / 14 for i in range(15)]
-    observers = Observers.from_code("F51", epochs)
+    observers = Observers.from_code("F51", Epochs.from_mjd(epochs, scale="tdb"))
     eph = generate_ephemeris(probe_orbit, observers, force_model=ForceModelTier.APPROXIMATE)
     ra = eph.ephemeris.coordinates.lon.to_numpy(zero_copy_only=False)
     dec = eph.ephemeris.coordinates.lat.to_numpy(zero_copy_only=False)

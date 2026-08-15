@@ -1,4 +1,4 @@
-"""Malformed covariance surfaces instead of being zeroed — bd empyrean-ekqe.
+"""Malformed covariance surfaces instead of being zeroed.
 
 ``coordinates_to_arrays`` and ``orbits_to_orbit_batch_dict`` each wrapped the
 covariance conversion in a bare ``except Exception`` and, on any failure,
@@ -37,6 +37,7 @@ from empyrean.coordinates.covariance import (
     SphericalCovariance,
 )
 from empyrean.coordinates.enums import Origin
+from empyrean.coordinates.epoch import Epochs
 from empyrean.orbits.orbits import CartesianOrbits
 
 # (coordinate class, covariance class, element kwargs for one row)
@@ -235,7 +236,9 @@ def test_propagate_surfaces_malformed_covariance() -> None:
     cov[0, 5, 5] = np.nan
 
     with pytest.raises(ValueError, match="coordinates_to_arrays"):
-        empyrean.propagate(_cartesian_orbits(cov), np.array([60001.0]))
+        empyrean.propagate(
+            _cartesian_orbits(cov), Epochs.from_mjd(np.array([60001.0]), scale="tdb")
+        )
 
 
 def test_write_orbits_parquet_surfaces_malformed_covariance(tmp_path) -> None:

@@ -1,6 +1,6 @@
 """Behavioral contract for the GaussianMixture (adaptive Gaussian
 mixture, AGM) uncertainty method in :func:`empyrean.propagate` and
-:func:`empyrean.generate_ephemeris` — bd empyrean-p1j7.
+:func:`empyrean.generate_ephemeris`.
 
 GaussianMixture is exposed as a top-level uncertainty method (tag 5)
 reusing the AGM parameter slots the C ABI already carried for ``Auto``;
@@ -26,7 +26,7 @@ from __future__ import annotations
 import empyrean
 import numpy as np
 import pytest
-from empyrean import GaussianMixture, PropagationConfig, UncertaintyMethod
+from empyrean import Epochs, GaussianMixture, PropagationConfig, UncertaintyMethod
 from empyrean.coordinates.coordinates import CartesianCoordinates
 from empyrean.coordinates.covariance import CartesianCovariance
 from empyrean.orbits.orbits import CartesianOrbits
@@ -71,14 +71,20 @@ def orbit() -> CartesianOrbits:
 
 
 @pytest.fixture(scope="module")
-def times() -> np.ndarray:
-    return np.array([_EPOCH_MJD_TDB, _EPOCH_MJD_TDB + 365.0, _EPOCH_MJD_TDB + 730.0])
+def times() -> Epochs:
+    return Epochs.from_mjd(
+        np.array([_EPOCH_MJD_TDB, _EPOCH_MJD_TDB + 365.0, _EPOCH_MJD_TDB + 730.0]),
+        scale="tdb",
+    )
 
 
 @pytest.fixture(scope="module")
 def observers():
     empyrean.initialize()
-    return empyrean.get_observer_states(["500"], np.array([_EPOCH_MJD_TDB, _EPOCH_MJD_TDB + 30.0]))
+    return empyrean.get_observer_states(
+        ["500"],
+        Epochs.from_mjd(np.array([_EPOCH_MJD_TDB, _EPOCH_MJD_TDB + 30.0]), scale="tdb"),
+    )
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -127,7 +133,7 @@ def test_gaussian_mixture_wire_dict_serialization() -> None:
     ids=["enum", "dataclass"],
 )
 def test_propagate_gaussian_mixture_runs_finite(
-    orbit: CartesianOrbits, times: np.ndarray, method
+    orbit: CartesianOrbits, times: Epochs, method
 ) -> None:
     """Both the enum and the dataclass forms run without raising and
     attach a finite state covariance with non-negative variances. The
@@ -142,9 +148,7 @@ def test_propagate_gaussian_mixture_runs_finite(
     assert kinds <= {"linear", "mixture"}, f"unexpected tagged-covariance kind(s): {kinds}"
 
 
-def test_propagate_gaussian_mixture_reaches_engine(
-    orbit: CartesianOrbits, times: np.ndarray
-) -> None:
+def test_propagate_gaussian_mixture_reaches_engine(orbit: CartesianOrbits, times: Epochs) -> None:
     """Proof-of-reach: GaussianMixture must execute a distinct engine path,
     NOT be silently downgraded to the literal first-order code. Under a
     silent downgrade the covariance would be *bit-identical* to
@@ -175,7 +179,7 @@ def test_propagate_gaussian_mixture_reaches_engine(
     assert np.allclose(m_gmm, m_fo, rtol=1e-6, atol=1e-20)
 
 
-def test_propagate_gaussian_mixture_params_flow(orbit: CartesianOrbits, times: np.ndarray) -> None:
+def test_propagate_gaussian_mixture_params_flow(orbit: CartesianOrbits, times: Epochs) -> None:
     """The AGM parameters flow to the engine rather than being clamped to
     defaults at the wrapper: a non-default ``components_per_split`` is
     accepted (honored — on a benign arc the splitter never fires, so no
@@ -192,7 +196,7 @@ def test_propagate_gaussian_mixture_params_flow(orbit: CartesianOrbits, times: n
 
 
 def test_propagate_gaussian_mixture_wire_dict_path_consistent(
-    orbit: CartesianOrbits, times: np.ndarray
+    orbit: CartesianOrbits, times: Epochs
 ) -> None:
     """The ``config=`` (wire-dict) path resolves ``GAUSSIAN_MIXTURE`` to the
     real variant — not a silently-substituted first-order covariance —

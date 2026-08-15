@@ -7,10 +7,10 @@ use empyrean_core::convert::{coordinate_state_to_coordinates, frame_to_int};
 use empyrean_core::coordinates::{AU, CoordinateRepresentation, Coordinates, Origin};
 use empyrean_core::determination::{
     AcceptabilityReport, AdaptiveRejectionConfig, BiasKind, BiasScope, CMC2003Config,
-    CovarianceTrust, DetermineError, ODConfig, ODResult, ObservationResidualSummary,
-    ObservationResult, Observations, OriginPolicy, OutputEpoch, RadarMeasurement, RadarObservation,
-    RadarResidual, RejectionReason, SolveFor, SolveForParams, SolvedCovariance, TrustGateEvent,
-    UpstreamForceModelTier, determine, evaluate_single, refine_single,
+    CovarianceTrust, DetermineError, ODConfig, ODResult, ODWarning, ObservationResidualSummary,
+    ObservationResult, Observations, OriginPolicy, OutputEpoch, ParamDisposition, RadarMeasurement,
+    RadarObservation, RadarResidual, RejectionReason, SolveFor, SolveForParams, SolvedCovariance,
+    TrustGateEvent, UpstreamForceModelTier, determine, evaluate_single, refine_single,
 };
 use empyrean_core::io::{ADESObservations, parse_ades};
 use empyrean_core::nongrav::NonGravModel;
@@ -299,6 +299,20 @@ pub const EMPYREAN_REJECTION_OBSERVER_CONSTRUCTION_FAILED: i32 = 13;
 /// [`EMPYREAN_REJECTION_NOT_EVALUATED`], which means the call path ran
 /// no rejection pass at all.
 pub const EMPYREAN_REJECTION_NEVER_ABSORBED: i32 = 14;
+/// The observation names a **per-observation site** — the roving-observer
+/// codes `247` / `270` and the occultation code `275` — whose position
+/// travels with each observation, so the MPC publishes no planetodetic
+/// constants for it and there is nothing to look up.
+///
+/// Distinct from [`EMPYREAN_REJECTION_UNSUPPORTED_OBSERVATORY`]: the code
+/// is perfectly well known, and what is missing is the observation's own
+/// longitude / latitude / altitude, not a registry entry. Distinct from
+/// [`EMPYREAN_REJECTION_SPACECRAFT_KERNEL_MISSING`] too: that is a
+/// data-provisioning gap closed by loading a kernel, whereas this one is
+/// closed by supplying the coordinates the ADES record already carries
+/// per observation, which routes the row through the geodetic-observer
+/// path and fits it.
+pub const EMPYREAN_REJECTION_PER_OBSERVATION_SITE_REQUIRED: i32 = 15;
 /// Rejection was not evaluated for this observation (e.g. evaluate path).
 pub const EMPYREAN_REJECTION_NOT_EVALUATED: i32 = -1;
 
@@ -503,6 +517,43 @@ pub const EMPYREAN_SOLVE_WIDTH: usize = 20;
 /// MUST read the slot tags — a width alone is ambiguous (width 9 is
 /// Marsden OR one-segment thrust).
 pub const EMPYREAN_SLOT_NONE: u32 = 0xFFFF_FFFF;
+
+// ── Per-axis parameter dispositions ───────────────────────────────
+// The tri-state on `EmpyreanSolveFor` and the per-segment thrust
+// disposition arrays. `0` and `1` are what the retired boolean flags
+// meant, so `memset(0)` is unchanged; `2` is new.
+/// The axis is marginalized out of the prior in covariance space. It
+/// contributes nothing and changes no number. The zero-init default,
+/// and what a boolean `false` always meant.
+pub const EMPYREAN_PARAM_FIXED: u8 = 0;
+/// The axis is estimated from the data: it occupies a solved slot and
+/// comes back with a posterior variance. What a boolean `true` meant.
+pub const EMPYREAN_PARAM_SOLVED: u8 = 1;
+/// The axis is not estimated but is uncertain, and that uncertainty
+/// reaches the state through its measurement partials — Schmidt–Kalman
+/// consider analysis (Tapley, Byron D., Schutz, Bob E., and Born,
+/// George H., *Statistical Orbit Determination*, Elsevier Academic
+/// Press, 2004, ch. 6, "Consider Covariance Analysis").
+pub const EMPYREAN_PARAM_CONSIDERED: u8 = 2;
+/// The largest number of thrust Δv correction segments one fit can
+/// declare, and the length of every per-segment thrust array on this
+/// ABI — the dispositions, the Δv corrections, and their posterior
+/// covariances.
+///
+/// A literal rather than an alias of the engine's own constant, because
+/// cbindgen resolves array lengths textually and cannot see through a
+/// crate it does not parse — an aliased value emits a header that names
+/// a macro it never defines. A compile-time assertion in the library's
+/// own source keeps the literal honest: it fails the build the day the
+/// engine's maximum moves, which is exactly when this ABI needs a fresh
+/// version bump rather than a silently truncated array.
+pub const EMPYREAN_MAX_THRUST_SEGMENTS: usize = 3;
+const _: () = assert!(
+    EMPYREAN_MAX_THRUST_SEGMENTS == empyrean_core::determination::MAX_THRUST_SEGMENTS,
+    "the engine's thrust-segment maximum moved: every per-segment array on \
+     EmpyreanODResult and EmpyreanSolveFor is frozen at this width, so widening \
+     it is an EMPYREAN_ABI_VERSION break, not a constant edit"
+);
 // The frozen width can never silently fall below scott's own maximum.
 const _: () = assert!(EMPYREAN_SOLVE_WIDTH >= empyrean_core::determination::MAX_SOLVE_WIDTH);
 
@@ -521,37 +572,263 @@ pub const EMPYREAN_PHOTOMETRY_MODEL_HG1G2: i32 = 4;
 
 /// Integer handshake on the frozen-ABI shape contract, distinct from the
 /// per-crate semver strings in `EmpyreanVersions` (which are provenance).
-/// Consumers compiled against a given `EMPYREAN_SOLVE_WIDTH` check this at
-/// load; any additive change to the frozen structs bumps it.
+/// A consumer checks it the moment it opens the library and requires
+/// **equality**, never an ordering or a range: the value names the
+/// distribution release that built the library (see *The version scheme*
+/// at the end of this comment), so any difference at all means a
+/// different release, and the remedy is to rebuild against that
+/// release's header or to repoint at the matching engine. A difference
+/// is therefore no longer evidence that a frozen struct moved, and an
+/// equal value is what licenses the layouts below — `dlsym` resolves on
+/// symbol name alone, and the names are stable across releases while the
+/// shapes behind them are not, so a mismatch allowed to proceed reads
+/// the caller's arguments through the wrong layout instead of failing.
 ///
-/// Version 3 (this one) is a single, batched break:
+/// This release's ABI (0.10.0) is a single, batched break carrying the joint
+/// solved-parameter covariance across the boundary in both directions,
+/// plus the riders that were queued behind a version bump. Every change,
+/// in full:
 ///
-/// - `EmpyreanPropagationConfig` grows `ephemeris_overlap_policy` at its tail (and
-///   so does the `EmpyreanEphemerisConfig` that embeds it);
-/// - `EmpyreanObserver` grows `frame` / `origin` — the basis the state
-///   is expressed in, which used to be an undeclared ICRF/SSB
-///   assumption;
-/// - `EmpyreanTaggedCovariance` grows `quality_kappa_state`, the payload
-///   of the new `EMPYREAN_COVARIANCE_QUALITY_EXPANSION_SUSPECT` tag;
-/// - `empyrean_transform_coordinates` becomes the **batched** entry
-///   point (array in, array out) and the one-state form is renamed
-///   `empyrean_transform_coordinates_single`;
-/// - `empyrean_get_observers` gains `frame` / `origin` parameters;
-/// - `empyrean_determine` becomes the **batched** entry point: it writes
-///   an [`EmpyreanDetermineResults`] table with one
-///   [`EmpyreanODObjectResult`] per ADES object instead of a single
-///   [`EmpyreanODResult`], and its output is released with the new
-///   [`empyrean_determine_results_free`];
-/// - [`EmpyreanObservationResult`] grows `object_id`, and
-///   [`EmpyreanAcceptabilityReport`] grows the selection-fraction,
-///   selected-arc-coverage and trailing-gap gate axes plus the
-///   `radar_fit_ok` tri-state.
+/// **The joint covariance, input side.**
 ///
-/// Fields are only ever appended, never reordered or removed, so the
-/// signature changes are the only source-breaking ones — a consumer
-/// built against an older header must recompile against this one either
-/// way.
-pub const EMPYREAN_ABI_VERSION: u32 = 3;
+/// - [`CoordinateState`](crate::CoordinateState) grows
+///   `has_non_grav_cross` / `non_grav_cross[6][3]` — the state↔Marsden
+///   border, placed beside the 6×6 it borders so
+///   `empyrean_transform_coordinates` cannot move one without the
+///   other;
+/// - [`EmpyreanOrbit`] grows `state_param_cross` / `n_state_param_cross`
+///   and `param_pair_cross` / `n_param_pair_cross` — the wide carrier,
+///   as caller-owned side arrays following the `thrust_arcs` template;
+/// - three new input structs — [`EmpyreanParamColumn`](crate::joint::EmpyreanParamColumn),
+///   [`EmpyreanStateParamCross`](crate::joint::EmpyreanStateParamCross),
+///   [`EmpyreanParamPairCross`](crate::joint::EmpyreanParamPairCross).
+///
+/// **Two new exported symbols** — the first movement of the parity
+/// manifest in this release, and deliberate:
+///
+/// - [`empyrean_propagation_joint_at`](crate::propagate::empyrean_propagation_joint_at)
+///   returns the propagated joint's cross terms at one
+///   `(orbit_index, epoch_index)`;
+/// - [`empyrean_orbit_covariance_free`](crate::propagate::empyrean_orbit_covariance_free)
+///   releases what it wrote.
+///
+/// They exist as a separate call rather than as fields on
+/// [`EmpyreanTaggedCovariance`](crate::propagate::EmpyreanTaggedCovariance)
+/// **to preserve that struct's plain-old-data contract**. A caller
+/// declares one on the stack and frees nothing; giving it owned arrays
+/// would have turned every such caller — code correct today, and
+/// recompiling without a diagnostic — into a leaking one, two
+/// allocations per call, with no error and no wrong number to notice.
+/// Opt-in ownership at a new entry point costs one extra symbol and
+/// makes the acquisition explicit. `EmpyreanTaggedCovariance` is
+/// therefore unchanged in the 0.10.0 ABI.
+///
+/// **New constants**, all nine of them:
+///
+/// - `EMPYREAN_PARAM_COLUMN_MARSDEN` / `_DT` / `_AMRAT` / `_THRUST` —
+///   the parameter-column identity tags, the value set of
+///   `EmpyreanParamColumn::kind`;
+/// - `EMPYREAN_PARAM_FIXED` / `_SOLVED` / `_CONSIDERED` — the
+///   disposition tri-state, the value set of every `u8` on
+///   [`EmpyreanSolveFor`] and of its `thrust_dispositions` entries;
+/// - [`EMPYREAN_MAX_THRUST_SEGMENTS`] — the length of every per-segment
+///   array on this ABI;
+/// - [`EMPYREAN_REJECTION_PER_OBSERVATION_SITE_REQUIRED`] (15).
+///
+/// **The joint covariance, output side.**
+///
+/// - [`EmpyreanPropagatedState`](crate::propagate::EmpyreanPropagatedState)
+///   grows `orbit_cov`
+///   ([`EmpyreanOrbitCovariance`](crate::joint::EmpyreanOrbitCovariance),
+///   new), carrying the propagated border and carrier as library-owned
+///   arrays. This is what closes leg chaining: `covariance` alone is the
+///   state block, and the engine's propagated joint has non-zero
+///   state↔parameter columns **even from a block-diagonal input**,
+///   because propagation itself generates them. A caller who chained
+///   legs on the 6×6 alone was quoting a tighter uncertainty than the
+///   propagation supports;
+/// - the same struct rides
+///   [`EmpyreanODResult::orbit`], so a fitted orbit and a propagated
+///   state expose their joint under one name with one ownership rule,
+///   and `determine → propagate` and `propagate → propagate` are the
+///   same field copy. The joint has exactly one home per result — there
+///   is deliberately no second border on `EmpyreanODResult` itself that
+///   could disagree with the one on its orbit;
+/// - [`EmpyreanNonGravParams`] grows `has_dt_variance` / `dt_variance`,
+///   which had no wire at all: a solved-DT fit used to round-trip with
+///   its DT column closed;
+/// - the non-grav 3×3, the DT variance and the AMRAT variance are now
+///   sourced from the fitted **orbit** rather than from
+///   `covariance_9x9`. The 9×9 is populated only for the width-9
+///   Marsden fit while every carrier-bearing fit is wider, so the old
+///   source reported an absent covariance for 100% of them.
+///   `covariance_9x9` remains populated for its deprecation window and
+///   stops being a source.
+///
+/// **The parameter partition.**
+///
+/// - [`EmpyreanSolveFor`]'s `marsden` / `dt` / `amrat` become a
+///   tri-state — `0` fixed, `1` solved, `2` considered — validated
+///   strictly at the boundary. `0` and `1` keep their exact former
+///   meaning, so `memset(0)` and every value an older caller could
+///   write are unchanged; a **semantic** break nonetheless, which is
+///   why it rides this bump rather than passing unversioned;
+/// - `EmpyreanSolveFor::thrust_segments` (a count) becomes
+///   `thrust_dispositions[3]` (per declared segment). Two counts cannot
+///   say WHICH burn is considered, and a three-segment orbit with only
+///   the middle burn solved is now a routine case;
+/// - [`EmpyreanODResult`] grows `dispositions`, echoing the partition
+///   the fit actually ran — which is what makes an Auto escalation
+///   readable after the fact, and what tells a caller whether
+///   re-attaching a prior to an axis double-counts.
+///
+/// **Thrust, per declared segment.**
+///
+/// - [`EmpyreanODResult`] grows `thrust_correction_covariances` and
+///   `n_thrust_segments`;
+/// - `thrust_delta_m_per_s` is **re-indexed from solved to declared
+///   order**, and `thrust_delta_count` becomes the declared count. This
+///   is a semantic change to a shipped field. It is made here because
+///   the alternative is freezing two incompatible index spaces into one
+///   struct forever: a consumer pairing `thrust_delta_m_per_s[i]` with
+///   `thrust_correction_covariances[i]` would otherwise attribute a Δv
+///   to the wrong burn's covariance the moment any segment is
+///   considered or fixed. An unsolved segment's Δv is NaN-filled
+///   exactly as its covariance is.
+///
+/// **Riders.**
+///
+/// - [`EmpyreanODResult`] grows the `warnings` / `num_warnings` string
+///   channel — supplied covariance a fit deliberately did not use;
+/// - `EMPYREAN_REJECTION_PER_OBSERVATION_SITE_REQUIRED` (15) joins the
+///   rejection codes;
+/// - [`EmpyreanObservatoryConfig`](crate::planning::EmpyreanObservatoryConfig)
+///   grows `min_elevation_deg` plus `has_max_sun_altitude_deg` /
+///   `max_sun_altitude_deg`, matching the engine's own observatory
+///   config. Both are marshaled across in full, and **no entry point
+///   exported by this ABI applies them**: the gates that read them
+///   belong to the engine's visibility survey, which has no C entry
+///   point, while `empyrean_evaluate_plan` — the one exported consumer
+///   of this struct — consults the site-invariant filters alone. They
+///   ride the struct so that exposing the survey later needs no further
+///   break;
+/// - the impact and B-plane paths marshal the caller's non-grav DT
+///   value and Marsden 3×3, both of which they silently dropped — the
+///   DT drop meant those two entry points evaluated a DT comet's
+///   \\(g(r)\\) at zero delay while honouring the DT prior variance
+///   eleven lines away;
+/// - the ephemeris path marshals the caller's Marsden 3×3 for the same
+///   reason;
+/// - and those three paths, plus the orbit-file writer, now share the
+///   propagation path's non-grav **presence rule**: an orbit that
+///   declares a non-grav covariance or a DT prior carries a non-grav
+///   model even when its A coefficients are all zero. That opens the
+///   Marsden columns those paths previously left closed — a behaviour
+///   change on the way to fixing the drops above, not merely a
+///   re-routing;
+/// - the orbit-file read path carries the non-grav 3×3, the border and
+///   the carrier onto [`EmpyreanOrbitBatch`](crate::io::EmpyreanOrbitBatch)
+///   rather than reporting them absent.
+///
+/// **Layout: appended everywhere but one, and that one SHRINKS two
+/// structs.** Every earlier release of this ABI could say "fields are
+/// only ever appended, never reordered or removed". This one cannot, and
+/// the exception is stated here rather than left for a consumer to
+/// discover by corruption: replacing `EmpyreanSolveFor::thrust_segments`
+/// (a `u32`) with `thrust_dispositions[3]` (three `u8`s) takes that
+/// struct from 8 bytes to 6 and its alignment from 4 to 1, which shifts
+/// every field after `solve_for_flags` inside the
+/// [`EmpyreanODConfig`] that embeds it —
+/// `allow_unbracketed_maneuvers` 392→390, `has_photometry` 393→391,
+/// `photometry` 400→392 — and shrinks that config 432→424 in turn.
+/// `EmpyreanSolveFor` and `EmpyreanODConfig` are the first structs on
+/// this ABI to get SMALLER.
+///
+/// A consumer with a hand-mirrored `EmpyreanODConfig` must therefore
+/// re-derive its whole layout, not just append: keeping an existing
+/// prefix and writing `photometry` at its old offset lands eight bytes
+/// past where the library reads it, corrupting the photometry config
+/// and the two bytes before it with no diagnostic. Every other frozen
+/// struct in this release grows by appending, and their sizes are
+/// enumerated in the changelog.
+///
+/// The source-breaking changes are the two semantic ones
+/// (`EmpyreanSolveFor`'s encoding and the thrust Δv index space) plus
+/// the `thrust_segments` → `thrust_dispositions` replacement above — a
+/// consumer built against an older header must recompile against this
+/// one either way, and `empyrean_abi_version()` is what makes a
+/// dynamically-loaded mismatch fail at the version check rather than in
+/// the physics.
+///
+/// **The version scheme.** The C ABI carries the distribution's own
+/// version, encoded \\(\text{major} \times 10000 + \text{minor} \times
+/// 100 + \text{patch}\\). It advances with every distribution release
+/// whether or not any boundary type changed: the ABI is versioned by the
+/// release that ships it, not by an independent counter.
+///
+/// **The scheme begins with 0.10.0**, which reports `1000` — the
+/// smallest value it can produce. Every release before it reported the
+/// retired independent counter instead; its last published value is 2,
+/// shipped by v0.9.0. That is why values below 1000 are counter-era and
+/// are not release numbers.
+///
+/// **Only the base version is encoded.** The pre-release suffix is not:
+/// `0.10.0-rc.1` and `0.10.0` both report `1000`. So this number
+/// separates one version from another, and never a version from its own
+/// pre-releases — if a boundary type moves inside a pre-release cycle,
+/// the handshake will not catch the mismatch and both sides have to be
+/// rebuilt together. Across the pre-releases of a single version, the
+/// artifact or tag that was installed is the only thing that identifies
+/// the exact build.
+///
+/// The distribution's own release string is not exported. A consumer
+/// identifies the build it is running by the artifact or tag it
+/// installed; `empyrean_version_string()` reports something else — the
+/// build provenance of the closed-source engine crates behind this
+/// boundary, not this distribution's version.
+pub const EMPYREAN_ABI_VERSION: u32 = 1000;
+
+/// The constant above is the crate's own version, encoded — and this
+/// assertion is what keeps it that way. Under the retired counter the
+/// value only had to move when a boundary type changed, which is a
+/// reviewed event; it now has to move on every release, including the
+/// release that changes nothing at the boundary and so gives nobody a
+/// reason to open this file. A forgotten bump would leave
+/// `empyrean_abi_version()` reporting a version the library is not,
+/// which is undetectable from either side of the handshake — both sides
+/// descend from this one literal.
+///
+/// `CARGO_PKG_VERSION_MAJOR` / `_MINOR` / `_PATCH` drop any pre-release
+/// suffix, so a pre-release and its final release encode to the same
+/// number and the assertion holds across a whole pre-release cycle
+/// without either side moving. That is the mechanism behind the
+/// base-version-only limitation stated on the constant above; it is a
+/// property of this encoding, not an oversight in the check.
+const fn encoded_crate_version() -> u32 {
+    const fn parse_u32(s: &str) -> u32 {
+        let bytes = s.as_bytes();
+        let mut value = 0u32;
+        let mut i = 0;
+        while i < bytes.len() {
+            assert!(
+                bytes[i] >= b'0' && bytes[i] <= b'9',
+                "a version component of this crate is not a plain integer"
+            );
+            value = value * 10 + (bytes[i] - b'0') as u32;
+            i += 1;
+        }
+        value
+    }
+    parse_u32(env!("CARGO_PKG_VERSION_MAJOR")) * 10000
+        + parse_u32(env!("CARGO_PKG_VERSION_MINOR")) * 100
+        + parse_u32(env!("CARGO_PKG_VERSION_PATCH"))
+}
+const _: () = assert!(
+    EMPYREAN_ABI_VERSION == encoded_crate_version(),
+    "EMPYREAN_ABI_VERSION no longer encodes this crate's version: the ABI is \
+     versioned by the distribution release that ships it, so a release bump \
+     must carry the constant with it (major * 10000 + minor * 100 + patch)"
+);
 
 /// Runtime accessor for [`EMPYREAN_ABI_VERSION`] — lets a dynamically
 /// linked consumer confirm the loaded library's frozen-shape contract
@@ -896,6 +1173,19 @@ pub struct EmpyreanNonGravParams {
     /// orbit lets a fitted orbit flow into a StateAndNonGrav refine without
     /// losing its non-grav prior.
     pub covariance: [[f64; 3]; 3],
+    /// 1 when `dt_variance` carries a meaningful DT variance (the fitted
+    /// posterior when DT was solved, else the carried-through prior); 0
+    /// otherwise.
+    pub has_dt_variance: u8,
+    /// Prior/posterior variance on the non-grav time delay DT (days²).
+    /// Only meaningful when `has_dt_variance = 1`.
+    ///
+    /// The DT posterior had no wire at all before 0.10.0: the fitted
+    /// variance existed on the orbit and simply could not cross the ABI,
+    /// so a solved-DT fit round-tripped with its DT column closed. Copy
+    /// it onto `EmpyreanOrbit::non_grav_dt_variance` to re-open and
+    /// prior that column in a follow-on refine.
+    pub dt_variance: f64,
 }
 
 /// The fitted orbit's **absolute** solar-radiation-pressure slot, flattened
@@ -927,22 +1217,79 @@ pub struct EmpyreanSRPParams {
 
 /// Result of orbit determination (determine or refine).
 ///
-/// Per-axis solve-for flags (mirrors scott's `SolveFor`). Read only when
-/// [`EmpyreanODConfig::solve_for`] is [`EMPYREAN_SOLVE_FOR_EXPLICIT`]; the
-/// three coarse `EMPYREAN_SOLVE_FOR_*` codes cover the common shapes
-/// without it. Each flag turns on a wide-STM axis, subject to its own
-/// precondition (a declared prior on the orbit) enforced by scott.
+/// Per-axis parameter **dispositions** (mirrors scott's `SolveFor`).
+/// Read only when [`EmpyreanODConfig::solve_for`] is
+/// [`EMPYREAN_SOLVE_FOR_EXPLICIT`]; the three coarse
+/// `EMPYREAN_SOLVE_FOR_*` codes cover the common shapes without it.
+///
+/// # A disposition, not a flag
+///
+/// Each axis says what the fit **does** with that parameter, and the
+/// three answers are different operations with different mathematics:
+///
+/// - [`EMPYREAN_PARAM_FIXED`] — marginalized out of the prior in
+///   covariance space. Contributes nothing; changes no number.
+/// - [`EMPYREAN_PARAM_SOLVED`] — estimated from the data. Occupies a
+///   solved slot and comes back with a posterior variance.
+/// - [`EMPYREAN_PARAM_CONSIDERED`] — not estimated, but its prior
+///   uncertainty reaches the posterior through its measurement partials
+///   (Schmidt–Kalman consider analysis), so the reported σ accounts for
+///   an error source the fit did not absorb.
+///
+/// A considered axis is **not** a safety margin. Under an uncorrelated
+/// prior the correction strictly widens the posterior, but when the
+/// orbit supplies cross terms between the considered axis and the solved
+/// ones the cross-dependent terms are sign-indefinite and the posterior
+/// can come back **tighter**.
+///
+/// Solving or considering an axis still requires its own precondition —
+/// a declared prior on the orbit — enforced by scott.
+///
+/// # Zero-init and the version handshake
+///
+/// `0` is `FIXED` and `1` is `SOLVED`, which is exactly what the `0` /
+/// `1` of the retired boolean flags meant, so a `memset(0)` config and
+/// every value an older caller could have written are unchanged.
+///
+/// The widening is only safe in that direction. A caller writing `2`
+/// for CONSIDERED against a pre-0.10.0 library would hit a bare
+/// non-zero test and get the axis **silently solved** — a wider solved
+/// set, a different fitted answer, and no error anywhere. Two things
+/// prevent it: this boundary refuses any value outside `0 | 1 | 2` by
+/// name and value, so a future fourth value fails loudly here rather
+/// than degrading silently; and the tri-state rides the
+/// [`EMPYREAN_ABI_VERSION`] break at 0.10.0, so
+/// [`empyrean_abi_version`] is what makes the mismatch legible to a
+/// caller compiled against 0.10.0's ABI and dynamically loaded
+/// against an earlier library.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct EmpyreanSolveFor {
-    /// Solve the Marsden A1/A2/A3 block (requires a non-grav covariance).
+    /// Disposition of the Marsden A1/A2/A3 block (3 columns when
+    /// solved). Solving or considering it requires the orbit to carry a
+    /// non-grav covariance.
     pub marsden: u8,
-    /// Solve the non-grav time delay DT (requires `marsden` + a DT prior).
+    /// Disposition of the non-grav time delay DT (1 column when solved).
+    /// Solving it requires `marsden` solved plus a DT value and prior
+    /// variance on the orbit.
     pub dt: u8,
-    /// Solve the SRP AMRAT (requires an SRP AMRAT prior).
+    /// Disposition of the SRP AMRAT (1 column when solved). Requires an
+    /// SRP slot carrying an AMRAT prior variance.
     pub amrat: u8,
-    /// Number of thrust Δv segments to solve (3 columns each; 0 = none).
-    pub thrust_segments: u32,
+    /// Disposition of each declared thrust Δv segment, **positional with
+    /// the orbit's `correction_covariances`** — entry `i` governs
+    /// declared segment `i`.
+    ///
+    /// Positional rather than a count, because a considered or fixed
+    /// segment sits *between* solved ones as readily as after them: a
+    /// three-segment orbit with only the middle burn solved is not
+    /// expressible as a count. Entries beyond the orbit's declared
+    /// segment count must be [`EMPYREAN_PARAM_FIXED`].
+    ///
+    /// The solved count is derivable from this array, which is why the
+    /// former `thrust_segments` count is gone rather than kept beside
+    /// it — two spellings of one fact are two facts that can disagree.
+    pub thrust_dispositions: [u8; EMPYREAN_MAX_THRUST_SEGMENTS],
 }
 
 /// Full solved-parameter covariance at the ABI-frozen width
@@ -1138,6 +1485,13 @@ pub struct EmpyreanODResult {
     /// Solve-for parameter set requested on the driving config
     /// (`EMPYREAN_SOLVE_FOR_*`). Together with `has_covariance_9x9`
     /// disambiguates Auto outcomes.
+    ///
+    /// This is the coarse code, and it names a **solved** set: a fit
+    /// that considers an axis reports `EXPLICIT` rather than the code
+    /// its solved set alone would suggest, because a considered axis
+    /// contributes to the delivered σ. Read
+    /// [`dispositions`](Self::dispositions) for what the fit did with
+    /// each axis.
     pub solve_for_used: i32,
     /// Structured fit-quality verdict. The `acceptable` flags can be
     /// checked directly; per-check values + thresholds are exposed for
@@ -1165,12 +1519,37 @@ pub struct EmpyreanODResult {
     pub has_amrat_delta: u8,
     /// Cumulative SRP AMRAT correction (m²/kg).
     pub amrat_delta: f64,
-    /// Number of fitted thrust Δv segments (0..=3); 0 = no thrust solve.
+    /// Number of **declared** thrust Δv segments (0..=3); 0 = the orbit
+    /// declared no thrust.
+    ///
+    /// **Deprecated, and identical to
+    /// [`n_thrust_segments`](Self::n_thrust_segments)** — read that one.
+    /// Kept populated for one deprecation window, exactly as
+    /// `covariance_9x9` is, so a consumer that reads the array bound
+    /// off the field beside the array still compiles and still reads
+    /// the right bound.
+    ///
+    /// Two names for one number is the defect that removed
+    /// `EmpyreanSolveFor::thrust_segments` in this same release; this
+    /// one survives only because it is a *published* field whose
+    /// meaning changed rather than a new one, and deleting it in the
+    /// same bump that re-indexed its array would leave a consumer no
+    /// compiling intermediate state.
     pub thrust_delta_count: u32,
     /// Per-segment fitted Δv in m/s, expressed in
-    /// [`dv_frame`](EmpyreanODResult::dv_frame). Entries
-    /// `0..thrust_delta_count` meaningful.
-    pub thrust_delta_m_per_s: [[f64; 3]; 3],
+    /// [`dv_frame`](EmpyreanODResult::dv_frame), **indexed by declared
+    /// segment**. Entries `0..thrust_delta_count` meaningful.
+    ///
+    /// A segment this fit did not solve has no correction and its entry
+    /// is **NaN-filled**, exactly as its posterior covariance is. Read
+    /// `dispositions.thrust_dispositions[i]` before the value.
+    ///
+    /// The index space changed in the 0.10.0 ABI, from solved order to
+    /// declared order, so that this array, `thrust_correction_covariances`
+    /// and `dispositions.thrust_dispositions` share one index. Under the
+    /// old pairing a fit with a considered burn between two solved ones
+    /// returned a Δv attributed to the wrong burn's covariance.
+    pub thrust_delta_m_per_s: [[f64; 3]; EMPYREAN_MAX_THRUST_SEGMENTS],
     /// Integration frame the Δv components are expressed in (0=ICRF,
     /// 1=EclipticJ2000). Only meaningful when `thrust_delta_count > 0`.
     pub dv_frame: i32,
@@ -1215,6 +1594,69 @@ pub struct EmpyreanODResult {
     /// encounter (solved width 6); 0 otherwise. Meaningful only for
     /// `ENCOUNTER_INTERVENES`.
     pub trust_second_order_recoverable: u8,
+
+    // ── Joint posterior + partition (0.10.0) ──────────────────────
+    //
+    // The fitted joint's CROSS terms live on `orbit.orbit_cov`, not
+    // here. One home: a propagated state and a fitted orbit carry the
+    // same `EmpyreanOrbitCovariance` under the same name, so leg
+    // chaining reads the same field whatever produced the state, and
+    // there is no second copy of the border that could disagree with
+    // the first.
+    /// What this fit did with each parameter axis the orbit declared —
+    /// solved, considered or fixed, in the same encoding
+    /// [`EmpyreanODConfig::solve_for_flags`] uses.
+    ///
+    /// Without it a covariance is ambiguous. An axis the fit
+    /// **considered** already has its uncertainty inside the delivered
+    /// 6×6, so re-attaching a prior to it double-counts; an axis the fit
+    /// held **fixed** contributed nothing, so attaching a prior to it is
+    /// conservative and correct. Same covariance, opposite conclusions.
+    ///
+    /// Reports the request as resolved against the orbit, so under
+    /// [`EMPYREAN_SOLVE_FOR_AUTO`] it names the width the fit actually
+    /// ran at rather than the width that was requested.
+    pub dispositions: EmpyreanSolveFor,
+    /// Number of **declared** thrust Δv segments — the length of the
+    /// meaningful prefix of
+    /// [`thrust_delta_m_per_s`](Self::thrust_delta_m_per_s),
+    /// [`thrust_correction_covariances`](Self::thrust_correction_covariances)
+    /// and `dispositions.thrust_dispositions`, which all share one index
+    /// space.
+    ///
+    /// This is the count the orbit's own `correction_covariances`
+    /// declares, **not** the number of segments solved — the two differ
+    /// exactly when a segment is considered or fixed. Read
+    /// `dispositions.thrust_dispositions[i]` to learn which.
+    pub n_thrust_segments: u32,
+    /// Per-segment fitted Δv correction covariances (AU/day)²,
+    /// row-major, **indexed by declared segment**. Entries
+    /// `0..n_thrust_segments` meaningful.
+    ///
+    /// A segment this fit did not solve carries no posterior and its 3×3
+    /// is **NaN-filled** rather than echoing the prior: republishing a
+    /// prior block under a posterior's name is the two-provenance defect
+    /// this whole surface exists to remove. Read the disposition before
+    /// the block.
+    ///
+    /// Re-feed by copying into `EmpyreanOrbit::correction_covariances`,
+    /// which is caller-owned and borrowed — copy, do not alias.
+    pub thrust_correction_covariances: [[[f64; 3]; 3]; EMPYREAN_MAX_THRUST_SEGMENTS],
+    /// Non-fatal conditions the fit reports about itself — chiefly
+    /// supplied covariance it deliberately did not use.
+    ///
+    /// Heap array of `num_warnings` NUL-terminated UTF-8 strings; null
+    /// when `num_warnings == 0`, which is the common case. One list per
+    /// fit, not per observation. Display-serialized so the ABI stays
+    /// stable as the engine's warning taxonomy grows.
+    ///
+    /// These are delivered scientific payload, not log lines: a supplied
+    /// prior cross term that had to be dropped changes how the σ for
+    /// that slot should be read. Owned by the result and freed with it.
+    pub warnings: *mut *mut c_char,
+    /// Number of warning strings. 0 when the fit used everything it was
+    /// given.
+    pub num_warnings: usize,
 }
 
 // ── Per-object failure codes (EmpyreanODObjectResult::error_code) ──
@@ -1854,6 +2296,9 @@ fn rejection_reason_to_c(reason: &RejectionReason) -> i32 {
         }
         RejectionReason::OutsideArc => EMPYREAN_REJECTION_OUTSIDE_ARC,
         RejectionReason::SpacecraftKernelMissing => EMPYREAN_REJECTION_SPACECRAFT_KERNEL_MISSING,
+        RejectionReason::PerObservationSiteRequired => {
+            EMPYREAN_REJECTION_PER_OBSERVATION_SITE_REQUIRED
+        }
         RejectionReason::ObserverConstructionFailed(_) => {
             EMPYREAN_REJECTION_OBSERVER_CONSTRUCTION_FAILED
         }
@@ -2220,6 +2665,9 @@ fn poisoned_od_result() -> EmpyreanODResult {
             stt: [[[f64::NAN; 6]; 6]; 6],
             has_stt: 0,
             resolved_kind: 0,
+            // Filled by `write_orbit_covariance` on the delivered
+            // path; absent here so a poisoned slot frees nothing.
+            orbit_cov: crate::joint::empty_orbit_covariance(),
         },
         observations: std::ptr::null_mut(),
         num_observations: 0,
@@ -2266,6 +2714,8 @@ fn poisoned_od_result() -> EmpyreanODResult {
             non_grav_dt: f64::NAN,
             has_covariance: 0,
             covariance: [[f64::NAN; 3]; 3],
+            has_dt_variance: 0,
+            dt_variance: f64::NAN,
         },
         rejection_passes: 0,
         num_oppositions_fit: 0,
@@ -2289,7 +2739,7 @@ fn poisoned_od_result() -> EmpyreanODResult {
         has_amrat_delta: 0,
         amrat_delta: f64::NAN,
         thrust_delta_count: 0,
-        thrust_delta_m_per_s: [[f64::NAN; 3]; 3],
+        thrust_delta_m_per_s: [[f64::NAN; 3]; EMPYREAN_MAX_THRUST_SEGMENTS],
         dv_frame: -1,
         has_photometry: 0,
         // Zeroed (not NaN-filled) because the free path walks its owned
@@ -2311,6 +2761,25 @@ fn poisoned_od_result() -> EmpyreanODResult {
         trust_event_body: std::ptr::null_mut(),
         trust_solved_width: 0,
         trust_second_order_recoverable: 0,
+        // Pointers null and counts 0 (not NaN-filled) because the free
+        // path walks the owned carrier arrays, exactly as for
+        // `photometry` above. The border and the thrust blocks ARE
+        // NaN-filled: they are inline values, and a zeroed cross block
+        // is a plausible "no correlation" claim a caller who skipped
+        // the `delivered` test would carry forward.
+        // Every axis FIXED: the always-valid reading, matching how the
+        // acceptability block reports "no gate passed" rather than an
+        // invented verdict.
+        dispositions: EmpyreanSolveFor {
+            marsden: EMPYREAN_PARAM_FIXED,
+            dt: EMPYREAN_PARAM_FIXED,
+            amrat: EMPYREAN_PARAM_FIXED,
+            thrust_dispositions: [EMPYREAN_PARAM_FIXED; EMPYREAN_MAX_THRUST_SEGMENTS],
+        },
+        n_thrust_segments: 0,
+        thrust_correction_covariances: [[[f64::NAN; 3]; 3]; EMPYREAN_MAX_THRUST_SEGMENTS],
+        warnings: std::ptr::null_mut(),
+        num_warnings: 0,
     }
 }
 
@@ -2668,10 +3137,6 @@ pub(crate) unsafe fn write_covariance_trust(
     }
 }
 
-/// Populate the v0.9.0 wide-fitting fields on a result out-pointer from
-/// scott's `ODResult`. ALWAYS writes every field (zeros / sentinels when
-/// an axis was not solved) — no defaulted covariance presented as real,
-/// per the full-population contract.
 /// Write every field of an [`ODResult`] into the C out-struct **except**
 /// `orbit`, which the caller supplies because the entry paths build the
 /// propagated state differently.
@@ -2686,7 +3151,7 @@ pub(crate) unsafe fn write_od_result_fields(
     result_out: *mut EmpyreanODResult,
     od: &ODResult,
     object_id: Option<&str>,
-) {
+) -> Result<(), String> {
     let (obs_ptr, obs_n) = observation_results_to_c(&od.observations, object_id);
     let summary = summary_to_c(&od.summary);
     let acceptability = acceptability_to_c(&od.acceptability);
@@ -2725,11 +3190,19 @@ pub(crate) unsafe fn write_od_result_fields(
         (*result_out).acceptability = acceptability;
         (*result_out).station_biases = sb_ptr;
         (*result_out).num_station_biases = sb_n;
-        populate_wide_fitting_fields(result_out, od);
+        populate_wide_fitting_fields(result_out, od)?;
     }
+    Ok(())
 }
 
-unsafe fn populate_wide_fitting_fields(result_out: *mut EmpyreanODResult, od: &ODResult) {
+/// Populate the v0.9.0 wide-fitting fields on a result out-pointer from
+/// scott's `ODResult`. ALWAYS writes every field (zeros / sentinels when
+/// an axis was not solved) — no defaulted covariance presented as real,
+/// per the full-population contract.
+unsafe fn populate_wide_fitting_fields(
+    result_out: *mut EmpyreanODResult,
+    od: &ODResult,
+) -> Result<(), String> {
     unsafe {
         write_covariance_trust(result_out, &od.covariance_trust);
         match &od.solved_covariance {
@@ -2768,19 +3241,13 @@ unsafe fn populate_wide_fitting_fields(result_out: *mut EmpyreanODResult, od: &O
         let (has_srp, srp) = od_result_srp_to_c(od);
         (*result_out).has_srp = has_srp;
         (*result_out).srp = srp;
-        let mut thrust = [[0.0_f64; 3]; 3];
-        let count = match od.thrust_delta_m_per_s() {
-            Some(dvs) => {
-                for (i, dv) in dvs.iter().take(3).enumerate() {
-                    thrust[i] = *dv;
-                }
-                dvs.len().min(3) as u32
-            }
-            None => 0,
-        };
-        (*result_out).thrust_delta_count = count;
-        (*result_out).thrust_delta_m_per_s = thrust;
+        write_thrust_posterior_fields(result_out, od);
         (*result_out).dv_frame = od.dv_frame.map(frame_to_int).unwrap_or(0);
+        (*result_out).dispositions = solve_for_to_c(&od.dispositions);
+        write_orbit_covariance(result_out, od)?;
+        let (warn_ptr, num_warnings) = od_warnings_to_c(&od.warnings);
+        (*result_out).warnings = warn_ptr;
+        (*result_out).num_warnings = num_warnings;
         match &od.photometry {
             Some(p) => {
                 (*result_out).has_photometry = 1;
@@ -2792,6 +3259,170 @@ unsafe fn populate_wide_fitting_fields(result_out: *mut EmpyreanODResult, od: &O
             }
         }
     }
+    Ok(())
+}
+
+/// Write the per-segment thrust surface — the Δv corrections, their
+/// posterior covariances, and the declared count they share.
+///
+/// # One index space, deliberately
+///
+/// All three per-segment arrays on the result — Δv, covariance,
+/// disposition — are indexed by **declared** segment. Before 0.10.0 the Δv
+/// array was indexed by *solved* segment while nothing else was, which
+/// was invisible while declared ≡ solved was an enforced invariant. It
+/// no longer is: a considered or fixed burn is declared-but-unsolved,
+/// and the two orders diverge the moment one appears. A consumer writing
+/// the obvious `thrust_delta_m_per_s[i]` beside
+/// `thrust_correction_covariances[i]` would then pair a Δv with another
+/// burn's covariance — silently, having followed the header.
+///
+/// So the Δv array is re-indexed here and an unsolved segment's Δv is
+/// NaN-filled exactly as its covariance is. That is a semantic change to
+/// a shipped field, which is acceptable only because it rides an ABI
+/// major bump and because the alternative is freezing two incompatible
+/// index spaces into one struct forever.
+unsafe fn write_thrust_posterior_fields(result_out: *mut EmpyreanODResult, od: &ODResult) {
+    let (declared, dv, cov) = thrust_posterior_arrays(
+        od.thrust_delta_declared().as_deref(),
+        od.thrust_correction_covariances.as_deref(),
+    );
+    unsafe {
+        (*result_out).n_thrust_segments = declared;
+        (*result_out).thrust_delta_count = declared;
+        (*result_out).thrust_delta_m_per_s = dv;
+        (*result_out).thrust_correction_covariances = cov;
+    }
+}
+
+/// The declared-indexed thrust arrays, as pure data.
+///
+/// Both inputs are already in **declared** segment order, so this
+/// scatters nothing — it converts the Δv to m/s, NaN-fills every
+/// unsolved slot in both arrays, and reports the declared count they
+/// share. Split out of the writer so the index space and the NaN-fill
+/// are testable without assembling a whole [`ODResult`].
+#[allow(clippy::type_complexity)]
+fn thrust_posterior_arrays(
+    dv_declared: Option<&[Option<[f64; 3]>]>,
+    cov_declared: Option<&[Option<[[f64; 3]; 3]>]>,
+) -> (
+    u32,
+    [[f64; 3]; EMPYREAN_MAX_THRUST_SEGMENTS],
+    [[[f64; 3]; 3]; EMPYREAN_MAX_THRUST_SEGMENTS],
+) {
+    use empyrean_core::constants::{M_PER_AU, S_PER_DAY};
+    const AU_PER_DAY_TO_M_PER_S: f64 = M_PER_AU / S_PER_DAY;
+
+    let mut dv = [[f64::NAN; 3]; EMPYREAN_MAX_THRUST_SEGMENTS];
+    let mut cov = [[[f64::NAN; 3]; 3]; EMPYREAN_MAX_THRUST_SEGMENTS];
+
+    // The declared count comes from the covariance array, whose length
+    // IS the orbit's declared segment count — the space `wide_layout`
+    // derives its thrust block in. Not `SolvedCovariance::thrust_count`,
+    // which counts only the solved segments and diverges the moment one
+    // is considered or fixed.
+    let declared = cov_declared
+        .map_or(0, |c| c.len())
+        .min(EMPYREAN_MAX_THRUST_SEGMENTS);
+
+    if let Some(dvs) = dv_declared {
+        for (i, entry) in dvs.iter().take(EMPYREAN_MAX_THRUST_SEGMENTS).enumerate() {
+            if let Some(v) = entry {
+                dv[i] = [
+                    v[0] * AU_PER_DAY_TO_M_PER_S,
+                    v[1] * AU_PER_DAY_TO_M_PER_S,
+                    v[2] * AU_PER_DAY_TO_M_PER_S,
+                ];
+            }
+        }
+    }
+    if let Some(blocks) = cov_declared {
+        for (i, entry) in blocks.iter().take(EMPYREAN_MAX_THRUST_SEGMENTS).enumerate() {
+            // `None` stays NaN-filled: a considered or fixed segment has
+            // no posterior, and echoing its prior here would republish a
+            // prior under a posterior's name.
+            if let Some(block) = entry {
+                cov[i] = *block;
+            }
+        }
+    }
+    (declared as u32, dv, cov)
+}
+
+/// Read the fitted orbit's border and wide carrier out onto the result.
+///
+/// Both are sourced from the same `ODResult::orbit` every other
+/// posterior block comes from, in that orbit's own output
+/// representation — so the crosses and the diagonals they are
+/// conditioned on describe one matrix rather than two provenances.
+///
+/// Fails on a failed allocation rather than publishing an absent
+/// carrier: "this fit produced no cross terms" and "we could not
+/// allocate them" are different claims, and a caller who read the first
+/// when the second was true would re-feed a block-diagonal joint — the
+/// exact error this surface exists to prevent.
+unsafe fn write_orbit_covariance(
+    result_out: *mut EmpyreanODResult,
+    od: &ODResult,
+) -> Result<(), String> {
+    // ── Basis: whatever the 6×6 beside it is ──────────────────────
+    //
+    // Read the joint off the STORED coordinate, un-rescaled, because
+    // that is exactly where `ODResult::covariance` comes from: the
+    // estimator reads its 6×6 straight off this coordinate, and
+    // `EmpyreanODResult::covariance` publishes it verbatim. Taking the
+    // border and carrier in the coordinate's angular unit instead would
+    // put degree-scaled crosses beside a radian 6×6 whenever the fit's
+    // output representation is Keplerian / Cometary / Spherical — a
+    // factor of 180/π on the angular rows, within one struct whose own
+    // documented contract is that the two share a basis AND units.
+    //
+    // The one-shot entry points never reach a non-Cartesian result
+    // (`od_orbit_to_propagated` refuses one), where the distinction is a
+    // no-op because Cartesian has no angular rows. The SESSION path does
+    // deliver Keplerian / Cometary / Spherical results, so the
+    // distinction is live there and only there.
+    let Some(coord) = od.orbit.coordinates().first() else {
+        // No row 0 at all: leave the joint absent rather than
+        // fabricating one. Absent is the truth here, not a fallback.
+        return Ok(());
+    };
+    let joint = crate::joint::joint_to_c(
+        coord.extended_covariance(),
+        od.orbit.wide_cross(0),
+        "fitted orbit",
+    )?;
+    unsafe {
+        (*result_out).orbit.orbit_cov = joint;
+    }
+    Ok(())
+}
+
+/// Marshal the fit's warning list into the C string-array channel.
+///
+/// Display-serialized rather than mirrored as an enum, because the
+/// engine's warning taxonomy is explicitly open-ended: mirroring it
+/// would freeze a set that is meant to grow, and every consumer would
+/// break on the next variant.
+fn od_warnings_to_c(warnings: &[ODWarning]) -> (*mut *mut c_char, usize) {
+    if warnings.is_empty() {
+        return (std::ptr::null_mut(), 0);
+    }
+    let n = warnings.len();
+    let Ok(layout) = std::alloc::Layout::array::<*mut c_char>(n) else {
+        set_last_error("allocation failed for the OD warnings array");
+        return (std::ptr::null_mut(), 0);
+    };
+    let ptr = unsafe { std::alloc::alloc(layout) } as *mut *mut c_char;
+    if ptr.is_null() {
+        set_last_error("allocation failed for the OD warnings array");
+        return (std::ptr::null_mut(), 0);
+    }
+    for (i, w) in warnings.iter().enumerate() {
+        unsafe { ptr.add(i).write(alloc_cstring(&w.to_string())) };
+    }
+    (ptr, n)
 }
 
 pub(crate) fn acceptability_to_c(r: &AcceptabilityReport) -> EmpyreanAcceptabilityReport {
@@ -2861,8 +3492,19 @@ fn solve_for_to_int(s: &SolveForParams) -> i32 {
     match s {
         SolveForParams::Auto => EMPYREAN_SOLVE_FOR_AUTO,
         SolveForParams::Explicit(sf) => {
-            let state_only = !sf.marsden && !sf.dt && !sf.amrat && sf.thrust_segments == 0;
-            let non_grav_only = sf.marsden && !sf.dt && !sf.amrat && sf.thrust_segments == 0;
+            // The two coarse codes name a SOLVED set, so a considered
+            // axis disqualifies them: a fit that considers AMRAT is not
+            // the state-only fit `STATE_ONLY` names, and reporting it as
+            // one would hide a σ contribution the caller asked for. Such
+            // a fit reports EXPLICIT, and the disposition echo carries
+            // the detail.
+            let quiet = |d: ParamDisposition| d == ParamDisposition::Fixed;
+            let thrust_quiet = sf.thrust.iter().copied().all(quiet);
+            let state_only = quiet(sf.marsden) && quiet(sf.dt) && quiet(sf.amrat) && thrust_quiet;
+            let non_grav_only = sf.marsden == ParamDisposition::Solved
+                && quiet(sf.dt)
+                && quiet(sf.amrat)
+                && thrust_quiet;
             if state_only {
                 EMPYREAN_SOLVE_FOR_STATE_ONLY
             } else if non_grav_only {
@@ -2894,8 +3536,26 @@ fn coord_rep_to_int(r: CoordinateRepresentation) -> i32 {
 /// `GFunction` (its fields are public). `NonGravModel` is Marsden-only in
 /// v1.20.0 — SRP is a separate first-class slot (`SRPForceParams`), no
 /// longer a non-grav model variant.
+/// The non-grav half of [`od_result_non_grav_to_c`], driven directly by
+/// the tests.
+///
+/// `od_result_non_grav_to_c` takes a whole `ODResult` — 30-odd fields,
+/// none defaulted — but reads exactly one thing from it: the fitted
+/// orbit's non-grav block. Splitting the read out lets the marshal
+/// itself be tested without assembling a result, so the coverage is of
+/// the shipped code path rather than of a fixture.
+#[cfg(test)]
+pub(crate) fn od_result_non_grav_to_c_for_test(orbit: &Orbits<AU>) -> (u8, EmpyreanNonGravParams) {
+    non_grav_block_to_c(orbit)
+}
+
 fn od_result_non_grav_to_c(od: &ODResult) -> (u8, EmpyreanNonGravParams) {
-    match od.orbit.non_grav_params(0) {
+    non_grav_block_to_c(&od.orbit)
+}
+
+/// Read an orbit's non-grav block into the flat C shape.
+fn non_grav_block_to_c(orbit: &Orbits<AU>) -> (u8, EmpyreanNonGravParams) {
+    match orbit.non_grav_params(0) {
         Some(ng) => {
             let (ng_alpha, ng_r0, ng_m, ng_n, ng_k) = match &ng.model {
                 // Normalize the inverse-square default (α=1, r0=1, m=2, n=0,
@@ -2914,23 +3574,34 @@ fn od_result_non_grav_to_c(od: &ODResult) -> (u8, EmpyreanNonGravParams) {
                 None => (0u8, f64::NAN),
             };
             // Fitted non-grav covariance: carry it out so the
-            // re-feedable orbit keeps its non-grav prior for a StateAndNonGrav
-            // refine. Source it from the authoritative 9×9 posterior block
-            // `od.covariance_9x9[6..9][6..9]` rather than the orbit's own
-            // non-grav covariance — the latter can still carry the escalation
-            // seed prior on the determine path, whereas
-            // `covariance_9x9` is always the final fitted posterior.
-            let (has_covariance, covariance) = match od.covariance_9x9 {
-                Some(c9) => {
-                    let mut c = [[0.0_f64; 3]; 3];
-                    for i in 0..3 {
-                        for j in 0..3 {
-                            c[i][j] = c9[6 + i][6 + j];
-                        }
-                    }
-                    (1u8, c)
-                }
+            // re-feedable orbit keeps its non-grav prior for a
+            // StateAndNonGrav refine.
+            //
+            // Sourced from the fitted ORBIT rather than from
+            // `od.covariance_9x9`, which is where it used to come from.
+            // The 9×9 is populated only for the width-9 Marsden fit, and
+            // every fit carrying a wide joint is wider than 9 by
+            // construction — a carrier needs a DT, AMRAT or thrust
+            // column, and each of those pushes the width past 9. The two
+            // sets are disjoint, so the old source reported "no
+            // covariance" and a zero 3×3 for 100% of the fits this
+            // surface exists to serve, while the orbit held the
+            // posterior. Re-feeding that yielded either a border with no
+            // parameter block (refused) or, worse, a caller clearing the
+            // border and silently substituting their prior.
+            //
+            // The estimator writes every posterior block onto this one
+            // orbit in a single pass and then builds the border and the
+            // carrier by reading those blocks back, so sourcing them all
+            // from here is what keeps the diagonals and the crosses
+            // conditioned on them from coming from two provenances.
+            let (has_covariance, covariance) = match ng.covariance {
+                Some(c) => (1u8, c),
                 None => (0u8, [[0.0_f64; 3]; 3]),
+            };
+            let (has_dt_variance, dt_variance) = match ng.dt_variance {
+                Some(v) => (1u8, v),
+                None => (0u8, f64::NAN),
             };
             (
                 1,
@@ -2947,6 +3618,8 @@ fn od_result_non_grav_to_c(od: &ODResult) -> (u8, EmpyreanNonGravParams) {
                     non_grav_dt,
                     has_covariance,
                     covariance,
+                    has_dt_variance,
+                    dt_variance,
                 },
             )
         }
@@ -3016,7 +3689,78 @@ fn od_orbit_to_propagated(
         stt: [[[0.0; 6]; 6]; 6],
         has_stt: 0,
         resolved_kind: 0,
+        // Absent at construction: `write_orbit_covariance` fills it
+        // from the fitted orbit once the result struct exists.
+        orbit_cov: crate::joint::empty_orbit_covariance(),
     })
+}
+
+/// Translate one C disposition byte into the engine's
+/// [`ParamDisposition`].
+///
+/// **Strict**: `0`, `1` and `2` are accepted and everything else is
+/// refused, naming the field, the value and the legal set. A bare
+/// non-zero test would be the same silent widening this tri-state
+/// exists to remove, one layer down — and it would swallow a *future*
+/// fourth disposition (a conditioned axis, say) as "solved" rather than
+/// failing on a library that cannot perform it.
+fn param_disposition_from_c(v: u8, field: &str) -> Result<ParamDisposition, String> {
+    match v {
+        EMPYREAN_PARAM_FIXED => Ok(ParamDisposition::Fixed),
+        EMPYREAN_PARAM_SOLVED => Ok(ParamDisposition::Solved),
+        EMPYREAN_PARAM_CONSIDERED => Ok(ParamDisposition::Considered),
+        other => Err(format!(
+            "solve_for_flags.{field} = {other} is not a parameter disposition; the legal \
+             values are {EMPYREAN_PARAM_FIXED} (fixed), {EMPYREAN_PARAM_SOLVED} (solved) \
+             and {EMPYREAN_PARAM_CONSIDERED} (considered)"
+        )),
+    }
+}
+
+/// Translate the engine's [`ParamDisposition`] into its C byte.
+///
+/// Total by construction — every variant maps, so a disposition the
+/// engine grows later is a compile error here rather than a value that
+/// crosses the ABI wearing another's meaning.
+fn param_disposition_to_c(d: ParamDisposition) -> u8 {
+    match d {
+        ParamDisposition::Fixed => EMPYREAN_PARAM_FIXED,
+        ParamDisposition::Solved => EMPYREAN_PARAM_SOLVED,
+        ParamDisposition::Considered => EMPYREAN_PARAM_CONSIDERED,
+    }
+}
+
+/// Read the per-axis disposition struct into scott's [`SolveFor`].
+///
+/// Every byte is validated: an out-of-range value on any axis, or on any
+/// entry of the thrust array, refuses the call by name and value rather
+/// than resolving to something the caller did not ask for.
+fn solve_for_from_c(f: &EmpyreanSolveFor) -> Result<SolveFor, String> {
+    let mut thrust = [ParamDisposition::Fixed; EMPYREAN_MAX_THRUST_SEGMENTS];
+    for (i, d) in f.thrust_dispositions.iter().enumerate() {
+        thrust[i] = param_disposition_from_c(*d, &format!("thrust_dispositions[{i}]"))?;
+    }
+    Ok(SolveFor {
+        marsden: param_disposition_from_c(f.marsden, "marsden")?,
+        dt: param_disposition_from_c(f.dt, "dt")?,
+        amrat: param_disposition_from_c(f.amrat, "amrat")?,
+        thrust,
+    })
+}
+
+/// Flatten scott's [`SolveFor`] into the C disposition struct, for the
+/// result path's echo of the partition the fit actually ran.
+fn solve_for_to_c(s: &SolveFor) -> EmpyreanSolveFor {
+    let mut thrust_dispositions = [EMPYREAN_PARAM_FIXED; EMPYREAN_MAX_THRUST_SEGMENTS];
+    for (i, d) in s.thrust.iter().enumerate() {
+        thrust_dispositions[i] = param_disposition_to_c(*d);
+    }
+    EmpyreanSolveFor {
+        marsden: param_disposition_to_c(s.marsden),
+        dt: param_disposition_to_c(s.dt),
+        amrat: param_disposition_to_c(s.amrat),
+        thrust_dispositions,
+    }
 }
 
 fn int_to_solve_for(v: i32) -> Result<SolveForParams, String> {
@@ -3025,9 +3769,9 @@ fn int_to_solve_for(v: i32) -> Result<SolveForParams, String> {
         EMPYREAN_SOLVE_FOR_STATE_AND_NONGRAV => Ok(SolveForParams::state_and_non_grav()),
         EMPYREAN_SOLVE_FOR_AUTO => Ok(SolveForParams::Auto),
         EMPYREAN_SOLVE_FOR_EXPLICIT => Err(
-            "solve_for = EXPLICIT (3) requires the per-axis solve_for flags \
-             (marsden / dt / amrat / thrust_segments); pass them via the \
-             EmpyreanSolveFor flag struct on EmpyreanODConfig"
+            "solve_for = EXPLICIT (3) requires the per-axis dispositions \
+             (marsden / dt / amrat / thrust_dispositions); pass them via the \
+             EmpyreanSolveFor struct on EmpyreanODConfig"
                 .to_string(),
         ),
         other => Err(format!("unknown solve_for code: {other}")),
@@ -3593,14 +4337,8 @@ pub(crate) fn build_od_config_from_c(c: &EmpyreanODConfig) -> Result<ODConfig, S
 
     cfg.solve_for = if c.solve_for == EMPYREAN_SOLVE_FOR_EXPLICIT {
         // Explicit multi-axis request — the coarse code can't name it, so
-        // read the per-axis flag struct.
-        let f = &c.solve_for_flags;
-        SolveForParams::Explicit(SolveFor {
-            marsden: f.marsden != 0,
-            dt: f.dt != 0,
-            amrat: f.amrat != 0,
-            thrust_segments: f.thrust_segments as usize,
-        })
+        // read the per-axis disposition struct.
+        SolveForParams::Explicit(solve_for_from_c(&c.solve_for_flags)?)
     } else {
         int_to_solve_for(c.solve_for)?
     };
@@ -3694,7 +4432,12 @@ pub(crate) fn empyrean_orbit_to_orbits(
     let coords =
         coordinate_state_to_coordinates(&state).map_err(|e| format!("orbit conversion: {e}"))?;
     let mut out = Orbits::empty();
-    out.push(id.to_string(), coords.into_radians())
+    // Attaches the 6×6, the state↔Marsden border and the wide carrier
+    // together, converting all three from the caller's degrees in one
+    // step. The OD paths consume the joint as their prior, so a carrier
+    // dropped here would silently substitute a block-diagonal prior for
+    // the correlated one the caller supplied.
+    crate::joint::push_orbit_with_joint(&mut out, id.to_string(), coords, orbit)
         .map_err(|e| format!("orbit push: {e}"))?;
     // Carry the caller's non-grav model onto the orbit. Without this the OD
     // entry points (evaluate / refine / seeded determine) would fit a
@@ -4327,16 +5070,37 @@ pub unsafe extern "C" fn empyrean_determine(
                         Ok(prop_state) => {
                             let mut result = poisoned_od_result();
                             result.orbit = prop_state;
-                            unsafe {
-                                write_od_result_fields(&mut result, &det.od, Some(object_id));
-                            }
-                            delivered_count += 1;
-                            EmpyreanODObjectResult {
-                                object_id: alloc_cstring(object_id),
-                                delivered: 1,
-                                result,
-                                error: std::ptr::null_mut(),
-                                error_code: EMPYREAN_OD_FAILURE_NONE,
+                            // Marshaling is fallible (the joint's carrier
+                            // arrays are heap-allocated), and a result
+                            // that cannot carry its joint is a delivery
+                            // failure for THIS object — reported like any
+                            // other, never delivered a block short.
+                            match unsafe {
+                                write_od_result_fields(&mut result, &det.od, Some(object_id))
+                            } {
+                                Ok(()) => {
+                                    delivered_count += 1;
+                                    EmpyreanODObjectResult {
+                                        object_id: alloc_cstring(object_id),
+                                        delivered: 1,
+                                        result,
+                                        error: std::ptr::null_mut(),
+                                        error_code: EMPYREAN_OD_FAILURE_NONE,
+                                    }
+                                }
+                                Err(e) => {
+                                    // Release whatever the partial write
+                                    // did allocate before discarding it.
+                                    unsafe { free_od_result_fields(&mut result) };
+                                    failures.push(format!("{object_id}: {e}"));
+                                    EmpyreanODObjectResult {
+                                        object_id: alloc_cstring(object_id),
+                                        delivered: 0,
+                                        result: poisoned_od_result(),
+                                        error: alloc_cstring(&e),
+                                        error_code: EMPYREAN_OD_FAILURE_OD,
+                                    }
+                                }
                             }
                         }
                         Err(e) => {
@@ -4425,7 +5189,7 @@ fn object_results_to_c(slots: Vec<EmpyreanODObjectResult>) -> (*mut EmpyreanODOb
 /// Shared by [`empyrean_od_result_free`] and
 /// [`empyrean_determine_results_free`] so a slot inside a batch table is
 /// freed exactly the way a standalone result is.
-unsafe fn free_od_result_fields(result: *mut EmpyreanODResult) {
+pub(crate) unsafe fn free_od_result_fields(result: *mut EmpyreanODResult) {
     let res = unsafe { &*result };
     let n = res.num_observations;
     let sb_n = res.num_station_biases;
@@ -4440,6 +5204,11 @@ unsafe fn free_od_result_fields(result: *mut EmpyreanODResult) {
             res.photometry.num_dropped_bands,
         );
         free_cstring(res.trust_event_body);
+        free_string_array(res.warnings, res.num_warnings);
+        // The joint posterior's carrier arrays are library-owned on the
+        // result (the mirror-image of the same fields on an input
+        // orbit), so they are released here with everything else.
+        crate::joint::free_orbit_covariance(&mut (*result).orbit.orbit_cov);
         (*result).observations = std::ptr::null_mut();
         (*result).num_observations = 0;
         (*result).station_biases = std::ptr::null_mut();
@@ -4451,6 +5220,8 @@ unsafe fn free_od_result_fields(result: *mut EmpyreanODResult) {
         (*result).photometry.dropped_bands = std::ptr::null_mut();
         (*result).photometry.num_dropped_bands = 0;
         (*result).trust_event_body = std::ptr::null_mut();
+        (*result).warnings = std::ptr::null_mut();
+        (*result).num_warnings = 0;
     }
 }
 
@@ -4514,6 +5285,15 @@ pub unsafe extern "C" fn empyrean_od_result_free(result: *mut EmpyreanODResult) 
 // ── empyrean_evaluate ───────────────────────────────────────
 
 /// Evaluate residuals for a single orbit against observations.
+///
+/// # A supplied joint covariance changes nothing here
+///
+/// Evaluation measures how well a FIXED orbit predicts observations; it
+/// forms no prior and performs no estimation, so an orbit carrying a
+/// state↔Marsden border or a wide carrier scores exactly as the same
+/// orbit without one. Nothing is dropped — there is simply nothing for
+/// the joint to affect, and this result type carries no orbit to echo
+/// one back on. The nine other orbit-reading entry points consume it.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn empyrean_evaluate(
     ctx: *const EmpyreanContext,
@@ -4687,7 +5467,11 @@ pub unsafe extern "C" fn empyrean_refine(
             (*result_out).orbit = prop_state;
             // Single-orbit refine: the caller supplied the orbit, so the
             // rows carry a null object_id.
-            write_od_result_fields(result_out, &od_result, None);
+            if let Err(e) = write_od_result_fields(result_out, &od_result, None) {
+                free_od_result_fields(result_out);
+                set_last_error(&e);
+                return -3;
+            }
         }
         0
     }));
@@ -4702,7 +5486,7 @@ pub unsafe extern "C" fn empyrean_refine(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use empyrean_core::determination::RejectionStrategy;
 
@@ -4966,6 +5750,8 @@ mod tests {
                 representation: EMPYREAN_REPRESENTATION_CARTESIAN, // Cartesian
                 frame: 0,                                          // ICRF
                 origin: 10,                                        // Sun (NAIF)
+                has_non_grav_cross: 0,
+                non_grav_cross: [[0.0; 3]; 6],
             },
             orbit_id: std::ptr::null(),
             object_id: std::ptr::null(),
@@ -4999,6 +5785,10 @@ mod tests {
             srp_amrat: 0.0,
             srp_cr: 0.0,
             srp_amrat_variance: f64::NAN,
+            state_param_cross: std::ptr::null(),
+            n_state_param_cross: 0,
+            param_pair_cross: std::ptr::null(),
+            n_param_pair_cross: 0,
         }
     }
 
@@ -5069,7 +5859,7 @@ mod tests {
     /// `EmpyreanObservation` array via the real `empyrean_read_ades` ABI entry
     /// point (the same path a C caller uses). Returns the pointer + count;
     /// the caller frees with `empyrean_observations_free`.
-    fn read_eros_observations() -> (*mut EmpyreanObservation, usize) {
+    pub(crate) fn read_eros_observations() -> (*mut EmpyreanObservation, usize) {
         let psv = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/433_eros.psv");
         let content = std::fs::read_to_string(psv).expect("read bundled Eros fixture");
         read_eros_observations_from(&content)
@@ -5109,7 +5899,7 @@ mod tests {
     /// (Approximate is too coarse for an OD smoke). `std::mem::zeroed` is sound
     /// here: every field is `#[repr(C)]` POD and the lone pointer
     /// (`excluded_perturbers_naif`) zero-inits to null with count 0.
-    pub(super) fn standard_od_config() -> EmpyreanODConfig {
+    pub(crate) fn standard_od_config() -> EmpyreanODConfig {
         let mut cfg: EmpyreanODConfig = unsafe { std::mem::zeroed() };
         cfg.force_model = 2; // Standard tier
         cfg
@@ -5119,7 +5909,7 @@ mod tests {
     /// `EmpyreanPropagatedState` (the determine/refine output orbit). Mirrors
     /// the output→input re-feed a real caller performs: flatten the propagated
     /// Cartesian state + 6×6 covariance back into an input orbit.
-    fn refeed_orbit(p: &EmpyreanPropagatedState) -> EmpyreanOrbit {
+    pub(super) fn refeed_orbit(p: &EmpyreanPropagatedState) -> EmpyreanOrbit {
         EmpyreanOrbit {
             state: crate::CoordinateState {
                 epoch_mjd_tdb: p.epoch_mjd_tdb,
@@ -5129,6 +5919,8 @@ mod tests {
                 representation: EMPYREAN_REPRESENTATION_CARTESIAN,
                 frame: p.frame,
                 origin: p.origin,
+                has_non_grav_cross: 0,
+                non_grav_cross: [[0.0; 3]; 6],
             },
             orbit_id: std::ptr::null(),
             object_id: std::ptr::null(),
@@ -5159,6 +5951,10 @@ mod tests {
             srp_amrat: 0.0,
             srp_cr: 0.0,
             srp_amrat_variance: f64::NAN,
+            state_param_cross: std::ptr::null(),
+            n_state_param_cross: 0,
+            param_pair_cross: std::ptr::null(),
+            n_param_pair_cross: 0,
         }
     }
 
@@ -5875,5 +6671,731 @@ mod residual_join_back_tests {
             empyrean_determine_results_free(&mut results);
             empyrean_observations_free(obs_ptr, obs_n);
         }
+    }
+}
+
+/// The parameter partition at the boundary: strict tri-state
+/// validation, the disposition echo, and the per-declared-segment thrust
+/// index space.
+#[cfg(test)]
+mod parameter_partition_tests {
+    use super::*;
+
+    fn flags(
+        marsden: u8,
+        dt: u8,
+        amrat: u8,
+        thrust: [u8; EMPYREAN_MAX_THRUST_SEGMENTS],
+    ) -> EmpyreanSolveFor {
+        EmpyreanSolveFor {
+            marsden,
+            dt,
+            amrat,
+            thrust_dispositions: thrust,
+        }
+    }
+
+    /// `memset(0)` is every axis FIXED — exactly what a `false` flag
+    /// always meant. This is what makes the semantic widening safe in
+    /// the old-caller direction.
+    #[test]
+    fn a_zero_init_solve_for_is_every_axis_fixed() {
+        let f = EmpyreanSolveFor::default();
+        let s = solve_for_from_c(&f).expect("a zero-init struct is well-formed");
+        assert_eq!(s.marsden, ParamDisposition::Fixed);
+        assert_eq!(s.dt, ParamDisposition::Fixed);
+        assert_eq!(s.amrat, ParamDisposition::Fixed);
+        assert!(s.thrust.iter().all(|d| *d == ParamDisposition::Fixed));
+        assert_eq!(s.solved_thrust_segments(), 0);
+    }
+
+    /// `1` still means solved, on every axis. An older caller's values
+    /// are unchanged by the widening.
+    #[test]
+    fn one_still_means_solved_on_every_axis() {
+        let s = solve_for_from_c(&flags(1, 1, 1, [1, 1, 1])).expect("all-solved is legal");
+        assert_eq!(s.marsden, ParamDisposition::Solved);
+        assert_eq!(s.dt, ParamDisposition::Solved);
+        assert_eq!(s.amrat, ParamDisposition::Solved);
+        assert_eq!(s.solved_thrust_segments(), 3);
+    }
+
+    /// `2` is considered, and it is a distinct third state rather than a
+    /// synonym for solved. A library that read the byte as a bare
+    /// non-zero test would silently SOLVE a considered axis — a wider
+    /// solved set, a different fitted answer, and no error anywhere.
+    #[test]
+    fn two_is_considered_and_is_not_solved() {
+        let s = solve_for_from_c(&flags(2, 0, 2, [0, 2, 0])).expect("considered is legal");
+        assert_eq!(s.marsden, ParamDisposition::Considered);
+        assert_eq!(s.amrat, ParamDisposition::Considered);
+        assert!(!s.marsden.is_solved(), "considered must not read as solved");
+        assert_eq!(s.solved_thrust_segments(), 0);
+        assert_eq!(s.considered_thrust_segments(), 1);
+    }
+
+    /// Any value outside `0 | 1 | 2` is refused by name and value. This
+    /// is what makes a FUTURE fourth disposition fail loudly against
+    /// this release instead of degrading into one of the three it knows.
+    #[test]
+    fn an_unknown_disposition_is_refused_by_name_and_value() {
+        for (f, field) in [
+            (flags(3, 0, 0, [0; 3]), "marsden"),
+            (flags(0, 7, 0, [0; 3]), "dt"),
+            (flags(0, 0, 255, [0; 3]), "amrat"),
+            (flags(0, 0, 0, [0, 4, 0]), "thrust_dispositions[1]"),
+        ] {
+            let err = solve_for_from_c(&f).expect_err("an unknown disposition is refused");
+            assert!(err.contains(field), "the error names the field: {err}");
+            assert!(
+                err.contains("fixed") && err.contains("solved") && err.contains("considered"),
+                "the error lists the legal set: {err}"
+            );
+        }
+    }
+
+    /// The disposition round trip: what a caller writes is what the
+    /// result echoes back, including WHICH thrust segment carries which
+    /// disposition. A count could not express the middle-segment case
+    /// this asserts.
+    #[test]
+    fn the_disposition_echo_names_which_segment_is_which() {
+        // Three declared burns; only the MIDDLE one solved, the first
+        // considered, the last fixed.
+        let supplied = flags(1, 0, 2, [2, 1, 0]);
+        let engine = solve_for_from_c(&supplied).expect("legal");
+        assert_eq!(engine.thrust[0], ParamDisposition::Considered);
+        assert_eq!(engine.thrust[1], ParamDisposition::Solved);
+        assert_eq!(engine.thrust[2], ParamDisposition::Fixed);
+        assert_eq!(engine.solved_thrust_segments(), 1);
+
+        let echoed = solve_for_to_c(&engine);
+        assert_eq!(echoed.marsden, supplied.marsden);
+        assert_eq!(echoed.dt, supplied.dt);
+        assert_eq!(echoed.amrat, supplied.amrat);
+        assert_eq!(
+            echoed.thrust_dispositions, supplied.thrust_dispositions,
+            "the echo must preserve per-segment identity, not just the counts"
+        );
+    }
+
+    /// The coarse `EMPYREAN_SOLVE_FOR_*` code names a SOLVED set, so a
+    /// fit that CONSIDERS an axis must not be reported as the coarse
+    /// code its solved set alone suggests. A considered axis contributes
+    /// to the delivered σ, and reporting such a fit as `STATE_ONLY`
+    /// would hide that from every consumer that branches on the code.
+    #[test]
+    fn a_considered_axis_disqualifies_the_coarse_codes() {
+        let state_only =
+            SolveForParams::Explicit(solve_for_from_c(&flags(0, 0, 0, [0; 3])).unwrap());
+        assert_eq!(solve_for_to_int(&state_only), EMPYREAN_SOLVE_FOR_STATE_ONLY);
+
+        let marsden_only =
+            SolveForParams::Explicit(solve_for_from_c(&flags(1, 0, 0, [0; 3])).unwrap());
+        assert_eq!(
+            solve_for_to_int(&marsden_only),
+            EMPYREAN_SOLVE_FOR_STATE_AND_NONGRAV
+        );
+
+        // The discriminating pair: identical SOLVED sets, one with a
+        // considered axis. They must not report the same code.
+        let considered_amrat =
+            SolveForParams::Explicit(solve_for_from_c(&flags(0, 0, 2, [0; 3])).unwrap());
+        assert_eq!(
+            solve_for_to_int(&considered_amrat),
+            EMPYREAN_SOLVE_FOR_EXPLICIT,
+            "a fit considering AMRAT solves nothing extra but reports a wider sigma; \
+             it is not the state-only fit STATE_ONLY names"
+        );
+
+        let considered_thrust =
+            SolveForParams::Explicit(solve_for_from_c(&flags(1, 0, 0, [0, 2, 0])).unwrap());
+        assert_eq!(
+            solve_for_to_int(&considered_thrust),
+            EMPYREAN_SOLVE_FOR_EXPLICIT,
+            "a considered burn disqualifies STATE_AND_NONGRAV for the same reason"
+        );
+    }
+
+    /// EXPLICIT without the disposition struct is refused, and the
+    /// message names the field to set rather than the field that used to
+    /// exist.
+    #[test]
+    fn explicit_without_the_disposition_struct_is_refused() {
+        let err = int_to_solve_for(EMPYREAN_SOLVE_FOR_EXPLICIT)
+            .expect_err("EXPLICIT needs the per-axis struct");
+        assert!(err.contains("thrust_dispositions"), "{err}");
+        assert!(
+            !err.contains("thrust_segments)"),
+            "the message must not name the removed count field: {err}"
+        );
+    }
+
+    /// Every rejection reason maps to a distinct code, including the one
+    /// added in this release. A collision would merge two causes in the
+    /// attribution census — which is the hole the reserved-code
+    /// discipline exists to keep closed.
+    #[test]
+    fn every_rejection_code_is_distinct_and_contiguous() {
+        let codes = [
+            EMPYREAN_REJECTION_ACCEPTED,
+            EMPYREAN_REJECTION_CHI_SQUARED,
+            EMPYREAN_REJECTION_SIGMA_CLIP,
+            EMPYREAN_REJECTION_COOKS_DISTANCE,
+            EMPYREAN_REJECTION_ADAPTIVE,
+            EMPYREAN_REJECTION_UNSUPPORTED_OBSERVATORY,
+            EMPYREAN_REJECTION_CMC2003,
+            EMPYREAN_REJECTION_RADAR_UNSUPPORTED,
+            EMPYREAN_REJECTION_OCCULTATION_UNSUPPORTED,
+            EMPYREAN_REJECTION_OUTSIDE_ARC,
+            EMPYREAN_REJECTION_NON_FINITE_CHI2,
+            EMPYREAN_REJECTION_MISSING_JACOBIAN,
+            EMPYREAN_REJECTION_SPACECRAFT_KERNEL_MISSING,
+            EMPYREAN_REJECTION_OBSERVER_CONSTRUCTION_FAILED,
+            EMPYREAN_REJECTION_NEVER_ABSORBED,
+            EMPYREAN_REJECTION_PER_OBSERVATION_SITE_REQUIRED,
+        ];
+        let mut sorted = codes.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), codes.len(), "no two reasons share a code");
+        assert_eq!(
+            sorted,
+            (0..codes.len() as i32).collect::<Vec<_>>(),
+            "the codes stay contiguous from 0, so the next free code is unambiguous"
+        );
+        assert!(
+            !codes.contains(&EMPYREAN_REJECTION_NOT_EVALUATED),
+            "the not-evaluated sentinel is outside the reason set"
+        );
+    }
+
+    /// The worked case: three declared burns with only the MIDDLE
+    /// one solved. Both per-segment arrays are indexed by DECLARED
+    /// segment, so the solved burn's Δv and its posterior covariance
+    /// land on the same index — 1 — and the two unsolved neighbours are
+    /// NaN in both.
+    ///
+    /// Under the retired pairing the Δv array was in SOLVED order, so the
+    /// single solved burn's Δv sat at index 0 while its covariance sat
+    /// at index 1: a consumer reading `thrust_delta_m_per_s[i]` beside
+    /// `thrust_correction_covariances[i]` would have attributed the
+    /// middle burn's Δv to the FIRST burn's covariance, silently, having
+    /// followed the header.
+    #[test]
+    fn the_thrust_arrays_share_one_declared_index_space() {
+        let dv = [None, Some([1.0e-6, 2.0e-6, 3.0e-6]), None];
+        let cov = [
+            None,
+            Some([[4.0, 0.0, 0.0], [0.0, 5.0, 0.0], [0.0, 0.0, 6.0]]),
+            None,
+        ];
+
+        let (declared, dv_out, cov_out) = thrust_posterior_arrays(Some(&dv), Some(&cov));
+
+        assert_eq!(
+            declared, 3,
+            "the count is DECLARED, not the one solved burn"
+        );
+
+        // The solved burn is at declared index 1 in BOTH arrays.
+        assert!(
+            dv_out[1].iter().all(|v| v.is_finite()),
+            "the solved burn's Δv lands at its declared index"
+        );
+        assert_eq!(cov_out[1][1][1], 5.0, "and so does its covariance");
+
+        // Its neighbours carry no posterior, in both arrays.
+        for i in [0usize, 2] {
+            assert!(
+                dv_out[i].iter().all(|v| v.is_nan()),
+                "segment {i} was not solved: its Δv must be NaN, never 0"
+            );
+            assert!(
+                cov_out[i].iter().flatten().all(|v| v.is_nan()),
+                "segment {i} was not solved: its 3x3 must be NaN-filled rather than \
+                 echoing the prior under a posterior's name"
+            );
+        }
+
+        // The Δv is converted to m/s, not passed through in AU/day.
+        assert!(
+            dv_out[1][0] > 1.0,
+            "1e-6 AU/day is ~1.7 m/s; a passthrough would leave it at 1e-6"
+        );
+    }
+
+    /// An orbit that declared no thrust reports a zero count and an
+    /// all-NaN pair of arrays — never zeros, which would read as a
+    /// fitted Δv of exactly zero with a singular covariance.
+    #[test]
+    fn no_declared_thrust_reports_nan_rather_than_zero() {
+        let (declared, dv, cov) = thrust_posterior_arrays(None, None);
+        assert_eq!(declared, 0);
+        assert!(dv.iter().flatten().all(|v| v.is_nan()));
+        assert!(cov.iter().flatten().flatten().all(|v| v.is_nan()));
+    }
+
+    /// Declared segments whose covariance is absent still count toward
+    /// the declared width: the count describes what the ORBIT declared,
+    /// not how many posteriors came back. A count derived from the
+    /// solved entries would shrink the array bound and hide the
+    /// trailing declared burns from a consumer entirely.
+    #[test]
+    fn the_declared_count_is_the_orbits_width_not_the_solved_one() {
+        let cov = [Some([[1.0; 3]; 3]), None, None];
+        let (declared, _, _) = thrust_posterior_arrays(None, Some(&cov));
+        assert_eq!(
+            declared, 3,
+            "three burns were declared even though one posterior came back"
+        );
+    }
+
+    /// The engine's per-observation-site reason maps to code 15 rather
+    /// than being folded into one of the two codes it deliberately is
+    /// not: the observatory IS known (so not UNSUPPORTED_OBSERVATORY),
+    /// and no kernel is missing (so not SPACECRAFT_KERNEL_MISSING).
+    #[test]
+    fn the_per_observation_site_reason_maps_to_its_own_code() {
+        assert_eq!(
+            rejection_reason_to_c(&RejectionReason::PerObservationSiteRequired),
+            EMPYREAN_REJECTION_PER_OBSERVATION_SITE_REQUIRED
+        );
+        assert_ne!(
+            EMPYREAN_REJECTION_PER_OBSERVATION_SITE_REQUIRED,
+            EMPYREAN_REJECTION_UNSUPPORTED_OBSERVATORY
+        );
+        assert_ne!(
+            EMPYREAN_REJECTION_PER_OBSERVATION_SITE_REQUIRED,
+            EMPYREAN_REJECTION_SPACECRAFT_KERNEL_MISSING
+        );
+    }
+}
+
+/// The OD **output** half of the joint: the posterior blocks the result
+/// re-sources from the fitted orbit, the joint on `orbit.orbit_cov`, the
+/// disposition echo, the warning channel, and the re-feed round trip.
+///
+/// The input half is covered in `joint.rs`; this module exists because
+/// the output half shipped untested — every field here is one a caller
+/// re-feeds, so a silently absent or wrongly-sourced block is a wrong
+/// prior on the next fit rather than a visible failure.
+#[cfg(test)]
+mod od_output_joint_tests {
+    use super::tests::{read_eros_observations, refeed_orbit, standard_od_config};
+    use super::*;
+
+    fn last_err_text() -> String {
+        unsafe { CStr::from_ptr(crate::empyrean_last_error()) }
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Fit the bundled Eros arc with the Marsden block solved, which is
+    /// the narrowest fit that produces a state↔Marsden border — the
+    /// output block this surface exists to carry.
+    ///
+    /// Returns the delivered result table; the caller frees it.
+    fn determine_eros_with_marsden(
+        ctx: *const EmpyreanContext,
+    ) -> Option<EmpyreanDetermineResults> {
+        let (obs_ptr, obs_n) = read_eros_observations();
+        let mut cfg = standard_od_config();
+        cfg.solve_for = EMPYREAN_SOLVE_FOR_EXPLICIT;
+        cfg.solve_for_flags.marsden = EMPYREAN_PARAM_SOLVED;
+
+        let mut out: EmpyreanDetermineResults = unsafe { std::mem::zeroed() };
+        let code = unsafe {
+            empyrean_determine(
+                ctx,
+                obs_ptr,
+                obs_n,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                &cfg,
+                &mut out,
+            )
+        };
+        unsafe { crate::od::empyrean_observations_free(obs_ptr, obs_n) };
+        if code != 0 {
+            // A Marsden solve can legitimately fail to converge on a
+            // thin local kernel set, so a developer without the full
+            // data still gets a skip. But this is the SECOND skip axis
+            // in this helper and it is the dangerous one: a convergence
+            // regression on a kernel-bearing runner would otherwise turn
+            // both headline tests green while they assert nothing.
+            // `EMPYREAN_REQUIRE_DATA` — which CI sets — makes it a
+            // failure, exactly as it does for a missing data directory.
+            let msg = format!(
+                "Marsden determine did not deliver (code {code}): {}",
+                last_err_text()
+            );
+            if code == EMPYREAN_DETERMINE_NONE_DELIVERED {
+                unsafe { empyrean_determine_results_free(&mut out) };
+            }
+            if std::env::var("EMPYREAN_REQUIRE_DATA").is_ok_and(|v| v != "0") {
+                panic!(
+                    "{msg} — EMPYREAN_REQUIRE_DATA is set, so this fit is required to deliver and the test must not skip past it."
+                );
+            }
+            eprintln!("skipping: {msg}");
+            return None;
+        }
+        Some(out)
+    }
+
+    /// The fitted joint reaches the caller, and every block of it is the
+    /// engine's own posterior rather than a re-derivation.
+    #[test]
+    fn a_marsden_fit_publishes_its_posterior_joint() {
+        let Some(ctx) =
+            crate::testing::context_or_skip("a_marsden_fit_publishes_its_posterior_joint")
+        else {
+            return;
+        };
+        let Some(mut results) = determine_eros_with_marsden(&ctx) else {
+            return;
+        };
+        assert_eq!(results.num_objects, 1);
+        let slot = unsafe { &*results.objects };
+        assert_eq!(
+            slot.delivered,
+            1,
+            "the Eros arc must deliver: {}",
+            last_err_text()
+        );
+        let res = &slot.result;
+
+        // The border is present and finite, and it is NOT all zeros —
+        // an all-zero border is what the engine reads as "absent", so a
+        // zero-filled one here would mean the marshal ran but carried
+        // nothing.
+        assert_eq!(
+            res.orbit.orbit_cov.has_non_grav_cross, 1,
+            "a Marsden fit's state↔A cross block must reach the caller"
+        );
+        let border = res.orbit.orbit_cov.non_grav_cross;
+        assert!(
+            border.iter().flatten().all(|v| v.is_finite()),
+            "every border entry must be finite"
+        );
+        assert!(
+            border.iter().flatten().any(|v| *v != 0.0),
+            "the border must carry real correlations, not a zero block"
+        );
+
+        // The Marsden 3×3 is present too — the border's other half. The
+        // two ship together or the engine refuses the re-feed.
+        assert_eq!(
+            res.non_grav.has_covariance, 1,
+            "the posterior 3×3 must accompany the border it conditions"
+        );
+        assert!(
+            res.non_grav
+                .covariance
+                .iter()
+                .flatten()
+                .all(|v| v.is_finite()),
+            "the posterior 3×3 must be finite"
+        );
+
+        // Sourced from the fitted ORBIT, not from covariance_9x9. On a
+        // width-9 Marsden fit both exist and must agree; the point of
+        // the re-sourcing is that the orbit is right for EVERY width,
+        // and this pins that it did not change the width-9 answer.
+        // Asserted rather than guarded: this fit solves Marsden and
+        // nothing else, so it IS width 9 and the legacy field must be
+        // populated. A conditional would let the comparison silently
+        // stop running the day the field or the width moved, which is
+        // the only thing it exists to catch.
+        assert_eq!(
+            res.has_covariance_9x9, 1,
+            "a width-9 Marsden fit must populate the legacy 9x9 — without it this \
+             comparison cannot run at all"
+        );
+        for i in 0..3 {
+            for j in 0..3 {
+                assert!(
+                    (res.non_grav.covariance[i][j] - res.covariance_9x9[6 + i][6 + j]).abs()
+                        < 1e-30,
+                    "the orbit-sourced 3×3 must equal the 9×9's block on a width-9 fit \
+                     at [{i}][{j}]"
+                );
+            }
+        }
+
+        // The disposition echo names what the fit actually did.
+        assert_eq!(
+            res.dispositions.marsden, EMPYREAN_PARAM_SOLVED,
+            "the echo must report Marsden solved"
+        );
+        assert_eq!(res.dispositions.dt, EMPYREAN_PARAM_FIXED);
+        assert_eq!(res.dispositions.amrat, EMPYREAN_PARAM_FIXED);
+        assert!(
+            res.dispositions
+                .thrust_dispositions
+                .iter()
+                .all(|d| *d == EMPYREAN_PARAM_FIXED),
+            "no thrust was declared, so every segment is fixed"
+        );
+
+        // No thrust declared: the per-segment arrays report zero
+        // declared segments and stay NaN, never zeros.
+        assert_eq!(res.n_thrust_segments, 0);
+        assert_eq!(res.thrust_delta_count, 0);
+        assert!(
+            res.thrust_correction_covariances
+                .iter()
+                .flatten()
+                .flatten()
+                .all(|v| v.is_nan()),
+            "an orbit with no declared burn reports NaN, not a zero covariance"
+        );
+
+        // The warnings channel is well-formed. Empty is the common case
+        // and is what this fit should produce; what must never happen is
+        // a non-zero count with a null array.
+        assert!(
+            res.num_warnings == 0 || !res.warnings.is_null(),
+            "a non-zero warning count must come with an array"
+        );
+        for k in 0..res.num_warnings {
+            let p = unsafe { *res.warnings.add(k) };
+            assert!(!p.is_null(), "warning {k} must not be null");
+            let text = unsafe { CStr::from_ptr(p) }.to_string_lossy();
+            assert!(!text.trim().is_empty(), "warning {k} must carry text");
+        }
+
+        unsafe { empyrean_determine_results_free(&mut results) };
+    }
+
+    /// The round trip the whole surface exists for: fit, copy the joint
+    /// onto an input orbit, refine again. The re-fed orbit must be
+    /// ACCEPTED — a border without its 3×3, or a carrier naming an
+    /// undeclared parameter, is refused by the engine, so acceptance is
+    /// the assertion that the marshaled pair is coherent.
+    #[test]
+    fn a_fitted_joint_re_feeds_into_a_refine() {
+        let Some(ctx) = crate::testing::context_or_skip("a_fitted_joint_re_feeds_into_a_refine")
+        else {
+            return;
+        };
+        let ctx_ptr: *const EmpyreanContext = &ctx;
+        let Some(mut results) = determine_eros_with_marsden(&ctx) else {
+            return;
+        };
+        let slot = unsafe { &*results.objects };
+        assert_eq!(slot.delivered, 1);
+        let res = &slot.result;
+
+        // The re-feed, field for field — the copy a C caller writes.
+        let mut refed = refeed_orbit(&res.orbit);
+        refed.state.has_non_grav_cross = res.orbit.orbit_cov.has_non_grav_cross;
+        refed.state.non_grav_cross = res.orbit.orbit_cov.non_grav_cross;
+        refed.state_param_cross = res.orbit.orbit_cov.state_param_cross;
+        refed.n_state_param_cross = res.orbit.orbit_cov.n_state_param_cross;
+        refed.param_pair_cross = res.orbit.orbit_cov.param_pair_cross;
+        refed.n_param_pair_cross = res.orbit.orbit_cov.n_param_pair_cross;
+        // The diagonal blocks the crosses are conditioned on.
+        refed.a1 = res.non_grav.a1;
+        refed.a2 = res.non_grav.a2;
+        refed.a3 = res.non_grav.a3;
+        refed.has_non_grav_covariance = res.non_grav.has_covariance;
+        refed.non_grav_covariance = res.non_grav.covariance;
+        refed.non_grav_dt_variance = if res.non_grav.has_dt_variance == 1 {
+            res.non_grav.dt_variance
+        } else {
+            f64::NAN
+        };
+
+        let (obs_ptr, obs_n) = read_eros_observations();
+        let mut cfg = standard_od_config();
+        cfg.solve_for = EMPYREAN_SOLVE_FOR_EXPLICIT;
+        cfg.solve_for_flags.marsden = EMPYREAN_PARAM_SOLVED;
+
+        let mut refined: EmpyreanODResult = unsafe { std::mem::zeroed() };
+        let code = unsafe { empyrean_refine(ctx_ptr, &refed, obs_ptr, obs_n, &cfg, &mut refined) };
+        unsafe { crate::od::empyrean_observations_free(obs_ptr, obs_n) };
+
+        assert_eq!(
+            code,
+            0,
+            "a refine given the fit's own joint must be accepted, not refused. \
+             A refusal here means the marshaled border and its 3×3 disagree, or the \
+             carrier names a parameter the orbit does not declare. last_error: {}",
+            last_err_text()
+        );
+        assert_eq!(refined.orbit.has_covariance, 1);
+        assert!(
+            refined.covariance.iter().flatten().all(|v| v.is_finite()),
+            "the re-fed fit must deliver a finite covariance"
+        );
+
+        unsafe { empyrean_od_result_free(&mut refined) };
+        unsafe { empyrean_determine_results_free(&mut results) };
+    }
+
+    /// The DT variance wire, both directions: it had none before 0.10.0, so
+    /// a solved-DT fit round-tripped with its DT column closed. Pinned
+    /// on the marshal contract rather than on a DT fit, which needs a
+    /// comet arc this crate does not bundle.
+    #[test]
+    fn the_dt_variance_wire_carries_both_directions() {
+        // ── Out ──
+        //
+        // Drive the real output marshal on both arms. Asserting on
+        // `EmpyreanNonGravParams::default()` instead would be
+        // tautological — the struct derives Default, so it proves only
+        // that `derive` works, not that `od_result_non_grav_to_c`
+        // publishes the switch it is supposed to.
+        //
+        // The contract: a carried variance publishes with the switch
+        // SET; an absent one publishes NaN with the switch CLEAR. Not
+        // 0.0 — that is a legal (if degenerate) variance, so a consumer
+        // could not tell it from a real one.
+        let mut orbit: empyrean_core::orbits::Orbits<AU> = empyrean_core::orbits::Orbits::empty();
+        let coord = empyrean_core::convert::coordinate_state_to_coordinates(
+            &empyrean_core::convert::CoordinateState {
+                epoch_mjd_tdb: 59000.0,
+                elements: [1.0, 0.1, 0.05, -0.005, 0.015, 0.001],
+                covariance: [[0.0; 6]; 6],
+                has_covariance: 0,
+                representation: EMPYREAN_REPRESENTATION_CARTESIAN,
+                frame: 0,
+                origin: 10,
+            },
+        )
+        .expect("a well-formed Cartesian state");
+        orbit
+            .push("dt-probe".to_string(), coord.into_radians())
+            .expect("push");
+
+        let with_variance = empyrean_core::nongrav::NonGravParams {
+            a1: 1.0e-10,
+            a2: 0.0,
+            a3: 0.0,
+            model: NonGravModel::MarsdenSekanina(
+                empyrean_core::nongrav::GFunction::inverse_square(),
+            ),
+            covariance: None,
+            dt: Some(45.7),
+            dt_variance: Some(4.0),
+        };
+        orbit.set_non_grav_params(0, Some(with_variance.clone()));
+        let (has, flat) = od_result_non_grav_to_c_for_test(&orbit);
+        assert_eq!(has, 1, "the orbit carries a non-grav block");
+        assert_eq!(
+            flat.has_dt_variance, 1,
+            "a carried DT variance sets its switch"
+        );
+        assert_eq!(flat.dt_variance, 4.0, "and publishes the value verbatim");
+        assert_eq!(flat.has_dt, 1, "the DT value rides with it");
+        assert_eq!(flat.non_grav_dt, 45.7);
+
+        let mut without = with_variance;
+        without.dt_variance = None;
+        orbit.set_non_grav_params(0, Some(without));
+        let (_, flat) = od_result_non_grav_to_c_for_test(&orbit);
+        assert_eq!(
+            flat.has_dt_variance, 0,
+            "an absent DT variance clears its switch"
+        );
+        assert!(
+            flat.dt_variance.is_nan(),
+            "and publishes NaN, never 0.0 — a consumer could not tell a zero-width \
+             prior from an absent one"
+        );
+
+        // In: the input side reads the variance only when finite and
+        // positive, which is the trigger that opens the DT column.
+        let mut o: EmpyreanOrbit = unsafe { std::mem::zeroed() };
+        o.non_grav_dt = 45.7;
+        o.non_grav_dt_variance = 4.0;
+        let params = crate::propagate::empyrean_orbit_non_grav_params(&o)
+            .expect("a DT value alone declares a non-grav block");
+        assert_eq!(params.dt, Some(45.7), "the DT VALUE must survive");
+        assert_eq!(
+            params.dt_variance,
+            Some(4.0),
+            "and so must its prior variance — the pair opens and priors the DT column"
+        );
+
+        // A zero or negative variance is "no prior", not a prior of zero.
+        for bad in [0.0, -1.0, f64::NAN] {
+            let mut o: EmpyreanOrbit = unsafe { std::mem::zeroed() };
+            o.non_grav_dt = 45.7;
+            o.non_grav_dt_variance = bad;
+            let params = crate::propagate::empyrean_orbit_non_grav_params(&o).expect("dt present");
+            assert_eq!(
+                params.dt_variance, None,
+                "dt_variance = {bad} must read as absent, never as a zero-width prior"
+            );
+        }
+    }
+
+    /// A malformed carrier fails the OD call with the ARGUMENT code
+    /// (-1), not the engine code (-2). The split is the only signal a
+    /// caller has for "my struct is wrong" versus "my covariance is
+    /// wrong", and it is decided before the engine is ever entered.
+    #[test]
+    fn a_malformed_carrier_fails_the_od_call_with_the_argument_code() {
+        let Some(ctx) = crate::testing::context_or_skip(
+            "a_malformed_carrier_fails_the_od_call_with_the_argument_code",
+        ) else {
+            return;
+        };
+        let ctx_ptr: *const EmpyreanContext = &ctx;
+        let (obs_ptr, obs_n) = read_eros_observations();
+        let cfg = standard_od_config();
+
+        let mut o: EmpyreanOrbit = unsafe { std::mem::zeroed() };
+        o.state = crate::CoordinateState {
+            epoch_mjd_tdb: 59000.0,
+            elements: [1.0, 0.1, 0.05, -0.005, 0.015, 0.001],
+            covariance: [[0.0; 6]; 6],
+            has_covariance: 0,
+            representation: EMPYREAN_REPRESENTATION_CARTESIAN,
+            frame: 0,
+            origin: 10,
+            has_non_grav_cross: 0,
+            non_grav_cross: [[0.0; 3]; 6],
+        };
+        o.non_grav_dt = f64::NAN;
+        o.non_grav_dt_variance = f64::NAN;
+        o.phot_system = -1;
+        o.h_mag = f64::NAN;
+        o.srp_amrat_variance = f64::NAN;
+
+        // An unknown column kind: malformed C, not malformed physics.
+        let bad = [crate::joint::EmpyreanStateParamCross {
+            column: crate::joint::EmpyreanParamColumn {
+                kind: 99,
+                index: 0,
+                segment: 0,
+                component: 0,
+            },
+            values: [1.0; 6],
+        }];
+        o.state_param_cross = bad.as_ptr();
+        o.n_state_param_cross = bad.len();
+
+        let mut out: EmpyreanODResult = unsafe { std::mem::zeroed() };
+        let code = unsafe { empyrean_refine(ctx_ptr, &o, obs_ptr, obs_n, &cfg, &mut out) };
+        unsafe { crate::od::empyrean_observations_free(obs_ptr, obs_n) };
+
+        assert_eq!(
+            code,
+            -1,
+            "a malformed parameter-column tag is an ARGUMENT error, not an engine \
+             refusal; last_error: {}",
+            last_err_text()
+        );
+        let msg = last_err_text();
+        assert!(
+            msg.contains("99") && msg.contains("kind"),
+            "the message must name the offending tag: {msg}"
+        );
     }
 }

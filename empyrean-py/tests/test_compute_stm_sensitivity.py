@@ -25,6 +25,7 @@ import pytest
 from empyrean import (
     CartesianCoordinates,
     CartesianOrbits,
+    Epochs,
     Observers,
     Origin,
     UncertaintyMethod,
@@ -35,7 +36,7 @@ from empyrean.propagation.config import PropagationConfig
 
 ORBIT_ID = "compute-stm-fixture"
 OBS_CODE = "500"
-OBS_EPOCHS = [61000.5, 61010.5, 61020.5]
+OBS_EPOCHS = Epochs.from_mjd([61000.5, 61010.5, 61020.5], scale="tdb")
 
 # A bound heliocentric state in the ephemeris integration frame.
 _STATE = {

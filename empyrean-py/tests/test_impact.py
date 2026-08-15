@@ -4,6 +4,7 @@ import empyrean
 from empyrean import (
     CartesianCoordinates,
     CartesianOrbits,
+    Epochs,
     GaussianMixture,
     NonGravParams,
     Origin,
@@ -58,7 +59,7 @@ def test_compute_impact_probabilities_without_non_grav():
     # exercise `_common_orbit_args` end-to-end. Should not raise.
     ips = compute_impact_probabilities(
         orbits,
-        end_epoch=60010.0,
+        end_epoch=Epochs.from_mjd([60010.0], scale="tdb"),
         methods=[UncertaintyMethod.FIRST_ORDER],
         body_filter=[Origin.EARTH],
     )
@@ -89,7 +90,7 @@ def test_compute_impact_probabilities_accepts_gaussian_mixture():
     # GaussianMixture is accepted end-to-end rather than eager-rejected.
     ips = compute_impact_probabilities(
         orbits,
-        end_epoch=60010.0,
+        end_epoch=Epochs.from_mjd([60010.0], scale="tdb"),
         methods=[GaussianMixture()],
         body_filter=[Origin.EARTH],
     )
@@ -103,7 +104,7 @@ def test_compute_impact_probabilities_with_non_grav_present():
     orbits = _make_test_orbit(with_non_grav=True)
     ips = compute_impact_probabilities(
         orbits,
-        end_epoch=60010.0,
+        end_epoch=Epochs.from_mjd([60010.0], scale="tdb"),
         methods=[UncertaintyMethod.FIRST_ORDER],
         body_filter=[Origin.EARTH],
     )

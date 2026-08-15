@@ -30,12 +30,13 @@ import quivr as qv
 from empyrean._convert import (
     AnyOrbits,
     coordinates_to_arrays,
+    extract_joint,
     extract_non_grav_covariance,
     extract_srp,
     validate_non_grav_marsden_only,
 )
 from empyrean.coordinates.enums import Origin
-from empyrean.coordinates.epoch import Epochs
+from empyrean.coordinates.epoch import Epochs, _require_single_epoch
 from empyrean.propagation.config import (
     _DATACLASS_TO_INT,
     _UNCERTAINTY_METHOD_TO_INT,
@@ -520,17 +521,6 @@ def _common_orbit_args(orbits: AnyOrbits) -> dict[str, _OrbitArg]:
     }
 
 
-def _coerce_end_mjd_tdb(epoch: float | Epochs) -> float:
-    """Accept either a plain MJD float or an :class:`Epochs` of length 1."""
-    if isinstance(epoch, Epochs):
-        tdb = epoch.to_tdb()
-        arr = tdb.mjd.to_numpy(zero_copy_only=False)
-        if len(arr) != 1:
-            raise ValueError("end_epoch must be a single epoch (Epochs of length 1 or a float MJD)")
-        return float(arr[0])
-    return float(epoch)
-
-
 def _nan_to_null(arr: FloatArray) -> pa.Array:
     """Convert a float64 numpy array with NaN sentinels to a nullable
     pyarrow array — quivr nullable columns expect arrow nulls, not
@@ -600,7 +590,7 @@ def _recover_user_ids(
 
 def compute_impact_probabilities(
     orbits: AnyOrbits,
-    end_epoch: float | Epochs,
+    end_epoch: Epochs,
     methods: Sequence[UncertaintyMethodLike],
     body_filter: Sequence[Origin | str] | None = None,
 ) -> ImpactProbabilities:
@@ -612,9 +602,11 @@ def compute_impact_probabilities(
     orbits : CartesianOrbits | CometaryOrbits | KeplerianOrbits | SphericalOrbits
         Input orbits with optional covariance and non-gravitational
         parameters. Same shape :func:`empyrean.propagate` accepts.
-    end_epoch : float | Epochs
-        End of the propagation window. MJD TDB float or a length-1
-        :class:`Epochs` (any time scale — converted to TDB internally).
+    end_epoch : Epochs
+        End of the propagation window: a length-1 :class:`Epochs` in any
+        time scale, converted to TDB internally. Build one with
+        ``Epochs.from_mjd([value], scale="tdb")`` (or ``scale="utc"``); a
+        bare float is refused, as it carries no time scale.
     methods : sequence of UncertaintyMethod / str / dataclass
         Which uncertainty methods to run. One full propagation runs
         per method (in order); the result rows are tagged with the
@@ -667,9 +659,9 @@ def compute_impact_probabilities(
     from empyrean._convert import origin_to_naif
     from empyrean._empyrean_rs import _compute_impact_probabilities
 
+    end_mjd = _require_single_epoch(end_epoch, "compute_impact_probabilities() end_epoch")
     args = _common_orbit_args(orbits)
     method_tags, method_params = _flatten_method_specs(methods)
-    end_mjd = _coerce_end_mjd_tdb(end_epoch)
     filter_arg = [origin_to_naif(o) for o in body_filter] if body_filter else None
 
     out = _compute_impact_probabilities(
@@ -695,6 +687,11 @@ def compute_impact_probabilities(
         srp_amrat_variance=args["srp_amrat_variance"],
         has_non_grav_cov=args["has_non_grav_cov"],
         non_grav_cov=args["non_grav_cov"],
+        # The joint's off-diagonal terms. An impact probability computed
+        # against a block-diagonal covariance understates the tails: it
+        # asserts the state and the parameters were independent when one
+        # fit produced both. No keys at all when no orbit carries any.
+        **extract_joint(orbits),
         ng_alphas=args["ng_alphas"],
         ng_r0s=args["ng_r0s"],
         ng_ms=args["ng_ms"],
@@ -747,7 +744,7 @@ def compute_impact_probabilities(
 
 def compute_b_planes(
     orbits: AnyOrbits,
-    end_epoch: float | Epochs,
+    end_epoch: Epochs,
     methods: Sequence[UncertaintyMethodLike],
     body_filter: Sequence[Origin | str] | None = None,
 ) -> BPlanes:
@@ -781,9 +778,9 @@ def compute_b_planes(
     from empyrean._convert import origin_to_naif
     from empyrean._empyrean_rs import _compute_b_planes
 
+    end_mjd = _require_single_epoch(end_epoch, "compute_b_planes() end_epoch")
     args = _common_orbit_args(orbits)
     method_tags, method_params = _flatten_method_specs(methods)
-    end_mjd = _coerce_end_mjd_tdb(end_epoch)
     filter_arg = [origin_to_naif(o) for o in body_filter] if body_filter else None
 
     out = _compute_b_planes(
@@ -809,6 +806,11 @@ def compute_b_planes(
         srp_amrat_variance=args["srp_amrat_variance"],
         has_non_grav_cov=args["has_non_grav_cov"],
         non_grav_cov=args["non_grav_cov"],
+        # The joint's off-diagonal terms. An impact probability computed
+        # against a block-diagonal covariance understates the tails: it
+        # asserts the state and the parameters were independent when one
+        # fit produced both. No keys at all when no orbit carries any.
+        **extract_joint(orbits),
         ng_alphas=args["ng_alphas"],
         ng_r0s=args["ng_r0s"],
         ng_ms=args["ng_ms"],

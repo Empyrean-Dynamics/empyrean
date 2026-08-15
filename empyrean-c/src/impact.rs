@@ -18,7 +18,6 @@ use std::panic::AssertUnwindSafe;
 use empyrean_core::Origin;
 use empyrean_core::convert::coordinate_state_to_coordinates;
 use empyrean_core::impact::{compute_b_planes, compute_impact_probabilities};
-use empyrean_core::nongrav::{GFunction, NonGravModel, NonGravParams};
 use empyrean_core::orbits::Orbits;
 use empyrean_core::time::Epoch;
 
@@ -174,43 +173,17 @@ fn build_orbits_from_c(
         let coords =
             coordinate_state_to_coordinates(&state).map_err(|e| format!("orbit {i}: {e}"))?;
         let id = format!("orbit_{i}");
-        orbits
-            .push(id, coords.into_radians())
+        crate::joint::push_orbit_with_joint(&mut orbits, id, coords, orbit)
             .map_err(|e| format!("orbit {i}: {e}"))?;
-        if orbit.a1 != 0.0 || orbit.a2 != 0.0 || orbit.a3 != 0.0 {
-            let g_func = if orbit.ng_alpha == 0.0
-                && orbit.ng_r0 == 0.0
-                && orbit.ng_m == 0.0
-                && orbit.ng_n == 0.0
-                && orbit.ng_k == 0.0
-            {
-                GFunction::inverse_square()
-            } else {
-                GFunction::from_sbdb(
-                    orbit.ng_alpha,
-                    orbit.ng_r0,
-                    orbit.ng_m,
-                    orbit.ng_n,
-                    orbit.ng_k,
-                )
-            };
-            let params = NonGravParams {
-                a1: orbit.a1,
-                a2: orbit.a2,
-                a3: orbit.a3,
-                model: NonGravModel::MarsdenSekanina(g_func),
-                covariance: None,
-                dt: None,
-                // DT is a fittable axis; carry the DT prior variance when the
-                // input orbit supplies one so it opens the DT column downstream.
-                dt_variance: if orbit.non_grav_dt_variance.is_finite()
-                    && orbit.non_grav_dt_variance > 0.0
-                {
-                    Some(orbit.non_grav_dt_variance)
-                } else {
-                    None
-                },
-            };
+        // Routed through the shared helper rather than the inline copy
+        // this path used to carry. That copy dropped two things: the
+        // Marsden 3×3 (`covariance: None`) and — the sharper bug — the
+        // DT *value* (`dt: None`) while carrying the DT *variance* eleven
+        // lines below it. Impact probability and B-plane geometry were
+        // therefore evaluating a DT comet's g(r) at zero delay while
+        // opening a DT column priored on the caller's variance: the two
+        // entry points where an understated joint does the most damage.
+        if let Some(params) = crate::propagate::empyrean_orbit_non_grav_params(orbit) {
             orbits.set_non_grav_params(i, Some(params));
         }
         if let Some(tp) = crate::propagate::empyrean_orbit_thrust_params(orbit)

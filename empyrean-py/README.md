@@ -41,6 +41,15 @@ the
 [other distribution channels](https://github.com/Empyrean-Dynamics/empyrean#install)
 in the meantime.
 
+Each wheel bundles the `libempyrean` engine built for its own release,
+and the binding checks that pairing when the library opens: it reads the
+engine's ABI version and compares it against the one the wheel was built
+against, failing immediately — naming both numbers — if they differ. The
+version is per release, so an engine from a different release is rejected
+rather than used through a layout that may have moved. Nothing to
+configure; the bundled engine always matches. It matters only if you
+point the loader at an engine of your own.
+
 ## What it does
 
 - **Propagation** — N-body (Sun, planets, Moon, Pluto) with EIH general relativity, Sun J2 and Earth J2–J4 zonal harmonics, 16 asteroid perturbers, and the Marsden non-gravitational model — selectable across Approximate / Basic / Standard force-model tiers (Standard is the default). GR15 and DOP853 integrators. Optional finite-burn thrust arcs — constant-RTN, velocity-tangent, or inertial-fixed steering, with per-arc Δv targeting corrections — layer on as a continuous-thrust force input.
@@ -53,14 +62,14 @@ in the meantime.
 
 ```python
 import empyrean
-from empyrean import Epochs, TimeScale
+from empyrean import Epochs
 
 empyrean.download_data()   # SPICE kernels, first run only
 empyrean.initialize()
 
 # Query SBDB for Apophis and propagate through its 2029 Earth flyby
 orbits = empyrean.query_sbdb(["Apophis"])
-epochs = Epochs.from_kwargs(mjd=[65000.0], scale=TimeScale.TDB)
+epochs = Epochs.from_mjd([65000.0], scale="tdb")
 result = empyrean.propagate(orbits, epochs)
 
 # Event timeline
@@ -70,6 +79,17 @@ for i in range(len(result.events.summary)):
           f"{ev.body.to_pylist()[i]:8s} "
           f"MJD {ev.epoch.to_numpy()[i]:.2f}")
 ```
+
+Every time you hand to empyrean is an `Epochs`, and every `Epochs`
+states its scale — apart from the carve-outs whose scale is fixed by
+definition (columns named `mjd_tdb`, arguments named `epoch_mjd_tdb`,
+and the coordinate tables' `epoch` column, which is MJD TDB). A bare
+list or array is refused: `61000.5` read as UTC
+and `61000.5` read as TDB are about 69 seconds apart — easily enough to
+move an encounter geometry — so which one you mean is stated rather than
+defaulted. Build them with `Epochs.from_mjd(values, scale="tdb")` /
+`scale="utc"`, `Epochs.from_jd`, or `Epochs.from_iso([...])` for ISO-8601
+UTC timestamps.
 
 ## Orbit determination
 
@@ -239,9 +259,45 @@ A1/A2/A3 non-gravitational coefficients on a poor fit. `SolveFor` on
 `ODConfig.solve_for_flags` requests an explicit wider solve: beyond
 state + Marsden, `determine` and `refine` can also solve for the
 cometary outgassing time delay `dt`, the solar-radiation-pressure
-area-to-mass ratio `amrat`, and thrust Δv-correction segments
-(`thrust_segments`) — each differentiated analytically by the same
-hyperdual integrator that drives the dynamics.
+area-to-mass ratio `amrat`, and per-segment thrust Δv corrections
+(`thrust`) — each differentiated analytically by the same hyperdual
+integrator that drives the dynamics.
+
+Each axis takes a **disposition**, not a flag, because "not solved" is
+two different answers:
+
+| disposition | what the fit does |
+|---|---|
+| `"solved"` | estimated from the data; comes back with a posterior variance |
+| `"considered"` | not estimated, but its prior uncertainty still reaches the posterior through its measurement partials |
+| `"fixed"` | marginalized out; contributes nothing and changes no number |
+
+A considered axis is not a safety margin. Under an uncorrelated prior the
+consider correction strictly widens the posterior, but the fits that need
+it are the ones with cross terms between the considered axis and the
+solved ones — and there the correction is sign-indefinite, so the
+posterior can come back *tighter*. Report it as an unestimated error
+source folded through its measurement partials, never as conservatism
+(Schmidt–Kalman consider analysis; Tapley, Byron D., Schutz, Bob E., and
+Born, George H., *Statistical Orbit Determination*, Elsevier Academic
+Press, 2004, ch. 6).
+
+`False` cannot say which of the last two was meant, so a bool is refused
+by name rather than coerced. `result.dispositions` reports the partition
+the fit actually ran — the partition resolved against the orbit, not the
+one requested, so an `AUTO` escalation is readable after the fact. It is
+also the only place a considered axis appears, since a solved
+covariance's slot tags record what occupied a column and a considered
+axis occupies none. That is what tells you whether re-attaching a prior
+to an axis would double-count it: a considered axis already has its
+uncertainty inside the delivered 6×6, a fixed one does not. Same
+covariance, opposite conclusions.
+
+`result.warnings` is the other half of that honesty: covariance the fit
+was handed and deliberately did **not** use, delivered as payload rather
+than written to a log, because a dropped prior cross term changes how the
+σ for that slot should be read. It is empty on a fit that used everything
+it was given, which is the common case.
 
 `dt`, `amrat`, and thrust are refine-path solves: the seed orbit must
 carry the prior that opens each axis, so run them through `refine`. The
@@ -251,17 +307,34 @@ prior. Requesting an axis whose prior is absent is rejected loudly —
 the fit never returns a zeroed or defaulted column.
 
 ```python
-from empyrean import ODConfig, SolveFor
+from empyrean import ODConfig, ParamDisposition, SolveFor
 
 # Solve state + Marsden A1/A2/A3 + the outgassing time delay DT. The
 # seed orbit carries a non-grav covariance (opens Marsden) and a DT
 # prior variance (opens DT), e.g. its non-grav block was built with
 #   NonGravParams.from_kwargs(..., dt=[<days>], dt_variance=[<days**2>])
-config = ODConfig(solve_for_flags=SolveFor(marsden=True, dt=True))
+config = ODConfig(solve_for_flags=SolveFor(marsden="solved", dt="solved"))
 result = empyrean.refine(orbit, obs, config=config)
 
 print(result.dt_delta)      # fitted ΔDT (days); None if DT was not solved
 print(result.amrat_delta)   # fitted ΔAMRAT (m²/kg); None if not solved
+print(result.dispositions)  # what the fit did with each axis
+
+# The enum is equivalent to the string form, and is what `dispositions`
+# reports back:
+ParamDisposition.parse("considered") is ParamDisposition.CONSIDERED
+
+print(result.warnings)      # covariance the fit declined to use; often []
+
+# Per-segment thrust dispositions are positional with the orbit's
+# declared correction covariances — a considered or fixed burn sits
+# between solved ones as readily as after them, so a count could not
+# say which burn is which. At most three entries (the engine's
+# MAX_THRUST_SEGMENTS, on empyrean.od.result); a longer list raises
+# rather than being truncated to a shorter fit that drops a burn
+# silently. A bool raises too, by name — it cannot say which of
+# "considered" and "fixed" was meant.
+SolveFor(thrust=["solved", "fixed", "solved"])
 ```
 
 ### Tagged solved covariance
@@ -277,6 +350,72 @@ if sc is not None and sc.dt_slot is not None:
     print(f"σ(DT) = {dt_var ** 0.5:.4f} days")
 # sc.marsden_slot / sc.amrat_slot / sc.thrust_slots locate the rest;
 # canonical layout is [state 6 | Marsden 3 | DT 1 | AMRAT 1 | thrust 3×k].
+```
+
+### Carrying the joint onward
+
+The fitted orbit carries the off-diagonal blocks of that same matrix, so
+it can be fed straight back into propagation without falling back to the
+diagonal. They ride in two places: the 6×3 state↔Marsden border on
+`orbit.non_grav.non_grav_cross`, and everything else — state↔DT,
+state↔AMRAT, state↔Δv and the mixed parameter pairs — on
+`orbit.wide_cross`. Entries are keyed by parameter name (`"AMRAT"`,
+`"thrust[0].x"`), never by column index, because which column a
+parameter occupies depends on what else the orbit declares:
+
+```python
+cross = fit.orbit.wide_cross.state_cross(0)   # {tag: 6-vector}, by tag
+sigma_amrat_x = cross["AMRAT"][0]             # cov(x, AMRAT)
+```
+
+Propagated states carry the same two columns, holding the joint at each
+output epoch. This is what makes a chained propagation match the
+single-leg answer: the propagated state↔parameter columns are non-zero
+even when the input was block-diagonal, because propagation itself
+generates the correlation, so a second leg handed only the 6×6 reports a
+*tighter* uncertainty than the first leg supports. A row with no cross
+terms is null rather than zero — an absent correlation and a measured
+zero correlation are different claims, and only one of them is yours to
+make.
+
+When you chain legs by hand, carry the parameter blocks the cross terms
+are conditioned on (the non-grav 3×3, the DT and AMRAT prior variances)
+from the orbit that started the chain: propagation passes those through
+unchanged rather than restating them on every output row. A border
+supplied without its parameter block is refused, not quietly ignored.
+
+The joint is read by every downstream entry point that takes orbits, not
+just `propagate`: `compute_impact_probabilities`, `compute_b_planes`,
+`generate_ephemeris`, and the `determine` / `evaluate` / `refine` seed
+path all condition on it when the orbit carries it. An impact probability
+computed against a block-diagonal covariance materially understates the
+tails, for the same reason chaining does — it asserts an independence the
+fit never found. Feeding a fitted orbit through whole is what avoids the
+question; nothing has to be reassembled by hand.
+
+`TaggedCovariances` carries the same two columns alongside the 21
+synthesized `cov_*` scalars those columns are the state block of, so the
+per-epoch readback and an orbit table describe one joint the same way.
+It is populated on every uncertainty method that produces a joint,
+including the sampled ones, which recover the state↔parameter columns
+from the propagated cloud. `WideCross` is a nullable sub-table column
+rather than an optional attribute, so it is **never** `None` on a parent
+table — quivr returns a table of parent length regardless. Absence is
+per-row nulls: test `row_is_empty(i)` or the per-row accessors, never
+`orbits.wide_cross is None`.
+
+```python
+result = empyrean.propagate(orbits, epochs, tagged_covariance=True)
+
+tc = result.tagged_covariance_series(0)[-1]   # last epoch of orbit 0
+tc.non_grav_cross              # (6, 3) ndarray, or None
+tc.state_cross["AMRAT"]        # 6-vector, keyed by parameter tag
+tc.param_cross[("AMRAT", "DT")]
+
+# The same thing off the flat table, per row:
+wc = result.tagged_covariance.wide_cross
+wc.row_is_empty(0)
+wc.state_cross(0)              # {tag: 6-vector}
 ```
 
 ### Post-OD photometry
@@ -456,9 +595,11 @@ import pyarrow.compute as pc
 
 from empyrean import UncertaintyMethod
 
+end_epoch = empyrean.Epochs.from_mjd([63000.0], scale="tdb")
+
 ips = empyrean.compute_impact_probabilities(
     orbits,
-    end_epoch=63000.0,
+    end_epoch=end_epoch,
     methods=[UncertaintyMethod.FIRST_ORDER, UncertaintyMethod.SECOND_ORDER],
 )
 ips.epochs.scale                    # "tdb"
@@ -466,7 +607,7 @@ second = ips.where(pc.field("method") == "second_order")
 second.ip_second_order.to_numpy(zero_copy_only=False)   # nullable
 ips.ip_linear.to_numpy()            # always populated
 
-bps = empyrean.compute_b_planes(orbits, 63000.0, [UncertaintyMethod.SECOND_ORDER])
+bps = empyrean.compute_b_planes(orbits, end_epoch, [UncertaintyMethod.SECOND_ORDER])
 print(bps.b_dot_t_km.to_numpy())    # B·T (km)
 print(bps.b_dot_r_km.to_numpy())    # B·R (km)
 print(bps.semi_major_3sig_km.to_numpy(zero_copy_only=False))  # 3σ semi-major
@@ -489,7 +630,7 @@ from empyrean import Auto, MonteCarlo
 
 ips = empyrean.compute_impact_probabilities(
     orbits,
-    end_epoch=63000.0,
+    end_epoch=empyrean.Epochs.from_mjd([63000.0], scale="tdb"),
     methods=[
         Auto(threshold_first=0.05, threshold_mixture=5.0, gmm_max_depth=4),
         MonteCarlo(n_samples=100_000, seed=7),
@@ -514,6 +655,132 @@ distance, 1σ miss-distance uncertainty, and skewness, the
 closest-approach distance gradient and 6×6 Hessian with respect to the
 initial state, and the adaptive Gaussian-mixture component count.
 
+## Observation planning
+
+Given an orbit that already carries a covariance, `evaluate_plan` ranks
+candidate follow-up observations by how much each one would tighten it —
+before you spend the telescope time:
+
+```python
+import empyrean
+from empyrean import (
+    CartesianCoordinates,
+    PlannedObservation,
+    transform_coordinates,
+)
+
+# The planner consumes a Cartesian, barycentric covariance and converts
+# neither, so both are required. One call does both; the origin half is a
+# pure translation, so the covariance and its metrics come across unchanged.
+coords = transform_coordinates(fit.orbit.coordinates, CartesianCoordinates, origin="SSB")
+orbit = fit.orbit.set_column("coordinates", coords)
+t0 = float(coords.epoch.to_numpy()[0])
+
+plan = empyrean.evaluate_plan(
+    orbit,
+    [
+        PlannedObservation.optical(t0 + 30.0, "F51", (0.2, 0.2)),
+        PlannedObservation.optical(t0 + 31.0, "568", (0.3, 0.3)),
+        PlannedObservation.radar(
+            t0 + 45.0,
+            radar_bandwidth_hz=1.0e5,
+            radar_freq_resolution_hz=0.1,
+            radar_snr=50.0,
+        ),
+    ],
+)
+
+plan.metrics.to_dataframe()                 # two rows: "prior", "posterior"
+plan.metrics.prior().position_sigma_km[0].as_py()      # before any candidate
+plan.metrics.posterior().position_sigma_km[0].as_py()  # after all of them
+plan.candidates.best_by_information_gain(3).obs_code.to_pylist()
+```
+
+`plan.metrics` is a two-row `PlanMetrics` table with a `stage` column
+(`"prior"` / `"posterior"`) plus the five covariance summary metrics —
+RSS position and velocity σ, the 1σ position-ellipsoid semi-axes, and
+`log_det`. Keeping it a table means plans concatenate and join like any
+other output; `prior()` / `posterior()` are the one-row views.
+
+`plan.candidates` is a `PlanCandidates` quivr table — one row per
+candidate, carrying `marginal_volume_reduction` (the per-dimension
+generalized-variance ratio `(det Σ_post / det Σ_prior)^(1/6)` over the
+6×6 state covariance — a D-optimality score normalized to one dimension,
+so it reads as a linear scale factor; the 1σ ellipsoid volume ratio is
+that value cubed), the fractional position-σ improvement, and the running
+covariance metrics after that candidate and every one folded before it.
+`plan.ephemeris` is the predicted sky position at each optical
+candidate's epoch, with the epoch as an embedded `Epochs` sub-table; an
+optical row's `index` is its row there. A radar row has no epoch of its
+own — its `index` is its rank among the radar candidates, ordered by
+epoch.
+
+Rows come back in ascending epoch order, and each candidate's marginal
+gain is measured against the covariance that already contains every
+earlier one. The gains are therefore **conditional**: two identical
+observations do not score identically, and
+`best_by_information_gain` ranks contributions within one campaign rather
+than standalone candidate value. To compare candidates head to head,
+evaluate a one-candidate plan for each.
+
+`observable` means different things per kind. On an optical row it is a
+real engine verdict — today a solar-elongation test and nothing else,
+since the target's absolute magnitude does not reach the planner, so the
+limiting-magnitude filter cannot fire. On a radar row it is always
+`True`: no radar feasibility test runs here, not even the antenna
+elevation limit, so `True` means "not assessed". Either way the filters
+are engine-set and not caller-configurable, and `observable` **does not
+gate the fold** — an unobservable candidate still contributes to
+`posterior` and to every later `cumulative_*` row. What does gate it is
+whether the engine could compute the candidate's observation partials; a
+candidate for which it could not reports a `marginal_volume_reduction` of
+exactly 1 and leaves the covariance untouched. `observable_only()` filters
+rows, not information; to price the observable subset, drop those
+candidates from the plan and evaluate again.
+
+Not exposed in this release, recorded so the omissions are not mistaken
+for oversights: the non-gravitational planning variant that solves over
+state ⊕ (A1, A2, A3) and reports the σ(A2) tightening a radar campaign
+buys, the visibility survey, batch evaluation across many orbits, and the
+encounter B-plane. An orbit carrying non-gravitational parameters is
+accepted and evaluated state-only — the acceleration still acts in the
+dynamics, but the solve-for set stays 6×6 and no σ(A2) is reported.
+
+Optical and radar candidates fill different blocks and the cross-block is
+null, never zero: sky-plane geometry (`along_track_sigma_arcsec`,
+`position_angle_deg`, …) is populated only on optical rows, and
+`radar_mode` / `radar_snr` / `radar_range_km` only on radar rows. Radar
+adds the line-of-sight range and range-rate that angles-only astrometry
+cannot supply; its measurement σ is the Cramér-Rao bound set by the
+waveform bandwidth and the effective SNR.
+
+Leave `radar_snr` at `None` and the SNR is derived from a link budget over
+the target's physical properties instead. That path never substitutes a
+value it was not given — a missing property it needs is a loud refusal,
+and anything it *derived or adjusted* comes back on `radar_provenance`.
+Supplying an SNR selects the other request shape, so the link-budget
+inputs are refused alongside it rather than dropped:
+
+```python
+plan = empyrean.evaluate_plan(
+    orbit,
+    [
+        PlannedObservation.radar(
+            t0 + 45.0,
+            radar_bandwidth_hz=1.0e5,
+            radar_freq_resolution_hz=0.1,
+            radar_target_h_mag=19.7,
+            radar_target_visual_albedo=0.23,
+            radar_target_radar_albedo=0.15,
+            radar_integration_s=600.0,
+        )
+    ],
+)
+plan.candidates.radar_provenance.to_pylist()
+# [['diameter derived from H + p_V',
+#   'spin period unknown — coherent integration uncapped']]
+```
+
 ## Reading and writing files
 
 `empyrean.io` writes orbits, ephemerides, events, and residuals to
@@ -537,8 +804,20 @@ non-computable number is a literal `NaN` in CSV and `null` in JSON. The
 orbit CSV path goes through the same
 engine writer parquet uses, so the two emit an identical column set
 (state, covariance, non-grav including `dt` and its variance, photometry,
-SRP); a batch carrying a wide cross-covariance the row schema cannot
-express is refused rather than written short.
+SRP).
+
+Parquet additionally carries the **wide cross-covariance** — the
+state↔parameter and parameter↔parameter terms beyond the state+Marsden
+9×9 — in a tagged tail, so a fitted orbit round-trips through a parquet
+file carrying the joint the fit actually computed rather than its
+diagonal blocks. It is the only orbit format here that can, and the
+other two refuse such a batch by name rather than writing it short —
+both pointing at parquet. The JSON orbit format is a flat row shape
+carrying the 6×6 and nothing beyond it; the reason CSV cannot: this schema makes the difference between an absent
+cross and a supplied zero cross load-bearing, and CSV renders both as an
+empty cell. A carrier holding thrust Δv terms is refused wherever it is
+offered, because no orbit-file format can serialize the thrust arcs
+those terms describe.
 
 ## Data files
 

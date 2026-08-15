@@ -87,15 +87,12 @@ wherever you make it; what differs is reach.
 | Iterative `Session` refit — mask / refine / diff | ● | ● | ● | — |
 | Impact probability + B-plane geometry | ● | ● | ● | — |
 | Reusable built-system handle + `describe()` provenance | ● | ● | ● | — |
-| JPL SBDB / Horizons / MPC lookups | ● | ● | ● | ◐ |
+| Query APIs — SBDB / Horizons / MPC astrometry + radar | ● | ● | ● | — |
+| SBDB orbit input by id + Horizons state vectors | ● | ● | ● | ● |
 | Strict-offline context construction | ● | ● | ● | ● |
 | Ephemeris overlap policy — SB441-N16 self-perturbers | ● | ● | ● | — |
-| Observation planning — optical + radar candidates | — | — | ● | — |
+| Observation planning — optical + radar candidates | ● | ● | ● | — |
 | `empyrean show` output browser | — | — | — | ● |
-
-◐ The CLI resolves an SBDB orbit through `--object-id` and Horizons
-state vectors through `empyrean query horizons-vectors`; the MPC
-astrometry and radar lookups are library-side.
 
 ## Quickstart
 
@@ -124,7 +121,6 @@ SBDB epoch.
 
 ```python
 import empyrean
-import numpy as np
 
 empyrean.download_data()   # SPICE kernels, first run only
 empyrean.initialize()
@@ -132,9 +128,11 @@ empyrean.initialize()
 # 1. Pull Apophis from SBDB (Cometary orbits with covariance + non-grav).
 orbits = empyrean.query_sbdb(["99942"])
 
-# 2. Propagate 10 years past the SBDB epoch.
-t0 = orbits.coordinates.epoch.to_numpy()[0]
-epochs = np.array([t0 + 10.0 * 365.25])
+# 2. Propagate 10 years past the SBDB epoch. Times are always Epochs, and
+#    the scale is always stated — a bare MJD would not say which clock.
+#    from_orbits offsets each orbit's own epoch column (MJD TDB) and
+#    returns the typed grid, so no scale is restated by hand.
+epochs = empyrean.Epochs.from_orbits(orbits, [10.0 * 365.25])
 result = empyrean.propagate(orbits, epochs)
 
 counts = result.events.count_by_type()
@@ -196,7 +194,6 @@ Mauna Kea (MPC observatory code 568) for the next three months.
 
 ```python
 import empyrean
-import numpy as np
 
 empyrean.initialize()
 
@@ -204,7 +201,7 @@ orbits = empyrean.query_sbdb(["99942"])
 
 # Sample at SBDB epoch + {0, 30, 60} days.
 t0 = orbits.coordinates.epoch.to_numpy()[0]
-times = np.array([t0, t0 + 30.0, t0 + 60.0])
+times = empyrean.Epochs.from_mjd([t0, t0 + 30.0, t0 + 60.0], scale="tdb")
 
 observers = empyrean.get_observer_states(["568"], times)
 result = empyrean.generate_ephemeris(orbits, observers)
@@ -402,9 +399,20 @@ threshold, information loss), the influence diagnostics, the
 along / cross-track decomposition, and the radar block — in parquet, CSV,
 and JSON alike, all three emitted from one column table so they cannot
 disagree. The fitted-orbit CSV carries the same 82-column schema as the
-parquet, covariance included, rather than a lossy projection of it; a
-batch whose wide cross-covariance the row schema cannot express is
-refused rather than written short.
+parquet, covariance included, rather than a lossy projection of it.
+
+Parquet additionally carries the **wide cross-covariance** — the
+state↔parameter and parameter↔parameter terms beyond the state+Marsden
+9×9 — in a tagged tail, so a fitted orbit round-trips through a parquet
+file with the joint the fit actually computed rather than its diagonal
+blocks. It is the only orbit format here that can, and the other two
+refuse such a batch by name rather than writing it short — both pointing
+at parquet. CSV cannot because the schema makes the difference between
+an absent cross and a supplied zero cross load-bearing, and CSV renders
+both as an empty cell; the JSON orbit format is this crate's own flat
+row shape, carrying the 6×6 and nothing beyond it. A carrier holding
+thrust Δv terms is refused wherever it is offered, because no orbit-file
+format can serialize the thrust arcs those terms describe.
 
 Residual rows are typed by observable. Optical rows carry the RA / Dec
 and along / cross-track residuals with the track-frame pair's full

@@ -21,7 +21,7 @@ from __future__ import annotations
 import empyrean
 import pyarrow as pa
 import pytest
-from empyrean import Observers
+from empyrean import Epochs, Observers
 
 
 @pytest.fixture(scope="module")
@@ -35,7 +35,7 @@ def _observers_with_code(code: str) -> Observers:
     but relabelled to `code` — so the state columns are usable and only
     the lookup fails. That is exactly the situation the old fallback was
     silently rescuing."""
-    real = Observers.from_code("500", [61000.5, 61010.5])
+    real = Observers.from_code("500", Epochs.from_mjd([61000.5, 61010.5], scale="tdb"))
     table = real.table
     idx = table.schema.get_field_index("obs_code")
     relabelled = table.set_column(
@@ -63,7 +63,7 @@ def test_an_unknown_observatory_code_surfaces_instead_of_falling_back(orbits) ->
 
 def test_a_known_code_still_generates(orbits) -> None:
     """The guard rejects failures, not observers."""
-    good = Observers.from_code("500", [61000.5, 61010.5])
+    good = Observers.from_code("500", Epochs.from_mjd([61000.5, 61010.5], scale="tdb"))
     result = empyrean.generate_ephemeris(orbits, good)
     assert len(result.ephemeris) == 2
     # `observing_night` comes from the recompute, and a real one is

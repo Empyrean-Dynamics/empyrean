@@ -129,6 +129,9 @@ fn ffi_batch_to_owned(batch: &empyrean_sys::EmpyreanOrbitBatch) -> Result<OrbitB
                 ffi_orbit.has_srp,
                 ffi_orbit.srp_amrat_variance,
             ),
+            // SBDB publishes a state and, at most, a Marsden block — no
+            // cross terms of any kind. Absent, not dropped.
+            wide_cross: None,
         });
         let id_ptr = unsafe { *batch.orbit_ids.add(i) };
         let id = if id_ptr.is_null() {

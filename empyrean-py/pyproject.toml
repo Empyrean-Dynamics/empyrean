@@ -80,12 +80,15 @@ test = [
     "pytest>=7",
     "pytest-benchmark>=4",
     "pandas>=2.0",
+    # Independent reference for the time-scale conversions. Test-only:
+    # the package itself never imports astropy outside the optional
+    # Epochs.from_astropy / to_astropy interop above.
+    "astropy>=5.0",
 ]
 lint = [
     # Pinned exact: ruff is unpinned-latest in CI, so a minor bump that adds
-    # lint rules turns every open PR red mid-review (bd empyrean-ekqe/zxtd
-    # surfaced this on 0.16.0). Bump deliberately, fixing new findings in the
-    # same change.
+    # lint rules turns every open PR red mid-review (0.16.0 did exactly
+    # that). Bump deliberately, fixing new findings in the same change.
     "ruff==0.16.0",
     "mypy>=1.10",
 ]
@@ -106,7 +109,6 @@ dev = [
     {include-group = "test"},
     {include-group = "lint"},
     {include-group = "docs"},
-    "astropy>=5.0",
 ]
 
 # [project.urls] left intentionally unset — fill in once public homepage

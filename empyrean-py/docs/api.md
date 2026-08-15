@@ -28,11 +28,15 @@
 
    empyrean.query_sbdb
    empyrean.query_horizons
+   empyrean.query_horizons_vectors
    empyrean.query_observations
+   empyrean.query_radar
    empyrean.read_ades
    empyrean.initialize
    empyrean.download_data
    empyrean.default_data_dir
+   empyrean.versions
+   empyrean.version_string
 ```
 
 ## Coordinates & orbits
@@ -56,10 +60,27 @@
    empyrean.SphericalOrbits
    empyrean.NonGravParams
    empyrean.PhotometricParams
+   empyrean.SRPParams
+   empyrean.WideCross
    empyrean.Epochs
    empyrean.TimeScale
    empyrean.Frame
    empyrean.Origin
+```
+
+### Continuous thrust
+
+```{eval-rst}
+.. autosummary::
+   :toctree: _generated
+   :nosignatures:
+
+   empyrean.ThrustParams
+   empyrean.ThrustArc
+   empyrean.SteeringLaw
+   empyrean.ConstantRTN
+   empyrean.VelocityTangent
+   empyrean.InertialFixed
 ```
 
 ## Observers
@@ -88,6 +109,7 @@
    empyrean.EphemerisOverlapPolicy
    empyrean.ForceModelTier
    empyrean.UncertaintyMethod
+   empyrean.Auto
    empyrean.SigmaPoint
    empyrean.MonteCarlo
    empyrean.EventConfig
@@ -104,6 +126,40 @@
    empyrean.CaptureEnds
    empyrean.ShadowEntries
    empyrean.ShadowExits
+   empyrean.CovarianceRegimeChanges
+```
+
+### Tagged covariance
+
+The per-epoch covariance readback, carrying the joint's off-diagonal
+blocks alongside the 6×6 state block.
+
+```{eval-rst}
+.. autosummary::
+   :toctree: _generated
+   :nosignatures:
+
+   empyrean.TaggedCovariance
+   empyrean.TaggedCovariances
+   empyrean.CovarianceKind
+   empyrean.CovarianceQuality
+   empyrean.TargetFunctional
+   empyrean.GaussianMixture
+```
+
+### System handles
+
+```{eval-rst}
+.. autosummary::
+   :toctree: _generated
+   :nosignatures:
+
+   empyrean.build_system
+   empyrean.BuiltSystem
+   empyrean.SystemDescription
+   empyrean.KernelRecord
+   empyrean.KernelKind
+   empyrean.KernelProvenance
 ```
 
 ## Ephemeris
@@ -129,6 +185,37 @@
    empyrean.BPlanes
 ```
 
+## Observation planning
+
+```{eval-rst}
+.. autosummary::
+   :toctree: _generated
+   :nosignatures:
+
+   empyrean.evaluate_plan
+   empyrean.PlanResult
+   empyrean.PlanMetrics
+   empyrean.PlanCandidates
+   empyrean.PlanEphemeris
+```
+
+### Planning configuration
+
+```{eval-rst}
+.. autosummary::
+   :toctree: _generated
+   :nosignatures:
+
+   empyrean.PlanningConfig
+   empyrean.ObservatoryConfig
+   empyrean.STAGE_PRIOR
+   empyrean.STAGE_POSTERIOR
+   empyrean.PlannedObservation
+   empyrean.PlannedObservationKind
+   empyrean.RadarMode
+   empyrean.RadarStation
+```
+
 ## Math primitives
 
 ```{eval-rst}
@@ -150,6 +237,12 @@
 
    empyrean.StateSensitivities
    empyrean.ObservationSensitivities
+   empyrean.SENSITIVITY_ROW_RANGE
+   empyrean.SENSITIVITY_ROW_RA
+   empyrean.SENSITIVITY_ROW_DEC
+   empyrean.SENSITIVITY_ROW_VRANGE
+   empyrean.SENSITIVITY_ROW_VRA
+   empyrean.SENSITIVITY_ROW_VDEC
 ```
 
 ## Orbit determination
@@ -160,17 +253,38 @@
    :nosignatures:
 
    empyrean.ADESObservations
+   empyrean.ADESRadarObservations
    empyrean.ODConfig
    empyrean.DetermineResult
+   empyrean.DetermineResults
+   empyrean.DetermineFailure
    empyrean.EvaluateResult
    empyrean.ObservationResults
    empyrean.ResidualSummary
+   empyrean.FitSummary
+   empyrean.BandStat
    empyrean.AcceptabilityReport
+   empyrean.GateRecord
+   empyrean.SolvedCovariance
+   empyrean.CovarianceTrust
+   empyrean.TrustGateEvent
    empyrean.StationBiases
    empyrean.OutputEpoch
    empyrean.OutputEpochMode
    empyrean.Session
    empyrean.SessionDiff
+```
+
+### Post-OD photometry
+
+```{eval-rst}
+.. autosummary::
+   :toctree: _generated
+   :nosignatures:
+
+   empyrean.PhotometryConfig
+   empyrean.PhotometryModel
+   empyrean.PhotometryResult
 ```
 
 ### OD configuration
@@ -191,7 +305,11 @@
    empyrean.RejectionConfig
    empyrean.RejectionKind
    empyrean.SolveForParams
+   empyrean.SolveFor
+   empyrean.ParamDisposition
    empyrean.IODConfig
+   empyrean.OriginPolicy
+   empyrean.OriginPolicyMode
    empyrean.AutoEscalationPolicy
    empyrean.AcceptabilityThresholds
    empyrean.CovarianceRepresentation

@@ -30,10 +30,12 @@ from typing import Any
 import numpy as np
 import quivr as qv
 
+from empyrean._convert import joint_columns_from_result
 from empyrean.coordinates.covariance import (
     _cov_column_names,
     _lower_tri_indices,
 )
+from empyrean.orbits.wide_cross import WideCross
 
 # 6×6 Cartesian state labels — the matrix basis is always Cartesian
 # [x, y, z, vx, vy, vz] for the tagged readback.
@@ -175,6 +177,17 @@ class TaggedCovariance:
         Canonical origin (center body) name of the basis.
     frame : str
         Reference frame of the basis (canonical name, e.g. ``"icrf"``).
+    non_grav_cross : np.ndarray, optional
+        The ``(6, 3)`` state-to-(A1, A2, A3) cross covariance, in the
+        same basis as :attr:`matrix`; ``None`` when the orbit declared
+        no Marsden block.
+    state_cross : dict[str, np.ndarray]
+        Every other state-parameter column, keyed by parameter tag
+        (``"DT"``, ``"AMRAT"``, ``"thrust[0].x"``), each a 6-vector.
+        Empty when the layout carries none.
+    param_cross : dict[tuple[str, str], float]
+        Parameter-parameter terms, keyed by canonical ``(a, b)`` pair.
+        Empty when the layout carries none.
     """
 
     epoch_mjd_tdb: float
@@ -193,6 +206,9 @@ class TaggedCovariance:
     target_functional: TargetFunctional
     origin: str
     frame: str
+    non_grav_cross: np.ndarray | None
+    state_cross: dict[str, np.ndarray]
+    param_cross: dict[tuple[str, str], float]
 
     @property
     def corrected_mean(self) -> np.ndarray:
@@ -328,6 +344,23 @@ class TaggedCovariances(qv.Table):
     """``False`` on zero-filled placeholder rows where the underlying
     orbit carried no covariance."""
 
+    non_grav_cross = qv.LargeListColumn(qv.Float64Column(), nullable=True)
+    """6×3 row-major state-to-(A1, A2, A3) cross covariance, 18 values,
+    in the Cartesian basis of the ``cov_*`` columns above.
+
+    The off-diagonal half of the matrix those columns are the state block
+    of. Null on a row whose orbit declared no Marsden block — never a
+    block of zeros, which would read as a supplied zero correlation."""
+
+    wide_cross = WideCross.as_column(nullable=True)
+    """Cross terms beyond the state+Marsden ``9x9`` — state↔DT,
+    state↔AMRAT, state↔Δv, and every mixed parameter pair.
+
+    Populated on every uncertainty method that produces a joint,
+    including the sampled ones, which recover the state-parameter
+    columns from the propagated cloud. Absence is per-row nulls; see
+    :meth:`WideCross.row_is_empty`."""
+
     # ── Introspection ─────────────────────────────────────────
 
     def orbit_ids_unique(self) -> list[str]:
@@ -400,6 +433,10 @@ class TaggedCovariances(qv.Table):
         ng = np.column_stack(
             [self.column(f"non_grav_a{k}").to_numpy(zero_copy_only=False) for k in (1, 2, 3)]
         )
+        # The cross terms, read through the same accessors the table
+        # exposes so the two views cannot describe the same joint
+        # differently.
+        borders = self.non_grav_cross.to_pylist()
 
         out: list[TaggedCovariance] = []
         for i in range(n):
@@ -429,6 +466,13 @@ class TaggedCovariances(qv.Table):
                     target_functional=TargetFunctional(targets[i]),
                     origin=str(origins[i]),
                     frame=str(frames[i]),
+                    non_grav_cross=(
+                        np.asarray(borders[i], dtype=np.float64).reshape(6, 3)
+                        if borders[i] is not None
+                        else None
+                    ),
+                    state_cross=self.wide_cross.state_cross(i),
+                    param_cross=self.wide_cross.param_cross(i),
                 )
             )
         return out
@@ -527,5 +571,13 @@ def build_tagged_covariances(
     # 6×6 matrix → 21 lower-tri columns.
     for name, (i, j) in zip(_COV_NAMES, _LOWER_TRI, strict=False):
         kwargs[name] = matrix[:, i, j]
+
+    # The cross terms the 21 columns above are the state block of. Same
+    # two homes and same shapes as an orbit table's, so a consumer reads
+    # one surface the same way it reads the other.
+    border, wide = joint_columns_from_result(tagged, n)
+    kwargs["non_grav_cross"] = border if border is not None else [None] * n
+    if wide is not None:
+        kwargs["wide_cross"] = wide
 
     return TaggedCovariances.from_kwargs(**kwargs)

@@ -35,6 +35,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from empyrean import (
+    Epochs,
     Origin,
     SolveFor,
     SRPParams,
@@ -201,7 +202,7 @@ def test_non_grav_survives_propagation_refeed(apophis_fit):
     """
     orbit = apophis_fit.orbit
     epoch0 = orbit.coordinates.epoch[0].as_py()
-    targets = np.array([APOPHIS_2029_MJD_TDB])
+    targets = Epochs.from_mjd(np.array([APOPHIS_2029_MJD_TDB]), scale="tdb")
 
     # Strip the force model: same state and covariance, but A1/A2/A3 all
     # zero under the inverse-square asteroid g(r) — i.e. gravity-only.
@@ -252,7 +253,7 @@ def test_compute_impact_probabilities_accepts_fit_orbit(apophis_fit):
     """
     ips = compute_impact_probabilities(
         apophis_fit.orbit,
-        APOPHIS_IP_END_MJD_TDB,
+        Epochs.from_mjd([APOPHIS_IP_END_MJD_TDB], scale="tdb"),
         methods=[UncertaintyMethod.FIRST_ORDER],
         body_filter=[Origin.EARTH],
     )
@@ -382,7 +383,7 @@ def test_explicit_flag_solve_result_unwraps(apophis_fit, apophis_observations):
             amrat_variance=[_APOPHIS_AMRAT_SIGMA**2],
         ),
     )
-    config = ODConfig(solve_for_flags=SolveFor(amrat=True))
+    config = ODConfig(solve_for_flags=SolveFor(amrat="solved"))
     result = refine(primed, apophis_observations, config=config)
     assert result.solve_for_used == SolveForParams.EXPLICIT
     # The explicit AMRAT axis opened its column.
@@ -414,7 +415,7 @@ def test_non_physical_amrat_solve_refuses(apophis_fit, apophis_observations):
         coordinates=apophis_fit.orbit.coordinates,
         srp=SRPParams.from_kwargs(amrat=[1.0e-4], cr=[1.0], amrat_variance=[(1.0e-3) ** 2]),
     )
-    config = ODConfig(solve_for_flags=SolveFor(amrat=True))
+    config = ODConfig(solve_for_flags=SolveFor(amrat="solved"))
     with pytest.raises(RuntimeError, match="non-physical area-to-mass ratio") as excinfo:
         refine(unconstrained, apophis_observations, config=config)
     # The refusal carries the value it refused, so the caller can see how
@@ -449,7 +450,7 @@ def test_marsden_solve_seeds_from_zero_coefficients(apophis_fit, apophis_observa
     )
     # Must not raise "requires a covariance"; the zero-seeded column opens.
     result = refine(
-        zeroed, apophis_observations, config=ODConfig(solve_for_flags=SolveFor(marsden=True))
+        zeroed, apophis_observations, config=ODConfig(solve_for_flags=SolveFor(marsden="solved"))
     )
     assert result.solved_covariance is not None
     assert result.solved_covariance.marsden_slot is not None

@@ -28,6 +28,7 @@ import pytest
 from empyrean import (
     CartesianCoordinates,
     CartesianOrbits,
+    Epochs,
     Origin,
     UncertaintyMethod,
     compute_b_planes,
@@ -101,7 +102,7 @@ def test_states_carry_user_orbit_id_and_object_id() -> None:
     drop it.
     """
     orbits = _earth_crosser_orbit(orbit_id="MY_ORBIT_TAG", object_id="my_object_42")
-    target_epochs = np.array([61000.0, 61010.0, 61020.0])
+    target_epochs = Epochs.from_mjd(np.array([61000.0, 61010.0, 61020.0]), scale="tdb")
     result = empyrean.propagate(orbits, target_epochs)
 
     states_orbit_ids = result.states.orbit_id.to_pylist()
@@ -126,7 +127,7 @@ def test_events_carry_user_orbit_id_and_object_id() -> None:
     orbits = _earth_crosser_orbit(orbit_id="MY_ORBIT_TAG", object_id="my_object_42")
     # Multi-year window covers Apophis's 2029 Earth flyby, guaranteeing
     # at least one event in the result.
-    target_epochs = np.array([61000.0 + 60.0 * i for i in range(40)])
+    target_epochs = Epochs.from_mjd(np.array([61000.0 + 60.0 * i for i in range(40)]), scale="tdb")
     result = empyrean.propagate(orbits, target_epochs)
 
     summary_df = result.events.summary.to_dataframe()
@@ -177,7 +178,7 @@ def test_multiple_orbits_each_keep_their_own_id() -> None:
         object_id=["first_obj", "second_obj"],
         coordinates=coords,
     )
-    target_epochs = np.array([61000.0 + 60.0 * i for i in range(40)])
+    target_epochs = Epochs.from_mjd(np.array([61000.0 + 60.0 * i for i in range(40)]), scale="tdb")
     result = empyrean.propagate(orbits, target_epochs)
 
     df = result.events.summary.to_dataframe()
@@ -216,7 +217,9 @@ def test_ephemeris_carries_user_orbit_id_and_object_id() -> None:
     """
     orbits = _earth_crosser_orbit(orbit_id="EPH_TAG", object_id="eph_obj")
     # Geocentric observer at the orbit's epoch + a few days.
-    observers = Observers.from_code("500", [61000.5, 61010.5, 61020.5])
+    observers = Observers.from_code(
+        "500", Epochs.from_mjd([61000.5, 61010.5, 61020.5], scale="tdb")
+    )
     result = generate_ephemeris(orbits, observers)
     eph = result.ephemeris
     assert len(eph) > 0, "ephemeris result is empty"
@@ -268,7 +271,7 @@ def test_impact_probabilities_carry_user_orbit_id_and_object_id() -> None:
     orbits = _orbit_with_covariance(orbit_id="IP_TAG", object_id="ip_obj")
     ips = compute_impact_probabilities(
         orbits,
-        end_epoch=63000.0,  # past Apophis 2029 flyby
+        end_epoch=Epochs.from_mjd([63000.0], scale="tdb"),  # past Apophis 2029 flyby
         methods=[UncertaintyMethod.FIRST_ORDER],
         body_filter=[Origin.EARTH],
     )
@@ -305,7 +308,7 @@ def test_b_planes_carry_user_orbit_id_and_object_id() -> None:
     orbits = _orbit_with_covariance(orbit_id="BP_TAG", object_id="bp_obj")
     bps = compute_b_planes(
         orbits,
-        end_epoch=63000.0,
+        end_epoch=Epochs.from_mjd([63000.0], scale="tdb"),
         methods=[UncertaintyMethod.FIRST_ORDER],
         body_filter=[Origin.EARTH],
     )

@@ -26,6 +26,7 @@ from empyrean import (
     CartesianCovariance,
     CartesianOrbits,
     ConstantRTN,
+    Epochs,
     InertialFixed,
     Origin,
     PropagationConfig,
@@ -35,7 +36,7 @@ from empyrean import (
 )
 
 _T0 = 59000.0
-_EPOCHS = np.array([59000.0, 59005.0, 59012.0])
+_EPOCHS = Epochs.from_mjd(np.array([59000.0, 59005.0, 59012.0]), scale="tdb")
 
 
 def _diag_cov() -> np.ndarray:

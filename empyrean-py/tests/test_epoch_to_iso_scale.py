@@ -1,4 +1,4 @@
-"""``Epochs.to_iso(scale=...)`` must convert, not silently relabel — bd empyrean-4rlmv.
+"""``Epochs.to_iso(scale=...)`` must convert, not silently relabel.
 
 ``to_iso`` always emits the UTC wall-clock time of the stored instant,
 interpreting the stored MJD in the table's own scale. Passing a *different*
@@ -18,7 +18,7 @@ def test_to_iso_cross_scale_raises() -> None:
     """PROVING (fails on the pre-fix code, which relabelled instead of raising).
 
     A TDB table asked to format as UTC must raise rather than emit the raw TDB
-    clock reading stamped ``Z`` (the +69.18 s silent error the bead reports).
+    clock reading stamped ``Z`` (a +69.18 s silent error).
     """
     tdb = Epochs.from_mjd([61000.0], scale="tdb")
     with pytest.raises(ValueError, match="to_iso"):
@@ -38,7 +38,7 @@ def test_to_iso_same_scale_and_default_are_the_honest_path() -> None:
     ``scale is None`` and ``scale == self.scale`` both format the stored
     instant honestly, and the honest cross-scale conversion
     (``to_utc().to_iso()``) round-trips to the same UTC wall-clock — the
-    equality the bead verified (TDB−UTC = 69.1832 s).
+    equality this pins (TDB−UTC = 69.1832 s).
     """
     tdb = Epochs.from_mjd([61000.0], scale="tdb")
     default = tdb.to_iso()

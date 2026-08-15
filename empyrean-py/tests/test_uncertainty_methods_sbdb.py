@@ -1,19 +1,17 @@
-"""SBDB integration repro for the sampling uncertainty methods
-(bd empyrean-02j4). Mirrors the self-contained reproduction attached to
-the issue: query a real object from JPL SBDB and propagate it over a
-two-epoch grid under each uncertainty method.
+"""SBDB integration repro for the sampling uncertainty methods: query a
+real object from JPL SBDB and propagate it over a two-epoch grid under
+each uncertainty method.
 
 These tests hit the network (SBDB) and are skipped when it is
 unavailable, so they document/verify the end-to-end fix without gating
 the offline unit suite in ``test_uncertainty_methods.py``.
 
 The object comes back in the **cometary** representation (SBDB
-convention), which used to surface a distinct, deeper engine limitation
-(bd empyrean-r2dq): villeneuve's sigma-point path silently skipped
-non-Cartesian input orbits and left a first-order (linear) covariance in
-place. That is fixed engine-side — sigma points are constructed in
-native element space — so the cometary path is now asserted directly
-rather than xfailed. The Cartesian orbit derived from the same SBDB
+convention), which used to surface a distinct, deeper engine limitation:
+the sigma-point path silently skipped non-Cartesian input orbits and left
+a first-order (linear) covariance in place. That is fixed engine-side —
+sigma points are constructed in native element space — so the cometary
+path is now asserted directly rather than xfailed. The Cartesian orbit derived from the same SBDB
 record is kept as a second, independent check of the same property.
 """
 
@@ -23,6 +21,7 @@ import empyrean
 import numpy as np
 import pytest
 from empyrean import (
+    Epochs,
     GaussianMixture,
     MonteCarlo,
     Origin,
@@ -60,12 +59,14 @@ def sbdb_grid(sbdb_orbit) -> np.ndarray:
 def sbdb_orbit_cartesian(sbdb_orbit, sbdb_grid) -> CartesianOrbits:
     """The same SBDB record as a Cartesian orbit (state + covariance at
     the epoch), obtained by propagating to its own epoch. Originally the
-    workaround for the non-Cartesian sigma-point engine limitation
-    (empyrean-r2dq); retained after the fix as a second representation
-    exercising the same property."""
+    workaround for the non-Cartesian sigma-point engine limitation;
+    retained after the fix as a second representation exercising the
+    same property."""
     t0 = sbdb_grid[0]
     r0 = empyrean.propagate(
-        sbdb_orbit, np.array([t0]), uncertainty_method=UncertaintyMethod.FIRST_ORDER
+        sbdb_orbit,
+        Epochs.from_mjd(np.array([t0]), scale="tdb"),
+        uncertainty_method=UncertaintyMethod.FIRST_ORDER,
     )
     c = r0.states.coordinates
     cov0 = c.covariance.to_matrix()[0]
@@ -101,7 +102,9 @@ def test_sbdb_propagate_sampling_methods_do_not_raise(sbdb_orbit, sbdb_grid) -> 
         UncertaintyMethod.SIGMA_POINT,
         MonteCarlo(n_samples=64, seed=7),
     ):
-        res = empyrean.propagate(sbdb_orbit, sbdb_grid, uncertainty_method=method)
+        res = empyrean.propagate(
+            sbdb_orbit, Epochs.from_mjd(sbdb_grid, scale="tdb"), uncertainty_method=method
+        )
         assert len(res.states) == len(sbdb_grid)
 
 
@@ -127,7 +130,7 @@ def _assert_sigma_point_is_not_linear(res_fo, res_sp) -> None:
         )
         assert not np.array_equal(a, b), (
             f"sigma-point covariance is bit-identical to the first-order one at "
-            f"epoch {i} — tagged 'sigma_point' but never resampled (empyrean-r2dq)"
+            f"epoch {i} — tagged 'sigma_point' but never resampled"
         )
 
 
@@ -137,13 +140,13 @@ def test_sbdb_cartesian_sigma_point_is_genuine(sbdb_orbit_cartesian, sbdb_grid) 
     the linear first-order one — the fix's core value."""
     res_fo = empyrean.propagate(
         sbdb_orbit_cartesian,
-        sbdb_grid,
+        Epochs.from_mjd(sbdb_grid, scale="tdb"),
         uncertainty_method=UncertaintyMethod.FIRST_ORDER,
         tagged_covariance=True,
     )
     res_sp = empyrean.propagate(
         sbdb_orbit_cartesian,
-        sbdb_grid,
+        Epochs.from_mjd(sbdb_grid, scale="tdb"),
         uncertainty_method=UncertaintyMethod.SIGMA_POINT,
         tagged_covariance=True,
     )
@@ -179,7 +182,11 @@ def test_agm_impact_probability_fires_and_labels_correctly() -> None:
         pytest.skip("SBDB record for 2024 YR4 carries no covariance")
 
     t0 = float(orb.coordinates.epoch.to_numpy(zero_copy_only=False)[0])
-    r0 = empyrean.propagate(orb, np.array([t0]), uncertainty_method=UncertaintyMethod.FIRST_ORDER)
+    r0 = empyrean.propagate(
+        orb,
+        Epochs.from_mjd(np.array([t0]), scale="tdb"),
+        uncertainty_method=UncertaintyMethod.FIRST_ORDER,
+    )
     c = r0.states.coordinates
     cov0 = c.covariance.to_matrix()[0]
 
@@ -208,7 +215,7 @@ def test_agm_impact_probability_fires_and_labels_correctly() -> None:
     # 2032-12-22 encounter is ≈ MJD 63588.5; end a few days past it.
     ips = compute_impact_probabilities(
         yr4,
-        end_epoch=63594.0,
+        end_epoch=Epochs.from_mjd([63594.0], scale="tdb"),
         methods=[UncertaintyMethod.FIRST_ORDER, GaussianMixture()],
         body_filter=[Origin.EARTH],
     )
@@ -229,11 +236,11 @@ def test_sbdb_cometary_sigma_point_is_genuine(sbdb_orbit, sbdb_grid) -> None:
     """The SBDB (cometary) sigma-point path, which is the workflow a user
     actually runs — ``query_sbdb`` returns cometary orbits.
 
-    This was a strict-xfail guard for empyrean-r2dq, where the engine
-    silently skipped non-Cartesian input and left a first-order
-    covariance in place under a SIGMA_POINT request. r2dq is fixed
-    engine-side (sigma points are now constructed in native element
-    space), so the guard is retired and the path is asserted directly.
+    This was a strict-xfail guard for the case where the engine silently
+    skipped non-Cartesian input and left a first-order covariance in
+    place under a SIGMA_POINT request. That is fixed engine-side (sigma
+    points are now constructed in native element space), so the guard is
+    retired and the path is asserted directly.
 
     The tag alone is not the assertion: a covariance mislabelled
     ``sigma_point`` while still holding the linear values is exactly the
@@ -242,13 +249,13 @@ def test_sbdb_cometary_sigma_point_is_genuine(sbdb_orbit, sbdb_grid) -> None:
     """
     res_fo = empyrean.propagate(
         sbdb_orbit,
-        sbdb_grid,
+        Epochs.from_mjd(sbdb_grid, scale="tdb"),
         uncertainty_method=UncertaintyMethod.FIRST_ORDER,
         tagged_covariance=True,
     )
     res_sp = empyrean.propagate(
         sbdb_orbit,
-        sbdb_grid,
+        Epochs.from_mjd(sbdb_grid, scale="tdb"),
         uncertainty_method=UncertaintyMethod.SIGMA_POINT,
         tagged_covariance=True,
     )
@@ -260,7 +267,7 @@ def test_sbdb_cometary_sigma_point_is_genuine(sbdb_orbit, sbdb_grid) -> None:
 def test_sbdb_generate_ephemeris_rejects_sampling(sbdb_orbit, sbdb_grid) -> None:
     """generate_ephemeris rejects the sampling methods with a typed error
     (the silent-ignore fix), on a real SBDB orbit + observer."""
-    observers = empyrean.get_observer_states(["500"], sbdb_grid)
+    observers = empyrean.get_observer_states(["500"], Epochs.from_mjd(sbdb_grid, scale="tdb"))
     for method in (UncertaintyMethod.SIGMA_POINT, UncertaintyMethod.MONTE_CARLO):
         with pytest.raises(ValueError, match="sampling uncertainty methods"):
             empyrean.generate_ephemeris(sbdb_orbit, observers, uncertainty_method=method)

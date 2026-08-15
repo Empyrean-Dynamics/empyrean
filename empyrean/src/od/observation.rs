@@ -736,7 +736,7 @@ mod tests {
 
     /// A 4-character observatory code must be a loud error at the FFI
     /// boundary: clipped to 3 bytes it would silently alias a different
-    /// observatory (empyrean-agp9).
+    /// observatory.
     #[test]
     fn four_char_obs_code_is_rejected() {
         let obs = Observation {

@@ -1,8 +1,9 @@
 //! PyO3 bindings for the empyrean v0.7.0 safe wrapper.
 //!
 //! Surfaces the v0.7.0 public API: propagation, ephemeris, orbit
-//! determination, transforms. Thrust, planning/visibility, and the
-//! Full force-model tier are not exposed in this release.
+//! determination, transforms, and observation-plan evaluation. Thrust,
+//! the visibility survey, and the Full force-model tier are not exposed
+//! in this release.
 
 // PyO3 `#[pyfunction]` signatures mirror the Python API surface one-to-one, so
 // several take more than clippy's 7-argument threshold by design. The numpy
@@ -350,6 +351,9 @@ fn _transform_coordinates<'py>(
             representation: empyrean::int_to_rep(reps_arr[i]).map_err(to_pyerr)?,
             frame: empyrean::int_to_frame(frames_arr[i]).map_err(to_pyerr)?,
             origin: origin_from_naif(origins_arr[i])?,
+            // The border is an OD-output block; these paths build a
+            // state from Python inputs that carry none.
+            non_grav_cross: None,
         });
     }
 
@@ -794,6 +798,12 @@ fn build_uncertainty_method(
     srp_amrat_variance = None,
     has_non_grav_cov = None,
     non_grav_cov = None,
+    non_grav_cross = None,
+    wide_columns = None,
+    wide_state = None,
+    wide_pair_a = None,
+    wide_pair_b = None,
+    wide_pair_value = None,
     gm_threshold = 1.0,
     gm_max_depth = 3,
     gm_components_per_split = 3,
@@ -866,6 +876,16 @@ fn _propagate<'py>(
     // StateAndNonGrav prior instead of silently dropping it.
     has_non_grav_cov: Option<PyReadonlyArray1<'py, bool>>,
     non_grav_cov: Option<PyReadonlyArray3<'py, f64>>,
+    // The joint's off-diagonal terms, six parallel per-orbit lists (see
+    // `JointRows`). A leg fed its predecessor's joint propagates the
+    // covariance the previous leg actually computed; fed the 6×6 alone
+    // it reports a tighter uncertainty than that leg supports.
+    non_grav_cross: Option<Vec<Option<Vec<f64>>>>,
+    wide_columns: Option<Vec<Option<Vec<String>>>>,
+    wide_state: Option<Vec<Option<Vec<f64>>>>,
+    wide_pair_a: Option<Vec<Option<Vec<String>>>>,
+    wide_pair_b: Option<Vec<Option<Vec<String>>>>,
+    wide_pair_value: Option<Vec<Option<Vec<f64>>>>,
     gm_threshold: f64,
     gm_max_depth: usize,
     gm_components_per_split: usize,
@@ -959,6 +979,18 @@ fn _propagate<'py>(
         None => None,
     };
 
+    // The caller's joint, if any. Lengths are checked once, up front, so
+    // a mismatched list is refused before any orbit is built.
+    let joint_in = JointRows {
+        non_grav_cross,
+        columns: wide_columns,
+        state: wide_state,
+        pair_a: wide_pair_a,
+        pair_b: wide_pair_b,
+        pair_value: wide_pair_value,
+    };
+    joint_in.validate_lengths(n)?;
+
     let mut orbits: Vec<empyrean::Orbit> = Vec::with_capacity(n);
     for i in 0..n {
         let mut elems = [0.0f64; 6];
@@ -983,6 +1015,10 @@ fn _propagate<'py>(
             representation: empyrean::int_to_rep(reps_arr[i]).map_err(to_pyerr)?,
             frame: empyrean::int_to_frame(frames_arr[i]).map_err(to_pyerr)?,
             origin: origin_from_naif(origins_arr[i])?,
+            // The state↔Marsden border, carried in the coordinate's own
+            // basis and angular unit — the same basis as the 6×6 it
+            // borders.
+            non_grav_cross: joint_in.border_at(i)?,
         };
         // Optional g(r) overrides — when not provided, the C ABI
         // defaults to inverse_square (asteroid Yarkovsky / SRP).
@@ -1050,6 +1086,7 @@ fn _propagate<'py>(
             photometry,
             thrust,
             srp,
+            joint_in.wide_at(i)?,
         ));
     }
 
@@ -1158,6 +1195,13 @@ fn _propagate<'py>(
     // Resolved covariance kind per output state (linear / second-order /
     // …) — the provenance the tagged-covariance path also carries.
     let mut out_resolved_kind = Array1::<u8>::zeros(m);
+    // The propagated joint's cross terms per state row. `covariance`
+    // above is only the state block; a second leg handed that block
+    // alone gets a block-diagonal covariance, while the joint the engine
+    // computed has non-zero state↔parameter columns even from a
+    // block-diagonal input, because propagation generates that
+    // correlation.
+    let mut out_joint = JointColumns::with_capacity(m);
 
     for (i, state) in prop_result.states.iter().enumerate() {
         let orbit_idx = if n_times > 0 { i / n_times } else { 0 };
@@ -1208,6 +1252,7 @@ fn _propagate<'py>(
             }
         }
         out_resolved_kind[i] = covariance_kind_to_u8(state.resolved_kind);
+        out_joint.push(&state.joint);
     }
 
     let n_events = prop_result.events.len();
@@ -1351,6 +1396,10 @@ fn _propagate<'py>(
         "resolved_kind",
         PyArray1::from_owned_array(py, out_resolved_kind),
     )?;
+    // Six parallel per-row lists, or no keys at all when no row carried
+    // a joint — the states table then leaves those columns unset, as it
+    // did before this surface existed.
+    out_joint.set_on(&dict, "")?;
 
     // ── Opt-in provenance-tagged covariance readback ──────────
     // Fill per-(orbit, epoch) arrays aligned 1:1 with `states`
@@ -1568,6 +1617,15 @@ fn fill_tagged_covariance(
     let mut origin = Array1::<i32>::zeros(m);
     let mut frame = Array1::<i32>::zeros(m);
     let mut has_tagged = Array1::<bool>::default(m);
+    // The cross terms `matrix` is the state block of. A separate engine
+    // call per row, because the tagged covariance itself owns no heap
+    // storage and asking for the joint is an explicit acquisition — the
+    // same shape the C ABI gives a C caller.
+    let mut joint = JointColumns::with_capacity(m);
+    // Row-indexed rather than pushed in order: an orbit whose series is
+    // unavailable is skipped below, so the flat index is not a running
+    // counter here.
+    let mut joint_rows: Vec<Option<empyrean::JointCovariance>> = vec![None; m];
 
     for orbit_index in 0..num_orbits {
         // An orbit with no covariance makes the accessor error; that's
@@ -1617,7 +1675,23 @@ fn fill_tagged_covariance(
             origin[i] = tagged.origin.naif_id();
             frame[i] = empyrean::frame_to_int(tagged.frame);
             has_tagged[i] = true;
+            // Addressed by the same (orbit, epoch) pair as the matrix
+            // above, so the two always share provenance. A row the
+            // engine has no joint for comes back EMPTY, not as an
+            // error, so a failure here is a real one and is raised
+            // rather than turned into an absent joint — the two are
+            // different claims and only one of them is true.
+            joint_rows[i] = Some(prop_result.joint_at(orbit_index, k).map_err(to_pyerr)?);
         }
+    }
+    // Rows the loop above never reached — an orbit with no covariance at
+    // all — carry no joint either.
+    let absent = empyrean::JointCovariance {
+        non_grav_cross: None,
+        wide_cross: None,
+    };
+    for row in &joint_rows {
+        joint.push(row.as_ref().unwrap_or(&absent));
     }
 
     let tagged_dict = PyDict::new(py);
@@ -1664,6 +1738,9 @@ fn fill_tagged_covariance(
     tagged_dict.set_item("origin", PyArray1::from_owned_array(py, origin))?;
     tagged_dict.set_item("frame", PyArray1::from_owned_array(py, frame))?;
     tagged_dict.set_item("has_tagged", PyArray1::from_owned_array(py, has_tagged))?;
+    // Same six-list shape the states table carries, so one reader serves
+    // both surfaces. No keys at all when no row carried a joint.
+    joint.set_on(&tagged_dict, "")?;
 
     dict.set_item("tagged_covariance", tagged_dict)?;
     Ok(())
@@ -1705,8 +1782,8 @@ fn parse_fabricated_orbit_index(orbit_id: &str) -> Option<usize> {
 /// Python extension marshals from arrays/dicts. The body ends in an
 /// exhaustive `Orbit { .. }` literal with NO `..` rest pattern, so adding a
 /// field to the wrapper `Orbit` becomes a compile error here — at the marshal
-/// boundary — instead of a silent per-field drop (the empyrean-3qoe failure
-/// class). Every orbit builder routes its final construction through this fn;
+/// boundary — instead of a silent per-field drop, the failure class where a
+/// newly added field never reaches the engine and nothing says so. Every orbit builder routes its final construction through this fn;
 /// each keeps its own array-extraction logic and passes the per-orbit values.
 /// Optional inputs carry the wrapper's own "absent" convention (g(r) → the
 /// all-zero inverse-square sentinel, photometry → magnitude disabled).
@@ -1728,6 +1805,10 @@ fn assemble_orbit(
     // explicit `has_srp` switch was 0). A `Some(_, _, Some(v))` opens the
     // AMRAT fit column; `Some(_, _, None)` applies SRP as a fixed force.
     srp: Option<(f64, f64, Option<f64>)>,
+    // The joint's off-diagonal terms. `None` for every path that builds
+    // an orbit from flat arrays — those carry no cross terms — and
+    // `Some` only where a caller supplied or a fit returned one.
+    wide_cross: Option<empyrean::WideCross>,
 ) -> empyrean::Orbit {
     // Absent g(r) → the all-zero (alpha, r0, m, n, k) inverse-square sentinel
     // `Orbit::new` uses; the C ABI reads all-zeros as "inverse-square".
@@ -1758,6 +1839,13 @@ fn assemble_orbit(
         slope2,
         thrust,
         srp: None,
+        // The chokepoint's whole purpose: this literal has no `..` rest
+        // pattern, so a field added to the wrapper `Orbit` is a compile
+        // error HERE, at the marshal boundary, rather than a silent
+        // per-field drop. The carrier is threaded from the caller in the
+        // dict path; the array path builds orbits from flat columns and
+        // carries none.
+        wide_cross,
     };
     // Attach the SRP slot through the public builders so `has_srp` (the
     // explicit switch) and the AMRAT prior are set exactly as the wrapper /
@@ -1816,6 +1904,298 @@ fn ng_covariance_at(
     Some(m)
 }
 
+// ══════════════════════════════════════════════════════════
+//  The joint covariance across the Python boundary
+// ══════════════════════════════════════════════════════════
+//
+// One wire shape, both directions, named after the columns it feeds:
+// six parallel per-row lists that transcribe onto
+// `NonGravParams.non_grav_cross` and the five `WideCross` columns with
+// no re-derivation on either side.
+//
+// Absence is a `None` ROW, never a zero row. A zero entry is a supplied
+// zero correlation the engine runs its definiteness gate on, so
+// zero-filling an absent row would turn "this orbit has no cross terms"
+// into "this orbit asserts uncorrelated", which is a different and
+// stronger claim.
+
+/// The joint's off-diagonal terms as the Python channel supplies them,
+/// on the way IN to the engine.
+///
+/// Each list is `None` when the caller passed no such column at all, and
+/// carries `None` on a row with no entries. Lengths are checked against
+/// the orbit count before any row is read, so a truncated list is a
+/// refusal rather than a silently short-fed batch.
+#[derive(Default)]
+struct JointRows {
+    /// Row-major \\(6 \times 3\\) state↔Marsden border, 18 values.
+    non_grav_cross: Option<Vec<Option<Vec<f64>>>>,
+    /// Parameter identity per state-cross column, in the engine's own
+    /// rendering (`A1`, `DT`, `AMRAT`, `thrust[0].x`).
+    columns: Option<Vec<Option<Vec<String>>>>,
+    /// `6 * columns.len()` values, row-major: entry `k` covers
+    /// positions `6k..6k+6`.
+    state: Option<Vec<Option<Vec<f64>>>>,
+    /// Parameter↔parameter terms: three parallel lists of one term each.
+    pair_a: Option<Vec<Option<Vec<String>>>>,
+    pair_b: Option<Vec<Option<Vec<String>>>>,
+    pair_value: Option<Vec<Option<Vec<f64>>>>,
+}
+
+impl JointRows {
+    /// Refuse any supplied list whose length is not the orbit count.
+    ///
+    /// These lists are positional against the orbit batch, so a short
+    /// list would attach one orbit's cross terms to another — every
+    /// number finite, every gate passed, and the correlations on the
+    /// wrong object.
+    fn validate_lengths(&self, n: usize) -> PyResult<()> {
+        let check = |what: &str, len: Option<usize>| -> PyResult<()> {
+            match len {
+                Some(l) if l != n => Err(PyValueError::new_err(format!(
+                    "{what} has {l} entries but the batch has {n} orbit(s); these \
+                     lists are positional against the orbit batch, so a length \
+                     mismatch would attach one orbit's cross terms to another"
+                ))),
+                _ => Ok(()),
+            }
+        };
+        check("non_grav_cross", self.non_grav_cross.as_ref().map(Vec::len))?;
+        check("wide_columns", self.columns.as_ref().map(Vec::len))?;
+        check("wide_state", self.state.as_ref().map(Vec::len))?;
+        check("wide_pair_a", self.pair_a.as_ref().map(Vec::len))?;
+        check("wide_pair_b", self.pair_b.as_ref().map(Vec::len))?;
+        check("wide_pair_value", self.pair_value.as_ref().map(Vec::len))?;
+        Ok(())
+    }
+
+    /// Row `i`'s state↔Marsden border, or `None` when the row has none.
+    fn border_at(&self, i: usize) -> PyResult<Option<[[f64; 3]; 6]>> {
+        let Some(rows) = self.non_grav_cross.as_ref() else {
+            return Ok(None);
+        };
+        let Some(flat) = rows[i].as_ref() else {
+            return Ok(None);
+        };
+        if flat.len() != 18 {
+            return Err(PyValueError::new_err(format!(
+                "non_grav_cross[{i}] has {} values but the state-Marsden border \
+                 is 6x3 = 18, row-major. A short or long row cannot be reshaped \
+                 without guessing which element went missing",
+                flat.len()
+            )));
+        }
+        let mut border = [[0.0f64; 3]; 6];
+        for r in 0..6 {
+            for c in 0..3 {
+                border[r][c] = flat[r * 3 + c];
+            }
+        }
+        Ok(Some(border))
+    }
+
+    /// Row `i`'s wide carrier, or `None` when the row carries no entries.
+    ///
+    /// Tags are parsed through [`empyrean::ParamColumn::from_tag`], the
+    /// single parse point for every string-tagged channel: an
+    /// unrecognized tag is refused here rather than defaulted, because a
+    /// mis-parsed tag attaches one parameter's correlations to another.
+    fn wide_at(&self, i: usize) -> PyResult<Option<empyrean::WideCross>> {
+        let tags = self.columns.as_ref().and_then(|rows| rows[i].as_ref());
+        let values = self.state.as_ref().and_then(|rows| rows[i].as_ref());
+        let pair_a = self.pair_a.as_ref().and_then(|rows| rows[i].as_ref());
+        let pair_b = self.pair_b.as_ref().and_then(|rows| rows[i].as_ref());
+        let pair_value = self.pair_value.as_ref().and_then(|rows| rows[i].as_ref());
+
+        let mut wide = empyrean::WideCross::new();
+
+        match (tags, values) {
+            (Some(tags), Some(values)) => {
+                let expected = 6 * tags.len();
+                if values.len() != expected {
+                    return Err(PyValueError::new_err(format!(
+                        "row {i}: wide_state has {} values but wide_columns names \
+                         {} column(s), which need {expected}. The payload is \
+                         row-major 6-per-column; reshaping a mismatch would attach \
+                         one parameter's covariances to another",
+                        values.len(),
+                        tags.len()
+                    )));
+                }
+                for (k, tag) in tags.iter().enumerate() {
+                    let column = empyrean::ParamColumn::from_tag(tag).map_err(to_pyerr)?;
+                    let mut six = [0.0f64; 6];
+                    six.copy_from_slice(&values[k * 6..k * 6 + 6]);
+                    wide.set_state_cross(column, six);
+                }
+            }
+            (None, None) => {}
+            (tags, _) => {
+                return Err(PyValueError::new_err(format!(
+                    "row {i}: wide_columns and wide_state must be supplied \
+                     together — got {} and {}. One without the other is either \
+                     tags with no covariances or covariances with no identity, \
+                     and neither can be placed",
+                    if tags.is_some() { "tags" } else { "no tags" },
+                    if values.is_some() {
+                        "values"
+                    } else {
+                        "no values"
+                    },
+                )));
+            }
+        }
+
+        match (pair_a, pair_b, pair_value) {
+            (Some(a), Some(b), Some(v)) => {
+                if !(a.len() == b.len() && b.len() == v.len()) {
+                    return Err(PyValueError::new_err(format!(
+                        "row {i}: wide_pair_a / wide_pair_b / wide_pair_value have \
+                         lengths {} / {} / {}. They are three parallel lists of one \
+                         term each; unequal lengths mean any pairing of them would \
+                         be invented",
+                        a.len(),
+                        b.len(),
+                        v.len()
+                    )));
+                }
+                for ((a, b), v) in a.iter().zip(b.iter()).zip(v.iter()) {
+                    let a = empyrean::ParamColumn::from_tag(a).map_err(to_pyerr)?;
+                    let b = empyrean::ParamColumn::from_tag(b).map_err(to_pyerr)?;
+                    wide.set_param_cross(a, b, *v);
+                }
+            }
+            (None, None, None) => {}
+            _ => {
+                return Err(PyValueError::new_err(format!(
+                    "row {i}: wide_pair_a, wide_pair_b and wide_pair_value must be \
+                     supplied together — a term needs both endpoints and a value"
+                )));
+            }
+        }
+
+        Ok((!wide.is_empty()).then_some(wide))
+    }
+}
+
+/// The joint's off-diagonal terms on the way OUT, accumulated row by row
+/// into the same six parallel lists [`JointRows`] reads.
+///
+/// A row the engine produced no joint for pushes `None` on every list —
+/// the null that says "this row has no cross terms", as distinct from a
+/// row of zeros.
+struct JointColumns {
+    non_grav_cross: Vec<Option<Vec<f64>>>,
+    columns: Vec<Option<Vec<String>>>,
+    state: Vec<Option<Vec<f64>>>,
+    pair_a: Vec<Option<Vec<String>>>,
+    pair_b: Vec<Option<Vec<String>>>,
+    pair_value: Vec<Option<Vec<f64>>>,
+    /// Whether any row carried anything. Drives whether the keys are set
+    /// at all, so a batch with no joint costs the Python side nothing.
+    any: bool,
+}
+
+impl JointColumns {
+    fn with_capacity(n: usize) -> Self {
+        Self {
+            non_grav_cross: Vec::with_capacity(n),
+            columns: Vec::with_capacity(n),
+            state: Vec::with_capacity(n),
+            pair_a: Vec::with_capacity(n),
+            pair_b: Vec::with_capacity(n),
+            pair_value: Vec::with_capacity(n),
+            any: false,
+        }
+    }
+
+    fn push(&mut self, joint: &empyrean::JointCovariance) {
+        match joint.non_grav_cross {
+            Some(border) => {
+                self.non_grav_cross
+                    .push(Some(border.iter().flatten().copied().collect()));
+                self.any = true;
+            }
+            None => self.non_grav_cross.push(None),
+        }
+
+        let wide = joint.wide_cross.as_ref().filter(|w| !w.is_empty());
+        let Some(wide) = wide else {
+            self.columns.push(None);
+            self.state.push(None);
+            self.pair_a.push(None);
+            self.pair_b.push(None);
+            self.pair_value.push(None);
+            return;
+        };
+
+        let mut tags: Vec<String> = Vec::new();
+        let mut values: Vec<f64> = Vec::new();
+        for (column, six) in wide.state_crosses() {
+            tags.push(column.as_tag());
+            values.extend_from_slice(six);
+        }
+        let mut a: Vec<String> = Vec::new();
+        let mut b: Vec<String> = Vec::new();
+        let mut v: Vec<f64> = Vec::new();
+        for (x, y, value) in wide.param_crosses() {
+            a.push(x.as_tag());
+            b.push(y.as_tag());
+            v.push(value);
+        }
+        // Each half is nulled on its own: a carrier can hold state
+        // columns with no parameter pairs, or the reverse, and an empty
+        // list would read as "supplied, and empty".
+        self.columns.push((!tags.is_empty()).then_some(tags));
+        self.state.push((!values.is_empty()).then_some(values));
+        self.pair_a.push((!a.is_empty()).then_some(a));
+        self.pair_b.push((!b.is_empty()).then_some(b));
+        self.pair_value.push((!v.is_empty()).then_some(v));
+        self.any = true;
+    }
+
+    /// Write the six lists into `dict` under `prefix`, or write nothing
+    /// when no row carried a joint.
+    fn set_on(self, dict: &Bound<'_, PyDict>, prefix: &str) -> PyResult<()> {
+        if !self.any {
+            return Ok(());
+        }
+        dict.set_item(format!("{prefix}non_grav_cross"), self.non_grav_cross)?;
+        dict.set_item(format!("{prefix}wide_columns"), self.columns)?;
+        dict.set_item(format!("{prefix}wide_state"), self.state)?;
+        dict.set_item(format!("{prefix}wide_pair_a"), self.pair_a)?;
+        dict.set_item(format!("{prefix}wide_pair_b"), self.pair_b)?;
+        dict.set_item(format!("{prefix}wide_pair_value"), self.pair_value)?;
+        Ok(())
+    }
+}
+
+/// Read the six joint lists out of an orbit dict, for the entry points
+/// that take a whole orbit table as one dict rather than as loose
+/// arrays.
+fn joint_rows_from_dict(orbit_dict: &Bound<'_, PyDict>) -> PyResult<JointRows> {
+    let floats = |key: &str| -> PyResult<Option<Vec<Option<Vec<f64>>>>> {
+        match orbit_dict.get_item(key)? {
+            Some(o) => Ok(Some(o.extract()?)),
+            None => Ok(None),
+        }
+    };
+    let strings = |key: &str| -> PyResult<Option<Vec<Option<Vec<String>>>>> {
+        match orbit_dict.get_item(key)? {
+            Some(o) => Ok(Some(o.extract()?)),
+            None => Ok(None),
+        }
+    };
+    Ok(JointRows {
+        non_grav_cross: floats("non_grav_cross")?,
+        columns: strings("wide_columns")?,
+        state: floats("wide_state")?,
+        pair_a: strings("wide_pair_a")?,
+        pair_b: strings("wide_pair_b")?,
+        pair_value: floats("wide_pair_value")?,
+    })
+}
+
 fn build_orbits_from_arrays(
     epochs: &numpy::ndarray::Array1<f64>,
     elements: &numpy::ndarray::Array2<f64>,
@@ -1840,8 +2220,12 @@ fn build_orbits_from_arrays(
     srp_amrat_variance: Option<&numpy::ndarray::Array1<f64>>,
     has_non_grav_cov: Option<&numpy::ndarray::Array1<bool>>,
     non_grav_cov: Option<&numpy::ndarray::Array3<f64>>,
+    // The joint's off-diagonal terms, when the caller's orbits carry
+    // them. Empty for a batch that carries none.
+    joint: &JointRows,
 ) -> PyResult<Vec<empyrean::Orbit>> {
     let n = epochs.len();
+    joint.validate_lengths(n)?;
     let mut orbits: Vec<empyrean::Orbit> = Vec::with_capacity(n);
     for i in 0..n {
         let mut elems = [0.0f64; 6];
@@ -1866,6 +2250,9 @@ fn build_orbits_from_arrays(
             representation: empyrean::int_to_rep(representations[i]).map_err(to_pyerr)?,
             frame: empyrean::int_to_frame(frames[i]).map_err(to_pyerr)?,
             origin: origin_from_naif(origins[i])?,
+            // The state-Marsden border, in the coordinate's own basis
+            // and angular unit.
+            non_grav_cross: joint.border_at(i)?,
         };
         let g_function = match (ng_alphas, ng_r0s, ng_ms, ng_ns, ng_ks) {
             (Some(a), Some(r), Some(m), Some(n_), Some(k)) => Some((a[i], r[i], m[i], n_[i], k[i])),
@@ -1890,6 +2277,7 @@ fn build_orbits_from_arrays(
             None,
             None,
             srp,
+            joint.wide_at(i)?,
         ));
     }
     Ok(orbits)
@@ -2018,6 +2406,8 @@ fn methods_from_flat(
     srp_cr=None,
     srp_amrat_variance=None,
     has_non_grav_cov=None, non_grav_cov=None,
+    non_grav_cross=None, wide_columns=None, wide_state=None,
+    wide_pair_a=None, wide_pair_b=None, wide_pair_value=None,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn _compute_impact_probabilities<'py>(
@@ -2075,6 +2465,16 @@ fn _compute_impact_probabilities<'py>(
     // keeps its StateAndNonGrav prior instead of silently dropping it.
     has_non_grav_cov: Option<PyReadonlyArray1<'py, bool>>,
     non_grav_cov: Option<PyReadonlyArray3<'py, f64>>,
+    // The joint's off-diagonal terms, six parallel per-orbit lists (see
+    // `JointRows`). A fitted orbit re-fed here conditions on the joint
+    // its fit produced; without them it conditions on a block-diagonal
+    // covariance no leg ever computed.
+    non_grav_cross: Option<Vec<Option<Vec<f64>>>>,
+    wide_columns: Option<Vec<Option<Vec<String>>>>,
+    wide_state: Option<Vec<Option<Vec<f64>>>>,
+    wide_pair_a: Option<Vec<Option<Vec<String>>>>,
+    wide_pair_b: Option<Vec<Option<Vec<String>>>>,
+    wide_pair_value: Option<Vec<Option<Vec<f64>>>>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let ctx = get_context()?;
 
@@ -2117,6 +2517,14 @@ fn _compute_impact_probabilities<'py>(
             .as_ref()
             .map(|a| a.as_array().to_owned())
             .as_ref(),
+        &JointRows {
+            non_grav_cross,
+            columns: wide_columns,
+            state: wide_state,
+            pair_a: wide_pair_a,
+            pair_b: wide_pair_b,
+            pair_value: wide_pair_value,
+        },
     )?;
     let methods = methods_from_flat(
         &method_tags,
@@ -2292,6 +2700,8 @@ fn _compute_impact_probabilities<'py>(
     srp_cr=None,
     srp_amrat_variance=None,
     has_non_grav_cov=None, non_grav_cov=None,
+    non_grav_cross=None, wide_columns=None, wide_state=None,
+    wide_pair_a=None, wide_pair_b=None, wide_pair_value=None,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn _compute_b_planes<'py>(
@@ -2349,6 +2759,16 @@ fn _compute_b_planes<'py>(
     // keeps its StateAndNonGrav prior instead of silently dropping it.
     has_non_grav_cov: Option<PyReadonlyArray1<'py, bool>>,
     non_grav_cov: Option<PyReadonlyArray3<'py, f64>>,
+    // The joint's off-diagonal terms, six parallel per-orbit lists (see
+    // `JointRows`). A fitted orbit re-fed here conditions on the joint
+    // its fit produced; without them it conditions on a block-diagonal
+    // covariance no leg ever computed.
+    non_grav_cross: Option<Vec<Option<Vec<f64>>>>,
+    wide_columns: Option<Vec<Option<Vec<String>>>>,
+    wide_state: Option<Vec<Option<Vec<f64>>>>,
+    wide_pair_a: Option<Vec<Option<Vec<String>>>>,
+    wide_pair_b: Option<Vec<Option<Vec<String>>>>,
+    wide_pair_value: Option<Vec<Option<Vec<f64>>>>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let ctx = get_context()?;
 
@@ -2391,6 +2811,14 @@ fn _compute_b_planes<'py>(
             .as_ref()
             .map(|a| a.as_array().to_owned())
             .as_ref(),
+        &JointRows {
+            non_grav_cross,
+            columns: wide_columns,
+            state: wide_state,
+            pair_a: wide_pair_a,
+            pair_b: wide_pair_b,
+            pair_value: wide_pair_value,
+        },
     )?;
     let methods = methods_from_flat(
         &method_tags,
@@ -2601,6 +3029,12 @@ fn _get_observers<'py>(
     srp_amrat_variance = None,
     has_non_grav_cov = None,
     non_grav_cov = None,
+    non_grav_cross = None,
+    wide_columns = None,
+    wide_state = None,
+    wide_pair_a = None,
+    wide_pair_b = None,
+    wide_pair_value = None,
     phot_slope2 = None,
     gm_threshold = 1.0,
     gm_max_depth = 3,
@@ -2662,6 +3096,16 @@ fn _generate_ephemeris<'py>(
     // StateAndNonGrav prior instead of silently dropping it.
     has_non_grav_cov: Option<PyReadonlyArray1<'py, bool>>,
     non_grav_cov: Option<PyReadonlyArray3<'py, f64>>,
+    // The joint's off-diagonal terms, six parallel per-orbit lists (see
+    // `JointRows`). A fitted orbit re-fed here conditions on the joint
+    // its fit produced; without them it conditions on a block-diagonal
+    // covariance no leg ever computed.
+    non_grav_cross: Option<Vec<Option<Vec<f64>>>>,
+    wide_columns: Option<Vec<Option<Vec<String>>>>,
+    wide_state: Option<Vec<Option<Vec<f64>>>>,
+    wide_pair_a: Option<Vec<Option<Vec<String>>>>,
+    wide_pair_b: Option<Vec<Option<Vec<String>>>>,
+    wide_pair_value: Option<Vec<Option<Vec<f64>>>>,
     phot_slope2: Option<PyReadonlyArray1<'py, f64>>,
     gm_threshold: f64,
     gm_max_depth: usize,
@@ -2726,6 +3170,18 @@ fn _generate_ephemeris<'py>(
     let srp_var_arr = srp_amrat_variance.as_ref().map(|a| a.as_array().to_owned());
     let has_ng_cov_arr = has_non_grav_cov.as_ref().map(|a| a.as_array().to_owned());
     let ng_cov_arr = non_grav_cov.as_ref().map(|a| a.as_array().to_owned());
+    // The caller's joint. An ephemeris of a fitted orbit is computed
+    // against the covariance the fit produced, not against its diagonal
+    // blocks: the sky-plane covariance this call reports inherits
+    // whatever the state covariance was conditioned on.
+    let joint_in = JointRows {
+        non_grav_cross,
+        columns: wide_columns,
+        state: wide_state,
+        pair_a: wide_pair_a,
+        pair_b: wide_pair_b,
+        pair_value: wide_pair_value,
+    };
 
     // The observer table's own state columns are deliberately NOT taken
     // here: every observer is recomputed from its (code, epoch) below, so
@@ -2735,6 +3191,7 @@ fn _generate_ephemeris<'py>(
     let obs_epochs_arr = obs_epochs.as_array().to_owned();
 
     let n = epochs_arr.len();
+    joint_in.validate_lengths(n)?;
     let mut orbits: Vec<empyrean::Orbit> = Vec::with_capacity(n);
     for i in 0..n {
         let mut elems = [0.0f64; 6];
@@ -2759,6 +3216,9 @@ fn _generate_ephemeris<'py>(
             representation: empyrean::int_to_rep(reps_arr[i]).map_err(to_pyerr)?,
             frame: empyrean::int_to_frame(frames_arr[i]).map_err(to_pyerr)?,
             origin: origin_from_naif(origins_arr[i])?,
+            // The state-Marsden border, in the coordinate's own basis
+            // and angular unit.
+            non_grav_cross: joint_in.border_at(i)?,
         };
         let g_function = match (&ng_alpha_arr, &ng_r0_arr, &ng_m_arr, &ng_n_arr, &ng_k_arr) {
             (Some(a), Some(r), Some(m), Some(n), Some(k)) => Some((a[i], r[i], m[i], n[i], k[i])),
@@ -2823,6 +3283,7 @@ fn _generate_ephemeris<'py>(
             photometry,
             None,
             srp,
+            joint_in.wide_at(i)?,
         ));
     }
 
@@ -3577,6 +4038,13 @@ fn build_orbit_from_dict<'py>(orbit_dict: &Bound<'py, PyDict>) -> PyResult<empyr
         return Err(PyRuntimeError::new_err("orbit dict is empty"));
     }
 
+    // The seed orbit's joint, if it carries one. Only row 0 is read
+    // here — this entry point takes a single orbit — but the lists are
+    // length-checked against the whole dict so a malformed table is
+    // refused rather than partly consumed.
+    let joint_in = joint_rows_from_dict(orbit_dict)?;
+    joint_in.validate_lengths(epochs.len())?;
+
     let mut elems = [0.0f64; 6];
     for j in 0..6 {
         elems[j] = elements[[0, j]];
@@ -3599,6 +4067,10 @@ fn build_orbit_from_dict<'py>(orbit_dict: &Bound<'py, PyDict>) -> PyResult<empyr
         representation: empyrean::int_to_rep(reps[0]).map_err(to_pyerr)?,
         frame: empyrean::int_to_frame(frames[0]).map_err(to_pyerr)?,
         origin: origin_from_naif(origins[0])?,
+        // The state↔Marsden border a seed orbit carries — a fitted orbit
+        // re-fed into evaluate / refine keeps the joint its fit
+        // produced, not just the diagonal blocks of it.
+        non_grav_cross: joint_in.border_at(0)?,
     };
     // Non-grav (optional): thread the seed orbit's force model so evaluate /
     // refine operate on the actual non-grav (not silently gravity-only), and
@@ -3706,6 +4178,7 @@ fn build_orbit_from_dict<'py>(orbit_dict: &Bound<'py, PyDict>) -> PyResult<empyr
         None,
         None,
         srp,
+        joint_in.wide_at(0)?,
     ))
 }
 
@@ -4432,6 +4905,420 @@ fn _refine_single<'py>(
 }
 
 // ══════════════════════════════════════════════════════════
+//  PlanningConfig dict ↔ Rust struct
+// ══════════════════════════════════════════════════════════
+
+/// Build an [`empyrean::PlanningConfig`] from a Python-side dict.
+///
+/// Keys mirror the dataclass one-for-one: `force_model` (lowercase wire
+/// string), `epsilon`, `num_threads` (`-1` = every available core, the C
+/// ABI's convention), and `observatories` (a list of per-site dicts).
+/// Missing keys keep the wrapper default.
+fn build_planning_config_from_dict(d: &Bound<'_, PyDict>) -> PyResult<empyrean::PlanningConfig> {
+    let mut cfg = empyrean::PlanningConfig::default();
+
+    if let Some(v) = d.get_item("force_model")? {
+        let s: String = v.extract()?;
+        cfg.force_model = match s.to_ascii_lowercase().as_str() {
+            "approximate" => empyrean::ForceModelTier::Approximate,
+            "basic" => empyrean::ForceModelTier::Basic,
+            "standard" => empyrean::ForceModelTier::Standard,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown force_model: {other}"
+                )));
+            }
+        };
+    }
+    if let Some(v) = d.get_item("epsilon")? {
+        cfg.epsilon = v.extract()?;
+    }
+    if let Some(v) = d.get_item("num_threads")? {
+        let n: i32 = v.extract()?;
+        cfg.num_threads = if n < 0 { None } else { Some(n as usize) };
+    }
+    if let Some(v) = d.get_item("observatories")? {
+        let entries: Vec<Bound<'_, PyDict>> = v.extract()?;
+        let mut observatories = Vec::with_capacity(entries.len());
+        for (i, e) in entries.iter().enumerate() {
+            let obs_code: String = e
+                .get_item("obs_code")?
+                .ok_or_else(|| {
+                    PyValueError::new_err(format!("observatories[{i}] is missing obs_code"))
+                })?
+                .extract()?;
+            let get_f64 = |key: &str| -> PyResult<f64> {
+                e.get_item(key)?
+                    .ok_or_else(|| {
+                        PyValueError::new_err(format!("observatories[{i}] is missing {key}"))
+                    })?
+                    .extract()
+            };
+            observatories.push(empyrean::ObservatoryConfig {
+                obs_code,
+                sigma_arcsec: [get_f64("sigma_ra_arcsec")?, get_f64("sigma_dec_arcsec")?],
+                max_apparent_mag: get_f64("max_apparent_mag")?,
+                min_elongation_deg: get_f64("min_elongation_deg")?,
+                // Optional: absent means the engine's own default (the
+                // geometric horizon, and astronomical twilight). A
+                // defaulted 0.0 for the sun altitude would silently plan
+                // in daylight, so it is an Option rather than a bare f64.
+                min_elevation_deg: e
+                    .get_item("min_elevation_deg")?
+                    .map(|v| v.extract::<f64>())
+                    .transpose()?
+                    .unwrap_or(0.0),
+                max_sun_altitude_deg: e
+                    .get_item("max_sun_altitude_deg")?
+                    .map(|v| v.extract::<f64>())
+                    .transpose()?,
+            });
+        }
+        cfg.observatories = observatories;
+    }
+
+    Ok(cfg)
+}
+
+// ══════════════════════════════════════════════════════════
+//  PlannedObservation columns → Vec<PlannedObservation>
+// ══════════════════════════════════════════════════════════
+
+/// Assert that a planned-observation column is positionally aligned with
+/// the `kinds` discriminator column.
+///
+/// The columns are consumed by index, never by `zip`: a short column
+/// would silently truncate the plan and a long one would silently ignore
+/// the tail. A mismatch is a `ValueError` naming the column and both
+/// lengths.
+fn check_planned_column_len(name: &str, len: usize, n: usize) -> PyResult<()> {
+    if len != n {
+        return Err(PyValueError::new_err(format!(
+            "{name} must be positionally aligned with kinds: got {len} \
+             entries for {n} planned observations"
+        )));
+    }
+    Ok(())
+}
+
+/// Decode the parallel planned-observation columns into wrapper
+/// [`empyrean::PlannedObservation`]s.
+fn build_planned_observations(
+    d: &Bound<'_, PyDict>,
+) -> PyResult<Vec<empyrean::PlannedObservation>> {
+    fn req<'py>(d: &Bound<'py, PyDict>, key: &str) -> PyResult<Bound<'py, PyAny>> {
+        d.get_item(key)?
+            .ok_or_else(|| PyRuntimeError::new_err(format!("missing {key}")))
+    }
+    fn col_f64(d: &Bound<'_, PyDict>, key: &str, n: usize) -> PyResult<Vec<f64>> {
+        let v: Vec<f64> = req(d, key)?.extract()?;
+        check_planned_column_len(key, v.len(), n)?;
+        Ok(v)
+    }
+    fn col_u8(d: &Bound<'_, PyDict>, key: &str, n: usize) -> PyResult<Vec<u8>> {
+        let v: Vec<u8> = req(d, key)?.extract()?;
+        check_planned_column_len(key, v.len(), n)?;
+        Ok(v)
+    }
+
+    let kinds: Vec<u8> = req(d, "kinds")?.extract()?;
+    let n = kinds.len();
+
+    let epochs = col_f64(d, "epochs", n)?;
+    let optical_codes: Vec<String> = req(d, "optical_codes")?.extract()?;
+    check_planned_column_len("optical_codes", optical_codes.len(), n)?;
+    let optical_sigma_ra = col_f64(d, "optical_sigma_ra_arcsec", n)?;
+    let optical_sigma_dec = col_f64(d, "optical_sigma_dec_arcsec", n)?;
+    let tx = col_u8(d, "radar_transmit_stations", n)?;
+    let rx = col_u8(d, "radar_receive_stations", n)?;
+    let modes = col_u8(d, "radar_modes", n)?;
+    let bandwidth = col_f64(d, "radar_bandwidth_hz", n)?;
+    let freq_resolution = col_f64(d, "radar_freq_resolution_hz", n)?;
+    let snr = col_f64(d, "radar_snr", n)?;
+    let h_mag = col_f64(d, "radar_target_h_mag", n)?;
+    let visual_albedo = col_f64(d, "radar_target_visual_albedo", n)?;
+    let radar_albedo = col_f64(d, "radar_target_radar_albedo", n)?;
+    let diameter_km = col_f64(d, "radar_target_diameter_km", n)?;
+    let spin_period_hours = col_f64(d, "radar_target_spin_period_hours", n)?;
+    let integration_s = col_f64(d, "radar_integration_s", n)?;
+
+    fn station_from_int(code: u8, role: &str, i: usize) -> PyResult<empyrean::RadarStation> {
+        match code {
+            0 => Ok(empyrean::RadarStation::GoldstoneDSS14),
+            1 => Ok(empyrean::RadarStation::GreenBank),
+            2 => Ok(empyrean::RadarStation::Arecibo),
+            other => Err(PyValueError::new_err(format!(
+                "planned observation {i}: unknown radar {role} station {other} \
+                 (0=Goldstone DSS-14, 1=Green Bank, 2=Arecibo)"
+            ))),
+        }
+    }
+
+    let mut planned = Vec::with_capacity(n);
+    for i in 0..n {
+        let epoch = empyrean::Epoch::from_mjd_tdb(epochs[i]);
+        match kinds[i] {
+            0 => planned.push(empyrean::PlannedObservation::optical(
+                optical_codes[i].as_str(),
+                [optical_sigma_ra[i], optical_sigma_dec[i]],
+                epoch,
+            )),
+            1 => {
+                let mode = match modes[i] {
+                    0 => empyrean::RadarMode::Delay,
+                    1 => empyrean::RadarMode::Doppler,
+                    2 => empyrean::RadarMode::Both,
+                    other => {
+                        return Err(PyValueError::new_err(format!(
+                            "planned observation {i}: unknown radar mode {other} \
+                             (0=delay, 1=doppler, 2=both)"
+                        )));
+                    }
+                };
+                let transmit = station_from_int(tx[i], "transmit", i)?;
+                let receive = station_from_int(rx[i], "receive", i)?;
+                // NaN SNR is the "derive it from the link budget"
+                // discriminant, not a missing value.
+                let spec = if snr[i].is_nan() {
+                    empyrean::RadarPlanSpec::link_budget(
+                        transmit,
+                        receive,
+                        empyrean::TargetRadarProperties {
+                            h_mag: nan_to_opt(h_mag[i]),
+                            visual_albedo: nan_to_opt(visual_albedo[i]),
+                            radar_albedo: nan_to_opt(radar_albedo[i]),
+                            diameter_km: nan_to_opt(diameter_km[i]),
+                            spin_period_hours: nan_to_opt(spin_period_hours[i]),
+                        },
+                        integration_s[i],
+                        mode,
+                        bandwidth[i],
+                        freq_resolution[i],
+                    )
+                } else {
+                    empyrean::RadarPlanSpec::given(
+                        transmit,
+                        receive,
+                        mode,
+                        bandwidth[i],
+                        freq_resolution[i],
+                        snr[i],
+                    )
+                };
+                planned.push(empyrean::PlannedObservation::radar(spec, epoch));
+            }
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "planned observation {i}: unknown kind {other} (0=optical, 1=radar)"
+                )));
+            }
+        }
+    }
+    Ok(planned)
+}
+
+/// NaN sentinel → `Option`, the inverse of [`nan_to_value`].
+fn nan_to_opt(v: f64) -> Option<f64> {
+    if v.is_nan() { None } else { Some(v) }
+}
+
+// ══════════════════════════════════════════════════════════
+//  _evaluate_plan
+// ══════════════════════════════════════════════════════════
+
+/// Write one [`empyrean::CovarianceMetrics`] into the output dict as five
+/// scalar entries under a shared prefix.
+fn add_covariance_metrics_to_dict(
+    dict: &Bound<'_, PyDict>,
+    metrics: &empyrean::CovarianceMetrics,
+    prefix: &str,
+) -> PyResult<()> {
+    dict.set_item(
+        format!("{prefix}position_sigma_km"),
+        metrics.position_sigma_km,
+    )?;
+    dict.set_item(
+        format!("{prefix}velocity_sigma_m_s"),
+        metrics.velocity_sigma_m_s,
+    )?;
+    dict.set_item(format!("{prefix}semi_major_km"), metrics.semi_major_km)?;
+    dict.set_item(format!("{prefix}semi_minor_km"), metrics.semi_minor_km)?;
+    dict.set_item(format!("{prefix}log_det"), metrics.log_det)?;
+    Ok(())
+}
+
+#[pyfunction]
+#[pyo3(signature = (orbit_dict, planned_dict, config_dict, orbit_id = None))]
+fn _evaluate_plan<'py>(
+    py: Python<'py>,
+    orbit_dict: &Bound<'py, PyDict>,
+    planned_dict: &Bound<'py, PyDict>,
+    config_dict: &Bound<'py, PyDict>,
+    orbit_id: Option<&str>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let ctx = get_context()?;
+    let orbit = build_orbit_from_dict(orbit_dict)?;
+    let planned = build_planned_observations(planned_dict)?;
+    let cfg = build_planning_config_from_dict(config_dict)?;
+
+    let plan = py
+        .detach(|| ctx.evaluate_plan(&orbit, orbit_id, &planned, &cfg))
+        .map_err(to_pyerr)?;
+
+    let n = plan.candidates.len();
+    let mut index = Array1::<u64>::zeros(n);
+    let mut kind = Array1::<u8>::zeros(n);
+    let mut observable = vec![false; n];
+    let mut obs_code: Vec<String> = Vec::with_capacity(n);
+    let mut along_track = Array1::<f64>::from_elem(n, f64::NAN);
+    let mut cross_track = Array1::<f64>::from_elem(n, f64::NAN);
+    let mut ra_sigma = Array1::<f64>::from_elem(n, f64::NAN);
+    let mut dec_sigma = Array1::<f64>::from_elem(n, f64::NAN);
+    let mut position_angle = Array1::<f64>::from_elem(n, f64::NAN);
+    let mut volume_reduction = Array1::<f64>::from_elem(n, f64::NAN);
+    let mut position_improvement = Array1::<f64>::from_elem(n, f64::NAN);
+    let mut post_along_track = Array1::<f64>::from_elem(n, f64::NAN);
+    let mut post_cross_track = Array1::<f64>::from_elem(n, f64::NAN);
+    let mut cum_position_sigma = Array1::<f64>::from_elem(n, f64::NAN);
+    let mut cum_velocity_sigma = Array1::<f64>::from_elem(n, f64::NAN);
+    let mut cum_semi_major = Array1::<f64>::from_elem(n, f64::NAN);
+    let mut cum_semi_minor = Array1::<f64>::from_elem(n, f64::NAN);
+    let mut cum_log_det = Array1::<f64>::from_elem(n, f64::NAN);
+    let mut active_width = Array1::<u64>::zeros(n);
+    let mut radar_snr = Array1::<f64>::from_elem(n, f64::NAN);
+    let mut radar_range_km = Array1::<f64>::from_elem(n, f64::NAN);
+    // -1 is the C ABI's optical sentinel for the radar mode tag.
+    let mut radar_mode = Array1::<i32>::from_elem(n, -1);
+    let mut radar_provenance: Vec<Vec<String>> = Vec::with_capacity(n);
+
+    for (i, c) in plan.candidates.iter().enumerate() {
+        index[i] = c.index as u64;
+        obs_code.push(c.obs_code.clone());
+        observable[i] = c.observable;
+        along_track[i] = nan_to_value(c.along_track_sigma_arcsec);
+        cross_track[i] = nan_to_value(c.cross_track_sigma_arcsec);
+        ra_sigma[i] = nan_to_value(c.ra_sigma_arcsec);
+        dec_sigma[i] = nan_to_value(c.dec_sigma_arcsec);
+        position_angle[i] = nan_to_value(c.position_angle_deg);
+        volume_reduction[i] = c.marginal_volume_reduction;
+        position_improvement[i] = c.marginal_position_improvement;
+        post_along_track[i] = nan_to_value(c.post_along_track_sigma_arcsec);
+        post_cross_track[i] = nan_to_value(c.post_cross_track_sigma_arcsec);
+        cum_position_sigma[i] = c.cumulative.position_sigma_km;
+        cum_velocity_sigma[i] = c.cumulative.velocity_sigma_m_s;
+        cum_semi_major[i] = c.cumulative.semi_major_km;
+        cum_semi_minor[i] = c.cumulative.semi_minor_km;
+        cum_log_det[i] = c.cumulative.log_det;
+        active_width[i] = c.active_width as u64;
+        match &c.kind {
+            empyrean::CandidateKind::Optical => {
+                kind[i] = 0;
+                radar_provenance.push(Vec::new());
+            }
+            empyrean::CandidateKind::Radar {
+                mode,
+                snr,
+                range_km,
+                provenance,
+            } => {
+                kind[i] = 1;
+                radar_snr[i] = *snr;
+                radar_range_km[i] = *range_km;
+                radar_mode[i] = match mode {
+                    empyrean::RadarMode::Delay => 0,
+                    empyrean::RadarMode::Doppler => 1,
+                    empyrean::RadarMode::Both => 2,
+                };
+                radar_provenance.push(provenance.clone());
+            }
+        }
+    }
+
+    let n_eph = plan.ephemeris.len();
+    let mut eph_epoch = Array1::<f64>::from_elem(n_eph, f64::NAN);
+    let mut eph_ra = Array1::<f64>::from_elem(n_eph, f64::NAN);
+    let mut eph_dec = Array1::<f64>::from_elem(n_eph, f64::NAN);
+    for (i, p) in plan.ephemeris.iter().enumerate() {
+        eph_epoch[i] = p.epoch.mjd_tdb().map_err(to_pyerr)?;
+        eph_ra[i] = p.ra_deg;
+        eph_dec[i] = p.dec_deg;
+    }
+
+    let dict = PyDict::new(py);
+    dict.set_item("orbit_id", plan.orbit_id)?;
+    dict.set_item("active_width", plan.active_width)?;
+    add_covariance_metrics_to_dict(&dict, &plan.prior, "prior_")?;
+    add_covariance_metrics_to_dict(&dict, &plan.posterior, "posterior_")?;
+
+    dict.set_item("candidate_index", index.into_pyarray(py))?;
+    dict.set_item("candidate_obs_code", obs_code)?;
+    dict.set_item("candidate_kind", kind.into_pyarray(py))?;
+    dict.set_item("candidate_observable", observable)?;
+    dict.set_item(
+        "candidate_along_track_sigma_arcsec",
+        along_track.into_pyarray(py),
+    )?;
+    dict.set_item(
+        "candidate_cross_track_sigma_arcsec",
+        cross_track.into_pyarray(py),
+    )?;
+    dict.set_item("candidate_ra_sigma_arcsec", ra_sigma.into_pyarray(py))?;
+    dict.set_item("candidate_dec_sigma_arcsec", dec_sigma.into_pyarray(py))?;
+    dict.set_item(
+        "candidate_position_angle_deg",
+        position_angle.into_pyarray(py),
+    )?;
+    dict.set_item(
+        "candidate_marginal_volume_reduction",
+        volume_reduction.into_pyarray(py),
+    )?;
+    dict.set_item(
+        "candidate_marginal_position_improvement",
+        position_improvement.into_pyarray(py),
+    )?;
+    dict.set_item(
+        "candidate_post_along_track_sigma_arcsec",
+        post_along_track.into_pyarray(py),
+    )?;
+    dict.set_item(
+        "candidate_post_cross_track_sigma_arcsec",
+        post_cross_track.into_pyarray(py),
+    )?;
+    dict.set_item(
+        "candidate_cumulative_position_sigma_km",
+        cum_position_sigma.into_pyarray(py),
+    )?;
+    dict.set_item(
+        "candidate_cumulative_velocity_sigma_m_s",
+        cum_velocity_sigma.into_pyarray(py),
+    )?;
+    dict.set_item(
+        "candidate_cumulative_semi_major_km",
+        cum_semi_major.into_pyarray(py),
+    )?;
+    dict.set_item(
+        "candidate_cumulative_semi_minor_km",
+        cum_semi_minor.into_pyarray(py),
+    )?;
+    dict.set_item("candidate_cumulative_log_det", cum_log_det.into_pyarray(py))?;
+    dict.set_item("candidate_active_width", active_width.into_pyarray(py))?;
+    dict.set_item("candidate_radar_snr", radar_snr.into_pyarray(py))?;
+    dict.set_item("candidate_radar_range_km", radar_range_km.into_pyarray(py))?;
+    dict.set_item("candidate_radar_mode", radar_mode.into_pyarray(py))?;
+    // Ragged per-candidate notes ship as a native list-of-lists: joining
+    // them on a separator would silently mangle any future note that
+    // contains it, and a code mapping would drop notes the engine adds
+    // later.
+    dict.set_item("candidate_radar_provenance", radar_provenance)?;
+
+    dict.set_item("ephemeris_epoch_mjd_tdb", eph_epoch.into_pyarray(py))?;
+    dict.set_item("ephemeris_ra_deg", eph_ra.into_pyarray(py))?;
+    dict.set_item("ephemeris_dec_deg", eph_dec.into_pyarray(py))?;
+
+    Ok(dict)
+}
+
+// ══════════════════════════════════════════════════════════
 //  ODConfig dict ↔ Rust struct
 // ══════════════════════════════════════════════════════════
 
@@ -4793,11 +5680,69 @@ fn build_od_config_from_dict(d: &Bound<'_, PyDict>) -> PyResult<empyrean::ODConf
     }
     // Explicit per-axis solve request (overrides the coarse `solve_for`).
     if let Some(sf) = get_dict(d, "solve_for_flags")? {
+        // Dispositions, not flags. A bool cannot say whether an
+        // unsolved axis is CONSIDERED — its uncertainty inflating the
+        // posterior through its measurement partials — or FIXED, which
+        // contributes nothing. The two produce different covariances,
+        // so the tag is required to say which and a bool is refused by
+        // name rather than coerced.
+        let disposition = |key: &str| -> PyResult<empyrean::ParamDisposition> {
+            match sf.get_item(key)? {
+                None => Ok(empyrean::ParamDisposition::Fixed),
+                Some(v) => {
+                    if v.is_instance_of::<pyo3::types::PyBool>() {
+                        return Err(PyValueError::new_err(format!(
+                            "solve_for_flags[{key}] is a bool; pass \"solved\", \
+                             \"considered\" or \"fixed\" — True/False cannot say \
+                             whether an unsolved axis is considered (its uncertainty \
+                             reaches the posterior) or fixed (it contributes nothing)"
+                        )));
+                    }
+                    let tag: String = v.extract()?;
+                    match tag.as_str() {
+                        "fixed" => Ok(empyrean::ParamDisposition::Fixed),
+                        "solved" => Ok(empyrean::ParamDisposition::Solved),
+                        "considered" => Ok(empyrean::ParamDisposition::Considered),
+                        other => Err(PyValueError::new_err(format!(
+                            "solve_for_flags[{key}]: unknown disposition {other:?}; \
+                             expected \"fixed\", \"solved\" or \"considered\""
+                        ))),
+                    }
+                }
+            }
+        };
+        let mut thrust = [empyrean::ParamDisposition::Fixed; empyrean::MAX_THRUST_SEGMENTS];
+        if let Some(list) = sf.get_item("thrust")? {
+            let tags: Vec<String> = list.extract()?;
+            if tags.len() > empyrean::MAX_THRUST_SEGMENTS {
+                return Err(PyValueError::new_err(format!(
+                    "solve_for_flags['thrust'] has {} entries but the engine's \
+                     maximum is {} — the 17-column wide budget is shared across the \
+                     state, Marsden, DT, AMRAT and thrust axes",
+                    tags.len(),
+                    empyrean::MAX_THRUST_SEGMENTS
+                )));
+            }
+            for (i, tag) in tags.iter().enumerate() {
+                thrust[i] = match tag.as_str() {
+                    "fixed" => empyrean::ParamDisposition::Fixed,
+                    "solved" => empyrean::ParamDisposition::Solved,
+                    "considered" => empyrean::ParamDisposition::Considered,
+                    other => {
+                        return Err(PyValueError::new_err(format!(
+                            "solve_for_flags['thrust'][{i}]: unknown disposition \
+                             {other:?}; expected \"fixed\", \"solved\" or \
+                             \"considered\""
+                        )));
+                    }
+                };
+            }
+        }
         cfg.solve_for = empyrean::SolveForParams::Explicit(empyrean::SolveFor {
-            marsden: get_bool(&sf, "marsden")?.unwrap_or(false),
-            dt: get_bool(&sf, "dt")?.unwrap_or(false),
-            amrat: get_bool(&sf, "amrat")?.unwrap_or(false),
-            thrust_segments: get_u32(&sf, "thrust_segments")?.unwrap_or(0),
+            marsden: disposition("marsden")?,
+            dt: disposition("dt")?,
+            amrat: disposition("amrat")?,
+            thrust,
         });
     }
     if let Some(v) = get_bool(d, "allow_unbracketed_maneuvers")? {
@@ -5636,6 +6581,9 @@ fn pydict_to_orbit_batch<'py>(dict: &Bound<'py, PyDict>) -> PyResult<empyrean::O
             representation: rep,
             frame: f,
             origin: origin_from_naif(origin[i])?,
+            // The border is an OD-output block; these paths build a
+            // state from Python inputs that carry none.
+            non_grav_cross: None,
         };
         let want_cov = has_cov_view.map(|h| h[i] != 0).unwrap_or(false);
         if want_cov && let Some(cv) = cov_view.as_ref() {
@@ -5692,6 +6640,8 @@ fn pydict_to_orbit_batch<'py>(dict: &Bound<'py, PyDict>) -> PyResult<empyrean::O
                         .then_some(srp_var_view[i]),
                 )
             }),
+            // Flat-array construction: no cross terms to carry.
+            None,
         ));
     }
     empyrean::OrbitBatch::new(orbits, orbit_ids, object_ids).map_err(to_pyerr)
@@ -6764,6 +7714,16 @@ fn determine_result_to_pydict<'py>(
                 dict.set_item("orbit_srp_amrat_variance", v)?;
             }
         }
+        // The fit's joint — the off-diagonal blocks of the same matrix
+        // whose state block is `covariance` below. Emitted through the
+        // same six-list shape a propagated state uses, so a fitted orbit
+        // and a propagated one re-feed by the identical transcription.
+        let mut joint = JointColumns::with_capacity(1);
+        joint.push(&empyrean::JointCovariance {
+            non_grav_cross: o.state.non_grav_cross,
+            wide_cross: o.wide_cross.clone(),
+        });
+        joint.set_on(&dict, "orbit_")?;
     }
     add_residuals_to_dict(&dict, &result.residuals)?;
     add_summary_to_dict(&dict, &result.summary, "summary_")?;
@@ -6831,13 +7791,42 @@ fn determine_result_to_pydict<'py>(
         dict.set_item("amrat_delta", a)?;
     }
     if !result.thrust_delta_m_per_s.is_empty() {
-        let thrust: Vec<Vec<f64>> = result
+        // DECLARED-indexed, and an unsolved burn is null rather than a
+        // zero vector — a zero would read as a fitted correction of
+        // exactly zero. Shares one index space with the posterior
+        // covariances and the dispositions below.
+        let thrust: Vec<Option<Vec<f64>>> = result
             .thrust_delta_m_per_s
             .iter()
-            .map(|d| d.to_vec())
+            .map(|d| d.map(|v| v.to_vec()))
             .collect();
         dict.set_item("thrust_delta_m_per_s", thrust)?;
     }
+    if !result.thrust_correction_covariances.is_empty() {
+        let cov: Vec<Option<Vec<f64>>> = result
+            .thrust_correction_covariances
+            .iter()
+            .map(|m| m.map(|b| b.iter().flatten().copied().collect()))
+            .collect();
+        dict.set_item("thrust_correction_covariances", cov)?;
+    }
+    // The partition the fit actually ran, and the warnings it raised
+    // about covariance it was given and did not use.
+    let disp = PyDict::new(py);
+    disp.set_item("marsden", result.dispositions.marsden.as_tag())?;
+    disp.set_item("dt", result.dispositions.dt.as_tag())?;
+    disp.set_item("amrat", result.dispositions.amrat.as_tag())?;
+    disp.set_item(
+        "thrust",
+        result
+            .dispositions
+            .thrust
+            .iter()
+            .map(|d| d.as_tag())
+            .collect::<Vec<_>>(),
+    )?;
+    dict.set_item("dispositions", disp)?;
+    dict.set_item("warnings", result.warnings.clone())?;
     if let Some(f) = result.dv_frame {
         let fs = match f {
             empyrean::Frame::ICRF => "icrf",
@@ -6928,6 +7917,7 @@ fn _empyrean_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_determine, m)?)?;
     m.add_function(wrap_pyfunction!(_evaluate_single, m)?)?;
     m.add_function(wrap_pyfunction!(_refine_single, m)?)?;
+    m.add_function(wrap_pyfunction!(_evaluate_plan, m)?)?;
     m.add_function(wrap_pyfunction!(_convert_epochs, m)?)?;
     m.add_function(wrap_pyfunction!(_iso_to_mjd, m)?)?;
     m.add_function(wrap_pyfunction!(_mjd_to_iso, m)?)?;

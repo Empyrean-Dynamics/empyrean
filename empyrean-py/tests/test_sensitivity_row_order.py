@@ -1,4 +1,4 @@
-"""The observation-Jacobian row order is a cross-layer contract — bd empyrean-9666l.
+"""The observation-Jacobian row order is a cross-layer contract.
 
 The engine returns a ``[6][n_params]`` observation Jacobian whose six rows are
 ``[range, RA, Dec, range-rate, RA-rate, Dec-rate]``, and every distribution

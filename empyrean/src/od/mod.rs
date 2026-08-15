@@ -70,9 +70,9 @@ pub use rejection::{RejectionConfig, RejectionKind};
 pub use result::{
     AcceptabilityReport, BandStat, CovarianceRepresentation, CovarianceTrust, DetermineEntry,
     DetermineFailure, DetermineFailureKind, DetermineResult, DetermineResults, EvaluateResult,
-    GateRecord, ObservationResidual, OriginPolicy, OutputEpoch, PhotometryModel, PhotometryResult,
-    RadarResidual, RadarResidualKind, RejectionReason, ResidualSummary, SolveFor, SolveForParams,
-    SolvedCovariance, StationBias, TrustGateEvent,
+    GateRecord, MAX_THRUST_SEGMENTS, ObservationResidual, OriginPolicy, OutputEpoch,
+    PhotometryModel, PhotometryResult, RadarResidual, RadarResidualKind, RejectionReason,
+    ResidualSummary, SolveFor, SolveForParams, SolvedCovariance, StationBias, TrustGateEvent,
 };
 pub use weighting::{SigmaPolicy, WeightingConfig, WeightingLayer, WeightingPreset};
 
@@ -370,12 +370,39 @@ fn ffi_od_result_to_rust(
         };
     let solved_covariance = (result.has_solved_covariance != 0)
         .then(|| SolvedCovariance::from_ffi(&result.solved_covariance));
-    let thrust_delta_m_per_s: Vec<[f64; 3]> =
-        result.thrust_delta_m_per_s[..result.thrust_delta_count as usize].to_vec();
+    // Both per-segment arrays are DECLARED-indexed and NaN-filled at a
+    // segment the fit did not solve, so `None` is read off the NaN
+    // rather than inferred from a count. Pairing a solved-order Δv with
+    // a declared-order covariance would attribute a burn's correction to
+    // another burn's uncertainty.
+    let n_declared = result.n_thrust_segments as usize;
+    let thrust_delta_m_per_s: Vec<Option<[f64; 3]>> = result.thrust_delta_m_per_s[..n_declared]
+        .iter()
+        .map(|dv| dv.iter().all(|v| v.is_finite()).then_some(*dv))
+        .collect();
+    let thrust_correction_covariances: Vec<Option<[[f64; 3]; 3]>> = result
+        .thrust_correction_covariances[..n_declared]
+        .iter()
+        .map(|m| m.iter().flatten().all(|v| v.is_finite()).then_some(*m))
+        .collect();
     // dv_frame is only meaningful when a thrust segment was solved.
-    let dv_frame = (result.thrust_delta_count > 0)
+    let dv_frame = (n_declared > 0)
         .then(|| crate::coordinate::int_to_frame(result.dv_frame).ok())
         .flatten();
+    let dispositions = SolveFor::from_ffi(&result.dispositions)?;
+    let warnings: Vec<String> = if result.warnings.is_null() || result.num_warnings == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(result.warnings, result.num_warnings) }
+            .iter()
+            .filter(|p| !p.is_null())
+            .map(|p| {
+                unsafe { std::ffi::CStr::from_ptr(*p) }
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect()
+    };
     let photometry =
         (result.has_photometry != 0).then(|| PhotometryResult::from_ffi(&result.photometry));
     let covariance_trust = CovarianceTrust::from_ffi(result);
@@ -410,6 +437,9 @@ fn ffi_od_result_to_rust(
         dv_frame,
         photometry,
         covariance_trust,
+        thrust_correction_covariances,
+        dispositions,
+        warnings,
     })
 }
 
@@ -435,7 +465,41 @@ fn ffi_od_result_orbit(result: &empyrean_sys::EmpyreanODResult) -> crate::error:
         frame,
         origin,
     );
+    // ── The two-convention seam, refused rather than passed through ──
+    //
+    // The fitted STATE is always Cartesian here — the C layer refuses to
+    // flatten anything else. The fitted COVARIANCE is in the fit's
+    // `covariance_representation`, and the session path can deliver
+    // Keplerian / Cometary / Spherical. Attaching one to the other would
+    // produce a `CoordinateState` labelled Cartesian carrying a
+    // covariance that is not: not a unit mismatch but a mislabeled
+    // matrix, which a re-feed would then propagate as if it were
+    // Cartesian.
+    //
+    // The engine's angular convention differs too — a non-Cartesian
+    // fitted covariance comes back in RADIANS, while every covariance
+    // this crate accepts on input is in the coordinate's own units
+    // (degrees for angular rows). Converting here would need the
+    // representation Jacobian, which this layer does not have and must
+    // not approximate.
+    //
+    // So the re-feedable orbit is refused with the remedy named, rather
+    // than handed back wrong.
     if s.has_covariance != 0 {
+        let rep = result.covariance_representation;
+        if rep != empyrean_sys::EMPYREAN_REPRESENTATION_CARTESIAN as i32 {
+            return Err(Error::invalid_input(format!(
+                "this fit reports its covariance in representation {rep}, not \
+                 Cartesian, while its state is Cartesian — the two cannot be \
+                 assembled into one re-feedable orbit without the \
+                 representation Jacobian, and the non-Cartesian covariance is \
+                 additionally in radians rather than the degrees this crate's \
+                 inputs use. Re-run the fit with a Cartesian output \
+                 representation, or read `covariance` and \
+                 `covariance_representation` off the result directly and \
+                 transform them yourself."
+            )));
+        }
         state = state.with_covariance(s.covariance);
     }
     let mut orbit = Orbit::new(state);
@@ -461,6 +525,11 @@ fn ffi_od_result_orbit(result: &empyrean_sys::EmpyreanODResult) -> crate::error:
             orbit = orbit.with_nongrav_covariance(Some(ng.covariance));
         }
     }
+    // The DT posterior. It had no wire before the 0.10.0 ABI, so a solved-DT
+    // fit used to round-trip with its DT column closed.
+    if result.has_non_grav != 0 && result.non_grav.has_dt_variance != 0 {
+        orbit = orbit.with_non_grav_dt_variance(Some(result.non_grav.dt_variance));
+    }
     // Carry the fitted/absolute SRP slot so a solved AMRAT orbit re-feeds into
     // propagate / refine without silently dropping its SRP force. When the
     // AMRAT was solved, `amrat_variance` is the fitted posterior — chaining the
@@ -472,5 +541,13 @@ fn ffi_od_result_orbit(result: &empyrean_sys::EmpyreanODResult) -> crate::error:
             orbit = orbit.with_srp_amrat_variance(Some(srp.amrat_variance));
         }
     }
+    // The cross terms — the half of the posterior that is not a diagonal
+    // block. Both halves land where a re-feed reads them: the border on
+    // the coordinate beside its 6×6, the carrier on the orbit. Without
+    // this the returned orbit carries a block-diagonal covariance, which
+    // is a tighter claim than the fit made.
+    let joint = unsafe { crate::JointCovariance::from_ffi(&result.orbit.orbit_cov) }?;
+    orbit.state.non_grav_cross = joint.non_grav_cross;
+    orbit.wide_cross = joint.wide_cross;
     Ok(orbit)
 }

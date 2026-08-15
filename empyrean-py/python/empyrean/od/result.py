@@ -16,6 +16,7 @@ from typing import TypeAlias
 import numpy as np
 
 from empyrean.coordinates.enums import Frame, Origin
+from empyrean.od.disposition import ParamDisposition
 from empyrean.od.residuals import (
     AcceptabilityReport,
     FitSummary,
@@ -554,25 +555,61 @@ class StationRaDecConfig:
 #    empyrean::PhotometryConfig) ─────────────────────────────────
 
 
+MAX_THRUST_SEGMENTS = 3
+"""Largest number of thrust Δv segments one fit can declare."""
+
+
 @dataclass
 class SolveFor:
-    """Per-axis wide solve-for selection. Mirrors ``empyrean::SolveFor``.
+    """What the fit does with each parameter axis. Mirrors ``empyrean::SolveFor``.
 
     Set on :attr:`ODConfig.solve_for_flags` to request an explicit
     multi-axis fit that the coarse :class:`SolveForParams` variants
-    can't name. Each flag turns on one wide-STM axis, subject to its
-    own precondition (a declared prior on the orbit) enforced by the
-    engine.
+    can't name. Each axis carries a
+    :class:`~empyrean.od.disposition.ParamDisposition` rather than a
+    flag, subject to its own precondition (a declared prior on the
+    orbit) enforced by the engine.
+
+    Why not booleans
+    ----------------
+
+    "Not solved" is two different answers. A **fixed** axis is
+    marginalized out and contributes nothing; a **considered** axis is
+    not estimated but its prior uncertainty still reaches the posterior
+    through its measurement partials, so the reported σ accounts for an
+    error source the fit did not absorb. Both produce well-formed
+    covariances, and ``False`` cannot say which was meant — so the axes
+    take tags, and a bool is refused rather than coerced.
     """
 
-    marsden: bool = False
-    """Solve the Marsden A1/A2/A3 block (requires a non-grav covariance)."""
-    dt: bool = False
-    """Solve the non-grav time delay DT (requires ``marsden`` + a DT prior)."""
-    amrat: bool = False
-    """Solve the SRP AMRAT (requires an SRP AMRAT prior)."""
-    thrust_segments: int = 0
-    """Number of thrust Δv segments to solve (3 columns each; 0 = none)."""
+    marsden: ParamDisposition = ParamDisposition.FIXED
+    """Disposition of the Marsden A1/A2/A3 block (requires a non-grav covariance)."""
+    dt: ParamDisposition = ParamDisposition.FIXED
+    """Disposition of the non-grav time delay DT (requires ``marsden`` solved + a DT prior)."""
+    amrat: ParamDisposition = ParamDisposition.FIXED
+    """Disposition of the SRP AMRAT (requires an SRP AMRAT prior)."""
+    thrust: list[ParamDisposition] = field(default_factory=list)
+    """Disposition of each **declared** thrust Δv segment, positional with
+    the orbit's ``correction_covariances``.
+
+    Positional rather than a count: a considered or fixed burn sits
+    between solved ones as readily as after them, and a count cannot say
+    which burn is which.
+    """
+
+    def __post_init__(self) -> None:
+        # Parse and validate eagerly, so a bad tag fails where it was
+        # written rather than deep in the marshal.
+        self.marsden = ParamDisposition.parse(self.marsden)
+        self.dt = ParamDisposition.parse(self.dt)
+        self.amrat = ParamDisposition.parse(self.amrat)
+        if len(self.thrust) > MAX_THRUST_SEGMENTS:
+            raise ValueError(
+                f"thrust has {len(self.thrust)} entries but the engine's maximum is "
+                f"{MAX_THRUST_SEGMENTS} — the 17-column wide budget is shared across "
+                "the state, Marsden, DT, AMRAT and thrust axes"
+            )
+        self.thrust = [ParamDisposition.parse(d) for d in self.thrust]
 
 
 @dataclass
@@ -771,10 +808,10 @@ class ODConfig:
         # photometry-off defaults untouched.
         if self.solve_for_flags is not None:
             wire["solve_for_flags"] = {
-                "marsden": self.solve_for_flags.marsden,
-                "dt": self.solve_for_flags.dt,
-                "amrat": self.solve_for_flags.amrat,
-                "thrust_segments": self.solve_for_flags.thrust_segments,
+                "marsden": self.solve_for_flags.marsden.value,
+                "dt": self.solve_for_flags.dt.value,
+                "amrat": self.solve_for_flags.amrat.value,
+                "thrust": [d.value for d in self.solve_for_flags.thrust],
             }
         if self.photometry is not None:
             wire["photometry"] = {
@@ -1094,6 +1131,25 @@ class DetermineResult:
     """Event-aware trust verdict on the delivered covariance. ``None``
     when the call path ran no trust gate — absence of a verdict is not
     trust."""
+    dispositions: SolveFor
+    """What the fit actually did with each parameter axis.
+
+    The partition the engine ran, not the one that was requested: an
+    axis can be requested and then not opened. Read this rather than
+    :attr:`solve_for_used` to learn whether an axis was *considered* —
+    not estimated, but contributing its prior uncertainty to the
+    posterior through its measurement partials — because a solved
+    covariance's slot tags record only what occupied a column, and a
+    considered axis occupies none.
+
+    It is also what tells you whether re-attaching a prior to an axis
+    would double-count it."""
+    warnings: list[str]
+    """Covariance the fit was given and deliberately did not use.
+
+    Delivered as payload rather than written to a log, because a dropped
+    prior cross term changes how the σ for that slot should be read.
+    Empty when the fit used everything it was given."""
 
 
 @dataclass

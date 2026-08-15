@@ -129,28 +129,52 @@ fn solve_for_axes(mode: SolveForArg) -> (bool, bool, bool) {
     }
 }
 
+/// Map a requested axis onto its disposition.
+///
+/// This CLI opens an axis or leaves it out, so it only ever produces
+/// `Solved` or `Fixed`. The third disposition, `Considered` — not
+/// estimated, but its prior uncertainty still reaches the posterior
+/// through its measurement partials — has no flag here yet. It is a
+/// distinct modelling statement rather than a shade of "off", so it
+/// wants its own surface rather than an overloading of these flags.
+fn disposition(requested: bool) -> empyrean::ParamDisposition {
+    if requested {
+        empyrean::ParamDisposition::Solved
+    } else {
+        empyrean::ParamDisposition::Fixed
+    }
+}
+
 /// Build the wrapper's `SolveForParams` from the CLI selection. Any axis
 /// the coarse variants can't name (DT / AMRAT / thrust) becomes an
 /// `Explicit` solve, at parity with empyrean-core.
-fn build_solve_for(mode: SolveForArg, thrust_segments: u32) -> empyrean::SolveForParams {
+///
+/// An over-budget thrust request is refused rather than clamped: the
+/// wrapper's `with_leading_thrust` returns an error instead of
+/// saturating, because silently fitting three of four requested burns
+/// would marginalize the fourth without a word.
+fn build_solve_for(mode: SolveForArg, thrust_segments: u32) -> Result<empyrean::SolveForParams> {
     use empyrean::{SolveFor, SolveForParams};
     if mode == SolveForArg::Auto && thrust_segments == 0 {
-        return SolveForParams::Auto;
+        return Ok(SolveForParams::Auto);
     }
     let (marsden, dt, amrat) = solve_for_axes(mode);
     if !dt && !amrat && thrust_segments == 0 {
-        return if marsden {
+        return Ok(if marsden {
             SolveForParams::StateAndNonGrav
         } else {
             SolveForParams::StateOnly
-        };
+        });
     }
-    SolveForParams::Explicit(SolveFor {
-        marsden,
-        dt,
-        amrat,
-        thrust_segments,
-    })
+    let solve_for = SolveFor {
+        marsden: disposition(marsden),
+        dt: disposition(dt),
+        amrat: disposition(amrat),
+        ..Default::default()
+    }
+    .with_leading_thrust(thrust_segments as usize)
+    .map_err(|e| anyhow::anyhow!("--thrust-segments {thrust_segments}: {e}"))?;
+    Ok(SolveForParams::Explicit(solve_for))
 }
 
 /// Reject an invocation whose prior flags don't match the requested
@@ -281,7 +305,7 @@ fn run_refine_path(
     let wide_config = empyrean::ODConfig {
         force_model: args.force_model.to_empyrean(),
         max_iterations: args.max_iterations,
-        solve_for: build_solve_for(args.solve_for, args.thrust_segments),
+        solve_for: build_solve_for(args.solve_for, args.thrust_segments)?,
         photometry: args.photometry.then(empyrean::PhotometryConfig::default),
         ..empyrean::ODConfig::default()
     };
@@ -436,12 +460,19 @@ fn report_wide_axes(results: &DetermineResults) {
             header(&mut printed_header);
             eprintln!("    SRP AMRAT correction     = {a:.4e} m^2/kg");
         }
+        // Indexed by DECLARED segment, so an entry is `None` where that
+        // burn was not solved. Printing zeros there would read as a
+        // fitted correction of exactly zero, which is a result the fit
+        // never produced.
         for (i, dv) in fit.thrust_delta_m_per_s.iter().enumerate() {
             header(&mut printed_header);
-            eprintln!(
-                "    Thrust dv[{i}] = [{:.3}, {:.3}, {:.3}] m/s",
-                dv[0], dv[1], dv[2]
-            );
+            match dv {
+                Some(dv) => eprintln!(
+                    "    Thrust dv[{i}] = [{:.3}, {:.3}, {:.3}] m/s",
+                    dv[0], dv[1], dv[2]
+                ),
+                None => eprintln!("    Thrust dv[{i}] = not solved"),
+            }
         }
         if let Some(ph) = &fit.photometry {
             header(&mut printed_header);
@@ -608,7 +639,7 @@ pub fn run(data: &DataOptions, args: DetermineArgs) -> Result<()> {
         let config = empyrean::ODConfig {
             force_model: args.force_model.to_empyrean(),
             max_iterations: args.max_iterations,
-            solve_for: build_solve_for(args.solve_for, args.thrust_segments),
+            solve_for: build_solve_for(args.solve_for, args.thrust_segments)?,
             photometry: args.photometry.then(empyrean::PhotometryConfig::default),
             ..empyrean::ODConfig::default()
         };
@@ -646,7 +677,7 @@ fn format_extension(fmt: OutputFormat) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use empyrean::{SolveFor, SolveForParams};
+    use empyrean::SolveForParams;
 
     /// A minimal `DetermineArgs` with every prior flag unset, `solve_for`
     /// caller-chosen. Only the fields the prior-flag logic reads matter.
@@ -683,38 +714,59 @@ mod tests {
         );
     }
 
+    /// The disposition an axis the CLI did not request must carry.
+    ///
+    /// `Fixed`, not `Considered`: an unrequested axis is marginalized
+    /// out and changes no number, whereas a considered axis would
+    /// inflate the posterior through its measurement partials. This CLI
+    /// has no flag for the latter, so it must never produce it by
+    /// accident.
+    const OFF: empyrean::ParamDisposition = empyrean::ParamDisposition::Fixed;
+    const ON: empyrean::ParamDisposition = empyrean::ParamDisposition::Solved;
+
     #[test]
     fn wide_solve_for_opens_the_expected_columns() {
+        let explicit = |mode| match build_solve_for(mode, 0).expect("no thrust requested") {
+            SolveForParams::Explicit(s) => s,
+            other => panic!("expected an explicit solve, got {other:?}"),
+        };
+
         // DT: Marsden + DT columns open.
-        assert!(matches!(
-            build_solve_for(SolveForArg::Dt, 0),
-            SolveForParams::Explicit(SolveFor {
-                marsden: true,
-                dt: true,
-                amrat: false,
-                thrust_segments: 0,
-            })
-        ));
+        let dt = explicit(SolveForArg::Dt);
+        assert_eq!((dt.marsden, dt.dt, dt.amrat), (ON, ON, OFF));
+        assert!(dt.thrust.iter().all(|d| *d == OFF));
+
         // AMRAT alone: only the AMRAT column.
-        assert!(matches!(
-            build_solve_for(SolveForArg::Amrat, 0),
-            SolveForParams::Explicit(SolveFor {
-                marsden: false,
-                dt: false,
-                amrat: true,
-                thrust_segments: 0,
-            })
-        ));
+        let amrat = explicit(SolveForArg::Amrat);
+        assert_eq!((amrat.marsden, amrat.dt, amrat.amrat), (OFF, OFF, ON));
+        assert!(amrat.thrust.iter().all(|d| *d == OFF));
+
         // Non-grav + AMRAT: Marsden + AMRAT.
-        assert!(matches!(
-            build_solve_for(SolveForArg::NonGravAmrat, 0),
-            SolveForParams::Explicit(SolveFor {
-                marsden: true,
-                dt: false,
-                amrat: true,
-                thrust_segments: 0,
-            })
-        ));
+        let both = explicit(SolveForArg::NonGravAmrat);
+        assert_eq!((both.marsden, both.dt, both.amrat), (ON, OFF, ON));
+        assert!(both.thrust.iter().all(|d| *d == OFF));
+    }
+
+    #[test]
+    fn thrust_segments_open_the_leading_burns() {
+        let SolveForParams::Explicit(s) = build_solve_for(SolveForArg::StateOnly, 2).unwrap()
+        else {
+            panic!("a thrust request must produce an explicit solve");
+        };
+        assert_eq!(s.solved_thrust_segments(), 2);
+        assert_eq!(s.thrust[0], ON);
+        assert_eq!(s.thrust[1], ON);
+        assert_eq!(s.thrust[2], OFF);
+    }
+
+    #[test]
+    fn an_over_budget_thrust_request_is_refused_not_clamped() {
+        // Clamping would fit three of the four requested burns and
+        // marginalize the fourth without a word.
+        let err = build_solve_for(SolveForArg::StateOnly, 4).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("--thrust-segments 4"), "{msg}");
+        assert!(msg.contains("maximum"), "{msg}");
     }
 
     #[test]

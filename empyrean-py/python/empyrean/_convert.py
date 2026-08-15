@@ -940,6 +940,182 @@ def extract_non_grav_covariance(
     return has_non_grav_cov, non_grav_cov
 
 
+# ── The joint covariance (shared marshal helpers) ────────────────────
+#
+# The state block of a joint solved-parameter covariance rides
+# ``coordinates.covariance``; its off-diagonal blocks ride
+# :class:`~empyrean.orbits.nongrav.NonGravParams.non_grav_cross` (the
+# state-Marsden border) and
+# :class:`~empyrean.orbits.wide_cross.WideCross` (everything else).
+# These helpers carry that pair across the extension boundary in both
+# directions, as six parallel per-row lists named for the columns they
+# feed.
+#
+# Absence is a ``None`` ROW at every hop, never a row of zeros. An entry
+# whose values are all zero is a supplied zero correlation that engages
+# the engine's definiteness gate, so zero-filling an absent row would
+# turn "this orbit has no cross terms" into "this orbit asserts
+# uncorrelated" — a different and stronger claim than the caller made.
+
+# Number of values in the row-major 6x3 state-Marsden border.
+_BORDER_VALUES = 18
+
+# The six keys the extension reads and writes. One list per key, one
+# entry per orbit row.
+_JOINT_KEYS = (
+    "non_grav_cross",
+    "wide_columns",
+    "wide_state",
+    "wide_pair_a",
+    "wide_pair_b",
+    "wide_pair_value",
+)
+
+
+def extract_joint(orbits: AnyOrbits) -> dict[str, list[Any]]:
+    """Extract an orbit table's joint cross terms for the extension.
+
+    Returns the six parallel per-row lists keyed by
+    :data:`_JOINT_KEYS`, or an **empty dict** when no row carries
+    anything — so a caller can splat the result into an extension call
+    and a batch with no joint passes no joint keys at all.
+
+    Shared by every orbit-marshaling entry point (propagate, determine /
+    evaluate / refine) so none of them silently drops a caller's cross
+    terms. A fitted or propagated orbit re-fed with only its ``6x6``
+    reports a tighter uncertainty than the run that produced it
+    supports, because the state-parameter columns it drops are non-zero
+    even when the original input was block-diagonal.
+
+    Raises
+    ------
+    ValueError
+        If a row's border is not 18 values, or its tag and payload
+        lengths disagree. Both are refused rather than reshaped: a
+        mismatch means the two were written out of step, and reshaping
+        anyway attaches one parameter's covariances to another.
+    """
+    n = len(orbits)
+    border: list[list[float] | None] = [None] * n
+    if orbits.non_grav is not None:
+        for i, row in enumerate(orbits.non_grav.non_grav_cross.to_pylist()):
+            if row is None:
+                continue
+            if len(row) != _BORDER_VALUES:
+                raise ValueError(
+                    f"orbits.non_grav.non_grav_cross[{i}] has {len(row)} values but "
+                    f"the state-Marsden border is 6x3 = {_BORDER_VALUES}, row-major "
+                    "(state elements down, A1/A2/A3 across). A short or long row "
+                    "cannot be reshaped without guessing which element went missing."
+                )
+            border[i] = [float(v) for v in row]
+
+    # A nullable sub-table column is never None — quivr returns a table
+    # of parent length regardless — so this reads per-row nulls rather
+    # than testing the sub-table for absence.
+    wide = orbits.wide_cross
+    columns: list[list[str] | None] = wide.columns.to_pylist()
+    state: list[list[float] | None] = wide.state.to_pylist()
+    pair_a: list[list[str] | None] = wide.pair_a.to_pylist()
+    pair_b: list[list[str] | None] = wide.pair_b.to_pylist()
+    pair_value: list[list[float] | None] = wide.pair_value.to_pylist()
+
+    for i, (tags, values) in enumerate(zip(columns, state, strict=True)):
+        n_tags = len(tags) if tags else 0
+        n_values = len(values) if values else 0
+        if n_values != 6 * n_tags:
+            raise ValueError(
+                f"orbits.wide_cross row {i}: the state payload has {n_values} values "
+                f"but {n_tags} tagged column(s) need {6 * n_tags}. The payload is "
+                "row-major 6-per-column; a mismatch means the two were written out "
+                "of step, and reshaping anyway would attach one parameter's "
+                "covariances to another."
+            )
+
+    # Erased to the return type's element type: the six lists differ in
+    # payload (floats, tags) but are handled identically from here.
+    carried: list[list[Any]] = [border, columns, state, pair_a, pair_b, pair_value]
+    if not any(any(row is not None for row in column) for column in carried):
+        return {}
+    return dict(zip(_JOINT_KEYS, carried, strict=True))
+
+
+def joint_columns_from_result(
+    result: dict[str, Any], n: int, prefix: str = ""
+) -> tuple[list[list[float] | None] | None, qv.Table | None]:
+    """Rebuild the joint's two homes from an extension result dict.
+
+    Returns ``(non_grav_cross, wide_cross)`` — the per-row border column
+    for :class:`~empyrean.orbits.nongrav.NonGravParams` and a populated
+    :class:`~empyrean.orbits.wide_cross.WideCross`, each ``None`` when
+    the result carried none. Inverse of :func:`extract_joint`.
+
+    Rows the engine produced no joint for stay ``None``; nothing is
+    zero-filled on the way back either.
+    """
+    from empyrean.orbits.wide_cross import WideCross
+
+    border = result.get(f"{prefix}non_grav_cross")
+    columns = result.get(f"{prefix}wide_columns")
+    state = result.get(f"{prefix}wide_state")
+    pair_a = result.get(f"{prefix}wide_pair_a")
+    pair_b = result.get(f"{prefix}wide_pair_b")
+    pair_value = result.get(f"{prefix}wide_pair_value")
+
+    # Gated on CONTENT, not on the key being present. The six lists are
+    # written as a group whenever any of them carries something, so a
+    # result with a carrier but no state-Marsden border still writes a
+    # border column of all-nulls. Treating that as "a border arrived"
+    # attaches an all-null NonGravParams to an orbit that declares no
+    # Marsden block — harmless in value, but it says the orbit has a
+    # non-grav block when it has none.
+    border_col: list[list[float] | None] | None = None
+    if border is not None and any(row is not None for row in border):
+        border_col = [list(row) if row is not None else None for row in border]
+
+    wide: qv.Table | None = None
+    if any(c is not None for c in (columns, state, pair_a, pair_b, pair_value)):
+        empty: list[None] = [None] * n
+        wide = WideCross.from_kwargs(
+            columns=columns if columns is not None else empty,
+            state=state if state is not None else empty,
+            pair_a=pair_a if pair_a is not None else empty,
+            pair_b=pair_b if pair_b is not None else empty,
+            pair_value=pair_value if pair_value is not None else empty,
+        )
+    return border_col, wide
+
+
+def non_grav_border_only(border: list[list[float] | None]) -> qv.Table:
+    """A :class:`NonGravParams` carrying the border and nothing else.
+
+    A propagation output carries the *propagated* state-Marsden border,
+    but not the Marsden coefficients or their ``3x3`` — those are inputs
+    that propagation passes through unchanged, and restating them on the
+    output would give one orbit's force model two homes that can
+    disagree.
+
+    So the other columns are written **explicitly null**, which is the
+    same shape quivr materialises for a sub-table column the caller
+    never set. They are declared non-nullable, so this is the one
+    construction in this module that passes ``permit_nulls``; a
+    fabricated zero ``a1`` would read as "this orbit has no radial
+    non-grav acceleration", which the output does not claim.
+    """
+    from empyrean.orbits.nongrav import NonGravParams
+
+    n = len(border)
+    nulls_f64 = pa.nulls(n, pa.float64())
+    return NonGravParams.from_kwargs(
+        a1=nulls_f64,
+        a2=nulls_f64,
+        a3=nulls_f64,
+        model=pa.nulls(n, pa.large_string()),
+        non_grav_cross=border,
+        permit_nulls=True,
+    )
+
+
 # ── SRP force slot (shared marshal helpers) ──────────────────────────
 #
 # SRP is a first-class, additive force slot carried on ``orbits.srp``

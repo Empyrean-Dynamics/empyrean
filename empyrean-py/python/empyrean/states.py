@@ -1,19 +1,17 @@
 """Query body states from SPK ephemeris."""
 
-from collections.abc import Sequence
-
 import numpy as np
 
 from empyrean._convert import frame_to_int, int_to_frame, naif_to_origin, origin_to_naif
 from empyrean.coordinates.coordinates import CartesianCoordinates
 from empyrean.coordinates.enums import Frame, Origin
-from empyrean.coordinates.epoch import Epochs
+from empyrean.coordinates.epoch import Epochs, _epochs_mjd_tdb
 
 
 def get_states(
     target: Origin | str,
     center: Origin | str,
-    epochs: Epochs | np.ndarray | Sequence[float],
+    epochs: Epochs,
     frame: Frame | str = Frame.ECLIPTICJ2000,
 ) -> CartesianCoordinates:
     """Query Cartesian states of a body from the SPK ephemeris.
@@ -25,8 +23,10 @@ def get_states(
         the canonical name (e.g. ``"Earth"``).
     center : Origin | str
         Center body. Same shape as ``target``.
-    epochs : Epochs | array-like
-        Epochs as an Epochs table or MJD TDB array.
+    epochs : Epochs
+        Epochs table, converted to TDB internally. Build one with
+        ``Epochs.from_mjd(values, scale="tdb")`` (or ``scale="utc"``);
+        a bare array is refused, as it carries no time scale.
     frame : Frame | str
         Reference frame (default: EclipticJ2000).
 
@@ -34,6 +34,11 @@ def get_states(
     -------
     CartesianCoordinates
         Cartesian states (AU, AU/day) at each epoch.
+
+    Raises
+    ------
+    TypeError
+        ``epochs`` is not an :class:`Epochs` table.
     """
     from empyrean._empyrean_rs import _get_states
 
@@ -41,11 +46,7 @@ def get_states(
     center_naif = origin_to_naif(center)
     frame_int = frame_to_int(frame)
 
-    if isinstance(epochs, Epochs):
-        tdb = epochs.to_tdb()
-        epochs_mjd = np.asarray(tdb.mjd.to_numpy(zero_copy_only=False), dtype=np.float64)
-    else:
-        epochs_mjd = np.asarray(epochs, dtype=np.float64)
+    epochs_mjd = _epochs_mjd_tdb(epochs, "get_states() epochs")
 
     result = _get_states(target_naif, center_naif, epochs_mjd, frame_int)
 

@@ -49,12 +49,104 @@ and Rust-native lifetime management.
 
 ## What the bindings cover
 
-The declarations track the full C ABI at `EMPYREAN_ABI_VERSION`
-(currently `3`), including the v0.9.0 wide-parameter fitting surface
-and the ABI-2 output surface below. ABI 2 grew existing struct shapes by
-appending fields only; ABI 3 is the first version to change function
-shapes and struct interiors, so consumers must recompile against the
-matching header.
+The declarations track the full C ABI of **this crate's own release**,
+including the v0.9.0 wide-parameter fitting surface and the output
+surface below.
+
+`EMPYREAN_ABI_VERSION` carries that release, encoded
+`major * 10000 + minor * 100 + patch` — the 0.10.0 ABI reports `1000` —
+and it advances with **every** release, whether or not any boundary type
+changed. So the number no longer tells you anything about layout, and
+the only reading it supports is equality: if the loaded engine reports a
+different value, it is a different release, and the fix is to rebuild
+against the matching header or repoint at the matching engine. There is
+no compatible range to reason about, and a value that did not move is no
+longer a promise that nothing did.
+
+The scheme begins with 0.10.0. Every release before it reported an
+independent counter instead, now retired, whose last published value is
+2 (v0.9.0); that counter is the subject of the historical notes below,
+and no library has ever reported a value between it and 1000.
+
+Only the base version is encoded — the pre-release suffix is not, so
+`0.10.0-rc.1` and `0.10.0` both report `1000`. The handshake therefore
+separates one version from another and never a version from its own
+pre-releases: a boundary change inside a pre-release cycle is not caught
+by it, and both sides must be rebuilt together.
+
+### The 0.10.0 ABI — the joint covariance
+
+The boundary now carries the **off-diagonal** blocks of a fit's
+`(6+P) × (6+P)` covariance, not only its diagonal blocks. Input side,
+caller-owned: `CoordinateState` gains `has_non_grav_cross` /
+`non_grav_cross[6][3]` (the state↔Marsden border, placed beside the 6×6 it
+borders so a coordinate transform moves both), and `EmpyreanOrbit` gains
+`state_param_cross` / `n_state_param_cross` and `param_pair_cross` /
+`n_param_pair_cross` as side arrays. Output side, library-owned:
+`EmpyreanOrbitCovariance` rides `EmpyreanPropagatedState::orbit_cov`, and an
+`EmpyreanODResult`'s `orbit` is itself an `EmpyreanPropagatedState`, so a
+fitted orbit and a propagated row expose their joint under one field name
+with one ownership rule.
+
+This is what closes leg chaining: the engine's propagated border is non-zero
+**even from a block-diagonal input**, because propagation itself generates
+the correlation, so a caller who chained legs on the 6×6 alone was quoting a
+tighter uncertainty than the propagation supports.
+
+**Two new exported symbols** — the first movement of the symbol set in this
+release: `empyrean_propagation_joint_at(result, orbit_index, epoch_index,
+out)` returns the propagated joint at one row, and
+`empyrean_orbit_covariance_free` releases what it wrote. They are a separate
+call rather than fields on `EmpyreanTaggedCovariance` to keep that struct
+free of owned storage — a caller declares one on the stack and frees nothing,
+and giving it owned arrays would have turned correct, silently recompiling
+code into a leaking caller at two allocations per call.
+
+Three new input structs carry the terms: `EmpyreanParamColumn` (16 bytes),
+`EmpyreanStateParamCross` (64), `EmpyreanParamPairCross` (40), plus
+`EmpyreanOrbitCovariance` (184) on the output side. Nine new constants:
+`EMPYREAN_PARAM_COLUMN_MARSDEN` / `_DT` / `_AMRAT` / `_THRUST`,
+`EMPYREAN_PARAM_FIXED` / `_SOLVED` / `_CONSIDERED`,
+`EMPYREAN_MAX_THRUST_SEGMENTS`, and
+`EMPYREAN_REJECTION_PER_OBSERVATION_SITE_REQUIRED` (15).
+
+**The shrink.** `EmpyreanSolveFor` replaces `thrust_segments` (a `u32`) with
+`thrust_dispositions[3]` (three `u8`s), taking it from 8 bytes to 6 and its
+alignment from 4 to 1. That shifts every field after `solve_for_flags` inside
+the `EmpyreanODConfig` embedding it — `allow_unbracketed_maneuvers` 392 →
+390, `has_photometry` 393 → 391, `photometry` 400 → 392 — and shrinks that
+config 432 → 424. A consumer with a hand-mirrored config must re-derive its
+whole layout rather than append: keeping the old prefix and writing
+`photometry` at its former offset lands eight bytes past where the library
+reads it, corrupting that config and the two bytes before it with no
+diagnostic. Every other change in this release is an append:
+`CoordinateState` 360 → 512, `EmpyreanOrbit` 648 → 832,
+`EmpyreanPropagatedState` 2392 → 2576, `EmpyreanNonGravParams` 160 → 176
+(`has_dt_variance` / `dt_variance`, which had no wire at all before),
+`EmpyreanObservatoryConfig` 40 → 64 (the visibility fields, which are
+marshaled in full but which no exported entry point applies — the gates that
+read them live in the engine's unexported visibility survey), and
+`EmpyreanODResult` 7688 → 8128 (the joint, `dispositions`, the per-segment
+thrust posteriors and the `warnings` channel), carrying
+`EmpyreanODObjectResult` 7720 → 8160 with it.
+
+**Semantic breaks the sizes will not catch.** `EmpyreanSolveFor`'s axes
+become a disposition tri-state — `0` fixed, `1` solved, `2` considered — so
+`memset(0)` and every value an older caller could write keep their exact
+former meaning while the type gains a third. And
+`EmpyreanODResult::thrust_delta_m_per_s` is re-indexed from **solved** to
+**declared** order, with `thrust_delta_count` becoming the declared count, so
+it shares one index space with the new `thrust_correction_covariances` and
+with `dispositions.thrust_dispositions`. An unsolved segment is NaN-filled in
+both arrays.
+
+### ABI 3 — the last of the retired counter
+
+Historical: `3` was the final value of the independent counter. It was
+prepared but never published — every released library on the counter tops
+out at 2 (v0.9.0) — so the changes below reach consumers for the first
+time in this release, and every upgrading consumer crosses both breaks at
+once.
 
 **Function shapes.** `empyrean_determine` keeps its name and arity, but
 its final out-parameter is now `EmpyreanDetermineResults *` — the batch
@@ -88,16 +180,31 @@ no size check would catch. New types: `EmpyreanDetermineResults` (32),
 `EmpyreanODObjectResult` (7720), `EmpyreanFitSummary` (184),
 `EmpyreanDataDirOptions` (8), `EmpyreanMissingDataFiles` (16).
 
-The version handshake is enforced here, not merely documented: the
-loader calls `empyrean_abi_version()` the moment it opens `libempyrean`
-and panics — naming both versions and the resolved path — if the engine
-disagrees with `EMPYREAN_ABI_VERSION`. `dlsym` matches on symbol name
-alone, so a stale engine picked up from `EMPYREAN_LIB` or a leftover
-`target/release` would do worse than return wrong numbers: an ABI-2
-`empyrean_get_observers` reads the caller's `frame` integer as its
-out-pointer, and an ABI-2 `empyrean_determine` writes a 7600-byte
-`EmpyreanODResult` through a pointer the caller sized for a 32-byte
-`EmpyreanDetermineResults`.
+### The version handshake
+
+It is enforced here, not merely documented: the loader calls
+`empyrean_abi_version()` the moment it opens `libempyrean` and panics —
+naming both versions and the resolved path — if the engine disagrees with
+`EMPYREAN_ABI_VERSION`. Any inequality panics; there is no tolerated
+range, because the value is a release identity rather than a layout
+generation.
+
+`dlsym` matches on symbol name alone, so a stale engine picked up from
+`EMPYREAN_LIB` or a leftover `target/release` would do worse than return
+wrong numbers. An ABI-2 `empyrean_get_observers` reads the caller's
+`frame` integer as its out-pointer; an ABI-2 `empyrean_determine` writes a
+7600-byte `EmpyreanODResult` through a pointer the caller sized for a
+32-byte `EmpyreanDetermineResults`; and an ABI-3 `empyrean_refine` reads
+its `EmpyreanODConfig`'s photometry block eight bytes past where a 0.10.0
+caller wrote it. Every struct size named above is additionally asserted at
+compile time in the generated bindings, so a header/binding drift fails the
+build rather than the physics.
+
+The engine binary this crate resolves is version-pinned by construction:
+the checksummed download in `build.rs` targets the `v{crate version}` tag,
+and the copy bundled in the Python wheel ships beside the wheel's own
+bindings. A manual `EMPYREAN_LIB` is the one path that can pair mismatched
+releases.
 
 Each type below maps 1:1 onto a C struct; consult `include/empyrean.h`
 at the repository root for field-level semantics.
@@ -138,9 +245,28 @@ at the repository root for field-level semantics.
   `EMPYREAN_REJECTION_NON_FINITE_CHI2`,
   `EMPYREAN_REJECTION_MISSING_JACOBIAN`,
   `EMPYREAN_REJECTION_OBSERVER_CONSTRUCTION_FAILED`,
-  `EMPYREAN_REJECTION_SPACECRAFT_KERNEL_MISSING`, and
-  `EMPYREAN_REJECTION_NEVER_ABSORBED`, so a deselected observation
-  always carries a reason rather than a bare flag.
+  `EMPYREAN_REJECTION_SPACECRAFT_KERNEL_MISSING`,
+  `EMPYREAN_REJECTION_NEVER_ABSORBED`, and
+  `EMPYREAN_REJECTION_PER_OBSERVATION_SITE_REQUIRED` (a roving-observer
+  `247` / `270` or occultation `275` code, whose site travels with each
+  observation, so there are no published planetodetic constants to look up),
+  so a deselected observation always carries a reason rather than a bare
+  flag. The codes are kept distinct because each names a different thing the
+  caller can do: an unmodelled observatory, a kernel to load, or coordinates
+  the ADES record already carries per observation.
+- **The joint covariance.** `EmpyreanOrbitCovariance` carries a fitted or
+  propagated covariance's off-diagonal blocks — `has_non_grav_cross` /
+  `non_grav_cross[6][3]` for the state↔Marsden border, and
+  `state_param_cross` / `param_pair_cross` with their counts for everything
+  else. Entries are keyed by `EmpyreanParamColumn` identity (`kind` plus
+  `index` / `segment` / `component`), never by column index, since which
+  column a parameter occupies depends on what else the orbit declares. The
+  output arrays are **library-owned** and released with the parent result;
+  the identically-named fields on `EmpyreanOrbit` are **caller-owned** and
+  borrowed for the call, so re-feeding by pointer assignment is valid only
+  while the result outlives the orbit. Absence is a null pointer with a zero
+  count, never a zeroed block: a supplied zero correlation is a claim, and it
+  engages the engine's definiteness gate.
 - **Hard-object switches.** `EmpyreanODConfig::allow_arc_truncation`
   and `coorbital_enabled` are tri-state (`-1` engine default, `1` on,
   `0` off). Forbidding truncation makes an arc spanning a dynamical
@@ -153,11 +279,22 @@ at the repository root for field-level semantics.
   block for the cometary outgassing time delay DT, the SRP area-to-mass
   ratio AMRAT, and per-segment thrust Δv corrections on continuous-thrust
   arcs — each partial produced analytically by the hyperdual integrator. The per-axis `EmpyreanSolveFor`
-  (`marsden` / `dt` / `amrat` / `thrust_segments`) is read under
-  `EMPYREAN_SOLVE_FOR_EXPLICIT`. DT / AMRAT / thrust are refine-path solves:
+  (`marsden` / `dt` / `amrat` / `thrust_dispositions`) is read under
+  `EMPYREAN_SOLVE_FOR_EXPLICIT`. Each axis carries a disposition rather
+  than a flag: solved is estimated, considered is not estimated but still
+  reaches the posterior through its measurement partials, and fixed is
+  marginalized out. DT / AMRAT / thrust are refine-path solves:
   the input orbit must carry the corresponding prior (its declared variance)
   to open the axis, and requesting an axis without its prior errors out
-  rather than returning a zeroed or defaulted column.
+  rather than returning a zeroed or defaulted column. `EmpyreanODResult`
+  echoes the partition it actually ran on `dispositions` — the only place a
+  *considered* axis is visible, since it occupies no solved slot — reports
+  per-declared-segment `thrust_delta_m_per_s` and
+  `thrust_correction_covariances` (NaN-filled where a segment was not
+  solved), and carries `warnings` / `num_warnings` for covariance it was
+  handed and deliberately did not use. Consider analysis is not a
+  conservatism knob: with cross terms to the solved axes the correction is
+  sign-indefinite, so a considered axis can tighten the posterior.
 - **Tagged solved covariance.** `EmpyreanSolvedCovariance` carries the
   fitted-parameter identities alongside the matrix: `marsden_slot`,
   `dt_slot`, `amrat_slot`, and `thrust_slots` locate each parameter's
@@ -209,7 +346,16 @@ at the repository root for field-level semantics.
   carry the effective SNR (linear power ratio), one-way range (km),
   link-budget provenance notes, and the measurement mode;
   `EmpyreanPlanResult` carries the predicted optical ephemeris (epoch
-  MJD TDB, RA, Dec per optical candidate).
+  MJD TDB, RA, Dec per optical candidate). `EmpyreanObservatoryConfig`
+  additionally declares `min_elevation_deg` and the
+  `has_max_sun_altitude_deg` / `max_sun_altitude_deg` pair (unset takes the
+  engine's default of −18°, astronomical twilight; the `has_` switch exists
+  because `0.0` is a legal solar altitude, so a defaulted zero would plan a
+  campaign in daylight). Both are marshaled across in full, and **no
+  exported entry point applies them**: the gates that read them belong to
+  the engine's visibility survey, which this ABI does not export. They
+  ride the struct so that exposing the survey later needs no further ABI
+  break.
 - **Basis-tagged mixture components.** Each `EmpyreanMixtureComponent`
   is tagged with the reference `frame` and center-body `origin` (NAIF
   id) its mean and covariance are expressed in.
@@ -237,7 +383,8 @@ inside the published Python wheel. The path is resolved from the
 `EMPYREAN_LIB` environment variable if set, else a `libempyrean.*`
 sitting next to the loaded module, else a build-time location — an
 `EMPYREAN_LIB_DIR` override, a sibling `../target/release` build, or
-a checksum-pinned download from the GitHub release (in that order).
+a checksum-pinned download from the GitHub release tagged
+`v{crate version}` (in that order).
 The FFI bindings are pre-generated and committed, so no C header,
 libclang, or bindgen is needed to build.
 

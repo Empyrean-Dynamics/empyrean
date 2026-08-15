@@ -5,6 +5,7 @@
 // loops, which read more clearly than iterator adapters here.
 #![allow(clippy::needless_range_loop)]
 
+use crate::JointCovariance;
 use std::ffi::CStr;
 
 use crate::coordinate::{Frame, Origin};
@@ -209,7 +210,13 @@ impl TaggedCovariance {
 }
 
 /// A propagated state at one epoch.
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// **No longer `Copy` as of the joint-covariance release.** The type now
+/// owns heap storage (the wide carrier on [`joint`](Self::joint)), so
+/// `Copy` is not available to it. `Clone` is, and copying a struct that
+/// already carried a 1728-byte STT was never cheap; call sites that
+/// relied on implicit copies need an explicit `.clone()`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct PropagatedState {
     /// Epoch.
     pub epoch: crate::Epoch,
@@ -243,6 +250,21 @@ pub struct PropagatedState {
     /// (Linear outside `Auto` CA windows). The full provenance is on
     /// [`PropagationResult::covariance_series_cartesian`].
     pub resolved_kind: CovarianceKind,
+    /// The propagated joint's cross terms at this epoch, in the
+    /// Cartesian basis of [`covariance`](Self::covariance).
+    ///
+    /// [`covariance`](Self::covariance) is only the state block. Feeding
+    /// a second leg that block alone hands the engine a block-diagonal
+    /// covariance, while the joint it computed has non-zero
+    /// state↔parameter columns **even when the input was
+    /// block-diagonal** — propagation generates that correlation. So a
+    /// chained propagation built on the 6×6 alone reports a tighter
+    /// uncertainty than the first leg supports.
+    ///
+    /// Copy it onto the next leg's [`Orbit`](crate::Orbit), together
+    /// with the parameter blocks it is conditioned on, which propagation
+    /// carries through from the input orbit unchanged.
+    pub joint: crate::JointCovariance,
 }
 
 impl PropagatedState {
@@ -264,6 +286,7 @@ impl PropagatedState {
             stm: (s.has_stm != 0).then_some(s.stm),
             stt: (s.has_stt != 0).then_some(s.stt),
             resolved_kind: CovarianceKind::from_u8(s.resolved_kind)?,
+            joint: unsafe { crate::JointCovariance::from_ffi(&s.orbit_cov) }?,
         })
     }
 }
@@ -566,6 +589,48 @@ impl PropagationResult {
         let init = unsafe { out.assume_init() };
         TaggedCovariance::from_ffi(&init)
     }
+
+    /// The propagated joint's cross terms at one
+    /// `(orbit_index, epoch_index)` — the state↔Marsden border and the
+    /// wide carrier whose state block is
+    /// [`TaggedCovariance::matrix`](crate::TaggedCovariance).
+    ///
+    /// # Why it is a separate call from the covariance
+    ///
+    /// The C ABI keeps its tagged-covariance struct free of owned
+    /// storage, so a C caller who wants only the \\(6 \\times 6\\) frees
+    /// nothing. Asking for the joint is an explicit acquisition there,
+    /// and this mirrors that shape rather than folding the two together
+    /// — the parity rule is by name and semantics, and hiding an
+    /// allocation behind the covariance accessor would give the two
+    /// channels different ownership stories for the same call.
+    ///
+    /// Rust callers get the allocation released for them: the FFI arrays
+    /// are copied into owned Rust values and freed before this returns.
+    ///
+    /// An empty [`JointCovariance`] means the engine produced no cross
+    /// terms at this row — the orbit declared no solved-parameter block
+    /// — not that the terms were zero.
+    pub fn joint_at(&self, orbit_index: usize, epoch_index: usize) -> Result<JointCovariance> {
+        let mut out = empyrean_sys::EmpyreanOrbitCovariance::default();
+        let code = unsafe {
+            empyrean_sys::empyrean_propagation_joint_at(
+                &*self.ffi,
+                orbit_index,
+                epoch_index,
+                &mut out,
+            )
+        };
+        if code != 0 {
+            return Err(Error::capture(code));
+        }
+        // Copy out, then release the engine's arrays before returning:
+        // the owned Rust value must not alias storage the caller has no
+        // handle to free.
+        let joint = unsafe { JointCovariance::from_ffi(&out) };
+        unsafe { empyrean_sys::empyrean_orbit_covariance_free(&mut out) };
+        joint
+    }
 }
 
 #[cfg(test)]
@@ -685,8 +750,7 @@ mod tests {
     use super::CovarianceKind;
 
     /// Every covariance kind round-trips through its C-ABI tag, and the
-    /// new sample-based kinds map to the tags the engine emits
-    /// (empyrean-2hza).
+    /// new sample-based kinds map to the tags the engine emits.
     #[test]
     fn covariance_kind_round_trips_c_tags() {
         for kind in [

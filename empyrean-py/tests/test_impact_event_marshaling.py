@@ -1,13 +1,13 @@
-"""Impact / possible-impact event marshaling — bd empyrean-h7t1g + empyrean-snzy0.
+"""Impact / possible-impact event marshaling.
 
 Two distribution-output-contract fixes on the ``_build_events`` marshaler,
 driven by a synthetic flat event dict (no propagation, no data):
 
-* h7t1g: ``PossibleImpacts`` absent second-order / AGM / MC probabilities must
+* ``PossibleImpacts`` absent second-order / AGM / MC probabilities must
   marshal to Arrow **null**, matching ``compute_impact_probabilities``' own
   encoding — not NaN, which made ``row.ip_agm is not None`` a false positive on
   every event row.
-* snzy0: ``Impacts`` must carry ``relative_velocity_au_day`` (the impact speed
+* ``Impacts`` must carry ``relative_velocity_au_day`` (the impact speed
   the flat C-ABI surface already ships), NaN -> null where unresolved.
 """
 

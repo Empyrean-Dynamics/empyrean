@@ -1,6 +1,6 @@
 """Behavioral contracts for the sampling uncertainty methods
 (``SIGMA_POINT`` / ``MONTE_CARLO``) in :func:`empyrean.propagate` and
-:func:`empyrean.generate_ephemeris` — bd empyrean-02j4.
+:func:`empyrean.generate_ephemeris`.
 
 These functions previously mishandled the two sampling methods, and the
 two failed *differently*:
@@ -35,7 +35,7 @@ from __future__ import annotations
 import empyrean
 import numpy as np
 import pytest
-from empyrean import MonteCarlo, SigmaPoint, UncertaintyMethod
+from empyrean import Epochs, MonteCarlo, SigmaPoint, UncertaintyMethod
 from empyrean.coordinates.coordinates import CartesianCoordinates
 from empyrean.coordinates.covariance import CartesianCovariance
 from empyrean.orbits.orbits import CartesianOrbits
@@ -76,10 +76,13 @@ def orbit() -> CartesianOrbits:
 
 
 @pytest.fixture(scope="module")
-def times() -> np.ndarray:
+def times() -> Epochs:
     # A multi-year arc so the sigma-point sample covariance has room to
     # diverge from the linear one even in this weakly-nonlinear regime.
-    return np.array([_EPOCH_MJD_TDB, _EPOCH_MJD_TDB + 365.0, _EPOCH_MJD_TDB + 730.0])
+    return Epochs.from_mjd(
+        np.array([_EPOCH_MJD_TDB, _EPOCH_MJD_TDB + 365.0, _EPOCH_MJD_TDB + 730.0]),
+        scale="tdb",
+    )
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -88,7 +91,7 @@ def times() -> np.ndarray:
 
 
 def test_propagate_sigma_point_covariance_differs_from_first_order(
-    orbit: CartesianOrbits, times: np.ndarray
+    orbit: CartesianOrbits, times: Epochs
 ) -> None:
     """``SIGMA_POINT`` must produce a genuine, provenance-tagged sample
     covariance that differs from the linear first-order one — not a
@@ -122,7 +125,7 @@ def test_propagate_sigma_point_covariance_differs_from_first_order(
     )
 
 
-def test_propagate_sigma_point_honors_dataclass(orbit: CartesianOrbits, times: np.ndarray) -> None:
+def test_propagate_sigma_point_honors_dataclass(orbit: CartesianOrbits, times: Epochs) -> None:
     """The ``SigmaPoint`` dataclass (default params) reaches the engine
     and produces a sigma-point covariance, not a downgraded first-order
     one — the wire-dict serialization of the dataclass is lossy, so this
@@ -132,7 +135,7 @@ def test_propagate_sigma_point_honors_dataclass(orbit: CartesianOrbits, times: n
 
 
 def test_propagate_sigma_point_non_default_params_raise(
-    orbit: CartesianOrbits, times: np.ndarray
+    orbit: CartesianOrbits, times: Epochs
 ) -> None:
     """Non-default sigma-point params are passed through unchanged and
     rejected LOUDLY by the engine (the canonical 2N+1 construction is
@@ -149,7 +152,7 @@ def test_propagate_sigma_point_non_default_params_raise(
 
 
 def test_propagate_monte_carlo_omits_state_covariance(
-    orbit: CartesianOrbits, times: np.ndarray
+    orbit: CartesianOrbits, times: Epochs
 ) -> None:
     """``MONTE_CARLO`` runs but produces NO per-epoch state covariance —
     its deliverable is the Monte-Carlo impact probability, not a sampled
@@ -183,10 +186,14 @@ def _earth_approaching_orbit() -> CartesianOrbits:
     empyrean.initialize()
     dt = 0.02
     r0 = np.asarray(
-        empyrean.get_observer_states(["500"], np.array([_EPOCH_MJD_TDB])).coordinates.r[0]
+        empyrean.get_observer_states(
+            ["500"], Epochs.from_mjd(np.array([_EPOCH_MJD_TDB]), scale="tdb")
+        ).coordinates.r[0]
     )
     r1 = np.asarray(
-        empyrean.get_observer_states(["500"], np.array([_EPOCH_MJD_TDB + dt])).coordinates.r[0]
+        empyrean.get_observer_states(
+            ["500"], Epochs.from_mjd(np.array([_EPOCH_MJD_TDB + dt]), scale="tdb")
+        ).coordinates.r[0]
     )
     v = (r1 - r0) / dt  # finite-difference Earth velocity (ICRF, SSB origin)
     return CartesianOrbits.from_kwargs(
@@ -224,7 +231,7 @@ def mc_close_approach():
     seed) once over an Earth close approach, sharing the (expensive)
     sample propagations across the seed / differential tests."""
     orbit = _earth_approaching_orbit()
-    times = np.array([_EPOCH_MJD_TDB, _EPOCH_MJD_TDB + 20.0])
+    times = Epochs.from_mjd(np.array([_EPOCH_MJD_TDB, _EPOCH_MJD_TDB + 20.0]), scale="tdb")
     events = EventConfig(close_approaches=True, possible_impacts=True, body_filter=["Earth"])
 
     def run(method):
@@ -285,9 +292,7 @@ def test_propagate_monte_carlo_seed_reproducible(mc_close_approach) -> None:
 # ══════════════════════════════════════════════════════════════════
 
 
-def test_propagate_unknown_uncertainty_method_raises(
-    orbit: CartesianOrbits, times: np.ndarray
-) -> None:
+def test_propagate_unknown_uncertainty_method_raises(orbit: CartesianOrbits, times: Epochs) -> None:
     """An out-of-range integer tag is a typed ``ValueError`` naming the
     supported set — never a raw ``RuntimeError`` leaking enum ints."""
     with pytest.raises(ValueError, match="unsupported uncertainty_method"):
@@ -296,7 +301,7 @@ def test_propagate_unknown_uncertainty_method_raises(
 
 @pytest.mark.parametrize("method", [UncertaintyMethod.SECOND_ORDER, UncertaintyMethod.AUTO])
 def test_propagate_analytic_methods_attach_finite_covariance(
-    orbit: CartesianOrbits, times: np.ndarray, method
+    orbit: CartesianOrbits, times: Epochs, method
 ) -> None:
     """Non-regression: making the flat ``uncertainty_method`` arg
     authoritative over the wire dict must not have disturbed the analytic
@@ -316,7 +321,10 @@ def test_propagate_analytic_methods_attach_finite_covariance(
 @pytest.fixture(scope="module")
 def observers():
     empyrean.initialize()
-    return empyrean.get_observer_states(["500"], np.array([_EPOCH_MJD_TDB, _EPOCH_MJD_TDB + 30.0]))
+    return empyrean.get_observer_states(
+        ["500"],
+        Epochs.from_mjd(np.array([_EPOCH_MJD_TDB, _EPOCH_MJD_TDB + 30.0]), scale="tdb"),
+    )
 
 
 @pytest.mark.parametrize(

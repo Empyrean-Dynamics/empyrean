@@ -37,13 +37,17 @@ from empyrean import (
     CartesianCoordinates,
     CartesianOrbits,
     CometaryCoordinates,
+    Epochs,
     KeplerianCoordinates,
     NonGravParams,
     Origin,
     PhotometricParams,
+    PlannedObservation,
+    SRPParams,
     UncertaintyMethod,
     compute_b_planes,
     compute_impact_probabilities,
+    evaluate_plan,
     generate_ephemeris,
     transform_coordinates,
 )
@@ -240,6 +244,34 @@ def _full_feature_orbit() -> CartesianOrbits:
     )
 
 
+def _wide_layout_orbit() -> CartesianOrbits:
+    """:func:`_full_feature_orbit` plus an SRP slot with an AMRAT prior.
+
+    The fourth solved axis, and what widens the layout past the
+    state+Marsden ``9x9``. A Marsden-only orbit's cross terms fit
+    entirely inside the ``6x3`` border on ``non_grav``, so the
+    ``wide_cross`` columns have no input at all from
+    :func:`_full_feature_orbit` — they would read as a silent drop when
+    they are really an unexercised channel. AMRAT is the cheapest axis
+    that opens them: the SRP slot is additive with the Marsden block, and
+    the state-AMRAT column plus the ``A_i``-AMRAT pairs have no home but
+    the carrier.
+
+    Kept separate from :func:`_full_feature_orbit` rather than folded
+    into it, because an AMRAT prior is not free elsewhere: the
+    second-order propagation path refuses an SRP-AMRAT covariance
+    outright, so the sensitivity walk needs an orbit without one.
+
+    The area-to-mass ratio is Apophis-scale (a ~370 m rock at ~2.7e10 kg)
+    with a ~10% prior sigma.
+    """
+    orbits = _full_feature_orbit()
+    return orbits.set_column(
+        "srp",
+        SRPParams.from_kwargs(amrat=[4.0e-6], cr=[1.0], amrat_variance=[1.6e-13]),
+    )
+
+
 # 2008 TC3 — the first asteroid ever detected before it hit Earth
 # (2008-Oct-07). JPL SBDB cometary elements at MJD 54746.0 TDB, the
 # covariance epoch (lifted from villeneuve/tests/test_jet2.rs so the
@@ -397,8 +429,11 @@ def _format_failures(
 
 
 def test_propagation_states_no_silent_drops() -> None:
-    orbits = _full_feature_orbit()
-    target_epochs = np.array([61000.0 + 60.0 * i for i in range(40)])
+    # The wide-layout fixture: the states table carries the propagated
+    # joint, whose carrier columns exist only for a layout past the
+    # state+Marsden 9x9.
+    orbits = _wide_layout_orbit()
+    target_epochs = Epochs.from_mjd(np.array([61000.0 + 60.0 * i for i in range(40)]), scale="tdb")
     result = empyrean.propagate(orbits, target_epochs)
 
     bad_null, bad_not_null = _check_no_silent_drops(result.states, "PropagatedStates")
@@ -409,7 +444,7 @@ def test_propagation_states_no_silent_drops() -> None:
 
 def test_propagation_events_summary_no_silent_drops() -> None:
     orbits = _full_feature_orbit()
-    target_epochs = np.array([61000.0 + 60.0 * i for i in range(40)])
+    target_epochs = Epochs.from_mjd(np.array([61000.0 + 60.0 * i for i in range(40)]), scale="tdb")
     result = empyrean.propagate(orbits, target_epochs)
 
     if len(result.events.summary) == 0:
@@ -492,7 +527,7 @@ def test_propagation_event_subtables_no_silent_drops() -> None:
     the historical periapsis ``relative_*`` drop.
     """
     orbits = _full_feature_orbit()
-    target_epochs = np.array([61000.0 + 60.0 * i for i in range(40)])
+    target_epochs = Epochs.from_mjd(np.array([61000.0 + 60.0 * i for i in range(40)]), scale="tdb")
     result = empyrean.propagate(orbits, target_epochs)
     events = result.events
 
@@ -530,7 +565,7 @@ def test_impactor_event_subtables_no_silent_drops() -> None:
     orbit = _impactor_orbit()
     # Last day before impact (~MJD 54746.116), fine steps so the encounter
     # is bracketed.
-    target_epochs = np.array([54746.0 + 0.04 * i for i in range(26)])
+    target_epochs = Epochs.from_mjd(np.array([54746.0 + 0.04 * i for i in range(26)]), scale="tdb")
     result = empyrean.propagate(orbit, target_epochs)
     events = result.events
 
@@ -587,10 +622,14 @@ def _grazing_flyby_orbit() -> tuple[CartesianOrbits, np.ndarray]:
     epoch = _GRAZER_EPOCH
 
     # Earth and Sun heliocentric (SSB-centered) ecliptic states at the epoch.
-    earth = empyrean.get_states(Origin.EARTH, Origin.SSB, [epoch], Frame.ECLIPTICJ2000)
+    earth = empyrean.get_states(
+        Origin.EARTH, Origin.SSB, Epochs.from_mjd([epoch], scale="tdb"), Frame.ECLIPTICJ2000
+    )
     e_r = np.array([earth.x[0].as_py(), earth.y[0].as_py(), earth.z[0].as_py()])
     e_v = np.array([earth.vx[0].as_py(), earth.vy[0].as_py(), earth.vz[0].as_py()])
-    sun = empyrean.get_states(Origin.SUN, Origin.SSB, [epoch], Frame.ECLIPTICJ2000)
+    sun = empyrean.get_states(
+        Origin.SUN, Origin.SSB, Epochs.from_mjd([epoch], scale="tdb"), Frame.ECLIPTICJ2000
+    )
     s_r = np.array([sun.x[0].as_py(), sun.y[0].as_py(), sun.z[0].as_py()])
     s_v = np.array([sun.vx[0].as_py(), sun.vy[0].as_py(), sun.vz[0].as_py()])
 
@@ -648,7 +687,7 @@ def _grazing_flyby_orbit() -> tuple[CartesianOrbits, np.ndarray]:
     big_f = np.arcsinh(np.sin(nu) * np.sqrt(e_orb**2 - 1.0) / (1.0 + e_orb * np.cos(nu)))
     mean_anom = e_orb * np.sinh(big_f) - big_f
     t_to_peri = -mean_anom / np.sqrt(_MU_EARTH / a**3)
-    target_epochs = epoch + np.linspace(0.0, 2.4 * t_to_peri, 200)
+    target_epochs = Epochs.from_mjd(epoch + np.linspace(0.0, 2.4 * t_to_peri, 200), scale="tdb")
     return orbits, target_epochs
 
 
@@ -754,7 +793,7 @@ def test_capture_event_subtables_no_silent_drops() -> None:
     # Coarse 50-day grid over the real 2017-2020 CD3 capture window. Capture
     # detection runs on the main integration grid, so a coarse target grid is
     # sufficient.
-    target_epochs = np.array([57000.0 + 50.0 * i for i in range(41)])
+    target_epochs = Epochs.from_mjd(np.array([57000.0 + 50.0 * i for i in range(41)]), scale="tdb")
     result = empyrean.propagate(orbit, target_epochs, config=config)
     events = result.events
 
@@ -842,7 +881,9 @@ def test_covariance_regime_changes_fire_under_auto() -> None:
     """
     orbits = _auto_escalation_orbit()
     t_ca = 62240.0  # ~2029-04-13 Earth flyby
-    target_epochs = np.array([t_ca - 30.0, t_ca - 5.0, t_ca, t_ca + 5.0, t_ca + 30.0])
+    target_epochs = Epochs.from_mjd(
+        np.array([t_ca - 30.0, t_ca - 5.0, t_ca, t_ca + 5.0, t_ca + 30.0]), scale="tdb"
+    )
     result = empyrean.propagate(
         orbits,
         target_epochs,
@@ -877,14 +918,20 @@ def test_auto_method_label_round_trips_in_ip_and_bplane() -> None:
         (UncertaintyMethod.AUTO, "auto"),
     ):
         ips = compute_impact_probabilities(
-            orbits, end_epoch=62300.0, methods=[method], body_filter=[Origin.EARTH]
+            orbits,
+            end_epoch=Epochs.from_mjd([62300.0], scale="tdb"),
+            methods=[method],
+            body_filter=[Origin.EARTH],
         )
         if len(ips) > 0:
             assert set(ips.method.to_pylist()) == {expected}, (
                 f"IP method label for {method.value}: got {set(ips.method.to_pylist())}"
             )
         bps = compute_b_planes(
-            orbits, end_epoch=62300.0, methods=[method], body_filter=[Origin.EARTH]
+            orbits,
+            end_epoch=Epochs.from_mjd([62300.0], scale="tdb"),
+            methods=[method],
+            body_filter=[Origin.EARTH],
         )
         if len(bps) > 0:
             assert set(bps.method.to_pylist()) == {expected}, (
@@ -900,7 +947,7 @@ def test_propagation_state_sensitivities_no_silent_drops() -> None:
     regression that drops an STM/STT column fails loudly.
     """
     orbits = _full_feature_orbit()
-    target_epochs = np.array([61000.0 + 60.0 * i for i in range(40)])
+    target_epochs = Epochs.from_mjd(np.array([61000.0 + 60.0 * i for i in range(40)]), scale="tdb")
     result = empyrean.propagate(
         orbits, target_epochs, uncertainty_method=UncertaintyMethod.SECOND_ORDER
     )
@@ -924,7 +971,9 @@ def test_ephemeris_observation_sensitivities_no_silent_drops() -> None:
     and it has to fail if the drop comes back.
     """
     orbits = _full_feature_orbit()
-    observers = Observers.from_code("500", [61000.5, 61010.5, 61020.5])
+    observers = Observers.from_code(
+        "500", Epochs.from_mjd([61000.5, 61010.5, 61020.5], scale="tdb")
+    )
     result = generate_ephemeris(orbits, observers, uncertainty_method=UncertaintyMethod.FIRST_ORDER)
     sens = result.sensitivity
     assert sens is not None and len(sens) > 0, (
@@ -940,7 +989,15 @@ def test_ephemeris_observation_sensitivities_no_silent_drops() -> None:
 
 def test_ephemeris_no_silent_drops() -> None:
     orbits = _full_feature_orbit()
-    observers = Observers.from_code("500", [61000.5, 61010.5, 61020.5])
+    # A real ground site, deliberately: the geocenter (500) has no local
+    # horizon, so its zenith/azimuth/hour-angle columns are legitimately
+    # all-null and this sweep would learn nothing about them. A site in
+    # the registry makes the engine compute all three, so a marshaling
+    # drop of the topocentric block fails here instead of hiding behind
+    # the horizonless case.
+    observers = Observers.from_code(
+        "689", Epochs.from_mjd([61000.5, 61010.5, 61020.5], scale="tdb")
+    )
     result = generate_ephemeris(orbits, observers)
 
     if len(result.ephemeris) == 0:
@@ -954,7 +1011,7 @@ def test_impact_probabilities_no_silent_drops() -> None:
     orbits = _full_feature_orbit()
     ips = compute_impact_probabilities(
         orbits,
-        end_epoch=63000.0,
+        end_epoch=Epochs.from_mjd([63000.0], scale="tdb"),
         methods=[UncertaintyMethod.FIRST_ORDER],
         body_filter=[Origin.EARTH],
     )
@@ -992,7 +1049,7 @@ def test_impactor_impact_probabilities_carry_the_surface_point() -> None:
     for method in (UncertaintyMethod.FIRST_ORDER, UncertaintyMethod.MONTE_CARLO):
         ips = compute_impact_probabilities(
             orbit,
-            end_epoch=54747.0,
+            end_epoch=Epochs.from_mjd([54747.0], scale="tdb"),
             methods=[method],
             body_filter=[Origin.EARTH],
         )
@@ -1023,7 +1080,7 @@ def test_b_planes_no_silent_drops() -> None:
     orbits = _full_feature_orbit()
     bps = compute_b_planes(
         orbits,
-        end_epoch=63000.0,
+        end_epoch=Epochs.from_mjd([63000.0], scale="tdb"),
         methods=[UncertaintyMethod.FIRST_ORDER],
         body_filter=[Origin.EARTH],
     )
@@ -1034,7 +1091,7 @@ def test_b_planes_no_silent_drops() -> None:
     assert not (bad_null or bad_not_null), _format_failures("BPlanes", bad_null, bad_not_null)
 
 
-# ── Non-grav covariance reaches the engine (empyrean-3qoe) ────────────
+# ── Non-grav covariance reaches the engine ───────────────────────────
 #
 # The forward-model marshals (propagate / generate_ephemeris / impact) used to
 # silently drop the fitted non-grav 3x3 covariance (`ng_covariance`) that the
@@ -1101,7 +1158,7 @@ def _position_sigma(states: CartesianOrbits) -> np.ndarray:
 
 def test_ng_covariance_reaches_propagated_covariance() -> None:
     """A fitted non-grav covariance must inflate the propagated per-state
-    covariance — the direct empyrean-3qoe reproduction.
+    covariance — the direct reproduction of the dropped-covariance bug.
 
     Propagates two orbits identical except for the presence of ``ng_covariance``
     and asserts (1) the per-state position sigma is strictly larger with the
@@ -1110,7 +1167,7 @@ def test_ng_covariance_reaches_propagated_covariance() -> None:
     deterministic (control: re-running it reproduces the covariance exactly, so
     the difference in (1) is attributable to ``ng_covariance``, not noise).
     """
-    target_epochs = np.array([61000.0 + 30.0 * i for i in range(6)])
+    target_epochs = Epochs.from_mjd(np.array([61000.0 + 30.0 * i for i in range(6)]), scale="tdb")
 
     with_cov = empyrean.propagate(
         _non_grav_solved_orbit(with_cov=True),
@@ -1173,19 +1230,21 @@ def test_ng_covariance_threads_through_ephemeris_and_impact() -> None:
     """
     orbits = _non_grav_solved_orbit(with_cov=True)
 
-    observers = Observers.from_code("500", [61000.5, 61010.5, 61020.5])
+    observers = Observers.from_code(
+        "500", Epochs.from_mjd([61000.5, 61010.5, 61020.5], scale="tdb")
+    )
     eph = generate_ephemeris(orbits, observers)
     assert len(eph.ephemeris) > 0, "ephemeris path produced no rows with ng_covariance present"
 
     ips = compute_impact_probabilities(
         orbits,
-        end_epoch=62300.0,
+        end_epoch=Epochs.from_mjd([62300.0], scale="tdb"),
         methods=[UncertaintyMethod.FIRST_ORDER],
         body_filter=[Origin.EARTH],
     )
     bps = compute_b_planes(
         orbits,
-        end_epoch=62300.0,
+        end_epoch=Epochs.from_mjd([62300.0], scale="tdb"),
         methods=[UncertaintyMethod.FIRST_ORDER],
         body_filter=[Origin.EARTH],
     )
@@ -1196,3 +1255,162 @@ def test_ng_covariance_threads_through_ephemeris_and_impact() -> None:
         np.isfinite(ips.sigma_distance_km.to_numpy(zero_copy_only=False))
     )
     assert len(bps) > 0
+
+
+# ── Observation planning ──────────────────────────────────────────────
+#
+# The plan's output surface has two blocks that are null by construction
+# on the wrong kind of row (sky-plane geometry on radar, the radar block
+# on optical), so the fixture below carries BOTH kinds — the allow-list
+# is a last resort and neither block needs an entry.
+
+
+def _plan_orbit_barycentric() -> CartesianOrbits:
+    """Apophis with a covariance, shifted to the barycentric basis the
+    planner evaluates in.
+
+    Derived from :data:`APOPHIS_STATE` through
+    :func:`transform_coordinates` so the two fixtures cannot drift; the
+    origin shift is a pure translation, so the covariance carries over
+    unchanged.
+    """
+    orbits = _full_feature_orbit()
+    coords = transform_coordinates(orbits.coordinates, CartesianCoordinates, origin="SSB")
+    return CartesianOrbits.from_kwargs(
+        orbit_id=["PLAN_TEST"],
+        object_id=["forcing_test_obj"],
+        coordinates=coords,
+    )
+
+
+def _plan_candidates() -> list[PlannedObservation]:
+    """Two optical sites, a caller-supplied-SNR radar run, and one that
+    has to derive its SNR from the link budget.
+
+    Every output block has an input that populates it: without the radar
+    rows the radar block would be uniformly null, without the optical
+    rows the sky-plane block would be, and without the link-budget row
+    ``radar_provenance`` would be empty everywhere.
+    """
+    t0 = APOPHIS_STATE["epoch"]
+    return [
+        PlannedObservation.optical(t0 + 10.0, "F51", (0.2, 0.2)),
+        PlannedObservation.optical(t0 + 12.0, "568", (0.3, 0.3)),
+        PlannedObservation.radar(
+            t0 + 15.0,
+            radar_bandwidth_hz=1.0e5,
+            radar_freq_resolution_hz=0.1,
+            radar_snr=50.0,
+        ),
+        PlannedObservation.radar(
+            t0 + 20.0,
+            radar_bandwidth_hz=1.0e5,
+            radar_freq_resolution_hz=0.1,
+            radar_target_h_mag=19.7,
+            radar_target_visual_albedo=0.23,
+            radar_target_radar_albedo=0.15,
+            radar_integration_s=600.0,
+        ),
+    ]
+
+
+# (attribute, class name) for every quivr table hanging off PlanResult.
+_PLAN_SUBTABLES: list[tuple[str, str]] = [
+    ("metrics", "PlanMetrics"),
+    ("candidates", "PlanCandidates"),
+    ("ephemeris", "PlanEphemeris"),
+]
+
+
+def test_plan_subtables_coverage_is_complete() -> None:
+    """Forcing function: every quivr table declared on ``PlanResult`` must
+    be in :data:`_PLAN_SUBTABLES`, so the silent-drop walk can't miss one.
+
+    Static (reads ``PlanResult.__annotations__`` — no engine call). The
+    failure mode it guards is a new output table landing upstream without
+    anyone extending the walk, leaving it silently unchecked.
+    """
+    import empyrean.planning.result as _planmod
+
+    def class_name(t: object) -> str:
+        # `from __future__ import annotations` makes these strings.
+        return t if isinstance(t, str) else getattr(t, "__name__", str(t))
+
+    # The two labels (orbit_id, active_width) are scalars, not tables.
+    scalars = {"orbit_id", "active_width"}
+    declared = {
+        name: class_name(t)
+        for name, t in _planmod.PlanResult.__annotations__.items()
+        if name not in scalars
+    }
+    walked = dict(_PLAN_SUBTABLES)
+
+    missing = set(declared) - set(walked)
+    extra = set(walked) - set(declared)
+    renamed = [
+        (a, walked[a], declared[a]) for a in set(walked) & set(declared) if walked[a] != declared[a]
+    ]
+
+    problems = []
+    if missing:
+        problems.append(
+            f"PlanResult table(s) NOT walked by test_no_silent_drops: {sorted(missing)} "
+            "— add them to _PLAN_SUBTABLES so they're checked for silent drops."
+        )
+    if extra:
+        problems.append(
+            f"_PLAN_SUBTABLES lists table(s) not on PlanResult: {sorted(extra)} "
+            "— remove the stale entries (renamed/removed upstream)."
+        )
+    if renamed:
+        problems.append(f"_PLAN_SUBTABLES class-name mismatch vs PlanResult: {renamed}")
+    assert not problems, "\n".join(problems)
+
+
+def test_plan_metrics_no_silent_drops() -> None:
+    plan = evaluate_plan(_plan_orbit_barycentric(), _plan_candidates())
+
+    assert len(plan.metrics) == 2, (
+        f"metrics brackets the campaign with a prior and a posterior row, got {len(plan.metrics)}"
+    )
+    bad_null, bad_not_null = _check_no_silent_drops(plan.metrics, "PlanMetrics")
+    assert not (bad_null or bad_not_null), _format_failures("PlanMetrics", bad_null, bad_not_null)
+
+
+def test_plan_candidates_no_silent_drops() -> None:
+    plan = evaluate_plan(_plan_orbit_barycentric(), _plan_candidates())
+
+    # `_check_no_silent_drops` skips zero-row columns, so without this the
+    # whole walk passes vacuously on an empty table — and PlanCandidates
+    # is the table the surface exists to produce.
+    assert len(plan.candidates) == len(_plan_candidates()), (
+        f"expected one row per submitted candidate, got {len(plan.candidates)}"
+    )
+    bad_null, bad_not_null = _check_no_silent_drops(plan.candidates, "PlanCandidates")
+    assert not (bad_null or bad_not_null), _format_failures(
+        "PlanCandidates", bad_null, bad_not_null
+    )
+
+
+def test_plan_ephemeris_no_silent_drops() -> None:
+    plan = evaluate_plan(_plan_orbit_barycentric(), _plan_candidates())
+
+    assert len(plan.ephemeris) > 0, "optical candidates must produce an ephemeris"
+    bad_null, bad_not_null = _check_no_silent_drops(plan.ephemeris, "PlanEphemeris")
+    assert not (bad_null or bad_not_null), _format_failures("PlanEphemeris", bad_null, bad_not_null)
+
+
+def test_plan_radar_provenance_is_carried_not_summarized() -> None:
+    """The link-budget notes are the wiring guard for the one output the
+    C ABI ships as a ragged array of owned strings: a drop there would
+    leave the derived-SNR row claiming an assumption-free budget.
+    """
+    plan = evaluate_plan(_plan_orbit_barycentric(), _plan_candidates())
+
+    provenance = plan.candidates.radar_provenance.to_pylist()
+    non_empty = [notes for notes in provenance if notes]
+    assert len(non_empty) == 1, (
+        f"exactly one candidate derives its SNR from the link budget, so "
+        f"exactly one may carry notes; got {provenance}"
+    )
+    assert all(isinstance(n, str) and n.strip() for n in non_empty[0]), non_empty[0]

@@ -27,6 +27,7 @@ from empyrean import (
     CartesianCovariance,
     CartesianOrbits,
     CovarianceKind,
+    Epochs,
     PropagationResult,
     TaggedCovariances,
 )
@@ -78,8 +79,8 @@ def _orbit_no_cov(orbit_id: str = "no-cov") -> CartesianOrbits:
     return CartesianOrbits.from_kwargs(orbit_id=[orbit_id], coordinates=coords)
 
 
-def _epochs() -> np.ndarray:
-    return np.array([_T0 + d for d in _OFFSETS], dtype=np.float64)
+def _epochs() -> Epochs:
+    return Epochs.from_mjd(np.array([_T0 + d for d in _OFFSETS], dtype=np.float64), scale="tdb")
 
 
 def test_tagged_covariance_off_by_default() -> None:

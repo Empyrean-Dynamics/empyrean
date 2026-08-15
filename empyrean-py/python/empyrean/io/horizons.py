@@ -8,7 +8,7 @@ import numpy as np
 import pyarrow as pa
 
 from empyrean.coordinates.enums import Frame, Origin
-from empyrean.coordinates.epoch import Epochs
+from empyrean.coordinates.epoch import Epochs, _epochs_mjd_tdb
 from empyrean.ephemeris.result import Ephemeris
 from empyrean.io._cache import resolve_cache_dir
 
@@ -18,7 +18,7 @@ FloatArray = np.ndarray[Any, np.dtype[np.float64]]
 def query_horizons(
     names: Sequence[str],
     observer: str,
-    epochs: Epochs | FloatArray | Sequence[float],
+    epochs: Epochs,
     cache_dir: str | Path | bool | None = None,
 ) -> Ephemeris:
     """Query JPL Horizons for observer-table ephemerides.
@@ -33,9 +33,12 @@ def query_horizons(
         Object names / designations / SPK IDs.
     observer : str
         MPC observatory code (e.g. ``"W84"``, ``"F51"``, ``"@399"``).
-    epochs : Epochs | array-like
-        Observation epochs. :class:`~empyrean.coordinates.epoch.Epochs`
-        table (converted to TDB internally) or a 1-D array of MJD TDB.
+    epochs : Epochs
+        Observation epochs as an
+        :class:`~empyrean.coordinates.epoch.Epochs` table, converted to
+        TDB internally. Build one with
+        ``Epochs.from_mjd(values, scale="tdb")`` (or ``scale="utc"``); a
+        bare array is refused, as it carries no time scale.
     cache_dir : str | Path | bool, optional
         - ``None`` (default): cache JSON responses under
           ``$EMPYREAN_CACHE_DIR/horizons`` (or
@@ -57,11 +60,7 @@ def query_horizons(
         SphericalCoordinates,
     )
 
-    if isinstance(epochs, Epochs):
-        tdb = epochs.to_tdb()
-        times_arr = np.asarray(tdb.mjd.to_numpy(zero_copy_only=False), dtype=np.float64)
-    else:
-        times_arr = np.asarray(epochs, dtype=np.float64)
+    times_arr = _epochs_mjd_tdb(epochs, "query_horizons() epochs")
 
     result = _query_horizons(
         list(names), observer, times_arr, resolve_cache_dir(cache_dir, "horizons")

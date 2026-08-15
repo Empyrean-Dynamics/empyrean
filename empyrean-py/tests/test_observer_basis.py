@@ -20,10 +20,10 @@ The contracts under test:
 import empyrean
 import numpy as np
 import pytest
-from empyrean import CartesianCoordinates, Frame, Observers, Origin
+from empyrean import CartesianCoordinates, Epochs, Frame, Observers, Origin
 
 CODES = ["500", "W84"]
-EPOCHS = [60000.0, 60001.0]
+EPOCHS = Epochs.from_mjd([60000.0, 60001.0], scale="tdb")
 
 
 def _xyz(observers: Observers) -> np.ndarray:

@@ -3,6 +3,7 @@
 //! biases, and the [`DetermineResult`] / [`EvaluateResult`] returned
 //! by the determine / evaluate / refine entry points.
 
+use crate::joint::ParamDisposition;
 use std::ffi::CStr;
 
 use crate::observers::obs_code_from_bytes;
@@ -349,35 +350,139 @@ impl CovarianceRepresentation {
     }
 }
 
-/// Per-axis wide solve-for selection (mirrors the engine's `SolveFor`).
+/// The largest number of thrust Δv correction segments one fit can
+/// declare, and the length of [`SolveFor::thrust`].
+pub const MAX_THRUST_SEGMENTS: usize = 3;
+
+/// What a fit does with each parameter axis (mirrors the engine's
+/// `SolveFor`).
 ///
-/// Each flag turns on one wide-STM axis, subject to its own precondition
-/// (a declared prior on the orbit) enforced by the engine. Used to
-/// request an explicit multi-axis fit via
-/// [`SolveForParams::Explicit`], and reported back on the result for
-/// fits the coarse variants can't name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Each axis carries a [`ParamDisposition`] rather than a flag, because
+/// the three treatments of a parameter are different operations: solved
+/// is estimated, considered inflates the posterior through its
+/// measurement partials without being estimated, and fixed is
+/// marginalized out. Using one where another is meant is silent — each
+/// produces a well-formed covariance.
+///
+/// Used to request an explicit multi-axis fit via
+/// [`SolveForParams::Explicit`], and reported back on
+/// [`DetermineResult::dispositions`] as what the fit actually ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SolveFor {
-    /// Solve the Marsden A1/A2/A3 block (requires a non-grav covariance).
-    pub marsden: bool,
-    /// Solve the non-grav time delay DT (requires `marsden` + a DT prior).
-    pub dt: bool,
-    /// Solve the SRP AMRAT (requires an SRP AMRAT prior).
-    pub amrat: bool,
-    /// Number of thrust Δv segments to solve (3 columns each; 0 = none).
-    pub thrust_segments: u32,
+    /// Disposition of the Marsden A1/A2/A3 block. Solving or considering
+    /// it requires the orbit to carry a non-grav covariance.
+    pub marsden: ParamDisposition,
+    /// Disposition of the non-grav time delay DT. Solving it requires
+    /// `marsden` solved plus a DT value and prior variance.
+    pub dt: ParamDisposition,
+    /// Disposition of the SRP AMRAT. Requires an SRP slot carrying an
+    /// AMRAT prior variance.
+    pub amrat: ParamDisposition,
+    /// Disposition of each **declared** thrust Δv segment, positional
+    /// with the orbit's `correction_covariances`.
+    ///
+    /// Positional rather than a count: a considered or fixed segment
+    /// sits between solved ones as readily as after them, and a count
+    /// cannot say which burn is which. Entries beyond the declared
+    /// count must be [`ParamDisposition::Fixed`].
+    pub thrust: [ParamDisposition; MAX_THRUST_SEGMENTS],
+}
+
+impl Default for SolveFor {
+    /// Every axis [`Fixed`](ParamDisposition::Fixed) — the state-only
+    /// set, and what a `false` flag always meant.
+    fn default() -> Self {
+        Self {
+            marsden: ParamDisposition::Fixed,
+            dt: ParamDisposition::Fixed,
+            amrat: ParamDisposition::Fixed,
+            thrust: [ParamDisposition::Fixed; MAX_THRUST_SEGMENTS],
+        }
+    }
 }
 
 impl SolveFor {
-    /// Recover the solved axes from a tagged [`SolvedCovariance`] — the
-    /// authoritative record of what the fit actually solved.
-    fn from_covariance(cov: &SolvedCovariance) -> Self {
-        Self {
-            marsden: cov.marsden_slot.is_some(),
-            dt: cov.dt_slot.is_some(),
-            amrat: cov.amrat_slot.is_some(),
-            thrust_segments: cov.thrust_slots.len() as u32,
+    /// Solve the leading `segments` burns, leaving the rest fixed.
+    ///
+    /// Refuses an over-budget request rather than saturating: clamping
+    /// would turn a four-segment request into a three-segment fit and
+    /// marginalize the fourth burn without a word.
+    pub fn with_leading_thrust(mut self, segments: usize) -> crate::error::Result<Self> {
+        if segments > MAX_THRUST_SEGMENTS {
+            return Err(crate::error::Error::invalid_input(format!(
+                "requested {segments} thrust segments but the engine's \
+                 maximum is {MAX_THRUST_SEGMENTS} — the 17-column wide budget \
+                 is shared across the state, Marsden, DT, AMRAT and thrust \
+                 axes"
+            )));
         }
+        for d in self.thrust.iter_mut().take(segments) {
+            *d = ParamDisposition::Solved;
+        }
+        Ok(self)
+    }
+
+    /// How many thrust segments this fit solves.
+    pub fn solved_thrust_segments(&self) -> usize {
+        self.thrust.iter().filter(|d| d.is_solved()).count()
+    }
+
+    /// How many thrust segments this fit considers.
+    pub fn considered_thrust_segments(&self) -> usize {
+        self.thrust.iter().filter(|d| d.is_considered()).count()
+    }
+
+    /// Recover the solved axes from a tagged [`SolvedCovariance`].
+    ///
+    /// Only ever reports `Solved` or `Fixed`: a solved-covariance's slot
+    /// tags record what occupied a column, and a considered axis
+    /// occupies none. A result's true partition — including which axes
+    /// were considered — is [`DetermineResult::dispositions`], which the engine
+    /// reports directly.
+    fn from_covariance(cov: &SolvedCovariance) -> Self {
+        let d = |present: bool| {
+            if present {
+                ParamDisposition::Solved
+            } else {
+                ParamDisposition::Fixed
+            }
+        };
+        let mut thrust = [ParamDisposition::Fixed; MAX_THRUST_SEGMENTS];
+        for slot in thrust.iter_mut().take(cov.thrust_slots.len()) {
+            *slot = ParamDisposition::Solved;
+        }
+        Self {
+            marsden: d(cov.marsden_slot.is_some()),
+            dt: d(cov.dt_slot.is_some()),
+            amrat: d(cov.amrat_slot.is_some()),
+            thrust,
+        }
+    }
+
+    pub(crate) fn to_ffi(self) -> empyrean_sys::EmpyreanSolveFor {
+        let mut thrust_dispositions = [ParamDisposition::Fixed.to_ffi(); MAX_THRUST_SEGMENTS];
+        for (i, d) in self.thrust.iter().enumerate() {
+            thrust_dispositions[i] = d.to_ffi();
+        }
+        empyrean_sys::EmpyreanSolveFor {
+            marsden: self.marsden.to_ffi(),
+            dt: self.dt.to_ffi(),
+            amrat: self.amrat.to_ffi(),
+            thrust_dispositions,
+        }
+    }
+
+    pub(crate) fn from_ffi(f: &empyrean_sys::EmpyreanSolveFor) -> crate::error::Result<Self> {
+        let mut thrust = [ParamDisposition::Fixed; MAX_THRUST_SEGMENTS];
+        for (i, d) in f.thrust_dispositions.iter().enumerate() {
+            thrust[i] = ParamDisposition::from_ffi(*d, &format!("thrust[{i}]"))?;
+        }
+        Ok(Self {
+            marsden: ParamDisposition::from_ffi(f.marsden, "marsden")?,
+            dt: ParamDisposition::from_ffi(f.dt, "dt")?,
+            amrat: ParamDisposition::from_ffi(f.amrat, "amrat")?,
+            thrust,
+        })
     }
 }
 
@@ -424,7 +529,7 @@ impl SolveForParams {
         match self {
             Self::StateOnly | Self::Auto => SolveFor::default(),
             Self::StateAndNonGrav => SolveFor {
-                marsden: true,
+                marsden: ParamDisposition::Solved,
                 ..SolveFor::default()
             },
             Self::Explicit(sf) => sf,
@@ -1111,8 +1216,23 @@ pub struct DetermineResult {
     /// Cumulative SRP AMRAT correction (m²/kg), when AMRAT was solved.
     pub amrat_delta: Option<f64>,
     /// Per-segment fitted thrust Δv (m/s), expressed in
-    /// [`dv_frame`](Self::dv_frame). Empty when no thrust was solved.
-    pub thrust_delta_m_per_s: Vec<[f64; 3]>,
+    /// [`dv_frame`](Self::dv_frame), indexed by **declared** segment.
+    ///
+    /// `None` at a segment this fit did not solve — that burn has no
+    /// correction, and a zero there would read as a fitted Δv of exactly
+    /// zero. Shares one index space with
+    /// [`thrust_correction_covariances`](Self::thrust_correction_covariances)
+    /// and [`dispositions`](Self::dispositions)`.thrust`.
+    pub thrust_delta_m_per_s: Vec<Option<[f64; 3]>>,
+    /// Per-segment fitted Δv correction covariances (AU/day)², indexed
+    /// by **declared** segment.
+    ///
+    /// `None` at a segment this fit did not solve: a considered or fixed
+    /// burn has no posterior, and echoing its prior here would republish
+    /// a prior under a posterior's name. Read
+    /// [`dispositions`](Self::dispositions)`.thrust[i]` before the
+    /// block.
+    pub thrust_correction_covariances: Vec<Option<[[f64; 3]; 3]>>,
     /// Integration frame the thrust Δv components are expressed in.
     /// `None` when no thrust was solved.
     pub dv_frame: Option<crate::coordinate::Frame>,
@@ -1122,6 +1242,26 @@ pub struct DetermineResult {
     /// when the call path ran no trust gate — absence of a verdict is
     /// not trust.
     pub covariance_trust: Option<CovarianceTrust>,
+    /// What the fit did with each parameter axis the orbit declared.
+    ///
+    /// Without it a covariance is ambiguous. An axis the fit
+    /// **considered** already has its uncertainty inside the delivered
+    /// 6×6, so re-attaching a prior to it double-counts; an axis held
+    /// **fixed** contributed nothing, so attaching a prior is
+    /// conservative and correct. Same covariance, opposite conclusions.
+    ///
+    /// Reports the request as resolved against the orbit, so under
+    /// [`SolveForParams::Auto`] it names the width the fit actually ran
+    /// at rather than the width requested.
+    pub dispositions: SolveFor,
+    /// Non-fatal conditions the fit reports about itself — chiefly
+    /// supplied covariance it deliberately did not use.
+    ///
+    /// Empty on a fit that used everything it was given, which is the
+    /// common case. These are delivered payload rather than log lines: a
+    /// dropped prior cross term changes how the σ for that slot should
+    /// be read.
+    pub warnings: Vec<String>,
 }
 
 impl DetermineResult {
@@ -1144,6 +1284,13 @@ impl DetermineResult {
             origin: st.origin,
             frame: st.frame,
             covariance: Some(self.covariance),
+            // The fit's own cross terms, from the same orbit this
+            // snapshot flattens — so the flat view and the re-feedable
+            // orbit describe one joint rather than two.
+            joint: crate::JointCovariance {
+                non_grav_cross: st.non_grav_cross,
+                wide_cross: self.orbit.wide_cross.clone(),
+            },
             stm: None,
             stt: None,
             resolved_kind: CovarianceKind::Linear,
@@ -1526,6 +1673,9 @@ mod batch_tests {
             dt_delta: None,
             amrat_delta: None,
             thrust_delta_m_per_s: Vec::new(),
+            thrust_correction_covariances: Vec::new(),
+            dispositions: SolveFor::default(),
+            warnings: Vec::new(),
             dv_frame: None,
             photometry: None,
             covariance_trust: None,

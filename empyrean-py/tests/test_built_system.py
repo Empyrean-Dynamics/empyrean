@@ -46,8 +46,8 @@ def _orbit() -> CartesianOrbits:
     return CartesianOrbits.from_kwargs(orbit_id=["a"], coordinates=coords)
 
 
-def _epochs() -> np.ndarray:
-    return np.array([59000.0, 59010.0, 59030.0])
+def _epochs() -> Epochs:
+    return Epochs.from_mjd(np.array([59000.0, 59010.0, 59030.0]), scale="tdb")
 
 
 # ── Construction / frozen key ─────────────────────────────────

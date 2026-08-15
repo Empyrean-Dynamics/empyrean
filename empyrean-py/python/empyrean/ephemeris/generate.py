@@ -10,6 +10,7 @@ from empyrean._convert import (
     _COORD_TYPE_MAP,
     AnyOrbits,
     coordinates_to_arrays,
+    extract_joint,
     extract_non_grav_covariance,
     extract_photometry,
     extract_srp,
@@ -342,6 +343,12 @@ def generate_ephemeris(
         srp_amrat_variance=srp_amrat_variance,
         has_non_grav_cov=has_non_grav_cov,
         non_grav_cov=non_grav_cov,
+        # The joint's off-diagonal terms. An ephemeris of a fitted orbit
+        # is computed against the covariance the fit produced, not
+        # against its diagonal blocks — the sky-plane covariance
+        # reported per row inherits whatever the state covariance was
+        # conditioned on. No keys at all when no orbit carries any.
+        **extract_joint(orbits),
         gm_threshold=gm_threshold,
         gm_max_depth=gm_max_depth,
         gm_components_per_split=gm_components_per_split,

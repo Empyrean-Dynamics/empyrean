@@ -67,11 +67,53 @@ fn flatten_batch(
     let mut flat = Vec::with_capacity(transformed.len());
     for (i, c) in transformed.iter().enumerate() {
         match coordinates_to_coordinate_state(c) {
-            Ok(cs) => flat.push(CoordinateState::from_empyrean(&cs)),
+            Ok(cs) => {
+                let mut out = CoordinateState::from_empyrean(&cs);
+                // The core flat type carries no border, so read it off
+                // the transformed `Coordinates` directly. The engine
+                // rotated it with the 6×6 it borders — dropping it here
+                // would silently return half a joint through a basis
+                // change, which is the failure this whole surface exists
+                // to remove.
+                let (has_border, cross) = crate::joint::border_to_c(c.extended_covariance());
+                out.has_non_grav_cross = has_border;
+                out.non_grav_cross = cross;
+                flat.push(out);
+            }
             Err(e) => return Err(format!("batch element {i} failed to transform: {e}")),
         }
     }
     Ok(flat)
+}
+
+/// Rebuild the engine coordinate a flat [`CoordinateState`] describes,
+/// **including** its state↔Marsden border.
+///
+/// Both transform entry points take a bare `CoordinateState` with no
+/// orbit beside it, so there is no `non_grav_covariance` in scope to
+/// pair the border with. The engine only ever rotates the border's
+/// `cross` half through the state Jacobian and never reads `params` on
+/// this path, so a zero parameter block is inert here rather than a
+/// substituted value — and the caller gets the same `cross` back,
+/// rotated, with `params` still living on their orbit.
+///
+/// Note what the entry points therefore do and do not move: a coordinate
+/// and its border, never a whole joint. An orbit's wide carrier is not
+/// in scope at this signature — it is an orbit-level object, and the
+/// coordinate does not carry it.
+fn coordinate_state_to_bordered_coordinates(
+    s: &CoordinateState,
+) -> Result<
+    empyrean_core::coordinates::Coordinates<
+        empyrean_core::coordinates::AU,
+        empyrean_core::coordinates::Degrees,
+    >,
+    String,
+> {
+    let coords = coordinate_state_to_coordinates(&s.to_empyrean()).map_err(|e| e.to_string())?;
+    let ext =
+        crate::joint::border_from_c(s.has_non_grav_cross, &s.non_grav_cross, [[0.0_f64; 3]; 3]);
+    Ok(crate::joint::coordinates_with_extended(coords, ext))
 }
 
 /// Transform a **batch** of coordinate states to a new representation,
@@ -163,7 +205,7 @@ pub unsafe extern "C" fn empyrean_transform_coordinates(
         // wearing the code that means "your arguments are wrong".
         let mut coords_in = Vec::with_capacity(num_states);
         for (i, s) in in_slice.iter().enumerate() {
-            match coordinate_state_to_coordinates(&s.to_empyrean()) {
+            match coordinate_state_to_bordered_coordinates(s) {
                 Ok(c) => coords_in.push(c),
                 Err(e) => {
                     set_last_error(&format!("batch element {i} failed to transform: {e}"));
@@ -245,7 +287,7 @@ pub unsafe extern "C" fn empyrean_transform_coordinates_single(
         }
 
         let ctx_ref = unsafe { &*ctx };
-        let input_state = unsafe { &*input }.to_empyrean();
+        let input_state = unsafe { &*input };
 
         let (target_rep, target_frm, target_orig) =
             match resolve_target(target_representation, target_frame, target_origin) {
@@ -256,10 +298,10 @@ pub unsafe extern "C" fn empyrean_transform_coordinates_single(
                 }
             };
 
-        let coords_in = match coordinate_state_to_coordinates(&input_state) {
+        let coords_in = match coordinate_state_to_bordered_coordinates(input_state) {
             Ok(c) => c,
             Err(e) => {
-                set_last_error(&e.to_string());
+                set_last_error(&e);
                 return -1;
             }
         };
@@ -273,8 +315,13 @@ pub unsafe extern "C" fn empyrean_transform_coordinates_single(
         ) {
             Ok(transformed) => match coordinates_to_coordinate_state(&transformed) {
                 Ok(flat) => {
+                    let mut out = CoordinateState::from_empyrean(&flat);
+                    let (has_border, cross) =
+                        crate::joint::border_to_c(transformed.extended_covariance());
+                    out.has_non_grav_cross = has_border;
+                    out.non_grav_cross = cross;
                     unsafe {
-                        *output = CoordinateState::from_empyrean(&flat);
+                        *output = out;
                     }
                     0
                 }
@@ -299,8 +346,8 @@ pub unsafe extern "C" fn empyrean_transform_coordinates_single(
     }
 }
 
-/// The batch/single contract at the ABI boundary (empyrean-c67i6 /
-/// the v3 batch-first rename).
+/// The batch/single contract at the ABI boundary (the v3 batch-first
+/// rename).
 ///
 /// The batched symbol is the one that grew; the single-state symbol is
 /// the same code path it always was, under a new name. What these pin is
@@ -326,6 +373,8 @@ mod batch_contract_tests {
             representation: 0, // Cartesian
             frame: 0,          // ICRF
             origin: 10,        // Sun
+            has_non_grav_cross: 0,
+            non_grav_cross: [[0.0; 3]; 6],
         };
         vec![
             base(59000.0, 1.0),
@@ -344,6 +393,8 @@ mod batch_contract_tests {
                 representation: 0,
                 frame: 0,
                 origin: 0,
+                has_non_grav_cross: 0,
+                non_grav_cross: [[0.0; 3]; 6],
             })
             .collect()
     }
@@ -447,6 +498,97 @@ mod batch_contract_tests {
         assert!(
             flatten_batch(&four, 3).is_err(),
             "a long result is refused too"
+        );
+    }
+
+    /// The border survives a basis change rather than being dropped.
+    ///
+    /// `CoordinateState` gained the state↔Marsden border in the 0.10.0
+    /// ABI, and both transform entry points take a bare
+    /// `CoordinateState` — so the natural implementation (flatten
+    /// through the core type, which has no border) would silently return
+    /// half a joint through every representation change. The engine
+    /// rotates the border with the 6×6 it borders; this pins that it
+    /// reaches the caller.
+    #[test]
+    fn the_marsden_border_survives_a_basis_change() {
+        let Some(ctx) =
+            crate::testing::context_or_skip("the_marsden_border_survives_a_basis_change")
+        else {
+            return;
+        };
+        let mut input = inputs()[0];
+        // A border needs its 6×6: the engine refuses a cross with no
+        // state block to border, which is the guard this test must stay
+        // on the right side of.
+        for i in 0..6 {
+            input.covariance[i][i] = 1.0e-8 * (i as f64 + 1.0);
+        }
+        input.has_covariance = 1;
+        input.has_non_grav_cross = 1;
+        input.non_grav_cross = [[1.0e-12, 2.0e-12, 3.0e-12]; 6];
+
+        let mut out = zeroed_out(1);
+        // Keplerian + EclipticJ2000: both the representation and the
+        // frame move, so the border goes through a real Jacobian rather
+        // than an identity.
+        let code = unsafe {
+            empyrean_transform_coordinates_single(&ctx, &input, 1, 1, 10, out.as_mut_ptr())
+        };
+        assert_eq!(code, 0, "the transform must accept a bordered state");
+
+        assert_eq!(
+            out[0].has_non_grav_cross, 1,
+            "the border must reach the caller, not be dropped at the flat boundary"
+        );
+        assert!(
+            out[0]
+                .non_grav_cross
+                .iter()
+                .flatten()
+                .all(|v| v.is_finite()),
+            "every border entry must be finite after the rotation"
+        );
+        assert_ne!(
+            out[0].non_grav_cross, input.non_grav_cross,
+            "the border must be ROTATED, not passed through unchanged — a copy \
+             would be a border describing the old basis attached to a new one"
+        );
+
+        // And the batch path agrees with the single path, border included.
+        let mut batch_out = zeroed_out(1);
+        let code = unsafe {
+            empyrean_transform_coordinates(&ctx, &input, 1, 1, 1, 10, batch_out.as_mut_ptr())
+        };
+        assert_eq!(code, 0);
+        assert_eq!(batch_out[0].has_non_grav_cross, out[0].has_non_grav_cross);
+        assert_eq!(
+            batch_out[0].non_grav_cross, out[0].non_grav_cross,
+            "batch element 0 must be bit-identical to the single call, border included"
+        );
+    }
+
+    /// A state with no border transforms exactly as it did before 0.10.0 —
+    /// the zero-init contract, exercised through the shipped entry
+    /// point rather than asserted about the struct.
+    #[test]
+    fn a_borderless_state_is_unchanged_by_the_new_field() {
+        let Some(ctx) =
+            crate::testing::context_or_skip("a_borderless_state_is_unchanged_by_the_new_field")
+        else {
+            return;
+        };
+        let input = inputs()[0];
+        assert_eq!(input.has_non_grav_cross, 0, "the fixture carries no border");
+        let mut out = zeroed_out(1);
+        let code = unsafe {
+            empyrean_transform_coordinates_single(&ctx, &input, 1, 1, 0, out.as_mut_ptr())
+        };
+        assert_eq!(code, 0);
+        assert_eq!(out[0].has_non_grav_cross, 0, "no border in, no border out");
+        assert_eq!(
+            out[0].non_grav_cross, [[0.0; 3]; 6],
+            "and no fabricated values"
         );
     }
 

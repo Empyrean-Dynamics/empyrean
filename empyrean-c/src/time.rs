@@ -2,7 +2,8 @@
 //!
 //! Native (no astropy detour) round-trip between ISO 8601 UTC strings
 //! and MJD values in either UTC or TDB. Backed by villeneuve's
-//! leap-second + Fairhead & Bretagnon (1990) TDB-TT secular term.
+//! leap-second table and the full periodic Fairhead & Bretagnon (1990)
+//! TDB-TT series — the annual term is carried, not truncated away.
 
 use std::ffi::{CStr, c_char};
 use std::panic::AssertUnwindSafe;

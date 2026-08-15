@@ -300,6 +300,15 @@ Three artifacts land under `--out-dir`:
   keyed by its ADES designation. Fully re-feedable: state, covariance,
   and non-gravitational model carry straight into a follow-on
   `empyrean propagate` / `empyrean ephemeris` with no reconstruction.
+  A wide fit's orbit additionally carries the **joint** — the
+  off-diagonal blocks of the fitted covariance, beyond the state+Marsden
+  9×9. Only parquet (the `--format` default) can hold them; `--format
+  csv` and `--format json` refuse such a batch **by name** rather than
+  writing it short, because a file written short reads back as a
+  block-diagonal joint, which is a tighter claim than the fit made and
+  leaves nothing in the round trip to signal the loss. Keep the default
+  format for wide fits; a fit whose orbit carries no cross terms writes
+  in whichever format you ask for.
 - `fit_summary.parquet` **and** `fit_summary.csv` — one row per *input*
   object, delivered or not: `status`, convergence, iterations, observation
   and selected counts, residual RMS, reduced χ², both acceptability
@@ -363,10 +372,22 @@ beyond the 6-element state:
 - `non-grav-amrat` — state + Marsden + AMRAT.
 - `auto` (default) — state-only, escalating to non-grav automatically on a poor fit.
 
-`--thrust-segments <N>` additionally solves `N` impulsive **thrust Δv
-segments** (0 = none). Each solved segment is a 3-vector in the integration
-frame; its burn window must be bracketed by observations, or empyrean
-refuses the fit rather than letting the state quietly absorb the maneuver.
+`--thrust-segments <N>` additionally solves the leading `N` impulsive
+**thrust Δv segments** (0 = none), up to the engine's maximum of 3. Each
+solved segment is a 3-vector in the integration frame; its burn window must be
+bracketed by observations, or empyrean refuses the fit rather than letting the
+state quietly absorb the maneuver. An over-budget `N` is **refused**, not
+clamped — silently fitting three of four requested burns would marginalize the
+fourth without a word.
+
+Underneath, each axis carries a *disposition* rather than a flag: solved,
+fixed, or **considered** — not estimated, but its prior uncertainty still
+reaching the posterior through its measurement partials. This CLI opens an
+axis or leaves it out, so it only ever produces solved or fixed; there is no
+flag for considered, because it is a distinct modelling statement rather than
+a shade of "off" and wants its own surface rather than an overloading of
+`--solve-for`. An axis you did not request is marginalized out and changes no
+number.
 
 DT and AMRAT are refine-path axes: each is opened only when a prior
 variance is supplied for it (`--dt-variance` / `--amrat-variance`).
@@ -393,8 +414,12 @@ empyrean determine maneuvering.psv --solve-for non-grav --thrust-segments 2 --ou
 
 After the per-object table, each delivered object gets a readback of
 exactly the wide axes it recovered, under its own designation. A line for
-an axis appears only when that axis was actually solved, so a missing
-line reads as "not recovered", never a zero:
+a scalar axis appears only when that axis was actually solved, so a missing
+line reads as "not recovered", never a zero. Thrust is the exception, and
+deliberately so: the segments are indexed by **declared** burn, so every
+declared segment gets a line and an unsolved one says `not solved` rather
+than printing zeros — a zero there would read as a fitted correction of
+exactly zero, which is a result the fit never produced:
 
 ```text
   Object           Converged  Iter  RMS_RA" RMS_Dec"    Obs    Sel     Fit  Extrap
@@ -404,6 +429,17 @@ line reads as "not recovered", never a zero:
   1P:
     Solved covariance width: 10
     Non-grav time delay  ΔDT = 0.0142 d
+```
+
+With three burns declared on the orbit and `--thrust-segments 2` opening the
+leading two, the readback is positional across all three:
+
+```text
+  2024 ABC:
+    Solved covariance width: 15
+    Thrust dv[0] = [0.412, -0.089, 0.003] m/s
+    Thrust dv[1] = [0.118, 0.201, -0.044] m/s
+    Thrust dv[2] = not solved
 ```
 
 ### Tagged solved covariance
@@ -451,6 +487,14 @@ sitting next to the binary, else a build-time location — an
 `EMPYREAN_LIB_DIR` override, a sibling `../target/release` build, or
 a checksum-pinned prebuilt downloaded from the GitHub release (in
 that order); no system library path setup is needed.
+
+"Matching" above means the same release: the loader reads the engine's
+ABI version when it opens the library and refuses — naming both numbers
+and the resolved path — if it differs from the one this binary was built
+against. The ABI version encodes the release, so a `libempyrean` from a
+different release is rejected rather than driven through a layout that
+may have moved. Download both tarballs from the same release page and
+this cannot arise.
 
 ## License
 

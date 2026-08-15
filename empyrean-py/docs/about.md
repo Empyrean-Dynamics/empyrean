@@ -114,10 +114,9 @@ obs = empyrean.query_observations(["99942"])
 fit = empyrean.refine(orbits, obs)                  # scott + villeneuve
 
 # 4. Propagate the fitted orbit forward 10 years → states + events.
-#    The fitted epoch is a time-scale-aware Epochs; do the +10 yr offset
-#    in the TDB numeric domain and rebuild a typed grid.
-epoch_0 = fit.orbit.coordinates.epoch
-targets = empyrean.Epochs.from_mjd(epoch_0.mjd_tdb() + 10 * 365.25, scale="tdb")
+#    The coordinate epoch column is a plain float, MJD TDB by definition;
+#    from_orbits offsets it and returns the typed grid propagate wants.
+targets = empyrean.Epochs.from_orbits(fit.orbit, [10 * 365.25])
 result  = empyrean.propagate(fit.orbit, targets)
 result.events.close_approach_starts  # one row per CA per body
 result.events.capture_starts         # temporary gravitational capture

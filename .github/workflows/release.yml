@@ -525,6 +525,34 @@ jobs:
           rm -rf libempyrean-dist
           gh run download "$prep_run" --pattern 'libempyrean-*' --dir libempyrean-dist
 
+          # The pin must be FOR THIS TAG. checksums.txt is stamped by
+          # prepare-release.yml ("# Pinned for v<version>."); a stamp for any
+          # other version means Prepare was not run for this release, and the
+          # hash loop below would then verify a stale-but-consistent pair —
+          # old pins matching old tarballs — which is exactly how 0.9.0-era
+          # binaries shipped under v0.10.0-rc.0. Currency first, then
+          # consistency.
+          if ! grep -qxF "# Pinned for ${tag}." empyrean-sys/checksums.txt; then
+            stamp=$(grep -m1 '^# Pinned for ' empyrean-sys/checksums.txt || true)
+            echo "::error::empyrean-sys/checksums.txt is not pinned for ${tag} (found: '${stamp:-no stamp}'). Run prepare-release.yml with version=${tag#v} on main, land its pin commit, and cut the tag from that commit."
+            exit 1
+          fi
+
+          # ABI-surface currency: the header inside every served tarball must
+          # be byte-identical to include/empyrean.h in the tagged tree. A
+          # stale or foreign artifact whose ABI surface differs cannot pass;
+          # nothing is executed.
+          hdr_fail=0
+          for t in libempyrean-dist/libempyrean-*.tar.gz; do
+            d=$(mktemp -d)
+            tar -xzf "$t" -C "$d" empyrean.h
+            if ! cmp -s "$d/empyrean.h" include/empyrean.h; then
+              echo "::error::$(basename "$t"): bundled empyrean.h differs from include/empyrean.h at ${tag} — this artifact was not built from the tagged tree. Re-run prepare-release."
+              hdr_fail=1
+            fi
+          done
+          [ "$hdr_fail" -eq 0 ] || { echo "Header currency check failed — refusing to publish."; exit 1; }
+
           # Verify each committed checksum against the prepared tarball. A
           # mismatch means the tag was cut from a commit whose checksums.txt
           # does not match the prepared binaries — refuse to publish.

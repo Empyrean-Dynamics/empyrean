@@ -541,16 +541,25 @@ jobs:
           # ABI-surface currency: the header inside every served tarball must
           # be byte-identical to include/empyrean.h in the tagged tree. A
           # stale or foreign artifact whose ABI surface differs cannot pass;
-          # nothing is executed.
+          # nothing is executed. gh run download places each artifact in its
+          # own subdirectory, so walk with find (like the hash loop below) —
+          # and a walk that finds nothing must fail, not pass vacuously.
           hdr_fail=0
-          for t in libempyrean-dist/libempyrean-*.tar.gz; do
+          hdr_seen=0
+          while IFS= read -r t; do
+            hdr_seen=$((hdr_seen + 1))
             d=$(mktemp -d)
-            tar -xzf "$t" -C "$d" empyrean.h
-            if ! cmp -s "$d/empyrean.h" include/empyrean.h; then
-              echo "::error::$(basename "$t"): bundled empyrean.h differs from include/empyrean.h at ${tag} — this artifact was not built from the tagged tree. Re-run prepare-release."
+            tar -xzf "$t" -C "$d"
+            h=$(find "$d" -name empyrean.h | head -1)
+            if [ -z "$h" ] || ! cmp -s "$h" include/empyrean.h; then
+              echo "::error::$(basename "$t"): bundled empyrean.h missing or differs from include/empyrean.h at ${tag} — this artifact was not built from the tagged tree. Re-run prepare-release."
               hdr_fail=1
             fi
-          done
+          done < <(find libempyrean-dist -name 'libempyrean-*.tar.gz')
+          if [ "$hdr_seen" -eq 0 ]; then
+            echo "::error::no libempyrean tarballs found to header-check — refusing to publish."
+            exit 1
+          fi
           [ "$hdr_fail" -eq 0 ] || { echo "Header currency check failed — refusing to publish."; exit 1; }
 
           # Verify each committed checksum against the prepared tarball. A

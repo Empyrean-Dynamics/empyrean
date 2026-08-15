@@ -1,6 +1,6 @@
 """Behavioral contract for the GaussianMixture (adaptive Gaussian
 mixture, AGM) uncertainty method in :func:`empyrean.propagate` and
-:func:`empyrean.generate_ephemeris` — bd empyrean-p1j7.
+:func:`empyrean.generate_ephemeris`.
 
 GaussianMixture is exposed as a top-level uncertainty method (tag 5)
 reusing the AGM parameter slots the C ABI already carried for ``Auto``;

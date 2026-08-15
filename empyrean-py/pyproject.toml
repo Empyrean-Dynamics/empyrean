@@ -87,9 +87,8 @@ test = [
 ]
 lint = [
     # Pinned exact: ruff is unpinned-latest in CI, so a minor bump that adds
-    # lint rules turns every open PR red mid-review (bd empyrean-ekqe/zxtd
-    # surfaced this on 0.16.0). Bump deliberately, fixing new findings in the
-    # same change.
+    # lint rules turns every open PR red mid-review (0.16.0 did exactly
+    # that). Bump deliberately, fixing new findings in the same change.
     "ruff==0.16.0",
     "mypy>=1.10",
 ]

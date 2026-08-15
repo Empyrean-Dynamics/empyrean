@@ -12,6 +12,15 @@ members = [
 # feature). The "shared villeneuve.rlib for bit-identical numerics"
 # invariant holds because every crate here reaches villeneuve through
 # the single engine generation empyrean-core's release tag pins.
+#
+# To co-develop a sibling engine repo against this workspace, add a
+# `[patch."ssh://git@github.com/Empyrean-Dynamics/<repo>.git"]` block
+# HERE, with `<crate> = { path = "../<repo>" }`. It has to be this file:
+# cargo honours `[patch]` only at the workspace root, and a block added
+# to a member's own manifest — or to a path-dependency's — is silently
+# ignored rather than rejected. Such a block is a local override and is
+# never committed.
+
 # Release profile for the published cdylib (empyrean-c → libempyrean.dylib /
 # .so / .dll), the empyrean-py PyO3 wheel, and the empyrean-cli binary.
 # Symbols are stripped so the only names visible in the dynamic symbol

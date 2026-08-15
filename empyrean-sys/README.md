@@ -63,10 +63,16 @@ against the matching header or repoint at the matching engine. There is
 no compatible range to reason about, and a value that did not move is no
 longer a promise that nothing did.
 
-The scheme begins with 0.10.0. Every release before it — through
-0.10.0-rc.0 — reported an independent counter instead, now retired,
-which reached 3; that counter is the subject of the historical notes
-below, and no library has ever reported a value between 3 and 1000.
+The scheme begins with 0.10.0. Every release before it reported an
+independent counter instead, now retired, whose last published value is
+2 (v0.9.0); that counter is the subject of the historical notes below,
+and no library has ever reported a value between it and 1000.
+
+Only the base version is encoded — the pre-release suffix is not, so
+`0.10.0-rc.1` and `0.10.0` both report `1000`. The handshake therefore
+separates one version from another and never a version from its own
+pre-releases: a boundary change inside a pre-release cycle is not caught
+by it, and both sides must be rebuilt together.
 
 ### The 0.10.0 ABI — the joint covariance
 
@@ -136,9 +142,11 @@ both arrays.
 
 ### ABI 3 — the last of the retired counter
 
-Historical: `3` was the final value of the independent counter, shipped by
-0.10.0-rc.0. Its changes are still in force, and repeated here because a
-consumer upgrading from an ABI-2 library crosses both breaks at once.
+Historical: `3` was the final value of the independent counter. It was
+prepared but never published — every released library on the counter tops
+out at 2 (v0.9.0) — so the changes below reach consumers for the first
+time in this release, and every upgrading consumer crosses both breaks at
+once.
 
 **Function shapes.** `empyrean_determine` keeps its name and arity, but
 its final out-parameter is now `EmpyreanDetermineResults *` — the batch
@@ -343,9 +351,11 @@ at the repository root for field-level semantics.
   `has_max_sun_altitude_deg` / `max_sun_altitude_deg` pair (unset takes the
   engine's default of −18°, astronomical twilight; the `has_` switch exists
   because `0.0` is a legal solar altitude, so a defaulted zero would plan a
-  campaign in daylight) — **no exported entry point reads them yet**, and
-  they ride the struct so that exposing visibility later needs no further
-  ABI break.
+  campaign in daylight). Both are marshaled across in full, and **no
+  exported entry point applies them**: the gates that read them belong to
+  the engine's visibility survey, which this ABI does not export. They
+  ride the struct so that exposing the survey later needs no further ABI
+  break.
 - **Basis-tagged mixture components.** Each `EmpyreanMixtureComponent`
   is tagged with the reference `frame` and center-body `origin` (NAIF
   id) its mean and covariance are expressed in.

@@ -767,10 +767,19 @@ pub const EMPYREAN_PHOTOMETRY_MODEL_HG1G2: i32 = 4;
 /// release that ships it, not by an independent counter.
 ///
 /// **The scheme begins with 0.10.0**, which reports `1000` — the
-/// smallest value it can produce. Every release before it, through
-/// 0.10.0-rc.0, reported the retired independent counter instead, which
-/// reached 3; that is why values below 1000 are counter-era and are not
-/// release numbers.
+/// smallest value it can produce. Every release before it reported the
+/// retired independent counter instead; its last published value is 2,
+/// shipped by v0.9.0. That is why values below 1000 are counter-era and
+/// are not release numbers.
+///
+/// **Only the base version is encoded.** The pre-release suffix is not:
+/// `0.10.0-rc.1` and `0.10.0` both report `1000`. So this number
+/// separates one version from another, and never a version from its own
+/// pre-releases — if a boundary type moves inside a pre-release cycle,
+/// the handshake will not catch the mismatch and both sides have to be
+/// rebuilt together. Across the pre-releases of a single version, the
+/// artifact or tag that was installed is the only thing that identifies
+/// the exact build.
 ///
 /// The distribution's own release string is not exported. A consumer
 /// identifies the build it is running by the artifact or tag it
@@ -790,8 +799,11 @@ pub const EMPYREAN_ABI_VERSION: u32 = 1000;
 /// descend from this one literal.
 ///
 /// `CARGO_PKG_VERSION_MAJOR` / `_MINOR` / `_PATCH` drop any pre-release
-/// suffix, so `0.10.0-rc.0` and `0.10.0` both encode to `1000`, exactly
-/// as the scheme above says pre-releases of a version do.
+/// suffix, so a pre-release and its final release encode to the same
+/// number and the assertion holds across a whole pre-release cycle
+/// without either side moving. That is the mechanism behind the
+/// base-version-only limitation stated on the constant above; it is a
+/// property of this encoding, not an oversight in the check.
 const fn encoded_crate_version() -> u32 {
     const fn parse_u32(s: &str) -> u32 {
         let bytes = s.as_bytes();

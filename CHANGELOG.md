@@ -150,6 +150,15 @@ project adheres to [Semantic Versioning](https://semver.org).
   the single-leg answer; on the same input, dropping the cross terms
   understates the propagated position variance.
 
+  How much it understates by is fixture-specific, so here is one
+  measured case rather than a general claim. On the wide-layout orbit in
+  `empyrean-py/tests/test_wide_cross.py` — propagated, re-linked so the
+  cross terms are the engine's own, then carried 3000 days to its
+  close approach — dropping them understates the close-approach σ by
+  about 19% and the B-plane covariance by about 34%. Both figures are
+  pinned by bands in that file, so they turn red rather than drift
+  silently if an engine pin moves them.
+
   Entries are keyed by parameter name (`"AMRAT"`, `"thrust[0].x"`)
   through `WideCross.state_cross` / `.param_cross`, which refuse to
   reshape a row whose tags and payload disagree rather than attaching
@@ -161,8 +170,8 @@ project adheres to [Semantic Versioning](https://semver.org).
   name — `False` cannot say whether an axis was considered or fixed.
 
 - **Observation planning reaches Rust and Python.** `empyrean_evaluate_plan`
-  has been carried by the C ABI since v0.7.0 with no consumer in any other
-  channel; both now exist. Rust gains `Context::evaluate_plan` with typed
+  has been carried by the C ABI since v0.7.0-rc.4 with no consumer in any
+  other channel; both now exist. Rust gains `Context::evaluate_plan` with typed
   inputs (`PlannedObservation::optical` / `::radar`, `RadarPlanSpec::given` /
   `::link_budget`, `PlanningConfig`) and owned results. Python gains
   `empyrean.evaluate_plan`, taking one covariance-bearing orbit plus
@@ -196,9 +205,9 @@ project adheres to [Semantic Versioning](https://semver.org).
   duplicate entries fail by line number; and the consumption scanner's own
   discrimination (calls count; comments, strings, imports, and test-gated
   code do not) is pinned by a fixture test. The gate exists because
-  `empyrean_evaluate_plan` shipped in every release of this distribution —
-  the eight this changelog records, 0.7.0-rc.4 through 0.10.0-rc.0 — with no
-  consumer in any channel, and nothing noticed. The allow-list opens with a
+  `empyrean_evaluate_plan` shipped in every published release of this
+  distribution, from 0.7.0-rc.4 through 0.9.0, with no consumer in any
+  channel, and nothing noticed. The allow-list opens with a
   single entry: the load-time ABI handshake, consumed by `empyrean-sys`
   itself.
 
@@ -262,16 +271,28 @@ project adheres to [Semantic Versioning](https://semver.org).
   entry point with a `TypeError` that names the fix — not a deprecation
   warning, and never a silent assumption of TDB.
 
+  The scale-pinned carve-outs are unchanged and stay plain floats,
+  because their scale is fixed by definition rather than by the caller:
+  columns named `mjd_tdb`, arguments named `epoch_mjd_tdb`, and the
+  `epoch` column on the four coordinate tables, which is MJD TDB. That
+  column is one you read rather than a time you hand in; converting it
+  for reuse is `Epochs.from_mjd(..., scale="tdb")`, or
+  `Epochs.from_orbits(orbits, offsets)` which offsets and tags in one
+  step.
+
   A Modified Julian Date is a clock reading, not an instant. `61000.5`
   read as UTC and `61000.5` read as TDB name two moments about 69
   seconds apart, and that gap has grown with every leap second since
   1972. Which one a caller meant is a modelling statement, and the old
   signatures — `epochs: Epochs | np.ndarray | Sequence[float]`, with
   arrays taken as TDB — let a call site inherit that statement instead
-  of making it. Sixty-nine seconds is not a rounding error: mislabelling
-  one scale as the other moves a heliocentric state by roughly 360 km
-  before any encounter amplifies it, and an object crossing the Earth's
-  sphere of influence covers several hundred kilometres in that time.
+  of making it. Sixty-nine seconds is not a rounding error. Mislabelling
+  one scale as the other displaces a heliocentric state along track by
+  \(|v| \times 69.18\,\text{s}\) — about 1460 km for a body at 2 AU
+  (21.1 km/s) and about 2060 km at 1 AU (29.8 km/s) — before any
+  encounter amplifies it; an object crossing the Earth's sphere of
+  influence covers roughly 350 to 1040 km in that time, at a geocentric
+  5 to 15 km/s.
 
   Thirteen signatures change: `propagate` and `BuiltSystem.propagate`,
   `get_states`, `get_observer_states`, `Observers.from_code` /
@@ -296,15 +317,18 @@ project adheres to [Semantic Versioning](https://semver.org).
   timestamp's trailing `Z` already states the input's scale.
 
   Columns named `mjd_tdb`, and the arguments named `epoch_mjd_tdb` that
-  mirror the core signatures (`PlannedObservation.optical` / `.radar`,
-  `query_horizons_vectors`), are unchanged: there the name pins the
-  scale, so nothing is left unstated. Output tables are unaffected.
+  mirror the **C ABI's** flattened fields (`PlannedObservation.optical` /
+  `.radar`, `query_horizons_vectors`), are unchanged: there the name pins
+  the scale, so nothing is left unstated. The Rust forms of those same
+  constructors take a typed `Epoch` instead — the flattening is the C
+  boundary's, not a divergence. Output tables are unaffected.
 
   The Rust channel keeps `f64` times, and its time parameters name their
   scale explicitly — every one is either a typed `Epoch` that carries
-  its own `TimeScale` or a parameter named `*_mjd_tdb`, and the two
+  its own `TimeScale` or a parameter named `*_mjd_tdb`, and the three
   `empyrean-cli` flags that take a time (`propagate --epoch`,
-  `ephemeris --epoch`) state "(MJD TDB)" in their help text. An audit of
+  `ephemeris --epoch`, `query horizons-vectors --epoch-mjd-tdb`) all name
+  MJD TDB in their help text. An audit of
   every public function in `empyrean/src` found no ambiguous time
   parameter, so no signature changed there.
 
@@ -323,7 +347,8 @@ project adheres to [Semantic Versioning](https://semver.org).
   The comparison also corrects the documentation: the TT↔TDB conversion
   carries the **full periodic** Fairhead & Bretagnon (1990) series, not
   the secular-only truncation the docstrings claimed. The measured
-  TDB−UTC offset varies by 3.3148 ms peak-to-peak over a decade, matching
+  TDB−UTC offset varies by 3.3148 ms peak-to-peak over the six-year grid
+  the test samples (MJD 60300–62500), matching
   astropy's to the microsecond.
 
   The comparison surfaced one genuine defect, which this release
@@ -376,10 +401,18 @@ project adheres to [Semantic Versioning](https://semver.org).
   `EMPYREAN_ABI_VERSION` encodes the distribution's own version as
   `major * 10000 + minor * 100 + patch` and advances with every release
   whether or not any boundary type changed. The scheme **begins with
-  0.10.0**, which reports `1000`; every release before it — through
-  0.10.0-rc.0 — reported the retired independent counter instead, which
-  reached 3. Values below 1000 are therefore counter-era, not release
+  0.10.0**, which reports `1000`; every release before it reported the
+  retired independent counter instead, whose last published value is 2
+  (v0.9.0). Values below 1000 are therefore counter-era, not release
   numbers, and no library has ever reported anything between the two.
+
+  Only the **base** version is encoded — the pre-release suffix is not,
+  so `0.10.0-rc.1` and `0.10.0` both report `1000`. The number separates
+  one version from another and never a version from its own
+  pre-releases, so a boundary type that moves inside a pre-release cycle
+  is not caught by the handshake and both sides must be rebuilt
+  together. Within a version's pre-releases the installed artifact or
+  tag is what identifies the exact build.
 
   The consequence for consumers is that the number no longer says
   anything about layout: the only reading it supports is equality. A

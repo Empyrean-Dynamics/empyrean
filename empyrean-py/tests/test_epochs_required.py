@@ -21,7 +21,7 @@ Three gates live here:
    TDB — two MJD numbers ~69 s apart — propagates to bit-identical
    states, which is only possible if the declared scale is applied.
 
-Two carve-outs, both deliberate:
+Three carve-outs, all deliberate:
 
 * Parameters whose name pins the scale (``epoch_mjd_tdb``,
   ``end_mjd_tdb``) are already unambiguous — the name is the statement —
@@ -31,6 +31,14 @@ Two carve-outs, both deliberate:
   where numbers legitimately become epochs. They are exempted here and
   covered instead by
   :func:`test_epochs_constructors_require_an_explicit_scale`.
+* The ``epoch`` column on the four coordinate tables is a plain float,
+  MJD TDB by definition. It is a column you read, not a parameter you
+  pass, so the scan below cannot see it in the first place —
+  ``from_kwargs`` is inherited from quivr and never reaches
+  :func:`_time_parameters`. It is listed here so the boundary is
+  greppable: converting it for reuse as a time input is
+  ``Epochs.from_mjd(..., scale="tdb")`` or
+  :meth:`~empyrean.Epochs.from_orbits`.
 """
 
 from __future__ import annotations
@@ -81,10 +89,12 @@ _TIME_PARAM = re.compile(r"^(epoch|epochs|time|times)$|_(epoch|epochs|time|times
 # ``empyrean-core`` signatures one-for-one.
 _SCALE_PINNED = re.compile(r"_mjd_(tdb|utc)$")
 
-# Types a time parameter must not admit. ``str`` and ``datetime`` are in
-# the list for the same reason as ``float``: a naive datetime carries no
-# scale, and an ISO string's scale is a parsing convention, not a
-# declaration the callee can see.
+# Types a time parameter must not admit. A naive ``datetime`` carries no
+# scale, for the same reason a ``float`` does not. ``str`` is refused on
+# different grounds: a conforming ISO timestamp's trailing ``Z`` does
+# state its scale, but times cross this API as a typed table rather than
+# as text, and a parameter that accepted both would have to guess which
+# of the two a caller meant.
 _FORBIDDEN = ("ndarray", "Sequence", "float", "list", "int", "str", "datetime")
 
 # ``Epochs`` is where numbers legitimately become epochs.
@@ -433,12 +443,19 @@ def test_refusal_names_the_entry_point_the_caller_used() -> None:
 
 
 def test_iso_string_refusal_points_at_from_iso() -> None:
-    """A string gets the ISO constructor, not the MJD one."""
+    """A string gets the ISO constructor, not the MJD one.
+
+    And it is not told its timestamp carries no scale: the trailing
+    ``Z`` states the scale, so the reason a string is refused is the
+    type. Telling the caller otherwise would push them back into the
+    hand-conversion this surface exists to remove.
+    """
     with pytest.raises(TypeError) as excinfo:
         Observers.from_code("689", "2026-01-01T00:00:00.000Z")
     message = str(excinfo.value)
     assert "Epochs.from_iso" in message
-    assert "no time scale" in message
+    assert "no time scale" not in message
+    assert "'Z'" in message
 
 
 def test_refusal_is_not_a_deprecation_warning(
@@ -475,7 +492,9 @@ def test_declared_scale_is_honored_end_to_end(sample_orbit: Any) -> None:
     instant*. Each is reconstructed from its raw MJD rather than reused
     from the converted table, so the scale attribute is the only thing
     distinguishing them. If ``propagate`` ignored it and read both as
-    TDB, the two runs would start 69 s apart and land ~363 km apart (see
+    TDB, the two runs would start 69 s apart and their x-components would
+    land ~363 km apart — one component of a ~1460 km along-track
+    displacement at this fixture's 21.1 km/s (see
     :func:`test_a_scale_lie_moves_the_state`). Instead they agree
     **bit for bit**: the declared UTC is converted to the identical
     float64 TDB, so the integrator sees one and the same input.

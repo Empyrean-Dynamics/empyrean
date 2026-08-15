@@ -1,11 +1,10 @@
-"""AUTO reachable and tunable from empyrean-py — bd empyrean-adbp6 (remaining half).
+"""AUTO reachable and tunable from empyrean-py.
 
-The ``GaussianMixture`` half of the bead is stale (already satisfied). This
-covers the remaining half: a frozen :class:`Auto` dataclass exposes AUTO's
-caller-tunable κ band edges + AGM knobs, mirrors the wrapper / C-ABI struct
-field-for-field (post ``threshold_second`` removal), maps to tag 4, and — the
-point of the bead — its thresholds actually reach the engine instead of
-silently collapsing to ``auto()`` defaults.
+A frozen :class:`Auto` dataclass exposes AUTO's caller-tunable κ band edges
++ AGM knobs, mirrors the wrapper / C-ABI struct field-for-field (post
+``threshold_second`` removal), maps to tag 4, and — the point of these
+tests — its thresholds actually reach the engine instead of silently
+collapsing to ``auto()`` defaults.
 """
 
 from __future__ import annotations

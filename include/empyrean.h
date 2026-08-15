@@ -51,7 +51,7 @@ typedef struct Session Session;
  *
  * # Why these are not the `force_model` integers
  *
- * [`EmpyreanPropagationConfig::force_model`](crate::propagate::EmpyreanPropagationConfig::force_model)
+ * `EmpyreanPropagationConfig::force_model`
  * encodes Approximate as `0`, because a propagation config has no
  * "unset tier" state — it always propagates under some tier. A data
  * directory does: `NULL` options must mean "what `from_data_dir` does",
@@ -762,10 +762,19 @@ typedef struct Session Session;
  * release that ships it, not by an independent counter.
  *
  * **The scheme begins with 0.10.0**, which reports `1000` — the
- * smallest value it can produce. Every release before it, through
- * 0.10.0-rc.0, reported the retired independent counter instead, which
- * reached 3; that is why values below 1000 are counter-era and are not
- * release numbers.
+ * smallest value it can produce. Every release before it reported the
+ * retired independent counter instead; its last published value is 2,
+ * shipped by v0.9.0. That is why values below 1000 are counter-era and
+ * are not release numbers.
+ *
+ * **Only the base version is encoded.** The pre-release suffix is not:
+ * `0.10.0-rc.1` and `0.10.0` both report `1000`. So this number
+ * separates one version from another, and never a version from its own
+ * pre-releases — if a boundary type moves inside a pre-release cycle,
+ * the handshake will not catch the mismatch and both sides have to be
+ * rebuilt together. Across the pre-releases of a single version, the
+ * artifact or tag that was installed is the only thing that identifies
+ * the exact build.
  *
  * The distribution's own release string is not exported. A consumer
  * identifies the build it is running by the artifact or tag it
@@ -1172,9 +1181,9 @@ struct EmpyreanBuiltSystem;
  * `empyrean_determine` calls without external locking. Build it once
  * and share it — construction is the expensive part (it loads the whole
  * kernel set), and every constructor here is serialized internally
- * through [`CONSTRUCT_LOCK`] because the engine's first-init kernel
- * provisioning does writable-cache file I/O that is not concurrency
- * safe.
+ * through this module's private `CONSTRUCT_LOCK` because the engine's
+ * first-init kernel provisioning does writable-cache file I/O that is
+ * not concurrency safe.
  *
  * The two `&mut`-shaped entry points — [`empyrean_context_with_spk`] and
  * [`empyrean_context_free`] — are the exceptions: they mutate or destroy

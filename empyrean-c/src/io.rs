@@ -15,6 +15,26 @@
 //! `*_free()` helper. JSON / CSV use the schemas documented inline; the
 //! parquet schemas are villeneuve-native (round-trips with the rest of
 //! the empyrean ecosystem).
+//!
+//! # The wide cross-covariance, by orbit format
+//!
+//! Of the three orbit formats here, **only parquet carries** the
+//! state↔parameter and parameter↔parameter cross terms, in a tagged
+//! `wcs_*` / `wcp_*` column tail. **JSON and CSV refuse by name** on
+//! write, each pointing at parquet, rather than writing a row short and
+//! returning success — a file written short reads back as a
+//! block-diagonal joint, a tighter claim than the caller held, with
+//! nothing in the round trip to signal it. The refusal is write-side:
+//! the readers refuse nothing, because a file with no carrier columns is
+//! indistinguishable from one that never had any.
+//!
+//! The JSON refusal is this crate's own: `OrbitRow` is a flat serde
+//! shape with no slot for the terms. The CSV refusal comes from the
+//! engine's writer, which raises it by name. Note that the engine
+//! additionally has a **JSONL** orbit format that does carry the
+//! carrier, keyed by a widened `cov_dim` — that format is not exposed
+//! through this ABI, and this crate's `JSON` is a different, flat shape.
+//! Do not describe this boundary in the engine's `cov_dim` terms.
 
 use std::ffi::{CStr, CString, c_char};
 use std::fs::File;

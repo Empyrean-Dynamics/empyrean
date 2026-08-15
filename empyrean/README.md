@@ -877,8 +877,11 @@ it opens `libempyrean` and compares it against the `EMPYREAN_ABI_VERSION`
 it compiled with; any mismatch fails there and then, naming both numbers
 and the resolved path, rather than reading your arguments through a
 layout that moved. The number encodes the release, so pairing across
-releases is exactly what it rejects (pre-releases of a version share its
-number). The bundled and downloaded artifacts satisfy this by
+releases is exactly what it rejects. It encodes the **base** version
+only, though: a version and its pre-releases share one number, so the
+check cannot separate `0.10.0-rc.1` from `0.10.0`, and a boundary change
+inside a pre-release cycle needs both sides rebuilt together rather than
+caught here. The bundled and downloaded artifacts satisfy the pairing by
 construction — only a hand-set `EMPYREAN_LIB` can pair the wrong two.
 
 Prebuilt engine binaries are currently published for four targets —

@@ -58,9 +58,9 @@ fn construct_lock() -> std::sync::MutexGuard<'static, ()> {
 /// `empyrean_determine` calls without external locking. Build it once
 /// and share it — construction is the expensive part (it loads the whole
 /// kernel set), and every constructor here is serialized internally
-/// through [`CONSTRUCT_LOCK`] because the engine's first-init kernel
-/// provisioning does writable-cache file I/O that is not concurrency
-/// safe.
+/// through this module's private `CONSTRUCT_LOCK` because the engine's
+/// first-init kernel provisioning does writable-cache file I/O that is
+/// not concurrency safe.
 ///
 /// The two `&mut`-shaped entry points — [`empyrean_context_with_spk`] and
 /// [`empyrean_context_free`] — are the exceptions: they mutate or destroy
@@ -494,7 +494,7 @@ pub const EMPYREAN_DATA_REFRESH_OFF: u8 = 2;
 ///
 /// # Why these are not the `force_model` integers
 ///
-/// [`EmpyreanPropagationConfig::force_model`](crate::propagate::EmpyreanPropagationConfig::force_model)
+/// `EmpyreanPropagationConfig::force_model`
 /// encodes Approximate as `0`, because a propagation config has no
 /// "unset tier" state — it always propagates under some tier. A data
 /// directory does: `NULL` options must mean "what `from_data_dir` does",

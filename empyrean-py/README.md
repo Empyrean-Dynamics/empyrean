@@ -81,7 +81,10 @@ for i in range(len(result.events.summary)):
 ```
 
 Every time you hand to empyrean is an `Epochs`, and every `Epochs`
-states its scale. A bare list or array is refused: `61000.5` read as UTC
+states its scale — apart from the carve-outs whose scale is fixed by
+definition (columns named `mjd_tdb`, arguments named `epoch_mjd_tdb`,
+and the coordinate tables' `epoch` column, which is MJD TDB). A bare
+list or array is refused: `61000.5` read as UTC
 and `61000.5` read as TDB are about 69 seconds apart — easily enough to
 move an encounter geometry — so which one you mean is stated rather than
 defaulted. Build them with `Epochs.from_mjd(values, scale="tdb")` /

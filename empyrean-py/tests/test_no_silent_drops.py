@@ -1158,7 +1158,7 @@ def _position_sigma(states: CartesianOrbits) -> np.ndarray:
 
 def test_ng_covariance_reaches_propagated_covariance() -> None:
     """A fitted non-grav covariance must inflate the propagated per-state
-    covariance — the direct empyrean-3qoe reproduction.
+    covariance — the direct reproduction of the dropped-covariance bug.
 
     Propagates two orbits identical except for the presence of ``ng_covariance``
     and asserts (1) the per-state position sigma is strictly larger with the

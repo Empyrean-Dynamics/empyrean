@@ -151,9 +151,25 @@ fn download_prebuilt(lib_file: &str) -> PathBuf {
     // Download into memory with a pure-Rust HTTPS client (rustls), following
     // GitHub's redirect to the asset CDN — no system curl / wget / tar needed,
     // so the crate builds in minimal containers too.
-    let resp = ureq::get(&url)
-        .call()
-        .unwrap_or_else(|e| panic!("download libempyrean from {url}: {e}"));
+    let resp = ureq::get(&url).call().unwrap_or_else(|e| {
+        panic!(
+            "could not download libempyrean from {url}: {e}\n\
+             \n\
+             No prebuilt engine is published for version {VERSION} until that \
+             release is cut, so on an unreleased version this URL is expected \
+             to 404. Two ways forward, either of which this build script \
+             prefers over the download:\n\
+             \n\
+               1. Build the engine in this workspace first:\n\
+                    cargo build -p empyrean-c --release\n\
+                  (the release profile specifically — a debug build is not \
+                  picked up), then re-run your build.\n\
+               2. Point at an engine you already have:\n\
+                    EMPYREAN_LIB_DIR=/path/to/dir/containing/libempyrean\n\
+             \n\
+             At run time, EMPYREAN_LIB overrides the resolved path."
+        )
+    });
     let mut bytes = Vec::new();
     resp.into_reader()
         .read_to_end(&mut bytes)

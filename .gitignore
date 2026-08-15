@@ -5,8 +5,9 @@ Cargo.lock
 Cargo.lock.bak
 Cargo.lock.new
 
-# Cargo local-dev overrides — never tracked; sibling-checkout patches
-# already live in the workspace root Cargo.toml [patch] block.
+# Cargo local-dev overrides — never tracked. Keep local engine
+# redirections out of commits; see Cargo.toml for how to point this
+# workspace at a sibling checkout.
 .cargo/config.toml
 .cargo/config.toml.disabled
 

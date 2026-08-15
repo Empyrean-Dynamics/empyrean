@@ -736,6 +736,17 @@ def test_impact_probabilities_condition_on_the_joint(joint_bearing_orbit) -> Non
         f"the joint moves the reported sigma by only {shortfall}, so this "
         "fixture cannot tell a carried joint from a dropped one"
     )
+    # The band owns the published figure. The release notes quote "about
+    # 19%" for this fixture, and a bare > 1% floor would keep passing
+    # while the real number drifted with an engine pin or a kernel
+    # refresh, leaving the note asserting something nothing checks.
+    # Measured 18.80% / 18.72% on the two rows; widen deliberately if a
+    # pin genuinely moves it, and move the note with it.
+    assert np.all((shortfall > 0.15) & (shortfall < 0.25)), (
+        f"the sigma shortfall on this fixture moved to {shortfall * 100} %, "
+        "away from the ~19% the release notes quote — re-measure and update "
+        "the note and this band together"
+    )
 
 
 def test_b_planes_condition_on_the_joint(joint_bearing_orbit) -> None:
@@ -759,7 +770,15 @@ def test_b_planes_condition_on_the_joint(joint_bearing_orbit) -> None:
         f"dropping the cross terms must UNDERSTATE the B-plane covariance; "
         f"got {cov_without} against {cov_with}"
     )
-    assert np.all((cov_with - cov_without) / cov_with > 0.01)
+    cov_shortfall = (cov_with - cov_without) / cov_with
+    assert np.all(cov_shortfall > 0.01)
+    # As above: the band, not the floor, is what keeps the published
+    # "about 34%" honest. Measured 34.09% / 34.05% on the two rows.
+    assert np.all((cov_shortfall > 0.30) & (cov_shortfall < 0.40)), (
+        f"the B-plane covariance shortfall moved to {cov_shortfall * 100} %, "
+        "away from the ~34% the release notes quote — re-measure and update "
+        "the note and this band together"
+    )
 
 
 def test_dropping_the_impact_marshal_hop_restores_the_understatement(

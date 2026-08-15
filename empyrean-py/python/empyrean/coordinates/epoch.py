@@ -484,23 +484,30 @@ def _bare_time_refusal(value: object, where: str, *, single: bool) -> str:
     """
     got = type(value).__name__
     want = "a single-row Epochs table" if single else "an Epochs table"
+    # A timestamp states its own scale (the trailing 'Z'), so the reason
+    # a str or datetime is refused is the type, not an unstated scale.
+    # Telling the caller their 'Z' carries no scale would be false, and
+    # invites them to hand-convert to MJD — the bookkeeping this surface
+    # exists to remove. The ~69 s sentence belongs to the numeric arm
+    # alone, where the ambiguity is real.
     if isinstance(value, str):
-        fix = (
-            "Pass Epochs.from_iso([value]) for an ISO-8601 UTC timestamp "
-            "(the trailing 'Z' is required)"
+        return (
+            f"{where} must be {want}, not a {got}: empyrean takes times as a "
+            f"typed table, not raw text. Pass Epochs.from_iso([value]) — the "
+            f"trailing 'Z' is required, and it is what fixes the scale as UTC."
         )
-    elif isinstance(value, datetime):
-        fix = "Pass Epochs.from_iso([value.isoformat()]), or Epochs.from_astropy(...)"
-    else:
-        example = "[value]" if single else "values"
-        fix = (
-            f"Pass Epochs.from_mjd({example}, scale='utc') or "
-            f"Epochs.from_mjd({example}, scale='tdb')"
+    if isinstance(value, datetime):
+        return (
+            f"{where} must be {want}, not a {got}: empyrean takes times as a "
+            f"typed table. Pass Epochs.from_iso([value.isoformat()]), or "
+            f"Epochs.from_astropy(...) — either carries the scale across."
         )
+    example = "[value]" if single else "values"
     return (
         f"{where} must be {want}, not a {got}: a bare value carries no time "
-        f"scale. {fix} — the scale is a modelling statement, and 61000.5 UTC "
-        f"and 61000.5 TDB are ~69 seconds apart."
+        f"scale. Pass Epochs.from_mjd({example}, scale='utc') or "
+        f"Epochs.from_mjd({example}, scale='tdb') — the scale is a modelling "
+        f"statement, and 61000.5 UTC and 61000.5 TDB are ~69 seconds apart."
     )
 
 

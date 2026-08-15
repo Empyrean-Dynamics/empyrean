@@ -15,12 +15,13 @@ What our conversion carries
 and the Fairhead & Bretagnon (1990) TDB−TT series for TT↔TDB. That
 series is the **full periodic** one, not a secular-only truncation —
 which is why the tolerances below are as tight as they are. The
-measured TDB−UTC offset varies by 3.3148 ms peak-to-peak over a decade,
-and astropy's varies by the same 3.3148 ms; a secular-only
-implementation would show no such variation and would sit up to ~1.7 ms
-from astropy. Off leap-second days we agree with astropy **bit for
-bit** over the modern era, so :data:`_EXACT` is exact equality rather
-than a tolerance — anything looser would hide a regression.
+measured TDB−UTC offset varies by 3.3148 ms peak-to-peak over the
+six-year grid sampled below (MJD 60300–62500), and astropy's varies by
+the same 3.3148 ms; a secular-only implementation would show no such
+variation and would sit up to ~1.7 ms from astropy. Off leap-second days
+we agree with astropy **bit for bit** over the modern era, so
+:data:`_EXACT` is exact equality rather than a tolerance — anything
+looser would hide a regression.
 
 A tight assertion here is deliberate. If the engine's leap-second table
 falls behind IERS while astropy's does not, these tests go red, and
@@ -83,8 +84,20 @@ def _tdb_minus_utc_astropy(days: np.ndarray) -> np.ndarray:
 # rather than hard-coded: a hand-maintained table is one typo away from
 # testing the wrong thing, and deriving it turns the table itself into
 # something the astropy comparison can check.
+#
+# Derived from ASTROPY, deliberately, even though the engine could
+# answer it too. This list is a parametrize argument, so it is built
+# during collection — before conftest's autouse fixture has had a chance
+# to turn a missing kernel set or an unloadable engine into a skip. An
+# engine call here would raise at collection instead, taking the rest of
+# the suite's collection report with it. astropy is already guarded by
+# the importorskip above, so deriving from it is collection-safe, and
+# our own table is checked against astropy's entry for entry by
+# test_our_leap_second_table_matches_astropys_entry_for_entry below.
 _LEAP_SCAN_DAYS = np.arange(41317.0, 61200.0)
-_LEAP_SECOND_DAYS = sorted(_leap_days_from(_tdb_minus_utc(_LEAP_SCAN_DAYS), _LEAP_SCAN_DAYS))
+_LEAP_SECOND_DAYS = sorted(
+    _leap_days_from(_tdb_minus_utc_astropy(_LEAP_SCAN_DAYS), _LEAP_SCAN_DAYS)
+)
 
 # Whole days only: a fractional MJD on a leap day hits the known defect
 # documented in the module docstring and pinned separately below.
@@ -128,7 +141,7 @@ def test_the_tdb_tt_series_is_periodic_not_secular() -> None:
     reference_spread = reference.max() - reference.min()
 
     assert our_spread > 2e-3, (
-        f"TDB-UTC varies by only {our_spread * 1e3:.4f} ms across a decade; "
+        f"TDB-UTC varies by only {our_spread * 1e3:.4f} ms across the grid; "
         f"a full periodic series should show a few ms. Secular-only?"
     )
     assert abs(our_spread - reference_spread) < 1e-6, (

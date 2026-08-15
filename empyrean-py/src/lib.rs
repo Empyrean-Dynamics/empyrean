@@ -1782,8 +1782,8 @@ fn parse_fabricated_orbit_index(orbit_id: &str) -> Option<usize> {
 /// Python extension marshals from arrays/dicts. The body ends in an
 /// exhaustive `Orbit { .. }` literal with NO `..` rest pattern, so adding a
 /// field to the wrapper `Orbit` becomes a compile error here — at the marshal
-/// boundary — instead of a silent per-field drop (the empyrean-3qoe failure
-/// class). Every orbit builder routes its final construction through this fn;
+/// boundary — instead of a silent per-field drop, the failure class where a
+/// newly added field never reaches the engine and nothing says so. Every orbit builder routes its final construction through this fn;
 /// each keeps its own array-extraction logic and passes the per-orbit values.
 /// Optional inputs carry the wrapper's own "absent" convention (g(r) → the
 /// all-zero inverse-square sentinel, photometry → magnitude disabled).

@@ -156,7 +156,7 @@ jobs:
       # intra-doc links or other warnings — catches dangling [`Foo`]
       # references in /// comments before they become broken HTML.
       - name: Build rustdoc (deny warnings)
-        run: cargo doc --no-deps -p empyrean
+        run: cargo doc --no-deps -p empyrean -p empyrean-c
         env:
           RUSTDOCFLAGS: --html-in-header docs/katex-header.html -D warnings
           EMPYREAN_DATA_DIR: ${{ github.workspace }}/data
@@ -296,7 +296,7 @@ jobs:
         run: curl -LsSf https://astral.sh/uv/install.sh | sh
 
       - name: Install Python dependencies
-        run: uv pip install --system maturin numpy pyarrow quivr pytest pytest-benchmark pandas astropy ruff==0.16.0
+        run: uv pip install --system maturin numpy pyarrow quivr pytest pytest-benchmark pandas astropy==8.0.1 ruff==0.16.0
 
       - name: Lint Python (ruff check + ruff format --check)
         run: |
@@ -377,6 +377,15 @@ jobs:
       # ── Tests ──
       - name: Validation tests
         run: cd empyrean-py && pytest tests/test_transforms.py -v
+        env:
+          EMPYREAN_DATA_DIR: ${{ github.workspace }}/data
+
+      # The rest of the suite: the contract tests that pin the Python
+      # surface — time-scale typing, no-silent-drops, core parity, the
+      # wide-cross round trip, planning. Benchmarks are excluded because
+      # the step below runs them under --benchmark-only.
+      - name: Python test suite
+        run: cd empyrean-py && pytest tests/ --ignore=tests/test_benchmarks.py -q
         env:
           EMPYREAN_DATA_DIR: ${{ github.workspace }}/data
 

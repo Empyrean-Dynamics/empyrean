@@ -17,7 +17,9 @@ exposes at the API boundary:
 | `UTC`  | Coordinated Universal Time — leap-second-aware. Use for human-readable epochs (ISO strings) and observation timestamps. |
 
 **Every time you hand to empyrean is an :class:`~empyrean.Epochs` table,
-and every `Epochs` states its scale.** There is no bare-MJD entry point
+and every `Epochs` states its scale.** (The scale-pinned carve-outs
+below are the exception, and they are named by their own definition
+rather than by the caller.) There is no bare-MJD entry point
 and no default scale to fall back on: a plain `61000.5` does not say
 which clock it was read from, and read as UTC rather than TDB it names an
 instant about 69 seconds earlier — a difference that grows with every
@@ -37,9 +39,18 @@ epochs = empyrean.Epochs.from_iso(["2026-01-01T12:00:00.000Z"])      # ISO is UT
 scale. UTC↔TDB conversion (leap seconds plus the TDB−TT periodic terms)
 is built into the engine — no separate leap-second kernel is installed.
 
-Columns named `mjd_tdb` (and arguments named `epoch_mjd_tdb`) are the
-one place plain floats remain: the name pins the scale, so nothing is
-left unstated.
+Plain floats remain in exactly three places, and each pins its scale by
+definition rather than leaving it to the caller: columns named
+`mjd_tdb`, arguments named `epoch_mjd_tdb`, and the `epoch` column on the
+four coordinate tables (`CartesianCoordinates`, `KeplerianCoordinates`,
+`CometaryCoordinates`, `SphericalCoordinates`), which is **MJD TDB by
+definition**. Any raw MJD float at the API boundary is MJD TDB unless
+documented otherwise.
+
+That last one is a column you read, not a time you hand in. To use a
+coordinate epoch *as* a time input, convert it —
+`Epochs.from_mjd(orbits.coordinates.epoch.to_numpy(), scale="tdb")` — or
+let `Epochs.from_orbits(orbits, offsets_in_days)` do both steps.
 
 Earth-rotation kernels are stored on the TT scale internally; the
 TT ↔ TDB difference is small — a quasi-periodic term with peak
@@ -119,7 +130,7 @@ its segment.
 | Position              | astronomical units (AU)    | At the public API boundary.            |
 | Velocity              | AU / day                   | Same.                                  |
 | Time                  | days                       | Propagation step sizes, durations, etc. |
-| Epoch                 | `Epochs` (MJD + its scale) | Inputs are always `Epochs`; output columns are MJD TDB. See above. |
+| Epoch                 | `Epochs` (MJD + its scale) | Inputs are `Epochs`, apart from the scale-pinned carve-outs above; output columns, and the coordinate tables' `epoch` column, are MJD TDB. See above. |
 | Angle                 | degrees                    | At the boundary; converted to radians internally. |
 | Astrometric residuals | arcseconds                 | RA·cos(δ), Dec, AT/CT decompositions.   |
 | Track position angle  | degrees (East of North)    | On {class}`~empyrean.ObservationResults`. |

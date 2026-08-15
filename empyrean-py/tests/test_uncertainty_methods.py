@@ -1,6 +1,6 @@
 """Behavioral contracts for the sampling uncertainty methods
 (``SIGMA_POINT`` / ``MONTE_CARLO``) in :func:`empyrean.propagate` and
-:func:`empyrean.generate_ephemeris` — bd empyrean-02j4.
+:func:`empyrean.generate_ephemeris`.
 
 These functions previously mishandled the two sampling methods, and the
 two failed *differently*:

@@ -1,5 +1,4 @@
-"""Per-method uncertainty parameters reach the engine on the impact path —
-bd empyrean-zxtd.
+"""Per-method uncertainty parameters reach the engine on the impact path.
 
 ``compute_impact_probabilities`` / ``compute_b_planes`` used to collapse each
 method spec to a bare integer tag, and the Rust binding rebuilt every method

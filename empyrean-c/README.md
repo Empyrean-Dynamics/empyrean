@@ -24,9 +24,17 @@ The C ABI carries the distribution's own version:
 `major * 10000 + minor * 100 + patch`, readable at run time from
 `empyrean_abi_version()`, and it advances with every release whether or
 not any boundary type changed. **The scheme begins with 0.10.0**, which
-reports `1000`. Every release before it — through 0.10.0-rc.0, the last
-one published — reported the retired independent counter instead, which
-reached 3. This tree ships the 0.10.0 ABI, reporting `1000`.
+reports `1000`. Every release before it reported the retired independent
+counter instead; its last published value is 2, shipped by v0.9.0. This
+tree ships the 0.10.0 ABI, reporting `1000`.
+
+**Only the base version is encoded** — the pre-release suffix is not, so
+`0.10.0-rc.1` and `0.10.0` both report `1000`. The number separates one
+version from another, never a version from its own pre-releases: if a
+boundary type moves inside a pre-release cycle the handshake will not
+catch it, and both sides must be rebuilt together. Within one version's
+pre-releases, the artifact or tag you installed is what identifies the
+exact build.
 
 It is **not published to crates.io** — Rust callers should use the
 [`empyrean`](https://crates.io/crates/empyrean) safe wrapper crate or
@@ -496,9 +504,11 @@ longer evidence that a frozen struct moved, and matching numbers are
 what license the layouts below.
 
 The ABI is versioned by the distribution release that ships it. Before
-0.10.0 it was an independent counter, now retired, which reached 3 at
-0.10.0-rc.0: version 2 grew several result structs; version 3 made
-`empyrean_determine` and `empyrean_transform_coordinates` batched.
+0.10.0 it was an independent counter, now retired, whose last published
+value is 2 (v0.9.0, which grew several result structs). A value of 3 was
+prepared — it made `empyrean_determine` and `empyrean_transform_coordinates`
+batched — but no library reporting it was ever published; those changes
+reach consumers for the first time in this release.
 0.10.0's ABI is one batched break carrying the joint covariance across
 the boundary, plus the riders queued behind a break:
 

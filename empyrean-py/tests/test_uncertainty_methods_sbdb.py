@@ -1,19 +1,17 @@
-"""SBDB integration repro for the sampling uncertainty methods
-(bd empyrean-02j4). Mirrors the self-contained reproduction attached to
-the issue: query a real object from JPL SBDB and propagate it over a
-two-epoch grid under each uncertainty method.
+"""SBDB integration repro for the sampling uncertainty methods: query a
+real object from JPL SBDB and propagate it over a two-epoch grid under
+each uncertainty method.
 
 These tests hit the network (SBDB) and are skipped when it is
 unavailable, so they document/verify the end-to-end fix without gating
 the offline unit suite in ``test_uncertainty_methods.py``.
 
 The object comes back in the **cometary** representation (SBDB
-convention), which used to surface a distinct, deeper engine limitation
-(bd empyrean-r2dq): villeneuve's sigma-point path silently skipped
-non-Cartesian input orbits and left a first-order (linear) covariance in
-place. That is fixed engine-side — sigma points are constructed in
-native element space — so the cometary path is now asserted directly
-rather than xfailed. The Cartesian orbit derived from the same SBDB
+convention), which used to surface a distinct, deeper engine limitation:
+the sigma-point path silently skipped non-Cartesian input orbits and left
+a first-order (linear) covariance in place. That is fixed engine-side —
+sigma points are constructed in native element space — so the cometary
+path is now asserted directly rather than xfailed. The Cartesian orbit derived from the same SBDB
 record is kept as a second, independent check of the same property.
 """
 
@@ -238,11 +236,11 @@ def test_sbdb_cometary_sigma_point_is_genuine(sbdb_orbit, sbdb_grid) -> None:
     """The SBDB (cometary) sigma-point path, which is the workflow a user
     actually runs — ``query_sbdb`` returns cometary orbits.
 
-    This was a strict-xfail guard for empyrean-r2dq, where the engine
-    silently skipped non-Cartesian input and left a first-order
-    covariance in place under a SIGMA_POINT request. r2dq is fixed
-    engine-side (sigma points are now constructed in native element
-    space), so the guard is retired and the path is asserted directly.
+    This was a strict-xfail guard for the case where the engine silently
+    skipped non-Cartesian input and left a first-order covariance in
+    place under a SIGMA_POINT request. That is fixed engine-side (sigma
+    points are now constructed in native element space), so the guard is
+    retired and the path is asserted directly.
 
     The tag alone is not the assertion: a covariance mislabelled
     ``sigma_point`` while still holding the linear values is exactly the

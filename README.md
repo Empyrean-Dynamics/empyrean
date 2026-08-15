@@ -130,8 +130,9 @@ orbits = empyrean.query_sbdb(["99942"])
 
 # 2. Propagate 10 years past the SBDB epoch. Times are always Epochs, and
 #    the scale is always stated — a bare MJD would not say which clock.
-t0 = orbits.coordinates.epoch.to_numpy()[0]
-epochs = empyrean.Epochs.from_mjd([t0 + 10.0 * 365.25], scale="tdb")
+#    from_orbits offsets each orbit's own epoch column (MJD TDB) and
+#    returns the typed grid, so no scale is restated by hand.
+epochs = empyrean.Epochs.from_orbits(orbits, [10.0 * 365.25])
 result = empyrean.propagate(orbits, epochs)
 
 counts = result.events.count_by_type()

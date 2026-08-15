@@ -1,4 +1,4 @@
-"""Malformed covariance surfaces instead of being zeroed — bd empyrean-ekqe.
+"""Malformed covariance surfaces instead of being zeroed.
 
 ``coordinates_to_arrays`` and ``orbits_to_orbit_batch_dict`` each wrapped the
 covariance conversion in a bare ``except Exception`` and, on any failure,

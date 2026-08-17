@@ -8,6 +8,92 @@ project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- **The AGM mixture components read back, instead of dying at the
+  wrapper.** Under `GAUSSIAN_MIXTURE` — and inside `AUTO`'s
+  close-approach windows — the engine splits the input Gaussian and
+  retains the resulting components at every close approach where the
+  splitter actually fired. The C ABI has marshaled them all along
+  (`EmpyreanMixtureChain` / `EmpyreanMixtureComponent`); the safe Rust
+  wrapper's `marshal_propagation_result` copied three arrays off the FFI
+  result — states, object ids, events — and never touched `mixtures`, so
+  every retained component was dropped one layer above the boundary and
+  nothing downstream could see them. The only mixture-adjacent thing the
+  wrapper did expose was the `CovarianceKind::Mixture` tag, whose own doc
+  said "moment-collapsed to a single second moment" — which describes
+  the covariance readback, not the engine, and read as though the engine
+  collapsed the mixture. It does not.
+
+  The Rust wrapper gains `PropagationResult::mixtures` (one
+  `MixtureChain` per input orbit, positional with the input batch, with
+  empty components for an orbit that never split) and
+  `PropagationResult::mixture_at`, mirroring `empyrean-core`'s accessor
+  by name, argument names and semantics. Python gains
+  `empyrean.MixtureChains` — a flat table, one row per `(orbit, CA
+  epoch, component)`, on `PropagationResult.mixtures` and always
+  populated, since the components ride along at no extra engine cost.
+  Nothing split means **zero rows**, not placeholder rows.
+
+  Four limits on what is retained are documented at every layer rather
+  than papered over: depth-0 splits only; only CA epochs where AGM
+  actually fired; the component covariance is the linear
+  \(\Phi \Sigma_k \Phi^\top\) map with the second-order mean
+  correction omitted by design; and the retained weights may sum to
+  **less than 1**, because a sub-Gaussian whose own sub-propagation
+  missed the close approach contributes no component and the deficit is
+  not recorded anywhere. Do not assume the weights normalize.
+
+  No ABI change: the boundary types and `EMPYREAN_ABI_VERSION` are
+  untouched.
+
+- **Photometric parameter uncertainty is an input, so `mag_sigma` stops
+  under-reporting σ_V.** The engine has computed
+  \(\sigma_V = \sqrt{\sigma^2_{\text{photo}} + \sigma^2_{\text{state}}}\)
+  since v1.0.0, and three engine-side producers populate the photometric
+  3×3 that feeds the first term — the post-OD photometry fit, the SBDB
+  `phys_par` ingest, and the orbit-file readers. The distribution gave
+  it no slot: `EmpyreanOrbit` had nowhere to put it,
+  `empyrean_orbit_photometric_params` built every `PhotometricParams`
+  with `covariance: None`, and `orbits_to_batch` dropped it on the way
+  back out — so all three producers died at one boundary and shipped
+  `mag_sigma` was always the state contribution alone.
+
+  `EmpyreanOrbit` gains `has_phot_covariance` + `phot_covariance[3][3]`
+  over (H, slope1, slope2), **appended at the struct tail** so no
+  pre-existing field offset moves; the Rust wrapper gains
+  `Orbit::phot_covariance` and the `Orbit::with_photometry_covariance`
+  companion builder; Python gains a nullable
+  `PhotometricParams.covariance` column and carries the OD fit's own 3×3
+  onto the result orbit. \(\sigma^2_{\text{photo}} = J \Sigma_p J^\top\)
+  contracts the full 3×3 against
+  \(J = [\partial V/\partial H, \partial V/\partial\text{slope}_1,
+  \partial V/\partial\text{slope}_2]\); because
+  \(\partial V/\partial H \equiv 1\) exactly, an orbit with no state
+  covariance and a covariance of the **H-only** shape
+  \(\mathrm{diag}(\sigma_H^2, 0, 0)\) now reports
+  \(\sigma_V = \sigma_H\) to machine precision. Slope variances and
+  \(H\)–slope covariances do not drop out — they contract against
+  \(\partial V/\partial\text{slope}\), which vanishes only at zero phase
+  angle — so an orbit carrying SBDB's published
+  \(\mathrm{diag}(\sigma_H^2, \sigma_G^2, 0)\) reports
+  \(\sigma_V > \sigma_H\).
+
+  **`mag_sigma` will increase** for every orbit that now carries an H
+  uncertainty, including SBDB-queried orbits that get one automatically.
+  That is a correction, not a regression, but a consumer with a
+  hard-coded σ_V threshold will see it move. The two terms are combined
+  as independent: no joint state↔photometry covariance is computed
+  anywhere in the stack (the photometric fit holds the geometry exact),
+  so there is no cross term to add and the resulting σ_V is mildly
+  conservative.
+
+  `EmpyreanOrbit` grew from 832 to 912 bytes. `EMPYREAN_ABI_VERSION`
+  encodes only the base version, so a header/library mismatch inside a
+  pre-release cycle is not caught by the handshake — ship the header,
+  the rebuilt `libempyrean` and the re-pinned `empyrean-sys/checksums.txt`
+  together. `checksums.txt` now pins the header those binaries were built
+  from and `empyrean-sys/build.rs` refuses a stale pairing outright, so
+  the sequencing is enforced rather than remembered (see Fixed).
+
 - **The joint solved-parameter covariance crosses the boundary, in both
   directions.** A fit over the state and its parameters produces one
   \((6+P) \times (6+P)\) matrix, and until now only its diagonal blocks
@@ -221,6 +307,95 @@ project adheres to [Semantic Versioning](https://semver.org).
   work.
 
 ### Fixed
+
+- **A prebuilt `libempyrean` can no longer be linked against a header it
+  predates.** `empyrean-sys/checksums.txt` pins the SHA-256 of each
+  published tarball, which proves *which bytes* were downloaded and
+  nothing about the struct layouts inside them; `EMPYREAN_ABI_VERSION`
+  encodes only the base version, so every build inside one release cycle
+  reports the same number while `EmpyreanOrbit` grows underneath it.
+  A checkout whose orbit struct is 912 bytes, linked against a pinned
+  prebuilt whose orbit struct is 832, strides every orbit array wrong and
+  reads past the caller's buffer — silently, since the load-time
+  handshake passes.
+
+  `checksums.txt` now also pins the `include/empyrean.h` those binaries
+  were built from, and `empyrean-sys/build.rs` refuses the prebuilt
+  download when the header in the checkout hashes to anything else,
+  naming the fix (`cargo build -p empyrean-c --release`). Local source
+  builds and `EMPYREAN_LIB_DIR` are unaffected, and the packaged crate —
+  where the version already pins the release the assets come from — is
+  out of scope by construction.
+
+- **A zero-initialized `EmpyreanOrbit` claimed HG photometry with
+  H = 0.** `EMPYREAN_PHASE_FUNCTION_HG` is `0` and `0.0` is finite, so
+  the "named phase function plus finite H" presence test said PRESENT
+  for an orbit a C caller had given no photometry to — and once the write
+  path started attaching photometry, that fabrication (~20 mag brighter
+  than any minor body) was persisted into orbit files. `h_mag == 0.0`
+  now reads as "no absolute magnitude supplied", alongside NaN, and the
+  layers that *can* tell the difference say so instead: the Rust
+  wrapper and the Python marshal refuse photometry attached with H = 0
+  by name rather than letting it vanish at the boundary.
+
+- **A null H was written to disk as H = 0.0.** Python's
+  `extract_photometry` coerced a null absolute magnitude to zero while
+  still resolving the model tag, so an orbit built with a taxonomy slope
+  and no measured H was written as a real HG fit at H = 0. A row with no
+  photometry now emits no photometry. A photometric covariance supplied
+  on such a row — no absolute magnitude, or no model tag — is a typed
+  error rather than a mask set beside a null phase function: every
+  downstream absence test is `!h.is_finite()`, so the covariance had
+  nowhere to attach and was dropped between layers.
+
+- **An asymmetric photometric covariance was silently truncated.** The
+  orbit file formats carry only the six lower-triangle cells, so a 3×3
+  filled on one side only came back with the off-diagonal *dropped*, not
+  mirrored, and σ_V changed across a round trip with no warning. It is
+  now refused by name — with non-finite entries refused on their own
+  axis — at all three input layers: the Rust boundary, the C ABI's
+  `EmpyreanOrbit.phot_covariance` (whose field doc now states the
+  requirement), and the Python input path.
+
+- **A file round trip rewrote `PhotometricParams.model` to uppercase.**
+  The column documents lowercase tags (`"hg"`, `"hg1g2"`, `"hg12"`) and
+  `determine` writes them, but the batch-dict marshal emitted `"HG"`, so
+  any predicate written against the documented spelling matched zero rows
+  after a write/read cycle. The column writer now normalizes, and an
+  unrecognized tag is a typed error rather than a silent downgrade to
+  "no photometry".
+
+- **`PropagationResult::mixtures` was empty for a covariance-less
+  batch.** The field documents one row per input orbit, but the engine
+  empties its mixtures vector wholesale when *no* orbit in the batch
+  produced sensitivity tensors — so a perfectly ordinary ballistic batch
+  came back with zero rows under every method, and the documented
+  positional `zip` covered nothing while reading as success. The Rust
+  wrapper now pads that case to one empty chain per input orbit (empty
+  components is how "nothing split" is spelled everywhere else in the
+  array). At the C ABI the zero-row shape is still visible and now
+  documented: `num_mixtures` is either 0 or the input orbit count.
+
+- **`build_mixture_chains` treated an extension/Python skew as "nothing
+  split".** A missing `"mixtures"` key can only mean a compiled
+  extension older than this package, and returning an empty table spelled
+  it exactly like a genuine no-split run. It now raises and names the
+  fix; present-and-empty stays the quiet no-split shape.
+
+- **`batch_to_orbits` never attached photometry, so the orbit writers
+  wrote NULL.** `empyrean_orbits_write_parquet` /
+  `empyrean_orbits_write_csv` silently dropped a caller-supplied batch's
+  H/G — while the CSV writer's own doc claimed to carry photometry. The
+  marshal pair was never round-trip-tested for photometry; it is now.
+  The same gap existed on the Python side of the batch dict, whose read
+  direction had always consumed the photometry keys its write direction
+  never emitted.
+
+- **Python's `extract_photometry` read only the `g` column.** An `hg12`
+  orbit (with `g` null and `g12` populated) reached the engine with
+  `slope1 = 0.0` — a silently wrong phase function rather than the one
+  the caller asked for — and an `hg1g2` orbit lost \(G_2\) the same
+  way. The slope slots now follow each row's own model.
 
 - **The impact and B-plane paths dropped the caller's non-grav DT.**
   Both entry points — `empyrean_compute_impact_probabilities` and

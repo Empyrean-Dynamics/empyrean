@@ -1,6 +1,6 @@
 //! Orbit propagation and event detection.
 //!
-//! [`Context::propagate`] takes a batch of [`Orbit`](crate::Orbit)
+//! [`Context::propagate`] takes a batch of [`Orbit`]
 //! values and a list of target epochs (MJD TDB) and returns a
 //! [`PropagationResult`] carrying propagated states, detected events
 //! (close approaches, periapses, SOI crossings, occultations, eclipses,
@@ -46,6 +46,26 @@
 //! [`UncertaintyMethod::MonteCarlo`] when you need tail probabilities
 //! or want to exercise the full distribution.
 //!
+//! # Reading back the mixture
+//!
+//! Under [`UncertaintyMethod::Mixture`] (and inside
+//! [`UncertaintyMethod::Auto`]'s
+//! close-approach windows) the engine splits the input Gaussian and
+//! retains the resulting components at every close approach where the
+//! splitter actually fired. Those components come back on
+//! [`PropagationResult::mixtures`] — one [`MixtureChain`] per input
+//! orbit — and per-epoch via
+//! [`PropagationResult::mixture_at`]. They are the mixture itself, not
+//! its moment collapse: a consumer can evaluate
+//! \\(\\sum_k w_k \\, \\mathcal{N}(x \\mid \\mu_k, \\Sigma_k)\\)
+//! directly at the CA epoch. See [`MixtureChain`] for the four limits
+//! on what is retained.
+//!
+//! Note the module path: [`MixtureComponent`] here is the basis-tagged
+//! read-back component, distinct from the crate-root
+//! [`crate::MixtureComponent`], which is the
+//! [`split_gaussian`](crate::split_gaussian) primitive at \\(t_0\\).
+//!
 //! # Composing STMs between non-initial epochs
 //!
 //! [`PropagatedState::stm`] is the cumulative state-transition matrix
@@ -65,8 +85,8 @@ pub use config::{
     ForceModelTier, IntegratorChoice, OriginSwitchingConfig, PropagationConfig, UncertaintyMethod,
 };
 pub use result::{
-    CovarianceKind, CovarianceQuality, Event, PropagatedState, PropagationResult, TaggedCovariance,
-    TargetFunctional,
+    CovarianceKind, CovarianceQuality, Event, MixtureChain, MixtureComponent, PropagatedState,
+    PropagationResult, TaggedCovariance, TargetFunctional,
 };
 
 // Internal types other modules in this crate reach for via the
@@ -189,11 +209,49 @@ pub(crate) fn marshal_propagation_result(
             .collect()
     };
 
+    // Per-orbit AGM mixture chains. The C ABI emits one row per input
+    // orbit (empty for an orbit whose splitter never fired) — EXCEPT
+    // when no orbit in the batch produced sensitivity tensors at all, in
+    // which case the engine empties the vector wholesale and the C ABI
+    // hands back zero rows. Copied eagerly, like the three arrays above:
+    // the flat components are owned by the retained `ffi_result` and
+    // freed on drop, so a borrow would outlive its storage.
+    let mixtures: Vec<MixtureChain> = if ffi_result.mixtures.is_null() {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(ffi_result.mixtures, ffi_result.num_mixtures) }
+            .iter()
+            .enumerate()
+            .map(|(i, c)| unsafe { MixtureChain::from_ffi(c, i) })
+            .collect::<Result<_>>()?
+    };
+    // Pad that wholesale-empty case to one EMPTY chain per input orbit,
+    // so `mixtures` is positional with the input batch for EVERY method
+    // and every batch — which is what the field documents and what a
+    // `zip` against the input orbits silently gets wrong otherwise (zero
+    // iterations reads as "every orbit processed"). An empty chain is
+    // not a fabrication: empty components is exactly how "this orbit
+    // split nothing" is spelled everywhere else in this array. A padded
+    // row carries no `orbit_id`, because the engine emitted no chain to
+    // name — join positionally, as the field says. Any other length is a
+    // C-ABI contract violation and is named, not padded over.
+    let mixtures = match mixtures.len() {
+        n if n == num_orbits => mixtures,
+        0 => (0..num_orbits).map(|_| MixtureChain::empty()).collect(),
+        n => {
+            return Err(Error::invalid_input(format!(
+                "C ABI returned {n} mixture chains for {num_orbits} input orbits; the \
+                 contract is one chain per orbit, or none at all when the run produced no \
+                 sensitivity data"
+            )));
+        }
+    };
+
     // Retain the FFI result (rather than freeing it here) so the lazy
     // tagged-covariance accessors stay callable; it is freed when the
     // returned `PropagationResult` drops. The owned `states` / `object_ids`
-    // / `events` above are independent copies.
+    // / `events` / `mixtures` above are independent copies.
     Ok(PropagationResult::new(
-        states, object_ids, events, ffi_result,
+        states, object_ids, events, mixtures, ffi_result,
     ))
 }

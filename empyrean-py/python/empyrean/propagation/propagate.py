@@ -63,6 +63,7 @@ from empyrean.propagation.events import (
     ShadowEntries,
     ShadowExits,
 )
+from empyrean.propagation.mixtures import build_mixture_chains
 from empyrean.propagation.result import PropagationResult
 from empyrean.propagation.tagged_covariance import _KIND_BY_CODE
 
@@ -165,6 +166,28 @@ def propagate(
           ``SECOND_ORDER``), so for a well-determined object it reads back
           very close to ``FIRST_ORDER`` (tagged ``linear``) — that is
           expected, not a bug.
+
+          The mixture components themselves come back on
+          :attr:`PropagationResult.mixtures` (a
+          :class:`~empyrean.propagation.mixtures.MixtureChains` table),
+          so a consumer can evaluate ``sum_k w_k * N(x | mu_k, Sigma_k)``
+          directly at a retained close-approach epoch. Four limits apply
+          to what is retained, each a real property of the engine's
+          retention rather than a marshaling shortfall:
+
+          - **Depth-0 only.** Only the initial split is retained;
+            recursive AGM calls (depth > 0) are not captured.
+          - **Only CA epochs where AGM fired.** An orbit that never
+            triggered a split contributes no rows, not a one-component
+            chain.
+          - **Component covariance is the linear map.** Each component's
+            covariance is ``Phi Sigma_k Phi^T``; the second-order mean
+            correction is intentionally omitted.
+          - **Retained weights may sum to less than 1.** A sub-Gaussian
+            whose own sub-propagation missed the close approach (or
+            failed to integrate) contributes no component, and the
+            deficit is not recorded anywhere. Do not assume
+            ``sum_k w_k == 1``; sum ``weight`` and check.
     num_threads : int, optional
         Threads for multi-orbit propagation. ``None`` (default) and
         ``0`` both use all available cores; ``n`` > 0 pins exactly
@@ -399,8 +422,19 @@ def propagate(
         a2s = np.zeros(n, dtype=np.float64)
         a3s = np.zeros(n, dtype=np.float64)
 
-    # Photometric parameters
-    phot_h, phot_g, phot_model = extract_photometry(orbits)
+    # Photometric parameters, including the optional 3x3 covariance
+    # over (H, slope1, slope2). Gated like the non-grav covariance
+    # below so the common no-covariance case skips the FFI marshal.
+    (
+        phot_h,
+        phot_slope1,
+        phot_slope2,
+        phot_model,
+        has_phot_cov_arr,
+        phot_cov_arr,
+    ) = extract_photometry(orbits)
+    has_phot_cov: np.ndarray | None = has_phot_cov_arr if has_phot_cov_arr.any() else None
+    phot_cov: np.ndarray | None = phot_cov_arr if has_phot_cov_arr.any() else None
 
     # Fitted non-grav covariance — passed through only when a row carries one
     # (mirrors the OD output path) so a StateAndNonGrav-fitted orbit re-fed
@@ -499,7 +533,7 @@ def propagate(
         a2s,
         a3s,
         phot_h,
-        phot_g,
+        phot_slope1,
         phot_model,
         num_threads=num_threads,
         epsilon=epsilon,
@@ -512,6 +546,9 @@ def propagate(
         srp_amrat_variance=srp_amrat_variance,
         has_non_grav_cov=has_non_grav_cov,
         non_grav_cov=non_grav_cov,
+        phot_slope2=phot_slope2,
+        has_phot_cov=has_phot_cov,
+        phot_cov=phot_cov,
         # The joint's off-diagonal terms, when the input carries them.
         # A leg fed its predecessor's joint propagates the covariance
         # that leg actually computed; fed the 6x6 alone it reports a
@@ -557,11 +594,17 @@ def propagate(
     # ── Build provenance-tagged covariance table (opt-in) ─────
     tagged = _build_tagged_covariance(result) if tagged_covariance else None
 
+    # ── Retained AGM mixture components (always on) ───────────
+    # Free: the components already crossed the boundary with the result.
+    # Empty table when nothing split.
+    mixtures = build_mixture_chains(result)
+
     return PropagationResult(
         states=states,
         events=detected_events,
         sensitivity=sensitivity,
         tagged_covariance=tagged,
+        mixtures=mixtures,
     )
 
 

@@ -43,6 +43,13 @@ from empyrean.impact import (
 from empyrean.io.horizons import query_horizons, query_horizons_vectors
 from empyrean.io.observations import query_observations, query_radar
 from empyrean.io.sbdb import query_sbdb
+
+# NAME COLLISION, resolved by module path. This top-level
+# ``MixtureComponent`` is the ``split_gaussian`` primitive at t0 (weight /
+# mean / covariance, no basis tags). The AGM *read-back* component — the
+# basis-tagged one — is ``empyrean.propagation.mixtures.MixtureComponent``
+# and is deliberately NOT re-exported here: flattening both names would
+# need one of them renamed away from the name the engine uses.
 from empyrean.math import MixtureComponent, eigenvector_max_6x6, split_gaussian
 from empyrean.observers.observers import Observers
 from empyrean.observers.state import get_observer_states
@@ -157,6 +164,7 @@ from empyrean.propagation.events import (
     ShadowEntries,
     ShadowExits,
 )
+from empyrean.propagation.mixtures import MixtureChains
 from empyrean.propagation.propagate import propagate
 from empyrean.propagation.result import PropagationResult
 from empyrean.propagation.tagged_covariance import (

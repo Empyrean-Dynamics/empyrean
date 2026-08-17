@@ -11,6 +11,15 @@
 #
 # Pinned for v0.10.0-rc.1.
 #
+# The pinned binaries were built from the include/empyrean.h below. Hashing
+# the tarballs proves WHICH bytes were downloaded, not which struct layouts
+# they hold, and EMPYREAN_ABI_VERSION encodes only the base version — so
+# inside one release cycle a struct can grow while the handshake still says
+# 1000. build.rs refuses the download whenever the header in the checkout
+# hashes to anything else. Regenerated with the hashes below.
+#
+# Header-SHA256: 1c1c51d1b0fd81084e042fceb043bf43c9c010774e8556a6ee6f317720cf6c0f
+#
 # Format: <asset-stem> <sha256>
 libempyrean-linux-aarch64 c8d84fe1531608d7246b7a80e2b0811510dfc779548a09cda7425de128ffa888
 libempyrean-linux-x86_64 0371351e819a3bcefe73e32aa2ee2920b9ec6a8459508e1cca2e4b0b76ff4bde

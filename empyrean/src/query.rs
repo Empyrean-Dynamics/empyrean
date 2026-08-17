@@ -118,6 +118,12 @@ fn ffi_batch_to_owned(batch: &empyrean_sys::EmpyreanOrbitBatch) -> Result<OrbitB
             h_mag: ffi_orbit.h_mag,
             slope1: ffi_orbit.slope1,
             slope2: ffi_orbit.slope2,
+            // SBDB's `phys_par` publishes H / G sigmas, which the engine
+            // ingests as a diagonal 3×3. Carried through so a queried
+            // orbit's ephemeris reports the published H uncertainty in
+            // `mag_sigma` instead of the state term alone.
+            phot_covariance: (ffi_orbit.has_phot_covariance != 0)
+                .then_some(ffi_orbit.phot_covariance),
             // SBDB / Horizons queries return ballistic orbits; thrust is a
             // caller-supplied input, never reconstructed from a query.
             thrust: None,

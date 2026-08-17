@@ -20,26 +20,104 @@ use empyrean_core::propagation::{
 use empyrean_core::time::Epoch;
 
 /// Build a [`PhotometricParams`] from an [`EmpyreanOrbit`] when the
-/// caller supplied a phase function. Returns `None` when
-/// `phot_system == EMPYREAN_PHASE_FUNCTION_NONE` so callers can
+/// caller supplied photometry. Returns `None` when
+/// `phot_system == EMPYREAN_PHASE_FUNCTION_NONE`, or when `h_mag` is
+/// not a usable absolute magnitude, so callers can
 /// `set_photometric_params(i, None)` to leave H/G unset.
+///
+/// **`h_mag == 0.0` reads as absent**, alongside NaN and infinity. It is
+/// what `memset(0)` produces — and `EMPYREAN_PHASE_FUNCTION_HG` is `0`
+/// too, so a zero-initialized orbit would otherwise claim HG photometry
+/// with H = 0, an absolute magnitude no solar-system minor body has
+/// (Ceres, the brightest, is H ≈ 3.3; H = 0 is a ~1500 km body). Before
+/// the write path attached photometry that fabrication was invisible;
+/// now it would be written into orbit files and read back as fact.
+/// Making zero the absence value is what keeps the documented
+/// `memset(0)` idiom meaning "no photometry" — a caller who wants
+/// photometry sets a real H, and one who wants none can also say so
+/// explicitly with `EMPYREAN_PHASE_FUNCTION_NONE`.
+///
+/// The orbit's optional photometric 3×3 covariance rides through here
+/// too — this is the single function every C-ABI input path routes
+/// photometry through, so attaching it here is what makes
+/// `magnitude_uncertainty`'s \\(\sigma_{\text{photo}}\\) term reachable
+/// from the distribution. The 3×3 is validated finite and symmetric
+/// here — the orbit file formats store only its six lower-triangle
+/// cells, so an asymmetric matrix has no file representation and would
+/// come back truncated (the upper entry dropped, not mirrored), with
+/// `mag_sigma` silently changing across a round trip. Refusing at this
+/// one chokepoint gives C callers the same contract the Rust and Python
+/// layers enforce.
 pub(crate) fn empyrean_orbit_photometric_params(
     orbit: &EmpyreanOrbit,
-) -> Option<PhotometricParams> {
-    if !orbit.h_mag.is_finite() {
-        return None;
+) -> Result<Option<PhotometricParams>, String> {
+    if !orbit.h_mag.is_finite() || orbit.h_mag == 0.0 {
+        return Ok(None);
     }
-    match orbit.phot_system {
-        EMPYREAN_PHASE_FUNCTION_HG => Some(PhotometricParams::hg(orbit.h_mag, orbit.slope1)),
-        EMPYREAN_PHASE_FUNCTION_HG1G2 => Some(PhotometricParams::hg1g2(
-            orbit.h_mag,
-            orbit.slope1,
-            orbit.slope2,
-        )),
-        EMPYREAN_PHASE_FUNCTION_HG12 => Some(PhotometricParams::hg12(orbit.h_mag, orbit.slope1)),
-        EMPYREAN_PHASE_FUNCTION_NONE => None,
-        _ => None,
+    let params = match orbit.phot_system {
+        EMPYREAN_PHASE_FUNCTION_HG => PhotometricParams::hg(orbit.h_mag, orbit.slope1),
+        EMPYREAN_PHASE_FUNCTION_HG1G2 => {
+            PhotometricParams::hg1g2(orbit.h_mag, orbit.slope1, orbit.slope2)
+        }
+        EMPYREAN_PHASE_FUNCTION_HG12 => PhotometricParams::hg12(orbit.h_mag, orbit.slope1),
+        EMPYREAN_PHASE_FUNCTION_NONE => return Ok(None),
+        _ => return Ok(None),
+    };
+    Ok(Some(if orbit.has_phot_covariance != 0 {
+        validate_phot_covariance_symmetry(&orbit.phot_covariance)?;
+        params.with_covariance(orbit.phot_covariance)
+    } else {
+        params
+    }))
+}
+
+/// Relative tolerance on the photometric covariance's symmetry. A matrix
+/// assembled from a fit is symmetric to round-off, not to the bit. The
+/// tolerance is relative to the larger of the two mirrored entries, so a
+/// transposed or half-filled matrix (one side zero) fails at any
+/// magnitude.
+const PHOT_COV_SYMMETRY_RTOL: f64 = 1e-12;
+
+/// Reject an asymmetric or non-finite photometric 3×3 by name.
+///
+/// A covariance is symmetric by definition, and the orbit file formats
+/// store only its six lower-triangle cells — so an asymmetric matrix has
+/// no file representation and would come back truncated (the upper entry
+/// dropped, not mirrored), silently changing `mag_sigma` across a round
+/// trip. This mirrors the Rust and Python layers' identical checks so
+/// the C ABI is not the one surface where a half-filled matrix is
+/// accepted and quietly edited.
+fn validate_phot_covariance_symmetry(cov: &[[f64; 3]; 3]) -> Result<(), String> {
+    const NAME: [&str; 3] = ["H", "slope1", "slope2"];
+    for (i, row) in cov.iter().enumerate() {
+        for (j, v) in row.iter().enumerate() {
+            if !v.is_finite() {
+                return Err(format!(
+                    "photometric covariance entry [{i}][{j}] ({}-{}) is {v}, not a finite \
+                     number. A non-finite entry contracts to a NaN sigma_V, which reads \
+                     downstream as 'no photometric uncertainty was supplied' — supply the \
+                     real variance, or set has_phot_covariance = 0.",
+                    NAME[i], NAME[j],
+                ));
+            }
+        }
     }
+    for i in 0..3 {
+        for j in (i + 1)..3 {
+            let (a, b) = (cov[i][j], cov[j][i]);
+            let scale = a.abs().max(b.abs());
+            if (a - b).abs() > PHOT_COV_SYMMETRY_RTOL * scale {
+                return Err(format!(
+                    "photometric covariance is not symmetric: [{i}][{j}] = {a} ({}-{}) but \
+                     [{j}][{i}] = {b}. It is a covariance over (H, slope1, slope2), and the \
+                     orbit file formats store only its lower triangle, so an asymmetric \
+                     matrix cannot round-trip — mirror the term you meant onto both sides.",
+                    NAME[i], NAME[j],
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 use crate::{CoordinateState, EmpyreanContext, set_last_error};
@@ -210,8 +288,21 @@ pub struct EmpyreanOrbit {
     /// Phase-function model. `EMPYREAN_PHASE_FUNCTION_NONE` disables
     /// magnitude computation; the other values map to villeneuve's
     /// `PhaseFunction` enum.
+    ///
+    /// Note that `EMPYREAN_PHASE_FUNCTION_HG` is `0`, so `memset(0)`
+    /// selects HG rather than NONE — `h_mag` is what carries absence for
+    /// a zero-initialized orbit (see below).
     pub phot_system: i32,
     /// Absolute magnitude H. Ignored when `phot_system == NONE`.
+    ///
+    /// **0.0 means "no photometry supplied"**, as do NaN and infinity.
+    /// Zero is what `memset(0)` leaves here, and no solar-system minor
+    /// body has H = 0 (Ceres, the brightest, is H ≈ 3.3), so treating it
+    /// as a magnitude would let a zero-initialized orbit claim HG
+    /// photometry ~20 mag too bright — a fabrication that ephemeris
+    /// generation would predict from and the orbit writers would
+    /// persist. There is no way to request photometry with a literal H
+    /// of zero; supply the real absolute magnitude.
     pub h_mag: f64,
     /// Slope parameter slot 1 — G (HG), G₁ (HG1G2), or G₁₂ (HG12).
     pub slope1: f64,
@@ -337,6 +428,40 @@ pub struct EmpyreanOrbit {
     /// Number of entries in
     /// [`param_pair_cross`](Self::param_pair_cross).
     pub n_param_pair_cross: usize,
+
+    // ── Photometric parameter covariance ───────────────────────────
+    //
+    // APPENDED at the struct tail rather than beside the `phot_system`
+    // / `h_mag` / `slope1` / `slope2` quad above, so no pre-existing
+    // field offset moves. A `memset(0)` orbit carries no photometric
+    // covariance and propagates exactly as it did before these two
+    // fields existed.
+    /// 1 when [`phot_covariance`](Self::phot_covariance) carries a
+    /// photometric parameter covariance; 0 otherwise. Set it from an OD
+    /// photometry fit (`EmpyreanODPhotometryResult::covariance`), from
+    /// an SBDB query, or from an orbit file that carried one, so the
+    /// H/G uncertainty reaches ephemeris generation's `mag_sigma`
+    /// instead of being dropped. Leave 0 for a hand-built orbit with no
+    /// photometric uncertainty.
+    pub has_phot_covariance: u8,
+    /// Photometric 3×3 covariance over (H, slope1, slope2), row-major —
+    /// the same parameter order as `h_mag` / `slope1` / `slope2` above,
+    /// so which slope a row/column names follows `phot_system`. Only
+    /// read when `has_phot_covariance = 1`.
+    ///
+    /// Rows and columns of parameters the producing fit held fixed are
+    /// zero (a fixed parameter contributes no variance), which is
+    /// exactly what an H-only fit emits.
+    ///
+    /// **Must be symmetric**, and every one of the nine entries finite.
+    /// The orbit file formats store only the six lower-triangle cells,
+    /// so an asymmetric matrix has no file representation and would come
+    /// back truncated — the upper entry dropped rather than mirrored,
+    /// silently changing the magnitude uncertainty across a write/read
+    /// round trip. An asymmetric or non-finite matrix is refused by
+    /// name (entry indices and parameter names) rather than repaired;
+    /// fill both sides of each off-diagonal term.
+    pub phot_covariance: [[f64; 3]; 3],
 }
 
 /// Origin-switching configuration for trajectory splitting at body
@@ -986,9 +1111,8 @@ pub struct EmpyreanMixtureChain {
 
 /// Propagation result containing states, events, and object identifiers.
 ///
-/// `mixtures` parallels `object_ids` only when populated — it is
-/// per-orbit (not per-state), so its length is the distinct orbit
-/// count, not `num_states`.
+/// `mixtures` is per-orbit (not per-state), so when populated its length
+/// is the input orbit count, not `num_states`.
 #[repr(C)]
 pub struct EmpyreanPropagationResult {
     pub states: *mut EmpyreanPropagatedState,
@@ -996,10 +1120,21 @@ pub struct EmpyreanPropagationResult {
     pub object_ids: *mut *mut std::ffi::c_char,
     pub events: *mut EmpyreanEvent,
     pub num_events: usize,
-    /// One [`EmpyreanMixtureChain`] per input orbit (positional with
-    /// the input orbit batch). Empty / null when no orbits produced
-    /// mixtures (the typical case for FirstOrder / SecondOrder /
-    /// SigmaPoint / MonteCarlo).
+    /// One [`EmpyreanMixtureChain`] per input orbit, positional with the
+    /// input orbit batch, whenever the run produced any sensitivity data
+    /// at all — including under FirstOrder / SecondOrder / SigmaPoint /
+    /// MonteCarlo, where every row is an empty chain
+    /// (`num_ca_epochs == 0`, all four pointers null). An empty row means
+    /// "this orbit split nothing"; it is **not** absence.
+    ///
+    /// `num_mixtures == 0` (and a null `mixtures`) is the one other
+    /// shape: a batch in which NO orbit produced sensitivity tensors —
+    /// orbits carrying no covariance, under any method — for which the
+    /// engine empties the vector wholesale. So check `num_mixtures`
+    /// before indexing: it is either 0 or the input orbit count, never
+    /// anything between. (The Rust wrapper pads that case to one empty
+    /// chain per orbit so its own `mixtures` is positional
+    /// unconditionally; at this layer the zero-row shape is visible.)
     pub mixtures: *mut EmpyreanMixtureChain,
     pub num_mixtures: usize,
     /// Opaque retained handle to the rich propagation result, enabling
@@ -3385,6 +3520,8 @@ mod thrust_input_tests {
             n_state_param_cross: 0,
             param_pair_cross: std::ptr::null(),
             n_param_pair_cross: 0,
+            has_phot_covariance: 0,
+            phot_covariance: [[0.0; 3]; 3],
         }
     }
 
@@ -3721,6 +3858,8 @@ mod srp_input_tests {
             n_state_param_cross: 0,
             param_pair_cross: std::ptr::null(),
             n_param_pair_cross: 0,
+            has_phot_covariance: 0,
+            phot_covariance: [[0.0; 3]; 3],
         }
     }
 
@@ -3876,6 +4015,8 @@ mod non_grav_input_tests {
             n_state_param_cross: 0,
             param_pair_cross: std::ptr::null(),
             n_param_pair_cross: 0,
+            has_phot_covariance: 0,
+            phot_covariance: [[0.0; 3]; 3],
         }
     }
 
@@ -4346,5 +4487,338 @@ mod propagated_joint_tests {
         // Freeing a result whose joints are all absent is a no-op on
         // that surface, and must not fault.
         unsafe { empyrean_propagation_result_free(&mut result) };
+    }
+}
+
+#[cfg(test)]
+mod mixture_flattening_tests {
+    use super::*;
+
+    /// 99942 Apophis, heliocentric ecliptic Cartesian at MJD 61000 TDB,
+    /// with a covariance loose enough that the mapping through the 2029
+    /// Earth encounter is genuinely nonlinear — the regime AGM exists
+    /// for, and the only one that produces retained components.
+    fn apophis_loose() -> EmpyreanOrbit {
+        // SAFETY: `#[repr(C)]` POD plus pointers that zero-init to null.
+        let mut orbit: EmpyreanOrbit = unsafe { std::mem::zeroed() };
+        let mut cov = [[0.0f64; 6]; 6];
+        for i in 0..3 {
+            cov[i][i] = 1.0e-10;
+            cov[i + 3][i + 3] = 1.0e-16;
+        }
+        orbit.state = crate::CoordinateState {
+            epoch_mjd_tdb: 61000.0,
+            elements: [
+                -0.078_526_491_490_690_46,
+                -0.819_748_051_902_064_6,
+                0.041_893_951_532_339_09,
+                0.019_875_102_496_888_46,
+                0.001_322_088_445_361_402,
+                0.000_399_496_044_422_352_2,
+            ],
+            covariance: cov,
+            has_covariance: 1,
+            representation: crate::od::EMPYREAN_REPRESENTATION_CARTESIAN,
+            frame: 1,
+            origin: 10,
+            has_non_grav_cross: 0,
+            non_grav_cross: [[0.0; 3]; 6],
+        };
+        orbit.non_grav_dt = f64::NAN;
+        orbit.non_grav_dt_variance = f64::NAN;
+        orbit.srp_amrat_variance = f64::NAN;
+        orbit
+    }
+
+    /// The flattened chain's prefix-sum contract, asserted on a real
+    /// propagation rather than left as a comment.
+    ///
+    /// `components_offset[0] == 0` and
+    /// `components_offset[k] == sum(components_per_epoch[0..k])`, with
+    /// the last offset plus the last count exactly `num_components_total`
+    /// — the invariant every consumer's un-flattening rests on. The row
+    /// shape is checked too: one chain per input orbit, and an orbit that
+    /// never split gets `num_ca_epochs == 0` with null pointers, so a
+    /// positional join against the input batch always holds.
+    #[test]
+    fn flattened_mixture_offsets_are_the_prefix_sum_of_the_counts() {
+        let Some(ctx) =
+            crate::testing::context_or_skip("flattened_mixture_offsets_are_the_prefix_sum")
+        else {
+            return;
+        };
+        let orbit = apophis_loose();
+
+        let mut cfg: EmpyreanPropagationConfig = unsafe { std::mem::zeroed() };
+        // Approximate tier: this test is about the FLATTENING contract,
+        // not the dynamics, and the debug-profile integration over the
+        // ~3.8 years to the 2029 encounter is the whole cost.
+        cfg.force_model = 0;
+        cfg.uncertainty_method.tag = EMPYREAN_UNCERTAINTY_MIXTURE;
+        // Tag 5 reuses the AGM parameter slots it shares with Auto.
+        cfg.uncertainty_method.auto_threshold_mixture = 1.0;
+        cfg.uncertainty_method.auto_gmm_max_depth = 3;
+        cfg.uncertainty_method.auto_gmm_components_per_split = 3;
+        cfg.advanced.dt_initial = f64::NAN;
+        cfg.advanced.dt_min = f64::NAN;
+
+        let times: Vec<f64> = (0..5).map(|i| 61000.0 + 350.0 * i as f64).collect();
+        let mut result: EmpyreanPropagationResult = unsafe { std::mem::zeroed() };
+        let code = unsafe {
+            empyrean_propagate(
+                &ctx,
+                &orbit,
+                1,
+                times.as_ptr(),
+                times.len(),
+                &cfg,
+                &mut result,
+            )
+        };
+        let err = unsafe { CStr::from_ptr(crate::empyrean_last_error()) }.to_string_lossy();
+        assert_eq!(code, 0, "mixture propagation must succeed: {err}");
+
+        assert_eq!(
+            result.num_mixtures, 1,
+            "one chain per input orbit, always — non-mixture orbits get an empty row \
+             rather than being omitted, so the positional join holds"
+        );
+        assert!(!result.mixtures.is_null());
+
+        let chain = unsafe { &*result.mixtures };
+        let n = chain.num_ca_epochs;
+        assert!(
+            n > 0,
+            "the 2029 Apophis encounter with a loose covariance must fire the splitter"
+        );
+        assert!(!chain.ca_epochs_mjd_tdb.is_null());
+        assert!(!chain.components_per_epoch.is_null());
+        assert!(!chain.components_offset.is_null());
+
+        let counts = unsafe { std::slice::from_raw_parts(chain.components_per_epoch, n) };
+        let offsets = unsafe { std::slice::from_raw_parts(chain.components_offset, n) };
+        assert_eq!(offsets[0], 0, "components_offset[0] must be 0");
+        let mut running = 0usize;
+        for k in 0..n {
+            assert_eq!(
+                offsets[k], running,
+                "components_offset[{k}] must be the prefix sum of components_per_epoch[0..{k}]"
+            );
+            running += counts[k];
+        }
+        assert_eq!(
+            running, chain.num_components_total,
+            "the counts must sum to num_components_total"
+        );
+        if chain.num_components_total > 0 {
+            assert!(!chain.components.is_null());
+        }
+
+        unsafe { empyrean_propagation_result_free(&mut result) };
+    }
+
+    /// A FirstOrder run retains nothing, and "nothing" is an EMPTY row
+    /// per orbit with null pointers — not an absent array, which would
+    /// break the positional join, and not a fabricated one-component
+    /// chain.
+    #[test]
+    fn first_order_emits_one_empty_chain_per_orbit() {
+        let Some(ctx) = crate::testing::context_or_skip("first_order_emits_one_empty_chain") else {
+            return;
+        };
+        let orbit = apophis_loose();
+
+        let mut cfg: EmpyreanPropagationConfig = unsafe { std::mem::zeroed() };
+        cfg.force_model = 2;
+        cfg.uncertainty_method.tag = EMPYREAN_UNCERTAINTY_FIRST;
+        cfg.advanced.dt_initial = f64::NAN;
+        cfg.advanced.dt_min = f64::NAN;
+
+        let times = [61000.0f64, 61100.0];
+        let mut result: EmpyreanPropagationResult = unsafe { std::mem::zeroed() };
+        let code = unsafe {
+            empyrean_propagate(
+                &ctx,
+                &orbit,
+                1,
+                times.as_ptr(),
+                times.len(),
+                &cfg,
+                &mut result,
+            )
+        };
+        assert_eq!(code, 0);
+        assert_eq!(result.num_mixtures, 1);
+        let chain = unsafe { &*result.mixtures };
+        assert_eq!(chain.num_ca_epochs, 0);
+        assert_eq!(chain.num_components_total, 0);
+        assert!(chain.ca_epochs_mjd_tdb.is_null());
+        assert!(chain.components_per_epoch.is_null());
+        assert!(chain.components_offset.is_null());
+        assert!(chain.components.is_null());
+
+        unsafe { empyrean_propagation_result_free(&mut result) };
+    }
+
+    /// The ONE shape that is not one row per orbit: a batch in which no
+    /// orbit carries a covariance produces no sensitivity tensors at
+    /// all, and the engine empties the vector wholesale — so this layer
+    /// answers with `num_mixtures == 0` and a null array, under every
+    /// method.
+    ///
+    /// The field doc used to say the opposite ("empty / null when no
+    /// orbits produced mixtures … the typical case for FirstOrder"),
+    /// which its sibling test above falsifies; this pins the case that
+    /// actually is zero-row, so the two shapes are both nailed down and
+    /// the Rust wrapper's padding has a stated contract to pad.
+    #[test]
+    fn a_covariance_less_batch_emits_no_chains_at_all() {
+        let Some(ctx) = crate::testing::context_or_skip("a_covariance_less_batch_emits_no_chains")
+        else {
+            return;
+        };
+        let mut orbit = apophis_loose();
+        orbit.state.has_covariance = 0;
+        orbit.state.covariance = [[0.0; 6]; 6];
+
+        for tag in [EMPYREAN_UNCERTAINTY_FIRST, EMPYREAN_UNCERTAINTY_MIXTURE] {
+            let mut cfg: EmpyreanPropagationConfig = unsafe { std::mem::zeroed() };
+            cfg.force_model = 0;
+            cfg.uncertainty_method.tag = tag;
+            // Tag 5 reuses the AGM parameter slots it shares with Auto;
+            // harmless for FIRST, and this is about the row shape.
+            cfg.uncertainty_method.auto_threshold_mixture = 1.0;
+            cfg.uncertainty_method.auto_gmm_max_depth = 3;
+            cfg.uncertainty_method.auto_gmm_components_per_split = 3;
+            cfg.advanced.dt_initial = f64::NAN;
+            cfg.advanced.dt_min = f64::NAN;
+
+            let times = [61000.0f64, 61010.0];
+            let mut result: EmpyreanPropagationResult = unsafe { std::mem::zeroed() };
+            let code = unsafe {
+                empyrean_propagate(
+                    &ctx,
+                    &orbit,
+                    1,
+                    times.as_ptr(),
+                    times.len(),
+                    &cfg,
+                    &mut result,
+                )
+            };
+            let err =
+                unsafe { std::ffi::CStr::from_ptr(crate::empyrean_last_error()) }.to_string_lossy();
+            assert_eq!(code, 0, "method {tag}: {err}");
+            assert_eq!(
+                result.num_mixtures, 0,
+                "method {tag}: a batch with no covariance produces no sensitivity data, so \
+                 the engine returns no chains — check num_mixtures before indexing"
+            );
+            assert!(
+                result.mixtures.is_null(),
+                "method {tag}: zero rows, null array"
+            );
+
+            unsafe { empyrean_propagation_result_free(&mut result) };
+        }
+    }
+}
+
+#[cfg(test)]
+mod photometry_absence_tests {
+    use super::*;
+
+    /// `EmpyreanOrbit o = {0}` selects `EMPYREAN_PHASE_FUNCTION_HG`
+    /// (which is 0) with `h_mag = 0.0` (which is finite), so the
+    /// presence predicate "a named phase function and a finite H" says
+    /// PRESENT for an orbit the caller never gave photometry to. H = 0
+    /// is what carries absence here, and this pins it: a zero-init orbit
+    /// has no photometry.
+    ///
+    /// FAILS on the `!h_mag.is_finite()`-only predicate, which returns
+    /// `Some(hg(0.0, 0.0))` — an absolute magnitude ~20 mag brighter
+    /// than any minor body, which ephemeris generation predicts from and
+    /// (since the write path started attaching photometry) the orbit
+    /// writers persist.
+    #[test]
+    fn a_zero_initialized_orbit_carries_no_photometry() {
+        // SAFETY: `#[repr(C)]` POD plus pointers that zero-init to null.
+        let zeroed: EmpyreanOrbit = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            zeroed.phot_system, EMPYREAN_PHASE_FUNCTION_HG,
+            "the trap this guards: HG is 0, so memset(0) names a phase function"
+        );
+        assert!(
+            empyrean_orbit_photometric_params(&zeroed)
+                .expect("no covariance to validate")
+                .is_none(),
+            "a zero-initialized orbit must carry no photometry"
+        );
+    }
+
+    /// A real H still reaches the engine — the guard is about zero, not
+    /// about photometry in general.
+    #[test]
+    fn a_supplied_magnitude_still_reaches_the_engine() {
+        // SAFETY: as above.
+        let mut orbit: EmpyreanOrbit = unsafe { std::mem::zeroed() };
+        orbit.phot_system = EMPYREAN_PHASE_FUNCTION_HG;
+        orbit.h_mag = 19.7;
+        orbit.slope1 = 0.15;
+        let ph = empyrean_orbit_photometric_params(&orbit)
+            .expect("a symmetric (absent) covariance validates")
+            .expect("H = 19.7 is photometry");
+        assert!((ph.h() - 19.7).abs() < 1e-12);
+        assert!((ph.p2 - 0.15).abs() < 1e-12);
+    }
+
+    /// NaN keeps its long-standing meaning too.
+    #[test]
+    fn a_nan_magnitude_carries_no_photometry() {
+        // SAFETY: as above.
+        let mut orbit: EmpyreanOrbit = unsafe { std::mem::zeroed() };
+        orbit.phot_system = EMPYREAN_PHASE_FUNCTION_HG;
+        orbit.h_mag = f64::NAN;
+        assert!(
+            empyrean_orbit_photometric_params(&orbit)
+                .expect("no covariance to validate")
+                .is_none()
+        );
+    }
+
+    /// The orbit file formats store only the six lower-triangle cells of
+    /// the photometric 3×3, so an asymmetric matrix comes back with its
+    /// upper entry DROPPED (not mirrored) and `mag_sigma` silently
+    /// changes across a write/read round trip. The Rust and Python
+    /// layers refuse it; the C ABI must too, or it is the one surface
+    /// where the caller's uncertainty is quietly edited.
+    #[test]
+    fn an_asymmetric_photometric_covariance_is_refused_by_name() {
+        // SAFETY: as above.
+        let mut orbit: EmpyreanOrbit = unsafe { std::mem::zeroed() };
+        orbit.phot_system = EMPYREAN_PHASE_FUNCTION_HG;
+        orbit.h_mag = 19.7;
+        orbit.slope1 = 0.15;
+        orbit.has_phot_covariance = 1;
+        orbit.phot_covariance = [[0.09, -0.02, 0.0], [0.0, 0.0025, 0.0], [0.0, 0.0, 0.0]];
+        let err = empyrean_orbit_photometric_params(&orbit)
+            .expect_err("a half-filled off-diagonal has no file representation");
+        assert!(err.contains("not symmetric"), "{err}");
+        assert!(err.contains("H-slope1"), "the entry is named: {err}");
+
+        // Mirrored, it is accepted — this is about asymmetry, not about
+        // off-diagonals in general.
+        orbit.phot_covariance[1][0] = orbit.phot_covariance[0][1];
+        let ph = empyrean_orbit_photometric_params(&orbit)
+            .expect("a symmetric covariance validates")
+            .expect("H = 19.7 is photometry");
+        assert!(ph.covariance.is_some(), "the 3×3 rides through");
+
+        // A non-finite entry is refused too: it contracts to a NaN
+        // sigma_V, which reads downstream as "no uncertainty supplied".
+        orbit.phot_covariance[2][2] = f64::NAN;
+        let err = empyrean_orbit_photometric_params(&orbit)
+            .expect_err("a NaN variance is not an uncertainty");
+        assert!(err.contains("not a finite number"), "{err}");
     }
 }

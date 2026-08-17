@@ -50,10 +50,36 @@ class Ephemeris(qv.Table):
 
     # Photometry
     mag = qv.Float64Column(nullable=True)
-    # 1-sigma magnitude uncertainty. Populated iff photometry is enabled
-    # AND the input orbit carried a state covariance; null otherwise.
-    # State contribution only — H-magnitude uncertainty is not yet an
-    # input, so sigma_V is under-reported when H uncertainty matters.
+    # 1-sigma magnitude uncertainty. Populated only when photometry is
+    # enabled AND the input orbit carried at least one of a state
+    # covariance or a photometric covariance
+    # (PhotometricParams.covariance) AND what it carried contracts to a
+    # strictly positive variance; null otherwise. A carried covariance is
+    # not sufficient on its own: an all-zero 3x3, or a non-PSD one that
+    # contracts to <= 0, still reports null.
+    #
+    # Both contributions are summed in quadrature:
+    # sigma_V = sqrt(sigma_photo^2 + sigma_state^2), where sigma_photo
+    # contracts the photometric 3x3 against the FULL magnitude Jacobian
+    # sigma_photo^2 = J Sigma_p J^T, J = [dV/dH, dV/dslope1, dV/dslope2].
+    #
+    # V = H + 5*log10(r*Delta) + phi(alpha) gives dV/dH == 1, so an orbit
+    # with NO state covariance and a photometric covariance of the H-only
+    # shape diag(sigma_H^2, 0, 0) reports sigma_V = sigma_H exactly. The
+    # slope terms do not drop out of any other shape: slope variances and
+    # H-slope covariances contract against dV/dslope, which vanishes only
+    # at zero phase angle, so any covariance carrying them reports
+    # sigma_V > sigma_H. An SBDB-queried orbit is the common case — its
+    # published diag(sigma_H^2, sigma_G^2, 0) makes sigma_V strictly
+    # larger than sigma_H.
+    #
+    # The two terms are combined as independent. They are not strictly
+    # independent — a fitted sigma_H is conditional on the fitted state,
+    # because the photometric fit holds the geometry (r, Delta, alpha)
+    # exact — and no joint state<->photometry covariance is computed
+    # anywhere in the stack, so there is no cross term to add. The
+    # resulting sigma_V is therefore mildly conservative, which is the
+    # safe direction.
     mag_sigma = qv.Float64Column(nullable=True)
 
     # Local horizon

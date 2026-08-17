@@ -28,6 +28,8 @@ test loudly. That's the point.
 
 from __future__ import annotations
 
+import os
+
 import empyrean
 import numpy as np
 import pyarrow as pa
@@ -109,6 +111,7 @@ ALLOWED_ALL_NULL: dict[str, str] = {
     "PropagatedStates.photometric.g1": "schema-artifact (input fields on output table)",
     "PropagatedStates.photometric.g2": "schema-artifact (input fields on output table)",
     "PropagatedStates.photometric.g12": "schema-artifact (input fields on output table)",
+    "PropagatedStates.photometric.covariance": "schema-artifact (input fields on output table)",
     # ── Ephemeris aberrated state + both covariances: populated as of
     # v0.9.0 — the C ABI carries the sky-plane covariance,
     # the aberrated Cartesian state, and the aberrated covariance, so none
@@ -230,10 +233,16 @@ def _full_feature_orbit() -> CartesianOrbits:
         model=["inverse_square"],
         covariance=[np.diag([1e-20, 1e-20, 1e-20]).reshape(9).tolist()],
     )
+    # Photometric 3x3 over (H, G, unused), row-major flattened, so the
+    # full-feature input exercises the phot_covariance marshal channel too
+    # (the OD-output field the forward-model paths historically dropped).
+    # Its load-bearing DIFFERENCE check lives in
+    # test_phot_covariance_reaches_mag_sigma.
     photometric = PhotometricParams.from_kwargs(
         model=["hg"],
         h=[19.7],
         g=[0.15],
+        covariance=[np.diag([0.09, 0.0025, 0.0]).reshape(9).tolist()],
     )
     return CartesianOrbits.from_kwargs(
         orbit_id=["FORCING_TEST"],
@@ -1414,3 +1423,313 @@ def test_plan_radar_provenance_is_carried_not_summarized() -> None:
         f"exactly one may carry notes; got {provenance}"
     )
     assert all(isinstance(n, str) and n.strip() for n in non_empty[0]), non_empty[0]
+
+
+# ══════════════════════════════════════════════════════════════════
+#  Photometric parameter covariance — the sigma_photo input slot
+# ══════════════════════════════════════════════════════════════════
+
+
+def _photometric_orbit(phot_cov: np.ndarray | None) -> CartesianOrbits:
+    """:func:`_full_feature_orbit` with its photometric covariance
+    replaced (or removed), and no state covariance, so ``mag_sigma``
+    isolates the sigma_photo term."""
+    orbits = _full_feature_orbit()
+    coords = orbits.coordinates
+    stripped = CartesianCoordinates.from_kwargs(
+        epoch=coords.epoch,
+        x=coords.x,
+        y=coords.y,
+        z=coords.z,
+        vx=coords.vx,
+        vy=coords.vy,
+        vz=coords.vz,
+        frame=coords.frame,
+        origin=coords.origin,
+    )
+    return orbits.set_column("coordinates", stripped).set_column(
+        "photometric",
+        PhotometricParams.from_kwargs(
+            model=["hg"],
+            h=[19.7],
+            g=[0.15],
+            covariance=[None if phot_cov is None else phot_cov.reshape(9).tolist()],
+        ),
+    )
+
+
+def _mag_sigma(orbits: CartesianOrbits) -> float:
+    observers = Observers.from_code("500", Epochs.from_mjd([61030.5], scale="tdb"))
+    eph = generate_ephemeris(orbits, observers).ephemeris
+    assert len(eph) == 1
+    return float(eph.mag_sigma.to_numpy(zero_copy_only=False)[0])
+
+
+def test_phot_covariance_reaches_mag_sigma() -> None:
+    """The exact oracle. V = H + 5*log10(r*Delta) + phi(alpha) gives
+    dV/dH == 1 identically, so an orbit with a photometric covariance of
+    diag(sigma_H^2, 0, 0) and NO state covariance must report
+    mag_sigma == sigma_H to machine precision.
+
+    FAILS on the pre-fix code with ``mag_sigma`` null: the covariance had
+    no slot on ``EmpyreanOrbit`` and ``empyrean_orbit_photometric_params``
+    built every ``PhotometricParams`` with ``covariance = None``.
+    """
+    sigma_h = 0.3
+    got = _mag_sigma(_photometric_orbit(np.diag([sigma_h**2, 0.0, 0.0])))
+    assert abs(got - sigma_h) <= 1e-12, (
+        f"mag_sigma must equal sigma_H exactly when the state contributes "
+        f"nothing; got {got} vs {sigma_h}"
+    )
+
+
+def test_no_phot_covariance_leaves_mag_sigma_absent() -> None:
+    """Absence stays absence: with neither covariance there is no sigma to
+    report, and the channel must not fabricate a zero."""
+    got = _mag_sigma(_photometric_orbit(None))
+    assert np.isnan(got), f"expected an absent mag_sigma, got {got}"
+
+
+def test_phot_covariance_survives_a_parquet_round_trip() -> None:
+    """The orbit-file write path carried NO photometry at all — the
+    Python batch dict emitted none of the ``phot_*`` keys its own read
+    direction consumed, and ``batch_to_orbits`` never called
+    ``set_photometric_params``. This fails at both ends on the pre-fix
+    code.
+    """
+    import tempfile
+
+    phot_cov = np.array(
+        [
+            [0.09, -0.0135, 0.0],
+            [-0.0135, 0.0025, 0.0],
+            [0.0, 0.0, 0.0],
+        ]
+    )
+    orbits = _photometric_orbit(phot_cov)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "orbits.parquet")
+        empyrean.io.write_orbits_parquet(path, orbits)
+        back = empyrean.io.read_orbits_parquet(path)
+
+    assert back.photometric is not None, "photometry must survive the file round trip"
+    assert back.photometric.model.to_pylist()[0].lower() == "hg"
+    assert abs(float(back.photometric.h.to_numpy(zero_copy_only=False)[0]) - 19.7) < 1e-12
+    cov_back = back.photometric.covariance.to_pylist()[0]
+    assert cov_back is not None, "the photometric 3x3 must survive the file round trip"
+    np.testing.assert_allclose(np.asarray(cov_back).reshape(3, 3), phot_cov, atol=1e-15)
+
+
+def test_a_null_h_writes_no_photometry_at_all() -> None:
+    """A model tag with no absolute magnitude is not photometry, and must
+    not become one on the way to disk.
+
+    ``extract_photometry`` used to ``nan_to_num`` a null H to 0.0 while
+    still resolving the model tag, so this row was written as HG with
+    H = 0.0 mag — roughly 20 mag brighter than reality, a number the
+    caller never supplied and that ``generate_ephemeris`` then predicts
+    from. Before the write direction carried photometry at all the file
+    simply held NULL; the fix restores that.
+    """
+    import tempfile
+
+    orbits = _photometric_orbit(None).set_column(
+        "photometric",
+        PhotometricParams.from_kwargs(model=["hg"], h=[None], g=[0.15]),
+    )
+
+    from empyrean._convert import extract_photometry, orbits_to_orbit_batch_dict
+
+    h, _, _, models, _, _ = extract_photometry(orbits)
+    assert np.isnan(h[0]), "a null H stays NaN, never 0.0"
+    assert models.tolist() == [0], "the model tag itself is still resolved"
+
+    d = orbits_to_orbit_batch_dict(orbits)
+    assert d["phot_system"] == [None], (
+        "a row with no absolute magnitude must emit no phase function — a tag beside a "
+        "fabricated H = 0 is what reached the file before"
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "orbits.parquet")
+        empyrean.io.write_orbits_parquet(path, orbits)
+        back = empyrean.io.read_orbits_parquet(path)
+
+    if back.photometric is not None:
+        assert back.photometric.model.to_pylist()[0] is None, "no photometry in, no photometry out"
+        assert back.photometric.h.to_pylist()[0] is None, (
+            "H = 0.0 must never be fabricated for a row that had none"
+        )
+
+
+def test_the_model_tag_keeps_its_documented_lowercase_spelling() -> None:
+    """``PhotometricParams.model`` documents lowercase tags, and
+    ``od.determine`` writes them. The batch-dict write direction emitted
+    uppercase, so an Orbits -> file -> Orbits round trip silently
+    rewrote the caller's spelling and any predicate written against the
+    documented one matched zero rows afterwards.
+    """
+    import tempfile
+
+    orbits = _photometric_orbit(None)
+    assert orbits.photometric is not None
+    assert orbits.photometric.model.to_pylist() == ["hg"]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "orbits.parquet")
+        empyrean.io.write_orbits_parquet(path, orbits)
+        back = empyrean.io.read_orbits_parquet(path)
+
+    assert back.photometric is not None
+    assert back.photometric.model.to_pylist() == ["hg"], (
+        "the round trip must return the caller's own spelling, not 'HG'"
+    )
+
+
+def test_an_asymmetric_photometric_covariance_is_refused_by_name() -> None:
+    """The orbit file formats store only the six lower-triangle cells, so
+    an asymmetric 3x3 comes back with its upper entry DROPPED (not
+    mirrored) and sigma_V silently changes across a round trip. Refuse it
+    where it enters instead.
+    """
+    from empyrean._convert import extract_photometry
+
+    upper_only = np.zeros((3, 3))
+    upper_only[0][0] = 0.09
+    upper_only[1][1] = 0.0025
+    upper_only[0][1] = -0.02  # and [1][0] left at zero
+
+    orbits = _photometric_orbit(upper_only)
+    with pytest.raises(ValueError, match="not symmetric"):
+        extract_photometry(orbits)
+
+    # The mirrored form is accepted, so this is about asymmetry and not
+    # about off-diagonals in general.
+    symmetric = upper_only.copy()
+    symmetric[1][0] = symmetric[0][1]
+    _, _, _, _, has_cov, cov = extract_photometry(_photometric_orbit(symmetric))
+    assert bool(has_cov[0])
+    np.testing.assert_allclose(cov[0], symmetric, atol=1e-15)
+
+
+def test_a_covariance_with_no_photometry_to_attach_to_is_refused() -> None:
+    """A photometric covariance on a row with no absolute magnitude (or
+    no model tag) has nowhere to go: every downstream absence test is
+    ``!h.is_finite()``, so the whole PhotometricParams — covariance
+    included — is dropped at the engine boundary. The batch dict sent
+    ``has_phot_covariance = True`` beside ``phot_system = None`` and the
+    3x3 vanished between layers; refuse it by name instead.
+    """
+    from empyrean._convert import extract_photometry, orbits_to_orbit_batch_dict
+
+    cov = np.diag([0.09, 0.0, 0.0])
+
+    null_h = _photometric_orbit(cov).set_column(
+        "photometric",
+        PhotometricParams.from_kwargs(
+            model=["hg"], h=[None], g=[0.15], covariance=[cov.reshape(9).tolist()]
+        ),
+    )
+    with pytest.raises(ValueError, match="no absolute magnitude"):
+        extract_photometry(null_h)
+    with pytest.raises(ValueError, match="no absolute magnitude"):
+        orbits_to_orbit_batch_dict(null_h)
+
+    null_model = _photometric_orbit(cov).set_column(
+        "photometric",
+        PhotometricParams.from_kwargs(
+            model=[None], h=[19.7], g=[0.15], covariance=[cov.reshape(9).tolist()]
+        ),
+    )
+    with pytest.raises(ValueError, match="no phase-function model"):
+        extract_photometry(null_model)
+
+    # A null H with NO covariance stays the quiet, legitimate "no
+    # photometry" path — this is about the covariance, not about null H.
+    d = orbits_to_orbit_batch_dict(
+        _photometric_orbit(None).set_column(
+            "photometric",
+            PhotometricParams.from_kwargs(model=["hg"], h=[None], g=[0.15]),
+        )
+    )
+    assert d["phot_system"] == [None]
+    assert not bool(np.asarray(d["has_phot_covariance"])[0])
+
+
+def test_photometry_with_a_zero_absolute_magnitude_is_refused() -> None:
+    """H = 0.0 is the C ABI's 'no absolute magnitude supplied' value (it
+    is what memset(0) leaves on EmpyreanOrbit.h_mag, and
+    EMPYREAN_PHASE_FUNCTION_HG is 0 too). Photometry attached with it
+    would be dropped at the boundary, so say so here rather than letting
+    it disappear between layers.
+    """
+    from empyrean._convert import extract_photometry
+
+    orbits = _photometric_orbit(None).set_column(
+        "photometric",
+        PhotometricParams.from_kwargs(model=["hg"], h=[0.0], g=[0.15]),
+    )
+    with pytest.raises(ValueError, match="no absolute magnitude supplied"):
+        extract_photometry(orbits)
+
+
+def test_extract_photometry_reads_the_slope_slot_the_model_names() -> None:
+    """``extract_photometry`` read the ``g`` column unconditionally, so an
+    ``hg12`` orbit reached the engine with ``slope1 = 0.0`` and an
+    ``hg1g2`` orbit lost G2 — a silently wrong phase function, not the
+    one the caller asked for.
+    """
+    from empyrean._convert import extract_photometry
+
+    base = _photometric_orbit(None)
+
+    hg12 = base.set_column(
+        "photometric",
+        PhotometricParams.from_kwargs(model=["hg12"], h=[19.7], g12=[0.42]),
+    )
+    _, slope1, slope2, models, _, _ = extract_photometry(hg12)
+    assert models.tolist() == [2]
+    assert slope1[0] == 0.42, "hg12 must send G12 in slot 1, not a zero-filled g"
+    assert slope2[0] == 0.0
+
+    hg1g2 = base.set_column(
+        "photometric",
+        PhotometricParams.from_kwargs(model=["hg1g2"], h=[19.7], g1=[0.31], g2=[0.17]),
+    )
+    _, slope1, slope2, models, _, _ = extract_photometry(hg1g2)
+    assert models.tolist() == [1]
+    assert slope1[0] == 0.31, "hg1g2 must send G1 in slot 1"
+    assert slope2[0] == 0.17, "hg1g2 must send G2 in slot 2"
+
+    hg = base.set_column(
+        "photometric",
+        PhotometricParams.from_kwargs(model=["hg"], h=[19.7], g=[0.15]),
+    )
+    _, slope1, slope2, models, _, _ = extract_photometry(hg)
+    assert models.tolist() == [0]
+    assert slope1[0] == 0.15
+    assert slope2[0] == 0.0
+
+
+def test_hg12_slope_changes_the_predicted_magnitude() -> None:
+    """The slope-slot fix is load-bearing, not cosmetic: two ``hg12``
+    orbits differing only in G12 must predict different magnitudes. Under
+    the ``g``-only read both sent slope1 = 0.0 and the two predictions
+    were identical.
+    """
+    base = _photometric_orbit(None)
+
+    def mag(g12: float) -> float:
+        orbits = base.set_column(
+            "photometric",
+            PhotometricParams.from_kwargs(model=["hg12"], h=[19.7], g12=[g12]),
+        )
+        observers = Observers.from_code("500", Epochs.from_mjd([61030.5], scale="tdb"))
+        eph = generate_ephemeris(orbits, observers).ephemeris
+        return float(eph.mag.to_numpy(zero_copy_only=False)[0])
+
+    low, high = mag(0.1), mag(0.9)
+    assert np.isfinite(low) and np.isfinite(high)
+    assert abs(low - high) > 1e-6, (
+        f"G12 must reach the engine: G12=0.1 gave {low}, G12=0.9 gave {high}"
+    )

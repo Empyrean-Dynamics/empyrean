@@ -11,8 +11,10 @@
 //!   2. A sibling workspace build at `../target/release` (in-tree development),
 //!      unless `EMPYREAN_FORCE_DOWNLOAD=1`.
 //!   3. Download the prebuilt `libempyrean-<target>.tar.gz` for this crate's
-//!      version from the GitHub release, verified against a pinned SHA-256, into
-//!      a persistent per-version cache.
+//!      version from the GitHub release, verified against a pinned SHA-256 —
+//!      and, in a repository checkout, against the pinned SHA-256 of the
+//!      `include/empyrean.h` those binaries were built from — into a
+//!      persistent per-version cache.
 //!
 //! Download and extraction are done in-process (ureq + flate2 + tar), so the
 //! build needs no system `curl` / `wget` / `tar`. FFI bindings are pre-generated
@@ -27,6 +29,10 @@ use sha2::{Digest, Sha256};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const REPO: &str = "Empyrean-Dynamics/empyrean";
+
+// The pin parser, shared verbatim with the crate's tests.
+#[path = "src/header_pin.rs"]
+mod header_pin;
 
 /// SHA-256 of each `libempyrean-<target>.tar.gz` release asset, pinned to this
 /// crate version. Regenerated and pinned by `.github/workflows/release.yml`
@@ -69,9 +75,91 @@ fn lib_filename() -> &'static str {
     }
 }
 
+/// `include/empyrean.h` when this crate is being built inside the
+/// repository, `None` when it is the packaged crate (the header sits
+/// outside the package root, so it is not published; the bindings ship
+/// pre-generated instead).
+///
+/// The header's presence alone is not proof of a checkout — a registry
+/// cache is also a parent directory full of other crates — so the
+/// sibling `empyrean-c` package, which is what generates the header, has
+/// to be there too.
+fn checkout_header() -> Option<PathBuf> {
+    let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("..");
+    let header = root.join("include/empyrean.h");
+    (header.exists() && root.join("empyrean-c/Cargo.toml").exists()).then_some(header)
+}
+
+/// Refuse a downloaded prebuilt whose ABI surface predates the header in
+/// this checkout.
+///
+/// The tarball checksums prove the downloaded bytes are the bytes the
+/// release served; they say nothing about struct layouts. Neither does
+/// the load-time `empyrean_abi_version` handshake, which compares a
+/// constant encoding only the base version — so a struct that grows
+/// inside one release cycle passes it. The gap is real and silent: a
+/// checkout whose `EmpyreanOrbit` is 912 bytes, linked against a pinned
+/// prebuilt whose `EmpyreanOrbit` is 832, strides every orbit array
+/// wrong and reads past the caller's buffer.
+///
+/// So `checksums.txt` also pins the SHA-256 of the `include/empyrean.h`
+/// those binaries were built from, and this refuses the download when
+/// the checkout's header hashes to anything else.
+///
+/// Only the download path is guarded. A local source build
+/// (`cargo build -p empyrean-c --release`, resolution step 2) produces
+/// the library and the header from one tree and needs no pin, and
+/// `EMPYREAN_LIB_DIR` is an explicit override the caller owns.
+///
+/// In the packaged crate there is no `include/empyrean.h` to hash — the
+/// header lives outside the package root — and none is needed: a
+/// published `empyrean-sys x.y.z` and the `v x.y.z` release assets it
+/// downloads are cut from the same commit, which is what the version
+/// pins. The guard therefore applies exactly where the two can drift.
+fn assert_prebuilt_matches_header() {
+    let Some(header) = checkout_header() else {
+        return;
+    };
+    println!("cargo:rerun-if-changed={}", header.display());
+    let pinned = header_pin::pinned_header_sha(CHECKSUMS).unwrap_or_else(|| {
+        panic!(
+            "empyrean-sys/checksums.txt records no `{}` line, so the pinned prebuilt cannot be \
+             checked against {}. Re-run .github/workflows/prepare-release.yml, which pins both, \
+             or build the engine locally:\n    cargo build -p empyrean-c --release",
+            header_pin::HEADER_PIN_PREFIX,
+            header.display(),
+        )
+    });
+    let bytes = fs::read(&header)
+        .unwrap_or_else(|e| panic!("read {} for the ABI header pin: {e}", header.display()));
+    let actual = sha256_hex(&bytes);
+    if !header_pin::header_matches(pinned, &actual) {
+        panic!(
+            "the pinned prebuilt predates this header; build empyrean-c locally \
+             (cargo build -p empyrean-c --release)\n\
+             \n\
+             empyrean-sys/checksums.txt pins the libempyrean v{VERSION} binaries, which were \
+             built from an include/empyrean.h hashing to\n    {pinned}\n\
+             but {} hashes to\n    {actual}\n\
+             \n\
+             The two describe different struct layouts, and nothing downstream can see that: \
+             EMPYREAN_ABI_VERSION encodes only the base version, so the load-time handshake \
+             passes and every orbit array is then strided at the wrong width. Refusing to \
+             download.\n\
+             \n\
+             Either build the engine from this tree (the release profile specifically):\n    \
+             cargo build -p empyrean-c --release\n\
+             or point at an engine built from this exact header:\n    \
+             EMPYREAN_LIB_DIR=/path/to/dir/containing/libempyrean",
+            header.display(),
+        );
+    }
+}
+
 fn main() {
     println!("cargo:rerun-if-env-changed=EMPYREAN_LIB_DIR");
     println!("cargo:rerun-if-env-changed=EMPYREAN_FORCE_DOWNLOAD");
+    println!("cargo:rerun-if-changed=checksums.txt");
 
     let out = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR")).join("lib_path.rs");
 
@@ -127,6 +215,10 @@ fn resolve_lib_dir(lib_file: &str) -> PathBuf {
 }
 
 fn download_prebuilt(lib_file: &str) -> PathBuf {
+    // Before anything is fetched or reused from the cache: the pinned
+    // binaries must match this checkout's ABI header.
+    assert_prebuilt_matches_header();
+
     let (stem, expected_sha) = target_asset().unwrap_or_else(|| {
         panic!(
             "No prebuilt libempyrean is published for target {}-{}. Build it from the engine \

@@ -849,6 +849,8 @@ mod tests {
             n_state_param_cross: 0,
             param_pair_cross: std::ptr::null(),
             n_param_pair_cross: 0,
+            has_phot_covariance: 0,
+            phot_covariance: [[0.0; 3]; 3],
         }
     }
 

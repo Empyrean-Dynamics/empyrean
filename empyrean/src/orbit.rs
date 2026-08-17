@@ -136,6 +136,28 @@ pub struct Orbit {
     pub slope1: f64,
     /// Slope parameter slot 2 — G₂ (HG1G2 only); 0 for HG / HG12.
     pub slope2: f64,
+    /// Photometric 3×3 covariance over (H, slope1, slope2), row-major —
+    /// the same parameter order as [`h_mag`](Self::h_mag) /
+    /// [`slope1`](Self::slope1) / [`slope2`](Self::slope2), so which
+    /// slope a row names follows [`phot_system`](Self::phot_system).
+    ///
+    /// Set it from a photometry fit
+    /// ([`PhotometryResult::covariance`](crate::PhotometryResult)), an
+    /// SBDB query, or an orbit file that carried one, and ephemeris
+    /// generation adds the \\(\sigma_{\text{photo}}\\) term to
+    /// `mag_sigma`. `None` (the default for a hand-built orbit) leaves
+    /// `mag_sigma` carrying the state contribution alone.
+    ///
+    /// Rows and columns of parameters the producing fit held fixed are
+    /// zero, which is what an H-only fit emits.
+    ///
+    /// Must be **symmetric**; checked at the C-ABI boundary (see
+    /// [`with_photometry_covariance`](Self::with_photometry_covariance)).
+    /// The orbit file formats carry only the six lower-triangle cells
+    /// and mirror them on read, so an asymmetric matrix has no file
+    /// representation — which is why it is refused rather than written
+    /// short.
+    pub phot_covariance: Option<[[f64; 3]; 3]>,
     /// Continuous-thrust parameters (arcs + optional Δv corrections).
     /// `None` is a pure gravity + non-grav orbit. When
     /// [`ThrustParams::correction_covariances`] is non-empty the
@@ -185,6 +207,7 @@ impl Orbit {
             h_mag: f64::NAN,
             slope1: 0.0,
             slope2: 0.0,
+            phot_covariance: None,
             thrust: None,
             srp: None,
             wide_cross: None,
@@ -260,6 +283,12 @@ impl Orbit {
 
     /// Attach photometric parameters. The slot mapping depends on the
     /// model — see [`PhaseFunction`].
+    ///
+    /// `h` must be a real absolute magnitude: `0.0` is the C ABI's
+    /// "no absolute magnitude supplied" value (what `memset(0)` leaves
+    /// on `EmpyreanOrbit::h_mag`), so an orbit carrying it is refused by
+    /// name when it crosses the boundary rather than losing its
+    /// photometry there.
     pub fn with_photometry(
         mut self,
         phot_system: PhaseFunction,
@@ -271,6 +300,60 @@ impl Orbit {
         self.h_mag = h;
         self.slope1 = slope1;
         self.slope2 = slope2;
+        self
+    }
+
+    /// Attach the photometric 3×3 covariance over (H, slope1, slope2).
+    /// Pass `None` (the default) for an orbit with no photometric
+    /// uncertainty.
+    ///
+    /// The companion to [`Orbit::with_photometry`], in the same shape as
+    /// [`Orbit::with_nongrav_covariance`] /
+    /// [`Orbit::with_non_grav_dt_variance`] /
+    /// [`Orbit::with_srp_amrat_variance`]: the parameters and their
+    /// covariance are set separately because most orbits carry the
+    /// former without the latter.
+    ///
+    /// With it attached, ephemeris generation reports
+    /// \\[
+    ///   \sigma_V = \sqrt{\sigma^2_{\text{photo}} + \sigma^2_{\text{state}}}
+    /// \\]
+    /// rather than the state term alone, with
+    /// \\(\sigma^2_{\text{photo}} = J \Sigma_p J^\top\\) contracting the
+    /// full \\(3 \times 3\\) against
+    /// \\(J = [\partial V/\partial H, \partial V/\partial \text{slope}_1,
+    /// \partial V/\partial \text{slope}_2]\\). Because
+    /// \\(V = H + 5\log_{10}(r\Delta) + \phi(\alpha)\\) gives
+    /// \\(\partial V/\partial H \equiv 1\\), an orbit with no state
+    /// covariance and a covariance of the H-only shape
+    /// \\(\mathrm{diag}(\sigma_H^2, 0, 0)\\) reports
+    /// \\(\sigma_V = \sigma_H\\) exactly; a covariance carrying slope
+    /// variances or \\(H\\)–slope covariances reports
+    /// \\(\sigma_V > \sigma_H\\), because those terms contract against
+    /// \\(\partial V/\partial\text{slope}\\), which vanishes only at
+    /// zero phase angle.
+    ///
+    /// The matrix must be **symmetric** — it is a covariance, and the
+    /// orbit file formats store only its lower triangle, so an
+    /// asymmetric matrix could not round-trip. Symmetry is checked when
+    /// the orbit crosses the C ABI (propagate / ephemeris / impact / OD
+    /// / file write), which fails loudly naming the offending pair
+    /// rather than silently symmetrizing or truncating.
+    ///
+    /// ```no_run
+    /// # use empyrean::{Orbit, PhaseFunction};
+    /// # fn f(orbit: Orbit) -> Orbit {
+    /// orbit
+    ///     .with_photometry(PhaseFunction::HG, 19.7, 0.15, 0.0)
+    ///     .with_photometry_covariance(Some([
+    ///         [0.09, 0.0, 0.0],
+    ///         [0.0, 0.0025, 0.0],
+    ///         [0.0, 0.0, 0.0],
+    ///     ]))
+    /// # }
+    /// ```
+    pub fn with_photometry_covariance(mut self, covariance: Option<[[f64; 3]; 3]>) -> Self {
+        self.phot_covariance = covariance;
         self
     }
 
@@ -324,8 +407,29 @@ impl Orbit {
         &self,
     ) -> crate::error::Result<(empyrean_sys::EmpyreanOrbit, OrbitFfiKeep)> {
         use std::ffi::CString;
+        if let Some(cov) = self.phot_covariance {
+            validate_photometry_covariance_symmetry(&cov)?;
+        }
         let (phase_int, h, s1, s2) = match self.phot_system {
-            Some(pf) => (pf as i32, self.h_mag, self.slope1, self.slope2),
+            Some(pf) => {
+                // The C ABI reads `h_mag == 0.0` as "no photometry
+                // supplied" — it is what `memset(0)` leaves there, and
+                // `EMPYREAN_PHASE_FUNCTION_HG` is 0 too, so a
+                // zero-initialized orbit would otherwise claim HG at
+                // H = 0. A wrapper `Orbit` states presence in its own
+                // `Option`, so the two disagree here, and the honest
+                // move is to say so rather than let the photometry
+                // vanish at the boundary.
+                if self.h_mag == 0.0 {
+                    return Err(crate::error::Error::invalid_input(
+                        "photometry was attached with h_mag = 0.0, which the C ABI reads as \
+                         'no absolute magnitude supplied' (it is the memset(0) value). No \
+                         solar-system minor body has H = 0 — supply the real absolute \
+                         magnitude, or attach no photometry at all.",
+                    ));
+                }
+                (pf as i32, self.h_mag, self.slope1, self.slope2)
+            }
             None => (-1, f64::NAN, 0.0, 0.0),
         };
         // Empty CString for absent ids — the C side checks the pointer's
@@ -441,6 +545,11 @@ impl Orbit {
             n_state_param_cross: state_param_cross.len(),
             param_pair_cross: param_pair_cross_ptr,
             n_param_pair_cross: param_pair_cross.len(),
+            // Photometric parameter covariance. Same explicit-switch
+            // shape as `has_non_grav_covariance` above; the C side reads
+            // the 3×3 only when the switch is 1.
+            has_phot_covariance: u8::from(self.phot_covariance.is_some()),
+            phot_covariance: self.phot_covariance.unwrap_or([[0.0; 3]; 3]),
         };
         let keep = OrbitFfiKeep {
             _orbit_id: orbit_id_cstr,
@@ -453,6 +562,56 @@ impl Orbit {
         };
         Ok((ffi, keep))
     }
+}
+
+/// Relative tolerance on the photometric covariance's symmetry.
+///
+/// A covariance assembled from a fit is symmetric to round-off, not to
+/// the bit — the tolerance admits that and nothing wider. It is
+/// relative to the larger of the two entries, so a genuinely transposed
+/// or half-filled matrix (one side zero) fails at any magnitude.
+const PHOT_COV_SYMMETRY_RTOL: f64 = 1e-12;
+
+/// Reject an asymmetric photometric 3×3 by name.
+///
+/// A covariance is symmetric by definition, and the orbit file formats
+/// store only its six lower-triangle cells — so an asymmetric matrix has
+/// no file representation and would come back silently truncated (the
+/// upper entry dropped, not mirrored), with `mag_sigma` changing across
+/// a round trip. Refusing here, at the one boundary every C-ABI path
+/// crosses, is what keeps that from being a silent edit of the caller's
+/// uncertainty.
+fn validate_photometry_covariance_symmetry(cov: &[[f64; 3]; 3]) -> crate::error::Result<()> {
+    const NAME: [&str; 3] = ["H", "slope1", "slope2"];
+    for (i, row) in cov.iter().enumerate() {
+        for (j, v) in row.iter().enumerate() {
+            if !v.is_finite() {
+                return Err(crate::error::Error::invalid_input(format!(
+                    "photometric covariance entry [{i}][{j}] ({}–{}) is {v}, not a finite \
+                     number. A non-finite entry contracts to a NaN σ_V, which reads \
+                     downstream as 'no photometric uncertainty was supplied' — supply the \
+                     real variance, or leave the covariance absent.",
+                    NAME[i], NAME[j],
+                )));
+            }
+        }
+    }
+    for i in 0..3 {
+        for j in (i + 1)..3 {
+            let (a, b) = (cov[i][j], cov[j][i]);
+            let scale = a.abs().max(b.abs());
+            if (a - b).abs() > PHOT_COV_SYMMETRY_RTOL * scale {
+                return Err(crate::error::Error::invalid_input(format!(
+                    "photometric covariance is not symmetric: [{i}][{j}] = {a} ({}–{}) but \
+                     [{j}][{i}] = {b}. It is a covariance over (H, slope1, slope2), and the \
+                     orbit file formats store only its lower triangle, so an asymmetric \
+                     matrix cannot round-trip — mirror the term you meant onto both sides.",
+                    NAME[i], NAME[j],
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Keepalive owner for the heap-allocated identifier strings carried by
@@ -575,5 +734,127 @@ mod srp_tests {
         // (never fabricates a slot).
         let o = cartesian_orbit().with_srp_amrat_variance(Some(1.0e-8));
         assert!(o.srp.is_none());
+    }
+}
+
+#[cfg(test)]
+mod photometry_marshal_tests {
+    use super::*;
+    use crate::Epoch;
+    use crate::coordinate::{CoordinateState, Frame, Origin};
+
+    fn cartesian_orbit() -> Orbit {
+        Orbit::new(CoordinateState::cartesian(
+            Epoch::from_mjd_tdb(59000.0),
+            [1.0, 0.1, 0.05, -0.005, 0.015, 0.001],
+            Frame::EclipticJ2000,
+            Origin::Sun,
+        ))
+    }
+
+    /// A symmetric covariance crosses unchanged — the guard is about
+    /// asymmetry, not about covariances in general.
+    #[test]
+    fn a_symmetric_covariance_marshals_unchanged() {
+        let cov = [
+            [0.09, -0.0042, 0.0],
+            [-0.0042, 0.0025, 0.0],
+            [0.0, 0.0, 0.0],
+        ];
+        let o = cartesian_orbit()
+            .with_photometry(PhaseFunction::HG, 19.7, 0.15, 0.0)
+            .with_photometry_covariance(Some(cov));
+        let (ffi, _keep) = o.to_ffi_with_keep().expect("symmetric must marshal");
+        assert_eq!(ffi.has_phot_covariance, 1);
+        assert_eq!(ffi.phot_covariance, cov);
+    }
+
+    /// Round-off-level asymmetry is what a real fit produces, and must
+    /// not be refused.
+    #[test]
+    fn round_off_asymmetry_is_tolerated() {
+        let mut cov = [
+            [0.09, -0.0042, 0.0],
+            [-0.0042, 0.0025, 0.0],
+            [0.0, 0.0, 0.0],
+        ];
+        cov[1][0] = cov[0][1] * (1.0 + 1.0e-15);
+        let o = cartesian_orbit()
+            .with_photometry(PhaseFunction::HG, 19.7, 0.15, 0.0)
+            .with_photometry_covariance(Some(cov));
+        assert!(o.to_ffi_with_keep().is_ok());
+    }
+
+    /// An off-diagonal filled on ONE side only — the transposed /
+    /// upper-triangular convention nothing in the API forbade — is
+    /// refused by name.
+    ///
+    /// FAILS (marshals silently) without the guard, and the file
+    /// formats then store only the lower triangle: the term comes back
+    /// dropped rather than mirrored, and σ_V changes across a round
+    /// trip with no warning.
+    #[test]
+    fn an_asymmetric_covariance_is_refused_by_name() {
+        let cov = [[0.09, -0.02, 0.0], [0.0, 0.0025, 0.0], [0.0, 0.0, 0.0]];
+        let o = cartesian_orbit()
+            .with_photometry(PhaseFunction::HG, 19.7, 0.15, 0.0)
+            .with_photometry_covariance(Some(cov));
+        let err = match o.to_ffi_with_keep() {
+            Ok(_) => panic!("an asymmetric photometric covariance must not marshal"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("not symmetric") && err.contains("[0][1]"),
+            "the error must name the offending pair, got: {err}"
+        );
+        assert!(
+            err.contains("H") && err.contains("slope1"),
+            "and name the parameters, got: {err}"
+        );
+    }
+
+    /// A non-finite entry contracts to a NaN σ_V, which reads as "no
+    /// photometric uncertainty was supplied" — a different failure axis
+    /// with its own message.
+    #[test]
+    fn a_non_finite_covariance_entry_is_refused_on_its_own_axis() {
+        let cov = [[0.09, 0.0, 0.0], [0.0, f64::NAN, 0.0], [0.0, 0.0, 0.0]];
+        let o = cartesian_orbit()
+            .with_photometry(PhaseFunction::HG, 19.7, 0.15, 0.0)
+            .with_photometry_covariance(Some(cov));
+        let err = match o.to_ffi_with_keep() {
+            Ok(_) => panic!("a NaN covariance entry must not marshal"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("[1][1]") && err.contains("finite"),
+            "the finiteness axis must be named, not blamed on symmetry: {err}"
+        );
+    }
+
+    /// `h_mag = 0.0` is the C ABI's "no absolute magnitude supplied"
+    /// value. A wrapper `Orbit` states presence in its own `Option`, so
+    /// the two disagree — and the photometry must not simply vanish at
+    /// the boundary.
+    #[test]
+    fn photometry_with_a_zero_magnitude_is_refused_rather_than_dropped() {
+        let o = cartesian_orbit().with_photometry(PhaseFunction::HG, 0.0, 0.15, 0.0);
+        let err = match o.to_ffi_with_keep() {
+            Ok(_) => panic!("H = 0.0 must be refused, not silently dropped"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("h_mag = 0.0"),
+            "the error must name the value: {err}"
+        );
+    }
+
+    /// An orbit with no photometry at all still marshals, and says so.
+    #[test]
+    fn no_photometry_marshals_as_absent() {
+        let (ffi, _keep) = cartesian_orbit().to_ffi_with_keep().unwrap();
+        assert_eq!(ffi.phot_system, -1);
+        assert!(ffi.h_mag.is_nan());
+        assert_eq!(ffi.has_phot_covariance, 0);
     }
 }

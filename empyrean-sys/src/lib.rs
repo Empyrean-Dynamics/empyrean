@@ -170,3 +170,9 @@ pub fn lib() -> &'static EmpyreanLib {
 
 mod shims;
 pub use shims::*;
+
+// The header/prebuilt pin the build script enforces. Compiled only for
+// tests here — at build time `build.rs` pulls the same file in directly,
+// so the parse the tests cover is the parse the guard runs.
+#[cfg(test)]
+mod header_pin;

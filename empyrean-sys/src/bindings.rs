@@ -223,7 +223,7 @@ pub struct Session {
 pub struct EmpyreanBuiltSystem {
     _unused: [u8; 0],
 }
-#[doc = " C FFI opaque handle. Internally an [`empyrean_core::Context`]; the\n C header forward-declares `struct EmpyreanContext` — callers only\n see the pointer.\n\n # Thread safety\n\n A built `EmpyreanContext` is **read-only and safe to share across\n threads**: one pointer may be handed to any number of concurrent\n `empyrean_propagate` / `empyrean_generate_ephemeris` /\n `empyrean_determine` calls without external locking. Build it once\n and share it — construction is the expensive part (it loads the whole\n kernel set), and every constructor here is serialized internally\n through [`CONSTRUCT_LOCK`] because the engine's first-init kernel\n provisioning does writable-cache file I/O that is not concurrency\n safe.\n\n The two `&mut`-shaped entry points — [`empyrean_context_with_spk`] and\n [`empyrean_context_free`] — are the exceptions: they mutate or destroy\n the context, so the caller must guarantee no other thread is using the\n pointer for the duration of the call. `with_spk` takes the same\n construction lock; `free` cannot."]
+#[doc = " C FFI opaque handle. Internally an [`empyrean_core::Context`]; the\n C header forward-declares `struct EmpyreanContext` — callers only\n see the pointer.\n\n # Thread safety\n\n A built `EmpyreanContext` is **read-only and safe to share across\n threads**: one pointer may be handed to any number of concurrent\n `empyrean_propagate` / `empyrean_generate_ephemeris` /\n `empyrean_determine` calls without external locking. Build it once\n and share it — construction is the expensive part (it loads the whole\n kernel set), and every constructor here is serialized internally\n through this module's private `CONSTRUCT_LOCK` because the engine's\n first-init kernel provisioning does writable-cache file I/O that is\n not concurrency safe.\n\n The two `&mut`-shaped entry points — [`empyrean_context_with_spk`] and\n [`empyrean_context_free`] — are the exceptions: they mutate or destroy\n the context, so the caller must guarantee no other thread is using the\n pointer for the duration of the call. `with_spk` takes the same\n construction lock; `free` cannot."]
 pub type EmpyreanContext = Context;
 #[doc = " Options for [`empyrean_context_from_data_dir_with`].\n\n `memset(0)` — or passing a `NULL` pointer instead of the struct —\n selects exactly what [`empyrean_context_from_data_dir`] does. Set only\n the fields you are changing."]
 #[repr(C)]
@@ -502,9 +502,9 @@ pub struct EmpyreanOrbit {
     pub has_non_grav_covariance: u8,
     #[doc = " Non-grav 3×3 covariance for (A1, A2, A3), row-major. Only read when\n `has_non_grav_covariance = 1`."]
     pub non_grav_covariance: [[f64; 3usize]; 3usize],
-    #[doc = " Phase-function model. `EMPYREAN_PHASE_FUNCTION_NONE` disables\n magnitude computation; the other values map to villeneuve's\n `PhaseFunction` enum."]
+    #[doc = " Phase-function model. `EMPYREAN_PHASE_FUNCTION_NONE` disables\n magnitude computation; the other values map to villeneuve's\n `PhaseFunction` enum.\n\n Note that `EMPYREAN_PHASE_FUNCTION_HG` is `0`, so `memset(0)`\n selects HG rather than NONE — `h_mag` is what carries absence for\n a zero-initialized orbit (see below)."]
     pub phot_system: i32,
-    #[doc = " Absolute magnitude H. Ignored when `phot_system == NONE`."]
+    #[doc = " Absolute magnitude H. Ignored when `phot_system == NONE`.\n\n **0.0 means \"no photometry supplied\"**, as do NaN and infinity.\n Zero is what `memset(0)` leaves here, and no solar-system minor\n body has H = 0 (Ceres, the brightest, is H ≈ 3.3), so treating it\n as a magnitude would let a zero-initialized orbit claim HG\n photometry ~20 mag too bright — a fabrication that ephemeris\n generation would predict from and the orbit writers would\n persist. There is no way to request photometry with a literal H\n of zero; supply the real absolute magnitude."]
     pub h_mag: f64,
     #[doc = " Slope parameter slot 1 — G (HG), G₁ (HG1G2), or G₁₂ (HG12)."]
     pub slope1: f64,
@@ -538,10 +538,14 @@ pub struct EmpyreanOrbit {
     pub param_pair_cross: *const EmpyreanParamPairCross,
     #[doc = " Number of entries in\n [`param_pair_cross`](Self::param_pair_cross)."]
     pub n_param_pair_cross: usize,
+    #[doc = " 1 when [`phot_covariance`](Self::phot_covariance) carries a\n photometric parameter covariance; 0 otherwise. Set it from an OD\n photometry fit (`EmpyreanODPhotometryResult::covariance`), from\n an SBDB query, or from an orbit file that carried one, so the\n H/G uncertainty reaches ephemeris generation's `mag_sigma`\n instead of being dropped. Leave 0 for a hand-built orbit with no\n photometric uncertainty."]
+    pub has_phot_covariance: u8,
+    #[doc = " Photometric 3×3 covariance over (H, slope1, slope2), row-major —\n the same parameter order as `h_mag` / `slope1` / `slope2` above,\n so which slope a row/column names follows `phot_system`. Only\n read when `has_phot_covariance = 1`.\n\n Rows and columns of parameters the producing fit held fixed are\n zero (a fixed parameter contributes no variance), which is\n exactly what an H-only fit emits.\n\n **Must be symmetric**, and every one of the nine entries finite.\n The orbit file formats store only the six lower-triangle cells,\n so an asymmetric matrix has no file representation and would come\n back truncated — the upper entry dropped rather than mirrored,\n silently changing the magnitude uncertainty across a write/read\n round trip. An asymmetric or non-finite matrix is refused by\n name (entry indices and parameter names) rather than repaired;\n fill both sides of each off-diagonal term."]
+    pub phot_covariance: [[f64; 3usize]; 3usize],
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of EmpyreanOrbit"][::std::mem::size_of::<EmpyreanOrbit>() - 832usize];
+    ["Size of EmpyreanOrbit"][::std::mem::size_of::<EmpyreanOrbit>() - 912usize];
     ["Alignment of EmpyreanOrbit"][::std::mem::align_of::<EmpyreanOrbit>() - 8usize];
     ["Offset of field: EmpyreanOrbit::state"]
         [::std::mem::offset_of!(EmpyreanOrbit, state) - 0usize];
@@ -606,6 +610,10 @@ const _: () = {
         [::std::mem::offset_of!(EmpyreanOrbit, param_pair_cross) - 816usize];
     ["Offset of field: EmpyreanOrbit::n_param_pair_cross"]
         [::std::mem::offset_of!(EmpyreanOrbit, n_param_pair_cross) - 824usize];
+    ["Offset of field: EmpyreanOrbit::has_phot_covariance"]
+        [::std::mem::offset_of!(EmpyreanOrbit, has_phot_covariance) - 832usize];
+    ["Offset of field: EmpyreanOrbit::phot_covariance"]
+        [::std::mem::offset_of!(EmpyreanOrbit, phot_covariance) - 840usize];
 };
 impl Default for EmpyreanOrbit {
     fn default() -> Self {
@@ -1262,7 +1270,7 @@ impl Default for EmpyreanMixtureChain {
         }
     }
 }
-#[doc = " Propagation result containing states, events, and object identifiers.\n\n `mixtures` parallels `object_ids` only when populated — it is\n per-orbit (not per-state), so its length is the distinct orbit\n count, not `num_states`."]
+#[doc = " Propagation result containing states, events, and object identifiers.\n\n `mixtures` is per-orbit (not per-state), so when populated its length\n is the input orbit count, not `num_states`."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct EmpyreanPropagationResult {
@@ -1271,7 +1279,7 @@ pub struct EmpyreanPropagationResult {
     pub object_ids: *mut *mut ::std::os::raw::c_char,
     pub events: *mut EmpyreanEvent,
     pub num_events: usize,
-    #[doc = " One [`EmpyreanMixtureChain`] per input orbit (positional with\n the input orbit batch). Empty / null when no orbits produced\n mixtures (the typical case for FirstOrder / SecondOrder /\n SigmaPoint / MonteCarlo)."]
+    #[doc = " One [`EmpyreanMixtureChain`] per input orbit, positional with the\n input orbit batch, whenever the run produced any sensitivity data\n at all — including under FirstOrder / SecondOrder / SigmaPoint /\n MonteCarlo, where every row is an empty chain\n (`num_ca_epochs == 0`, all four pointers null). An empty row means\n \"this orbit split nothing\"; it is **not** absence.\n\n `num_mixtures == 0` (and a null `mixtures`) is the one other\n shape: a batch in which NO orbit produced sensitivity tensors —\n orbits carrying no covariance, under any method — for which the\n engine empties the vector wholesale. So check `num_mixtures`\n before indexing: it is either 0 or the input orbit count, never\n anything between. (The Rust wrapper pads that case to one empty\n chain per orbit so its own `mixtures` is positional\n unconditionally; at this layer the zero-row shape is visible.)"]
     pub mixtures: *mut EmpyreanMixtureChain,
     pub num_mixtures: usize,
     #[doc = " Opaque retained handle to the rich propagation result, enabling\n the on-demand tagged-covariance accessors\n (`empyrean_propagation_covariance_series_cartesian` /\n `_covariance_at_cartesian`). **Do not dereference from C** — it is\n freed by `empyrean_propagation_result_free`. Null when the\n propagation produced no retainable result."]
@@ -1423,7 +1431,7 @@ pub struct EmpyreanEphemerisEntry {
     pub heliocentric_distance_au: f64,
     #[doc = " Predicted apparent magnitude. NaN if unavailable."]
     pub mag: f64,
-    #[doc = " Magnitude uncertainty (1σ). Finite iff photometry is enabled AND\n the input orbit carried a state covariance; NaN otherwise. Today\n this reflects the state contribution only — an H-magnitude\n uncertainty is not yet an input, so `mag_sigma` under-reports σ_V\n when the H uncertainty is significant."]
+    #[doc = " Magnitude uncertainty (1σ). Finite only when photometry is\n enabled AND the input orbit carried at least one of a state\n covariance or a photometric covariance\n (`EmpyreanOrbit::phot_covariance`) AND what it carried contracts\n to a strictly positive variance; NaN otherwise. A carried\n covariance is not sufficient on its own: an all-zero 3×3, or a\n non-PSD one that contracts to ≤ 0, still reports NaN.\n\n Both contributions are summed in quadrature:\n σ_V = sqrt(σ²_photo + σ²_state), where σ_state is the state\n contribution and σ_photo contracts the orbit's photometric 3×3\n over (H, slope1, slope2) against the FULL magnitude Jacobian:\n σ²_photo = J Σ_p Jᵀ with J = [∂V/∂H, ∂V/∂slope1, ∂V/∂slope2].\n\n V = H + 5·log10(r·Δ) + φ(α) gives ∂V/∂H ≡ 1, so an orbit with NO\n state covariance and a photometric covariance of the H-only shape\n diag(σ_H², 0, 0) — what an H-only fit emits — reports σ_V = σ_H\n exactly. The slope terms do not drop out of any other shape:\n slope variances and H–slope covariances contract against\n ∂V/∂slope, which vanishes only at zero phase angle, so any\n covariance carrying them reports σ_V > σ_H. An SBDB-queried orbit\n is the common case — its published diag(σ_H², σ_G², 0) makes σ_V\n strictly larger than σ_H.\n\n The two terms are combined as independent. They are not strictly\n independent — a fitted σ_H is conditional on the fitted state,\n because the photometric fit holds the geometry (r, Δ, α) exact —\n and no joint state↔photometry covariance is computed anywhere in\n the stack, so there is no cross term to add. The resulting σ_V is\n therefore mildly conservative, which is the safe direction."]
     pub mag_sigma: f64,
     #[doc = " Topocentric zenith angle (degrees). NaN if unavailable (e.g. no\n observer geodetic position)."]
     pub zenith_angle_deg: f64,

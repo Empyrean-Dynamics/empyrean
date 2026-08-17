@@ -26,7 +26,13 @@ from __future__ import annotations
 import empyrean
 import numpy as np
 import pytest
-from empyrean import Epochs, GaussianMixture, PropagationConfig, UncertaintyMethod
+from empyrean import (
+    Epochs,
+    GaussianMixture,
+    MixtureChains,
+    PropagationConfig,
+    UncertaintyMethod,
+)
 from empyrean.coordinates.coordinates import CartesianCoordinates
 from empyrean.coordinates.covariance import CartesianCovariance
 from empyrean.orbits.orbits import CartesianOrbits
@@ -254,3 +260,204 @@ def test_generate_ephemeris_gaussian_mixture_not_in_rejection(
         orbit, observers, uncertainty_method=UncertaintyMethod.GAUSSIAN_MIXTURE
     )
     assert eph.ephemeris.coordinates.covariance is not None
+
+
+# ══════════════════════════════════════════════════════════════════
+#  Mixture component readback — the surface the wrapper used to drop
+# ══════════════════════════════════════════════════════════════════
+#
+# The safe Rust wrapper's marshal copied states / object_ids / events off
+# the FFI result and never touched `mixtures`, so every retained
+# component died one layer above the C ABI and Python had no mixture
+# surface at all. These tests pin it from this end.
+
+
+APOPHIS_STATE = [
+    -7.85264914906904643e-02,
+    -8.19748051902064567e-01,
+    4.18939515323390882e-02,
+    1.98751024968884596e-02,
+    1.32208844536140196e-03,
+    3.99496044422352188e-04,
+]
+_APOPHIS_EPOCH_MJD_TDB = 61000.0
+
+
+def _apophis_loose() -> CartesianOrbits:
+    """Apophis with a covariance loose enough that the mapping through the
+    2029 Earth encounter is genuinely nonlinear — the regime AGM exists
+    for, and the only regime that produces retained components."""
+    cov = np.zeros((1, 6, 6))
+    for k in range(3):
+        cov[0, k, k] = 1e-10
+        cov[0, k + 3, k + 3] = 1e-16
+    s = APOPHIS_STATE
+    return CartesianOrbits.from_kwargs(
+        orbit_id=["apophis-mixture"],
+        object_id=["99942"],
+        coordinates=CartesianCoordinates.from_kwargs(
+            epoch=np.array([_APOPHIS_EPOCH_MJD_TDB]),
+            x=[s[0]],
+            y=[s[1]],
+            z=[s[2]],
+            vx=[s[3]],
+            vy=[s[4]],
+            vz=[s[5]],
+            frame="ecliptic_j2000",
+            origin=["Sun"],
+            covariance=CartesianCovariance.from_matrix(cov),
+        ),
+    )
+
+
+def _encounter_epochs() -> Epochs:
+    """A grid straddling the 2029-04-13 Earth close approach."""
+    return Epochs.from_mjd(
+        np.arange(_APOPHIS_EPOCH_MJD_TDB, _APOPHIS_EPOCH_MJD_TDB + 1401.0, 100.0),
+        scale="tdb",
+    )
+
+
+@pytest.fixture(scope="module")
+def encounter_result():
+    empyrean.initialize()
+    return empyrean.propagate(
+        _apophis_loose(),
+        _encounter_epochs(),
+        uncertainty_method=GaussianMixture(),
+    )
+
+
+def test_mixture_components_reach_python(encounter_result) -> None:
+    """The components arrive, every emitted column has the same length,
+    and the values are honest: finite positive weights, finite means and
+    covariances, decoded basis names.
+
+    This is the test that would have caught the wrapper drop — under it,
+    the table is empty and the first assertion fails.
+    """
+    table = encounter_result.mixtures
+    assert len(table) > 0, (
+        "the 2029 Apophis encounter with a loose covariance must fire the splitter; "
+        "an empty table here means the components were dropped between the C ABI "
+        "and Python, or the fixture stopped being nonlinear"
+    )
+
+    n = len(table)
+    for name in (
+        "orbit_id",
+        "orbit_index",
+        "ca_epoch_mjd_tdb",
+        "component_index",
+        "weight",
+        "mean_x",
+        "covariance",
+        "origin",
+        "frame",
+    ):
+        assert len(table.column(name)) == n, f"column {name} is not length {n}"
+
+    weights = table.weight.to_numpy(zero_copy_only=False)
+    assert np.isfinite(weights).all(), "mixture weights must be finite"
+    assert (weights > 0.0).all(), "mixture weights must be positive"
+
+    assert set(table.orbit_id.to_pylist()) == {"apophis-mixture"}
+    assert set(table.orbit_index.to_numpy(zero_copy_only=False).tolist()) == {0}
+    assert all(o for o in table.origin.to_pylist()), "origins must decode to names"
+    assert all(f for f in table.frame.to_pylist()), "frames must decode to names"
+
+    covs = np.asarray(table.covariance.to_pylist(), dtype=np.float64)
+    assert covs.shape == (n, 36)
+    assert np.isfinite(covs).all(), "component covariances must be finite"
+
+
+def test_mixture_weights_never_exceed_one(encounter_result) -> None:
+    """Retained weights may sum to LESS than 1 — a sub-Gaussian that
+    missed the close approach contributes nothing and the deficit is not
+    recorded anywhere — but they must never sum to more."""
+    table = encounter_result.mixtures
+    epochs = table.ca_epoch_mjd_tdb.to_numpy(zero_copy_only=False)
+    weights = table.weight.to_numpy(zero_copy_only=False)
+    for t in np.unique(epochs):
+        total = float(weights[epochs == t].sum())
+        assert total <= 1.0 + 1e-9, f"weights at CA {t} sum to {total}"
+
+
+def test_mixture_chains_accessor_groups_by_ca_epoch(encounter_result) -> None:
+    """``to_chains`` regroups the flat table into one list per retained CA
+    epoch, with the matrices re-materialized as contiguous (6, 6)."""
+    chains = encounter_result.mixture_chains(0)
+    assert len(chains) == len(encounter_result.mixtures.ca_epochs(0))
+    assert any(len(group) > 0 for group in chains)
+    flat = [c for group in chains for c in group]
+    assert len(flat) == len(encounter_result.mixtures)
+    for c in flat:
+        assert c.mean.shape == (6,)
+        assert c.covariance.shape == (6, 6)
+        assert np.isfinite(c.covariance).all()
+        assert c.frame and c.origin
+
+
+def test_mixture_chains_round_trip_through_a_directory(encounter_result, tmp_path) -> None:
+    """``to_dir`` / ``from_dir`` round-trip the table bit-identically."""
+    table = encounter_result.mixtures
+    table.to_dir(str(tmp_path))
+    back = MixtureChains.from_dir(str(tmp_path))
+    assert back.table.equals(table.table), "the mixture table must round-trip bit-identically"
+
+
+def test_first_order_yields_an_empty_mixture_table() -> None:
+    """A FIRST_ORDER propagation retains nothing, and "nothing" is ZERO
+    ROWS — never zero-filled placeholder rows, which would read as
+    one-component mixtures of weight 0."""
+    empyrean.initialize()
+    result = empyrean.propagate(
+        _apophis_loose(),
+        _encounter_epochs(),
+        uncertainty_method=UncertaintyMethod.FIRST_ORDER,
+    )
+    assert len(result.mixtures) == 0
+    assert result.mixture_chains(0) == []
+
+
+def test_propagation_result_dir_round_trip_carries_mixtures(encounter_result, tmp_path) -> None:
+    """The whole result persists and reloads with its mixtures intact."""
+    encounter_result.to_dir(str(tmp_path))
+    back = empyrean.PropagationResult.from_dir(str(tmp_path))
+    assert len(back.mixtures) == len(encounter_result.mixtures)
+    assert back.mixtures.table.equals(encounter_result.mixtures.table)
+
+
+def test_a_missing_mixtures_key_raises_rather_than_reading_as_nothing_split() -> None:
+    """The extension sets ``"mixtures"`` unconditionally, so a missing key
+    can only mean a compiled extension older than this Python package.
+
+    Returning an empty table there spelled that skew exactly like a
+    genuine "the splitter never fired" — a GAUSSIAN_MIXTURE run that did
+    split would report no components, with no warning, and ``to_dir``
+    would persist the wrong claim.
+    """
+    from empyrean.propagation.mixtures import build_mixture_chains
+
+    with pytest.raises(RuntimeError, match="older than this Python package"):
+        build_mixture_chains({"states": []})
+
+
+def test_a_present_but_empty_mixtures_key_is_nothing_split() -> None:
+    """Present-and-empty is the genuine "nothing split" shape and must
+    stay a quiet empty table — the two cases are distinguished, not
+    merged."""
+    from empyrean.propagation.mixtures import build_mixture_chains
+
+    empty = {
+        "mixture_orbit_index": np.zeros(0, dtype=np.uint32),
+        "mixture_orbit_id": [],
+        "mixture_ca_epoch_mjd_tdb": np.zeros(0, dtype=np.float64),
+        "mixture_component_index": np.zeros(0, dtype=np.uint32),
+        "mixture_weight": np.zeros(0, dtype=np.float64),
+        "mixture_mean": np.zeros((0, 6), dtype=np.float64),
+        "mixture_covariance": np.zeros((0, 6, 6), dtype=np.float64),
+        "mixture_frame": np.zeros(0, dtype=np.int64),
+        "mixture_origin": np.zeros(0, dtype=np.int64),
+    }
+    assert len(build_mixture_chains({"mixtures": empty})) == 0

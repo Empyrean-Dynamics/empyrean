@@ -88,11 +88,36 @@ pub struct EmpyreanEphemerisEntry {
     pub heliocentric_distance_au: f64,
     /// Predicted apparent magnitude. NaN if unavailable.
     pub mag: f64,
-    /// Magnitude uncertainty (1σ). Finite iff photometry is enabled AND
-    /// the input orbit carried a state covariance; NaN otherwise. Today
-    /// this reflects the state contribution only — an H-magnitude
-    /// uncertainty is not yet an input, so `mag_sigma` under-reports σ_V
-    /// when the H uncertainty is significant.
+    /// Magnitude uncertainty (1σ). Finite only when photometry is
+    /// enabled AND the input orbit carried at least one of a state
+    /// covariance or a photometric covariance
+    /// (`EmpyreanOrbit::phot_covariance`) AND what it carried contracts
+    /// to a strictly positive variance; NaN otherwise. A carried
+    /// covariance is not sufficient on its own: an all-zero 3×3, or a
+    /// non-PSD one that contracts to ≤ 0, still reports NaN.
+    ///
+    /// Both contributions are summed in quadrature:
+    /// σ_V = sqrt(σ²_photo + σ²_state), where σ_state is the state
+    /// contribution and σ_photo contracts the orbit's photometric 3×3
+    /// over (H, slope1, slope2) against the FULL magnitude Jacobian:
+    /// σ²_photo = J Σ_p Jᵀ with J = [∂V/∂H, ∂V/∂slope1, ∂V/∂slope2].
+    ///
+    /// V = H + 5·log10(r·Δ) + φ(α) gives ∂V/∂H ≡ 1, so an orbit with NO
+    /// state covariance and a photometric covariance of the H-only shape
+    /// diag(σ_H², 0, 0) — what an H-only fit emits — reports σ_V = σ_H
+    /// exactly. The slope terms do not drop out of any other shape:
+    /// slope variances and H–slope covariances contract against
+    /// ∂V/∂slope, which vanishes only at zero phase angle, so any
+    /// covariance carrying them reports σ_V > σ_H. An SBDB-queried orbit
+    /// is the common case — its published diag(σ_H², σ_G², 0) makes σ_V
+    /// strictly larger than σ_H.
+    ///
+    /// The two terms are combined as independent. They are not strictly
+    /// independent — a fitted σ_H is conditional on the fitted state,
+    /// because the photometric fit holds the geometry (r, Δ, α) exact —
+    /// and no joint state↔photometry covariance is computed anywhere in
+    /// the stack, so there is no cross term to add. The resulting σ_V is
+    /// therefore mildly conservative, which is the safe direction.
     pub mag_sigma: f64,
     /// Topocentric zenith angle (degrees). NaN if unavailable (e.g. no
     /// observer geodetic position).
@@ -372,7 +397,9 @@ pub(crate) fn build_orbits_for_ephemeris(
         if let Some(params) = crate::propagate::empyrean_orbit_non_grav_params(orbit) {
             orbits.set_non_grav_params(i, Some(params));
         }
-        if let Some(ph) = empyrean_orbit_photometric_params(orbit) {
+        if let Some(ph) =
+            empyrean_orbit_photometric_params(orbit).map_err(|e| format!("orbit {i}: {e}"))?
+        {
             orbits.set_photometric_params(i, Some(ph));
         }
         match empyrean_orbit_thrust_params(orbit) {

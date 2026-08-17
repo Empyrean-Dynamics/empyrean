@@ -456,6 +456,32 @@ if let Some(phot) = &fit.photometry {
 # Ok::<(), empyrean::Error>(())
 ```
 
+Hand that covariance back to an orbit with `Orbit::with_photometry_covariance`
+and ephemeris generation reports the H uncertainty in `mag_sigma`:
+
+```rust,no_run
+# use empyrean::{Orbit, PhaseFunction};
+# fn f(orbit: Orbit, fitted: [[f64; 3]; 3]) -> Orbit {
+orbit
+    .with_photometry(PhaseFunction::HG, 19.7, 0.15, 0.0)
+    .with_photometry_covariance(Some(fitted))
+# }
+```
+
+The two contributions are summed in quadrature,
+σ_V = sqrt(σ²_photo + σ²_state), where σ²_photo = J Σ_p Jᵀ contracts the full
+3×3 against J = [∂V/∂H, ∂V/∂slope₁, ∂V/∂slope₂]. Because
+V = H + 5·log₁₀(rΔ) + φ(α) gives ∂V/∂H ≡ 1 exactly, an orbit carrying no state
+covariance and a covariance of the H-only shape diag(σ_H², 0, 0) reports
+σ_V = σ_H. Slope variances and H–slope covariances do not drop out — they
+contract against ∂V/∂slope, which vanishes only at zero phase angle — so any
+covariance carrying them reports σ_V > σ_H. SBDB's published
+diag(σ_H², σ_G², 0) is the common case. They are combined as independent: a fitted σ_H
+is conditional on the fitted state (the photometric fit holds the geometry
+exact) and no joint state↔photometry covariance is computed anywhere in the
+stack, so there is no cross term to add — the resulting σ_V is mildly
+conservative, which is the safe direction.
+
 ## Writing results
 
 Orbits, residuals, per-object fit summaries, ephemerides, and events all
@@ -598,6 +624,51 @@ let config = PropagationConfig {
 let result = ctx.propagate(&orbits, &epochs, &config)?;
 # Ok::<(), empyrean::Error>(())
 ```
+
+### Reading back the mixture
+
+Under `UncertaintyMethod::Mixture` — and inside `Auto`'s close-approach
+windows — the engine splits the input Gaussian and retains the resulting
+components at every close approach where the splitter actually fired.
+`PropagationResult::mixtures` carries one `MixtureChain` per input orbit
+(empty for an orbit that never split), and `mixture_at` is the per-epoch
+lookup. They are the mixture itself, not its moment collapse: a consumer can
+evaluate Σ_k w_k · N(x | μ_k, Σ_k) directly at the CA epoch.
+
+```rust,no_run
+# use empyrean::{Context, Epoch, PropagationConfig, UncertaintyMethod};
+# let ctx = Context::from_data_dir(None)?;
+# let orbits = empyrean::query_sbdb(&["Apophis"], None)?.orbits;
+# let epochs = vec![Epoch::from_mjd_tdb(65000.0)];
+let config = PropagationConfig {
+    uncertainty_method: UncertaintyMethod::gaussian_mixture(),
+    ..Default::default()
+};
+let result = ctx.propagate(&orbits, &epochs, &config)?;
+
+for chain in &result.mixtures {
+    for (k, group) in chain.components.iter().enumerate() {
+        let retained: f64 = group.iter().map(|c| c.weight).sum();
+        println!(
+            "{} @ MJD {:.3}: {} components, retained weight {retained:.4}",
+            chain.orbit_id, chain.ca_epochs_mjd_tdb[k], group.len(),
+        );
+    }
+}
+# Ok::<(), empyrean::Error>(())
+```
+
+Four limits on what is retained, each a real property of the engine's
+retention rather than a marshaling shortfall: depth-0 splits only; only CA
+epochs where AGM actually fired; the component covariance is the linear
+Φ Σ_k Φᵀ map with the second-order mean correction omitted by design; and the
+retained weights may sum to **less than 1**, because a sub-Gaussian whose own
+sub-propagation missed the close approach contributes no component and the
+deficit is not recorded anywhere. Do not assume the weights normalize.
+
+Note the module path: `empyrean::propagate::MixtureComponent` is the
+basis-tagged read-back component, a different type from the crate-root
+`empyrean::MixtureComponent`, which is the `split_gaussian` primitive at t₀.
 
 ## Continuous thrust
 

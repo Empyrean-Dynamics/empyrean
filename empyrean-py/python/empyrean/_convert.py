@@ -737,27 +737,45 @@ def orbit_batch_dict_to_orbits(result: dict[str, Any]) -> AnyOrbits:
                 model_list.append(None)
                 continue
             h_list.append(h)
-            model_list.append(pf)
-            if pf == "HG":
+            # The column's documented spelling is lowercase; the tag can
+            # arrive either way (the extension's own marshal emits
+            # uppercase), so normalize on the way IN to the column
+            # rather than letting a round trip rewrite the caller's
+            # spelling. An unrecognized tag is a typed error, not a
+            # silent downgrade to "no photometry": both writers of this
+            # key are ours, so a name this reader cannot resolve means
+            # the two sides disagree.
+            tag = pf.lower()
+            model_list.append(tag)
+            if tag == "hg":
                 g_list.append(s1)
                 g1_list.append(None)
                 g2_list.append(None)
                 g12_list.append(None)
-            elif pf == "HG1G2":
+            elif tag == "hg1g2":
                 g_list.append(None)
                 g1_list.append(s1)
                 g2_list.append(s2)
                 g12_list.append(None)
-            elif pf == "HG12":
+            elif tag == "hg12":
                 g_list.append(None)
                 g1_list.append(None)
                 g2_list.append(None)
                 g12_list.append(s1)
             else:
-                g_list.append(None)
-                g1_list.append(None)
-                g2_list.append(None)
-                g12_list.append(None)
+                raise ValueError(
+                    f"orbit {i}: unknown phase function '{pf}' (expected hg, hg1g2 or hg12)"
+                )
+        # Photometric 3x3 over (H, slope1, slope2), row-major flattened.
+        # Null (not a block of zeros) on a row whose mask is false — a
+        # zero block would read as a supplied zero uncertainty.
+        has_phot_cov = np.asarray(
+            result.get("has_phot_covariance", np.zeros(n, dtype=bool)), dtype=bool
+        )
+        phot_cov = np.asarray(result.get("phot_covariance", np.zeros((n, 3, 3))), dtype=np.float64)
+        cov_list: list[list[float] | None] = [
+            phot_cov[i].reshape(9).tolist() if has_phot_cov[i] else None for i in range(n)
+        ]
         orbits_kwargs["photometric"] = PhotometricParams.from_kwargs(
             model=model_list,
             h=h_list,
@@ -765,6 +783,7 @@ def orbit_batch_dict_to_orbits(result: dict[str, Any]) -> AnyOrbits:
             g1=g1_list,
             g2=g2_list,
             g12=g12_list,
+            covariance=cov_list,
         )
 
     # Bind validate / permit_nulls explicitly so the splat maps only onto
@@ -856,6 +875,26 @@ def orbits_to_orbit_batch_dict(orbits: AnyOrbits) -> dict[str, Any]:
     # with the Marsden non-grav above; validated + gated in extract_srp.
     has_srp, srp_amrat, srp_cr, srp_amrat_variance = extract_srp(orbits)
 
+    # Photometry. The reverse direction (orbit_batch_dict_to_orbits) has
+    # always read these keys back; this direction emitted none of them, so
+    # an orbit batch written through the Python I/O surface lost its H/G
+    # entirely — including the H uncertainty the engine's parquet / CSV
+    # formats do carry.
+    phot_h, phot_slope1, phot_slope2, phot_model, has_phot_cov, phot_cov = extract_photometry(
+        orbits
+    )
+    # The documented spelling of PhotometricParams.model (lowercase), so
+    # an Orbits -> dict -> Orbits round trip returns the caller's own
+    # tag rather than rewriting its case.
+    _MODEL_INT_TO_TAG = {0: "hg", 1: "hg1g2", 2: "hg12"}
+    # A model tag with no absolute magnitude is not photometry: the
+    # phase function alone predicts nothing. Emit no tag for such a row
+    # so the file carries NULL, rather than a tag beside a fabricated H.
+    phot_system = [
+        _MODEL_INT_TO_TAG.get(int(m)) if np.isfinite(h) else None
+        for m, h in zip(phot_model, phot_h, strict=True)
+    ]
+
     object_ids = [s if s else "" for s in orbits.object_id.to_pylist()]
     return {
         "orbit_ids": orbit_ids,
@@ -881,25 +920,110 @@ def orbits_to_orbit_batch_dict(orbits: AnyOrbits) -> dict[str, Any]:
         "srp_amrat": srp_amrat,
         "srp_cr": srp_cr,
         "srp_amrat_variance": srp_amrat_variance,
+        "phot_system": phot_system,
+        "phot_h": phot_h,
+        "phot_slope1": phot_slope1,
+        "phot_slope2": phot_slope2,
+        "has_phot_covariance": has_phot_cov,
+        "phot_covariance": phot_cov,
     }
+
+
+# Relative tolerance on the photometric covariance's symmetry. A matrix
+# assembled from a fit is symmetric to round-off, not to the bit; a
+# transposed or half-filled one (an off-diagonal on one side only) fails
+# at any magnitude.
+_PHOT_COV_SYMMETRY_RTOL = 1e-12
+_PHOT_COV_NAMES = ("H", "slope1", "slope2")
+
+
+def _validate_phot_covariance_symmetry(m: FloatArray, i: int) -> None:
+    """Reject an asymmetric photometric 3x3 by name.
+
+    A covariance is symmetric by definition, and the orbit file formats
+    carry only its six lower-triangle cells — so an asymmetric matrix has
+    no file representation and comes back truncated (the upper entry
+    dropped, not mirrored), silently changing ``mag_sigma`` across a
+    round trip.
+    """
+    for r in range(3):
+        for c in range(3):
+            if not np.isfinite(m[r, c]):
+                raise ValueError(
+                    f"orbit {i}: photometric covariance entry [{r}][{c}] "
+                    f"({_PHOT_COV_NAMES[r]}-{_PHOT_COV_NAMES[c]}) is {m[r, c]}, not a "
+                    "finite number. A non-finite entry contracts to a NaN sigma_V, which "
+                    "reads downstream as 'no photometric uncertainty was supplied' — "
+                    "supply the real variance, or leave the covariance null."
+                )
+    for r in range(3):
+        for c in range(r + 1, 3):
+            a = float(m[r, c])
+            b = float(m[c, r])
+            scale = max(abs(a), abs(b))
+            if not abs(a - b) <= _PHOT_COV_SYMMETRY_RTOL * scale:
+                raise ValueError(
+                    f"orbit {i}: photometric covariance is not symmetric — "
+                    f"[{r}][{c}] = {a} ({_PHOT_COV_NAMES[r]}-{_PHOT_COV_NAMES[c]}) but "
+                    f"[{c}][{r}] = {b}. It is a covariance over (H, slope1, slope2), and "
+                    "the orbit file formats store only its lower triangle, so an "
+                    "asymmetric matrix cannot round-trip — mirror the term you meant "
+                    "onto both sides."
+                )
 
 
 def extract_photometry(
     orbits: AnyOrbits,
-) -> tuple[FloatArray, FloatArray, npt.NDArray[np.int32]]:
+) -> tuple[
+    FloatArray,
+    FloatArray,
+    FloatArray,
+    npt.NDArray[np.int32],
+    npt.NDArray[np.bool_],
+    FloatArray,
+]:
     """Extract photometric parameters from orbits.
 
-    Returns (h, g, model_ints) arrays. model_int: 0=HG, 1=HG1G2, 2=HG12, -1=none.
+    Returns ``(h, slope1, slope2, model_ints, has_phot_cov, phot_cov)``.
+    ``model_int``: 0=HG, 1=HG1G2, 2=HG12, -1=none.
+
+    The slope slots follow the row's own model, not a fixed column:
+    ``slope1`` is ``g`` for ``"hg"``, ``g1`` for ``"hg1g2"`` and ``g12``
+    for ``"hg12"``; ``slope2`` is ``g2`` for ``"hg1g2"`` and 0 otherwise.
+    Reading ``g`` for every row — as this did — sent an ``hg12`` orbit to
+    the engine with ``slope1 = 0.0``, a silently wrong phase function
+    rather than the one the caller asked for.
+
+    ``h`` is NaN on a row with no absolute magnitude, which is the
+    absence convention every downstream reader uses (the binding's test
+    is ``!h.is_finite()``). It is deliberately NOT coerced to 0.0: a
+    model tag with no H is not photometry, and 0 mag is not a magnitude
+    any minor body has.
+
+    ``has_phot_cov`` / ``phot_cov`` are the ``(n,)`` bool mask + ``(n, 3,
+    3)`` row-major covariance over ``(H, slope1, slope2)``, all-False +
+    zeros where no row carries one. Same shape as
+    :func:`extract_non_grav_covariance`. Each supplied 3x3 is validated
+    finite and symmetric — the file formats store only the lower
+    triangle, so an asymmetric matrix would come back truncated. A
+    covariance on a row with no absolute magnitude or no model tag is a
+    :class:`ValueError`: it has no photometry to attach to and would be
+    dropped at the engine boundary, leaving ``has_phot_cov`` set beside
+    a null ``phot_system``.
     """
     n = len(orbits)
+    has_phot_cov = np.zeros(n, dtype=np.bool_)
+    phot_cov = np.zeros((n, 3, 3), dtype=np.float64)
     if orbits.photometric is not None:
         p = orbits.photometric
+        # A null H stays NaN. Coercing it to 0.0 turned "this row has no
+        # absolute magnitude" into a real H of 0 mag — brighter than any
+        # solar-system minor body — which the binding then accepted (its
+        # absence test is `!h.is_finite()`) and the orbit writers
+        # persisted to disk.
         h = np.asarray(p.h.to_numpy(zero_copy_only=False), dtype=np.float64)
-        g = np.asarray(p.g.to_numpy(zero_copy_only=False), dtype=np.float64)
-        h = np.nan_to_num(h, nan=0.0)
-        g = np.nan_to_num(g, nan=0.0)
         # PhotometricParams.model carries lowercase tags ("hg", "hg1g2",
-        # "hg12") per python/empyrean/orbits/photometry.py:18. Match case-
+        # "hg12") per python/empyrean/orbits/photometry.py. Match case-
         # insensitively so callers using either convention get photometry
         # threaded through; an unknown tag falls through to -1, which the
         # binding interprets as "no photometry — emit NaN mag".
@@ -909,11 +1033,79 @@ def extract_photometry(
             [model_map.get(m.lower(), -1) if m else -1 for m in models],
             dtype=np.int32,
         )
+        # Per-model slope slots. Each source column is read once and the
+        # row's own model selects which one lands in which slot.
+        g_col = np.nan_to_num(
+            np.asarray(p.g.to_numpy(zero_copy_only=False), dtype=np.float64), nan=0.0
+        )
+        g1_col = np.nan_to_num(
+            np.asarray(p.g1.to_numpy(zero_copy_only=False), dtype=np.float64), nan=0.0
+        )
+        g2_col = np.nan_to_num(
+            np.asarray(p.g2.to_numpy(zero_copy_only=False), dtype=np.float64), nan=0.0
+        )
+        g12_col = np.nan_to_num(
+            np.asarray(p.g12.to_numpy(zero_copy_only=False), dtype=np.float64), nan=0.0
+        )
+        slope1 = np.select(
+            [model_ints == 0, model_ints == 1, model_ints == 2],
+            [g_col, g1_col, g12_col],
+            default=0.0,
+        )
+        slope2 = np.where(model_ints == 1, g2_col, 0.0)
+
+        # H = 0.0 is the C ABI's "no absolute magnitude supplied" value
+        # (it is what memset(0) leaves on EmpyreanOrbit.h_mag, and
+        # EMPYREAN_PHASE_FUNCTION_HG is 0 too), so photometry attached
+        # with it would be dropped at the boundary. Say so here instead
+        # of letting it disappear between layers.
+        zero_h = (model_ints >= 0) & (h == 0.0)
+        if zero_h.any():
+            bad = int(np.flatnonzero(zero_h)[0])
+            raise ValueError(
+                f"orbit {bad}: photometric model {models[bad]!r} with h = 0.0. That is the "
+                "C ABI's 'no absolute magnitude supplied' value, and no solar-system minor "
+                "body has H = 0 — supply the real absolute magnitude, or leave the "
+                "photometric model null."
+            )
+
+        covs = p.covariance.to_pylist()
+        for i, row in enumerate(covs):
+            if row is None:
+                continue
+            flat = np.asarray(row, dtype=np.float64)
+            if flat.size != 9:
+                raise ValueError(
+                    f"orbit {i}: photometric covariance has {flat.size} values, expected 9 "
+                    "(row-major 3x3 over H, slope1, slope2)"
+                )
+            m = flat.reshape(3, 3)
+            # A covariance over (H, slope1, slope2) with no photometry to
+            # attach to has nowhere to go. Every downstream reader's
+            # absence test is `!h.is_finite()` (or a null model tag), so
+            # the whole PhotometricParams — covariance included — is
+            # dropped at the boundary: the batch dict would carry
+            # `has_phot_covariance = True` beside `phot_system = None`
+            # and the matrix would vanish between layers. Name it here
+            # instead.
+            if not np.isfinite(h[i]) or model_ints[i] < 0:
+                missing = "absolute magnitude" if not np.isfinite(h[i]) else "phase-function model"
+                raise ValueError(
+                    f"orbit {i}: a photometric covariance was supplied with no "
+                    f"{missing} (h = {h[i]}, model = {models[i]!r}). A covariance over "
+                    "(H, slope1, slope2) with no photometry to attach to is dropped at "
+                    "the engine boundary — supply the photometry it belongs to, or "
+                    "leave the covariance null."
+                )
+            _validate_phot_covariance_symmetry(m, i)
+            phot_cov[i] = m
+            has_phot_cov[i] = True
     else:
         h = np.full(n, np.nan, dtype=np.float64)
-        g = np.full(n, np.nan, dtype=np.float64)
+        slope1 = np.zeros(n, dtype=np.float64)
+        slope2 = np.zeros(n, dtype=np.float64)
         model_ints = np.full(n, -1, dtype=np.int32)
-    return h, g, model_ints
+    return h, slope1, slope2, model_ints, has_phot_cov, phot_cov
 
 
 def extract_non_grav_covariance(

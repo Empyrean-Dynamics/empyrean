@@ -444,6 +444,69 @@ if phot is not None and phot.covariance is not None:
     print(f"H = {phot.h:.2f} ± {sigma_h:.2f} mag  (model {phot.model_used.value})")
 ```
 
+`determine` folds the fit onto the result orbit's `photometric` column —
+including the 3×3 covariance over (H, slope1, slope2) — so a fitted orbit
+handed straight to `generate_ephemeris` reports the H uncertainty in
+`mag_sigma`:
+
+\[
+  \sigma_V = \sqrt{\sigma^2_\text{photo} + \sigma^2_\text{state}}
+\]
+
+with \(\sigma^2_\text{photo} = J \Sigma_p J^\top\) contracting the full
+3×3 against \(J = [\partial V/\partial H, \partial V/\partial
+\text{slope}_1, \partial V/\partial \text{slope}_2]\).
+
+Because \(V = H + 5\log_{10}(r\Delta) + \phi(\alpha)\) gives
+\(\partial V/\partial H \equiv 1\) exactly, an orbit carrying no state
+covariance and a covariance of the **H-only** shape
+\(\mathrm{diag}(\sigma_H^2, 0, 0)\) reports \(\sigma_V = \sigma_H\):
+
+```python
+import numpy as np
+from empyrean import PhotometricParams
+
+orbits = orbits.set_column(
+    "photometric",
+    PhotometricParams.from_kwargs(
+        model=["hg"],
+        h=[19.7],
+        g=[0.15],
+        covariance=[np.diag([0.3**2, 0.0, 0.0]).reshape(9).tolist()],
+    ),
+)
+```
+
+Slope variances and \(H\)–slope covariances do **not** drop out: they
+contract against \(\partial V/\partial\text{slope}\), which vanishes only
+at zero phase angle, so a covariance carrying them reports
+\(\sigma_V > \sigma_H\). SBDB is the common case — a queried orbit
+carries \(\mathrm{diag}(\sigma_H^2, \sigma_G^2, 0)\), so for Apophis
+(\(\sigma_H = 0.19\), \(\sigma_G = 0.11\)) the reported \(\sigma_V\)
+grows with phase angle and is strictly above 0.19 at every nonzero
+phase angle. The column is a row-major flattened 3×3 over
+\((H, \text{slope}_1, \text{slope}_2)\); it must be symmetric, and it is
+null when absent, never a block of zeros:
+
+```python
+orbits = orbits.set_column(
+    "photometric",
+    PhotometricParams.from_kwargs(
+        model=["hg"],
+        h=[19.7],
+        g=[0.15],
+        covariance=[np.diag([0.19**2, 0.11**2, 0.0]).reshape(9).tolist()],
+    ),
+)
+```
+
+The two terms are combined as independent. They are not strictly
+independent — a fitted \(\sigma_H\) is conditional on the fitted state,
+because the photometric fit holds the geometry exact — and no joint
+state↔photometry covariance is computed anywhere in the stack, so there
+is no cross term to add. The resulting \(\sigma_V\) is mildly
+conservative, which is the safe direction.
+
 ## Ephemeris
 
 ```python
@@ -521,6 +584,49 @@ result = empyrean.propagate(
 print(result.sensitivity.stms_array().shape)   # (N, 6, 6)
 print(result.sensitivity.stts_array().shape)   # (N, 6, 6, 6)
 ```
+
+### Reading back the mixture
+
+Under `GAUSSIAN_MIXTURE` — and inside `AUTO`'s close-approach windows —
+the engine splits the input Gaussian and retains the resulting components
+at every close approach where the splitter actually fired. Those
+components come back on `PropagationResult.mixtures`, a flat
+`MixtureChains` table with one row per (orbit, CA epoch, component). They
+are the mixture itself, not its moment collapse: you can evaluate
+\(\sum_k w_k\,\mathcal{N}(x \mid \mu_k, \Sigma_k)\) directly at the
+CA epoch.
+
+```python
+from empyrean import GaussianMixture
+
+result = empyrean.propagate(orbits, epochs, uncertainty_method=GaussianMixture())
+
+# One list per retained CA epoch of orbit 0.
+for group in result.mixture_chains(0):
+    print(len(group), "components,", sum(c.weight for c in group), "retained weight")
+    print(group[0].mean, group[0].covariance.shape, group[0].frame, group[0].origin)
+```
+
+Four limits on what is retained, each a real property of the engine's
+retention rather than a marshaling shortfall:
+
+- **Depth-0 only.** Only the initial split is retained; recursive AGM
+  calls (depth > 0) are not captured.
+- **Only CA epochs where AGM fired.** An orbit that never triggered a
+  split contributes no rows — a `FIRST_ORDER` run yields an empty table,
+  never zero-filled placeholder rows.
+- **Component covariance is the linear map.** Each component's covariance
+  is \(\Phi \Sigma_k \Phi^\top\); the second-order mean correction is
+  intentionally omitted.
+- **Retained weights may sum to less than 1.** A sub-Gaussian whose own
+  sub-propagation missed the close approach contributes no component, and
+  the deficit is not recorded anywhere. Do not assume the weights
+  normalize — sum them and check.
+
+Note the name: `empyrean.propagation.mixtures.MixtureComponent` is the
+basis-tagged read-back component, a different type from the top-level
+`empyrean.MixtureComponent`, which is the `split_gaussian` primitive at
+\(t_0\).
 
 ## Continuous thrust
 

@@ -39,12 +39,50 @@ pub struct EphemerisEntry {
     pub heliocentric_distance_au: f64,
     /// Predicted apparent magnitude. NaN if unavailable.
     pub mag: f64,
-    /// Magnitude uncertainty (1σ). Finite iff photometry is enabled AND
-    /// the input orbit carried a state covariance; NaN otherwise. Today
-    /// this reflects the **state contribution only** — an H-magnitude
-    /// uncertainty is not yet an input, so `mag_sigma` under-reports σ_V
-    /// when the H uncertainty is significant (the dominant photometric
-    /// error source for short-arc orbits).
+    /// Magnitude uncertainty (1σ). Finite only when photometry is
+    /// enabled AND the input orbit carried at least one of a state
+    /// covariance or a photometric covariance
+    /// ([`Orbit::with_photometry_covariance`](crate::Orbit::with_photometry_covariance))
+    /// AND what it carried contracts to a strictly positive variance;
+    /// NaN otherwise. A carried covariance is not sufficient on its own:
+    /// an all-zero \\(3 \times 3\\), or a non-PSD one that contracts to
+    /// \\(\le 0\\), still reports NaN.
+    ///
+    /// Both contributions are summed in quadrature,
+    /// \\[
+    ///   \sigma_V = \sqrt{\sigma^2_{\text{photo}} + \sigma^2_{\text{state}}},
+    /// \\]
+    /// where \\(\sigma_{\text{state}}\\) is the state contribution and
+    /// \\(\sigma_{\text{photo}}\\) contracts the orbit's photometric
+    /// \\(3 \times 3\\) over \\((H, \text{slope}_1, \text{slope}_2)\\)
+    /// against the **full** magnitude Jacobian,
+    /// \\[
+    ///   \sigma^2_{\text{photo}} = J \Sigma_p J^\top, \quad
+    ///   J = \left[\frac{\partial V}{\partial H},
+    ///             \frac{\partial V}{\partial \text{slope}_1},
+    ///             \frac{\partial V}{\partial \text{slope}_2}\right].
+    /// \\]
+    ///
+    /// \\(V = H + 5\log_{10}(r\Delta) + \phi(\alpha)\\) gives
+    /// \\(\partial V/\partial H \equiv 1\\), so an orbit with **no state
+    /// covariance** and a photometric covariance of the H-only shape
+    /// \\(\mathrm{diag}(\sigma_H^2, 0, 0)\\) — what an H-only fit emits —
+    /// reports \\(\sigma_V = \sigma_H\\) exactly. The slope terms do not
+    /// drop out of any other shape: slope variances and \\(H\\)–slope
+    /// covariances contract against \\(\partial V/\partial\text{slope}\\),
+    /// which vanishes only at zero phase angle, so any covariance
+    /// carrying them reports \\(\sigma_V > \sigma_H\\). An SBDB-queried
+    /// orbit is the common case — its published
+    /// \\(\mathrm{diag}(\sigma_H^2, \sigma_G^2, 0)\\) makes
+    /// \\(\sigma_V\\) strictly larger than \\(\sigma_H\\).
+    ///
+    /// The two terms are combined as independent. They are not strictly
+    /// independent — a fitted \\(\sigma_H\\) is conditional on the
+    /// fitted state, because the photometric fit holds the geometry
+    /// \\((r, \Delta, \alpha)\\) exact — and no joint
+    /// state↔photometry covariance is computed anywhere in the stack, so
+    /// there is no cross term to add. The resulting \\(\sigma_V\\) is
+    /// therefore mildly conservative, which is the safe direction.
     pub mag_sigma: f64,
     /// Topocentric zenith angle (degrees). NaN if unavailable.
     pub zenith_angle_deg: f64,

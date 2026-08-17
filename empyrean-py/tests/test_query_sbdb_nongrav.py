@@ -124,3 +124,55 @@ def test_no_nongrav_when_all_coefficients_zero() -> None:
         a2 = np.nan_to_num(ng.a2.to_numpy(zero_copy_only=False), nan=0.0)
         a3 = np.nan_to_num(ng.a3.to_numpy(zero_copy_only=False), nan=0.0)
         assert not (a1.any() or a2.any() or a3.any()), "spurious non-grav coefficients"
+
+
+def test_sbdb_photometric_covariance_survives_round_trip() -> None:
+    """SBDB's ``phys_par`` publishes H / G sigmas, which the engine ingests
+    as a diagonal 3×3. The distribution used to throw it away — the C ABI
+    had no covariance slot on ``EmpyreanOrbit``, so an SBDB query lost the
+    published H uncertainty and downstream ``mag_sigma`` reported the state
+    contribution alone.
+
+    Network-free, same as its siblings: this feeds
+    ``orbit_batch_dict_to_orbits`` the exact dict shape
+    ``orbit_batch_to_pydict`` emits for a photometry-bearing SBDB row.
+    """
+    sigma_h, sigma_g = 0.19, 0.11
+    cov = np.diag([sigma_h**2, sigma_g**2, 0.0])
+    orbits = orbit_batch_dict_to_orbits(
+        _sbdb_dict(
+            phot_system=["HG"],
+            phot_h=np.array([19.09]),
+            phot_slope1=np.array([0.24]),
+            phot_slope2=np.array([0.0]),
+            has_phot_covariance=np.array([True]),
+            phot_covariance=cov[None, :, :],
+        )
+    )
+    assert orbits.photometric is not None
+    # The extension's marshal emits the uppercase tag; the column's own
+    # documented spelling is lowercase, and the column writer normalizes
+    # so a round trip does not rewrite the caller's spelling.
+    assert orbits.photometric.model.to_pylist() == ["hg"]
+    assert orbits.photometric.h.to_numpy(zero_copy_only=False)[0] == 19.09
+    got = orbits.photometric.covariance.to_pylist()[0]
+    assert got is not None, "the SBDB-published H/G sigmas must survive the round trip"
+    np.testing.assert_allclose(np.asarray(got).reshape(3, 3), cov, atol=1e-15)
+
+
+def test_sbdb_photometry_without_a_covariance_stays_null() -> None:
+    """Absence stays absence: an SBDB row whose ``phys_par`` published no
+    sigmas gets a NULL covariance, never a block of zeros — which would
+    read as a supplied zero uncertainty."""
+    orbits = orbit_batch_dict_to_orbits(
+        _sbdb_dict(
+            phot_system=["HG"],
+            phot_h=np.array([19.09]),
+            phot_slope1=np.array([0.24]),
+            phot_slope2=np.array([0.0]),
+            has_phot_covariance=np.array([False]),
+            phot_covariance=np.zeros((1, 3, 3)),
+        )
+    )
+    assert orbits.photometric is not None
+    assert orbits.photometric.covariance.to_pylist()[0] is None

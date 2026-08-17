@@ -1596,10 +1596,23 @@ struct EmpyreanOrbit {
      * Phase-function model. `EMPYREAN_PHASE_FUNCTION_NONE` disables
      * magnitude computation; the other values map to villeneuve's
      * `PhaseFunction` enum.
+     *
+     * Note that `EMPYREAN_PHASE_FUNCTION_HG` is `0`, so `memset(0)`
+     * selects HG rather than NONE — `h_mag` is what carries absence for
+     * a zero-initialized orbit (see below).
      */
     int32_t phot_system;
     /**
      * Absolute magnitude H. Ignored when `phot_system == NONE`.
+     *
+     * **0.0 means "no photometry supplied"**, as do NaN and infinity.
+     * Zero is what `memset(0)` leaves here, and no solar-system minor
+     * body has H = 0 (Ceres, the brightest, is H ≈ 3.3), so treating it
+     * as a magnitude would let a zero-initialized orbit claim HG
+     * photometry ~20 mag too bright — a fabrication that ephemeris
+     * generation would predict from and the orbit writers would
+     * persist. There is no way to request photometry with a literal H
+     * of zero; supply the real absolute magnitude.
      */
     double h_mag;
     /**
@@ -1734,6 +1747,36 @@ struct EmpyreanOrbit {
      * [`param_pair_cross`](Self::param_pair_cross).
      */
     uintptr_t n_param_pair_cross;
+    /**
+     * 1 when [`phot_covariance`](Self::phot_covariance) carries a
+     * photometric parameter covariance; 0 otherwise. Set it from an OD
+     * photometry fit (`EmpyreanODPhotometryResult::covariance`), from
+     * an SBDB query, or from an orbit file that carried one, so the
+     * H/G uncertainty reaches ephemeris generation's `mag_sigma`
+     * instead of being dropped. Leave 0 for a hand-built orbit with no
+     * photometric uncertainty.
+     */
+    uint8_t has_phot_covariance;
+    /**
+     * Photometric 3×3 covariance over (H, slope1, slope2), row-major —
+     * the same parameter order as `h_mag` / `slope1` / `slope2` above,
+     * so which slope a row/column names follows `phot_system`. Only
+     * read when `has_phot_covariance = 1`.
+     *
+     * Rows and columns of parameters the producing fit held fixed are
+     * zero (a fixed parameter contributes no variance), which is
+     * exactly what an H-only fit emits.
+     *
+     * **Must be symmetric**, and every one of the nine entries finite.
+     * The orbit file formats store only the six lower-triangle cells,
+     * so an asymmetric matrix has no file representation and would come
+     * back truncated — the upper entry dropped rather than mirrored,
+     * silently changing the magnitude uncertainty across a write/read
+     * round trip. An asymmetric or non-finite matrix is refused by
+     * name (entry indices and parameter names) rather than repaired;
+     * fill both sides of each off-diagonal term.
+     */
+    double phot_covariance[3][3];
 };
 
 /**
@@ -2478,9 +2521,8 @@ struct EmpyreanMixtureChain {
 /**
  * Propagation result containing states, events, and object identifiers.
  *
- * `mixtures` parallels `object_ids` only when populated — it is
- * per-orbit (not per-state), so its length is the distinct orbit
- * count, not `num_states`.
+ * `mixtures` is per-orbit (not per-state), so when populated its length
+ * is the input orbit count, not `num_states`.
  */
 struct EmpyreanPropagationResult {
     struct EmpyreanPropagatedState *states;
@@ -2489,10 +2531,21 @@ struct EmpyreanPropagationResult {
     struct EmpyreanEvent *events;
     uintptr_t num_events;
     /**
-     * One [`EmpyreanMixtureChain`] per input orbit (positional with
-     * the input orbit batch). Empty / null when no orbits produced
-     * mixtures (the typical case for FirstOrder / SecondOrder /
-     * SigmaPoint / MonteCarlo).
+     * One [`EmpyreanMixtureChain`] per input orbit, positional with the
+     * input orbit batch, whenever the run produced any sensitivity data
+     * at all — including under FirstOrder / SecondOrder / SigmaPoint /
+     * MonteCarlo, where every row is an empty chain
+     * (`num_ca_epochs == 0`, all four pointers null). An empty row means
+     * "this orbit split nothing"; it is **not** absence.
+     *
+     * `num_mixtures == 0` (and a null `mixtures`) is the one other
+     * shape: a batch in which NO orbit produced sensitivity tensors —
+     * orbits carrying no covariance, under any method — for which the
+     * engine empties the vector wholesale. So check `num_mixtures`
+     * before indexing: it is either 0 or the input orbit count, never
+     * anything between. (The Rust wrapper pads that case to one empty
+     * chain per orbit so its own `mixtures` is positional
+     * unconditionally; at this layer the zero-row shape is visible.)
      */
     struct EmpyreanMixtureChain *mixtures;
     uintptr_t num_mixtures;
@@ -2670,11 +2723,36 @@ struct EmpyreanEphemerisEntry {
      */
     double mag;
     /**
-     * Magnitude uncertainty (1σ). Finite iff photometry is enabled AND
-     * the input orbit carried a state covariance; NaN otherwise. Today
-     * this reflects the state contribution only — an H-magnitude
-     * uncertainty is not yet an input, so `mag_sigma` under-reports σ_V
-     * when the H uncertainty is significant.
+     * Magnitude uncertainty (1σ). Finite only when photometry is
+     * enabled AND the input orbit carried at least one of a state
+     * covariance or a photometric covariance
+     * (`EmpyreanOrbit::phot_covariance`) AND what it carried contracts
+     * to a strictly positive variance; NaN otherwise. A carried
+     * covariance is not sufficient on its own: an all-zero 3×3, or a
+     * non-PSD one that contracts to ≤ 0, still reports NaN.
+     *
+     * Both contributions are summed in quadrature:
+     * σ_V = sqrt(σ²_photo + σ²_state), where σ_state is the state
+     * contribution and σ_photo contracts the orbit's photometric 3×3
+     * over (H, slope1, slope2) against the FULL magnitude Jacobian:
+     * σ²_photo = J Σ_p Jᵀ with J = [∂V/∂H, ∂V/∂slope1, ∂V/∂slope2].
+     *
+     * V = H + 5·log10(r·Δ) + φ(α) gives ∂V/∂H ≡ 1, so an orbit with NO
+     * state covariance and a photometric covariance of the H-only shape
+     * diag(σ_H², 0, 0) — what an H-only fit emits — reports σ_V = σ_H
+     * exactly. The slope terms do not drop out of any other shape:
+     * slope variances and H–slope covariances contract against
+     * ∂V/∂slope, which vanishes only at zero phase angle, so any
+     * covariance carrying them reports σ_V > σ_H. An SBDB-queried orbit
+     * is the common case — its published diag(σ_H², σ_G², 0) makes σ_V
+     * strictly larger than σ_H.
+     *
+     * The two terms are combined as independent. They are not strictly
+     * independent — a fitted σ_H is conditional on the fitted state,
+     * because the photometric fit holds the geometry (r, Δ, α) exact —
+     * and no joint state↔photometry covariance is computed anywhere in
+     * the stack, so there is no cross term to add. The resulting σ_V is
+     * therefore mildly conservative, which is the safe direction.
      */
     double mag_sigma;
     /**

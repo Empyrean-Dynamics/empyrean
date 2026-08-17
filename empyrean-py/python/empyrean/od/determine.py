@@ -1114,6 +1114,11 @@ def _photometry_params_from_result(pr: PhotometryResult) -> PhotometricParams:
     ``model_used`` is the resolved model (never ``AUTO``). ``PhotometricParams``
     has no ``honly`` model, so HONLY (H fit with a fixed slope, carried in
     ``slope1``) is represented as classical HG.
+
+    The fit's 3×3 covariance rides along, so a fitted orbit re-fed into
+    :func:`~empyrean.generate_ephemeris` reports the H uncertainty in
+    ``mag_sigma`` instead of the state contribution alone. ``None`` when
+    the fit produced none.
     """
     model = pr.model_used.value
     g = g1 = g2 = g12 = None
@@ -1124,8 +1129,19 @@ def _photometry_params_from_result(pr: PhotometryResult) -> PhotometricParams:
     else:  # "hg" and "honly" both reduce to classical H, G
         model = "hg"
         g = pr.slope1
+    covariance = (
+        np.asarray(pr.covariance, dtype=np.float64).reshape(9).tolist()
+        if pr.covariance is not None
+        else None
+    )
     return PhotometricParams.from_kwargs(
-        model=[model], h=[pr.h], g=[g], g1=[g1], g2=[g2], g12=[g12]
+        model=[model],
+        h=[pr.h],
+        g=[g],
+        g1=[g1],
+        g2=[g2],
+        g12=[g12],
+        covariance=[covariance],
     )
 
 

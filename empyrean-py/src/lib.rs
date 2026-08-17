@@ -798,6 +798,8 @@ fn build_uncertainty_method(
     srp_amrat_variance = None,
     has_non_grav_cov = None,
     non_grav_cov = None,
+    has_phot_cov = None,
+    phot_cov = None,
     non_grav_cross = None,
     wide_columns = None,
     wide_state = None,
@@ -876,6 +878,13 @@ fn _propagate<'py>(
     // StateAndNonGrav prior instead of silently dropping it.
     has_non_grav_cov: Option<PyReadonlyArray1<'py, bool>>,
     non_grav_cov: Option<PyReadonlyArray3<'py, f64>>,
+    // Photometric 3×3 covariance over (H, slope1, slope2), same nullable
+    // mask + (n,3,3) shape as the non-grav pair above. Propagation is
+    // agnostic to V-magnitude, but the photometry attached here — its
+    // covariance included — flows downstream to ephemeris generation,
+    // where it becomes the σ_photo term of `mag_sigma`.
+    has_phot_cov: Option<PyReadonlyArray1<'py, bool>>,
+    phot_cov: Option<PyReadonlyArray3<'py, f64>>,
     // The joint's off-diagonal terms, six parallel per-orbit lists (see
     // `JointRows`). A leg fed its predecessor's joint propagates the
     // covariance the previous leg actually computed; fed the 6×6 alone
@@ -953,6 +962,8 @@ fn _propagate<'py>(
     let srp_var_arr = srp_amrat_variance.as_ref().map(|a| a.as_array().to_owned());
     let has_ng_cov_arr = has_non_grav_cov.as_ref().map(|a| a.as_array().to_owned());
     let ng_cov_arr = non_grav_cov.as_ref().map(|a| a.as_array().to_owned());
+    let has_phot_cov_arr = has_phot_cov.as_ref().map(|a| a.as_array().to_owned());
+    let phot_cov_arr = phot_cov.as_ref().map(|a| a.as_array().to_owned());
 
     let n = epochs_arr.len();
 
@@ -1044,7 +1055,7 @@ fn _propagate<'py>(
             i,
         );
         // Fitted non-grav 3×3 covariance (optional, nullable per row).
-        let ng_cov = ng_covariance_at(has_ng_cov_arr.as_ref(), ng_cov_arr.as_ref(), i);
+        let ng_cov = covariance_3x3_at(has_ng_cov_arr.as_ref(), ng_cov_arr.as_ref(), i);
         // Photometry: ephemeris generation downstream consumes (H, slope1,
         // slope2) per the chosen phase function. NaN H or model = -1 leaves
         // photometry unset and the row's mag = NaN.
@@ -1064,7 +1075,13 @@ fn _propagate<'py>(
             // and a wrong-but-non-crashing fallback for HG1G2 — file
             // a clear array if HG1G2 fits matter).
             let s2 = phot_slope2_arr.as_ref().map_or(0.0, |a| a[i]);
-            Some((pf, h, g, s2))
+            Some((
+                pf,
+                h,
+                g,
+                s2,
+                covariance_3x3_at(has_phot_cov_arr.as_ref(), phot_cov_arr.as_ref(), i),
+            ))
         } else {
             None
         };
@@ -1910,7 +1927,16 @@ fn assemble_orbit(
     non_grav_dt: Option<f64>,
     non_grav_dt_variance: Option<f64>,
     ng_covariance: Option<[[f64; 3]; 3]>,
-    photometry: Option<(empyrean::PhaseFunction, f64, f64, f64)>,
+    // `(phase function, H, slope1, slope2, optional 3×3 covariance over
+    // those three parameters)`. The covariance is a separate `Option`
+    // inside the tuple because most orbits carry photometry without one.
+    photometry: Option<(
+        empyrean::PhaseFunction,
+        f64,
+        f64,
+        f64,
+        Option<[[f64; 3]; 3]>,
+    )>,
     thrust: Option<empyrean::ThrustParams>,
     // SRP force slot: `(amrat, cr, amrat_variance)`. `None` = no SRP (the
     // explicit `has_srp` switch was 0). A `Some(_, _, Some(v))` opens the
@@ -1925,9 +1951,9 @@ fn assemble_orbit(
     // `Orbit::new` uses; the C ABI reads all-zeros as "inverse-square".
     let (ng_alpha, ng_r0, ng_m, ng_n, ng_k) = g_function.unwrap_or((0.0, 0.0, 0.0, 0.0, 0.0));
     // Absent photometry → the `Orbit::new` defaults (mag computation disabled).
-    let (phot_system, h_mag, slope1, slope2) = match photometry {
-        Some((pf, h, s1, s2)) => (Some(pf), h, s1, s2),
-        None => (None, f64::NAN, 0.0, 0.0),
+    let (phot_system, h_mag, slope1, slope2, phot_covariance) = match photometry {
+        Some((pf, h, s1, s2, cov)) => (Some(pf), h, s1, s2, cov),
+        None => (None, f64::NAN, 0.0, 0.0, None),
     };
     let orbit = empyrean::Orbit {
         orbit_id,
@@ -1948,6 +1974,7 @@ fn assemble_orbit(
         h_mag,
         slope1,
         slope2,
+        phot_covariance,
         thrust,
         srp: None,
         // The chokepoint's whole purpose: this literal has no `..` rest
@@ -1993,11 +2020,15 @@ fn srp_at(
     Some((amrat, cr, amrat_variance))
 }
 
-/// Copy orbit `i`'s fitted non-grav 3×3 covariance out of the marshaled
+/// Copy orbit `i`'s 3×3 parameter covariance out of the marshaled
 /// `(has, cov)` arrays, honoring the per-row presence mask. `None` when the
 /// caller passed no arrays or the row's mask is false — the same nullable
 /// `(n,) bool` + `(n,3,3) f64` shape the OD output path uses.
-fn ng_covariance_at(
+///
+/// Shared by the non-grav (A1, A2, A3) and photometric
+/// (H, slope1, slope2) covariance channels: the marshal is identical and
+/// only the parameter labels differ.
+fn covariance_3x3_at(
     has: Option<&numpy::ndarray::Array1<bool>>,
     cov: Option<&numpy::ndarray::Array3<f64>>,
     i: usize,
@@ -2013,6 +2044,48 @@ fn ng_covariance_at(
         }
     }
     Some(m)
+}
+
+/// Build one orbit's photometry tuple from the batch dict's string
+/// phase-function tag plus its parameter slots and optional 3×3.
+///
+/// `None` tag or a non-finite H is "no photometry" — the same absence
+/// convention the flat-array paths use. An unrecognized tag is a typed
+/// error rather than a silent downgrade to no photometry: the tag is
+/// written by this crate's own marshal, so a name this reader cannot
+/// resolve means the two sides disagree.
+fn phot_at(
+    system: Option<&str>,
+    h: f64,
+    slope1: f64,
+    slope2: f64,
+    covariance: Option<[[f64; 3]; 3]>,
+) -> PyResult<
+    Option<(
+        empyrean::PhaseFunction,
+        f64,
+        f64,
+        f64,
+        Option<[[f64; 3]; 3]>,
+    )>,
+> {
+    let Some(tag) = system else {
+        return Ok(None);
+    };
+    if !h.is_finite() {
+        return Ok(None);
+    }
+    let pf = match tag.to_ascii_uppercase().as_str() {
+        "HG" => empyrean::PhaseFunction::HG,
+        "HG1G2" => empyrean::PhaseFunction::HG1G2,
+        "HG12" => empyrean::PhaseFunction::HG12,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unknown phase function '{other}' (expected HG, HG1G2 or HG12)"
+            )));
+        }
+    };
+    Ok(Some((pf, h, slope1, slope2, covariance)))
 }
 
 // ══════════════════════════════════════════════════════════
@@ -2372,7 +2445,7 @@ fn build_orbits_from_arrays(
         let non_grav_dt = non_grav_dts.and_then(|dts| dts[i].is_finite().then_some(dts[i]));
         let non_grav_dt_variance =
             non_grav_dt_variances.and_then(|v| (v[i].is_finite() && v[i] > 0.0).then_some(v[i]));
-        let ng_cov = ng_covariance_at(has_non_grav_cov, non_grav_cov, i);
+        let ng_cov = covariance_3x3_at(has_non_grav_cov, non_grav_cov, i);
         let srp = srp_at(has_srp, srp_amrat, srp_cr, srp_amrat_variance, i);
         orbits.push(assemble_orbit(
             None,
@@ -3140,6 +3213,8 @@ fn _get_observers<'py>(
     srp_amrat_variance = None,
     has_non_grav_cov = None,
     non_grav_cov = None,
+    has_phot_cov = None,
+    phot_cov = None,
     non_grav_cross = None,
     wide_columns = None,
     wide_state = None,
@@ -3207,6 +3282,12 @@ fn _generate_ephemeris<'py>(
     // StateAndNonGrav prior instead of silently dropping it.
     has_non_grav_cov: Option<PyReadonlyArray1<'py, bool>>,
     non_grav_cov: Option<PyReadonlyArray3<'py, f64>>,
+    // Photometric 3×3 covariance over (H, slope1, slope2), same nullable
+    // mask + (n,3,3) shape as the non-grav pair above. This is the input
+    // that makes `mag_sigma` carry the σ_photo term instead of the state
+    // contribution alone.
+    has_phot_cov: Option<PyReadonlyArray1<'py, bool>>,
+    phot_cov: Option<PyReadonlyArray3<'py, f64>>,
     // The joint's off-diagonal terms, six parallel per-orbit lists (see
     // `JointRows`). A fitted orbit re-fed here conditions on the joint
     // its fit produced; without them it conditions on a block-diagonal
@@ -3281,6 +3362,8 @@ fn _generate_ephemeris<'py>(
     let srp_var_arr = srp_amrat_variance.as_ref().map(|a| a.as_array().to_owned());
     let has_ng_cov_arr = has_non_grav_cov.as_ref().map(|a| a.as_array().to_owned());
     let ng_cov_arr = non_grav_cov.as_ref().map(|a| a.as_array().to_owned());
+    let has_phot_cov_arr = has_phot_cov.as_ref().map(|a| a.as_array().to_owned());
+    let phot_cov_arr = phot_cov.as_ref().map(|a| a.as_array().to_owned());
     // The caller's joint. An ephemeris of a fitted orbit is computed
     // against the covariance the fit produced, not against its diagonal
     // blocks: the sky-plane covariance this call reports inherits
@@ -3351,7 +3434,7 @@ fn _generate_ephemeris<'py>(
             i,
         );
         // Fitted non-grav 3×3 covariance (optional, nullable per row).
-        let ng_cov = ng_covariance_at(has_ng_cov_arr.as_ref(), ng_cov_arr.as_ref(), i);
+        let ng_cov = covariance_3x3_at(has_ng_cov_arr.as_ref(), ng_cov_arr.as_ref(), i);
         // Photometry — when phot_system[i] is one of {0, 1, 2} the
         // ephemeris pipeline produces apparent magnitude from H +
         // slope params. -1 (the absent sentinel) leaves
@@ -3376,7 +3459,13 @@ fn _generate_ephemeris<'py>(
             // and a wrong-but-non-crashing fallback for HG1G2 — file
             // a clear array if HG1G2 fits matter).
             let s2 = phot_slope2_arr.as_ref().map_or(0.0, |a| a[i]);
-            Some((pf, h, g, s2))
+            Some((
+                pf,
+                h,
+                g,
+                s2,
+                covariance_3x3_at(has_phot_cov_arr.as_ref(), phot_cov_arr.as_ref(), i),
+            ))
         } else {
             None
         };
@@ -6483,6 +6572,11 @@ fn orbit_batch_to_pydict<'py>(
     let mut phot_slope1 = Array1::<f64>::zeros(n);
     let mut phot_slope2 = Array1::<f64>::zeros(n);
     let mut phot_system: Vec<Option<String>> = Vec::with_capacity(n);
+    // Photometric 3×3 over (H, slope1, slope2): explicit per-row presence
+    // mask, so an all-zero 3×3 on an absent row cannot be mistaken for a
+    // supplied zero covariance.
+    let mut has_phot_covariance = Array1::<bool>::default(n);
+    let mut phot_covariance = Array3::<f64>::zeros((n, 3, 3));
     for (i, orbit) in batch.orbits.iter().enumerate() {
         epoch[i] = orbit.state.epoch.mjd_tdb().map_err(to_pyerr)?;
         for j in 0..6 {
@@ -6553,6 +6647,14 @@ fn orbit_batch_to_pydict<'py>(
                 phot_system.push(None);
             }
         }
+        if let Some(cov) = orbit.phot_covariance {
+            has_phot_covariance[i] = true;
+            for r in 0..3 {
+                for c in 0..3 {
+                    phot_covariance[[i, r, c]] = cov[r][c];
+                }
+            }
+        }
     }
     let dict = PyDict::new(py);
     dict.set_item("orbit_ids", batch.orbit_ids.clone())?;
@@ -6591,6 +6693,14 @@ fn orbit_batch_to_pydict<'py>(
     dict.set_item("phot_slope1", PyArray1::from_owned_array(py, phot_slope1))?;
     dict.set_item("phot_slope2", PyArray1::from_owned_array(py, phot_slope2))?;
     dict.set_item("phot_system", phot_system)?;
+    dict.set_item(
+        "has_phot_covariance",
+        PyArray1::from_owned_array(py, has_phot_covariance),
+    )?;
+    dict.set_item(
+        "phot_covariance",
+        PyArray3::from_owned_array(py, phot_covariance),
+    )?;
     Ok(dict)
 }
 
@@ -6657,6 +6767,33 @@ fn pydict_to_orbit_batch<'py>(dict: &Bound<'py, PyDict>) -> PyResult<empyrean::O
     let srp_amrat_view = read_array_or_nan(dict, "srp_amrat", n)?;
     let srp_cr_view = read_array_or_nan(dict, "srp_cr", n)?;
     let srp_var_view = read_array_or_nan(dict, "srp_amrat_variance", n)?;
+    // Photometry. The batch dict has carried the (system, H, slope1,
+    // slope2) quad in the orbits→dict direction all along; this
+    // direction dropped it on the floor, so an orbit batch written
+    // through the Python I/O surface lost its photometry entirely.
+    let phot_system_col: Vec<Option<String>> = match dict.get_item("phot_system")? {
+        Some(obj) => obj.extract()?,
+        None => vec![None; n],
+    };
+    if phot_system_col.len() != n {
+        return Err(PyValueError::new_err(format!(
+            "'phot_system' length {} != n {n}",
+            phot_system_col.len()
+        )));
+    }
+    let phot_h_view = read_array_or_nan(dict, "phot_h", n)?;
+    let phot_slope1_view = read_array_or_zero(dict, "phot_slope1", n)?;
+    let phot_slope2_view = read_array_or_zero(dict, "phot_slope2", n)?;
+    let has_phot_cov_arr: Option<PyReadonlyArray1<bool>> = dict
+        .get_item("has_phot_covariance")?
+        .map(|o| o.extract())
+        .transpose()?;
+    let phot_cov_arr: Option<PyReadonlyArray3<f64>> = dict
+        .get_item("phot_covariance")?
+        .map(|o| o.extract())
+        .transpose()?;
+    let has_phot_cov_owned = has_phot_cov_arr.as_ref().map(|a| a.as_array().to_owned());
+    let phot_cov_owned = phot_cov_arr.as_ref().map(|a| a.as_array().to_owned());
 
     let mut orbits = Vec::with_capacity(n);
     for i in 0..n {
@@ -6734,12 +6871,19 @@ fn pydict_to_orbit_batch<'py>(dict: &Bound<'py, PyDict>) -> PyResult<empyrean::O
             // Non-grav covariance is an OD-output concept; the OrbitBatch I/O
             // surface doesn't carry it.
             None,
-            // OrbitBatch I/O surface (parquet/JSON/CSV) does not yet carry
-            // photometry — round-tripped orbits come back without it. Use
-            // `Orbit::with_photometry` directly when populating batches via
-            // the in-process API. Continuous-thrust is likewise input-only
-            // and variable-length; supply it via `propagate`'s `thrust_arcs`.
-            None,
+            // Photometry, including its optional 3×3. An unrecognized
+            // phase-function tag is an error, not a silent "no
+            // photometry": the tag came from the batch's own writer, so
+            // a value this reader cannot name is a real inconsistency.
+            phot_at(
+                phot_system_col[i].as_deref(),
+                phot_h_view[i],
+                phot_slope1_view[i],
+                phot_slope2_view[i],
+                covariance_3x3_at(has_phot_cov_owned.as_ref(), phot_cov_owned.as_ref(), i),
+            )?,
+            // Continuous-thrust is input-only and variable-length; supply
+            // it via `propagate`'s `thrust_arcs`.
             None,
             // SRP force slot — carried through the OrbitBatch I/O surface via
             // the explicit `has_srp` switch (never value-inferred).

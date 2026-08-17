@@ -239,8 +239,19 @@ def generate_ephemeris(
         a2s = np.zeros(n, dtype=np.float64)
         a3s = np.zeros(n, dtype=np.float64)
 
-    # Photometric parameters
-    phot_h, phot_g, phot_model = extract_photometry(orbits)
+    # Photometric parameters, including the optional 3x3 covariance
+    # over (H, slope1, slope2). Gated like the non-grav covariance
+    # below so the common no-covariance case skips the FFI marshal.
+    (
+        phot_h,
+        phot_slope1,
+        phot_slope2,
+        phot_model,
+        has_phot_cov_arr,
+        phot_cov_arr,
+    ) = extract_photometry(orbits)
+    has_phot_cov: np.ndarray | None = has_phot_cov_arr if has_phot_cov_arr.any() else None
+    phot_cov: np.ndarray | None = phot_cov_arr if has_phot_cov_arr.any() else None
 
     # Fitted non-grav covariance — passed through only when a row carries one
     # (mirrors the OD output path) so a StateAndNonGrav-fitted orbit re-fed
@@ -328,7 +339,7 @@ def generate_ephemeris(
         a2s,
         a3s,
         phot_h,
-        phot_g,
+        phot_slope1,
         phot_model,
         obs_codes,
         obs_epochs,
@@ -343,6 +354,9 @@ def generate_ephemeris(
         srp_amrat_variance=srp_amrat_variance,
         has_non_grav_cov=has_non_grav_cov,
         non_grav_cov=non_grav_cov,
+        phot_slope2=phot_slope2,
+        has_phot_cov=has_phot_cov,
+        phot_cov=phot_cov,
         # The joint's off-diagonal terms. An ephemeris of a fitted orbit
         # is computed against the covariance the fit produced, not
         # against its diagonal blocks — the sky-plane covariance

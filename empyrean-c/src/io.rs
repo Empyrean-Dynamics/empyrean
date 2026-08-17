@@ -381,6 +381,12 @@ fn row_to_orbit(row: &OrbitRow) -> Result<(EmpyreanOrbit, String, Option<String>
         n_state_param_cross: 0,
         param_pair_cross: std::ptr::null(),
         n_param_pair_cross: 0,
+        // This crate's own flat JSON row shape carries no photometry at
+        // all (see `phot_system` above), so there is no covariance to
+        // carry either. The engine's own parquet / CSV formats DO carry
+        // both, and reach the batch through `orbits_to_batch`.
+        has_phot_covariance: 0,
+        phot_covariance: [[0.0; 3]; 3],
     };
     Ok((orbit, row.orbit_id.clone(), row.object_id.clone()))
 }
@@ -571,6 +577,16 @@ pub(crate) fn batch_to_orbits(batch: &EmpyreanOrbitBatch) -> Result<Orbits<AU>, 
         if let Some(params) = crate::propagate::empyrean_orbit_non_grav_params(orbit) {
             out.set_non_grav_params(i, Some(params));
         }
+        // Photometry, including its optional 3×3 covariance. Every other
+        // marshal into an engine `Orbits` sets this; this one never did,
+        // so `empyrean_orbits_write_parquet` / `_write_csv` wrote NULL
+        // photometry for a caller-supplied batch while the CSV writer's
+        // own doc claimed to carry it.
+        if let Some(ph) = crate::propagate::empyrean_orbit_photometric_params(orbit)
+            .map_err(|e| format!("orbit {i}: {e}"))?
+        {
+            out.set_photometric_params(i, Some(ph));
+        }
         if let Some(tp) = crate::propagate::empyrean_orbit_thrust_params(orbit)
             .map_err(|e| format!("orbit {i}: {e}"))?
         {
@@ -703,9 +719,10 @@ pub(crate) fn orbits_to_batch(orbits: &Orbits<AU>) -> Result<EmpyreanOrbitBatch,
             // border with no 3×3 is refused by the engine.
             has_non_grav_covariance: 0,
             non_grav_covariance: [[0.0; 3]; 3],
-            // Photometry is not currently carried through the read-orbits
-            // path; ephemeris generation downstream will see no H/G and
-            // emit `mag = NaN`.
+            // Absent defaults; back-filled from the villeneuve orbit
+            // below when it carries photometry. An orbit with none keeps
+            // `phot_system = -1` and ephemeris generation downstream
+            // emits `mag = NaN`.
             phot_system: -1,
             h_mag: f64::NAN,
             slope1: 0.0,
@@ -731,6 +748,14 @@ pub(crate) fn orbits_to_batch(orbits: &Orbits<AU>) -> Result<EmpyreanOrbitBatch,
             n_state_param_cross,
             param_pair_cross,
             n_param_pair_cross,
+            // Carried from the villeneuve orbit below when present. Every
+            // engine-side producer of a photometric covariance — the
+            // post-OD photometry fit, the SBDB `phys_par` ingest, and
+            // the orbit-file readers — reaches the C ABI through this
+            // one function, so dropping it here would strip the H/G
+            // uncertainty from all three at once.
+            has_phot_covariance: 0,
+            phot_covariance: [[0.0; 3]; 3],
         };
         orbit.state.has_non_grav_cross = has_border;
         orbit.state.non_grav_cross = border;
@@ -743,6 +768,10 @@ pub(crate) fn orbits_to_batch(orbits: &Orbits<AU>) -> Result<EmpyreanOrbitBatch,
             };
             orbit.slope1 = ph.p2;
             orbit.slope2 = ph.p3;
+            if let Some(cov) = ph.covariance {
+                orbit.has_phot_covariance = 1;
+                orbit.phot_covariance = cov;
+            }
         }
         if let Some(ng) = orbits.non_grav_params(i) {
             orbit.a1 = ng.a1;
@@ -3392,6 +3421,245 @@ mod orbit_file_joint_tests {
         assert_eq!(result.num_states, times.len());
 
         unsafe { crate::propagate::empyrean_propagation_result_free(&mut result) };
+        unsafe { empyrean_orbits_batch_free(&mut read_back) };
+        unsafe { empyrean_orbits_batch_free(&written as *const _ as *mut _) };
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod photometry_batch_tests {
+    use super::residual_writer_tests::tmp_dir;
+    use super::*;
+
+    /// The 3×3 the fixture carries: a real HG fit's shape, with the
+    /// strong negative H–G correlation such fits produce, so a
+    /// transposed or partially-copied round trip is visible.
+    const PHOT_COV: [[f64; 3]; 3] = [
+        [0.0900, -0.0042, 0.0],
+        [-0.0042, 0.0025, 0.0],
+        [0.0, 0.0, 0.0],
+    ];
+
+    /// A one-orbit batch carrying HG photometry with its 3×3.
+    fn photometric_batch() -> EmpyreanOrbitBatch {
+        // SAFETY: `#[repr(C)]` POD plus pointers that zero-init to null.
+        let mut orbit: EmpyreanOrbit = unsafe { std::mem::zeroed() };
+        orbit.state = CoordinateState {
+            epoch_mjd_tdb: 60320.0,
+            elements: [1.1, 0.2, 0.03, -0.004, 0.017, 0.0006],
+            covariance: [[0.0; 6]; 6],
+            has_covariance: 0,
+            representation: crate::od::EMPYREAN_REPRESENTATION_CARTESIAN,
+            frame: 0,
+            origin: 10,
+            has_non_grav_cross: 0,
+            non_grav_cross: [[0.0; 3]; 6],
+        };
+        orbit.non_grav_dt = f64::NAN;
+        orbit.non_grav_dt_variance = f64::NAN;
+        orbit.srp_amrat_variance = f64::NAN;
+        orbit.phot_system = crate::propagate::EMPYREAN_PHASE_FUNCTION_HG;
+        orbit.h_mag = 19.7;
+        orbit.slope1 = 0.15;
+        orbit.slope2 = 0.0;
+        orbit.has_phot_covariance = 1;
+        orbit.phot_covariance = PHOT_COV;
+
+        let id = crate::od::alloc_cstring_for_test("photometric-orbit");
+        EmpyreanOrbitBatch {
+            orbits: Box::into_raw(Box::new(orbit)),
+            orbit_ids: Box::into_raw(Box::new(id)),
+            object_ids: Box::into_raw(Box::new(std::ptr::null_mut::<c_char>())),
+            num_orbits: 1,
+        }
+    }
+
+    /// A one-orbit batch built the `memset(0)` way, with only the state
+    /// filled in — no photometry of any kind.
+    fn zero_initialized_batch() -> EmpyreanOrbitBatch {
+        // SAFETY: `#[repr(C)]` POD plus pointers that zero-init to null.
+        let mut orbit: EmpyreanOrbit = unsafe { std::mem::zeroed() };
+        orbit.state = CoordinateState {
+            epoch_mjd_tdb: 60320.0,
+            elements: [1.1, 0.2, 0.03, -0.004, 0.017, 0.0006],
+            covariance: [[0.0; 6]; 6],
+            has_covariance: 0,
+            representation: crate::od::EMPYREAN_REPRESENTATION_CARTESIAN,
+            frame: 0,
+            origin: 10,
+            has_non_grav_cross: 0,
+            non_grav_cross: [[0.0; 3]; 6],
+        };
+        // The three NaN sentinels a C caller sets for "absent"; leaving
+        // them zero is a separate (pre-existing) question, and this test
+        // is about photometry.
+        orbit.non_grav_dt = f64::NAN;
+        orbit.non_grav_dt_variance = f64::NAN;
+        orbit.srp_amrat_variance = f64::NAN;
+
+        let id = crate::od::alloc_cstring_for_test("zero-init-orbit");
+        EmpyreanOrbitBatch {
+            orbits: Box::into_raw(Box::new(orbit)),
+            orbit_ids: Box::into_raw(Box::new(id)),
+            object_ids: Box::into_raw(Box::new(std::ptr::null_mut::<c_char>())),
+            num_orbits: 1,
+        }
+    }
+
+    fn assert_photometry_survived(got: &EmpyreanOrbit, what: &str) {
+        assert_eq!(
+            got.phot_system,
+            crate::propagate::EMPYREAN_PHASE_FUNCTION_HG,
+            "{what}: the phase function must survive"
+        );
+        assert!(
+            (got.h_mag - 19.7).abs() < 1e-12,
+            "{what}: H must survive (got {})",
+            got.h_mag
+        );
+        assert!(
+            (got.slope1 - 0.15).abs() < 1e-12,
+            "{what}: the slope must survive (got {})",
+            got.slope1
+        );
+        assert_eq!(
+            got.has_phot_covariance, 1,
+            "{what}: the photometric 3×3 must survive"
+        );
+        for (i, (got_row, want_row)) in got.phot_covariance.iter().zip(PHOT_COV).enumerate() {
+            for (j, (g, w)) in got_row.iter().zip(want_row).enumerate() {
+                assert!(
+                    (g - w).abs() < 1e-15,
+                    "{what}: phot_covariance[{i}][{j}] must round-trip exactly"
+                );
+            }
+        }
+    }
+
+    /// The in-memory marshal pair, both directions in one call.
+    ///
+    /// This FAILS on the pre-fix code at BOTH ends: `batch_to_orbits`
+    /// never called `set_photometric_params` at all (so nothing reached
+    /// the engine `Orbits`), and `orbits_to_batch` dropped
+    /// `ph.covariance` on the way back out.
+    #[test]
+    fn photometry_and_its_covariance_round_trip_through_the_marshal_pair() {
+        let batch = photometric_batch();
+        let orbits = batch_to_orbits(&batch).expect("batch → orbits");
+
+        let ph = orbits
+            .photometric_params(0)
+            .expect("batch_to_orbits must attach photometry, not drop it");
+        assert!((ph.h() - 19.7).abs() < 1e-12);
+        assert_eq!(
+            ph.covariance,
+            Some(PHOT_COV),
+            "the 3×3 must reach the engine orbit — this is the input that makes \
+             magnitude_uncertainty's σ_photo term reachable at all"
+        );
+
+        let back = orbits_to_batch(&orbits).expect("orbits → batch");
+        assert_photometry_survived(unsafe { &*back.orbits }, "marshal pair");
+
+        unsafe { empyrean_orbits_batch_free(&back as *const _ as *mut _) };
+        unsafe { empyrean_orbits_batch_free(&batch as *const _ as *mut _) };
+    }
+
+    /// Both engine orbit-file formats carry photometry + its covariance.
+    ///
+    /// The write side is what `batch_to_orbits` used to break: the CSV
+    /// writer's own doc claims to carry photometry, and it wrote NULL.
+    #[test]
+    fn photometry_and_its_covariance_round_trip_through_parquet_and_csv() {
+        for (label, ext, write, read) in [
+            (
+                "parquet",
+                "parquet",
+                empyrean_orbits_write_parquet
+                    as unsafe extern "C" fn(*const c_char, *const EmpyreanOrbitBatch) -> i32,
+                empyrean_orbits_read_parquet
+                    as unsafe extern "C" fn(*const c_char, *mut EmpyreanOrbitBatch) -> i32,
+            ),
+            (
+                "csv",
+                "csv",
+                empyrean_orbits_write_csv
+                    as unsafe extern "C" fn(*const c_char, *const EmpyreanOrbitBatch) -> i32,
+                empyrean_orbits_read_csv
+                    as unsafe extern "C" fn(*const c_char, *mut EmpyreanOrbitBatch) -> i32,
+            ),
+        ] {
+            let dir = tmp_dir(&format!("photometric-{label}"));
+            let path = dir.join(format!("photometric.{ext}"));
+            let c_path = CString::new(path.display().to_string()).unwrap();
+
+            let written = photometric_batch();
+            let rc = unsafe { write(c_path.as_ptr(), &written) };
+            let err = unsafe { CStr::from_ptr(crate::empyrean_last_error()) }.to_string_lossy();
+            assert_eq!(rc, 0, "{label}: writing must succeed: {err}");
+
+            let mut read_back: EmpyreanOrbitBatch = unsafe { std::mem::zeroed() };
+            let rc = unsafe { read(c_path.as_ptr(), &mut read_back) };
+            let err = unsafe { CStr::from_ptr(crate::empyrean_last_error()) }.to_string_lossy();
+            assert_eq!(rc, 0, "{label}: reading back must succeed: {err}");
+            assert_eq!(read_back.num_orbits, 1);
+
+            assert_photometry_survived(unsafe { &*read_back.orbits }, label);
+
+            unsafe { empyrean_orbits_batch_free(&mut read_back) };
+            unsafe { empyrean_orbits_batch_free(&written as *const _ as *mut _) };
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// Absence survives the write path too.
+    ///
+    /// `EmpyreanOrbit o = {0}` names a phase function (HG is 0) with a
+    /// finite H (0.0), so the moment `batch_to_orbits` started attaching
+    /// photometry, a zero-initialized orbit began WRITING HG H = 0 into
+    /// orbit files — an absolute magnitude ~20 mag too bright, in a file
+    /// that previously carried NULL and that reads back as fact.
+    ///
+    /// FAILS with `phot_system == HG` and `h_mag == 0.0` on the
+    /// finite-only presence predicate.
+    #[test]
+    fn a_zero_initialized_orbit_writes_no_photometry() {
+        let dir = tmp_dir("photometric-zero-init");
+        let path = dir.join("zero-init.parquet");
+        let c_path = CString::new(path.display().to_string()).unwrap();
+
+        // Zero-init, state filled in, photometry never touched — the
+        // idiom `EmpyreanOrbit`'s own docs present as supported.
+        let written = zero_initialized_batch();
+        assert_eq!(
+            unsafe { (*written.orbits).phot_system },
+            crate::propagate::EMPYREAN_PHASE_FUNCTION_HG,
+            "the trap this guards: memset(0) leaves phot_system naming HG"
+        );
+
+        let rc = unsafe { empyrean_orbits_write_parquet(c_path.as_ptr(), &written) };
+        let err = unsafe { CStr::from_ptr(crate::empyrean_last_error()) }.to_string_lossy();
+        assert_eq!(rc, 0, "writing must succeed: {err}");
+
+        let mut read_back: EmpyreanOrbitBatch = unsafe { std::mem::zeroed() };
+        let rc = unsafe { empyrean_orbits_read_parquet(c_path.as_ptr(), &mut read_back) };
+        let err = unsafe { CStr::from_ptr(crate::empyrean_last_error()) }.to_string_lossy();
+        assert_eq!(rc, 0, "reading back must succeed: {err}");
+        assert_eq!(read_back.num_orbits, 1);
+
+        let got = unsafe { &*read_back.orbits };
+        assert_eq!(
+            got.phot_system,
+            crate::propagate::EMPYREAN_PHASE_FUNCTION_NONE,
+            "an orbit that was never given photometry must read back with none, not with \
+             a fabricated HG H = 0"
+        );
+        assert_eq!(
+            got.has_phot_covariance, 0,
+            "and no photometric covariance either"
+        );
+
         unsafe { empyrean_orbits_batch_free(&mut read_back) };
         unsafe { empyrean_orbits_batch_free(&written as *const _ as *mut _) };
         std::fs::remove_dir_all(&dir).ok();

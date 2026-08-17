@@ -4974,13 +4974,21 @@ fn radar_table_to_pydict<'py>(
 // ══════════════════════════════════════════════════════════
 
 #[pyfunction]
-#[pyo3(signature = (obs_dict, config_dict, initial_orbits_dict = None, radar_dict = None))]
+#[pyo3(signature = (obs_dict, config_dict, initial_orbits_dict = None, radar_dict = None, builtsystem = None))]
 fn _determine<'py>(
     py: Python<'py>,
     obs_dict: &Bound<'py, PyDict>,
     config_dict: &Bound<'py, PyDict>,
     initial_orbits_dict: Option<&Bound<'py, PyDict>>,
     radar_dict: Option<&Bound<'py, PyDict>>,
+    // Optional reusable pre-built force-model handle, exactly as on
+    // `_propagate` / `_generate_ephemeris`. When present the fit runs
+    // through the frozen handle — validated by key and by source-data
+    // identity on every call, a mismatch being a loud, distinct error
+    // rather than a silent per-solve rebuild. Bit-identical to the
+    // handle-less path on a matching key; only *when* the force model is
+    // assembled differs.
+    builtsystem: Option<Py<PyBuiltSystem>>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let ctx = get_context()?;
     // The legacy ``ades`` key path carries both optical and radar through
@@ -5007,9 +5015,15 @@ fn _determine<'py>(
     };
 
     let od_config = build_od_config_from_dict(config_dict)?;
-    let batch = py
-        .detach(|| ctx.determine(&observations, initial_orbits.as_deref(), &od_config))
-        .map_err(to_pyerr)?;
+    let handle_ref: Option<&empyrean::BuiltSystem> = builtsystem.as_ref().map(|b| &b.get().inner);
+    let batch = py.detach(|| match handle_ref {
+        Some(h) => h
+            .determine(ctx, &observations, initial_orbits.as_deref(), &od_config)
+            .map_err(builtsystem_guard_err),
+        None => ctx
+            .determine(&observations, initial_orbits.as_deref(), &od_config)
+            .map_err(to_pyerr),
+    })?;
 
     // Batch-first: one entry per ADES object, delivered or failed. A
     // failed object is an entry with `delivered = False` and an `error`,
@@ -5062,20 +5076,28 @@ fn determine_failure_kind_str(kind: empyrean::DetermineFailureKind) -> String {
 // ══════════════════════════════════════════════════════════
 
 #[pyfunction]
-#[pyo3(signature = (orbit_dict, obs_dict, config_dict))]
+#[pyo3(signature = (orbit_dict, obs_dict, config_dict, builtsystem = None))]
 fn _evaluate_single<'py>(
     py: Python<'py>,
     orbit_dict: &Bound<'py, PyDict>,
     obs_dict: &Bound<'py, PyDict>,
     config_dict: &Bound<'py, PyDict>,
+    // See `_determine`.
+    builtsystem: Option<Py<PyBuiltSystem>>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let ctx = get_context()?;
     let orbit = build_orbit_from_dict(orbit_dict)?;
     let observations = build_observations(ctx, obs_dict)?;
     let od_config = build_od_config_from_dict(config_dict)?;
-    let eval_result = py
-        .detach(|| ctx.evaluate(&orbit, &observations, &od_config))
-        .map_err(to_pyerr)?;
+    let handle_ref: Option<&empyrean::BuiltSystem> = builtsystem.as_ref().map(|b| &b.get().inner);
+    let eval_result = py.detach(|| match handle_ref {
+        Some(h) => h
+            .evaluate(ctx, &orbit, &observations, &od_config)
+            .map_err(builtsystem_guard_err),
+        None => ctx
+            .evaluate(&orbit, &observations, &od_config)
+            .map_err(to_pyerr),
+    })?;
 
     let dict = PyDict::new(py);
     add_residuals_to_dict(&dict, &eval_result.residuals)?;
@@ -5088,20 +5110,29 @@ fn _evaluate_single<'py>(
 // ══════════════════════════════════════════════════════════
 
 #[pyfunction]
-#[pyo3(signature = (orbit_dict, obs_dict, config_dict))]
+#[pyo3(signature = (orbit_dict, obs_dict, config_dict, builtsystem = None))]
 fn _refine_single<'py>(
     py: Python<'py>,
     orbit_dict: &Bound<'py, PyDict>,
     obs_dict: &Bound<'py, PyDict>,
     config_dict: &Bound<'py, PyDict>,
+    // See `_determine`. This is the measure-and-extend loop's entry
+    // point: assemble one handle, refine many times through it.
+    builtsystem: Option<Py<PyBuiltSystem>>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let ctx = get_context()?;
     let orbit = build_orbit_from_dict(orbit_dict)?;
     let observations = build_observations(ctx, obs_dict)?;
     let od_config = build_od_config_from_dict(config_dict)?;
-    let od_result = py
-        .detach(|| ctx.refine(&orbit, &observations, &od_config))
-        .map_err(to_pyerr)?;
+    let handle_ref: Option<&empyrean::BuiltSystem> = builtsystem.as_ref().map(|b| &b.get().inner);
+    let od_result = py.detach(|| match handle_ref {
+        Some(h) => h
+            .refine(ctx, &orbit, &observations, &od_config)
+            .map_err(builtsystem_guard_err),
+        None => ctx
+            .refine(&orbit, &observations, &od_config)
+            .map_err(to_pyerr),
+    })?;
 
     determine_result_to_pydict(py, &od_result)
 }
@@ -7592,9 +7623,10 @@ fn force_model_tier_to_int(t: empyrean::ForceModelTier) -> i32 {
     }
 }
 
-/// Convert a wrapper identity-guard rejection into a loud, axis-specific
+/// Convert a wrapper guard rejection into a loud, axis-specific
 /// Python exception. A [`empyrean::BuiltSystem`] never silently rebuilds:
-/// a data / frame / force-model / divisor / staleness mismatch each
+/// a data / frame / force-model / divisor / staleness mismatch, and a
+/// config that would move the frozen key mid-call, each
 /// surfaces as a distinct `ValueError`. Non-guard errors fall through to
 /// the ordinary runtime-error mapping.
 fn builtsystem_guard_err(e: empyrean::Error) -> PyErr {
@@ -7622,6 +7654,13 @@ fn builtsystem_guard_err(e: empyrean::Error) -> PyErr {
                 empyrean::BuiltSystemGuardError::Stale => {
                     "stale handle — the context's data changed after this handle \
                      was built; rebuild the handle"
+                }
+                empyrean::BuiltSystemGuardError::ConfigMutatesKey => {
+                    "the config would move the frozen key mid-call — \
+                     ODConfig.auto_force_model lets the fit re-pick its own \
+                     force-model tier part-way through, which no frozen handle \
+                     can follow; clear auto_force_model, or drop the handle and \
+                     use the module-level call, which is free to choose the tier"
                 }
             };
             PyValueError::new_err(format!("BuiltSystem identity guard: {detail} ({e})"))
@@ -7741,6 +7780,27 @@ impl PyBuiltSystem {
             force_model,
             frame,
             encounter_timescale_divisor: divisor,
+        })
+    }
+
+    /// Assemble a handle keyed for the orbit-determination entry points.
+    ///
+    /// The frame and the encounter-timescale divisor come from the engine
+    /// rather than from the caller: a fit picks both itself, and naming
+    /// them here would duplicate a recipe that must not drift. Reads the
+    /// resolved key back off the handle so the Python-side record is the
+    /// engine's answer, not a second copy of it.
+    #[staticmethod]
+    fn for_od(force_model: i32) -> PyResult<Self> {
+        let ctx = get_context()?;
+        let tier = force_model_tier_from_int(force_model)?;
+        let inner = empyrean::BuiltSystem::new_for_od(ctx, tier).map_err(to_pyerr)?;
+        let desc = inner.describe().map_err(to_pyerr)?;
+        Ok(Self {
+            force_model: force_model_tier_to_int(desc.force_model),
+            frame: empyrean::frame_to_int(desc.frame),
+            encounter_timescale_divisor: desc.encounter_timescale_divisor,
+            inner,
         })
     }
 

@@ -26,10 +26,16 @@
 
 use std::ffi::c_char;
 use std::panic::AssertUnwindSafe;
+use std::sync::Arc;
 
 use empyrean_core::convert::frame_to_int;
+use empyrean_core::coordinates::AU;
 use empyrean_core::data::{KernelKind, KernelProvenance, KernelRecord};
-use empyrean_core::ephemeris::EphemerisGenerationError;
+use empyrean_core::determination::{ODConfig, UpstreamForceModelTier};
+use empyrean_core::ephemeris::{
+    EphemerisConfig, EphemerisGenerationError, EphemerisPropagationConfig,
+};
+use empyrean_core::orbits::Orbits;
 use empyrean_core::propagation::{BuiltSystem, PropagationError, SystemKeyMismatch};
 use empyrean_core::time::Epoch;
 
@@ -79,6 +85,13 @@ pub const EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_DIVISOR: i32 = -23;
 /// load) after the handle was built. The handle refuses to serve results
 /// assembled from since-replaced kernels — rebuild it.
 pub const EMPYREAN_BUILTSYSTEM_STALE: i32 = -24;
+/// Guard (0): the *config* — not the handle — would move the frozen key
+/// during the call, so no handle could be followed to the end of it.
+/// Today this is `EmpyreanODConfig::auto_force_model`, which lets an OD
+/// fit re-pick its own force-model tier part-way through. Nothing about
+/// the handle is wrong; clear the setting, or drop the handle and use the
+/// one-shot entry point, which is free to choose the tier.
+pub const EMPYREAN_BUILTSYSTEM_CONFIG_MUTATES_KEY: i32 = -25;
 /// A panic was caught at the FFI boundary.
 pub const EMPYREAN_BUILTSYSTEM_PANIC: i32 = -99;
 
@@ -115,7 +128,12 @@ pub const EMPYREAN_KERNEL_PROVENANCE_BUILT_IN: i32 = 2;
 /// pointer) to as many threads as you like. It borrows nothing from the
 /// context after construction.
 pub struct EmpyreanBuiltSystem {
-    system: BuiltSystem,
+    /// `Arc`-shared because the OD entry points hand the very same handle
+    /// to the engine through `ODConfig::built_system`, which is typed
+    /// `Option<Arc<BuiltSystem>>` — and `BuiltSystem` is not `Clone`. The
+    /// struct is opaque to C, so widening the field is not a layout
+    /// change at the ABI.
+    system: Arc<BuiltSystem>,
     kernel_manifest: Vec<KernelRecord>,
 }
 
@@ -273,7 +291,7 @@ pub unsafe extern "C" fn empyrean_builtsystem_new(
         }
 
         let handle = Box::new(EmpyreanBuiltSystem {
-            system,
+            system: Arc::new(system),
             kernel_manifest: manifest,
         });
         unsafe {
@@ -287,6 +305,49 @@ pub unsafe extern "C" fn empyrean_builtsystem_new(
             set_last_error("panic in empyrean_builtsystem_new");
             EMPYREAN_BUILTSYSTEM_PANIC
         }
+    }
+}
+
+/// Assemble a handle keyed for the **orbit-determination** entry points.
+///
+/// Equivalent to [`empyrean_builtsystem_new`] with the frame and the
+/// encounter-timescale divisor an OD fit runs under already filled in, so
+/// the recipe cannot be got wrong. Only the force-model tier is yours:
+/// `ODConfig` exposes no frame or divisor knob, and the fit derives both
+/// from the engine defaults.
+///
+/// Use this — not [`empyrean_builtsystem_new`] — for
+/// [`empyrean_builtsystem_determine`] / `_evaluate` / `_refine`. A handle
+/// built with `frame = 0` (ICRF), which every propagation example in this
+/// header uses, is rejected on the OD path with
+/// [`EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_FRAME`]: OD does not integrate in
+/// ICRF, and the guard will not serve a fit under a frame the fit did not
+/// ask for.
+///
+/// - `force_model`: tier code (0=Approximate, 1=Basic, 2=Standard). Must
+///   equal the `force_model` on the `EmpyreanODConfig` you pass to the OD
+///   call.
+/// - `out`: receives the heap-allocated handle on success.
+///
+/// The handle it returns is an ordinary one — free it with
+/// [`empyrean_builtsystem_free`], describe it with
+/// [`empyrean_builtsystem_describe`], and use it for propagation too if a
+/// matching config asks for the same frame.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn empyrean_builtsystem_new_for_od(
+    ctx: *const EmpyreanContext,
+    force_model: i32,
+    out: *mut *mut EmpyreanBuiltSystem,
+) -> i32 {
+    let key = od_key_config();
+    unsafe {
+        empyrean_builtsystem_new(
+            ctx,
+            force_model,
+            frame_to_int(key.propagation.frame),
+            key.propagation.advanced.encounter_timescale_divisor,
+            out,
+        )
     }
 }
 
@@ -492,6 +553,298 @@ pub unsafe extern "C" fn empyrean_builtsystem_generate_ephemeris(
             set_last_error("panic in empyrean_builtsystem_generate_ephemeris");
             EMPYREAN_BUILTSYSTEM_PANIC
         }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Orbit determination through the handle
+// ────────────────────────────────────────────────────────────────────
+
+/// The ephemeris config whose frozen-key triple an OD fit runs under.
+///
+/// The fit derives its ephemeris config from the `ODConfig`, taking the
+/// integration frame and the encounter-timescale divisor from
+/// `EphemerisConfig::default()` — `ODConfig` carries no knob for either —
+/// and only the force-model tier from the caller. The key is exactly
+/// \\((\text{force\_model}, \text{frame}, \text{divisor})\\), so this
+/// reproduces the two derived members and leaves the tier to
+/// [`od_key_config_for`].
+fn od_key_config() -> EphemerisConfig {
+    EphemerisConfig::default()
+}
+
+/// [`od_key_config`] with the tier a specific fit will run under.
+fn od_key_config_for(force_model: UpstreamForceModelTier) -> EphemerisConfig {
+    let base = od_key_config();
+    EphemerisConfig {
+        propagation: EphemerisPropagationConfig {
+            force_model,
+            ..base.propagation
+        },
+        ..base
+    }
+}
+
+/// Validate a caller-supplied handle against the context and the OD
+/// config it is about to serve, returning the handle to inject on pass or
+/// a loud C code on failure.
+///
+/// This runs the same three guards the propagate path documents — data
+/// identity, the frozen key split by axis, and staleness — and returns
+/// the same `EMPYREAN_BUILTSYSTEM_*` code space, preceded by a guard the
+/// propagate path has no need for: a config that will *move* the frozen
+/// key mid-fit.
+///
+/// **This deliberately differs from the engine's internal behaviour.**
+/// scott's own adoption filter *degrades* on a mismatch: it quietly drops
+/// the handle and assembles a per-solve system, which costs speed and
+/// nothing else. That is defensible for a handle the engine injected for
+/// itself. It is not defensible here: a caller who named this entry point
+/// asked to reuse a specific frozen force model, and silently fitting
+/// under a differently-assembled one — while reporting success — is
+/// exactly the hidden fallback the house rules forbid. So a mismatched
+/// handle refuses the fit.
+fn guard_handle_for_od(
+    handle: &EmpyreanBuiltSystem,
+    ctx: &EmpyreanContext,
+    cfg: &ODConfig,
+) -> Result<Arc<BuiltSystem>, i32> {
+    // Guard (0): the config must not move the tier this guard is about to
+    // validate. `auto_force_model` lets the fit re-pick its own
+    // force-model tier part-way through, and the engine's adoption filter
+    // re-checks the handle against the *new* tier — so a handle that
+    // passes every check here is dropped downstream and the caller pays a
+    // per-solve assembly while the call returns success. That is precisely
+    // the silent non-amortization this entry point exists to make
+    // impossible, so the combination is refused rather than accepted with
+    // a caveat in prose. The one-shot entry points remain available for a
+    // fit that must choose its own tier.
+    if cfg.auto_force_model {
+        set_last_error(
+            "ODConfig::auto_force_model cannot be combined with a pre-built force-model \
+             handle: the fit re-picks its own force-model tier part-way through, and no \
+             frozen handle can follow it — the handle would be dropped mid-fit and every \
+             solve would reassemble the force model while this call reported success. \
+             Clear auto_force_model and freeze the handle at the tier you want, or drop \
+             the handle and call the one-shot entry point, which selects the tier freely.",
+        );
+        return Err(EMPYREAN_BUILTSYSTEM_CONFIG_MUTATES_KEY);
+    }
+    // Guard (a): data identity. `Arc::ptr_eq` on the kernels, so a handle
+    // built from a different context can never serve this one's physics.
+    if !handle.system.built_from(ctx.ephemeris_data()) {
+        set_last_error(
+            "BuiltSystem was not built from this context's ephemeris data — \
+             rebuild the handle after loading a new context or any kernel",
+        );
+        return Err(EMPYREAN_BUILTSYSTEM_DATA_MISMATCH);
+    }
+    // Guards (b) + (c): key and freshness. Both live behind the engine's
+    // forward-model entry points, so the cheapest way to run exactly the
+    // engine's own checks — rather than a re-implementation that can drift
+    // from them — is a zero-work forward model: no orbits, no observers,
+    // no integration, but `check_fresh` + `check_key` run first and reject
+    // before returning.
+    let probe: Orbits<AU> = Orbits::empty();
+    if let Err(e) = handle
+        .system
+        .generate_optical(&probe, &[], &od_key_config_for(cfg.force_model))
+    {
+        return Err(map_eph_error_to_code(&e));
+    }
+    Ok(Arc::clone(&handle.system))
+}
+
+/// Shared null-pointer / guard preamble for the three OD entry points.
+///
+/// Returns the handle to inject into `ODConfig::built_system`, or the C
+/// code to hand back.
+fn resolve_od_handle(
+    handle: *const EmpyreanBuiltSystem,
+    ctx: *const EmpyreanContext,
+    cfg: &ODConfig,
+) -> Result<Arc<BuiltSystem>, i32> {
+    if handle.is_null() || ctx.is_null() {
+        set_last_error("null pointer argument");
+        return Err(EMPYREAN_BUILTSYSTEM_NULL_POINTER);
+    }
+    guard_handle_for_od(unsafe { &*handle }, unsafe { &*ctx }, cfg)
+}
+
+/// Run the full orbit-determination pipeline over every object in
+/// `observations`, reusing the pre-built handle for every fit in the
+/// batch.
+///
+/// Signature parallels the one-shot
+/// [`empyrean_determine`](crate::od::empyrean_determine) but takes
+/// `(handle, ctx, ...)`, exactly as
+/// [`empyrean_builtsystem_propagate`] relates to `empyrean_propagate`.
+/// Every other argument keeps its name, position and meaning. Results are
+/// bit-identical to the one-shot with the same config and a matching
+/// handle — the handle only changes *when* the force model is assembled.
+///
+/// # The handle must be an OD handle
+///
+/// Build it with [`empyrean_builtsystem_new_for_od`]. OD does not
+/// integrate in ICRF, so a handle built the way the propagation examples
+/// build theirs is rejected here with
+/// [`EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_FRAME`].
+///
+/// The identity guard runs before any fitting and **refuses** on a
+/// mismatch — data identity ([`EMPYREAN_BUILTSYSTEM_DATA_MISMATCH`]),
+/// frozen key ([`EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_FRAME`] /
+/// `_FORCE_MODEL` / `_DIVISOR`), staleness
+/// ([`EMPYREAN_BUILTSYSTEM_STALE`]). It never degrades to a per-solve
+/// assembly: a caller who asked to amortize and silently is not is
+/// precisely the failure this entry point exists to make impossible.
+///
+/// # `auto_force_model` is refused, not tolerated
+///
+/// `EmpyreanODConfig::auto_force_model` lets the fit re-pick its own
+/// force-model tier part-way through, which no frozen handle can follow:
+/// the engine would drop this handle mid-fit and reassemble per solve
+/// while this call still returned `0`. Passing it with a handle therefore
+/// fails with [`EMPYREAN_BUILTSYSTEM_CONFIG_MUTATES_KEY`] and a message
+/// naming the field. Set `auto_force_model = 0` and freeze the handle at
+/// the tier you want, or drop the handle and call
+/// [`empyrean_determine`](crate::od::empyrean_determine), which is free to
+/// choose the tier.
+///
+/// # Return codes
+///
+/// The one-shot's codes, plus the guard codes above. On `0` and
+/// [`EMPYREAN_DETERMINE_NONE_DELIVERED`](crate::od::EMPYREAN_DETERMINE_NONE_DELIVERED)
+/// release `results_out` with
+/// [`empyrean_determine_results_free`](crate::od::empyrean_determine_results_free).
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn empyrean_builtsystem_determine(
+    handle: *const EmpyreanBuiltSystem,
+    ctx: *const EmpyreanContext,
+    observations: *const crate::od::EmpyreanObservation,
+    num_observations: usize,
+    radar: *const crate::od::EmpyreanRadarObservation,
+    num_radar: usize,
+    initial_orbits: *const EmpyreanOrbit,
+    num_initial_orbits: usize,
+    config: *const crate::od::EmpyreanODConfig,
+    results_out: *mut crate::od::EmpyreanDetermineResults,
+) -> i32 {
+    let r = std::panic::catch_unwind(AssertUnwindSafe(|| unsafe {
+        crate::od::determine_with_handle(
+            Some((handle, ctx)),
+            ctx,
+            observations,
+            num_observations,
+            radar,
+            num_radar,
+            initial_orbits,
+            num_initial_orbits,
+            config,
+            results_out,
+        )
+    }));
+    match r {
+        Ok(c) => c,
+        Err(_) => {
+            set_last_error("panic in empyrean_builtsystem_determine");
+            EMPYREAN_BUILTSYSTEM_PANIC
+        }
+    }
+}
+
+/// Evaluate residuals for a single orbit against observations, reusing
+/// the pre-built handle.
+///
+/// Signature parallels the one-shot
+/// [`empyrean_evaluate`](crate::od::empyrean_evaluate) with `handle`
+/// prepended. Same identity guard, same code space, the same OD-handle
+/// requirement and the same `auto_force_model` refusal as
+/// [`empyrean_builtsystem_determine`]. Free `result_out` with
+/// [`empyrean_evaluate_result_free`](crate::od::empyrean_evaluate_result_free).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn empyrean_builtsystem_evaluate(
+    handle: *const EmpyreanBuiltSystem,
+    ctx: *const EmpyreanContext,
+    orbit: *const EmpyreanOrbit,
+    observations: *const crate::od::EmpyreanObservation,
+    num_observations: usize,
+    config: *const crate::od::EmpyreanODConfig,
+    result_out: *mut crate::od::EmpyreanEvaluateResult,
+) -> i32 {
+    let r = std::panic::catch_unwind(AssertUnwindSafe(|| unsafe {
+        crate::od::evaluate_with_handle(
+            Some((handle, ctx)),
+            ctx,
+            orbit,
+            observations,
+            num_observations,
+            config,
+            result_out,
+        )
+    }));
+    match r {
+        Ok(c) => c,
+        Err(_) => {
+            set_last_error("panic in empyrean_builtsystem_evaluate");
+            EMPYREAN_BUILTSYSTEM_PANIC
+        }
+    }
+}
+
+/// Refine a single orbit estimate with new observations using a Bayesian
+/// prior, reusing the pre-built handle.
+///
+/// Signature parallels the one-shot
+/// [`empyrean_refine`](crate::od::empyrean_refine) with `handle`
+/// prepended. Same identity guard, same code space, the same OD-handle
+/// requirement and the same `auto_force_model` refusal as
+/// [`empyrean_builtsystem_determine`]. This is
+/// the measure-and-extend loop's entry point: build one handle, refine
+/// many times through it. Free `result_out` with
+/// [`empyrean_od_result_free`](crate::od::empyrean_od_result_free).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn empyrean_builtsystem_refine(
+    handle: *const EmpyreanBuiltSystem,
+    ctx: *const EmpyreanContext,
+    orbit: *const EmpyreanOrbit,
+    observations: *const crate::od::EmpyreanObservation,
+    num_observations: usize,
+    config: *const crate::od::EmpyreanODConfig,
+    result_out: *mut crate::od::EmpyreanODResult,
+) -> i32 {
+    let r = std::panic::catch_unwind(AssertUnwindSafe(|| unsafe {
+        crate::od::refine_with_handle(
+            Some((handle, ctx)),
+            ctx,
+            orbit,
+            observations,
+            num_observations,
+            config,
+            result_out,
+        )
+    }));
+    match r {
+        Ok(c) => c,
+        Err(_) => {
+            set_last_error("panic in empyrean_builtsystem_refine");
+            EMPYREAN_BUILTSYSTEM_PANIC
+        }
+    }
+}
+
+/// Resolve the caller's handle (if any) against an already-built
+/// `ODConfig`. `None` means the one-shot path: no handle, no guard.
+///
+/// Kept here beside the guard it runs so the OD module has one entry
+/// point into this one.
+pub(crate) fn od_handle_for(
+    pair: Option<(*const EmpyreanBuiltSystem, *const EmpyreanContext)>,
+    cfg: &ODConfig,
+) -> Result<Option<Arc<BuiltSystem>>, i32> {
+    match pair {
+        None => Ok(None),
+        Some((handle, ctx)) => resolve_od_handle(handle, ctx, cfg).map(Some),
     }
 }
 

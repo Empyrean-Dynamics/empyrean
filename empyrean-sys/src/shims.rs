@@ -273,6 +273,39 @@ pub unsafe fn empyrean_builtsystem_new(
         lib().empyrean_builtsystem_new(ctx, force_model, frame, encounter_timescale_divisor, out)
     }
 }
+/** Assemble a handle keyed for the **orbit-determination** entry points.
+
+Equivalent to [`empyrean_builtsystem_new`] with the frame and the
+encounter-timescale divisor an OD fit runs under already filled in, so
+the recipe cannot be got wrong. Only the force-model tier is yours:
+`ODConfig` exposes no frame or divisor knob, and the fit derives both
+from the engine defaults.
+
+Use this — not [`empyrean_builtsystem_new`] — for
+[`empyrean_builtsystem_determine`] / `_evaluate` / `_refine`. A handle
+built with `frame = 0` (ICRF), which every propagation example in this
+header uses, is rejected on the OD path with
+[`EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_FRAME`]: OD does not integrate in
+ICRF, and the guard will not serve a fit under a frame the fit did not
+ask for.
+
+- `force_model`: tier code (0=Approximate, 1=Basic, 2=Standard). Must
+  equal the `force_model` on the `EmpyreanODConfig` you pass to the OD
+  call.
+- `out`: receives the heap-allocated handle on success.
+
+The handle it returns is an ordinary one — free it with
+[`empyrean_builtsystem_free`], describe it with
+[`empyrean_builtsystem_describe`], and use it for propagation too if a
+matching config asks for the same frame.*/
+#[inline]
+pub unsafe fn empyrean_builtsystem_new_for_od(
+    ctx: *const EmpyreanContext,
+    force_model: i32,
+    out: *mut *mut EmpyreanBuiltSystem,
+) -> i32 {
+    unsafe { lib().empyrean_builtsystem_new_for_od(ctx, force_model, out) }
+}
 /** Free a handle previously returned by [`empyrean_builtsystem_new`].
 Passing null is a no-op.*/
 #[inline]
@@ -344,6 +377,144 @@ pub unsafe fn empyrean_builtsystem_generate_ephemeris(
             num_orbits,
             observers_ptr,
             num_observers,
+            config,
+            result_out,
+        )
+    }
+}
+/** Run the full orbit-determination pipeline over every object in
+`observations`, reusing the pre-built handle for every fit in the
+batch.
+
+Signature parallels the one-shot
+[`empyrean_determine`](crate::od::empyrean_determine) but takes
+`(handle, ctx, ...)`, exactly as
+[`empyrean_builtsystem_propagate`] relates to `empyrean_propagate`.
+Every other argument keeps its name, position and meaning. Results are
+bit-identical to the one-shot with the same config and a matching
+handle — the handle only changes *when* the force model is assembled.
+
+# The handle must be an OD handle
+
+Build it with [`empyrean_builtsystem_new_for_od`]. OD does not
+integrate in ICRF, so a handle built the way the propagation examples
+build theirs is rejected here with
+[`EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_FRAME`].
+
+The identity guard runs before any fitting and **refuses** on a
+mismatch — data identity ([`EMPYREAN_BUILTSYSTEM_DATA_MISMATCH`]),
+frozen key ([`EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_FRAME`] /
+`_FORCE_MODEL` / `_DIVISOR`), staleness
+([`EMPYREAN_BUILTSYSTEM_STALE`]). It never degrades to a per-solve
+assembly: a caller who asked to amortize and silently is not is
+precisely the failure this entry point exists to make impossible.
+
+# `auto_force_model` is refused, not tolerated
+
+`EmpyreanODConfig::auto_force_model` lets the fit re-pick its own
+force-model tier part-way through, which no frozen handle can follow:
+the engine would drop this handle mid-fit and reassemble per solve
+while this call still returned `0`. Passing it with a handle therefore
+fails with [`EMPYREAN_BUILTSYSTEM_CONFIG_MUTATES_KEY`] and a message
+naming the field. Set `auto_force_model = 0` and freeze the handle at
+the tier you want, or drop the handle and call
+[`empyrean_determine`](crate::od::empyrean_determine), which is free to
+choose the tier.
+
+# Return codes
+
+The one-shot's codes, plus the guard codes above. On `0` and
+[`EMPYREAN_DETERMINE_NONE_DELIVERED`](crate::od::EMPYREAN_DETERMINE_NONE_DELIVERED)
+release `results_out` with
+[`empyrean_determine_results_free`](crate::od::empyrean_determine_results_free).*/
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn empyrean_builtsystem_determine(
+    handle: *const EmpyreanBuiltSystem,
+    ctx: *const EmpyreanContext,
+    observations: *const EmpyreanObservation,
+    num_observations: usize,
+    radar: *const EmpyreanRadarObservation,
+    num_radar: usize,
+    initial_orbits: *const EmpyreanOrbit,
+    num_initial_orbits: usize,
+    config: *const EmpyreanODConfig,
+    results_out: *mut EmpyreanDetermineResults,
+) -> i32 {
+    unsafe {
+        lib().empyrean_builtsystem_determine(
+            handle,
+            ctx,
+            observations,
+            num_observations,
+            radar,
+            num_radar,
+            initial_orbits,
+            num_initial_orbits,
+            config,
+            results_out,
+        )
+    }
+}
+/** Evaluate residuals for a single orbit against observations, reusing
+the pre-built handle.
+
+Signature parallels the one-shot
+[`empyrean_evaluate`](crate::od::empyrean_evaluate) with `handle`
+prepended. Same identity guard, same code space, the same OD-handle
+requirement and the same `auto_force_model` refusal as
+[`empyrean_builtsystem_determine`]. Free `result_out` with
+[`empyrean_evaluate_result_free`](crate::od::empyrean_evaluate_result_free).*/
+#[inline]
+pub unsafe fn empyrean_builtsystem_evaluate(
+    handle: *const EmpyreanBuiltSystem,
+    ctx: *const EmpyreanContext,
+    orbit: *const EmpyreanOrbit,
+    observations: *const EmpyreanObservation,
+    num_observations: usize,
+    config: *const EmpyreanODConfig,
+    result_out: *mut EmpyreanEvaluateResult,
+) -> i32 {
+    unsafe {
+        lib().empyrean_builtsystem_evaluate(
+            handle,
+            ctx,
+            orbit,
+            observations,
+            num_observations,
+            config,
+            result_out,
+        )
+    }
+}
+/** Refine a single orbit estimate with new observations using a Bayesian
+prior, reusing the pre-built handle.
+
+Signature parallels the one-shot
+[`empyrean_refine`](crate::od::empyrean_refine) with `handle`
+prepended. Same identity guard, same code space, the same OD-handle
+requirement and the same `auto_force_model` refusal as
+[`empyrean_builtsystem_determine`]. This is
+the measure-and-extend loop's entry point: build one handle, refine
+many times through it. Free `result_out` with
+[`empyrean_od_result_free`](crate::od::empyrean_od_result_free).*/
+#[inline]
+pub unsafe fn empyrean_builtsystem_refine(
+    handle: *const EmpyreanBuiltSystem,
+    ctx: *const EmpyreanContext,
+    orbit: *const EmpyreanOrbit,
+    observations: *const EmpyreanObservation,
+    num_observations: usize,
+    config: *const EmpyreanODConfig,
+    result_out: *mut EmpyreanODResult,
+) -> i32 {
+    unsafe {
+        lib().empyrean_builtsystem_refine(
+            handle,
+            ctx,
+            orbit,
+            observations,
+            num_observations,
             config,
             result_out,
         )

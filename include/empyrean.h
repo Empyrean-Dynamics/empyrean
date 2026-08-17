@@ -149,6 +149,16 @@ typedef struct Session Session;
 #define EMPYREAN_BUILTSYSTEM_STALE -24
 
 /**
+ * Guard (0): the *config* — not the handle — would move the frozen key
+ * during the call, so no handle could be followed to the end of it.
+ * Today this is `EmpyreanODConfig::auto_force_model`, which lets an OD
+ * fit re-pick its own force-model tier part-way through. Nothing about
+ * the handle is wrong; clear the setting, or drop the handle and use the
+ * one-shot entry point, which is free to choose the tier.
+ */
+#define EMPYREAN_BUILTSYSTEM_CONFIG_MUTATES_KEY -25
+
+/**
  * A panic was caught at the FFI boundary.
  */
 #define EMPYREAN_BUILTSYSTEM_PANIC -99
@@ -1927,10 +1937,13 @@ struct EmpyreanDiagnosticsConfig {
  * Origin-switching configuration for trajectory splitting at body
  * Laplace spheres of influence (Amato/Baù/Bombardelli 2017 §6).
  *
- * Default **enabled** (the `_DEFAULT` sentinel resolves to
- * `enabled = 1`). When enabled, integration switches to a
- * body-centric frame inside the SOI of each eligible body and back
- * to SSB on exit. Set `enabled = 0` explicitly to opt out.
+ * Default **enabled** (the `_DEFAULT` sentinel resolves to the
+ * upstream default, currently `ON`). When enabled, integration
+ * switches to a body-centric frame inside the SOI of each eligible
+ * body and back to SSB on exit. Set
+ * `enabled = EMPYREAN_ORIGIN_SWITCHING_OFF` (2) to opt out; `0` is the
+ * DEFAULT sentinel and resolves to ON, so zero-initializing the struct
+ * does **not** disable trajectory splitting.
  *
  * At the C-ABI surface, the per-body opt-in list (`bodies` in
  * villeneuve) is not yet exposed — `EMPYREAN_ORIGIN_SWITCHING_ON`
@@ -2938,574 +2951,6 @@ struct EmpyreanEphemerisResult {
 };
 
 /**
- * One entry of the kernel-identity manifest captured by a handle.
- *
- * Names the provenance of each loaded data file — never any tuning
- * rationale. Free the owning [`EmpyreanSystemDescription`] with
- * [`empyrean_builtsystem_description_free`]; do not free these fields
- * individually.
- */
-struct EmpyreanKernelRecord {
-    /**
-     * Category of the entry (`EMPYREAN_KERNEL_KIND_*`).
-     */
-    int32_t kind;
-    /**
-     * Where the entry came from (`EMPYREAN_KERNEL_PROVENANCE_*`).
-     */
-    int32_t provenance;
-    /**
-     * Absolute path the kernel was loaded from. Non-null only for a
-     * `FILE` provenance; null otherwise. NUL-terminated UTF-8.
-     */
-    char *path;
-    /**
-     * Lowercase-hex SHA-256 of the file's bytes (64 chars). Non-null only
-     * for a `FILE` provenance; null otherwise. NUL-terminated UTF-8.
-     */
-    char *sha256;
-    /**
-     * Hashed file size in bytes. 0 unless `FILE` provenance.
-     */
-    uint64_t bytes;
-    /**
-     * Human-readable model name. Non-null only for a `BUILT_IN`
-     * provenance; null otherwise. NUL-terminated UTF-8.
-     */
-    char *name;
-};
-
-/**
- * A reproducibility summary of a handle's frozen force model plus its
- * captured kernel-identity manifest.
- *
- * Populated in full by [`empyrean_builtsystem_describe`] — every field
- * reflects the assembled system; nothing is defaulted. Names the citable
- * menu (tier, frame, GR, perturbers, BPC, kernel hashes) — never selection
- * logic or tuning rationale. Release the heap-owned arrays with
- * [`empyrean_builtsystem_description_free`].
- */
-struct EmpyreanSystemDescription {
-    /**
-     * Force-model tier: 0=Approximate, 1=Basic, 2=Standard.
-     */
-    int32_t force_model;
-    /**
-     * Integration/output frame: 0=ICRF, 1=EclipticJ2000, 2=ITRF93.
-     */
-    int32_t frame;
-    /**
-     * The frozen encounter-timescale divisor.
-     */
-    double encounter_timescale_divisor;
-    /**
-     * 1 if the post-Newtonian (EIH) GR correction is enabled, else 0.
-     */
-    uint8_t relativistic;
-    /**
-     * 1 if the N16 asteroid perturbers are included, else 0.
-     */
-    uint8_t asteroids;
-    /**
-     * 1 if a BPC (body-fixed rotation) kernel is loaded, else 0.
-     */
-    uint8_t has_bpc;
-    /**
-     * Heap array of perturbing-body NAIF ids (length `num_perturbers`).
-     * Null when `num_perturbers == 0`.
-     */
-    int32_t *perturber_origins;
-    /**
-     * Number of entries in [`perturber_origins`](Self::perturber_origins).
-     */
-    uintptr_t num_perturbers;
-    /**
-     * Heap array of kernel-identity records (length `num_kernels`). Null
-     * when `num_kernels == 0`.
-     */
-    struct EmpyreanKernelRecord *kernels;
-    /**
-     * Number of entries in [`kernels`](Self::kernels).
-     */
-    uintptr_t num_kernels;
-};
-
-/**
- * One impact-probability record emitted by
- * [`empyrean_compute_impact_probabilities`]. Mirrors
- * [`empyrean_core::impact::ImpactProbability`] flattened to primitives;
- * nullable fields use NaN sentinels (Option<f64>) or 0 / null
- * (Option<usize>).
- *
- * `method_tag` matches the `EMPYREAN_UNCERTAINTY_*` constants in
- * `propagate.rs` and identifies which propagation produced this row.
- */
-struct EmpyreanImpactProbability {
-    /**
-     * Variant tag of the [`UncertaintyMethod`] that produced this row.
-     */
-    uint8_t method_tag;
-    /**
-     * Owning C string — caller frees via `*_result_free`.
-     */
-    char *orbit_id;
-    char *object_id;
-    char *body;
-    int32_t body_naif_id;
-    double epoch_mjd_tdb;
-    double miss_distance_au;
-    double miss_distance_km;
-    double effective_radius_au;
-    double effective_radius_km;
-    double sigma_distance_au;
-    double sigma_distance_km;
-    double ip_linear;
-    double relative_velocity_au_day;
-    /**
-     * `ip_second_order`, NaN when not available.
-     */
-    double ip_second_order;
-    /**
-     * Jet2 nonlinearity κ, NaN when not available.
-     */
-    double nonlinearity;
-    /**
-     * AGM-mixed IP, NaN when not available.
-     */
-    double ip_agm;
-    /**
-     * MC-sampled IP, NaN when not available.
-     */
-    double ip_mc;
-    /**
-     * Number of MC samples drawn (0 when MC was not used).
-     */
-    uint64_t mc_n_samples;
-    /**
-     * Number of MC samples that impacted (0 when MC was not used).
-     */
-    uint64_t mc_n_impacts;
-    /**
-     * Geodetic latitude of the closest-approach surface point on the
-     * body's reference ellipsoid (degrees, north positive). NaN when no
-     * surface projection is available for this encounter (no
-     * body-orientation coverage, unmatched close approach, or the body
-     * has no registered ellipsoid).
-     */
-    double impact_latitude_deg;
-    /**
-     * Geodetic longitude of the closest-approach surface point
-     * (degrees, east positive, \\([-180, 180]\\)). NaN when unavailable.
-     */
-    double impact_longitude_deg;
-    /**
-     * Altitude of the closest-approach point above the reference
-     * ellipsoid (km). NaN when unavailable.
-     */
-    double impact_altitude_km;
-    /**
-     * Half-width of the 95% binomial (normal-approximation) confidence
-     * interval on `ip_mc`: \\(1.96\sqrt{p(1-p)/n}\\). The interval is
-     * `ip_mc ± mc_confidence_interval`. NaN when the producing method
-     * was not Monte Carlo.
-     */
-    double mc_confidence_interval;
-    /**
-     * Second-order corrected mean miss distance (AU),
-     * \\(\mu_d = d_0 + \tfrac{1}{2}\mathrm{Tr}(H_d \Sigma_0)\\). On
-     * Monte-Carlo rows carries the sample-mean miss distance instead.
-     * NaN when the producing method computed neither.
-     */
-    double mean_distance_second_order_au;
-    /**
-     * Second-order corrected 1σ miss-distance uncertainty (AU). NaN
-     * when the producing method carried no second-order derivatives.
-     */
-    double sigma_distance_second_order_au;
-    /**
-     * Skewness \\(\gamma_1\\) of the miss-distance distribution under
-     * the second-order expansion (dimensionless). NaN when not
-     * computed.
-     */
-    double skewness;
-    /**
-     * Gradient \\(\partial d / \partial x_0\\) of the closest-approach
-     * distance with respect to the initial Cartesian state (position
-     * components dimensionless, velocity components in days). All-zero
-     * on Monte-Carlo rows and on degenerate zero-miss encounters.
-     */
-    double gradient[6];
-    /**
-     * Second derivatives \\(\partial^2 d / \partial x_{0i} \partial
-     * x_{0j}\\) of the closest-approach distance (6×6 symmetric, same
-     * initial-state units as `gradient`). Every entry NaN when the
-     * producing method carried no second-order derivatives.
-     */
-    double distance_hessian[6][6];
-    /**
-     * Number of mixture components used by the adaptive
-     * Gaussian-mixture IP refinement. 0 when the refinement did not run
-     * (matches `ip_agm` = NaN).
-     */
-    uint64_t agm_components;
-};
-
-struct EmpyreanImpactProbabilitiesResult {
-    struct EmpyreanImpactProbability *records;
-    uintptr_t num_records;
-};
-
-/**
- * One B-plane breakdown emitted by [`empyrean_compute_b_planes`].
- * Mirrors [`empyrean_core::impact::BPlaneData`] flattened to primitives.
- * Nullable f64 fields use NaN sentinels.
- */
-struct EmpyreanBPlane {
-    /**
-     * Variant tag of the [`UncertaintyMethod`] that produced this row.
-     */
-    uint8_t method_tag;
-    /**
-     * Owning C string — caller frees via `*_result_free`.
-     */
-    char *body;
-    double epoch_mjd_tdb;
-    double b_dot_t_km;
-    double b_dot_r_km;
-    double b_mag_km;
-    double v_inf_km_s;
-    double effective_radius_km;
-    double body_radius_km;
-    /**
-     * `[σ_TT, σ_TR, σ_RR]` covariance elements (km²); NaN when no
-     * projected covariance is available.
-     */
-    double cov_b_plane[3];
-    double semi_major_3sig_km;
-    double semi_minor_3sig_km;
-    double ellipse_angle_rad;
-    double ip_linear;
-};
-
-struct EmpyreanBPlanesResult {
-    struct EmpyreanBPlane *records;
-    uintptr_t num_records;
-};
-
-/**
- * A batch of orbits with their identifiers.
- *
- * Returned by every `empyrean_orbits_read_*` and consumed by every
- * `empyrean_orbits_write_*`. `orbit_ids` and `object_ids` are parallel
- * to `orbits` (same length); each `object_ids[i]` may be null when the
- * underlying orbit had no object designation.
- *
- * # Ownership of the wide-carrier side arrays
- *
- * On a batch the library **hands you**, each orbit's
- * `state_param_cross` / `param_pair_cross` point into storage this
- * batch owns, and [`empyrean_orbits_batch_free`] releases them with
- * everything else. That is the opposite of the same fields on an
- * `EmpyreanOrbit` you **build**, where they are caller-owned and merely
- * borrowed for the call — the identical asymmetry `orbit_id` already
- * has. A caller re-feeding a read orbit into a propagate/OD call before
- * freeing the batch may pass the pointers straight through; one that
- * frees the batch first must copy.
- *
- * Free with [`empyrean_orbits_batch_free`] when done.
- */
-struct EmpyreanOrbitBatch {
-    /**
-     * Heap-allocated array of `EmpyreanOrbit`. Null when `num_orbits == 0`.
-     */
-    struct EmpyreanOrbit *orbits;
-    /**
-     * Heap-allocated array of orbit identifiers (null-terminated UTF-8).
-     * Each `orbit_ids[i]` is non-null when `i < num_orbits`.
-     */
-    char **orbit_ids;
-    /**
-     * Heap-allocated array of optional object identifiers
-     * (null-terminated UTF-8 or null pointer when absent).
-     */
-    char **object_ids;
-    /**
-     * Number of orbits in the batch.
-     */
-    uintptr_t num_orbits;
-};
-
-/**
- * Per-observation result from orbit determination or evaluation.
- *
- * Mirrors scott's [`ObservationResult`](scott::results::ObservationResult)
- * — every field upstream produces is carried across the C ABI. NaN /
- * `EMPYREAN_REJECTION_NOT_EVALUATED` mark fields that aren't populated
- * for the call type (e.g. evaluate doesn't compute rejection or
- * influence diagnostics).
- *
- * `obs_id`, `object_id` and `ast_cat` are heap-allocated NUL-terminated
- * UTF-8 strings; the pointers are freed by
- * [`empyrean_determine_results_free`] / [`empyrean_od_result_free`] /
- * [`empyrean_evaluate_result_free`] when the parent array is freed.
- * Do NOT free them manually.
- */
-struct EmpyreanObservationResult {
-    /**
-     * ADES `obsID` (or scott auto-assigned). Owned by the parent array
-     * — freed by the matching `*_result_free` call.
-     */
-    char *obs_id;
-    /**
-     * ADES object identifier (permID / provID / trkSub) of the object
-     * this row was fitted against. Populated by
-     * [`empyrean_determine`], which groups by object — so a caller may
-     * concatenate every object's rows into one flat table and still
-     * know which fit each row belongs to.
-     *
-     * Null on the single-object paths (`empyrean_evaluate`,
-     * `empyrean_refine`), where the caller supplied the one orbit and
-     * no grouping key exists. Owned by the parent array.
-     */
-    char *object_id;
-    /**
-     * MPC observatory code (3-byte + NUL).
-     */
-    uint8_t obs_code[4];
-    /**
-     * Star catalog used for astrometric reduction (ADES `astCat`).
-     * Heap-allocated; null when ADES did not carry one. Freed with the array.
-     */
-    char *ast_cat;
-    /**
-     * Observation epoch (MJD TDB).
-     */
-    double epoch_mjd_tdb;
-    /**
-     * RA·cosδ residual (observed - predicted), arcsec.
-     */
-    double ra_residual_arcsec;
-    /**
-     * Dec residual, arcsec.
-     */
-    double dec_residual_arcsec;
-    /**
-     * Mahalanobis χ² of this observation. NaN if covariance unavailable.
-     */
-    double chi2;
-    /**
-     * Degrees of freedom (number of non-NaN residual dimensions).
-     */
-    uint32_t dof;
-    /**
-     * χ² survival probability.
-     */
-    double probability;
-    /**
-     * Whether this observation was used in the fit (1 = yes, 0 = no).
-     */
-    uint8_t selected;
-    /**
-     * Combined obs+predicted RA covariance (arcsec²). NaN if absent.
-     */
-    double residual_cov_ra;
-    /**
-     * Combined obs+predicted Dec covariance (arcsec²). NaN if absent.
-     */
-    double residual_cov_dec;
-    /**
-     * Off-diagonal correlation coefficient (dimensionless, [-1, 1]). NaN if absent.
-     */
-    double residual_cov_corr;
-    /**
-     * Reason this observation was kept / rejected. One of the
-     * `EMPYREAN_REJECTION_*` codes; `EMPYREAN_REJECTION_NOT_EVALUATED`
-     * when the call did not run rejection (e.g. `empyrean_evaluate`).
-     */
-    int32_t rejection_reason;
-    /**
-     * Criterion value (chi², Cook's D, …) tested against the threshold. NaN if not evaluated.
-     */
-    double rejection_criterion;
-    /**
-     * Static threshold the criterion was compared against. NaN if not evaluated.
-     */
-    double rejection_threshold;
-    /**
-     * Effective threshold for adaptive rejection (Layer 3). NaN otherwise.
-     */
-    double rejection_effective_threshold;
-    /**
-     * D-optimality information loss from removing this observation. NaN if not computed.
-     */
-    double rejection_information_loss;
-    /**
-     * Cook's distance. NaN if no influence pass was run.
-     */
-    double cooks_distance;
-    /**
-     * Scalar leverage h_ii ∈ [0, 2]. NaN if no influence pass.
-     */
-    double leverage;
-    /**
-     * D-optimality fractional information contribution
-     * `f_i = tr(N⁻¹ I_i)`. NaN if no influence pass.
-     */
-    double fractional_information;
-    /**
-     * Along-track residual (arcsec). NaN if no sky-motion rates.
-     */
-    double along_track_arcsec;
-    /**
-     * Cross-track residual (arcsec). NaN if no sky-motion rates.
-     */
-    double cross_track_arcsec;
-    /**
-     * Along-track 1σ (arcsec). NaN if unavailable.
-     */
-    double along_track_error_arcsec;
-    /**
-     * Cross-track 1σ (arcsec). NaN if unavailable.
-     */
-    double cross_track_error_arcsec;
-    /**
-     * Position angle of sky motion (degrees, East of North). NaN if unavailable.
-     */
-    double track_position_angle_deg;
-    /**
-     * D-optimality information loss on removal, from the influence
-     * pass: \\(\Delta_i = \log\det N - \log\det(N - I_i)\\). NaN
-     * if no influence pass was run; +∞ when removing this observation
-     * makes the normal matrix singular (the observation is
-     * indispensable).
-     */
-    double influence_information_loss;
-    /**
-     * Off-diagonal covariance of the (along-track, cross-track)
-     * residual pair (arcsec²). Symmetric 2×2: the diagonal is
-     * `along_track_error_arcsec`² / `cross_track_error_arcsec`².
-     * NaN when the AT/CT covariance is unavailable.
-     */
-    double along_cross_covariance_arcsec2;
-    /**
-     * Radar (delay/Doppler) residual: observed − predicted. Seconds
-     * for delay, hertz for Doppler (see `radar_kind`). NaN when
-     * `has_radar == 0`.
-     */
-    double radar_residual;
-    /**
-     * χ² of the radar residual. NaN when `has_radar == 0`.
-     */
-    double radar_chi2;
-    /**
-     * χ² survival probability of the radar residual. NaN when
-     * `has_radar == 0`.
-     */
-    double radar_probability;
-    /**
-     * Combined observed+predicted radar residual variance (s² for
-     * delay, Hz² for Doppler). NaN when unavailable or
-     * `has_radar == 0`.
-     */
-    double radar_variance;
-    /**
-     * Degrees of freedom of the radar residual (1 for radar). 0 when
-     * `has_radar == 0`.
-     */
-    uint32_t radar_dof;
-    /**
-     * 1 when this row is a radar observation and the `radar_*` fields
-     * are live. The optical RA/Dec residual fields are NaN on radar
-     * rows.
-     */
-    uint8_t has_radar;
-    /**
-     * `EMPYREAN_RADAR_KIND_DELAY` (0) or `EMPYREAN_RADAR_KIND_DOPPLER`
-     * (1). Only meaningful when `has_radar == 1`.
-     */
-    uint8_t radar_kind;
-};
-
-/**
- * One row of the per-object fit summary: what a batch orbit
- * determination did with **one** input object, delivered or not.
- *
- * This is the row shape of the `fit_summary` table every distribution
- * channel emits, so the file the CLI writes and the table the Python
- * API returns describe a fit with the same column names.
- *
- * A failed object still gets a row — that is the point of the table.
- * Its numeric columns are NaN (never 0.0, which would read as a
- * measurement), its `_ok` booleans are false, and `error` carries the
- * reason. `status` is `"delivered"` or `"failed"`.
- *
- * Both string fields are borrowed for the duration of the call: the
- * writer copies what it needs and frees nothing.
- */
-struct EmpyreanFitSummary {
-    /**
-     * ADES object identifier. Never null.
-     */
-    const char *object_id;
-    /**
-     * `"delivered"` or `"failed"`. Never null.
-     */
-    const char *status;
-    /**
-     * 1 when the differential correction reached its stopping
-     * criterion. 0 on a failed object.
-     */
-    uint8_t converged;
-    /**
-     * DC iterations used. 0 on a failed object.
-     */
-    uint32_t iterations;
-    /**
-     * Observations this object contributed.
-     */
-    uintptr_t n_obs;
-    /**
-     * Observations the fit retained.
-     */
-    uintptr_t n_selected;
-    double rms_ra_arcsec;
-    double rms_dec_arcsec;
-    double reduced_chi2;
-    uint8_t fit_acceptable;
-    uint8_t extrapolation_acceptable;
-    uint8_t selection_fraction_ok;
-    double selection_fraction;
-    double selection_fraction_threshold;
-    uint8_t selected_arc_coverage_ok;
-    double selected_arc_days;
-    double selected_arc_fraction;
-    double selected_arc_fraction_threshold;
-    uint8_t trailing_gap_ok;
-    double trailing_gap_days;
-    double trailing_gap_threshold_days;
-    uint8_t fractional_sigma_a_ok;
-    double fractional_sigma_a;
-    double fractional_sigma_a_threshold;
-    /**
-     * Width of the solved-parameter set (6 for a state-only fit). 0 on
-     * a failed object.
-     */
-    uint32_t solve_for_width;
-    /**
-     * Failure message. Null on a delivered object.
-     */
-    const char *error;
-};
-
-/**
- * Result containing an array of observer states.
- */
-struct EmpyreanObserverResult {
-    struct EmpyreanObserver *observers;
-    uintptr_t num_observers;
-};
-
-/**
  * A single optical observation for orbit determination — full ADES schema.
  *
  * String fields are nullable (`null` pointer = absent). Float fields
@@ -4350,6 +3795,197 @@ struct EmpyreanODConfig {
      * [`has_photometry`](EmpyreanODConfig::has_photometry) is non-zero.
      */
     struct EmpyreanPhotometryConfig photometry;
+};
+
+/**
+ * Per-observation result from orbit determination or evaluation.
+ *
+ * Mirrors scott's [`ObservationResult`](scott::results::ObservationResult)
+ * — every field upstream produces is carried across the C ABI. NaN /
+ * `EMPYREAN_REJECTION_NOT_EVALUATED` mark fields that aren't populated
+ * for the call type (e.g. evaluate doesn't compute rejection or
+ * influence diagnostics).
+ *
+ * `obs_id`, `object_id` and `ast_cat` are heap-allocated NUL-terminated
+ * UTF-8 strings; the pointers are freed by
+ * [`empyrean_determine_results_free`] / [`empyrean_od_result_free`] /
+ * [`empyrean_evaluate_result_free`] when the parent array is freed.
+ * Do NOT free them manually.
+ */
+struct EmpyreanObservationResult {
+    /**
+     * ADES `obsID` (or scott auto-assigned). Owned by the parent array
+     * — freed by the matching `*_result_free` call.
+     */
+    char *obs_id;
+    /**
+     * ADES object identifier (permID / provID / trkSub) of the object
+     * this row was fitted against. Populated by
+     * [`empyrean_determine`], which groups by object — so a caller may
+     * concatenate every object's rows into one flat table and still
+     * know which fit each row belongs to.
+     *
+     * Null on the single-object paths (`empyrean_evaluate`,
+     * `empyrean_refine`), where the caller supplied the one orbit and
+     * no grouping key exists. Owned by the parent array.
+     */
+    char *object_id;
+    /**
+     * MPC observatory code (3-byte + NUL).
+     */
+    uint8_t obs_code[4];
+    /**
+     * Star catalog used for astrometric reduction (ADES `astCat`).
+     * Heap-allocated; null when ADES did not carry one. Freed with the array.
+     */
+    char *ast_cat;
+    /**
+     * Observation epoch (MJD TDB).
+     */
+    double epoch_mjd_tdb;
+    /**
+     * RA·cosδ residual (observed - predicted), arcsec.
+     */
+    double ra_residual_arcsec;
+    /**
+     * Dec residual, arcsec.
+     */
+    double dec_residual_arcsec;
+    /**
+     * Mahalanobis χ² of this observation. NaN if covariance unavailable.
+     */
+    double chi2;
+    /**
+     * Degrees of freedom (number of non-NaN residual dimensions).
+     */
+    uint32_t dof;
+    /**
+     * χ² survival probability.
+     */
+    double probability;
+    /**
+     * Whether this observation was used in the fit (1 = yes, 0 = no).
+     */
+    uint8_t selected;
+    /**
+     * Combined obs+predicted RA covariance (arcsec²). NaN if absent.
+     */
+    double residual_cov_ra;
+    /**
+     * Combined obs+predicted Dec covariance (arcsec²). NaN if absent.
+     */
+    double residual_cov_dec;
+    /**
+     * Off-diagonal correlation coefficient (dimensionless, [-1, 1]). NaN if absent.
+     */
+    double residual_cov_corr;
+    /**
+     * Reason this observation was kept / rejected. One of the
+     * `EMPYREAN_REJECTION_*` codes; `EMPYREAN_REJECTION_NOT_EVALUATED`
+     * when the call did not run rejection (e.g. `empyrean_evaluate`).
+     */
+    int32_t rejection_reason;
+    /**
+     * Criterion value (chi², Cook's D, …) tested against the threshold. NaN if not evaluated.
+     */
+    double rejection_criterion;
+    /**
+     * Static threshold the criterion was compared against. NaN if not evaluated.
+     */
+    double rejection_threshold;
+    /**
+     * Effective threshold for adaptive rejection (Layer 3). NaN otherwise.
+     */
+    double rejection_effective_threshold;
+    /**
+     * D-optimality information loss from removing this observation. NaN if not computed.
+     */
+    double rejection_information_loss;
+    /**
+     * Cook's distance. NaN if no influence pass was run.
+     */
+    double cooks_distance;
+    /**
+     * Scalar leverage h_ii ∈ [0, 2]. NaN if no influence pass.
+     */
+    double leverage;
+    /**
+     * D-optimality fractional information contribution
+     * `f_i = tr(N⁻¹ I_i)`. NaN if no influence pass.
+     */
+    double fractional_information;
+    /**
+     * Along-track residual (arcsec). NaN if no sky-motion rates.
+     */
+    double along_track_arcsec;
+    /**
+     * Cross-track residual (arcsec). NaN if no sky-motion rates.
+     */
+    double cross_track_arcsec;
+    /**
+     * Along-track 1σ (arcsec). NaN if unavailable.
+     */
+    double along_track_error_arcsec;
+    /**
+     * Cross-track 1σ (arcsec). NaN if unavailable.
+     */
+    double cross_track_error_arcsec;
+    /**
+     * Position angle of sky motion (degrees, East of North). NaN if unavailable.
+     */
+    double track_position_angle_deg;
+    /**
+     * D-optimality information loss on removal, from the influence
+     * pass: \\(\Delta_i = \log\det N - \log\det(N - I_i)\\). NaN
+     * if no influence pass was run; +∞ when removing this observation
+     * makes the normal matrix singular (the observation is
+     * indispensable).
+     */
+    double influence_information_loss;
+    /**
+     * Off-diagonal covariance of the (along-track, cross-track)
+     * residual pair (arcsec²). Symmetric 2×2: the diagonal is
+     * `along_track_error_arcsec`² / `cross_track_error_arcsec`².
+     * NaN when the AT/CT covariance is unavailable.
+     */
+    double along_cross_covariance_arcsec2;
+    /**
+     * Radar (delay/Doppler) residual: observed − predicted. Seconds
+     * for delay, hertz for Doppler (see `radar_kind`). NaN when
+     * `has_radar == 0`.
+     */
+    double radar_residual;
+    /**
+     * χ² of the radar residual. NaN when `has_radar == 0`.
+     */
+    double radar_chi2;
+    /**
+     * χ² survival probability of the radar residual. NaN when
+     * `has_radar == 0`.
+     */
+    double radar_probability;
+    /**
+     * Combined observed+predicted radar residual variance (s² for
+     * delay, Hz² for Doppler). NaN when unavailable or
+     * `has_radar == 0`.
+     */
+    double radar_variance;
+    /**
+     * Degrees of freedom of the radar residual (1 for radar). 0 when
+     * `has_radar == 0`.
+     */
+    uint32_t radar_dof;
+    /**
+     * 1 when this row is a radar observation and the `radar_*` fields
+     * are live. The optical RA/Dec residual fields are NaN on radar
+     * rows.
+     */
+    uint8_t has_radar;
+    /**
+     * `EMPYREAN_RADAR_KIND_DELAY` (0) or `EMPYREAN_RADAR_KIND_DOPPLER`
+     * (1). Only meaningful when `has_radar == 1`.
+     */
+    uint8_t radar_kind;
 };
 
 /**
@@ -5229,6 +4865,383 @@ struct EmpyreanEvaluateResult {
     struct EmpyreanObservationResult *observations;
     uintptr_t num_observations;
     struct EmpyreanResidualSummary summary;
+};
+
+/**
+ * One entry of the kernel-identity manifest captured by a handle.
+ *
+ * Names the provenance of each loaded data file — never any tuning
+ * rationale. Free the owning [`EmpyreanSystemDescription`] with
+ * [`empyrean_builtsystem_description_free`]; do not free these fields
+ * individually.
+ */
+struct EmpyreanKernelRecord {
+    /**
+     * Category of the entry (`EMPYREAN_KERNEL_KIND_*`).
+     */
+    int32_t kind;
+    /**
+     * Where the entry came from (`EMPYREAN_KERNEL_PROVENANCE_*`).
+     */
+    int32_t provenance;
+    /**
+     * Absolute path the kernel was loaded from. Non-null only for a
+     * `FILE` provenance; null otherwise. NUL-terminated UTF-8.
+     */
+    char *path;
+    /**
+     * Lowercase-hex SHA-256 of the file's bytes (64 chars). Non-null only
+     * for a `FILE` provenance; null otherwise. NUL-terminated UTF-8.
+     */
+    char *sha256;
+    /**
+     * Hashed file size in bytes. 0 unless `FILE` provenance.
+     */
+    uint64_t bytes;
+    /**
+     * Human-readable model name. Non-null only for a `BUILT_IN`
+     * provenance; null otherwise. NUL-terminated UTF-8.
+     */
+    char *name;
+};
+
+/**
+ * A reproducibility summary of a handle's frozen force model plus its
+ * captured kernel-identity manifest.
+ *
+ * Populated in full by [`empyrean_builtsystem_describe`] — every field
+ * reflects the assembled system; nothing is defaulted. Names the citable
+ * menu (tier, frame, GR, perturbers, BPC, kernel hashes) — never selection
+ * logic or tuning rationale. Release the heap-owned arrays with
+ * [`empyrean_builtsystem_description_free`].
+ */
+struct EmpyreanSystemDescription {
+    /**
+     * Force-model tier: 0=Approximate, 1=Basic, 2=Standard.
+     */
+    int32_t force_model;
+    /**
+     * Integration/output frame: 0=ICRF, 1=EclipticJ2000, 2=ITRF93.
+     */
+    int32_t frame;
+    /**
+     * The frozen encounter-timescale divisor.
+     */
+    double encounter_timescale_divisor;
+    /**
+     * 1 if the post-Newtonian (EIH) GR correction is enabled, else 0.
+     */
+    uint8_t relativistic;
+    /**
+     * 1 if the N16 asteroid perturbers are included, else 0.
+     */
+    uint8_t asteroids;
+    /**
+     * 1 if a BPC (body-fixed rotation) kernel is loaded, else 0.
+     */
+    uint8_t has_bpc;
+    /**
+     * Heap array of perturbing-body NAIF ids (length `num_perturbers`).
+     * Null when `num_perturbers == 0`.
+     */
+    int32_t *perturber_origins;
+    /**
+     * Number of entries in [`perturber_origins`](Self::perturber_origins).
+     */
+    uintptr_t num_perturbers;
+    /**
+     * Heap array of kernel-identity records (length `num_kernels`). Null
+     * when `num_kernels == 0`.
+     */
+    struct EmpyreanKernelRecord *kernels;
+    /**
+     * Number of entries in [`kernels`](Self::kernels).
+     */
+    uintptr_t num_kernels;
+};
+
+/**
+ * One impact-probability record emitted by
+ * [`empyrean_compute_impact_probabilities`]. Mirrors
+ * [`empyrean_core::impact::ImpactProbability`] flattened to primitives;
+ * nullable fields use NaN sentinels (Option<f64>) or 0 / null
+ * (Option<usize>).
+ *
+ * `method_tag` matches the `EMPYREAN_UNCERTAINTY_*` constants in
+ * `propagate.rs` and identifies which propagation produced this row.
+ */
+struct EmpyreanImpactProbability {
+    /**
+     * Variant tag of the [`UncertaintyMethod`] that produced this row.
+     */
+    uint8_t method_tag;
+    /**
+     * Owning C string — caller frees via `*_result_free`.
+     */
+    char *orbit_id;
+    char *object_id;
+    char *body;
+    int32_t body_naif_id;
+    double epoch_mjd_tdb;
+    double miss_distance_au;
+    double miss_distance_km;
+    double effective_radius_au;
+    double effective_radius_km;
+    double sigma_distance_au;
+    double sigma_distance_km;
+    double ip_linear;
+    double relative_velocity_au_day;
+    /**
+     * `ip_second_order`, NaN when not available.
+     */
+    double ip_second_order;
+    /**
+     * Jet2 nonlinearity κ, NaN when not available.
+     */
+    double nonlinearity;
+    /**
+     * AGM-mixed IP, NaN when not available.
+     */
+    double ip_agm;
+    /**
+     * MC-sampled IP, NaN when not available.
+     */
+    double ip_mc;
+    /**
+     * Number of MC samples drawn (0 when MC was not used).
+     */
+    uint64_t mc_n_samples;
+    /**
+     * Number of MC samples that impacted (0 when MC was not used).
+     */
+    uint64_t mc_n_impacts;
+    /**
+     * Geodetic latitude of the closest-approach surface point on the
+     * body's reference ellipsoid (degrees, north positive). NaN when no
+     * surface projection is available for this encounter (no
+     * body-orientation coverage, unmatched close approach, or the body
+     * has no registered ellipsoid).
+     */
+    double impact_latitude_deg;
+    /**
+     * Geodetic longitude of the closest-approach surface point
+     * (degrees, east positive, \\([-180, 180]\\)). NaN when unavailable.
+     */
+    double impact_longitude_deg;
+    /**
+     * Altitude of the closest-approach point above the reference
+     * ellipsoid (km). NaN when unavailable.
+     */
+    double impact_altitude_km;
+    /**
+     * Half-width of the 95% binomial (normal-approximation) confidence
+     * interval on `ip_mc`: \\(1.96\sqrt{p(1-p)/n}\\). The interval is
+     * `ip_mc ± mc_confidence_interval`. NaN when the producing method
+     * was not Monte Carlo.
+     */
+    double mc_confidence_interval;
+    /**
+     * Second-order corrected mean miss distance (AU),
+     * \\(\mu_d = d_0 + \tfrac{1}{2}\mathrm{Tr}(H_d \Sigma_0)\\). On
+     * Monte-Carlo rows carries the sample-mean miss distance instead.
+     * NaN when the producing method computed neither.
+     */
+    double mean_distance_second_order_au;
+    /**
+     * Second-order corrected 1σ miss-distance uncertainty (AU). NaN
+     * when the producing method carried no second-order derivatives.
+     */
+    double sigma_distance_second_order_au;
+    /**
+     * Skewness \\(\gamma_1\\) of the miss-distance distribution under
+     * the second-order expansion (dimensionless). NaN when not
+     * computed.
+     */
+    double skewness;
+    /**
+     * Gradient \\(\partial d / \partial x_0\\) of the closest-approach
+     * distance with respect to the initial Cartesian state (position
+     * components dimensionless, velocity components in days). All-zero
+     * on Monte-Carlo rows and on degenerate zero-miss encounters.
+     */
+    double gradient[6];
+    /**
+     * Second derivatives \\(\partial^2 d / \partial x_{0i} \partial
+     * x_{0j}\\) of the closest-approach distance (6×6 symmetric, same
+     * initial-state units as `gradient`). Every entry NaN when the
+     * producing method carried no second-order derivatives.
+     */
+    double distance_hessian[6][6];
+    /**
+     * Number of mixture components used by the adaptive
+     * Gaussian-mixture IP refinement. 0 when the refinement did not run
+     * (matches `ip_agm` = NaN).
+     */
+    uint64_t agm_components;
+};
+
+struct EmpyreanImpactProbabilitiesResult {
+    struct EmpyreanImpactProbability *records;
+    uintptr_t num_records;
+};
+
+/**
+ * One B-plane breakdown emitted by [`empyrean_compute_b_planes`].
+ * Mirrors [`empyrean_core::impact::BPlaneData`] flattened to primitives.
+ * Nullable f64 fields use NaN sentinels.
+ */
+struct EmpyreanBPlane {
+    /**
+     * Variant tag of the [`UncertaintyMethod`] that produced this row.
+     */
+    uint8_t method_tag;
+    /**
+     * Owning C string — caller frees via `*_result_free`.
+     */
+    char *body;
+    double epoch_mjd_tdb;
+    double b_dot_t_km;
+    double b_dot_r_km;
+    double b_mag_km;
+    double v_inf_km_s;
+    double effective_radius_km;
+    double body_radius_km;
+    /**
+     * `[σ_TT, σ_TR, σ_RR]` covariance elements (km²); NaN when no
+     * projected covariance is available.
+     */
+    double cov_b_plane[3];
+    double semi_major_3sig_km;
+    double semi_minor_3sig_km;
+    double ellipse_angle_rad;
+    double ip_linear;
+};
+
+struct EmpyreanBPlanesResult {
+    struct EmpyreanBPlane *records;
+    uintptr_t num_records;
+};
+
+/**
+ * A batch of orbits with their identifiers.
+ *
+ * Returned by every `empyrean_orbits_read_*` and consumed by every
+ * `empyrean_orbits_write_*`. `orbit_ids` and `object_ids` are parallel
+ * to `orbits` (same length); each `object_ids[i]` may be null when the
+ * underlying orbit had no object designation.
+ *
+ * # Ownership of the wide-carrier side arrays
+ *
+ * On a batch the library **hands you**, each orbit's
+ * `state_param_cross` / `param_pair_cross` point into storage this
+ * batch owns, and [`empyrean_orbits_batch_free`] releases them with
+ * everything else. That is the opposite of the same fields on an
+ * `EmpyreanOrbit` you **build**, where they are caller-owned and merely
+ * borrowed for the call — the identical asymmetry `orbit_id` already
+ * has. A caller re-feeding a read orbit into a propagate/OD call before
+ * freeing the batch may pass the pointers straight through; one that
+ * frees the batch first must copy.
+ *
+ * Free with [`empyrean_orbits_batch_free`] when done.
+ */
+struct EmpyreanOrbitBatch {
+    /**
+     * Heap-allocated array of `EmpyreanOrbit`. Null when `num_orbits == 0`.
+     */
+    struct EmpyreanOrbit *orbits;
+    /**
+     * Heap-allocated array of orbit identifiers (null-terminated UTF-8).
+     * Each `orbit_ids[i]` is non-null when `i < num_orbits`.
+     */
+    char **orbit_ids;
+    /**
+     * Heap-allocated array of optional object identifiers
+     * (null-terminated UTF-8 or null pointer when absent).
+     */
+    char **object_ids;
+    /**
+     * Number of orbits in the batch.
+     */
+    uintptr_t num_orbits;
+};
+
+/**
+ * One row of the per-object fit summary: what a batch orbit
+ * determination did with **one** input object, delivered or not.
+ *
+ * This is the row shape of the `fit_summary` table every distribution
+ * channel emits, so the file the CLI writes and the table the Python
+ * API returns describe a fit with the same column names.
+ *
+ * A failed object still gets a row — that is the point of the table.
+ * Its numeric columns are NaN (never 0.0, which would read as a
+ * measurement), its `_ok` booleans are false, and `error` carries the
+ * reason. `status` is `"delivered"` or `"failed"`.
+ *
+ * Both string fields are borrowed for the duration of the call: the
+ * writer copies what it needs and frees nothing.
+ */
+struct EmpyreanFitSummary {
+    /**
+     * ADES object identifier. Never null.
+     */
+    const char *object_id;
+    /**
+     * `"delivered"` or `"failed"`. Never null.
+     */
+    const char *status;
+    /**
+     * 1 when the differential correction reached its stopping
+     * criterion. 0 on a failed object.
+     */
+    uint8_t converged;
+    /**
+     * DC iterations used. 0 on a failed object.
+     */
+    uint32_t iterations;
+    /**
+     * Observations this object contributed.
+     */
+    uintptr_t n_obs;
+    /**
+     * Observations the fit retained.
+     */
+    uintptr_t n_selected;
+    double rms_ra_arcsec;
+    double rms_dec_arcsec;
+    double reduced_chi2;
+    uint8_t fit_acceptable;
+    uint8_t extrapolation_acceptable;
+    uint8_t selection_fraction_ok;
+    double selection_fraction;
+    double selection_fraction_threshold;
+    uint8_t selected_arc_coverage_ok;
+    double selected_arc_days;
+    double selected_arc_fraction;
+    double selected_arc_fraction_threshold;
+    uint8_t trailing_gap_ok;
+    double trailing_gap_days;
+    double trailing_gap_threshold_days;
+    uint8_t fractional_sigma_a_ok;
+    double fractional_sigma_a;
+    double fractional_sigma_a_threshold;
+    /**
+     * Width of the solved-parameter set (6 for a state-only fit). 0 on
+     * a failed object.
+     */
+    uint32_t solve_for_width;
+    /**
+     * Failure message. Null on a delivered object.
+     */
+    const char *error;
+};
+
+/**
+ * Result containing an array of observer states.
+ */
+struct EmpyreanObserverResult {
+    struct EmpyreanObserver *observers;
+    uintptr_t num_observers;
 };
 
 /**
@@ -6122,6 +6135,38 @@ int32_t empyrean_builtsystem_new(const EmpyreanContext *ctx,
                                  struct EmpyreanBuiltSystem **out);
 
 /**
+ * Assemble a handle keyed for the **orbit-determination** entry points.
+ *
+ * Equivalent to [`empyrean_builtsystem_new`] with the frame and the
+ * encounter-timescale divisor an OD fit runs under already filled in, so
+ * the recipe cannot be got wrong. Only the force-model tier is yours:
+ * `ODConfig` exposes no frame or divisor knob, and the fit derives both
+ * from the engine defaults.
+ *
+ * Use this — not [`empyrean_builtsystem_new`] — for
+ * [`empyrean_builtsystem_determine`] / `_evaluate` / `_refine`. A handle
+ * built with `frame = 0` (ICRF), which every propagation example in this
+ * header uses, is rejected on the OD path with
+ * [`EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_FRAME`]: OD does not integrate in
+ * ICRF, and the guard will not serve a fit under a frame the fit did not
+ * ask for.
+ *
+ * - `force_model`: tier code (0=Approximate, 1=Basic, 2=Standard). Must
+ *   equal the `force_model` on the `EmpyreanODConfig` you pass to the OD
+ *   call.
+ * - `out`: receives the heap-allocated handle on success.
+ *
+ * The handle it returns is an ordinary one — free it with
+ * [`empyrean_builtsystem_free`], describe it with
+ * [`empyrean_builtsystem_describe`], and use it for propagation too if a
+ * matching config asks for the same frame.
+ */
+
+int32_t empyrean_builtsystem_new_for_od(const EmpyreanContext *ctx,
+                                        int32_t force_model,
+                                        struct EmpyreanBuiltSystem **out);
+
+/**
  * Free a handle previously returned by [`empyrean_builtsystem_new`].
  * Passing null is a no-op.
  */
@@ -6179,6 +6224,107 @@ int32_t empyrean_builtsystem_generate_ephemeris(const struct EmpyreanBuiltSystem
                                                 uintptr_t num_observers,
                                                 const struct EmpyreanEphemerisConfig *config,
                                                 struct EmpyreanEphemerisResult *result_out);
+
+/**
+ * Run the full orbit-determination pipeline over every object in
+ * `observations`, reusing the pre-built handle for every fit in the
+ * batch.
+ *
+ * Signature parallels the one-shot
+ * [`empyrean_determine`](crate::od::empyrean_determine) but takes
+ * `(handle, ctx, ...)`, exactly as
+ * [`empyrean_builtsystem_propagate`] relates to `empyrean_propagate`.
+ * Every other argument keeps its name, position and meaning. Results are
+ * bit-identical to the one-shot with the same config and a matching
+ * handle — the handle only changes *when* the force model is assembled.
+ *
+ * # The handle must be an OD handle
+ *
+ * Build it with [`empyrean_builtsystem_new_for_od`]. OD does not
+ * integrate in ICRF, so a handle built the way the propagation examples
+ * build theirs is rejected here with
+ * [`EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_FRAME`].
+ *
+ * The identity guard runs before any fitting and **refuses** on a
+ * mismatch — data identity ([`EMPYREAN_BUILTSYSTEM_DATA_MISMATCH`]),
+ * frozen key ([`EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_FRAME`] /
+ * `_FORCE_MODEL` / `_DIVISOR`), staleness
+ * ([`EMPYREAN_BUILTSYSTEM_STALE`]). It never degrades to a per-solve
+ * assembly: a caller who asked to amortize and silently is not is
+ * precisely the failure this entry point exists to make impossible.
+ *
+ * # `auto_force_model` is refused, not tolerated
+ *
+ * `EmpyreanODConfig::auto_force_model` lets the fit re-pick its own
+ * force-model tier part-way through, which no frozen handle can follow:
+ * the engine would drop this handle mid-fit and reassemble per solve
+ * while this call still returned `0`. Passing it with a handle therefore
+ * fails with [`EMPYREAN_BUILTSYSTEM_CONFIG_MUTATES_KEY`] and a message
+ * naming the field. Set `auto_force_model = 0` and freeze the handle at
+ * the tier you want, or drop the handle and call
+ * [`empyrean_determine`](crate::od::empyrean_determine), which is free to
+ * choose the tier.
+ *
+ * # Return codes
+ *
+ * The one-shot's codes, plus the guard codes above. On `0` and
+ * [`EMPYREAN_DETERMINE_NONE_DELIVERED`](crate::od::EMPYREAN_DETERMINE_NONE_DELIVERED)
+ * release `results_out` with
+ * [`empyrean_determine_results_free`](crate::od::empyrean_determine_results_free).
+ */
+
+int32_t empyrean_builtsystem_determine(const struct EmpyreanBuiltSystem *handle,
+                                       const EmpyreanContext *ctx,
+                                       const struct EmpyreanObservation *observations,
+                                       uintptr_t num_observations,
+                                       const struct EmpyreanRadarObservation *radar,
+                                       uintptr_t num_radar,
+                                       const struct EmpyreanOrbit *initial_orbits,
+                                       uintptr_t num_initial_orbits,
+                                       const struct EmpyreanODConfig *config,
+                                       struct EmpyreanDetermineResults *results_out);
+
+/**
+ * Evaluate residuals for a single orbit against observations, reusing
+ * the pre-built handle.
+ *
+ * Signature parallels the one-shot
+ * [`empyrean_evaluate`](crate::od::empyrean_evaluate) with `handle`
+ * prepended. Same identity guard, same code space, the same OD-handle
+ * requirement and the same `auto_force_model` refusal as
+ * [`empyrean_builtsystem_determine`]. Free `result_out` with
+ * [`empyrean_evaluate_result_free`](crate::od::empyrean_evaluate_result_free).
+ */
+
+int32_t empyrean_builtsystem_evaluate(const struct EmpyreanBuiltSystem *handle,
+                                      const EmpyreanContext *ctx,
+                                      const struct EmpyreanOrbit *orbit,
+                                      const struct EmpyreanObservation *observations,
+                                      uintptr_t num_observations,
+                                      const struct EmpyreanODConfig *config,
+                                      struct EmpyreanEvaluateResult *result_out);
+
+/**
+ * Refine a single orbit estimate with new observations using a Bayesian
+ * prior, reusing the pre-built handle.
+ *
+ * Signature parallels the one-shot
+ * [`empyrean_refine`](crate::od::empyrean_refine) with `handle`
+ * prepended. Same identity guard, same code space, the same OD-handle
+ * requirement and the same `auto_force_model` refusal as
+ * [`empyrean_builtsystem_determine`]. This is
+ * the measure-and-extend loop's entry point: build one handle, refine
+ * many times through it. Free `result_out` with
+ * [`empyrean_od_result_free`](crate::od::empyrean_od_result_free).
+ */
+
+int32_t empyrean_builtsystem_refine(const struct EmpyreanBuiltSystem *handle,
+                                    const EmpyreanContext *ctx,
+                                    const struct EmpyreanOrbit *orbit,
+                                    const struct EmpyreanObservation *observations,
+                                    uintptr_t num_observations,
+                                    const struct EmpyreanODConfig *config,
+                                    struct EmpyreanODResult *result_out);
 
 /**
  * Populate `out` with a full reproducibility summary of the handle's frozen

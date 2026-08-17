@@ -4956,7 +4956,61 @@ pub unsafe extern "C" fn empyrean_determine(
     config: *const EmpyreanODConfig,
     results_out: *mut EmpyreanDetermineResults,
 ) -> i32 {
-    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| unsafe {
+        determine_with_handle(
+            None,
+            ctx,
+            observations,
+            num_observations,
+            radar,
+            num_radar,
+            initial_orbits,
+            num_initial_orbits,
+            config,
+            results_out,
+        )
+    }));
+
+    match result {
+        Ok(code) => code,
+        Err(_) => {
+            set_last_error("panic in empyrean_determine");
+            -99
+        }
+    }
+}
+
+/// The body of [`empyrean_determine`], with the caller's pre-built force
+/// model threaded in.
+///
+/// `handle` is `None` for the one-shot entry point — the engine then
+/// injects a shared system of its own for the batch, exactly as before —
+/// and `Some((handle, ctx))` for
+/// [`empyrean_builtsystem_determine`](crate::built_system::empyrean_builtsystem_determine),
+/// where it is validated against the frozen key and refused loudly on any
+/// mismatch. Nothing else differs between the two paths, which is what
+/// makes their results bit-identical on a matching handle.
+///
+/// # Safety
+///
+/// Every pointer follows the exported entry point's contract.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn determine_with_handle(
+    handle: Option<(
+        *const crate::built_system::EmpyreanBuiltSystem,
+        *const EmpyreanContext,
+    )>,
+    ctx: *const EmpyreanContext,
+    observations: *const EmpyreanObservation,
+    num_observations: usize,
+    radar: *const EmpyreanRadarObservation,
+    num_radar: usize,
+    initial_orbits: *const EmpyreanOrbit,
+    num_initial_orbits: usize,
+    config: *const EmpyreanODConfig,
+    results_out: *mut EmpyreanDetermineResults,
+) -> i32 {
+    (|| {
         if ctx.is_null() || observations.is_null() || config.is_null() || results_out.is_null() {
             set_last_error("null pointer argument");
             return -1;
@@ -4992,13 +5046,21 @@ pub unsafe extern "C" fn empyrean_determine(
             Vec::new()
         };
 
-        let cfg = match build_od_config_from_c(cfg_ref) {
+        let mut cfg = match build_od_config_from_c(cfg_ref) {
             Ok(c) => c,
             Err(e) => {
                 set_last_error(&e);
                 return -1;
             }
         };
+        // A caller-supplied handle wins over the one the engine would
+        // inject for itself, and is validated against the frozen key
+        // first — a mismatch refuses the fit rather than quietly falling
+        // back to a per-solve assembly.
+        match crate::built_system::od_handle_for(handle, &cfg) {
+            Ok(h) => cfg.built_system = h,
+            Err(code) => return code,
+        }
 
         // Build the optional initial-orbit map. The HashMap key is the
         // ADES `object_id` of the matching observation group; we map
@@ -5155,15 +5217,7 @@ pub unsafe extern "C" fn empyrean_determine(
             return EMPYREAN_DETERMINE_NONE_DELIVERED;
         }
         0
-    }));
-
-    match result {
-        Ok(code) => code,
-        Err(_) => {
-            set_last_error("panic in empyrean_determine");
-            -99
-        }
-    }
+    })()
 }
 
 /// Move per-object slots into an owned C array.
@@ -5303,7 +5357,46 @@ pub unsafe extern "C" fn empyrean_evaluate(
     config: *const EmpyreanODConfig,
     result_out: *mut EmpyreanEvaluateResult,
 ) -> i32 {
-    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| unsafe {
+        evaluate_with_handle(
+            None,
+            ctx,
+            orbit,
+            observations,
+            num_observations,
+            config,
+            result_out,
+        )
+    }));
+
+    match result {
+        Ok(code) => code,
+        Err(_) => {
+            set_last_error("panic in empyrean_evaluate");
+            -99
+        }
+    }
+}
+
+/// The body of [`empyrean_evaluate`], with the caller's pre-built force
+/// model threaded in. See [`determine_with_handle`].
+///
+/// # Safety
+///
+/// Every pointer follows the exported entry point's contract.
+pub(crate) unsafe fn evaluate_with_handle(
+    handle: Option<(
+        *const crate::built_system::EmpyreanBuiltSystem,
+        *const EmpyreanContext,
+    )>,
+    ctx: *const EmpyreanContext,
+    orbit: *const EmpyreanOrbit,
+    observations: *const EmpyreanObservation,
+    num_observations: usize,
+    config: *const EmpyreanODConfig,
+    result_out: *mut EmpyreanEvaluateResult,
+) -> i32 {
+    (|| {
         if ctx.is_null()
             || orbit.is_null()
             || observations.is_null()
@@ -5335,13 +5428,17 @@ pub unsafe extern "C" fn empyrean_evaluate(
             }
         };
 
-        let cfg = match build_od_config_from_c(cfg_ref) {
+        let mut cfg = match build_od_config_from_c(cfg_ref) {
             Ok(c) => c,
             Err(e) => {
                 set_last_error(&e);
                 return -1;
             }
         };
+        match crate::built_system::od_handle_for(handle, &cfg) {
+            Ok(h) => cfg.built_system = h,
+            Err(code) => return code,
+        }
 
         // Single-orbit evaluate: residuals of this one orbit against ALL the
         // supplied observations, with no object-identifier keying.
@@ -5364,15 +5461,7 @@ pub unsafe extern "C" fn empyrean_evaluate(
             (*result_out).summary = summary;
         }
         0
-    }));
-
-    match result {
-        Ok(code) => code,
-        Err(_) => {
-            set_last_error("panic in empyrean_evaluate");
-            -99
-        }
-    }
+    })()
 }
 
 /// Free an evaluate result previously returned by `empyrean_evaluate()`.
@@ -5405,7 +5494,46 @@ pub unsafe extern "C" fn empyrean_refine(
     config: *const EmpyreanODConfig,
     result_out: *mut EmpyreanODResult,
 ) -> i32 {
-    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| unsafe {
+        refine_with_handle(
+            None,
+            ctx,
+            orbit,
+            observations,
+            num_observations,
+            config,
+            result_out,
+        )
+    }));
+
+    match result {
+        Ok(code) => code,
+        Err(_) => {
+            set_last_error("panic in empyrean_refine");
+            -99
+        }
+    }
+}
+
+/// The body of [`empyrean_refine`], with the caller's pre-built force
+/// model threaded in. See [`determine_with_handle`].
+///
+/// # Safety
+///
+/// Every pointer follows the exported entry point's contract.
+pub(crate) unsafe fn refine_with_handle(
+    handle: Option<(
+        *const crate::built_system::EmpyreanBuiltSystem,
+        *const EmpyreanContext,
+    )>,
+    ctx: *const EmpyreanContext,
+    orbit: *const EmpyreanOrbit,
+    observations: *const EmpyreanObservation,
+    num_observations: usize,
+    config: *const EmpyreanODConfig,
+    result_out: *mut EmpyreanODResult,
+) -> i32 {
+    (|| {
         if ctx.is_null()
             || orbit.is_null()
             || observations.is_null()
@@ -5437,13 +5565,17 @@ pub unsafe extern "C" fn empyrean_refine(
             }
         };
 
-        let cfg = match build_od_config_from_c(cfg_ref) {
+        let mut cfg = match build_od_config_from_c(cfg_ref) {
             Ok(c) => c,
             Err(e) => {
                 set_last_error(&e);
                 return -1;
             }
         };
+        match crate::built_system::od_handle_for(handle, &cfg) {
+            Ok(h) => cfg.built_system = h,
+            Err(code) => return code,
+        }
 
         // Single-orbit refine: Bayesian update of this one orbit against ALL
         // the supplied observations, with no object-identifier keying.
@@ -5474,15 +5606,7 @@ pub unsafe extern "C" fn empyrean_refine(
             }
         }
         0
-    }));
-
-    match result {
-        Ok(code) => code,
-        Err(_) => {
-            set_last_error("panic in empyrean_refine");
-            -99
-        }
-    }
+    })()
 }
 
 #[cfg(test)]
@@ -7401,5 +7525,608 @@ mod od_output_joint_tests {
             msg.contains("99") && msg.contains("kind"),
             "the message must name the offending tag: {msg}"
         );
+    }
+}
+
+/// The named handle-backed OD entry points: bit-identity with the
+/// one-shots, proof that the caller's own handle serves the fit, and
+/// every identity-guard axis as its own loud code.
+///
+/// The whole point of a named reuse API is that a caller who thinks they
+/// are amortizing actually is. That claim splits in two, and both halves
+/// need their own test: the numbers must not move (bit-identity), and the
+/// handle must actually be the one that produced them (`Arc` identity —
+/// bit-identity cannot see it, because a matching key makes the engine's
+/// own system indistinguishable). The engine's adoption filter degrades
+/// silently on a mismatch — correct there, since it costs only speed —
+/// but at this surface a mismatched handle, or a config that would move
+/// the key mid-fit, must refuse, so these pin every axis by code.
+///
+/// Gated on a real data directory; skipped without one, and **not**
+/// skipped on a runner that was pointed at one.
+#[cfg(test)]
+mod builtsystem_od_tests {
+    use super::tests::{read_eros_observations, refeed_orbit, standard_od_config};
+    use super::*;
+    use crate::built_system::{
+        EMPYREAN_BUILTSYSTEM_CONFIG_MUTATES_KEY, EMPYREAN_BUILTSYSTEM_DATA_MISMATCH,
+        EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_DIVISOR, EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_FORCE_MODEL,
+        EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_FRAME, EMPYREAN_BUILTSYSTEM_OK,
+        EMPYREAN_BUILTSYSTEM_STALE, EmpyreanBuiltSystem, empyrean_builtsystem_determine,
+        empyrean_builtsystem_evaluate, empyrean_builtsystem_free, empyrean_builtsystem_new,
+        empyrean_builtsystem_new_for_od, empyrean_builtsystem_refine,
+    };
+    // The crate-wide loud helper: a context failure on a runner that was
+    // pointed at a data directory fails the test instead of skipping it.
+    // These tests carry the whole warrant for this surface, so a
+    // silent self-disable here would be the most expensive false green in
+    // the suite.
+    use crate::testing::context_or_skip;
+
+    /// Standard tier, the tier `standard_od_config` fits under.
+    const STANDARD: i32 = 2;
+
+    fn last_err() -> String {
+        unsafe { CStr::from_ptr(crate::empyrean_last_error()) }
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// An OD-keyed handle over `ctx` at the Standard tier.
+    fn od_handle(ctx: *const EmpyreanContext) -> *mut EmpyreanBuiltSystem {
+        let mut handle: *mut EmpyreanBuiltSystem = std::ptr::null_mut();
+        let code = unsafe { empyrean_builtsystem_new_for_od(ctx, STANDARD, &mut handle) };
+        assert_eq!(
+            code,
+            EMPYREAN_BUILTSYSTEM_OK,
+            "OD handle build failed: {}",
+            last_err()
+        );
+        assert!(!handle.is_null());
+        handle
+    }
+
+    /// A plain heliocentric orbit the optical forward model can run over
+    /// the bundled arc. Not a fit and not meant to be one — the tests
+    /// that use it assert return codes and handle identity, never
+    /// residual quality.
+    fn probe_orbit() -> EmpyreanOrbit {
+        let mut orbit: EmpyreanOrbit = unsafe { std::mem::zeroed() };
+        orbit.state = crate::CoordinateState {
+            epoch_mjd_tdb: 59000.0,
+            elements: [1.0, 0.1, 0.05, -0.005, 0.015, 0.001],
+            covariance: [[0.0; 6]; 6],
+            has_covariance: 0,
+            representation: EMPYREAN_REPRESENTATION_CARTESIAN,
+            frame: 0,
+            origin: 10,
+            has_non_grav_cross: 0,
+            non_grav_cross: [[0.0; 3]; 6],
+        };
+        orbit.non_grav_dt = f64::NAN;
+        orbit.non_grav_dt_variance = f64::NAN;
+        orbit.phot_system = -1;
+        orbit.h_mag = f64::NAN;
+        orbit.srp_amrat_variance = f64::NAN;
+        orbit
+    }
+
+    /// Every f64 the fitted state carries, for a bit-identity comparison.
+    fn fitted_bits(p: &EmpyreanPropagatedState) -> Vec<u64> {
+        let mut bits: Vec<u64> = [p.x, p.y, p.z, p.vx, p.vy, p.vz, p.epoch_mjd_tdb]
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        for row in &p.covariance {
+            bits.extend(row.iter().map(|v| v.to_bits()));
+        }
+        bits
+    }
+
+    /// The OD key recipe, pinned.
+    ///
+    /// `empyrean_builtsystem_new_for_od` exists so the frame and the
+    /// divisor an OD fit runs under cannot be got wrong by hand. If the
+    /// engine's ephemeris defaults ever move, every documented handle
+    /// would start failing the guard — so the recipe is asserted here
+    /// rather than discovered in the field.
+    #[test]
+    fn the_od_key_recipe_is_pinned() {
+        use empyrean_core::coordinates::Frame;
+        use empyrean_core::ephemeris::EphemerisConfig;
+
+        let key = EphemerisConfig::default().propagation;
+        assert_eq!(
+            key.frame,
+            Frame::EclipticJ2000,
+            "OD integrates in EclipticJ2000 — an ICRF handle is the documented footgun"
+        );
+        assert_eq!(
+            key.advanced.encounter_timescale_divisor, 1000.0,
+            "the OD key freezes the engine-default encounter-timescale divisor"
+        );
+
+        let Some(ctx) = context_or_skip("the_od_key_recipe_is_pinned (handle half)") else {
+            return;
+        };
+        let ctx_ptr: *const EmpyreanContext = &ctx;
+        let handle = od_handle(ctx_ptr);
+        let mut desc: crate::built_system::EmpyreanSystemDescription =
+            unsafe { std::mem::zeroed() };
+        let code = unsafe { crate::built_system::empyrean_builtsystem_describe(handle, &mut desc) };
+        assert_eq!(code, EMPYREAN_BUILTSYSTEM_OK, "describe: {}", last_err());
+        assert_eq!(desc.force_model, STANDARD);
+        assert_eq!(desc.frame, 1, "EclipticJ2000 is frame code 1");
+        assert_eq!(desc.encounter_timescale_divisor, 1000.0);
+        unsafe {
+            crate::built_system::empyrean_builtsystem_description_free(&mut desc);
+            empyrean_builtsystem_free(handle);
+        }
+    }
+
+    /// All three handle-backed entry points reproduce their one-shot
+    /// bit-for-bit on a matching handle. The handle changes *when* the
+    /// force model is assembled, never the numbers.
+    #[test]
+    fn handle_backed_od_matches_the_one_shots() {
+        let Some(ctx) = context_or_skip("handle_backed_od_matches_the_one_shots") else {
+            return;
+        };
+        let ctx_ptr: *const EmpyreanContext = &ctx;
+        let (obs_ptr, obs_n) = read_eros_observations();
+        let cfg = standard_od_config();
+        let handle = od_handle(ctx_ptr);
+
+        // ── determine ────────────────────────────────────────────
+        let mut one_shot: EmpyreanDetermineResults = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            empyrean_determine(
+                ctx_ptr,
+                obs_ptr,
+                obs_n,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                &cfg,
+                &mut one_shot,
+            )
+        };
+        assert_eq!(rc, 0, "one-shot determine: {}", last_err());
+
+        let mut via_handle: EmpyreanDetermineResults = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            empyrean_builtsystem_determine(
+                handle,
+                ctx_ptr,
+                obs_ptr,
+                obs_n,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                &cfg,
+                &mut via_handle,
+            )
+        };
+        assert_eq!(rc, 0, "handle determine: {}", last_err());
+        assert_eq!(one_shot.num_objects, via_handle.num_objects);
+        assert_eq!(one_shot.num_objects, 1);
+        let a = unsafe { &*one_shot.objects };
+        let b = unsafe { &*via_handle.objects };
+        assert_eq!(a.delivered, 1);
+        assert_eq!(b.delivered, 1, "handle determine must deliver");
+        assert_eq!(
+            fitted_bits(&a.result.orbit),
+            fitted_bits(&b.result.orbit),
+            "determine through the handle must be bit-identical to the one-shot"
+        );
+        assert_eq!(
+            a.result.summary.reduced_chi2.to_bits(),
+            b.result.summary.reduced_chi2.to_bits()
+        );
+
+        let refed = refeed_orbit(&a.result.orbit);
+
+        // ── evaluate ─────────────────────────────────────────────
+        let mut eval_one: EmpyreanEvaluateResult = unsafe { std::mem::zeroed() };
+        let rc = unsafe { empyrean_evaluate(ctx_ptr, &refed, obs_ptr, obs_n, &cfg, &mut eval_one) };
+        assert_eq!(rc, 0, "one-shot evaluate: {}", last_err());
+        let mut eval_handle: EmpyreanEvaluateResult = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            empyrean_builtsystem_evaluate(
+                handle,
+                ctx_ptr,
+                &refed,
+                obs_ptr,
+                obs_n,
+                &cfg,
+                &mut eval_handle,
+            )
+        };
+        assert_eq!(rc, 0, "handle evaluate: {}", last_err());
+        assert_eq!(eval_one.num_observations, eval_handle.num_observations);
+        assert!(eval_one.num_observations > 0);
+        assert_eq!(
+            eval_one.summary.rms_combined_arcsec.to_bits(),
+            eval_handle.summary.rms_combined_arcsec.to_bits(),
+            "evaluate through the handle must be bit-identical to the one-shot"
+        );
+        for i in 0..eval_one.num_observations {
+            let ra = unsafe { &*eval_one.observations.add(i) };
+            let rb = unsafe { &*eval_handle.observations.add(i) };
+            assert_eq!(
+                ra.ra_residual_arcsec.to_bits(),
+                rb.ra_residual_arcsec.to_bits(),
+                "residual RA row {i}"
+            );
+            assert_eq!(
+                ra.dec_residual_arcsec.to_bits(),
+                rb.dec_residual_arcsec.to_bits(),
+                "residual Dec row {i}"
+            );
+        }
+
+        // ── refine ───────────────────────────────────────────────
+        let mut ref_one: EmpyreanODResult = unsafe { std::mem::zeroed() };
+        let rc = unsafe { empyrean_refine(ctx_ptr, &refed, obs_ptr, obs_n, &cfg, &mut ref_one) };
+        assert_eq!(rc, 0, "one-shot refine: {}", last_err());
+        let mut ref_handle: EmpyreanODResult = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            empyrean_builtsystem_refine(
+                handle,
+                ctx_ptr,
+                &refed,
+                obs_ptr,
+                obs_n,
+                &cfg,
+                &mut ref_handle,
+            )
+        };
+        assert_eq!(rc, 0, "handle refine: {}", last_err());
+        assert_eq!(
+            fitted_bits(&ref_one.orbit),
+            fitted_bits(&ref_handle.orbit),
+            "refine through the handle must be bit-identical to the one-shot"
+        );
+
+        unsafe {
+            empyrean_evaluate_result_free(&mut eval_one);
+            empyrean_evaluate_result_free(&mut eval_handle);
+            empyrean_od_result_free(&mut ref_one);
+            empyrean_od_result_free(&mut ref_handle);
+            empyrean_determine_results_free(&mut one_shot);
+            empyrean_determine_results_free(&mut via_handle);
+            empyrean_observations_free(obs_ptr, obs_n);
+            empyrean_builtsystem_free(handle);
+        }
+    }
+
+    /// The fit runs against the caller's *own* handle, not merely against
+    /// some handle.
+    ///
+    /// Bit-identity cannot show this and never will: on a matching key
+    /// the system the engine assembles for itself is physically
+    /// indistinguishable from the caller's, which is exactly why
+    /// `handle_backed_od_matches_the_one_shots` is a valid parity test.
+    /// The one thing that *does* distinguish "the caller's `Arc` served
+    /// this fit" from "the engine built its own and threw it away" is the
+    /// identity of the `Arc` — so this watches its strong count across a
+    /// real exported call.
+    ///
+    /// Adopted, the count is elevated for essentially the whole call: the
+    /// guard's clone lives in `ODConfig::built_system` until the call
+    /// returns, the engine's `with_shared_system` clones it again rather
+    /// than building one, and scott's `ODProblem` holds a third for the
+    /// solve. Not adopted, it falls back to the baseline the instant the
+    /// guard's clone is dropped, and the engine assembles a system of its
+    /// own that this `Arc` knows nothing about — the same numbers, none of
+    /// the amortization, and a `0` return either way.
+    ///
+    /// All three entry points inject the handle on their own line, so all
+    /// three are watched: delete `cfg.built_system = h` from
+    /// `determine_with_handle`, `evaluate_with_handle` or
+    /// `refine_with_handle` and this goes red naming the verb, while every
+    /// other test in the branch stays green.
+    #[test]
+    fn the_fit_runs_against_the_callers_handle() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let Some(ctx) = context_or_skip("the_fit_runs_against_the_callers_handle") else {
+            return;
+        };
+        let ctx_ptr: *const EmpyreanContext = &ctx;
+        let (obs_ptr, obs_n) = read_eros_observations();
+        let cfg = standard_od_config();
+        let handle = od_handle(ctx_ptr);
+
+        // The very `Arc` the guard hands the fit. Taken through the guard
+        // itself so the test cannot drift from what the entry point
+        // injects, and so a guard that stopped returning the caller's
+        // handle would fail here first.
+        let cfg_rs = build_od_config_from_c(&cfg).expect("the Standard-tier config must translate");
+        let watched = crate::built_system::od_handle_for(Some((handle, ctx_ptr)), &cfg_rs)
+            .expect("the guard must accept a matching OD handle")
+            .expect("a handle was supplied, so the guard must return one");
+        let baseline = std::sync::Arc::strong_count(&watched);
+
+        /// Run `call` while a second thread samples the watched `Arc`'s
+        /// strong count, and assert the count stayed above `baseline` for
+        /// the call.
+        ///
+        /// Adopted, the elevation covers all but the marshaling prologue:
+        /// measured 2302/2309 samples on `evaluate`. Not adopted, the only
+        /// window is the few nanoseconds the guard's clone exists before it
+        /// is dropped: measured 0/2322 with the injection deleted. A simple
+        /// majority sits orders of magnitude away from either measurement,
+        /// so the threshold is a formality, not a tuning knob.
+        fn watched_call(
+            verb: &str,
+            watched: &std::sync::Arc<empyrean_core::propagation::BuiltSystem>,
+            baseline: usize,
+            call: impl FnOnce() -> i32,
+        ) {
+            let stop = AtomicBool::new(false);
+            let samples = AtomicUsize::new(0);
+            let elevated = AtomicUsize::new(0);
+            let code = std::thread::scope(|s| {
+                s.spawn(|| {
+                    while !stop.load(Ordering::Relaxed) {
+                        samples.fetch_add(1, Ordering::Relaxed);
+                        if std::sync::Arc::strong_count(watched) > baseline {
+                            elevated.fetch_add(1, Ordering::Relaxed);
+                        }
+                        std::thread::sleep(Duration::from_micros(50));
+                    }
+                });
+                let code = call();
+                stop.store(true, Ordering::Relaxed);
+                code
+            });
+            assert_eq!(code, EMPYREAN_BUILTSYSTEM_OK, "{verb} must succeed");
+
+            let samples = samples.load(Ordering::Relaxed);
+            let elevated = elevated.load(Ordering::Relaxed);
+            assert!(
+                samples >= 8,
+                "{verb}: the watcher must observe the call, not race past it \
+                 ({samples} samples)"
+            );
+            assert!(
+                elevated * 2 > samples,
+                "{verb} must hold the caller's handle for the call rather than assemble \
+                 its own: {elevated}/{samples} samples saw a strong count above the \
+                 {baseline} the test itself holds"
+            );
+        }
+
+        // The guard passes, so each call runs a real forward model over
+        // every observation in the arc — long enough to watch. `determine`
+        // goes first because `refine` needs the prior it produces.
+        let mut fit: EmpyreanDetermineResults = unsafe { std::mem::zeroed() };
+        watched_call("determine", &watched, baseline, || unsafe {
+            empyrean_builtsystem_determine(
+                handle,
+                ctx_ptr,
+                obs_ptr,
+                obs_n,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                &cfg,
+                &mut fit,
+            )
+        });
+        assert_eq!(fit.num_objects, 1);
+        let delivered = unsafe { &*fit.objects };
+        assert_eq!(delivered.delivered, 1, "the arc must fit: {}", last_err());
+        let orbit = refeed_orbit(&delivered.result.orbit);
+
+        watched_call("refine", &watched, baseline, || {
+            let mut out: EmpyreanODResult = unsafe { std::mem::zeroed() };
+            let code = unsafe {
+                empyrean_builtsystem_refine(handle, ctx_ptr, &orbit, obs_ptr, obs_n, &cfg, &mut out)
+            };
+            unsafe { empyrean_od_result_free(&mut out) };
+            code
+        });
+
+        watched_call("evaluate", &watched, baseline, || {
+            let mut out: EmpyreanEvaluateResult = unsafe { std::mem::zeroed() };
+            let code = unsafe {
+                empyrean_builtsystem_evaluate(
+                    handle, ctx_ptr, &orbit, obs_ptr, obs_n, &cfg, &mut out,
+                )
+            };
+            unsafe { empyrean_evaluate_result_free(&mut out) };
+            code
+        });
+
+        unsafe {
+            empyrean_determine_results_free(&mut fit);
+            empyrean_observations_free(obs_ptr, obs_n);
+            empyrean_builtsystem_free(handle);
+        }
+    }
+
+    /// Every identity-guard axis fires by code on the OD path, and the
+    /// guard runs before any fitting — a mismatched handle refuses the
+    /// fit rather than quietly assembling a per-solve system, which is
+    /// what the engine's internal filter does and what a named reuse API
+    /// must not. The sixth axis is on the *config*: a setting that will
+    /// move the frozen key mid-fit is refused up front rather than
+    /// accepted and dropped downstream.
+    ///
+    /// `evaluate` is the probe because the guard runs ahead of any work,
+    /// so a rejection costs nothing.
+    #[test]
+    fn od_guard_fires_on_every_axis() {
+        use std::sync::atomic::Ordering;
+
+        let Some(ctx) = context_or_skip("od_guard_fires_on_every_axis") else {
+            return;
+        };
+        let ctx_ptr: *const EmpyreanContext = &ctx;
+        let (obs_ptr, obs_n) = read_eros_observations();
+        let cfg = standard_od_config();
+
+        // A minimal orbit to evaluate; on the refusal axes the guard
+        // rejects before it is read, and on the two acceptance axes it is
+        // simply an orbit the forward model can run.
+        let orbit = probe_orbit();
+
+        let evaluate_through = |handle: *mut EmpyreanBuiltSystem, ctx: *const EmpyreanContext| {
+            let mut out: EmpyreanEvaluateResult = unsafe { std::mem::zeroed() };
+            let code = unsafe {
+                empyrean_builtsystem_evaluate(handle, ctx, &orbit, obs_ptr, obs_n, &cfg, &mut out)
+            };
+            unsafe { empyrean_evaluate_result_free(&mut out) };
+            code
+        };
+
+        // ── frame: the documented footgun. Every propagation example in
+        // the header builds ICRF handles; OD integrates in EclipticJ2000.
+        let mut icrf: *mut EmpyreanBuiltSystem = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { empyrean_builtsystem_new(ctx_ptr, STANDARD, 0, 0.0, &mut icrf) },
+            EMPYREAN_BUILTSYSTEM_OK,
+            "{}",
+            last_err()
+        );
+        assert_eq!(
+            evaluate_through(icrf, ctx_ptr),
+            EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_FRAME,
+            "an ICRF handle must be refused by axis on the OD path: {}",
+            last_err()
+        );
+        unsafe { empyrean_builtsystem_free(icrf) };
+
+        // ── force model: Basic handle, Standard config.
+        let mut basic: *mut EmpyreanBuiltSystem = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { empyrean_builtsystem_new_for_od(ctx_ptr, 1, &mut basic) },
+            EMPYREAN_BUILTSYSTEM_OK,
+            "{}",
+            last_err()
+        );
+        assert_eq!(
+            evaluate_through(basic, ctx_ptr),
+            EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_FORCE_MODEL,
+            "a Basic handle must not serve a Standard fit: {}",
+            last_err()
+        );
+        unsafe { empyrean_builtsystem_free(basic) };
+
+        // ── divisor: right frame and tier, non-default step floor.
+        let mut divisor: *mut EmpyreanBuiltSystem = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { empyrean_builtsystem_new(ctx_ptr, STANDARD, 1, 500.0, &mut divisor) },
+            EMPYREAN_BUILTSYSTEM_OK,
+            "{}",
+            last_err()
+        );
+        assert_eq!(
+            evaluate_through(divisor, ctx_ptr),
+            EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_DIVISOR,
+            "a non-default divisor changes the integration: {}",
+            last_err()
+        );
+        unsafe { empyrean_builtsystem_free(divisor) };
+
+        // ── data identity: a handle from a second, independently loaded
+        // context. Structurally identical kernels, different `Arc`s.
+        //
+        // The first context built, so this one must too. Returning early
+        // here would silently drop the DATA_MISMATCH and STALE axes from
+        // a run that is otherwise fully provisioned — a half-executed
+        // test reported as a whole one.
+        // Serialized through the ABI's own construction lock, so this cannot
+        // race another test's first-init cache I/O and turn a transient
+        // provisioning collision into a hard failure below.
+        let other = {
+            let _guard = crate::construct_lock();
+            EmpyreanContext::from_data_dir(None)
+                .expect("the first context built, so a second independent load must build too")
+        };
+        let other_ptr: *const EmpyreanContext = &other;
+        let foreign = od_handle(other_ptr);
+        assert_eq!(
+            evaluate_through(foreign, ctx_ptr),
+            EMPYREAN_BUILTSYSTEM_DATA_MISMATCH,
+            "a handle from a foreign context must never serve this one: {}",
+            last_err()
+        );
+        // …and the same handle against its OWN context SERVES THE FIT, so
+        // the rejection above is specific rather than blanket. Asserting
+        // success rather than "not DATA_MISMATCH" is the point: ten other
+        // codes satisfy the inequality, so a guard that had started
+        // refusing every valid handle would still have passed it.
+        assert_eq!(
+            evaluate_through(foreign, other_ptr),
+            EMPYREAN_BUILTSYSTEM_OK,
+            "a matching handle must serve the fit, not merely avoid one code: {}",
+            last_err()
+        );
+        unsafe { empyrean_builtsystem_free(foreign) };
+
+        // ── the config axis: `auto_force_model` re-picks the tier
+        // part-way through the fit, so the engine's own adoption filter
+        // would drop this handle downstream while the call still reported
+        // success — the caller pays a per-solve assembly and is never
+        // told. Nothing about the handle is wrong here (it is the same
+        // handle every other axis accepts), which is why the refusal has
+        // to be on the config, before any fitting.
+        let auto_handle = od_handle(ctx_ptr);
+        let auto_cfg = EmpyreanODConfig {
+            auto_force_model: 1,
+            ..standard_od_config()
+        };
+        let mut auto_out: EmpyreanEvaluateResult = unsafe { std::mem::zeroed() };
+        let auto_code = unsafe {
+            empyrean_builtsystem_evaluate(
+                auto_handle,
+                ctx_ptr,
+                &orbit,
+                obs_ptr,
+                obs_n,
+                &auto_cfg,
+                &mut auto_out,
+            )
+        };
+        unsafe { empyrean_evaluate_result_free(&mut auto_out) };
+        assert_eq!(
+            auto_code,
+            EMPYREAN_BUILTSYSTEM_CONFIG_MUTATES_KEY,
+            "auto_force_model forfeits reuse, so it must be refused rather than accepted \
+             with a caveat: {}",
+            last_err()
+        );
+        assert!(
+            last_err().contains("auto_force_model"),
+            "the refusal must name the field the caller has to change: {}",
+            last_err()
+        );
+        unsafe { empyrean_builtsystem_free(auto_handle) };
+
+        // ── staleness: the source data mutated after the handle was
+        // built. `empyrean_context_with_spk` cannot reach this state — it
+        // refuses once the kernels are shared, which is the other half of
+        // the same protection — so bump the very counter every `load_*`
+        // bumps, which is what the handle's freshness check reads.
+        let stale_handle = od_handle(ctx_ptr);
+        ctx.ephemeris_data()
+            .epoch_generation
+            .fetch_add(1, Ordering::Relaxed);
+        assert_eq!(
+            evaluate_through(stale_handle, ctx_ptr),
+            EMPYREAN_BUILTSYSTEM_STALE,
+            "a handle built before a kernel load must refuse to serve: {}",
+            last_err()
+        );
+        unsafe { empyrean_builtsystem_free(stale_handle) };
+
+        unsafe { empyrean_observations_free(obs_ptr, obs_n) };
     }
 }

@@ -719,6 +719,7 @@ def determine(
     *,
     radar: ADESRadarObservations | None = None,
     config: ODConfig | None = None,
+    _builtsystem: Any = None,
 ) -> DetermineResults:
     """Run the full orbit determination pipeline (IOD + DC) over every
     object in ``observations``.
@@ -775,7 +776,13 @@ def determine(
         for oid, orbit in initial_orbits.items():
             initial_orbits_dict[oid] = _orbits_to_dict(orbit)
 
-    batch = _determine(obs_dict, config._to_wire_dict(), initial_orbits_dict, radar_dict)
+    batch = _determine(
+        obs_dict,
+        config._to_wire_dict(),
+        initial_orbits_dict,
+        radar_dict,
+        _builtsystem,
+    )
     seed_labels = _seed_labels(observations, list(initial_orbits)) if initial_orbits else {}
     return _build_determine_results(batch, seed_labels)
 
@@ -931,6 +938,7 @@ def evaluate(
     observations: ADESObservations,
     *,
     config: ODConfig | None = None,
+    _builtsystem: Any = None,
 ) -> EvaluateResult:
     """Evaluate residuals for an orbit against observations.
 
@@ -961,7 +969,7 @@ def evaluate(
 
     orbit_dict = _orbits_to_dict(orbit)
     obs_dict = _obs_to_dict(observations)
-    result = _evaluate_single(orbit_dict, obs_dict, config._to_wire_dict())
+    result = _evaluate_single(orbit_dict, obs_dict, config._to_wire_dict(), _builtsystem)
 
     obs_results = _build_observation_results(result)
     summary = _build_residual_summary(result, prefix="summary_")
@@ -974,6 +982,7 @@ def refine(
     observations: ADESObservations,
     *,
     config: ODConfig | None = None,
+    _builtsystem: Any = None,
 ) -> DetermineResult:
     """Refine an orbit with new observations using a Bayesian prior.
 
@@ -1006,7 +1015,7 @@ def refine(
 
     orbit_dict = _orbits_to_dict(orbit)
     obs_dict = _obs_to_dict(observations)
-    result = _refine_single(orbit_dict, obs_dict, config._to_wire_dict())
+    result = _refine_single(orbit_dict, obs_dict, config._to_wire_dict(), _builtsystem)
 
     # Carry the prior orbit's identity onto the refined fit (the C ABI drops it).
     _inject_identity(result, _orbit_identity(orbit))

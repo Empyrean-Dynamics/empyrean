@@ -807,8 +807,10 @@ frees an `empyrean_refine` result.
 `empyrean_builtsystem_new` assembles a reusable force-model handle for a
 `(force_model, frame)` pair, freezing `encounter_timescale_divisor` into
 its key, so a caller running many propagations pays the assembly cost
-once. `empyrean_builtsystem_propagate` and
-`empyrean_builtsystem_generate_ephemeris` parallel their one-shot
+once. `empyrean_builtsystem_propagate`,
+`empyrean_builtsystem_generate_ephemeris`,
+`empyrean_builtsystem_determine`, `empyrean_builtsystem_evaluate` and
+`empyrean_builtsystem_refine` parallel their one-shot
 equivalents but take `(handle, ctx, ...)`; on a pass their results are
 bit-identical to the one-shot with the same config.
 `empyrean_builtsystem_describe` returns a full reproducibility summary of
@@ -816,8 +818,23 @@ the frozen force model and the kernel manifest captured at construction
 (release it with `empyrean_builtsystem_description_free`; the handle
 itself with `empyrean_builtsystem_free`).
 
+The three OD entry points need an **OD handle**, which is not the handle
+the propagation examples build: a fit integrates in EclipticJ2000 (frame
+code `1`) at the engine-default encounter-timescale divisor, and `EmpyreanODConfig`
+carries no knob for either. Build it with
+`empyrean_builtsystem_new_for_od(ctx, force_model, &out)`, which freezes
+that recipe for you. Handing an ICRF propagation handle to
+`empyrean_builtsystem_determine` is the expected mistake and comes back
+as `EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_FRAME` (`-21`), not as a fit under
+dynamics you did not ask for. `EmpyreanODConfig::auto_force_model` is
+refused with `EMPYREAN_BUILTSYSTEM_CONFIG_MUTATES_KEY` (`-25`) when a
+handle is passed: it lets the fit re-pick its own tier part-way through,
+which no frozen handle can follow, so the engine would drop the handle
+mid-fit and reassemble per solve while the call still returned `0`.
+
 The reuse is only safe because it is **guarded**, and every guard failure
-is a distinct code — never a silently served result:
+is a distinct code — never a silently served result. The same table
+governs the three OD entry points:
 
 | code | guard |
 |------|-------|
@@ -827,6 +844,7 @@ is a distinct code — never a silently served result:
 | `EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_FORCE_MODEL` (`-22`) | the per-call force-model tier diverges from the frozen tier |
 | `EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_DIVISOR` (`-23`) | the per-call encounter-timescale divisor diverges from the frozen divisor |
 | `EMPYREAN_BUILTSYSTEM_STALE` (`-24`) | a kernel was loaded into the context after the handle was built — rebuild it |
+| `EMPYREAN_BUILTSYSTEM_CONFIG_MUTATES_KEY` (`-25`) | the config, not the handle, would move the frozen key mid-call (`EmpyreanODConfig::auto_force_model`) — clear it, or use the one-shot |
 | `EMPYREAN_BUILTSYSTEM_NULL_POINTER` (`-1`) / `_INVALID_ARGUMENT` (`-2`) / `_PROPAGATION` (`-3`) / `_ALLOC` (`-5`) / `_PANIC` (`-99`) | non-guard failures |
 
 The C-ABI ephemeris config carries no divisor knob, so a handle frozen at
@@ -834,8 +852,15 @@ a non-default divisor is rejected by
 `empyrean_builtsystem_generate_ephemeris` with
 `EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_DIVISOR` rather than served under the
 wrong dynamics — build the handle with the default divisor for ephemeris
-reuse. `empyrean_last_error()` carries the message on every non-zero
-return.
+reuse, and with `empyrean_builtsystem_new_for_od` for OD reuse.
+`empyrean_last_error()` carries the message on every non-zero return.
+
+The guard **refuses**; it never degrades to a per-solve assembly. That is
+a deliberate divergence from what the engine does with a handle it
+injected for itself, where a mismatch costs only speed: a caller who
+named these entry points asked to reuse one specific frozen force model,
+and paying for a rebuild on every call while the return code says `0` is
+the silent substitution this ABI does not make.
 
 ## Impact probability & uncertainty methods
 

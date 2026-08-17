@@ -155,6 +155,7 @@ blocks alongside the 6×6 state block.
    :nosignatures:
 
    empyrean.build_system
+   empyrean.od_system
    empyrean.BuiltSystem
    empyrean.SystemDescription
    empyrean.KernelRecord

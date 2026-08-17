@@ -63,6 +63,7 @@ from empyrean.propagation.events import (
     ShadowEntries,
     ShadowExits,
 )
+from empyrean.propagation.mixtures import build_mixture_chains
 from empyrean.propagation.result import PropagationResult
 from empyrean.propagation.tagged_covariance import _KIND_BY_CODE
 
@@ -165,6 +166,28 @@ def propagate(
           ``SECOND_ORDER``), so for a well-determined object it reads back
           very close to ``FIRST_ORDER`` (tagged ``linear``) — that is
           expected, not a bug.
+
+          The mixture components themselves come back on
+          :attr:`PropagationResult.mixtures` (a
+          :class:`~empyrean.propagation.mixtures.MixtureChains` table),
+          so a consumer can evaluate ``sum_k w_k * N(x | mu_k, Sigma_k)``
+          directly at a retained close-approach epoch. Four limits apply
+          to what is retained, each a real property of the engine's
+          retention rather than a marshaling shortfall:
+
+          - **Depth-0 only.** Only the initial split is retained;
+            recursive AGM calls (depth > 0) are not captured.
+          - **Only CA epochs where AGM fired.** An orbit that never
+            triggered a split contributes no rows, not a one-component
+            chain.
+          - **Component covariance is the linear map.** Each component's
+            covariance is ``Phi Sigma_k Phi^T``; the second-order mean
+            correction is intentionally omitted.
+          - **Retained weights may sum to less than 1.** A sub-Gaussian
+            whose own sub-propagation missed the close approach (or
+            failed to integrate) contributes no component, and the
+            deficit is not recorded anywhere. Do not assume
+            ``sum_k w_k == 1``; sum ``weight`` and check.
     num_threads : int, optional
         Threads for multi-orbit propagation. ``None`` (default) and
         ``0`` both use all available cores; ``n`` > 0 pins exactly
@@ -557,11 +580,17 @@ def propagate(
     # ── Build provenance-tagged covariance table (opt-in) ─────
     tagged = _build_tagged_covariance(result) if tagged_covariance else None
 
+    # ── Retained AGM mixture components (always on) ───────────
+    # Free: the components already crossed the boundary with the result.
+    # Empty table when nothing split.
+    mixtures = build_mixture_chains(result)
+
     return PropagationResult(
         states=states,
         events=detected_events,
         sensitivity=sensitivity,
         tagged_covariance=tagged,
+        mixtures=mixtures,
     )
 
 

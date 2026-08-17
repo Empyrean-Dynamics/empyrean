@@ -23,7 +23,13 @@ pub enum CovarianceKind {
     SecondOrder,
     /// Third-order (Jet3 STT3) extension.
     ThirdOrder,
-    /// Adaptive Gaussian Mixture (moment-collapsed to a single second moment).
+    /// Adaptive Gaussian Mixture. This *tag's* matrix is the mixture's
+    /// moment collapse \\(\Sigma = \sum_k w_k (\Sigma_k + d_k d_k^\top)\\)
+    /// — a single second moment, which is all a covariance readback can
+    /// carry. The mixture itself is **not** collapsed by the engine: the
+    /// retained per-component weights, means and covariances are on
+    /// [`PropagationResult::mixtures`] and
+    /// [`PropagationResult::mixture_at`].
     Mixture,
     /// Monte Carlo sample covariance.
     MonteCarlo,
@@ -480,6 +486,230 @@ impl Event {
     }
 }
 
+/// One Gaussian sub-component of an adaptive-Gaussian-mixture (AGM)
+/// decomposition, retained at a close-approach epoch.
+///
+/// The mean is the *propagated* sub-Gaussian centroid at the CA epoch;
+/// the covariance is the linearly-mapped
+/// \\(\Phi \\, \Sigma_k \\, \Phi^\top\\) over the same segment (the
+/// second-order mean correction is omitted by design). A consumer can
+/// evaluate
+/// \\(\sum_k w_k \\, \mathcal{N}(x \mid \mu_k, \Sigma_k)\\)
+/// directly at that epoch — no further propagation is needed.
+///
+/// Each component is basis-tagged, so the mixture is self-describing
+/// rather than relying on positional alignment with the propagated
+/// states.
+///
+/// Named to match `empyrean_core::propagation::MixtureComponent`
+/// exactly. It is deliberately **not** re-exported at the crate root,
+/// where [`crate::MixtureComponent`] is the unrelated
+/// [`split_gaussian`](crate::split_gaussian) primitive at \\(t_0\\);
+/// reach this one by its module path,
+/// `empyrean::propagate::MixtureComponent`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MixtureComponent {
+    /// Prior split weight from the Gaussian splitting library — never
+    /// likelihood-reweighted.
+    pub weight: f64,
+    /// Propagated sub-Gaussian centroid `[x, y, z, vx, vy, vz]` at the
+    /// CA epoch (AU, AU/day), in the basis given by
+    /// [`frame`](Self::frame) / [`origin`](Self::origin).
+    pub mean: [f64; 6],
+    /// Linearly-mapped component covariance \\(\Phi \Sigma_k \Phi^\top\\)
+    /// in the same basis as [`mean`](Self::mean).
+    pub covariance: [[f64; 6]; 6],
+    /// Reference frame `mean` / `covariance` are expressed in — the
+    /// integration frame of the run.
+    pub frame: Frame,
+    /// Origin (center body) `mean` is expressed relative to. Matches the
+    /// propagation origin at the split's close-approach epoch, so it can
+    /// differ between CA epochs of the same chain when origin switching
+    /// occurred.
+    pub origin: Origin,
+}
+
+/// One orbit's retained AGM mixture decomposition — the components
+/// kept at each close approach where the splitter actually fired.
+///
+/// Named to match `empyrean_core::propagation::MixtureChain` exactly;
+/// see [`MixtureComponent`] for why neither type is re-exported at the
+/// crate root.
+///
+/// # Scope of what is retained
+///
+/// Four limits apply, and each one is a real property of the engine's
+/// retention rather than a marshaling shortfall:
+///
+/// - **Depth-0 only.** Only the initial split is retained; recursive
+///   AGM calls (depth > 0) are not captured.
+/// - **Only CA epochs where AGM fired.** An orbit that never triggered
+///   a split gets an empty chain, not a one-component chain.
+/// - **Component covariance is the linear map.** Each
+///   [`MixtureComponent::covariance`] is \\(\Phi \Sigma_k \Phi^\top\\);
+///   the second-order mean correction is intentionally omitted.
+/// - **Retained weights may sum to less than 1.** A sub-Gaussian whose
+///   own sub-propagation missed the close approach (or failed to
+///   integrate) contributes no component, and the deficit is not
+///   recorded anywhere. Do not assume \\(\sum_k w_k = 1\\); sum
+///   [`MixtureComponent::weight`] and check.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MixtureChain {
+    /// Orbit identifier — the caller's `Orbit.orbit_id`, or a positional
+    /// `"orbit_{i}"` if the caller didn't tag the orbit.
+    ///
+    /// Empty on a row padded in for a batch the engine returned no
+    /// chains for at all (see [`PropagationResult::mixtures`]): there
+    /// was no chain to carry a name. The row's position in `mixtures` is
+    /// the join key in every case.
+    pub orbit_id: String,
+    /// Close-approach epochs (MJD TDB) at which components were
+    /// retained. Same length as [`components`](Self::components).
+    pub ca_epochs_mjd_tdb: Vec<f64>,
+    /// Retained components, one inner vector per entry of
+    /// [`ca_epochs_mjd_tdb`](Self::ca_epochs_mjd_tdb).
+    pub components: Vec<Vec<MixtureComponent>>,
+}
+
+impl MixtureComponent {
+    fn from_ffi(c: &empyrean_sys::EmpyreanMixtureComponent) -> Result<Self> {
+        let origin = Origin::from_naif_id(c.origin).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "C ABI returned unknown NAIF id for mixture component origin: {}",
+                c.origin
+            ))
+        })?;
+        let frame = crate::coordinate::int_to_frame(c.frame)?;
+        Ok(Self {
+            weight: c.weight,
+            mean: c.mean,
+            covariance: c.covariance,
+            frame,
+            origin,
+        })
+    }
+}
+
+impl MixtureChain {
+    /// A chain that retained nothing — no CA epochs, no components, no
+    /// identifier.
+    ///
+    /// This is how "this orbit split nothing" is spelled, and it is what
+    /// `marshal_propagation_result` pads with when the engine returns no
+    /// chains at all for a batch
+    /// whose orbits carry no covariance, so
+    /// [`PropagationResult::mixtures`] stays positional with the input
+    /// batch for every method.
+    pub(crate) fn empty() -> Self {
+        Self {
+            orbit_id: String::new(),
+            ca_epochs_mjd_tdb: Vec::new(),
+            components: Vec::new(),
+        }
+    }
+
+    /// Un-flatten one C-ABI chain into the nested Rust shape.
+    ///
+    /// The four pointers on `EmpyreanMixtureChain` are independently
+    /// nullable (an orbit that produced no mixture gets a row with
+    /// `num_ca_epochs == 0` and all-null pointers), and
+    /// `slice::from_raw_parts` requires a non-null pointer even for
+    /// length 0 — so each is guarded on its own rather than inferred
+    /// from a sibling's count.
+    ///
+    /// `components_offset` / `components_per_epoch` cross an FFI
+    /// boundary and are therefore validated, not trusted: a slice that
+    /// would run past `num_components_total` is an error, never an
+    /// out-of-bounds read.
+    ///
+    /// # Safety
+    ///
+    /// `c` must be a chain populated by `empyrean_propagate`, with its
+    /// pointers either null or valid for the lengths it declares.
+    pub(crate) unsafe fn from_ffi(
+        c: &empyrean_sys::EmpyreanMixtureChain,
+        chain_index: usize,
+    ) -> Result<Self> {
+        let orbit_id = if c.orbit_id.is_null() {
+            String::new()
+        } else {
+            unsafe { CStr::from_ptr(c.orbit_id) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        let n_epochs = c.num_ca_epochs;
+        if n_epochs == 0 {
+            return Ok(Self {
+                orbit_id,
+                ca_epochs_mjd_tdb: Vec::new(),
+                components: Vec::new(),
+            });
+        }
+        if c.ca_epochs_mjd_tdb.is_null() {
+            return Err(Error::invalid_input(format!(
+                "mixture chain {chain_index}: null ca_epochs_mjd_tdb with num_ca_epochs = {n_epochs}"
+            )));
+        }
+        if c.components_per_epoch.is_null() {
+            return Err(Error::invalid_input(format!(
+                "mixture chain {chain_index}: null components_per_epoch with num_ca_epochs = {n_epochs}"
+            )));
+        }
+        if c.components_offset.is_null() {
+            return Err(Error::invalid_input(format!(
+                "mixture chain {chain_index}: null components_offset with num_ca_epochs = {n_epochs}"
+            )));
+        }
+        let epochs = unsafe { std::slice::from_raw_parts(c.ca_epochs_mjd_tdb, n_epochs) };
+        let counts = unsafe { std::slice::from_raw_parts(c.components_per_epoch, n_epochs) };
+        let offsets = unsafe { std::slice::from_raw_parts(c.components_offset, n_epochs) };
+        let total = c.num_components_total;
+        let flat: &[empyrean_sys::EmpyreanMixtureComponent] = if total == 0 {
+            &[]
+        } else if c.components.is_null() {
+            return Err(Error::invalid_input(format!(
+                "mixture chain {chain_index}: null components with num_components_total = {total}"
+            )));
+        } else {
+            unsafe { std::slice::from_raw_parts(c.components, total) }
+        };
+
+        let mut components: Vec<Vec<MixtureComponent>> = Vec::with_capacity(n_epochs);
+        for k in 0..n_epochs {
+            let (start, count) = (offsets[k], counts[k]);
+            if start > total {
+                return Err(Error::invalid_input(format!(
+                    "mixture chain {chain_index}: components_offset[{k}] = {start} exceeds \
+                     num_components_total = {total}"
+                )));
+            }
+            let end = start.checked_add(count).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "mixture chain {chain_index}: components_offset[{k}] = {start} + \
+                     components_per_epoch[{k}] = {count} overflows"
+                ))
+            })?;
+            if end > total {
+                return Err(Error::invalid_input(format!(
+                    "mixture chain {chain_index}: components_offset[{k}] = {start} + \
+                     components_per_epoch[{k}] = {count} exceeds num_components_total = {total}"
+                )));
+            }
+            components.push(
+                flat[start..end]
+                    .iter()
+                    .map(MixtureComponent::from_ffi)
+                    .collect::<Result<Vec<_>>>()?,
+            );
+        }
+        Ok(Self {
+            orbit_id,
+            ca_epochs_mjd_tdb: epochs.to_vec(),
+            components,
+        })
+    }
+}
+
 /// Result of propagating one or more orbits.
 ///
 /// `states` is organized as `num_orbits × num_epochs` flat entries in
@@ -501,9 +731,28 @@ pub struct PropagationResult {
     /// Detected events (one list across all orbits — disambiguate via
     /// `Event::orbit_id`).
     pub events: Vec<Event>,
+    /// Retained AGM mixture decompositions — **one row per input
+    /// orbit**, positional with the input batch, not per state. An orbit
+    /// whose splitter never fired carries an empty
+    /// [`MixtureChain::components`] rather than being absent, so the
+    /// positional join holds for every method and every batch.
+    ///
+    /// The engine returns no chains at all for a batch in which no orbit
+    /// produced sensitivity tensors — a batch whose orbits carry no
+    /// covariance, under any method. Those rows are padded here to empty
+    /// chains, which is the same claim ("nothing split") the engine
+    /// makes per-orbit; a padded row has an empty
+    /// [`orbit_id`](MixtureChain::orbit_id), because there was no chain
+    /// to name it, so join positionally rather than on the id.
+    ///
+    /// Read [`MixtureChain`]'s scope notes before consuming these:
+    /// depth-0 only, CA epochs only, linear component covariance, and
+    /// retained weights that may sum to less than 1.
+    pub mixtures: Vec<MixtureChain>,
     /// Retained C-ABI result, freed on drop. The owned `states` /
-    /// `object_ids` / `events` above are independent copies; this is
-    /// kept solely to back the lazy tagged-covariance accessors.
+    /// `object_ids` / `events` / `mixtures` above are independent
+    /// copies; this is kept solely to back the lazy tagged-covariance
+    /// accessors.
     ffi: Box<empyrean_sys::EmpyreanPropagationResult>,
 }
 
@@ -525,14 +774,47 @@ impl PropagationResult {
         states: Vec<PropagatedState>,
         object_ids: Vec<String>,
         events: Vec<Event>,
+        mixtures: Vec<MixtureChain>,
         ffi: empyrean_sys::EmpyreanPropagationResult,
     ) -> Self {
         Self {
             states,
             object_ids,
             events,
+            mixtures,
             ffi: Box::new(ffi),
         }
+    }
+
+    /// Retained mixture components for one orbit at a close-approach
+    /// epoch, or `None` when that orbit retained no components within
+    /// `tolerance_days` of `epoch_mjd_tdb`.
+    ///
+    /// Mirrors
+    /// `empyrean_core::propagation::PropagationResult::mixture_at` by
+    /// name, argument names and semantics: the nearest retained CA epoch
+    /// within the tolerance wins, and an orbit index past the end is
+    /// `None` rather than a panic.
+    ///
+    /// The components are the mixture *at that CA epoch*. Away from a
+    /// retained CA there is nothing to return — the engine keeps no
+    /// off-CA mixture — so this is not an interpolator.
+    pub fn mixture_at(
+        &self,
+        orbit_index: usize,
+        epoch_mjd_tdb: f64,
+        tolerance_days: f64,
+    ) -> Option<&[MixtureComponent]> {
+        let chain = self.mixtures.get(orbit_index)?;
+        let mut best: Option<(usize, f64)> = None;
+        for (k, t) in chain.ca_epochs_mjd_tdb.iter().enumerate() {
+            let d = (t - epoch_mjd_tdb).abs();
+            if d <= tolerance_days && best.is_none_or(|(_, bd)| d < bd) {
+                best = Some((k, d));
+            }
+        }
+        let (k, _) = best?;
+        chain.components.get(k).map(|v| v.as_slice())
     }
 
     /// Resolved-kind tagged covariance at every output epoch for one
@@ -768,5 +1050,254 @@ mod tests {
             CovarianceKind::SigmaPoint
         );
         assert!(CovarianceKind::from_u8(6).is_err(), "unknown tags reject");
+    }
+}
+
+#[cfg(test)]
+mod mixture_marshal_tests {
+    use super::{MixtureChain, MixtureComponent};
+    use crate::coordinate::{Frame, Origin};
+
+    /// Build a component with a recognizable weight so slices can be
+    /// identified by value.
+    fn comp(weight: f64) -> empyrean_sys::EmpyreanMixtureComponent {
+        empyrean_sys::EmpyreanMixtureComponent {
+            weight,
+            mean: [weight; 6],
+            covariance: [[weight; 6]; 6],
+            // 0 = ICRF, 399 = Earth — the encodings the C ABI documents.
+            frame: 0,
+            origin: 399,
+        }
+    }
+
+    /// A chain over borrowed storage. The caller keeps the backing
+    /// vectors alive for the duration of the `from_ffi` call, which is
+    /// the same contract the real C result provides.
+    fn chain(
+        epochs: &mut [f64],
+        counts: &mut [usize],
+        offsets: &mut [usize],
+        comps: &mut [empyrean_sys::EmpyreanMixtureComponent],
+        total: usize,
+    ) -> empyrean_sys::EmpyreanMixtureChain {
+        empyrean_sys::EmpyreanMixtureChain {
+            orbit_id: std::ptr::null_mut(),
+            ca_epochs_mjd_tdb: epochs.as_mut_ptr(),
+            num_ca_epochs: epochs.len(),
+            components_per_epoch: counts.as_mut_ptr(),
+            components_offset: offsets.as_mut_ptr(),
+            components: comps.as_mut_ptr(),
+            num_components_total: total,
+        }
+    }
+
+    /// The un-flattening reproduces the exact per-epoch slices the
+    /// prefix-sum offsets describe, and decodes the basis tags rather
+    /// than defaulting them.
+    #[test]
+    fn unflattens_components_by_offset_and_count() {
+        let mut epochs = [60000.0_f64, 60100.0, 60200.0];
+        let mut counts = [2_usize, 0, 3];
+        let mut offsets = [0_usize, 2, 2];
+        let mut comps = [comp(1.0), comp(2.0), comp(3.0), comp(4.0), comp(5.0)];
+        let c = chain(&mut epochs, &mut counts, &mut offsets, &mut comps, 5);
+
+        let out = unsafe { MixtureChain::from_ffi(&c, 0) }.expect("well-formed chain marshals");
+        assert_eq!(out.ca_epochs_mjd_tdb, vec![60000.0, 60100.0, 60200.0]);
+        assert_eq!(out.components.len(), 3);
+        let weights: Vec<Vec<f64>> = out
+            .components
+            .iter()
+            .map(|g| g.iter().map(|c| c.weight).collect())
+            .collect();
+        assert_eq!(weights, vec![vec![1.0, 2.0], vec![], vec![3.0, 4.0, 5.0]]);
+        // An epoch with zero components is an empty group, not a
+        // dropped epoch — the epoch list and the group list stay
+        // index-aligned.
+        assert!(out.components[1].is_empty());
+        assert_eq!(out.components[0][0].frame, Frame::ICRF);
+        assert_eq!(out.components[0][0].origin, Origin::EARTH);
+        assert_eq!(out.components[2][2].mean, [5.0; 6]);
+    }
+
+    /// An offset+count that would run past the flat array is a typed
+    /// error, not an out-of-bounds read. The offsets come from across an
+    /// FFI boundary and are not a local invariant.
+    #[test]
+    fn malformed_offset_errors_rather_than_reading_out_of_bounds() {
+        let mut epochs = [60000.0_f64];
+        let mut counts = [4_usize];
+        let mut offsets = [0_usize];
+        let mut comps = [comp(1.0), comp(2.0)];
+        let c = chain(&mut epochs, &mut counts, &mut offsets, &mut comps, 2);
+
+        let err = unsafe { MixtureChain::from_ffi(&c, 7) }.expect_err("must reject");
+        assert!(
+            err.message.contains("mixture chain 7") && err.message.contains("exceeds"),
+            "expected a bounds error naming the chain, got: {}",
+            err.message
+        );
+    }
+
+    /// The offset axis and the extent axis are separate failures: an
+    /// offset already past the end is reported as such even when its
+    /// count is zero (so offset + count would not overflow).
+    #[test]
+    fn offset_past_end_errors_on_its_own_axis() {
+        let mut epochs = [60000.0_f64];
+        let mut counts = [0_usize];
+        let mut offsets = [9_usize];
+        let mut comps = [comp(1.0), comp(2.0)];
+        let c = chain(&mut epochs, &mut counts, &mut offsets, &mut comps, 2);
+
+        let err = unsafe { MixtureChain::from_ffi(&c, 3) }.expect_err("must reject");
+        assert!(
+            err.message.contains("components_offset[0] = 9"),
+            "expected the offset axis to be named, got: {}",
+            err.message
+        );
+        assert!(
+            !err.message.contains("components_per_epoch[0]"),
+            "the extent axis must not be blamed for an offset fault: {}",
+            err.message
+        );
+    }
+
+    /// A non-mixture orbit's row — `num_ca_epochs == 0` with all-null
+    /// pointers — marshals to an empty chain. `slice::from_raw_parts`
+    /// requires a non-null pointer even at length 0, so this must never
+    /// reach it.
+    #[test]
+    fn all_null_chain_marshals_to_empty() {
+        let c = empyrean_sys::EmpyreanMixtureChain {
+            orbit_id: std::ptr::null_mut(),
+            ca_epochs_mjd_tdb: std::ptr::null_mut(),
+            num_ca_epochs: 0,
+            components_per_epoch: std::ptr::null_mut(),
+            components_offset: std::ptr::null_mut(),
+            components: std::ptr::null_mut(),
+            num_components_total: 0,
+        };
+        let out = unsafe { MixtureChain::from_ffi(&c, 0) }.expect("empty chain marshals");
+        assert!(out.ca_epochs_mjd_tdb.is_empty());
+        assert!(out.components.is_empty());
+        assert_eq!(out.orbit_id, "");
+    }
+
+    /// A declared epoch count with a null parallel array is a loud
+    /// error, one per pointer — the four are guarded independently
+    /// rather than inferred from a sibling's count.
+    #[test]
+    fn null_parallel_array_with_nonzero_count_errors() {
+        let mut epochs = [60000.0_f64];
+        let mut counts = [1_usize];
+        let mut offsets = [0_usize];
+        let mut comps = [comp(1.0)];
+
+        let mut c = chain(&mut epochs, &mut counts, &mut offsets, &mut comps, 1);
+        c.ca_epochs_mjd_tdb = std::ptr::null_mut();
+        let err = unsafe { MixtureChain::from_ffi(&c, 0) }.expect_err("must reject");
+        assert!(
+            err.message.contains("null ca_epochs_mjd_tdb"),
+            "{}",
+            err.message
+        );
+
+        let mut c = chain(&mut epochs, &mut counts, &mut offsets, &mut comps, 1);
+        c.components_per_epoch = std::ptr::null_mut();
+        let err = unsafe { MixtureChain::from_ffi(&c, 0) }.expect_err("must reject");
+        assert!(
+            err.message.contains("null components_per_epoch"),
+            "{}",
+            err.message
+        );
+
+        let mut c = chain(&mut epochs, &mut counts, &mut offsets, &mut comps, 1);
+        c.components_offset = std::ptr::null_mut();
+        let err = unsafe { MixtureChain::from_ffi(&c, 0) }.expect_err("must reject");
+        assert!(
+            err.message.contains("null components_offset"),
+            "{}",
+            err.message
+        );
+
+        let mut c = chain(&mut epochs, &mut counts, &mut offsets, &mut comps, 1);
+        c.components = std::ptr::null_mut();
+        let err = unsafe { MixtureChain::from_ffi(&c, 0) }.expect_err("must reject");
+        assert!(err.message.contains("null components"), "{}", err.message);
+    }
+
+    /// An unknown basis tag is refused rather than defaulted to
+    /// ICRF / SSB — the same loud path `PropagatedState::from_ffi` takes.
+    #[test]
+    fn unknown_basis_tags_error_rather_than_default() {
+        let mut epochs = [60000.0_f64];
+        let mut counts = [1_usize];
+        let mut offsets = [0_usize];
+
+        let mut bad_frame = [comp(1.0)];
+        bad_frame[0].frame = 77;
+        let c = chain(&mut epochs, &mut counts, &mut offsets, &mut bad_frame, 1);
+        assert!(unsafe { MixtureChain::from_ffi(&c, 0) }.is_err());
+
+        let mut bad_origin = [comp(1.0)];
+        bad_origin[0].origin = -12345;
+        let c = chain(&mut epochs, &mut counts, &mut offsets, &mut bad_origin, 1);
+        let err = unsafe { MixtureChain::from_ffi(&c, 0) }.expect_err("must reject");
+        assert!(
+            err.message.contains("mixture component origin"),
+            "{}",
+            err.message
+        );
+    }
+
+    /// `mixture_at` picks the nearest retained CA within the tolerance
+    /// and returns `None` outside it — it is a lookup, not an
+    /// interpolator.
+    #[test]
+    fn mixture_at_selects_nearest_within_tolerance() {
+        fn component(weight: f64) -> MixtureComponent {
+            MixtureComponent {
+                weight,
+                mean: [0.0; 6],
+                covariance: [[0.0; 6]; 6],
+                frame: Frame::ICRF,
+                origin: Origin::EARTH,
+            }
+        }
+        let result = super::PropagationResult::new(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![MixtureChain {
+                orbit_id: "a".into(),
+                ca_epochs_mjd_tdb: vec![60000.0, 60000.5],
+                components: vec![vec![component(0.25)], vec![component(0.75)]],
+            }],
+            empyrean_sys::EmpyreanPropagationResult {
+                states: std::ptr::null_mut(),
+                num_states: 0,
+                object_ids: std::ptr::null_mut(),
+                events: std::ptr::null_mut(),
+                num_events: 0,
+                mixtures: std::ptr::null_mut(),
+                num_mixtures: 0,
+                lazy_handle: std::ptr::null_mut(),
+            },
+        );
+
+        let near = result
+            .mixture_at(0, 60000.4, 1.0)
+            .expect("within tolerance");
+        assert_eq!(near[0].weight, 0.75, "nearest CA wins, not the first");
+        assert!(
+            result.mixture_at(0, 60050.0, 1.0).is_none(),
+            "outside tolerance"
+        );
+        assert!(
+            result.mixture_at(1, 60000.0, 1.0).is_none(),
+            "orbit out of range"
+        );
     }
 }

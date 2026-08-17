@@ -986,9 +986,8 @@ pub struct EmpyreanMixtureChain {
 
 /// Propagation result containing states, events, and object identifiers.
 ///
-/// `mixtures` parallels `object_ids` only when populated — it is
-/// per-orbit (not per-state), so its length is the distinct orbit
-/// count, not `num_states`.
+/// `mixtures` is per-orbit (not per-state), so when populated its length
+/// is the input orbit count, not `num_states`.
 #[repr(C)]
 pub struct EmpyreanPropagationResult {
     pub states: *mut EmpyreanPropagatedState,
@@ -996,10 +995,21 @@ pub struct EmpyreanPropagationResult {
     pub object_ids: *mut *mut std::ffi::c_char,
     pub events: *mut EmpyreanEvent,
     pub num_events: usize,
-    /// One [`EmpyreanMixtureChain`] per input orbit (positional with
-    /// the input orbit batch). Empty / null when no orbits produced
-    /// mixtures (the typical case for FirstOrder / SecondOrder /
-    /// SigmaPoint / MonteCarlo).
+    /// One [`EmpyreanMixtureChain`] per input orbit, positional with the
+    /// input orbit batch, whenever the run produced any sensitivity data
+    /// at all — including under FirstOrder / SecondOrder / SigmaPoint /
+    /// MonteCarlo, where every row is an empty chain
+    /// (`num_ca_epochs == 0`, all four pointers null). An empty row means
+    /// "this orbit split nothing"; it is **not** absence.
+    ///
+    /// `num_mixtures == 0` (and a null `mixtures`) is the one other
+    /// shape: a batch in which NO orbit produced sensitivity tensors —
+    /// orbits carrying no covariance, under any method — for which the
+    /// engine empties the vector wholesale. So check `num_mixtures`
+    /// before indexing: it is either 0 or the input orbit count, never
+    /// anything between. (The Rust wrapper pads that case to one empty
+    /// chain per orbit so its own `mixtures` is positional
+    /// unconditionally; at this layer the zero-row shape is visible.)
     pub mixtures: *mut EmpyreanMixtureChain,
     pub num_mixtures: usize,
     /// Opaque retained handle to the rich propagation result, enabling
@@ -4346,5 +4356,239 @@ mod propagated_joint_tests {
         // Freeing a result whose joints are all absent is a no-op on
         // that surface, and must not fault.
         unsafe { empyrean_propagation_result_free(&mut result) };
+    }
+}
+
+#[cfg(test)]
+mod mixture_flattening_tests {
+    use super::*;
+
+    /// 99942 Apophis, heliocentric ecliptic Cartesian at MJD 61000 TDB,
+    /// with a covariance loose enough that the mapping through the 2029
+    /// Earth encounter is genuinely nonlinear — the regime AGM exists
+    /// for, and the only one that produces retained components.
+    fn apophis_loose() -> EmpyreanOrbit {
+        // SAFETY: `#[repr(C)]` POD plus pointers that zero-init to null.
+        let mut orbit: EmpyreanOrbit = unsafe { std::mem::zeroed() };
+        let mut cov = [[0.0f64; 6]; 6];
+        for i in 0..3 {
+            cov[i][i] = 1.0e-10;
+            cov[i + 3][i + 3] = 1.0e-16;
+        }
+        orbit.state = crate::CoordinateState {
+            epoch_mjd_tdb: 61000.0,
+            elements: [
+                -0.078_526_491_490_690_46,
+                -0.819_748_051_902_064_6,
+                0.041_893_951_532_339_09,
+                0.019_875_102_496_888_46,
+                0.001_322_088_445_361_402,
+                0.000_399_496_044_422_352_2,
+            ],
+            covariance: cov,
+            has_covariance: 1,
+            representation: crate::od::EMPYREAN_REPRESENTATION_CARTESIAN,
+            frame: 1,
+            origin: 10,
+            has_non_grav_cross: 0,
+            non_grav_cross: [[0.0; 3]; 6],
+        };
+        orbit.non_grav_dt = f64::NAN;
+        orbit.non_grav_dt_variance = f64::NAN;
+        orbit.srp_amrat_variance = f64::NAN;
+        orbit
+    }
+
+    /// The flattened chain's prefix-sum contract, asserted on a real
+    /// propagation rather than left as a comment.
+    ///
+    /// `components_offset[0] == 0` and
+    /// `components_offset[k] == sum(components_per_epoch[0..k])`, with
+    /// the last offset plus the last count exactly `num_components_total`
+    /// — the invariant every consumer's un-flattening rests on. The row
+    /// shape is checked too: one chain per input orbit, and an orbit that
+    /// never split gets `num_ca_epochs == 0` with null pointers, so a
+    /// positional join against the input batch always holds.
+    #[test]
+    fn flattened_mixture_offsets_are_the_prefix_sum_of_the_counts() {
+        let Some(ctx) =
+            crate::testing::context_or_skip("flattened_mixture_offsets_are_the_prefix_sum")
+        else {
+            return;
+        };
+        let orbit = apophis_loose();
+
+        let mut cfg: EmpyreanPropagationConfig = unsafe { std::mem::zeroed() };
+        // Approximate tier: this test is about the FLATTENING contract,
+        // not the dynamics, and the debug-profile integration over the
+        // ~3.8 years to the 2029 encounter is the whole cost.
+        cfg.force_model = 0;
+        cfg.uncertainty_method.tag = EMPYREAN_UNCERTAINTY_MIXTURE;
+        // Tag 5 reuses the AGM parameter slots it shares with Auto.
+        cfg.uncertainty_method.auto_threshold_mixture = 1.0;
+        cfg.uncertainty_method.auto_gmm_max_depth = 3;
+        cfg.uncertainty_method.auto_gmm_components_per_split = 3;
+        cfg.advanced.dt_initial = f64::NAN;
+        cfg.advanced.dt_min = f64::NAN;
+
+        let times: Vec<f64> = (0..5).map(|i| 61000.0 + 350.0 * i as f64).collect();
+        let mut result: EmpyreanPropagationResult = unsafe { std::mem::zeroed() };
+        let code = unsafe {
+            empyrean_propagate(
+                &ctx,
+                &orbit,
+                1,
+                times.as_ptr(),
+                times.len(),
+                &cfg,
+                &mut result,
+            )
+        };
+        let err = unsafe { CStr::from_ptr(crate::empyrean_last_error()) }.to_string_lossy();
+        assert_eq!(code, 0, "mixture propagation must succeed: {err}");
+
+        assert_eq!(
+            result.num_mixtures, 1,
+            "one chain per input orbit, always — non-mixture orbits get an empty row \
+             rather than being omitted, so the positional join holds"
+        );
+        assert!(!result.mixtures.is_null());
+
+        let chain = unsafe { &*result.mixtures };
+        let n = chain.num_ca_epochs;
+        assert!(
+            n > 0,
+            "the 2029 Apophis encounter with a loose covariance must fire the splitter"
+        );
+        assert!(!chain.ca_epochs_mjd_tdb.is_null());
+        assert!(!chain.components_per_epoch.is_null());
+        assert!(!chain.components_offset.is_null());
+
+        let counts = unsafe { std::slice::from_raw_parts(chain.components_per_epoch, n) };
+        let offsets = unsafe { std::slice::from_raw_parts(chain.components_offset, n) };
+        assert_eq!(offsets[0], 0, "components_offset[0] must be 0");
+        let mut running = 0usize;
+        for k in 0..n {
+            assert_eq!(
+                offsets[k], running,
+                "components_offset[{k}] must be the prefix sum of components_per_epoch[0..{k}]"
+            );
+            running += counts[k];
+        }
+        assert_eq!(
+            running, chain.num_components_total,
+            "the counts must sum to num_components_total"
+        );
+        if chain.num_components_total > 0 {
+            assert!(!chain.components.is_null());
+        }
+
+        unsafe { empyrean_propagation_result_free(&mut result) };
+    }
+
+    /// A FirstOrder run retains nothing, and "nothing" is an EMPTY row
+    /// per orbit with null pointers — not an absent array, which would
+    /// break the positional join, and not a fabricated one-component
+    /// chain.
+    #[test]
+    fn first_order_emits_one_empty_chain_per_orbit() {
+        let Some(ctx) = crate::testing::context_or_skip("first_order_emits_one_empty_chain") else {
+            return;
+        };
+        let orbit = apophis_loose();
+
+        let mut cfg: EmpyreanPropagationConfig = unsafe { std::mem::zeroed() };
+        cfg.force_model = 2;
+        cfg.uncertainty_method.tag = EMPYREAN_UNCERTAINTY_FIRST;
+        cfg.advanced.dt_initial = f64::NAN;
+        cfg.advanced.dt_min = f64::NAN;
+
+        let times = [61000.0f64, 61100.0];
+        let mut result: EmpyreanPropagationResult = unsafe { std::mem::zeroed() };
+        let code = unsafe {
+            empyrean_propagate(
+                &ctx,
+                &orbit,
+                1,
+                times.as_ptr(),
+                times.len(),
+                &cfg,
+                &mut result,
+            )
+        };
+        assert_eq!(code, 0);
+        assert_eq!(result.num_mixtures, 1);
+        let chain = unsafe { &*result.mixtures };
+        assert_eq!(chain.num_ca_epochs, 0);
+        assert_eq!(chain.num_components_total, 0);
+        assert!(chain.ca_epochs_mjd_tdb.is_null());
+        assert!(chain.components_per_epoch.is_null());
+        assert!(chain.components_offset.is_null());
+        assert!(chain.components.is_null());
+
+        unsafe { empyrean_propagation_result_free(&mut result) };
+    }
+
+    /// The ONE shape that is not one row per orbit: a batch in which no
+    /// orbit carries a covariance produces no sensitivity tensors at
+    /// all, and the engine empties the vector wholesale — so this layer
+    /// answers with `num_mixtures == 0` and a null array, under every
+    /// method.
+    ///
+    /// The field doc used to say the opposite ("empty / null when no
+    /// orbits produced mixtures … the typical case for FirstOrder"),
+    /// which its sibling test above falsifies; this pins the case that
+    /// actually is zero-row, so the two shapes are both nailed down and
+    /// the Rust wrapper's padding has a stated contract to pad.
+    #[test]
+    fn a_covariance_less_batch_emits_no_chains_at_all() {
+        let Some(ctx) = crate::testing::context_or_skip("a_covariance_less_batch_emits_no_chains")
+        else {
+            return;
+        };
+        let mut orbit = apophis_loose();
+        orbit.state.has_covariance = 0;
+        orbit.state.covariance = [[0.0; 6]; 6];
+
+        for tag in [EMPYREAN_UNCERTAINTY_FIRST, EMPYREAN_UNCERTAINTY_MIXTURE] {
+            let mut cfg: EmpyreanPropagationConfig = unsafe { std::mem::zeroed() };
+            cfg.force_model = 0;
+            cfg.uncertainty_method.tag = tag;
+            // Tag 5 reuses the AGM parameter slots it shares with Auto;
+            // harmless for FIRST, and this is about the row shape.
+            cfg.uncertainty_method.auto_threshold_mixture = 1.0;
+            cfg.uncertainty_method.auto_gmm_max_depth = 3;
+            cfg.uncertainty_method.auto_gmm_components_per_split = 3;
+            cfg.advanced.dt_initial = f64::NAN;
+            cfg.advanced.dt_min = f64::NAN;
+
+            let times = [61000.0f64, 61010.0];
+            let mut result: EmpyreanPropagationResult = unsafe { std::mem::zeroed() };
+            let code = unsafe {
+                empyrean_propagate(
+                    &ctx,
+                    &orbit,
+                    1,
+                    times.as_ptr(),
+                    times.len(),
+                    &cfg,
+                    &mut result,
+                )
+            };
+            let err =
+                unsafe { std::ffi::CStr::from_ptr(crate::empyrean_last_error()) }.to_string_lossy();
+            assert_eq!(code, 0, "method {tag}: {err}");
+            assert_eq!(
+                result.num_mixtures, 0,
+                "method {tag}: a batch with no covariance produces no sensitivity data, so \
+                 the engine returns no chains — check num_mixtures before indexing"
+            );
+            assert!(
+                result.mixtures.is_null(),
+                "method {tag}: zero rows, null array"
+            );
+
+            unsafe { empyrean_propagation_result_free(&mut result) };
+        }
     }
 }

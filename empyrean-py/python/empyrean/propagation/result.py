@@ -8,7 +8,7 @@ a ``sensitivity/`` subdir.
 """
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TypeVar
 
 import quivr as qv
@@ -31,6 +31,7 @@ from empyrean.propagation.events import (
     ShadowEntries,
     ShadowExits,
 )
+from empyrean.propagation.mixtures import MixtureChains, MixtureComponent
 from empyrean.propagation.tagged_covariance import (
     TaggedCovariance,
     TaggedCovariances,
@@ -93,12 +94,39 @@ class PropagationResult:
         ``tagged_covariance=True``. Use
         :meth:`tagged_covariance_series` for the per-epoch view of one
         orbit.
+    mixtures : MixtureChains
+        Flat per-``(orbit, CA epoch, component)`` readback of the AGM
+        mixture components the engine retained — the mixture itself, not
+        its moment collapse. Empty (zero rows) when nothing split, which
+        is every ``FIRST_ORDER`` run. Always populated; no opt-in flag,
+        because the components ride along with the result at no extra
+        engine cost. See
+        :mod:`~empyrean.propagation.mixtures` for the four limits on what
+        is retained.
     """
 
     states: CartesianOrbits
     events: Events
     sensitivity: StateSensitivities | None = None
     tagged_covariance: TaggedCovariances | None = None
+    mixtures: MixtureChains = field(default_factory=MixtureChains.empty)
+
+    def mixture_chains(self, orbit_index: int) -> list[list[MixtureComponent]]:
+        """One orbit's retained mixture components, grouped by CA epoch.
+
+        Thin accessor over
+        :meth:`~empyrean.propagation.mixtures.MixtureChains.to_chains`,
+        mirroring :meth:`tagged_covariance_series`'s shape. Returns an
+        empty list for an orbit that retained nothing — a real answer,
+        not an error.
+
+        Parameters
+        ----------
+        orbit_index : int
+            Zero-based index into the input orbits (orbit-major output
+            order).
+        """
+        return self.mixtures.to_chains(orbit_index)
 
     def tagged_covariance_series(self, orbit_index: int) -> list[TaggedCovariance]:
         """Per-epoch tagged covariance for one orbit, as dataclasses.
@@ -169,6 +197,12 @@ class PropagationResult:
         if self.tagged_covariance is not None and len(self.tagged_covariance) > 0:
             self.tagged_covariance.to_parquet(os.path.join(path, "tagged_covariance.parquet"))
 
+        # Written only when non-empty, matching every other optional
+        # table here: an absent file reads back as the empty table, which
+        # is the same claim as "nothing split".
+        if len(self.mixtures) > 0:
+            self.mixtures.to_dir(path)
+
     @classmethod
     def from_dir(cls, path: str) -> "PropagationResult":
         """Load a propagation result written by :meth:`to_dir`."""
@@ -210,4 +244,5 @@ class PropagationResult:
             events=events,
             sensitivity=sensitivity,
             tagged_covariance=tagged_covariance,
+            mixtures=MixtureChains.from_dir(path),
         )

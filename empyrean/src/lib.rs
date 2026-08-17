@@ -113,7 +113,15 @@ mod observers;
 mod od;
 mod orbit;
 mod planning;
-mod propagate;
+// Public because [`propagate::MixtureComponent`] cannot be flattened to
+// the crate root: [`MixtureComponent`] there is already the
+// `split_gaussian` primitive (see the `pub use math::` line below), and
+// renaming either one would break the API-parity rule against
+// `empyrean_core::propagation::MixtureComponent`. Every other name in
+// here is also re-exported at the root, so the module adds exactly the
+// two mixture read-back types plus a second path to what the root
+// already exposes.
+pub mod propagate;
 mod query;
 mod session;
 mod states;
@@ -148,6 +156,13 @@ pub use io::{
     write_residuals_csv, write_residuals_json, write_residuals_parquet,
 };
 pub use joint::{JointCovariance, ParamColumn, ParamDisposition, WideCross};
+// NAME COLLISION, resolved by module path. This root `MixtureComponent`
+// is the `split_gaussian` primitive at t₀ (weight / mean / covariance,
+// no basis tags). The AGM *read-back* component — the basis-tagged one
+// named after `empyrean_core::propagation::MixtureComponent` — is
+// [`propagate::MixtureComponent`] and is deliberately NOT re-exported
+// here: flattening both names to the root would need one of them
+// renamed away from the core name the parity rule pins.
 pub use math::{MixtureComponent, eigenvector_max_6x6, split_gaussian};
 pub use observers::Observer;
 pub use od::{

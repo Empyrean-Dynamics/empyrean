@@ -1411,6 +1411,12 @@ fn _propagate<'py>(
         fill_tagged_covariance(py, &dict, &prop_result, n_times)?;
     }
 
+    // ── Retained AGM mixture components ───────────────────────
+    // Always on: the components are already sitting in the result the
+    // wrapper marshaled, so emitting them costs no engine work. Zero
+    // rows when nothing split — never placeholder rows.
+    fill_mixtures(py, &dict, &prop_result, &orbit_ids)?;
+
     let events_dict = PyDict::new(py);
     events_dict.set_item("orbit_ids", ev_orbit_ids)?;
     events_dict.set_item("object_ids", ev_object_ids)?;
@@ -1743,6 +1749,111 @@ fn fill_tagged_covariance(
     joint.set_on(&tagged_dict, "")?;
 
     dict.set_item("tagged_covariance", tagged_dict)?;
+    Ok(())
+}
+
+/// Fill the retained AGM mixture components into `dict` as flat,
+/// join-ready columns — one row per `(orbit, CA epoch, component)`.
+///
+/// Unlike the tagged covariance above, this costs no extra engine call:
+/// the components are already on
+/// [`empyrean::PropagationResult::mixtures`], copied out of the C ABI at
+/// marshal time. It is therefore always on.
+///
+/// An orbit whose splitter never fired contributes **zero rows**, not a
+/// placeholder row — an empty table is the honest answer, and a
+/// zero-filled row would read as a one-component mixture of weight 0.
+/// A `FIRST_ORDER` propagation therefore emits an empty table.
+///
+/// `caller_orbit_ids` are the ids the caller supplied. The chain's own
+/// `orbit_id` comes from the C ABI, which fabricates a positional
+/// `"orbit_N"` when the flat-array input path attached none — so the
+/// caller's id is recovered by index here, exactly as the states loop
+/// does, rather than exposing the fabricated one as a join key.
+fn fill_mixtures(
+    py: Python<'_>,
+    dict: &Bound<'_, PyDict>,
+    prop_result: &empyrean::PropagationResult,
+    caller_orbit_ids: &[String],
+) -> PyResult<()> {
+    let n_rows: usize = prop_result
+        .mixtures
+        .iter()
+        .map(|chain| chain.components.iter().map(|c| c.len()).sum::<usize>())
+        .sum();
+
+    let mut orbit_index = Array1::<u32>::zeros(n_rows);
+    let mut orbit_id: Vec<String> = Vec::with_capacity(n_rows);
+    let mut ca_epoch = Array1::<f64>::zeros(n_rows);
+    let mut component_index = Array1::<u32>::zeros(n_rows);
+    let mut weight = Array1::<f64>::zeros(n_rows);
+    let mut mean = Array2::<f64>::zeros((n_rows, 6));
+    let mut covariance = Array3::<f64>::zeros((n_rows, 6, 6));
+    let mut frame = Array1::<i32>::zeros(n_rows);
+    let mut origin = Array1::<i32>::zeros(n_rows);
+
+    let mut row = 0usize;
+    for (oi, chain) in prop_result.mixtures.iter().enumerate() {
+        for (k, comps) in chain.components.iter().enumerate() {
+            // The chain's two vectors are built together by the
+            // un-flattening, so `ca_epochs_mjd_tdb[k]` always exists —
+            // but read it fallibly rather than indexing, so a future
+            // divergence surfaces as an error instead of a panic.
+            let epoch = *chain.ca_epochs_mjd_tdb.get(k).ok_or_else(|| {
+                PyRuntimeError::new_err(format!(
+                    "mixture chain {oi}: {} component groups but {} CA epochs",
+                    chain.components.len(),
+                    chain.ca_epochs_mjd_tdb.len()
+                ))
+            })?;
+            for (ci, comp) in comps.iter().enumerate() {
+                orbit_index[row] = oi as u32;
+                orbit_id.push(
+                    caller_orbit_ids
+                        .get(oi)
+                        .cloned()
+                        .unwrap_or_else(|| chain.orbit_id.clone()),
+                );
+                ca_epoch[row] = epoch;
+                component_index[row] = ci as u32;
+                weight[row] = comp.weight;
+                for r in 0..6 {
+                    mean[[row, r]] = comp.mean[r];
+                    for c in 0..6 {
+                        covariance[[row, r, c]] = comp.covariance[r][c];
+                    }
+                }
+                frame[row] = empyrean::frame_to_int(comp.frame);
+                origin[row] = comp.origin.naif_id();
+                row += 1;
+            }
+        }
+    }
+
+    let mix = PyDict::new(py);
+    mix.set_item(
+        "mixture_orbit_index",
+        PyArray1::from_owned_array(py, orbit_index),
+    )?;
+    mix.set_item("mixture_orbit_id", orbit_id)?;
+    mix.set_item(
+        "mixture_ca_epoch_mjd_tdb",
+        PyArray1::from_owned_array(py, ca_epoch),
+    )?;
+    mix.set_item(
+        "mixture_component_index",
+        PyArray1::from_owned_array(py, component_index),
+    )?;
+    mix.set_item("mixture_weight", PyArray1::from_owned_array(py, weight))?;
+    mix.set_item("mixture_mean", PyArray2::from_owned_array(py, mean))?;
+    mix.set_item(
+        "mixture_covariance",
+        PyArray3::from_owned_array(py, covariance),
+    )?;
+    mix.set_item("mixture_frame", PyArray1::from_owned_array(py, frame))?;
+    mix.set_item("mixture_origin", PyArray1::from_owned_array(py, origin))?;
+
+    dict.set_item("mixtures", mix)?;
     Ok(())
 }
 

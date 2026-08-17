@@ -538,6 +538,22 @@ jobs:
             exit 1
           fi
 
+          # The ABI header pin empyrean-sys/build.rs enforces on the
+          # download path must name THIS tag's header. A stale pin makes
+          # every in-repo build that falls through to the download refuse
+          # to build (fail closed, but wrongly), and a missing one turns
+          # the guard off. Both are release-blocking.
+          hdr_pin=$(sed -n 's/^# Header-SHA256:[[:space:]]*//p' empyrean-sys/checksums.txt | head -1)
+          hdr_now=$(sha256sum include/empyrean.h | awk '{print $1}')
+          if [ -z "$hdr_pin" ]; then
+            echo "::error::empyrean-sys/checksums.txt carries no '# Header-SHA256:' pin. Re-run prepare-release.yml."
+            exit 1
+          fi
+          if [ "$hdr_pin" != "$hdr_now" ]; then
+            echo "::error::empyrean-sys/checksums.txt pins header ${hdr_pin} but include/empyrean.h at ${tag} hashes to ${hdr_now}. Re-run prepare-release.yml for this commit."
+            exit 1
+          fi
+
           # ABI-surface currency: the header inside every served tarball must
           # be byte-identical to include/empyrean.h in the tagged tree. A
           # stale or foreign artifact whose ABI surface differs cannot pass;

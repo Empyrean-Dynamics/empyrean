@@ -193,8 +193,10 @@ fn _initialize(
 /// Map a context-construction failure into a Python exception **without
 /// dropping the structured missing-file list**.
 ///
-/// [`empyrean::Error::missing_data_files`] is populated only by a strict
-/// offline (`refresh=false`) construction, and it is the actionable half
+/// [`empyrean::Error::missing_data_files`] is populated whenever the
+/// engine names a data shortfall — a strict-offline (`refresh=false`)
+/// construction, and equally one floored there by `EMPYREAN_OFFLINE=1` —
+/// and it is the actionable half
 /// of that failure: fetch exactly those files and the same call succeeds.
 /// Flattening it into the message would force a caller to split the text
 /// back apart on a separator a filename may itself contain, so it is

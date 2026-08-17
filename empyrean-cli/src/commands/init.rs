@@ -24,10 +24,10 @@ pub fn run(data: &DataOptions, args: InitArgs) -> Result<()> {
     //
     // Under `--no-refresh` — or `EMPYREAN_OFFLINE=1`, which floors it to
     // the same thing — init is a *verifier*, not a fetcher: the download
-    // step is skipped outright (it is the one call here whose whole
-    // purpose is to reach the network, and it does not consult the floor
-    // itself) and the strict-offline load reports exactly which files the
-    // directory is missing.
+    // step is skipped outright and the strict-offline load reports exactly
+    // which files the directory is missing. `download_data` refuses under
+    // the floor on its own now, so this branch is what turns that refusal
+    // into the verifier run the user asked for rather than an error.
     let resolved_dir = if data.effective_refresh() {
         eprintln!("Checking kernel files...");
         empyrean::download_data(data.dir()).context("failed to resolve data directory")?

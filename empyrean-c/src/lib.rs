@@ -469,7 +469,12 @@ pub unsafe extern "C" fn empyrean_context_from_data_dir(
         match outcome {
             Ok(ctx) => Box::into_raw(Box::new(ctx)),
             Err(e) => {
-                set_last_error(&e.to_string());
+                // Same recorder as `empyrean_context_from_data_dir_with`:
+                // a bare `set_last_error` drops the structured
+                // `MissingDataFiles` payload, so the same failure reached
+                // through the older constructor arrived with no file list
+                // for `empyrean_missing_data_files` to hand back.
+                set_last_error_from(&e);
                 std::ptr::null_mut()
             }
         }

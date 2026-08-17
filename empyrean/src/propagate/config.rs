@@ -276,7 +276,8 @@ pub struct AdvancedIntegratorConfig {
     /// interpolation (light-time iteration, dense output,
     /// arbitrary-epoch state queries).
     pub cache_integrator_steps: bool,
-    /// Origin-switching trajectory splitting. Default disabled.
+    /// Origin-switching trajectory splitting. Default enabled — see
+    /// [`OriginSwitchingConfig`].
     pub origin_switching: OriginSwitchingConfig,
 }
 
@@ -640,5 +641,31 @@ mod overlap_policy_tests {
                 "{policy:?} marshals to {want}"
             );
         }
+    }
+}
+
+/// Origin-switching defaults, pinned at the wrapper.
+///
+/// The default flipped to `enabled = true` upstream but five doc sites
+/// kept saying "opt-in" — including one eleven lines below the `Default`
+/// impl in this file. Nothing asserted the value, so nothing caught the
+/// drift. This is that assertion.
+#[cfg(test)]
+mod origin_switching_default_tests {
+    use super::*;
+
+    /// Trajectory splitting is ON by default, both on its own config and
+    /// as reached through [`AdvancedIntegratorConfig`], and it marshals
+    /// to the ABI's explicit ON rather than the DEFAULT sentinel.
+    #[test]
+    fn origin_switching_is_enabled_by_default() {
+        assert!(OriginSwitchingConfig::default().enabled);
+        assert!(AdvancedIntegratorConfig::default().origin_switching.enabled);
+        let (ffi, _keep) = PropagationConfig::default().to_ffi_with();
+        assert_eq!(
+            ffi.advanced.origin_switching.enabled,
+            empyrean_sys::EMPYREAN_ORIGIN_SWITCHING_ON as u8,
+            "the wrapper marshals its resolved default explicitly"
+        );
     }
 }

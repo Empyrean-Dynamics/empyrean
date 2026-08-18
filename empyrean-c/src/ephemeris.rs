@@ -1539,4 +1539,232 @@ mod ephemeris_config_end_to_end_tests {
              EphemerisPropagationConfig"
         );
     }
+
+    // ── The ABI boundary itself ──────────────────────────────────
+    //
+    // The tests above call the internal converter and
+    // `empyrean_core::generate_ephemeris` directly, so nothing yet
+    // exercises the exported symbol plus `marshal_ephemeris_result` for
+    // the no-input-covariance case — which is exactly the path a C
+    // consumer sees, and exactly the claim ("sensitivity without an input
+    // covariance") that has to be provable from outside.
+
+    // A context, or `None` when the host genuinely has no kernels. The
+    // crate-wide helper panics instead of skipping when the environment
+    // says the kernels are supposed to be here — a data-gated test that
+    // turns itself off on the one runner configured to run it is a green
+    // no-op, not a test.
+    use crate::testing::context_or_skip;
+
+    fn observer_at(epoch_mjd_tdb: f64) -> EmpyreanObserver {
+        EmpyreanObserver {
+            epoch_mjd_tdb,
+            ..observer()
+        }
+    }
+
+    /// The three observer epochs the boundary tests share. A short arc:
+    /// the point is the marshalled buffer, not a long integration.
+    fn observers_three() -> [EmpyreanObserver; 3] {
+        [
+            observer_at(OBS_EPOCH),
+            observer_at(OBS_EPOCH + 10.0),
+            observer_at(OBS_EPOCH + 20.0),
+        ]
+    }
+
+    /// Call the exported symbol and hand back the populated result. The
+    /// caller frees it.
+    fn generate_through_the_abi(
+        ctx: &empyrean_core::Context,
+        orbit: &EmpyreanOrbit,
+        cfg: &EmpyreanEphemerisConfig,
+        observers: &[EmpyreanObserver],
+    ) -> EmpyreanEphemerisResult {
+        let ctx_ptr: *const EmpyreanContext = ctx;
+        // SAFETY: `#[repr(C)]` scalars and pointers; the exported entry
+        // point overwrites every field on success.
+        let mut out: EmpyreanEphemerisResult = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            empyrean_generate_ephemeris(
+                ctx_ptr,
+                orbit,
+                1,
+                observers.as_ptr(),
+                observers.len(),
+                cfg,
+                &mut out,
+            )
+        };
+        assert_eq!(rc, 0, "empyrean_generate_ephemeris returned {rc}");
+        out
+    }
+
+    /// Collect each row's Jacobian as an owned buffer, asserting the
+    /// pointer/length contract on the way out.
+    fn jacobians(result: &EmpyreanEphemerisResult) -> Vec<Vec<f64>> {
+        assert!(!result.sensitivity.is_null(), "sensitivity array is null");
+        (0..result.num_sensitivity)
+            .map(|i| {
+                let row = unsafe { &*result.sensitivity.add(i) };
+                assert_eq!(row.n_params, 6, "state-only fit is six columns wide");
+                assert!(
+                    !row.jacobian.is_null(),
+                    "row {i} carries no Jacobian through the ABI"
+                );
+                assert_eq!(
+                    row.jacobian_len,
+                    6 * row.n_params as usize,
+                    "row {i}: jacobian_len must be 6 * n_params"
+                );
+                unsafe { std::slice::from_raw_parts(row.jacobian, row.jacobian_len) }.to_vec()
+            })
+            .collect()
+    }
+
+    /// An orbit carrying a small diagonal covariance — the seeded-prior
+    /// shim shape this API is meant to make unnecessary.
+    fn orbit_with_dummy_covariance() -> EmpyreanOrbit {
+        let mut o = orbit();
+        o.state.has_covariance = 1;
+        for i in 0..6 {
+            o.state.covariance[i][i] = 1e-12;
+        }
+        o
+    }
+
+    /// The whole A6 claim, asserted at the surface a C consumer touches:
+    /// `compute_stm = 1` with **no** input covariance produces the six
+    /// observation-sensitivity rows, populated, finite, and physically
+    /// sized — and the free path nulls them.
+    #[test]
+    fn sensitivity_survives_the_abi_with_no_input_covariance() {
+        let Some(ctx) = context_or_skip("sensitivity_survives_the_abi_with_no_input_covariance")
+        else {
+            return;
+        };
+        let mut cfg = config(&[]);
+        cfg.propagation.compute_stm = 1;
+        let o = orbit();
+        assert_eq!(o.state.has_covariance, 0, "the fixture carries no Σ₀");
+        let observers = observers_three();
+
+        let mut out = generate_through_the_abi(&ctx, &o, &cfg, &observers);
+        assert_eq!(
+            out.num_sensitivity,
+            observers.len(),
+            "one sensitivity row per observer epoch"
+        );
+
+        for (i, jac) in jacobians(&out).iter().enumerate() {
+            assert!(
+                jac.iter().all(|v| v.is_finite()),
+                "row {i} carries a non-finite partial"
+            );
+            // Position partials of the two angles: a defaulted or
+            // zero-filled buffer fails here, and so does a wrong-units or
+            // wrong-row read — ∂RA/∂x₀ at ~1 AU is O(10) deg/AU, so the
+            // true value sits comfortably inside these decades.
+            for (name, row) in [
+                ("RA", EMPYREAN_SENSITIVITY_ROW_RA),
+                ("Dec", EMPYREAN_SENSITIVITY_ROW_DEC),
+            ] {
+                let peak = (0..3)
+                    .map(|c| jac[row * 6 + c].abs())
+                    .fold(0.0f64, f64::max);
+                assert!(
+                    peak > 1e-2 && peak < 1e4,
+                    "row {i}: |∂{name}/∂r₀| peaked at {peak:e} deg/AU, outside 1e-2..1e4"
+                );
+            }
+        }
+
+        unsafe { empyrean_ephemeris_result_free(&mut out) };
+        assert!(
+            out.sensitivity.is_null(),
+            "free nulls the sensitivity array"
+        );
+        assert_eq!(out.num_sensitivity, 0);
+        assert!(out.entries.is_null(), "free nulls the entry array");
+        assert_eq!(out.num_entries, 0);
+    }
+
+    /// The shim-removal warrant: the partials produced with **no**
+    /// covariance and `compute_stm = 1` are not merely present, they are
+    /// the same numbers the dummy-covariance workaround was producing.
+    ///
+    /// Strict `f64` equality is deliberate and must stay strict. Both runs
+    /// take the same `Jet1<6>` arm and Σ₀ feeds only the covariance
+    /// composition, never the integration — so a red here does not mean
+    /// "the tolerance is too tight", it means the seeded Σ₀ has started
+    /// influencing step selection, and the two paths no longer produce the
+    /// same dynamics. Do not "fix" this with a tolerance.
+    #[test]
+    fn sensitivity_is_bit_identical_with_and_without_the_covariance_shim() {
+        let Some(ctx) =
+            context_or_skip("sensitivity_is_bit_identical_with_and_without_the_covariance_shim")
+        else {
+            return;
+        };
+        let observers = observers_three();
+
+        let mut stm_cfg = config(&[]);
+        stm_cfg.propagation.compute_stm = 1;
+        let mut without = generate_through_the_abi(&ctx, &orbit(), &stm_cfg, &observers);
+
+        // The shim: a dummy Σ₀ switched the partials on, with the flag off.
+        let shim_cfg = config(&[]);
+        assert_eq!(shim_cfg.propagation.compute_stm, 0);
+        let mut with_shim =
+            generate_through_the_abi(&ctx, &orbit_with_dummy_covariance(), &shim_cfg, &observers);
+
+        let a = jacobians(&without);
+        let b = jacobians(&with_shim);
+        assert_eq!(a.len(), b.len(), "same number of sensitivity rows");
+        assert!(!a.is_empty(), "the comparison must not be vacuous");
+        for (i, (ja, jb)) in a.iter().zip(b.iter()).enumerate() {
+            assert_eq!(ja.len(), jb.len(), "row {i}: same Jacobian length");
+            for (k, (x, y)) in ja.iter().zip(jb.iter()).enumerate() {
+                assert_eq!(
+                    x.to_bits(),
+                    y.to_bits(),
+                    "row {i}, element {k}: {x:e} vs {y:e} — the no-covariance partials \
+                     must be bit-identical to the dummy-covariance shim's"
+                );
+            }
+        }
+
+        unsafe {
+            empyrean_ephemeris_result_free(&mut without);
+            empyrean_ephemeris_result_free(&mut with_shim);
+        }
+    }
+
+    /// The negative control: with the flag off and no covariance there is
+    /// no STM to compose, and the ABI must say so with a null pointer and
+    /// a zero length — never a zero-filled buffer, which a caller cannot
+    /// tell apart from a real all-zero Jacobian.
+    #[test]
+    fn compute_stm_zero_leaves_the_jacobian_null_through_the_abi() {
+        let Some(ctx) =
+            context_or_skip("compute_stm_zero_leaves_the_jacobian_null_through_the_abi")
+        else {
+            return;
+        };
+        let cfg = config(&[]);
+        assert_eq!(cfg.propagation.compute_stm, 0);
+        let observers = observers_three();
+        let mut out = generate_through_the_abi(&ctx, &orbit(), &cfg, &observers);
+
+        for i in 0..out.num_sensitivity {
+            let row = unsafe { &*out.sensitivity.add(i) };
+            assert!(
+                row.jacobian.is_null(),
+                "row {i}: no STM was traced, so the Jacobian must be null"
+            );
+            assert_eq!(row.jacobian_len, 0, "row {i}: a null Jacobian has length 0");
+        }
+
+        unsafe { empyrean_ephemeris_result_free(&mut out) };
+    }
 }

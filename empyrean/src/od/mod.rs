@@ -78,6 +78,7 @@ pub use weighting::{SigmaPolicy, WeightingConfig, WeightingLayer, WeightingPrese
 
 use std::ffi::CString;
 
+use crate::built_system::BuiltSystem;
 use crate::context::Context;
 use crate::error::{Error, Result};
 use crate::orbit::Orbit;
@@ -262,6 +263,181 @@ impl Context {
         let code = unsafe {
             empyrean_sys::empyrean_refine(
                 self.as_raw(),
+                &ffi_orbit,
+                obs_ptr,
+                obs_len,
+                &ffi_config,
+                &mut result,
+            )
+        };
+        if code != 0 {
+            return Err(Error::capture(code));
+        }
+        let det = ffi_od_result_to_rust(&result);
+        unsafe { empyrean_sys::empyrean_od_result_free(&mut result) };
+        det
+    }
+}
+
+/// Orbit determination through a pre-built force model.
+///
+/// The three verbs mirror [`Context::determine`] / [`Context::evaluate`]
+/// / [`Context::refine`] argument for argument, with the context passed
+/// explicitly because the handle — not the context — is the receiver. A
+/// fit through a matching handle is bit-identical to the one-shot; the
+/// handle only changes *when* the force model is assembled.
+///
+/// # Build the handle with [`BuiltSystem::new_for_od`]
+///
+/// A fit picks its own integration frame and encounter-timescale divisor,
+/// and neither is ICRF-shaped: a handle from
+/// [`Context::built_system`] with `Frame::ICRF` — which is what every
+/// propagation example in this crate builds — is refused here with
+/// [`BuiltSystemGuardError::KeyMismatchFrame`](crate::BuiltSystemGuardError::KeyMismatchFrame).
+///
+/// # The guard refuses; it does not degrade
+///
+/// A mismatched handle fails the call rather than quietly assembling a
+/// per-solve force model. That is deliberate, and it differs from what
+/// the engine does with a handle it injected for itself, where a mismatch
+/// costs only speed. Here the caller asked to reuse a *specific* frozen
+/// force model, and fitting under a different one while reporting success
+/// is exactly the silent substitution this crate refuses to make.
+/// Classify the axis with
+/// [`Error::builtsystem_guard`](crate::Error::builtsystem_guard).
+///
+/// # `auto_force_model` is refused, not tolerated
+///
+/// [`ODConfig::auto_force_model`] lets the fit re-pick its own tier
+/// part-way through, which no frozen handle can follow: the engine would
+/// drop the handle mid-fit and reassemble per solve while the call still
+/// returned `Ok`. All three verbs therefore fail with
+/// [`BuiltSystemGuardError::ConfigMutatesKey`](crate::BuiltSystemGuardError::ConfigMutatesKey)
+/// — its own axis, because nothing about the handle is wrong — and a
+/// message naming the field. Clear it and freeze the handle at the tier
+/// you want, or drop the handle and use [`Context::determine`], which is
+/// free to choose the tier.
+impl BuiltSystem {
+    /// Run the full orbit-determination pipeline over **every object** in
+    /// `observations`, reusing this handle for every fit in the batch.
+    ///
+    /// Parallels [`Context::determine`]; see it for the batch semantics,
+    /// the seeding rules, and what `Err` does and does not mean.
+    pub fn determine(
+        &self,
+        ctx: &Context,
+        observations: &Observations,
+        initial_orbits: Option<&[Orbit]>,
+        config: &ODConfig,
+    ) -> Result<DetermineResults> {
+        let mut _orbit_keep: Vec<crate::orbit::OrbitFfiKeep> = Vec::new();
+        let ffi_initial: Option<Vec<_>> = match initial_orbits {
+            Some(orbs) => {
+                _orbit_keep.reserve(orbs.len());
+                let v: Vec<_> = orbs
+                    .iter()
+                    .map(|o| {
+                        let (ffi, keep) = o.to_ffi_with_keep()?;
+                        _orbit_keep.push(keep);
+                        Ok(ffi)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Some(v)
+            }
+            None => None,
+        };
+        let (init_ptr, init_len) = match &ffi_initial {
+            Some(v) => (v.as_ptr(), v.len()),
+            None => (std::ptr::null(), 0),
+        };
+        let (obs_ptr, obs_len) = observations.as_ffi_slice();
+        let (radar_ptr, radar_len) = observations.as_radar_ffi_slice();
+
+        let mut results = empyrean_sys::EmpyreanDetermineResults::default();
+        let (ffi_config, _perturbers_keep) = config.to_ffi_with()?;
+        let code = unsafe {
+            empyrean_sys::empyrean_builtsystem_determine(
+                self.as_raw(),
+                ctx.as_raw(),
+                obs_ptr,
+                obs_len,
+                radar_ptr,
+                radar_len,
+                init_ptr,
+                init_len,
+                &ffi_config,
+                &mut results,
+            )
+        };
+        // NONE_DELIVERED still populates (and hands us ownership of) the
+        // table; every other nonzero code writes nothing.
+        if code != 0 && code != empyrean_sys::EMPYREAN_DETERMINE_NONE_DELIVERED {
+            return Err(Error::capture(code));
+        }
+        let batch = ffi_determine_results_to_rust(&results);
+        unsafe { empyrean_sys::empyrean_determine_results_free(&mut results) };
+        batch
+    }
+
+    /// Evaluate a candidate orbit against observations without fitting,
+    /// reusing this handle. Parallels [`Context::evaluate`].
+    pub fn evaluate(
+        &self,
+        ctx: &Context,
+        orbit: &Orbit,
+        observations: &Observations,
+        config: &ODConfig,
+    ) -> Result<EvaluateResult> {
+        let (ffi_orbit, _orbit_keep) = orbit.to_ffi_with_keep()?;
+        let (obs_ptr, obs_len) = observations.as_ffi_slice();
+
+        let mut result = empyrean_sys::EmpyreanEvaluateResult::default();
+        let (ffi_config, _perturbers_keep) = config.to_ffi_with()?;
+        let code = unsafe {
+            empyrean_sys::empyrean_builtsystem_evaluate(
+                self.as_raw(),
+                ctx.as_raw(),
+                &ffi_orbit,
+                obs_ptr,
+                obs_len,
+                &ffi_config,
+                &mut result,
+            )
+        };
+        if code != 0 {
+            return Err(Error::capture(code));
+        }
+        let residuals = unsafe {
+            std::slice::from_raw_parts(result.observations, result.num_observations)
+                .iter()
+                .map(ObservationResidual::from_ffi)
+                .collect()
+        };
+        let summary = ResidualSummary::from_ffi(&result.summary);
+        unsafe { empyrean_sys::empyrean_evaluate_result_free(&mut result) };
+
+        Ok(EvaluateResult { residuals, summary })
+    }
+
+    /// Refine an orbit with observations using a Bayesian prior, reusing
+    /// this handle. Parallels [`Context::refine`], and is the loop this
+    /// whole surface exists for: assemble once, refine many.
+    pub fn refine(
+        &self,
+        ctx: &Context,
+        orbit: &Orbit,
+        observations: &Observations,
+        config: &ODConfig,
+    ) -> Result<DetermineResult> {
+        let (ffi_orbit, _orbit_keep) = orbit.to_ffi_with_keep()?;
+        let (obs_ptr, obs_len) = observations.as_ffi_slice();
+
+        let mut result = empyrean_sys::EmpyreanODResult::default();
+        let (ffi_config, _perturbers_keep) = config.to_ffi_with()?;
+        let code = unsafe {
+            empyrean_sys::empyrean_builtsystem_refine(
+                self.as_raw(),
+                ctx.as_raw(),
                 &ffi_orbit,
                 obs_ptr,
                 obs_len,

@@ -8,6 +8,47 @@ project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- **Orbit determination through the pre-built force-model handle.** The
+  reusable `BuiltSystem` handle served `propagate` and
+  `generate_ephemeris` but not the three OD verbs, so a
+  measure-and-extend loop — fit, observe again, refit — reassembled the
+  force model on every call with no way to say otherwise from C, Rust or
+  Python. Three new exports mirror their one-shots with the handle
+  prepended, exactly as `empyrean_builtsystem_propagate` mirrors
+  `empyrean_propagate`: `empyrean_builtsystem_determine`,
+  `empyrean_builtsystem_evaluate`, `empyrean_builtsystem_refine`; plus
+  `BuiltSystem::determine` / `.evaluate` / `.refine` in Rust and
+  `BuiltSystem.determine` / `.evaluate` / `.refine` in Python. Every
+  argument keeps its name, position and meaning, and results are
+  bit-identical to the one-shot on a matching handle — the handle changes
+  only *when* the force model is assembled.
+
+  A fit picks its own integration frame and encounter-timescale divisor,
+  and the frame is not the one the propagation examples use, so a
+  dedicated constructor freezes the recipe rather than leaving it to be
+  guessed: `empyrean_builtsystem_new_for_od(ctx, force_model, out)` in C,
+  `BuiltSystem::new_for_od(&ctx, force_model)` in Rust,
+  `empyrean.od_system(force_model)` in Python. A handle built for
+  propagation (ICRF) is **refused** on the OD path with
+  `EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_FRAME`.
+
+  The identity guard runs before any fitting and refuses on every axis —
+  data identity, frame, force model, divisor, staleness — rather than
+  degrading to a per-solve assembly. That is deliberate and differs from
+  what the engine does with a handle it injected for itself, where a
+  mismatch costs only speed: a caller who named this API asked to reuse a
+  *specific* frozen force model, and fitting under a different one while
+  reporting success is the silent substitution this distribution does not
+  ship. For the same reason `ODConfig::auto_force_model` is **refused**
+  rather than accepted with a caveat — it lets the fit re-pick its own
+  tier part-way through, which no frozen handle can follow, so the engine
+  would drop the handle mid-fit and reassemble per solve while the call
+  still reported success. That refusal has its own axis, because nothing
+  about the handle is wrong: `EMPYREAN_BUILTSYSTEM_CONFIG_MUTATES_KEY`
+  (`-25`) in C, `BuiltSystemGuardError::ConfigMutatesKey` in Rust, a
+  `ValueError` naming the field in Python. Clear it and freeze the handle
+  at the tier you want, or use the one-shot entry points, which choose the
+  tier freely.
 - **The AGM mixture components read back, instead of dying at the
   wrapper.** Under `GAUSSIAN_MIXTURE` — and inside `AUTO`'s
   close-approach windows — the engine splits the input Gaussian and
@@ -306,8 +347,39 @@ project adheres to [Semantic Versioning](https://semver.org).
   manual check. Widening the scanner to the other source roots is follow-up
   work.
 
+- **Observation sensitivity without an input covariance is now provable
+  from outside.** `PropagationConfig.compute_stm` has produced the six
+  observation-sensitivity rows on an orbit carrying no covariance since
+  the converter fix in `0.10.0-rc.0`, but the tests that showed it called
+  the internal converter rather than the exported symbol, so nothing
+  demonstrated the claim at the surface a C consumer actually touches. It
+  is now asserted through `empyrean_generate_ephemeris` itself: every row
+  carries a non-null Jacobian of length `6 * n_params`, every element is
+  finite, the RA/Dec position partials are physically sized, and the free
+  path nulls the buffers. A companion assertion is the warrant for
+  deleting the old dummy-covariance workaround — the no-covariance
+  partials are **bit-identical** to the ones that workaround produced,
+  element for element, so the shim can go without a re-validation pass.
+  On the Python side the partials are checked against central differences
+  (indexed through the `SENSITIVITY_ROW_*` constants, so a row misread
+  fails the same assertion), and the residual disagreement in the
+  velocity columns is pinned to the documented light-time omission by
+  asserting it shrinks with the observation baseline. No production code
+  changed.
+
 ### Fixed
 
+- **C-ABI origin-switching opt-out documented correctly.** The
+  `EmpyreanOriginSwitchingConfig` struct doc told C callers to set
+  `enabled = 0` to disable trajectory splitting. Under the tri-state
+  encoding `0` is `EMPYREAN_ORIGIN_SWITCHING_DEFAULT` and resolves to
+  ON, so a caller following the header got switching enabled. Use
+  `EMPYREAN_ORIGIN_SWITCHING_OFF` (2). No behaviour change; the
+  field-level doc was already correct, and the same stale "default
+  disabled" sentence is corrected on the Rust wrapper's
+  `AdvancedIntegratorConfig::origin_switching`. Both defaults are now
+  pinned by tests — a zero-initialized config resolves to enabled, and
+  `OFF` resolves to disabled.
 - **A prebuilt `libempyrean` can no longer be linked against a header it
   predates.** `empyrean-sys/checksums.txt` pins the SHA-256 of each
   published tarball, which proves *which bytes* were downloaded and
@@ -438,6 +510,63 @@ project adheres to [Semantic Versioning](https://semver.org).
   deprecation window and is no longer a source.
 
 ### Changed
+
+- **`EMPYREAN_OFFLINE=1` now binds every data-provisioning entry point.**
+  *Behaviour change.* The floor was implemented in one place
+  and called from one place — `Context::from_data_dir_with` — so
+  `Context::from_data_dir` (the constructor in every README snippet and
+  roughly twenty doc examples) and `empyrean::download_data` reached the
+  network on a host whose operator had asserted that it must not, with
+  no signal that the variable had been ignored. That is the silently-
+  ignored assertion the no-hidden-fallbacks rule forbids, and the
+  original rationale — "reinterpreting the older constructor would change
+  the meaning of pre-existing code" — is answered by the announcement the
+  floor already prints whenever it downgrades.
+
+  `Context::from_data_dir` now behaves under the floor exactly as
+  `from_data_dir_with(dir, DataDirOptions { refresh: false, .. })`: it
+  resolves the Standard tier from the data directory alone and fails
+  naming every absent file. The downgrade is announced on stderr naming
+  the variable. `download_data` has no offline form — reaching the
+  network is the entire call — so under the floor it fails with an error
+  naming `EMPYREAN_OFFLINE` and pointing at `refresh: false` (Python
+  `refresh=False`, CLI `--no-refresh`) instead of provisioning anyway.
+
+  Callers affected: a pipeline that exported `EMPYREAN_OFFLINE=1` *and*
+  relied on `from_data_dir` still downloading now fails with
+  `MissingDataFiles` instead. That is the intended meaning of a floor.
+
+  Scope, stated plainly so the variable is not read as more than it is:
+  it gates data provisioning, not all outbound traffic. The catalog
+  query helpers (`query_sbdb`, `query_horizons`,
+  `query_horizons_vectors`, `query_observations`, `query_radar`, and the
+  CLI's `query` command and `--object-id` inputs) still reach JPL and the
+  MPC, and the C ABI reads no environment variable at all — a C caller
+  states the policy in `EmpyreanDataDirOptions`. `offline_floor_is_active()`
+  (Rust) is there for a caller that wants to gate its own network work on
+  the same assertion.
+
+- **A broken data directory is diagnosed as one.** The Rust wrapper's
+  construction-failure probe looked for absent kernels before it looked
+  at the directory itself, so a data dir that is a symbolic link not
+  resolving to a directory — dangling, pointing at a file, or
+  self-referential — made every kernel look absent and always blamed
+  `de440.bsp`, with `download_data` as the suggested remedy. The
+  underlying failure is `mkdir` returning `File exists (os error 17)`
+  (mkdir never follows a trailing symlink), and no download can fix it.
+  The directory is now inspected first: an unusable one is reported
+  naming the path, the link target when there is one, and the real
+  reason, and **no** kernel is named. A path that simply does not exist
+  yet is still the ordinary unprovisioned case and keeps its
+  `download_data` remedy. Python's kernel-staging `mkdir` grew the same
+  guard, raising a `NotADirectoryError` naming the link and its target
+  instead of a bare `[Errno 17] File exists`. `empyrean_context_from_data_dir`
+  also now records failures with the same structured recorder its
+  `_with` sibling uses, and the Rust wrapper's `Context::from_data_dir`
+  drains that payload into `Error::missing_data_files` (with code `-2`)
+  exactly as `from_data_dir_with` does — so which constructor a caller
+  reached a missing-files failure through no longer decides whether the
+  error carries the file list.
 
 - **Python time inputs are `Epochs`, and every `Epochs` states its
   scale.** *Breaking.* Every public entry point in the `empyrean` Python

@@ -178,17 +178,33 @@ impl Context {
     /// missing files. Pass `None` to use the platform XDG data directory
     /// (`~/.empyrean/data` on Linux/macOS).
     ///
-    /// **This constructor ignores `EMPYREAN_OFFLINE`.** It predates the
-    /// variable, and quietly reinterpreting it would change the meaning
-    /// of code written before the variable existed — so on a host where
-    /// the operator has asserted the floor, this still reaches the
-    /// network, including for the staleness checks a fully populated
-    /// data directory would otherwise skip. Use
-    /// [`from_data_dir_with`](Self::from_data_dir_with) with an explicit
-    /// [`DataDirOptions`] when the variable should apply; that is the
-    /// constructor Python's `initialize()` and the CLI both route
-    /// through.
+    /// **`EMPYREAN_OFFLINE=1` applies here too.** The variable is a floor
+    /// on the process, not a knob on one constructor: an operator who has
+    /// asserted "this machine must not reach the network" is not reached
+    /// past by the older, options-less entry point. When the floor is in
+    /// force this call behaves exactly like
+    /// [`from_data_dir_with`](Self::from_data_dir_with) with
+    /// `refresh: false` — it resolves the Standard tier from `data_dir`
+    /// alone and fails naming every file the tier needs and the directory
+    /// does not have. The downgrade is announced on stderr naming the
+    /// variable, so a run that stopped downloading is never a mystery.
+    /// Nothing else about this constructor changes.
     pub fn from_data_dir(data_dir: Option<&Path>) -> Result<Self> {
+        // The floor, applied where the network request is actually made.
+        // `DataDirOptions::default()` is documented as exactly this
+        // constructor's behaviour, so routing the floored case through the
+        // options constructor is the same call with `refresh` at the floor
+        // — no second announcement (it only speaks when it downgrades a
+        // `true`), no tier change, no other divergence.
+        if !apply_offline_floor(true) {
+            return Self::from_data_dir_with(
+                data_dir,
+                DataDirOptions {
+                    refresh: false,
+                    ..DataDirOptions::default()
+                },
+            );
+        }
         let c_path = match data_dir {
             Some(d) => Some(path_to_cstring(d)?),
             None => None,
@@ -247,11 +263,24 @@ impl Context {
     /// that genuinely must reach the network on such a machine unsets
     /// `EMPYREAN_OFFLINE` for that process; nothing is decided quietly.
     ///
-    /// Note that `Context::from_data_dir` does **not** consult the
-    /// variable: quietly reinterpreting the older, options-less
-    /// constructor would change the meaning of code written before the
-    /// variable existed. Reach for this constructor — with an explicit
-    /// `refresh` — when the variable should apply.
+    /// # What the floor covers
+    ///
+    /// Every **data-provisioning** entry point in this crate applies it:
+    /// this constructor, [`Context::from_data_dir`] (which is this call
+    /// with [`DataDirOptions::default`]), and
+    /// [`download_data`](crate::download_data), which refuses outright
+    /// under the floor rather than downloading — reaching the network is
+    /// its entire purpose, so there is nothing left to downgrade.
+    ///
+    /// It does **not** cover the catalog query helpers
+    /// ([`query_sbdb`](crate::query_sbdb),
+    /// [`query_horizons`](crate::query_horizons),
+    /// [`query_horizons_vectors`](crate::query_horizons_vectors),
+    /// [`query_observations`](crate::query_observations),
+    /// [`query_radar`](crate::query_radar)): those reach JPL and the MPC
+    /// and are ungated. Use [`offline_floor_is_active`] to gate them
+    /// yourself on a host where the variable must mean "no outbound
+    /// requests at all".
     pub fn from_data_dir_with(data_dir: Option<&Path>, options: DataDirOptions) -> Result<Self> {
         let c_path = match data_dir {
             Some(d) => Some(path_to_cstring(d)?),
@@ -341,6 +370,87 @@ fn first_missing_core_kernel(dir: &Path) -> Option<&'static str> {
     CORE_KERNELS.iter().copied().find(|f| !dir.join(f).exists())
 }
 
+/// Why a data directory that *exists* cannot be used as one.
+///
+/// Distinct from "a kernel is absent", and it has to be: the engine's
+/// provisioning pass `mkdir`s the data directory, and `mkdir` never follows
+/// a trailing symbolic link — so a data dir that is a link to nowhere (or
+/// to a file, or to itself) fails with a bare `File exists (os error 17)`.
+/// Probing *that* path for kernels finds none of them, so the first entry
+/// of [`CORE_KERNELS`] would be blamed for a failure it had no part in, and
+/// the caller would be sent to `download_data`, which cannot fix a link.
+struct UnusableDataDir {
+    /// The link's target, when the data-dir path is itself a symbolic link.
+    symlink_target: Option<PathBuf>,
+    /// What is wrong with the path, in the filesystem's own terms.
+    reason: String,
+}
+
+/// Inspect the data directory itself, before any kernel is probed.
+///
+/// `Ok(())` means either that the path resolves to a directory (so a
+/// kernel-level diagnosis is meaningful) or that nothing is there at all
+/// (the ordinary un-provisioned case, whose remedy really is
+/// `download_data`). `Err` means the path exists but is not a usable
+/// directory, and no kernel may be named for it.
+fn inspect_data_dir(dir: &Path) -> std::result::Result<(), UnusableDataDir> {
+    // lstat: does not follow the link, so a dangling one is still "there".
+    let link_meta = match std::fs::symlink_metadata(dir) {
+        Ok(m) => m,
+        // Nothing at this path — not an obstruction, just unprovisioned.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(UnusableDataDir {
+                symlink_target: None,
+                reason: format!("could not be inspected: {source}"),
+            });
+        }
+    };
+    let symlink_target = if link_meta.file_type().is_symlink() {
+        std::fs::read_link(dir).ok()
+    } else {
+        None
+    };
+    // stat: follows the link, which is the resolution `mkdir` needs and
+    // does not perform itself.
+    match std::fs::metadata(dir) {
+        Ok(m) if m.is_dir() => Ok(()),
+        Ok(_) => Err(UnusableDataDir {
+            symlink_target,
+            reason: "exists but is not a directory".to_string(),
+        }),
+        Err(source) => Err(UnusableDataDir {
+            symlink_target,
+            reason: format!("does not resolve to a directory: {source}"),
+        }),
+    }
+}
+
+/// Append the directory-level diagnosis to a construction error's message.
+///
+/// Names the path, the link target when there is one, and the real reason —
+/// and deliberately names **no** kernel, because none of them is why this
+/// failed.
+fn augment_with_unusable_data_dir(base: &str, dir: &Path, bad: &UnusableDataDir) -> String {
+    let what = match &bad.symlink_target {
+        Some(target) => format!(
+            "the empyrean data directory '{}' is a symbolic link to '{}' that {}",
+            dir.display(),
+            target.display(),
+            bad.reason,
+        ),
+        None => format!(
+            "the empyrean data directory '{}' {}",
+            dir.display(),
+            bad.reason,
+        ),
+    };
+    format!(
+        "{base} — {what}. Repoint or remove that path, or set EMPYREAN_DATA_DIR to a \
+         directory that already contains the kernels."
+    )
+}
+
 /// Append the resolved data directory (and, if a core kernel is absent, an
 /// actionable remedy) to a construction error's (already de-duplicated) message.
 ///
@@ -364,9 +474,24 @@ fn augment_with_data_dir(base: &str, dir: &Path, missing: Option<&str>) -> Strin
 /// de-duplicate the engine's doubly-wrapped `I/O error:` prefix and, when the
 /// resolved data directory is missing required kernels, name the file and the
 /// remedy instead of returning the path-less native message.
+///
+/// The structured missing-files payload is drained first, exactly as
+/// [`Context::from_data_dir_with`] drains it. The C ABI records that
+/// payload for **both** constructors, so which one a caller reached the
+/// failure through must not decide whether
+/// [`Error::missing_data_files`] is populated — an error contract that
+/// changes shape with an environment variable is not a contract.
 fn construction_error(data_dir: Option<&Path>) -> Error {
     let mut err = Error::from_null_ptr();
     err.message = dedupe_io_prefix(&err.message);
+    err.missing_data_files = drain_missing_data_files();
+    if !err.missing_data_files.is_empty() {
+        // A non-empty list is the authoritative signal that this was a
+        // missing-data failure, and a null-returning constructor has no
+        // return code to carry the category otherwise.
+        err.code = -2;
+        return err;
+    }
     augment_construction_error(err, data_dir)
 }
 
@@ -379,6 +504,17 @@ fn augment_construction_error(mut err: Error, data_dir: Option<&Path>) -> Error 
         .map(Path::to_path_buf)
         .or_else(|| default_data_dir().ok());
     if let Some(dir) = resolved {
+        // The directory itself comes first. A path that does not resolve to
+        // a directory makes every kernel look absent, so a kernel-level
+        // guess made here would be manufactured, not observed — and its
+        // remedy (`download_data`) cannot repair a broken link. Only a
+        // resolving directory may reach `first_missing_core_kernel`.
+        if let Err(bad) = inspect_data_dir(&dir) {
+            // Not a missing-data failure: leave the captured code alone
+            // rather than recategorizing an I/O fault as absent data.
+            err.message = augment_with_unusable_data_dir(&err.message, &dir, &bad);
+            return err;
+        }
         let missing = first_missing_core_kernel(&dir);
         if missing.is_some() {
             // Categorize as missing-data rather than the generic invalid-argument
@@ -426,6 +562,27 @@ fn apply_offline_floor(requested_refresh: bool) -> bool {
         return false;
     }
     requested_refresh
+}
+
+/// Refuse a download-only call while the `EMPYREAN_OFFLINE` floor is in
+/// force.
+///
+/// [`apply_offline_floor`] downgrades a *construction* from "refresh" to
+/// "resolve what is already here". A provisioning call has no such second
+/// mode — the network access is the whole call — so the floor cannot
+/// downgrade it and must not be ignored either. Factored out so the tests
+/// can exercise the decision without a network or a data directory.
+fn refuse_download_under_offline_floor() -> Result<()> {
+    if offline_env_is_set() {
+        return Err(Error::invalid_input(format!(
+            "{OFFLINE_ENV}=1 is set — refusing to provision kernels, because downloading \
+             them is the entire operation and there is no offline form of it. Build the \
+             context against an already-provisioned directory with `refresh: false` \
+             (Python `refresh=False`, CLI `--no-refresh`), or unset {OFFLINE_ENV} for the \
+             process that must provision."
+        )));
+    }
+    Ok(())
 }
 
 /// Take the structured missing-file list recorded by the most recent
@@ -494,6 +651,17 @@ pub fn default_data_dir() -> Result<std::path::PathBuf> {
 /// context is built or loaded, so this does not pay for a full Standard-tier
 /// context assembly it would immediately discard.
 ///
+/// # `EMPYREAN_OFFLINE=1` refuses this call
+///
+/// The [`EMPYREAN_OFFLINE`](offline_floor_is_active) floor downgrades a
+/// context construction from "refresh" to "resolve what is already here".
+/// This function has no such second mode — reaching the network *is* the
+/// call — so under the floor it fails with an error naming the variable
+/// rather than provisioning anyway. Build against an already-provisioned
+/// directory with `refresh: false` (Python `refresh=False`, CLI
+/// `--no-refresh`), or unset the variable for the process that must
+/// provision.
+///
 /// ```no_run
 /// # fn main() -> Result<(), empyrean::Error> {
 /// let dir = empyrean::download_data(None)?; // ensures a usable data directory
@@ -502,6 +670,7 @@ pub fn default_data_dir() -> Result<std::path::PathBuf> {
 /// # }
 /// ```
 pub fn download_data(data_dir: Option<&Path>) -> Result<PathBuf> {
+    refuse_download_under_offline_floor()?;
     // Provision without building a context: the C ABI's
     // `empyrean_download_data` runs the engine's download-and-cache pass and
     // stops at the resolved kernel paths — no ephemeris load, no context to
@@ -602,11 +771,16 @@ mod tests {
 ///
 /// The precedence rule is the whole point: the variable may only ever
 /// turn network access **off**, never on, and only the exact value `1`
-/// asserts it. These exercise [`apply_offline_floor`] directly rather
-/// than through a constructor, so they need no kernels and no network.
+/// asserts it. Most of these exercise [`apply_offline_floor`] directly,
+/// so they need no kernels and no network — but the two that matter most
+/// go through the real public entry points, because a decision function
+/// nobody calls is not a floor.
 #[cfg(test)]
 mod offline_floor_tests {
-    use super::{DataDirOptions, DataTier, OFFLINE_ENV, apply_offline_floor, offline_env_is_set};
+    use super::{
+        Context, DataDirOptions, DataTier, OFFLINE_ENV, apply_offline_floor, download_data,
+        offline_env_is_set, offline_floor_is_active, refuse_download_under_offline_floor,
+    };
 
     /// `EMPYREAN_OFFLINE` is process-global; serialize the tests that
     /// set it so they cannot observe each other's value.
@@ -676,5 +850,312 @@ mod offline_floor_tests {
         with_offline(Some("1"), || {
             assert!(offline_env_is_set());
         });
+    }
+
+    /// `from_data_dir` is `from_data_dir_with(dir, default())`, so under
+    /// the floor it must take the same floored path. Asserted through the
+    /// decision function the constructor branches on, so the test needs
+    /// neither kernels nor a network: `apply_offline_floor(true)` is
+    /// exactly the predicate `from_data_dir` evaluates, and it is what the
+    /// options constructor evaluates for `DataDirOptions::default()`.
+    #[test]
+    fn the_older_constructor_takes_the_same_floored_path() {
+        with_offline(Some("1"), || {
+            assert!(
+                !apply_offline_floor(DataDirOptions::default().refresh),
+                "the floor downgrades the default `refresh: true` the old constructor uses"
+            );
+            assert!(offline_floor_is_active());
+        });
+        with_offline(None, || {
+            assert!(
+                apply_offline_floor(DataDirOptions::default().refresh),
+                "unset, the old constructor still refreshes"
+            );
+        });
+    }
+
+    /// Provisioning has no offline form, so the floor refuses it outright
+    /// instead of downgrading it — and the refusal names the variable and
+    /// the way out, because an error a caller cannot act on is its own
+    /// failure.
+    #[test]
+    fn provisioning_is_refused_under_the_floor() {
+        with_offline(None, || {
+            assert!(
+                refuse_download_under_offline_floor().is_ok(),
+                "unset: provisioning proceeds"
+            );
+        });
+        with_offline(Some("1"), || {
+            let err = refuse_download_under_offline_floor()
+                .expect_err("the floor must refuse a download-only call");
+            assert!(
+                err.message.contains(OFFLINE_ENV),
+                "names the variable: {err}"
+            );
+            assert!(
+                err.message.contains("refresh: false") || err.message.contains("refresh=False"),
+                "points at the offline construction path: {err}"
+            );
+        });
+        with_offline(Some("0"), || {
+            assert!(
+                refuse_download_under_offline_floor().is_ok(),
+                "only the exact value 1 asserts the floor"
+            );
+        });
+    }
+
+    /// A scratch directory that does not exist yet, so the constructor has
+    /// to either provision it or refuse.
+    fn empty_scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "empyrean-offline-{}-{}-{tag}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch data dir");
+        dir
+    }
+
+    fn entries(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir).map(|d| d.count()).unwrap_or(0)
+    }
+
+    /// The floor through the real constructor, end to end.
+    ///
+    /// The decision function being right is necessary and not sufficient:
+    /// delete the branch in [`Context::from_data_dir`] that consults it
+    /// and every predicate test above still passes. This calls the
+    /// shipped constructor over an empty directory and asserts the three
+    /// things a floored construction must be — it fails, it fails as a
+    /// named data shortfall (`code == -2` with the file list, the same
+    /// contract `from_data_dir_with` carries), and it downloads
+    /// **nothing**: the directory is still empty afterwards, and the
+    /// whole call is over in well under the time the first kernel alone
+    /// takes to fetch.
+    #[test]
+    fn the_older_constructor_is_floored_end_to_end() {
+        let dir = empty_scratch("ctor");
+        let started = std::time::Instant::now();
+        let err = with_offline(Some("1"), || {
+            Context::from_data_dir(Some(&dir))
+                .err()
+                .expect("an empty directory under the floor cannot produce a context")
+        });
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            err.code, -2,
+            "a floored construction is a missing-data failure: {err}"
+        );
+        assert!(
+            !err.missing_data_files().is_empty(),
+            "the floored path must carry the structured file list, not just prose: {err}"
+        );
+        assert_eq!(
+            entries(&dir),
+            0,
+            "the floor must not have downloaded anything into {}",
+            dir.display()
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "the floored constructor resolved in {elapsed:?} — that is long enough to \
+             have gone to the network"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same, for the provisioning call — which has no offline form, so
+    /// the floor refuses it outright. Through the public function, for the
+    /// same reason: the private helper being right proves nothing about
+    /// whether anything calls it.
+    #[test]
+    fn provisioning_is_refused_through_the_public_function() {
+        let dir = empty_scratch("download");
+        let err = with_offline(Some("1"), || {
+            download_data(Some(&dir)).expect_err("provisioning under the floor must refuse")
+        });
+        assert!(
+            err.message.contains(OFFLINE_ENV),
+            "the refusal must name the variable: {err}"
+        );
+        assert_eq!(
+            entries(&dir),
+            0,
+            "nothing may be fetched into {}",
+            dir.display()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The directory-level diagnosis, which must run *before* any kernel is
+/// named.
+///
+/// A data dir that is a symlink to nowhere makes every kernel look absent,
+/// so the old probe always blamed `de440.bsp` — the first entry of
+/// `CORE_KERNELS` — and sent the caller to `download_data`, which cannot
+/// repair a link. These pin the message assembly directly, so they need no
+/// engine, no kernels and no network.
+#[cfg(test)]
+mod data_dir_shape_tests {
+    use super::{augment_construction_error, augment_with_unusable_data_dir, inspect_data_dir};
+    use crate::error::Error;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "empyrean-datadir-{}-{}-{tag}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A real directory, and an absent path, both leave the kernel-level
+    /// diagnosis in charge — the first because it resolves, the second
+    /// because "nothing is provisioned yet" really is a `download_data`
+    /// case.
+    #[test]
+    fn a_resolving_or_absent_path_is_not_a_directory_level_fault() {
+        let root = scratch("ok");
+        assert!(inspect_data_dir(&root).is_ok(), "a real directory resolves");
+        assert!(
+            inspect_data_dir(&root.join("not-created-yet")).is_ok(),
+            "an absent path is unprovisioned, not obstructed"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A symlink that DOES resolve to a directory is fine — the guard must
+    /// not reject the ordinary "data dir lives behind a link" layout.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_to_a_real_directory_resolves() {
+        let root = scratch("goodlink");
+        let real = root.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(inspect_data_dir(&link).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The regression: a dangling data-dir symlink must produce the
+    /// directory-level diagnosis, naming the link and its target, and must
+    /// NOT accuse `de440.bsp` of being absent.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_names_the_link_not_a_kernel() {
+        let root = scratch("dangling");
+        let link = root.join("data");
+        std::os::unix::fs::symlink(root.join("nowhere"), &link).unwrap();
+
+        let bad = inspect_data_dir(&link).expect_err("a dangling link is not a usable data dir");
+        assert_eq!(
+            bad.symlink_target.as_deref(),
+            Some(root.join("nowhere").as_path()),
+            "the link target is read and reported"
+        );
+
+        let msg =
+            augment_with_unusable_data_dir("I/O error: File exists (os error 17)", &link, &bad);
+        assert!(
+            msg.starts_with("I/O error: File exists (os error 17)"),
+            "the native cause stays up front: {msg}"
+        );
+        assert!(
+            msg.contains("symbolic link"),
+            "names the shape of the fault: {msg}"
+        );
+        assert!(
+            msg.contains("nowhere"),
+            "names the unresolved target: {msg}"
+        );
+        assert!(
+            !msg.contains("de440.bsp"),
+            "no kernel may be blamed for a directory-level fault: {msg}"
+        );
+        assert!(
+            !msg.contains("download_data"),
+            "download_data cannot repair a broken link: {msg}"
+        );
+
+        // And through the real assembly path the constructors use.
+        let err = augment_construction_error(
+            Error::invalid_input("I/O error: File exists (os error 17)"),
+            Some(&link),
+        );
+        assert!(!err.message.contains("de440.bsp"), "{}", err.message);
+        assert!(err.message.contains("symbolic link"), "{}", err.message);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A data dir that is a regular file (or a link to one) is named as
+    /// such — the same class of fault, a different filesystem shape.
+    #[test]
+    fn a_regular_file_at_the_data_dir_path_is_named() {
+        let root = scratch("file");
+        let path = root.join("data");
+        std::fs::write(&path, b"not a directory").unwrap();
+        let bad = inspect_data_dir(&path).expect_err("a file is not a usable data dir");
+        assert!(bad.symlink_target.is_none());
+        let msg = augment_with_unusable_data_dir("boom", &path, &bad);
+        assert!(msg.contains("is not a directory"), "{msg}");
+        assert!(!msg.contains("de440.bsp"), "{msg}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The older constructor's error builder drains the structured
+    /// missing-files payload, exactly as its `_with` sibling does.
+    ///
+    /// The C ABI records that payload for both constructors, so the
+    /// question is only whether this side reads it. If it does not, the
+    /// same directory yields a file list through one constructor and an
+    /// empty one through the other, and a caller branching on
+    /// `missing_data_files().is_empty()` takes a different path depending
+    /// on which entry point they happened to call.
+    ///
+    /// Drives the engine to a real missing-files failure with no network
+    /// (`refresh` off over an empty directory), which leaves the payload
+    /// on this thread, then asks [`construction_error`] what it makes of
+    /// it — the same function `Context::from_data_dir` builds its error
+    /// with.
+    #[test]
+    fn the_older_constructors_error_builder_carries_the_file_list() {
+        let dir = scratch("payload");
+        let c_dir = std::ffi::CString::new(dir.to_str().unwrap()).unwrap();
+        let options = empyrean_sys::EmpyreanDataDirOptions {
+            refresh: empyrean_sys::EMPYREAN_DATA_REFRESH_OFF,
+            tier: empyrean_sys::EMPYREAN_DATA_TIER_STANDARD,
+        };
+        let raw =
+            unsafe { empyrean_sys::empyrean_context_from_data_dir_with(c_dir.as_ptr(), &options) };
+        assert!(
+            raw.is_null(),
+            "an empty directory cannot resolve the Standard tier offline"
+        );
+
+        let err = super::construction_error(Some(&dir));
+        assert!(
+            !err.missing_data_files().is_empty(),
+            "the older constructor must carry the file list too: {err}"
+        );
+        assert_eq!(
+            err.code, -2,
+            "a named data shortfall is the missing-data category: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -673,6 +673,18 @@ the handle can be shared across threads. A call that disagrees with the
 frozen key is rejected loudly, never silently rebuilt; rebuild the
 handle after any `initialize()` / data reload.
 
+The same handle serves orbit determination: `determine` / `evaluate` /
+`refine` mirror the module-level `empyrean.determine` /
+`empyrean.evaluate` / `empyrean.refine` argument for argument, which is
+the measure-and-extend loop — assemble once, refine many. Build that
+handle with `od_system(force_model)` rather than `build_system`: a fit
+picks its own integration frame and encounter-timescale divisor, and the
+frame is *not* the one the propagation examples freeze, so a
+`frame="icrf"` handle is refused on the OD path with a frame-mismatch
+error. `ODConfig.auto_force_model` is refused too — it lets the fit
+re-pick its own tier part-way through, which no frozen handle can
+follow.
+
 ```python
 import empyrean
 from empyrean import ForceModelTier, Frame
@@ -688,6 +700,12 @@ result = system.propagate(orbits, epochs)
 # model name for built-in fields).
 desc = system.describe()
 print(len(desc.perturber_origins), "perturbers,", len(desc.kernels), "kernels")
+
+# For fitting, freeze the recipe a fit actually runs under and reuse one
+# handle across the whole measure-and-extend loop.
+od = empyrean.od_system(ForceModelTier.STANDARD)
+for arc in arcs:
+    fit = od.refine(orbit, arc)  # one force-model assembly total
 ```
 
 ## Impact probability and B-plane geometry

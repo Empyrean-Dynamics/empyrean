@@ -17,15 +17,20 @@ pub struct Error {
     /// Error message captured from `empyrean_last_error()` at the time
     /// of the failure.
     pub message: String,
-    /// Data files a strict-offline construction found absent.
+    /// Data files a construction found absent.
     ///
-    /// Non-empty **only** for a
-    /// [`Context::from_data_dir_with`](crate::Context::from_data_dir_with)
-    /// failure under `refresh: false`, where it names **every** file the
-    /// requested tier needs and the directory does not have — so a caller
-    /// can fetch or report exactly that set in one pass instead of
-    /// splitting [`message`](Self::message) back apart on a separator a
-    /// filename may itself contain. Prefer
+    /// Non-empty whenever the engine reported a missing-data shortfall by
+    /// name — [`Context::from_data_dir_with`](crate::Context::from_data_dir_with)
+    /// under `refresh: false`,
+    /// [`Context::from_data_dir`](crate::Context::from_data_dir) (which
+    /// resolves that way under the `EMPYREAN_OFFLINE` floor, and reports
+    /// the same payload when the engine names files on any other path),
+    /// and [`download_data`](crate::download_data). It names **every**
+    /// file the requested tier needs and the directory does not have, so
+    /// a caller can fetch or report exactly that set in one pass instead
+    /// of splitting [`message`](Self::message) back apart on a separator
+    /// a filename may itself contain. Empty for every failure that is not
+    /// a named data shortfall. Prefer
     /// [`missing_data_files`](Self::missing_data_files) to reading the
     /// field.
     pub missing_data_files: Vec<String>,
@@ -63,14 +68,23 @@ impl Error {
         }
     }
 
-    /// The data files a strict-offline construction found absent, or an
-    /// empty slice for every other failure.
+    /// The data files a construction found absent, or an empty slice for
+    /// any failure that is not a named data shortfall.
     ///
-    /// The actionable form of a
-    /// [`Context::from_data_dir_with`](crate::Context::from_data_dir_with)
-    /// failure under `refresh: false`: fetch exactly these and the same
-    /// call succeeds. Pair with `self.code == -2`, which is the category
-    /// this failure carries.
+    /// The actionable form of a missing-data failure: fetch exactly these
+    /// and the same call succeeds. Population is unconditional — whenever
+    /// the engine names files, the list is here, whatever path reached the
+    /// failure and whether or not the `EMPYREAN_OFFLINE` floor is in
+    /// effect. Both context constructors report it
+    /// ([`Context::from_data_dir_with`](crate::Context::from_data_dir_with)
+    /// and [`Context::from_data_dir`](crate::Context::from_data_dir)), as
+    /// does [`download_data`](crate::download_data). An error contract
+    /// that changes shape with an environment variable is not a contract.
+    ///
+    /// A non-empty list from either constructor carries
+    /// `self.code == -2`, the missing-data category; `download_data`
+    /// keeps whatever code the engine returned, so read the list rather
+    /// than the code to decide whether a failure named files.
     pub fn missing_data_files(&self) -> &[String] {
         &self.missing_data_files
     }

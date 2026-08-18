@@ -467,10 +467,13 @@ pub struct EmpyreanOrbit {
 /// Origin-switching configuration for trajectory splitting at body
 /// Laplace spheres of influence (Amato/Baù/Bombardelli 2017 §6).
 ///
-/// Default **enabled** (the `_DEFAULT` sentinel resolves to
-/// `enabled = 1`). When enabled, integration switches to a
-/// body-centric frame inside the SOI of each eligible body and back
-/// to SSB on exit. Set `enabled = 0` explicitly to opt out.
+/// Default **enabled** (the `_DEFAULT` sentinel resolves to the
+/// upstream default, currently `ON`). When enabled, integration
+/// switches to a body-centric frame inside the SOI of each eligible
+/// body and back to SSB on exit. Set
+/// `enabled = EMPYREAN_ORIGIN_SWITCHING_OFF` (2) to opt out; `0` is the
+/// DEFAULT sentinel and resolves to ON, so zero-initializing the struct
+/// does **not** disable trajectory splitting.
 ///
 /// At the C-ABI surface, the per-body opt-in list (`bodies` in
 /// villeneuve) is not yet exposed — `EMPYREAN_ORIGIN_SWITCHING_ON`
@@ -4196,6 +4199,58 @@ mod covariance_quality_tag_tests {
             }
             assert!(*a < 0, "every failure code is negative");
         }
+    }
+}
+
+/// The tri-state origin-switching sentinel, pinned at the translator.
+///
+/// The struct doc above `EmpyreanOriginSwitchingConfig` once told C
+/// callers to set `enabled = 0` to opt out. Under the tri-state encoding
+/// `0` is DEFAULT and resolves to ON, so a caller following the header
+/// got trajectory splitting enabled. These pin the semantic so the
+/// prose cannot drift back.
+#[cfg(test)]
+mod origin_switching_tristate_tests {
+    use super::*;
+
+    /// A `memset(0)` config — what a C consumer who zero-initializes the
+    /// struct hands us — must resolve to the upstream default, which is
+    /// ON. This is the assertion the wrong header sentence contradicted.
+    #[test]
+    fn zero_init_resolves_to_enabled() {
+        // SAFETY: `#[repr(C)]` with scalar fields only; the all-zero
+        // pattern is exactly what `memset(0)` gives a C caller.
+        let c: EmpyreanAdvancedIntegratorConfig = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            c.origin_switching.enabled, EMPYREAN_ORIGIN_SWITCHING_DEFAULT,
+            "memset(0) is the DEFAULT sentinel, not OFF"
+        );
+        let a = build_advanced_from_c(&c);
+        assert!(
+            a.origin_switching.enabled,
+            "the DEFAULT sentinel resolves to the upstream default (ON)"
+        );
+    }
+
+    /// Opting out is reachable only through the explicit OFF value.
+    #[test]
+    fn explicit_off_resolves_to_disabled() {
+        // SAFETY: see `zero_init_resolves_to_enabled`.
+        let mut c: EmpyreanAdvancedIntegratorConfig = unsafe { std::mem::zeroed() };
+        c.origin_switching.enabled = EMPYREAN_ORIGIN_SWITCHING_OFF;
+        let a = build_advanced_from_c(&c);
+        assert!(
+            !a.origin_switching.enabled,
+            "EMPYREAN_ORIGIN_SWITCHING_OFF (2) is the documented opt-out"
+        );
+
+        // SAFETY: see `zero_init_resolves_to_enabled`.
+        let mut on: EmpyreanAdvancedIntegratorConfig = unsafe { std::mem::zeroed() };
+        on.origin_switching.enabled = EMPYREAN_ORIGIN_SWITCHING_ON;
+        assert!(
+            build_advanced_from_c(&on).origin_switching.enabled,
+            "explicit ON stays on"
+        );
     }
 }
 

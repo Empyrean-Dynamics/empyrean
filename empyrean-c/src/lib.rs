@@ -208,15 +208,36 @@ pub(crate) mod testing {
     /// cache reports green while asserting nothing, and the more
     /// load-bearing the test, the more damage the false green does.
     ///
-    /// Setting `EMPYREAN_REQUIRE_DATA=1` turns the skip into a failure.
-    /// CI sets it; a developer without a local kernel set does not, and
-    /// still gets the skip. The default is deliberately the permissive
-    /// one — a tripwire that blocks local `cargo test` gets disabled,
+    /// Two environments say the kernels are supposed to be here, and
+    /// either one turns the skip into a failure:
+    ///
+    /// * `EMPYREAN_DATA_DIR` — the runner was *pointed at* a data
+    ///   directory. A data-gated test that turns itself off on the one
+    ///   runner configured to run it is a green no-op, not a test, so a
+    ///   context failure here is a failure, not a skip. This is the
+    ///   variable CI sets on every job that runs these tests.
+    /// * `EMPYREAN_REQUIRE_DATA` — an explicit "must not skip" for a
+    ///   runner that resolves its kernels through the platform default
+    ///   directory instead.
+    ///
+    /// A developer with neither set, and no local kernel set, still gets
+    /// the skip: a tripwire that blocks local `cargo test` gets disabled,
     /// and a disabled tripwire protects nothing.
     pub fn context_or_skip(what: &str) -> Option<empyrean_core::Context> {
+        // Take the same lock the C ABI's own constructors take: this builds a
+        // native context directly, and an unlocked build can race a concurrent
+        // one on first-init cache I/O (see [`CONSTRUCT_LOCK`]). Without it the
+        // tripwire below would report that race — a known, transient
+        // provisioning collision — as an unusable data directory.
+        let _guard = crate::construct_lock();
         match empyrean_core::Context::from_data_dir(None) {
             Ok(ctx) => Some(ctx),
             Err(e) => {
+                assert!(
+                    std::env::var_os("EMPYREAN_DATA_DIR").is_none(),
+                    "{what}: EMPYREAN_DATA_DIR is set, so the kernels are supposed to be \
+                     here and this test must not skip. Context construction failed: {e}"
+                );
                 if std::env::var("EMPYREAN_REQUIRE_DATA").is_ok_and(|v| v != "0") {
                     panic!(
                         "{what}: EMPYREAN_REQUIRE_DATA is set, so a data directory is \
@@ -448,7 +469,12 @@ pub unsafe extern "C" fn empyrean_context_from_data_dir(
         match outcome {
             Ok(ctx) => Box::into_raw(Box::new(ctx)),
             Err(e) => {
-                set_last_error(&e.to_string());
+                // Same recorder as `empyrean_context_from_data_dir_with`:
+                // a bare `set_last_error` drops the structured
+                // `MissingDataFiles` payload, so the same failure reached
+                // through the older constructor arrived with no file list
+                // for `empyrean_missing_data_files` to hand back.
+                set_last_error_from(&e);
                 std::ptr::null_mut()
             }
         }

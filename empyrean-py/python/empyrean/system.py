@@ -60,6 +60,7 @@ __all__ = [
     "KernelRecord",
     "SystemDescription",
     "build_system",
+    "od_system",
 ]
 
 # Force-model tier code (the Rust boundary) → the Python enum. Inverse of
@@ -240,6 +241,21 @@ class BuiltSystem:
         # so the recorded key reflects the actual frozen divisor.
         self._encounter_timescale_divisor: float = float(self._rs.encounter_timescale_divisor)
 
+    @classmethod
+    def _adopt(cls, rs: Any) -> BuiltSystem:
+        """Wrap an already-assembled native handle, reading the frozen key
+        back off it rather than restating it here.
+
+        Used by :func:`od_system`, whose whole point is that the recipe
+        lives in the engine and not in a second copy on this side.
+        """
+        self = cls.__new__(cls)
+        self._rs = rs
+        self._force_model = _INT_TO_FORCE_MODEL[int(rs.force_model)]
+        self._frame = int_to_frame(int(rs.frame))
+        self._encounter_timescale_divisor = float(rs.encounter_timescale_divisor)
+        return self
+
     # ── Frozen key (read-only) ────────────────────────────────
 
     @property
@@ -342,6 +358,87 @@ class BuiltSystem:
             )
         return _generate_ephemeris_fn(orbits, observers, config, _builtsystem=self._rs)
 
+    # ── Orbit determination ───────────────────────────────────
+    #
+    # The three verbs mirror the module-level :func:`empyrean.determine` /
+    # :func:`empyrean.evaluate` / :func:`empyrean.refine` argument for
+    # argument. Build the handle with :func:`od_system` — a fit picks its
+    # own integration frame (EclipticJ2000) and encounter-timescale
+    # divisor, and a handle frozen at, say, ``frame="icrf"`` is refused
+    # here rather than served under dynamics the fit did not ask for.
+    #
+    # The guard refuses; it does not degrade. A caller who named this
+    # surface asked to reuse a *specific* frozen force model, so fitting
+    # under a differently-assembled one while reporting success is exactly
+    # the silent substitution this package will not make.
+    #
+    # ``ODConfig.auto_force_model`` is refused here, not tolerated: it lets
+    # the fit re-pick its own tier part-way through, which no frozen handle
+    # can follow, so the engine would drop the handle mid-fit and reassemble
+    # per solve while the call still returned a result. All three verbs
+    # raise instead, naming the field. Clear it and freeze the handle at the
+    # tier you want, or use the module-level :func:`empyrean.determine`,
+    # which is free to choose the tier.
+
+    def determine(
+        self,
+        observations: Any,
+        initial_orbits: Any = None,
+        *,
+        radar: Any = None,
+        config: Any = None,
+    ) -> Any:
+        """Run the full OD pipeline over every object, through the frozen
+        force model.
+
+        Identical to :func:`empyrean.determine`, which see for the batch
+        semantics, the seeding rules, and the return shape. Results are
+        bit-identical to that call on a matching handle.
+        """
+        from empyrean.od.determine import determine as _determine_fn
+
+        return _determine_fn(
+            observations,
+            initial_orbits,
+            radar=radar,
+            config=config,
+            _builtsystem=self._rs,
+        )
+
+    def evaluate(
+        self,
+        orbit: Any,
+        observations: Any,
+        *,
+        config: Any = None,
+    ) -> Any:
+        """Evaluate residuals for an orbit against observations, through
+        the frozen force model.
+
+        Identical to :func:`empyrean.evaluate`; no fitting is performed.
+        """
+        from empyrean.od.determine import evaluate as _evaluate_fn
+
+        return _evaluate_fn(orbit, observations, config=config, _builtsystem=self._rs)
+
+    def refine(
+        self,
+        orbit: Any,
+        observations: Any,
+        *,
+        config: Any = None,
+    ) -> Any:
+        """Refine an orbit with new observations using a Bayesian prior,
+        through the frozen force model.
+
+        Identical to :func:`empyrean.refine`. This is the loop the whole
+        surface exists for: assemble one handle, refine many times through
+        it.
+        """
+        from empyrean.od.determine import refine as _refine_fn
+
+        return _refine_fn(orbit, observations, config=config, _builtsystem=self._rs)
+
     # ── Provenance ────────────────────────────────────────────
 
     def describe(self) -> SystemDescription:
@@ -401,3 +498,43 @@ def build_system(
         frame=frame,
         encounter_timescale_divisor=encounter_timescale_divisor,
     )
+
+
+def od_system(force_model: ForceModelTier | str | int = ForceModelTier.STANDARD) -> BuiltSystem:
+    """Assemble a :class:`BuiltSystem` keyed for the orbit-determination
+    entry points.
+
+    :func:`build_system` asks for a frame and an encounter-timescale
+    divisor. An OD fit picks both itself — :class:`~empyrean.ODConfig`
+    exposes no knob for either — so naming them at the call site is an
+    invitation to name them wrong, and the wrong frame is the likely
+    mistake: OD integrates in :attr:`Frame.ECLIPTICJ2000`, while
+    propagation examples routinely freeze ``"icrf"``. This function
+    freezes the recipe a fit actually runs under, so the handle it returns
+    is accepted by the OD identity guard as long as ``force_model``
+    matches the config's.
+
+    Parameters
+    ----------
+    force_model : ForceModelTier | str | int
+        Force-model tier to freeze. Must equal the ``force_model`` on the
+        :class:`~empyrean.ODConfig` you pass to the fit. Default
+        :attr:`ForceModelTier.STANDARD`, which is ``ODConfig``'s default.
+
+    Returns
+    -------
+    BuiltSystem
+        An ordinary handle: ``describe``-able, shareable across threads,
+        and usable for propagation too when the config asks for the same
+        frame.
+
+    Examples
+    --------
+    >>> system = empyrean.od_system()
+    >>> for arc in arcs:  # doctest: +SKIP
+    ...     fit = system.refine(orbit, arc)  # one force-model assembly total
+    """
+    from empyrean._empyrean_rs import BuiltSystem as _RsBuiltSystem
+
+    tier = _resolve_force_model(force_model)
+    return BuiltSystem._adopt(_RsBuiltSystem.for_od(_FORCE_MODEL_TO_INT[tier]))

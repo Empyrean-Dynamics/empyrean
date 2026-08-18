@@ -546,7 +546,23 @@ nothing and reports exactly what the directory lacks.
 
 `EMPYREAN_OFFLINE=1` in the environment is a floor, not a switch: it
 downgrades a requested refresh to off and announces it on stderr, and it
-can only ever remove network access, never restore it.
+can only ever remove network access, never restore it. It binds **data
+provisioning** on every channel that reads the environment — both Rust
+constructors (`Context::from_data_dir` and `Context::from_data_dir_with`),
+`initialize()` in Python, and the CLI's data-acquiring commands — and
+the provisioning calls that have no offline form
+(`empyrean::download_data`, `empyrean.download_data()`, `empyrean init`)
+refuse under it rather than download. Only the exact value `1` asserts
+it.
+
+Two things it deliberately does **not** cover, so that a machine-level
+assertion is never mistaken for more than it is. The catalog query
+helpers — `query_sbdb`, `query_horizons`, `query_horizons_vectors`,
+`query_observations`, `query_radar`, and the CLI's `query` command and
+`--object-id` inputs — call JPL and the MPC directly and are not gated
+by the variable. Neither is the C ABI, which reads no environment
+variable at all by design: a C caller states the policy in the
+`EmpyreanDataDirOptions` it passes.
 
 ## Validation
 

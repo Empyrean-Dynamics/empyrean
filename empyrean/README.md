@@ -738,6 +738,32 @@ println!("{} perturbers, {} kernels", desc.perturber_origins.len(), desc.kernels
 # Ok::<(), empyrean::Error>(())
 ```
 
+The same handle serves orbit determination: `BuiltSystem::determine` /
+`evaluate` / `refine` mirror [`Context::determine`] / [`Context::evaluate`]
+/ [`Context::refine`] argument for argument, with the context passed
+explicitly because the handle is the receiver — the measure-and-extend
+loop, assembled once. Build that handle with
+`BuiltSystem::new_for_od(&ctx, force_model)`, not `Context::built_system`:
+a fit picks its own integration frame and encounter-timescale divisor, and
+the frame is *not* the `Frame::ICRF` the propagation examples freeze, so
+such a handle is refused on the OD path with
+[`BuiltSystemGuardError::KeyMismatchFrame`]. `ODConfig::auto_force_model`
+is refused as well — it lets the fit re-pick its own tier part-way
+through, which no frozen handle can follow, and being quietly
+un-amortized is not a result this crate returns.
+
+```rust,no_run
+# use empyrean::{BuiltSystem, Context, ForceModelTier, ODConfig, Observations};
+# let ctx = Context::from_data_dir(None)?;
+# let (arcs, orbit): (Vec<Observations>, empyrean::Orbit) = unimplemented!();
+let system = BuiltSystem::new_for_od(&ctx, ForceModelTier::Standard)?;
+for arc in &arcs {
+    let fit = system.refine(&ctx, &orbit, arc, &ODConfig::default())?;
+    println!("converged: {}", fit.converged);
+}
+# Ok::<(), empyrean::Error>(())
+```
+
 ## Impact probability and B-plane geometry
 
 For each detected close approach you can ask for an impact-probability
@@ -920,11 +946,13 @@ let ctx = Context::from_data_dir_with(
 requested `refresh: true` to `false` and says so on stderr, and it can
 never turn a `false` into a `true`. Only the exact value `1` asserts it.
 `offline_floor_is_active()` reports whether it is in force, for a caller
-that does network work of its own before building a context.
-`Context::from_data_dir` does not consult it — it predates the variable,
-and quietly reinterpreting it would change the meaning of code written
-before the variable existed — so reach for `from_data_dir_with` when the
-variable should apply.
+that does network work of its own before building a context. It binds
+`Context::from_data_dir` too — that constructor is
+`from_data_dir_with(dir, DataDirOptions::default())`, and a floor that
+covered the superset but not the default would be no floor at all.
+`download_data` has no offline form (reaching the network is the whole
+call), so under the floor it refuses with an error naming the variable
+rather than provisioning anyway.
 
 `DataTier` selects which kernel set has to be on disk — Approximate,
 Basic, or Standard (the default) — and lines up with the

@@ -70,11 +70,12 @@ use crate::propagate::{
 // Identity-guard error classification
 // ────────────────────────────────────────────────────────────────────
 
-/// Which identity-guard axis a [`BuiltSystem`] forward-model call tripped.
+/// Which guard axis a [`BuiltSystem`] call tripped.
 ///
 /// A handle never silently rebuilds or serves wrong physics: a foreign
-/// context, a stale handle, or a per-call config that diverges from the
-/// frozen key each surfaces as a distinct, loud [`Error`]. Recover the axis
+/// context, a stale handle, a per-call config that diverges from the
+/// frozen key, or a config that would *move* that key mid-call each
+/// surfaces as a distinct, loud [`Error`]. Recover the axis
 /// with [`Error::builtsystem_guard`] and match on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltSystemGuardError {
@@ -91,6 +92,14 @@ pub enum BuiltSystemGuardError {
     /// The context's ephemeris data was mutated (a kernel load) after the
     /// handle was built. Rebuild the handle.
     Stale,
+    /// The *config*, not the handle, would move the frozen key during the
+    /// call, so no handle could be followed to the end of it. Today that
+    /// is [`ODConfig::auto_force_model`](crate::ODConfig::auto_force_model),
+    /// which lets a fit re-pick its own force-model tier part-way through.
+    /// Nothing about the handle is wrong: clear the setting, or drop the
+    /// handle and use the one-shot entry point, which is free to choose
+    /// the tier.
+    ConfigMutatesKey,
 }
 
 impl Error {
@@ -116,6 +125,9 @@ impl Error {
             }
             c if c == empyrean_sys::EMPYREAN_BUILTSYSTEM_STALE => {
                 Some(BuiltSystemGuardError::Stale)
+            }
+            c if c == empyrean_sys::EMPYREAN_BUILTSYSTEM_CONFIG_MUTATES_KEY => {
+                Some(BuiltSystemGuardError::ConfigMutatesKey)
             }
             _ => None,
         }
@@ -276,8 +288,57 @@ impl Context {
 }
 
 impl BuiltSystem {
+    /// Assemble a handle keyed for the **orbit-determination** entry
+    /// points: [`BuiltSystem::determine`], [`BuiltSystem::evaluate`] and
+    /// [`BuiltSystem::refine`].
+    ///
+    /// [`Context::built_system`] asks for a frame and a divisor. An OD fit
+    /// picks both itself — [`ODConfig`](crate::ODConfig) exposes no knob
+    /// for either — so naming them at the call site is an invitation to
+    /// name them wrong, and the wrong frame is the likely mistake: every
+    /// propagation example in this crate builds
+    /// [`Frame::ICRF`](crate::Frame::ICRF) handles, and OD does not
+    /// integrate in ICRF. This constructor freezes the recipe a fit
+    /// actually runs under, so a handle it returns is accepted by the OD
+    /// guard as long as `force_model` matches the config's.
+    ///
+    /// ```no_run
+    /// use empyrean::{BuiltSystem, Context, ForceModelTier, ODConfig};
+    ///
+    /// let ctx = Context::from_data_dir(None)?;
+    /// let cfg = ODConfig::default();
+    /// let system = BuiltSystem::new_for_od(&ctx, cfg.force_model)?;
+    ///
+    /// // Assemble once, refine many.
+    /// let obs = ctx.read_ades("arc.psv")?;
+    /// let seed = ctx.determine(&obs, None, &cfg)?.into_single()?;
+    /// let refined = system.refine(&ctx, &seed.orbit, &obs, &cfg)?;
+    /// # let _ = refined;
+    /// # Ok::<(), empyrean::Error>(())
+    /// ```
+    ///
+    /// The result is an ordinary handle: free-on-drop, `describe`-able,
+    /// and usable for propagation too when the config asks for the same
+    /// frame.
+    pub fn new_for_od(ctx: &Context, force_model: ForceModelTier) -> Result<BuiltSystem> {
+        let mut raw: *mut empyrean_sys::EmpyreanBuiltSystem = std::ptr::null_mut();
+        let code = unsafe {
+            empyrean_sys::empyrean_builtsystem_new_for_od(
+                ctx.as_raw(),
+                force_model as i32,
+                &mut raw,
+            )
+        };
+        if code != 0 {
+            return Err(Error::capture(code));
+        }
+        NonNull::new(raw)
+            .map(|raw| BuiltSystem { raw })
+            .ok_or_else(Error::from_null_ptr)
+    }
+
     /// Borrow the raw FFI handle pointer (internal use).
-    fn as_raw(&self) -> *const empyrean_sys::EmpyreanBuiltSystem {
+    pub(crate) fn as_raw(&self) -> *const empyrean_sys::EmpyreanBuiltSystem {
         self.raw.as_ptr()
     }
 

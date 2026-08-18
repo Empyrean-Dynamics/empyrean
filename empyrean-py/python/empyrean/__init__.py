@@ -182,6 +182,7 @@ from empyrean.system import (
     KernelRecord,
     SystemDescription,
     build_system,
+    od_system,
 )
 
 
@@ -328,6 +329,46 @@ _B612_TO_VILLENEUVE_FILENAME = {
 }
 
 
+def _ensure_data_dir(cache: pathlib.Path) -> None:
+    """Create the data directory, naming a broken path instead of ``Errno 17``.
+
+    ``Path.mkdir(exist_ok=True)`` re-raises ``FileExistsError`` whenever the
+    path exists but is not a directory — and ``mkdir(2)`` never follows a
+    trailing symbolic link, so a data dir that is a link to nowhere (or to a
+    file, or to itself) raises a bare ``[Errno 17] File exists`` naming
+    nothing the user can act on. Re-check what is actually there and say so.
+
+    Raises:
+        NotADirectoryError: the path exists but does not resolve to a
+            directory. The message names the path, and the link target when
+            the path is a symbolic link.
+    """
+    import os
+
+    try:
+        cache.mkdir(parents=True, exist_ok=True)
+    except FileExistsError:
+        if cache.is_dir():
+            # Raced with another process that created it; nothing is wrong.
+            return
+        if cache.is_symlink():
+            try:
+                target = os.readlink(cache)
+            except OSError as read_err:  # pragma: no cover - unreadable link
+                target = f"<unreadable: {read_err}>"
+            raise NotADirectoryError(
+                f"the empyrean data directory {str(cache)!r} is a symbolic link to "
+                f"{target!r} that does not resolve to a directory. Repoint or remove "
+                f"that link, or set EMPYREAN_DATA_DIR to a directory that already "
+                f"contains the kernels."
+            ) from None
+        raise NotADirectoryError(
+            f"the empyrean data directory {str(cache)!r} exists but is not a "
+            f"directory. Remove or replace that path, or set EMPYREAN_DATA_DIR to a "
+            f"directory that already contains the kernels."
+        ) from None
+
+
 def _stage_b612_cache(b612: dict[str, str]) -> pathlib.Path:
     """Stage B612-provided kernel symlinks inside the platform data directory.
 
@@ -358,7 +399,7 @@ def _stage_b612_cache(b612: dict[str, str]) -> pathlib.Path:
     from empyrean._empyrean_rs import _default_data_dir
 
     cache = Path(_default_data_dir())
-    cache.mkdir(parents=True, exist_ok=True)
+    _ensure_data_dir(cache)
 
     def _link_if_safe(target: Path, link: Path) -> None:
         # Replace stale symlinks (e.g. when a B612 package updated and
@@ -489,6 +530,18 @@ def download_data(*, data_dir: str | pathlib.Path | None = None) -> str:
     -------
     str
         Path to the provisioned data directory.
+
+    Raises
+    ------
+    RuntimeError
+        If ``EMPYREAN_OFFLINE=1`` is set. That variable is a floor on the
+        process, and it downgrades a context construction from "refresh"
+        to "resolve what is already here" — but provisioning has no such
+        second mode, because reaching the network *is* the call. So it
+        refuses rather than ignoring the assertion, naming the variable.
+        Build against an already-provisioned directory with
+        :func:`initialize` and ``refresh=False`` instead, or unset the
+        variable for the process that must provision.
     """
     # Prefer installed B612 data packages — symlink the kernels they ship into
     # the data dir (no network) and let the engine fetch only the remainder.

@@ -2603,7 +2603,18 @@ struct EmpyreanObserver {
     double vy;
     double vz;
     /**
-     * Observing night as YYYYMMDD integer, or -1 if unavailable.
+     * Observing night as YYYYMMDD integer, or -1 if unavailable
+     * (space-based observers, or a site without a longitude). -1 means
+     * the same on input: the night is treated as absent, never as a
+     * date.
+     *
+     * The night is the local calendar date on which the observing night
+     * began: the UTC epoch is shifted by the site's east longitude to
+     * local mean solar time, and epochs before local noon stamp the
+     * previous date. MPC east-of-Greenwich longitudes in [0, 360) are
+     * wrapped to signed [-180, 180] before the fold, so a site west of
+     * Greenwich (e.g. 289 E in Chile) shifts by -71 degrees, not +19
+     * hours.
      */
     int32_t observing_night;
     /**

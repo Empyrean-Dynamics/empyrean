@@ -18,7 +18,16 @@ pub struct Observer {
     /// Velocity in the [`frame`](Self::frame) / [`origin`](Self::origin)
     /// basis (AU/day).
     pub velocity: [f64; 3],
-    /// Observing night as YYYYMMDD integer, or -1 if unavailable.
+    /// Observing night as YYYYMMDD integer, or -1 if unavailable
+    /// (space-based observers, or a site without a longitude).
+    ///
+    /// The night is the local calendar date on which the observing night
+    /// began: the UTC epoch is shifted by the site's east longitude to
+    /// local mean solar time, and epochs before local noon stamp the
+    /// previous date. MPC east-of-Greenwich longitudes in \\( [0, 360) \\)
+    /// are wrapped to signed \\( [-180, 180] \\) before the fold, so a
+    /// site west of Greenwich (e.g. \\( 289^\circ \\)E in Chile) shifts by
+    /// \\( -71^\circ \\), not \\( +19 \\) hours.
     pub observing_night: i32,
     /// Reference frame [`position`](Self::position) and
     /// [`velocity`](Self::velocity) are expressed in.

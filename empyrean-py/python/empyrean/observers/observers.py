@@ -30,6 +30,15 @@ class Observers(qv.Table):
     ``M`` epochs). The top-level shortcut
     :func:`empyrean.get_observer_states` is the same as
     :meth:`from_codes`.
+
+    ``observing_night`` is the YYYYMMDD local calendar date on which the
+    observing night began, or null when unavailable (space-based
+    observers, or a site without a longitude): the UTC epoch is shifted
+    by the site's east longitude to local mean solar time, and epochs
+    before local noon stamp the previous date. MPC east-of-Greenwich
+    longitudes in ``[0, 360)`` are wrapped to signed ``[-180, 180]``
+    before the fold, so a site west of Greenwich (e.g. 289°E in Chile)
+    shifts by −71°, not +19 hours.
     """
 
     obs_code = qv.LargeStringColumn()

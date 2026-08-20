@@ -9,7 +9,7 @@
 # release serves. in-tree development links the local ../target/release build
 # and never reads this file.
 #
-# Pinned for v0.10.0-rc.1.
+# Pinned for v0.10.0-rc.2.
 #
 # The pinned binaries were built from the include/empyrean.h below. Hashing
 # the tarballs proves WHICH bytes were downloaded, not which struct layouts
@@ -18,10 +18,10 @@
 # 1000. build.rs refuses the download whenever the header in the checkout
 # hashes to anything else. Regenerated with the hashes below.
 #
-# Header-SHA256: 1c1c51d1b0fd81084e042fceb043bf43c9c010774e8556a6ee6f317720cf6c0f
+# Header-SHA256: 8e32906cc85b1ea308fc80cdbc73a0485bfab685928e52e5e4cd07b2596a95a5
 #
 # Format: <asset-stem> <sha256>
-libempyrean-linux-aarch64 c8d84fe1531608d7246b7a80e2b0811510dfc779548a09cda7425de128ffa888
-libempyrean-linux-x86_64 0371351e819a3bcefe73e32aa2ee2920b9ec6a8459508e1cca2e4b0b76ff4bde
-libempyrean-macos-aarch64 57b0b45a66218efbddb15858a2b5158e9ea0ff8ccb7db4ef8f47606502e6634f
-libempyrean-macos-x86_64 125987b90801902cb1cef5adccc3023697fe616edfe7dec2b8e94e5619bcab24
+libempyrean-linux-aarch64 92f375f5fbf846cde33fd558ab5df1003e15b68bcf1a15d09f264bf8e266cebd
+libempyrean-linux-x86_64 99d047fae4bee83b8ef3cbc3fa36d76df0d3f535d400d54ff274c31f9cd4bdc1
+libempyrean-macos-aarch64 31fc6b6b0d967aa12cfef05878151bc96c245261971f6cc2445d5608ed1c6bc5
+libempyrean-macos-x86_64 708ead621819a7dd025cd71d44120c486096fe26c9b8edad9ed9af457cb6ad92

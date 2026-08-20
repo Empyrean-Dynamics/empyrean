@@ -13,6 +13,24 @@ pub struct Error {
     /// negative values indicate the error category:
     /// -1 invalid argument, -2 missing data, -3 convergence failure,
     /// -4 propagation error, -5 I/O error.
+    ///
+    /// -2 is the missing-data **category**, not one failure: it covers a
+    /// named set of files the data directory does not have (no fetch was
+    /// attempted), a fetch that was attempted and failed — a 404 from an
+    /// upstream that rotated or withdrew a pinned kernel, a refused
+    /// connection, a mid-transfer failure — and the category's other
+    /// residents (a kernel that read but would not parse, an
+    /// Earth-orientation coverage gap, a force-model tier whose inputs
+    /// are not loaded). Two implications DO hold and are the ones to
+    /// key on: a non-empty
+    /// [`missing_data_files`](Self::missing_data_files) list means the
+    /// named-files shape, and a message starting `"Data download
+    /// failed: "` means a failed acquisition. Anything else under -2:
+    /// read the message.
+    ///
+    /// -5 is local I/O — a read or write against the filesystem. A
+    /// failed acquisition is **not** -5: its remedy is connectivity or
+    /// a stale kernel pin, never local file repair.
     pub code: i32,
     /// Error message captured from `empyrean_last_error()` at the time
     /// of the failure.
@@ -82,9 +100,26 @@ impl Error {
     /// that changes shape with an environment variable is not a contract.
     ///
     /// A non-empty list from either constructor carries
-    /// `self.code == -2`, the missing-data category; `download_data`
-    /// keeps whatever code the engine returned, so read the list rather
-    /// than the code to decide whether a failure named files.
+    /// `self.code == -2`, the missing-data category. The converse does
+    /// not hold — -2 is a category with several residents, and only two
+    /// of them have a shape this method can key on:
+    ///
+    /// * **Files absent, no fetch attempted** — the list names every one
+    ///   of them and [`message`](Self::message) reads
+    ///   `"Missing data files: <names>"`. Fetch or stage exactly those.
+    /// * **A fetch was attempted and failed** — the list is **empty**,
+    ///   and the message starts `"Data download failed: "`, naming the
+    ///   failing kernel by its URL. The remedy is
+    ///   connectivity, or — when the URL 404s because an upstream
+    ///   rotated or withdrew a pinned kernel — staging that file by hand
+    ///   or moving to an engine whose pin is still served.
+    ///
+    /// An empty list beside a -2 with any other message is one of the
+    /// category's other residents — a kernel that read but would not
+    /// parse, a coverage gap, an unloaded force-model input — whose
+    /// remedy the message itself states. So: a non-empty list always
+    /// means named files; the download prefix always means a failed
+    /// acquisition; for anything else under -2, read the message.
     pub fn missing_data_files(&self) -> &[String] {
         &self.missing_data_files
     }
@@ -102,20 +137,42 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Collapse a doubly-wrapped `"I/O error: I/O error: ..."` prefix down to a
-/// single `"I/O error: "`.
+/// The engine's category prefix on a failed acquisition — a fetch that was
+/// attempted and errored, as opposed to files that are simply absent. The
+/// rest of the message is the request context, naming the kernel by URL.
+pub(crate) const DOWNLOAD_FAILED_PREFIX: &str = "Data download failed: ";
+
+/// The engine's category prefix on a local I/O failure.
+pub(crate) const IO_ERROR_PREFIX: &str = "I/O error: ";
+
+/// Collapse a repeated category prefix down to a single copy.
 ///
 /// The native engine wraps an already-formatted `io::Error` string inside
 /// another `io::Error`, so a missing-file failure arrives as
 /// `"I/O error: I/O error: No such file or directory (os error 2)"`. Keep one
 /// prefix so the message reads cleanly.
+///
+/// Failed downloads no longer lead with `"I/O error: "` — they carry
+/// [`DOWNLOAD_FAILED_PREFIX`] and the missing-data code — so a test anchored
+/// at position 0 against the I/O prefix alone would stop collapsing anything
+/// the moment a doubling sat behind the download prefix. Walk the leading
+/// prefixes instead, dropping only exact consecutive repeats: a distinct
+/// prefix is always kept, and a URL or filename further into the message is
+/// never touched.
 pub(crate) fn dedupe_io_prefix(msg: &str) -> String {
-    let mut s = msg.to_string();
-    while s.starts_with("I/O error: I/O error: ") {
-        // Drop the first prefix, leaving exactly one.
-        s = s.replacen("I/O error: ", "", 1);
+    let mut kept = String::new();
+    let mut rest = msg;
+    while let Some((prefix, tail)) = [DOWNLOAD_FAILED_PREFIX, IO_ERROR_PREFIX]
+        .into_iter()
+        .find_map(|p| rest.strip_prefix(p).map(|tail| (p, tail)))
+    {
+        if !kept.ends_with(prefix) {
+            kept.push_str(prefix);
+        }
+        rest = tail;
     }
-    s
+    kept.push_str(rest);
+    kept
 }
 
 /// Result type for empyrean FFI calls.
@@ -138,6 +195,34 @@ mod tests {
         assert_eq!(
             dedupe_io_prefix("I/O error: I/O error: I/O error: boom"),
             "I/O error: boom"
+        );
+    }
+
+    #[test]
+    fn collapses_behind_the_download_prefix() {
+        // A failed acquisition leads with its own category prefix; a
+        // doubling behind it still collapses.
+        assert_eq!(
+            dedupe_io_prefix("Data download failed: I/O error: I/O error: boom"),
+            "Data download failed: I/O error: boom"
+        );
+        // A doubled download prefix collapses the same way.
+        assert_eq!(
+            dedupe_io_prefix("Data download failed: Data download failed: GET https://x/y: 404"),
+            "Data download failed: GET https://x/y: 404"
+        );
+        // The ordinary shape — one prefix, a request line naming the
+        // kernel by URL — is passed through untouched.
+        assert_eq!(
+            dedupe_io_prefix(
+                "Data download failed: GET https://naif.jpl.nasa.gov/x.bpc: http status: 404"
+            ),
+            "Data download failed: GET https://naif.jpl.nasa.gov/x.bpc: http status: 404"
+        );
+        // Distinct prefixes are both kept; only repeats are dropped.
+        assert_eq!(
+            dedupe_io_prefix("I/O error: Data download failed: nope"),
+            "I/O error: Data download failed: nope"
         );
     }
 }

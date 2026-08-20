@@ -25,10 +25,10 @@ DuckDB, and pages through what it wrote without leaving the terminal.
 
 ## Install
 
-Current release: **0.10.0-rc.0** (release candidate).
+Current release: **0.10.0-rc.2** (release candidate).
 
 ```sh
-cargo install empyrean-cli --version 0.10.0-rc.0
+cargo install empyrean-cli --version 0.10.0-rc.2
 ```
 
 A release candidate is not selected by a bare `cargo install`, so the

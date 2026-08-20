@@ -18,10 +18,10 @@ Uncertainty-first orbit propagation, ephemeris, orbit determination, and event d
 ---
 
 ```bash
-pip install --pre empyrean==0.10.0rc0
+pip install --pre empyrean==0.10.0rc2
 ```
 
-Current release: **0.10.0rc0** (release candidate) — `--pre` is required
+Current release: **0.10.0rc2** (release candidate) — `--pre` is required
 until 0.10.0 is final.
 
 A plain install pulls empyrean
@@ -969,7 +969,7 @@ platform data directory (`~/.local/share/empyrean/data/` on Linux,
 
 | File | Size | When | Source |
 |------|------|------|--------|
-| `moon_pa_de440_200625.bpc` | 12 MB | first `initialize()` | NAIF — Moon orientation |
+| `moon_pa_de440_*.bpc` | 12 MB | first `initialize()` | NAIF — Moon orientation; the dated release is resolved by the loader's glob |
 | `bias.dat` | 35 MB | first `initialize()` | Star-catalog debiasing table (Eggl, Farnocchia, Chamberlin & Chesley 2020) |
 | `jwst_rec.bsp` | 121 MB | on demand, for JWST observers | NAIF — JWST ephemeris |
 

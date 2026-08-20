@@ -6,7 +6,86 @@ project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.10.0-rc.2] — 2026-08-19
+
+Engine chain: empyrean-core v0.10.2 (villeneuve v1.24.0 / scott v1.18.0).
+`EmpyreanODResult` grows ten fields at its tail, so **the engine and every
+consumer must be rebuilt together within this release cycle** — the
+load-time handshake cannot catch a mixed pair inside one version's
+pre-releases, for the reason spelled out in the first entry below.
+
+Known issue, fix targeted at 0.11.0: the engine's second- and third-order
+covariance closure applies twice the correct Isserlis coefficient, so a
+delivered second/third-order 6×6 overstates its quadratic correction by
+up to ~20% in the strongly nonlinear regime (conservative direction —
+σ inflates), and the expansion-suspect / mixture-escalation thresholds
+keyed on it fire early by up to √2. First-order covariances are
+unaffected.
+
 ### Added
+
+- **A delivered fit says how the solver stopped.** A fit that ran out of
+  damping and a fit that met `gtol` arrived through the same success path,
+  with nothing on the result to tell them apart — so a pipeline could not
+  distinguish a converged orbit from one the solver merely stopped
+  producing steps for. `EmpyreanODResult` grows ten fields at its tail:
+  `termination` (the solver's own verdict, one of the ten
+  `EMPYREAN_SOLVER_STOP_*` codes), `gn_step_qnorm` (the undamped
+  Gauss-Newton step's quadratic form at the delivered iterate — the
+  quantity `convergence_tol` bounds, and the only step norm comparable to
+  it), `accepted_steps`, `final_solve_iterations`, `mu_final`, and the
+  five `stall_*` fields describing a fit delivered by the stable-stall
+  acceptance rather than by a convergence criterion (`stall_delivered`,
+  `stall_underlying_stop`, `stall_gn_qnorm`, `stall_convergence_tol`,
+  `stall_optical_reduced_chi2`). Ints lead the doubles in the struct; the
+  block pads once (4 bytes) and the growth is 64 bytes.
+
+  The Rust wrapper carries the same six values with the C sentinels typed
+  away — `Option<SolverStop>` for the verdict, `Option<f64>` for
+  `gn_step_qnorm` and `mu_final`, `Option<usize>` for
+  `final_solve_iterations`, and one `Option<StallDelivery>` for the stall
+  block. `accepted_steps` is deliberately a plain `u32`: every count is a
+  plausible reading and `0` is a real one — the solver latched a criterion
+  at its starting point and never moved. Python mirrors all six as
+  top-level attributes under the same names, the verdict arriving as
+  `termination`, a stable lowercase tag (`"gradient_tolerance"`,
+  `"stalled_delivered"`, …) or `None` when nothing was reported. A stop
+  the engine build cannot name reads as `"unrecognized"`, never as
+  nothing-reported: a stop that fired but cannot be named is not the same
+  as no stop at all.
+
+  The wrapper's `SolverStop` is a **fieldless** mirror of the engine's.
+  Upstream, damping-exhaustion carries the μ that exceeded the cap and
+  trial-exhaustion carries a trial count; neither crosses the ABI as part
+  of the code. μ at termination is published for every path as `mu_final`
+  instead, and the trial count is not delivered.
+
+  What the fields buy, in one case: `determine` transfers to mid-arc and
+  re-solves, so its final solve is a refit of an already-stationary orbit
+  and routinely reports `accepted_steps == 0` beside an `update_norm` of
+  exactly `0.0`, with `termination` reading `step_tolerance` and
+  `gn_step_qnorm` sitting orders of magnitude under the tolerance —
+  measured live on the Eros fixture by the new behavioral test. Before
+  this, that `0.0` was indistinguishable from a step of size zero having
+  been taken.
+
+  Both `DetermineResult` types grew required fields for this
+  (source-breaking for struct-literal and positional construction in
+  Rust and Python respectively); every constructor path inside the
+  distribution funnels through the updated builders.
+
+  **Both sides must be rebuilt together.** The growth is at the tail
+  (`EmpyreanODResult` 8128 → 8192), and `EmpyreanODObjectResult` embeds
+  it, so that grows with it (8160 → 8224) and a batch array strides by the
+  new size: a caller built against the rc.2 header and running on an rc.1
+  library reads ten fields the library never wrote, and starts every
+  element after the first at the wrong offset. The handshake cannot catch
+  that — `EMPYREAN_ABI_VERSION` encodes the base version only, so rc.1 and
+  rc.2 both report `1000`, and the number separates one version from
+  another but never a version from its own pre-releases (see the handshake
+  section of the `empyrean-sys` README). Inside a pre-release cycle the
+  artifact or tag is what identifies a build, so rebuild the engine and
+  every consumer from the same tree.
 
 - **Orbit determination through the pre-built force-model handle.** The
   reusable `BuiltSystem` handle served `propagate` and
@@ -369,6 +448,27 @@ project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- **The bundled B612 kernel map named Earth-orientation files NAIF no
+  longer serves.** The Python package symlinks the pip-installed B612
+  Foundation kernels into the data directory under the filenames the
+  engine expects, and the map still named the withdrawn dated Earth pair,
+  `earth_620120_250826.bpc` and `earth_2025_250826_2125_predict.bpc` —
+  both rotated away upstream on 2026-08-08. A staged name the upstream no
+  longer serves is a name every refresh of that slot 404s on, and under
+  the glob resolution below a freshly written link under the withdrawn
+  name outranks the served file beside it on mtime. The map names the
+  served 260806 vintage instead (`earth_620120_260806.bpc`,
+  `earth_2026_260806_2126_predict.bpc`).
+
+  The pinned engine now resolves a kernel slot through the same glob the
+  loader uses, so a data directory survives the next rotation rather than
+  failing a completeness check on one exact dated name. That retires the
+  two CI steps which materialized the withdrawn names as copies of the
+  current bytes; both are deleted. The kernel cache key moves with them
+  (`data-full-v2` → `data-full-v3`), because a warm cache still holds
+  those copies, and their mtimes are newer than the real files' — which is
+  precisely what an mtime-ordered newest-wins resolve would pick.
+
 - **C-ABI origin-switching opt-out documented correctly.** The
   `EmpyreanOriginSwitchingConfig` struct doc told C callers to set
   `enabled = 0` to disable trajectory splitting. Under the tri-state
@@ -510,6 +610,79 @@ project adheres to [Semantic Versioning](https://semver.org).
   deprecation window and is no longer a source.
 
 ### Changed
+
+- **The engine pin advances to empyrean-core v0.10.2** (villeneuve
+  v1.24.0 / scott v1.18.0). rc.1 shipped v0.10.1 — the generation that
+  carried the wide cross-covariance wire format and its units channel,
+  the correlated joint prior with full Schmidt–Kalman consider analysis,
+  the tri-state solve partition, and the per-site elevation and darkness
+  visibility gates, all of which v0.10.2 subsumes unchanged; cross-free
+  fits were bit-identical across that step over the full validation
+  catalog (61/61 orbit-determination rows, 8958/8958 propagation and
+  ephemeris rows), so nothing moved there and nothing moves here for the
+  same fits.
+
+  What v0.10.2 adds: scott reports the solver's own stopping verdict on
+  every delivered fit and shares one DC-frame `BuiltSystem` across the
+  whole OD pipeline — the covariance-trust gate, its close-approach
+  backstop, the `Auto` epoch scan, the output-epoch transfer, and the
+  build-once-refit-many session — validating a caller-supplied handle by
+  key axis and rejecting it loudly. villeneuve delivers the marginal
+  ephemeris covariance, resolves kernel-slot completeness through the same
+  glob the loader uses, follows symlinked data directories instead of
+  failing on them, and pins the observing-night fold across the
+  UTC-midnight seam.
+
+  Three numeric axes move, exactly as the engine's own pin records them.
+  (1) The covariance-trust gate integrates in the DC frame instead of
+  ICRF, so the fit's own `BuiltSystem` can serve it: verdict floats move
+  ~1e-14 relative on well-behaved arcs, and a chaotic arc amplifies the
+  basis change without bound — on 2020 CD3's full temporarily-captured arc
+  the gate's close-approach distance moves ~1e-7 relative, and under
+  `OutputEpoch::Auto` (**not** the default; `MidArc` is) the epoch scan
+  lands on a different encounter-free cluster and delivers a *different*
+  fit: epoch 58899.067 → 58745.149 MJD, reduced χ² 0.428 → 0.434, 3 → 30
+  iterations, 48 s → 142 s. (2) The generated sky covariance is now the
+  **marginal** over declared force-model parameter uncertainty rather than
+  the conditional: an orbit declaring none is bit-identical, and any
+  Marsden 3×3, dT/AMRAT variance, or Δv block widens every sky sigma. (3)
+  sigma_V no longer depends on the integration frame — the magnitude
+  uncertainty takes one already-propagated state covariance in the same
+  frame as its position arguments, where the previous unrotated
+  (STM, initial-covariance) composition made it frame-dependent by a
+  measured ~19% EclipticJ2000-vs-ICRF; values read from a frame-crossing
+  configuration change accordingly.
+
+- **A failed kernel fetch is missing data, not an I/O fault.** A download
+  that was attempted and failed — a 404 from an upstream that rotated or
+  withdrew a pinned kernel, a refused connection, a mid-transfer failure —
+  arrived as the generic I/O category (`-5`), message `"I/O error: HTTP
+  error: ..."`, in the same bucket as a genuine local disk fault. It now
+  carries the missing-data category (`-2`), and the message leads with
+  `"Data download failed: "` and names the failing kernel by its URL
+  (`GET <url>: ...`) — on every path, the context constructors and
+  `download_data` alike. The remedy for it is connectivity, or a pin the
+  upstream still serves; it is never the local file repair the old
+  category pointed at. A cold install whose pinned kernel had been
+  withdrawn used to die minutes into the download sequence with an
+  unexplained I/O error.
+
+  Two `-2` shapes now carry a signature a caller can key on: a
+  **non-empty** structured missing-files list is always a
+  named set of files the directory does not have, with no fetch attempted;
+  a message starting `"Data download failed: "` is always a failed
+  acquisition naming the URL. (`-2` is the missing-data *category*, so an
+  empty list with any other message is one of its other residents — a
+  kernel that read but would not parse, a coverage gap — whose message
+  states its own remedy.) Both signatures are documented where a caller
+  meets them —
+  `empyrean_download_data` in the header, `Error::code` /
+  `Error::missing_data_files` and `download_data` in Rust, the
+  `download_data` docstring in Python. The Rust wrapper also stops
+  appending "run `download_data` to provision it" to a failure that *is*
+  `download_data`: a remedy that sends the caller back around the loop
+  that just failed, blaming whichever core kernel the probe found absent
+  when the fetch is why they all are.
 
 - **`EMPYREAN_OFFLINE=1` now binds every data-provisioning entry point.**
   *Behaviour change.* The floor was implemented in one place
@@ -666,24 +839,17 @@ project adheres to [Semantic Versioning](https://semver.org).
   moment the behavior changes, so it cannot be resolved silently. The
   fix is engine-side and is not in this release.
 
-- **The engine pin advances to empyrean-core v0.10.1.** The release
-  that carries everything above: the wide cross-covariance wire format
-  and its units channel, the correlated joint prior with full
-  Schmidt–Kalman consider analysis, the tri-state solve partition, and
-  the per-site elevation and darkness visibility gates. Cross-free
-  fits are bit-identical to the previous engine generation over the
-  full validation catalog (61/61 orbit-determination rows, 8958/8958
-  propagation and ephemeris rows), so existing results do not move.
-
 - **Struct sizes and the two shrinks.** Nine frozen structs change size
   — seven grow, two shrink. The seven: `CoordinateState` by the border
-  (360 → 512), `EmpyreanOrbit` by the carrier arrays (648 → 832),
+  (360 → 512), `EmpyreanOrbit` by the carrier arrays and then the
+  photometric-covariance pair (648 → 832 → 912),
   `EmpyreanPropagatedState` by `orbit_cov` (2392 → 2576),
   `EmpyreanNonGravParams` by the DT variance pair (160 → 176),
   `EmpyreanObservatoryConfig` by the visibility fields (40 → 64), and
   `EmpyreanODResult` by the joint, dispositions, thrust posteriors and
-  warnings (7688 → 8128) — which also grows the
-  `EmpyreanODObjectResult` that embeds it (7720 → 8160). The two:
+  warnings, then the solver-termination block (7688 → 8128 → 8192) —
+  which also grows the
+  `EmpyreanODObjectResult` that embeds it (7720 → 8160 → 8224). The two:
   `EmpyreanSolveFor` **shrinks** 8 → 6, and the `EmpyreanODConfig` that
   embeds it shrinks 432 → 424 with it.
 

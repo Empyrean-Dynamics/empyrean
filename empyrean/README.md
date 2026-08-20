@@ -25,7 +25,7 @@ raw FFI pointers.
 
 ```toml
 [dependencies]
-empyrean = "0.10.0-rc.0"
+empyrean = "0.10.0-rc.2"
 ```
 
 ## What it does

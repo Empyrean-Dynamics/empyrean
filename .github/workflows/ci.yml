@@ -91,7 +91,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: data
-          key: data-full-v2
+          key: data-full-v3
 
       - name: Download SPICE kernels
         if: steps.cache-kernels.outputs.cache-hit != 'true'
@@ -113,26 +113,6 @@ jobs:
           curl -sSfL --retry 8 --retry-connrefused --retry-all-errors --connect-timeout 30 -o jggrx_0900d_sha.tab https://pds-geosciences.wustl.edu/grail/grail-l-lgrs-5-rdr-v1/grail_1001/shadr/jggrx_0900d_sha.tab
           curl -sSfL --retry 8 --retry-connrefused --retry-all-errors --connect-timeout 30 -o ggmes_100v08_sha.tab https://pgda.gsfc.nasa.gov/data/PGDA_HgM008/ggmes_100v08_sha.tab
 
-      - name: Bridge withdrawn kernel canonicals for the pinned engine
-        # TEMPORARY: the pinned engine chain (villeneuve v1.23.0 behind the
-        # empyrean-core pin) checks data completeness by CANONICAL kernel
-        # filename, and NAIF withdrew the canonical Earth pair on 2026-08-08
-        # (the URLs 404), so context construction tries to re-download them
-        # and fails. The loader itself already glob-resolves dated variants,
-        # so everything runs on the 260806 bytes either way -- only the
-        # completeness check needs the old names to exist. Materialize them
-        # as copies of the current bytes, unconditionally so a warm cache is
-        # bridged too. DELETE this step when the villeneuve >= 1.24 repin
-        # (glob-aware slot resolution) reaches this repo's engine pin.
-        run: |
-          cd data
-          # rm -f first: a cached dir can carry a dangling symlink under the
-          # withdrawn name (cp -n refuses to write through it, and -n is
-          # non-portable between GNU and BSD cp anyway). Overwriting with
-          # identical bytes is idempotent.
-          rm -f earth_620120_250826.bpc earth_2025_250826_2125_predict.bpc
-          cp earth_620120_260806.bpc earth_620120_250826.bpc
-          cp earth_2026_260806_2126_predict.bpc earth_2025_250826_2125_predict.bpc
       - name: Cache API responses
         uses: actions/cache@v4
         with:
@@ -355,7 +335,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: data
-          key: data-full-v2
+          key: data-full-v3
 
       - name: Download SPICE kernels
         if: steps.cache-kernels.outputs.cache-hit != 'true'
@@ -378,26 +358,6 @@ jobs:
           curl -sSfL --retry 8 --retry-connrefused --retry-all-errors --connect-timeout 30 -o ggmes_100v08_sha.tab https://pgda.gsfc.nasa.gov/data/PGDA_HgM008/ggmes_100v08_sha.tab
 
       # ── Validation data from villeneuve ──
-      - name: Bridge withdrawn kernel canonicals for the pinned engine
-        # TEMPORARY: the pinned engine chain (villeneuve v1.23.0 behind the
-        # empyrean-core pin) checks data completeness by CANONICAL kernel
-        # filename, and NAIF withdrew the canonical Earth pair on 2026-08-08
-        # (the URLs 404), so context construction tries to re-download them
-        # and fails. The loader itself already glob-resolves dated variants,
-        # so everything runs on the 260806 bytes either way -- only the
-        # completeness check needs the old names to exist. Materialize them
-        # as copies of the current bytes, unconditionally so a warm cache is
-        # bridged too. DELETE this step when the villeneuve >= 1.24 repin
-        # (glob-aware slot resolution) reaches this repo's engine pin.
-        run: |
-          cd data
-          # rm -f first: a cached dir can carry a dangling symlink under the
-          # withdrawn name (cp -n refuses to write through it, and -n is
-          # non-portable between GNU and BSD cp anyway). Overwriting with
-          # identical bytes is idempotent.
-          rm -f earth_620120_250826.bpc earth_2025_250826_2125_predict.bpc
-          cp earth_620120_260806.bpc earth_620120_250826.bpc
-          cp earth_2026_260806_2126_predict.bpc earth_2025_250826_2125_predict.bpc
       - name: Fetch validation data from villeneuve
         run: |
           mkdir -p empyrean-py/tests/data

@@ -324,8 +324,8 @@ _B612_TO_VILLENEUVE_FILENAME = {
     "de440": "de440.bsp",
     "sb441_n16": "sb441-n16.bsp",
     "earth_high_prec": "earth_latest_high_prec.bpc",
-    "earth_historical": "earth_620120_250826.bpc",
-    "earth_predict": "earth_2025_250826_2125_predict.bpc",
+    "earth_historical": "earth_620120_260806.bpc",
+    "earth_predict": "earth_2026_260806_2126_predict.bpc",
     "mpc_obscodes": "obscodes_extended.json",
 }
 

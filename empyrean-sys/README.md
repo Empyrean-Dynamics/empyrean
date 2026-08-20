@@ -24,7 +24,7 @@ type-check, or RAII-manage the underlying handles.
 
 ```toml
 [dependencies]
-empyrean-sys = "0.10.0-rc.0"
+empyrean-sys = "0.10.0-rc.2"
 ```
 
 ```rust
@@ -120,15 +120,16 @@ whole layout rather than append: keeping the old prefix and writing
 `photometry` at its former offset lands eight bytes past where the library
 reads it, corrupting that config and the two bytes before it with no
 diagnostic. Every other change in this release is an append:
-`CoordinateState` 360 → 512, `EmpyreanOrbit` 648 → 832,
+`CoordinateState` 360 → 512, `EmpyreanOrbit` 648 → 832 → 912,
 `EmpyreanPropagatedState` 2392 → 2576, `EmpyreanNonGravParams` 160 → 176
 (`has_dt_variance` / `dt_variance`, which had no wire at all before),
 `EmpyreanObservatoryConfig` 40 → 64 (the visibility fields, which are
 marshaled in full but which no exported entry point applies — the gates that
 read them live in the engine's unexported visibility survey), and
-`EmpyreanODResult` 7688 → 8128 (the joint, `dispositions`, the per-segment
-thrust posteriors and the `warnings` channel), carrying
-`EmpyreanODObjectResult` 7720 → 8160 with it.
+`EmpyreanODResult` 7688 → 8128 → 8192 (the joint, `dispositions`, the
+per-segment thrust posteriors and the `warnings` channel, then the
+solver-termination block), carrying
+`EmpyreanODObjectResult` 7720 → 8160 → 8224 with it.
 
 **Semantic breaks the sizes will not catch.** `EmpyreanSolveFor`'s axes
 become a disposition tri-state — `0` fixed, `1` solved, `2` considered — so

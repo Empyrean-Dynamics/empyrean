@@ -7582,6 +7582,12 @@ impl PySession {
     /// Diff the current fit against the prior_idx-th history entry.
     /// Returns a dict with keys: reduced_chi2_delta, iterations_delta,
     /// n_observations_delta, update_norm_current, update_norm_prior.
+    ///
+    /// The two update-norms are each fit's μ-DAMPED last accepted step,
+    /// **not** a convergence metric and not comparable to
+    /// `convergence_tol`; they are a damping-trajectory diagnostic
+    /// between two fits of the same arc. For whether either fit
+    /// converged, read that fit's `termination` / `gn_step_qnorm`.
     fn diff<'py>(&self, py: Python<'py>, prior_idx: usize) -> PyResult<Bound<'py, PyDict>> {
         let diff = self.inner.diff(prior_idx).map_err(to_pyerr)?;
         let dict = PyDict::new(py);
@@ -8048,6 +8054,23 @@ fn determine_result_to_pydict<'py>(
     dict.set_item("iterations", result.iterations)?;
     dict.set_item("update_norm", result.update_norm)?;
     dict.set_item("converged", result.converged)?;
+    // How the solve that produced the published state stopped, and how
+    // far from stationary it was when it did. An absent reading omits
+    // its key entirely rather than emitting 0 / NaN — the loud-None
+    // contract the wide-fitting surface already follows.
+    if let Some(stop) = result.termination {
+        dict.set_item("termination", stop.as_str())?;
+    }
+    if let Some(q) = result.gn_step_qnorm {
+        dict.set_item("gn_step_qnorm", q)?;
+    }
+    if let Some(mu) = result.mu_final {
+        dict.set_item("mu_final", mu)?;
+    }
+    dict.set_item("accepted_steps", result.accepted_steps)?;
+    if let Some(n) = result.final_solve_iterations {
+        dict.set_item("final_solve_iterations", n)?;
+    }
 
     // 6×6 fitted covariance, flat row-major.
     let mut cov_flat: Vec<f64> = Vec::with_capacity(36);
@@ -8202,6 +8225,17 @@ fn determine_result_to_pydict<'py>(
             }
         }
         dict.set_item("covariance_trust", t)?;
+    }
+    // Stall delivery — key omitted entirely on the ordinary path, where
+    // the solver met one of its own criteria and there is no stall to
+    // describe.
+    if let Some(sd) = &result.stall_delivery {
+        let d = PyDict::new(py);
+        d.set_item("underlying_stop", sd.underlying_stop.as_str())?;
+        d.set_item("gn_qnorm", sd.gn_qnorm)?;
+        d.set_item("convergence_tol", sd.convergence_tol)?;
+        d.set_item("optical_reduced_chi2", sd.optical_reduced_chi2)?;
+        dict.set_item("stall_delivery", d)?;
     }
 
     Ok(dict)

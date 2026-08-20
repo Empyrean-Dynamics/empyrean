@@ -267,6 +267,7 @@ blocks alongside the 6×6 state block.
    empyrean.AcceptabilityReport
    empyrean.GateRecord
    empyrean.SolvedCovariance
+   empyrean.StallDelivery
    empyrean.CovarianceTrust
    empyrean.TrustGateEvent
    empyrean.StationBiases

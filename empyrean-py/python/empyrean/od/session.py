@@ -77,13 +77,22 @@ class SessionDiff:
     reduced_chi2_delta: float
     """Δ reduced χ² (positive ⇒ current fit is worse)."""
     iterations_delta: int
-    """Δ iteration count between current and prior fits."""
+    """Δ iteration count between current and prior fits, over
+    :attr:`DetermineResult.iterations` — a TOTAL across each fit's
+    solves. Two fits that reached the same orbit by different ladders
+    differ here without either being worse."""
     n_observations_delta: int
     """Δ number of observations used (negative when masked between refines)."""
     update_norm_current: float
-    """Final update-norm convergence metric on the current fit."""
+    """:attr:`DetermineResult.update_norm` on the current fit — the
+    μ-DAMPED last accepted step, **not** a convergence metric and **not**
+    comparable to :attr:`ODConfig.convergence_tol`. It is here as a
+    damping-trajectory diagnostic between two fits of the same arc. For
+    whether either fit converged, and on what, read that fit's
+    :attr:`DetermineResult.termination` /
+    :attr:`DetermineResult.gn_step_qnorm`."""
     update_norm_prior: float
-    """Final update-norm convergence metric on the prior fit."""
+    """The same quantity on the prior fit, with the same caveat."""
 
 
 SessionInput = str | Path | ADESObservations

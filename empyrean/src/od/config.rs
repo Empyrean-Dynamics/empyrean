@@ -173,7 +173,12 @@ pub struct ODConfig {
     pub output_epoch: OutputEpoch,
     /// Maximum DC iterations. 0 → engine default (100).
     pub max_iterations: u32,
-    /// DC convergence tolerance on Δx^T N Δx. 0.0 → engine default (1e-5).
+    /// DC convergence tolerance, tested on the **undamped** Gauss–Newton
+    /// step's quadratic form — the number published back as
+    /// [`DetermineResult::gn_step_qnorm`](crate::DetermineResult::gn_step_qnorm),
+    /// NOT the μ-damped
+    /// [`update_norm`](crate::DetermineResult::update_norm), which this
+    /// tolerance does not bound. 0.0 → engine default (1e-5).
     pub convergence_tol: f64,
     /// Allow the outward-expansion pipeline to truncate a sub-arc it
     /// cannot fit as one piece. Default `true` (the engine default).

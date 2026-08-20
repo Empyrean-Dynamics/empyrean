@@ -10,7 +10,7 @@ use empyrean_core::determination::{
     CovarianceTrust, DetermineError, ODConfig, ODResult, ODWarning, ObservationResidualSummary,
     ObservationResult, Observations, OriginPolicy, OutputEpoch, ParamDisposition, RadarMeasurement,
     RadarObservation, RadarResidual, RejectionReason, SolveFor, SolveForParams, SolvedCovariance,
-    TrustGateEvent, UpstreamForceModelTier, determine, evaluate_single, refine_single,
+    SolverStop, TrustGateEvent, UpstreamForceModelTier, determine, evaluate_single, refine_single,
 };
 use empyrean_core::io::{ADESObservations, parse_ades};
 use empyrean_core::nongrav::NonGravModel;
@@ -153,6 +153,72 @@ pub const EMPYREAN_TRUST_EVENT_NONE: i32 = 0;
 pub const EMPYREAN_TRUST_EVENT_CLOSE_APPROACH: i32 = 1;
 /// Intervening trust-gate event kind: high-nonlinearity crossing.
 pub const EMPYREAN_TRUST_EVENT_HIGH_NONLINEARITY: i32 = 2;
+
+// ── Solver stopping criteria (EmpyreanODResult::termination) ──
+//
+// Which criterion ended the solve that produced the published state.
+// The payloads the engine's own enum carries on two of these arms (the
+// damping value, the trial count) are not encoded in the code itself:
+// μ at termination is published separately as
+// [`EmpyreanODResult::mu_final`], and the trial count has no ABI field.
+//
+// Read this rather than inferring convergence from
+// [`EmpyreanODResult::update_norm`], which is the μ-damped accepted
+// step and is not comparable to `convergence_tol` in either direction.
+
+/// No termination was reported: the result did not come from a solver
+/// run (a rebuild or a test fixture). **Not** a stopping criterion, and
+/// deliberately the zero value so a zero-initialized struct reads as
+/// "nothing was reported" rather than as some specific verdict.
+pub const EMPYREAN_SOLVER_STOP_NOT_REPORTED: i32 = 0;
+/// The scaled gradient at the accepted point fell below `gtol` (MINPACK
+/// cosine form). Tested before the step test, so it says nothing about
+/// how large the remaining Gauss-Newton step was.
+pub const EMPYREAN_SOLVER_STOP_GRADIENT_TOLERANCE: i32 = 1;
+/// The **undamped** Gauss-Newton step's quadratic form fell below
+/// [`EmpyreanODConfig::convergence_tol`]. The only stop on the ordinary
+/// LM path under which [`EmpyreanODResult::gn_step_qnorm`] is bounded by
+/// that tolerance.
+pub const EMPYREAN_SOLVER_STOP_STEP_TOLERANCE: i32 = 2;
+/// Actual and predicted reduction of the last accepted step both fell
+/// below `ftol`·Φ under a consistent model.
+pub const EMPYREAN_SOLVER_STOP_COST_TOLERANCE: i32 = 3;
+/// The outer iteration budget ([`EmpyreanODConfig::max_iterations`]) ran
+/// out while the solve was still moving. **Not** a convergence.
+pub const EMPYREAN_SOLVER_STOP_MAX_ITERATIONS: i32 = 4;
+/// Damping exceeded the driver's cap while rejecting trials: no
+/// improving step exists from that point at any μ. Not a convergence —
+/// but see [`EMPYREAN_SOLVER_STOP_STALLED_DELIVERED`], the verdict when
+/// such a point is nonetheless statistically stationary. The μ that
+/// exceeded the cap is [`EmpyreanODResult::mu_final`].
+pub const EMPYREAN_SOLVER_STOP_DAMPING_EXHAUSTED: i32 = 5;
+/// The inner trial budget ran out inside one outer iteration without an
+/// acceptance. Not a convergence; same caveat as
+/// [`EMPYREAN_SOLVER_STOP_DAMPING_EXHAUSTED`].
+pub const EMPYREAN_SOLVER_STOP_INNER_TRIALS_EXHAUSTED: i32 = 6;
+/// No solver criterion latched, and the iterate was delivered anyway by
+/// the stable-stall acceptance. The numbers that earned it are the
+/// `stall_*` fields on [`EmpyreanODResult`], including
+/// [`EmpyreanODResult::stall_underlying_stop`] — what the solver itself
+/// reported before the acceptance overrode the verdict.
+pub const EMPYREAN_SOLVER_STOP_STALLED_DELIVERED: i32 = 7;
+/// The Schur (nuisance-block) loop's own step test: the step's quadratic
+/// form under the Schur complement \\(S\\) fell below
+/// [`EmpyreanODConfig::convergence_tol`]. Deliberately not
+/// [`EMPYREAN_SOLVER_STOP_STEP_TOLERANCE`] — that loop runs no
+/// accept/reject and forms its step norm under a different system.
+/// [`EmpyreanODResult::gn_step_qnorm`] is published on this path only at
+/// solved width ≤ 6, where the loop runs undamped.
+pub const EMPYREAN_SOLVER_STOP_SCHUR_STEP_TOLERANCE: i32 = 8;
+/// The solver reported a termination this engine build does not know how
+/// to name — the optimizer grew a variant ahead of the mapping.
+///
+/// Never folded into one of the codes above, and never reported as
+/// [`EMPYREAN_SOLVER_STOP_NOT_REPORTED`]: a stop that fired but cannot
+/// be named is not the same as no stop at all, and reporting an
+/// unrecognized stop as something specific would be a diagnostic that
+/// lies.
+pub const EMPYREAN_SOLVER_STOP_UNRECOGNIZED: i32 = 9;
 
 /// A single radar (delay or Doppler) observation for orbit determination —
 /// the ADES `<radar>` schema.
@@ -1449,7 +1515,33 @@ pub struct EmpyreanODResult {
     pub num_observations: usize,
     pub summary: EmpyreanResidualSummary,
     pub iterations: u32,
-    /// Convergence metric at the final DC iteration (Δx^T N Δx).
+    /// **NOT the quantity [`EmpyreanODConfig::convergence_tol`] bounds.**
+    /// This is the μ-DAMPED last ACCEPTED step's \\(q\\)-norm
+    /// (Δx^T N Δx) — the size of the step the solver actually took,
+    /// after Levenberg-Marquardt damping.
+    ///
+    /// The tolerance is tested on the *undamped* Gauss-Newton step,
+    /// published as [`gn_step_qnorm`](Self::gn_step_qnorm). The two are
+    /// incomparable in BOTH directions: a converged fit routinely
+    /// reports an `update_norm` orders of magnitude ABOVE
+    /// `convergence_tol` (damping is light near the optimum, so the step
+    /// taken is large), while a solve thrashing to
+    /// [`DAMPING_EXHAUSTED`](EMPYREAN_SOLVER_STOP_DAMPING_EXHAUSTED)
+    /// reports one orders of magnitude BELOW it (μ has crushed every
+    /// step to nothing). Read [`termination`](Self::termination) and
+    /// [`gn_step_qnorm`](Self::gn_step_qnorm) for convergence, or
+    /// [`acceptability`](Self::acceptability) for the fit-quality
+    /// verdict.
+    ///
+    /// On the Schur path (station-bias / nuisance fits) this carries
+    /// that loop's own step norm under the Schur complement instead —
+    /// the quantity IT tests against `convergence_tol`.
+    /// [`termination`](Self::termination) says which loop ran.
+    ///
+    /// Exactly `0.0` with [`accepted_steps`](Self::accepted_steps)` == 0`
+    /// means the solver latched a criterion at its STARTING point and
+    /// never accepted a step — the incoming iterate was already
+    /// stationary. It does not mean "a step of size zero was taken".
     pub update_norm: f64,
     /// Solver reached its stopping criterion (1 = yes).
     /// Equivalent to `acceptability.converged_ok`; kept for backwards
@@ -1657,6 +1749,167 @@ pub struct EmpyreanODResult {
     /// Number of warning strings. 0 when the fit used everything it was
     /// given.
     pub num_warnings: usize,
+
+    // ── Solver termination + stall delivery (0.10.0) ──────────────
+    //
+    // What the solve that produced the published state actually did:
+    // which criterion stopped it, how far from stationary it was when
+    // it stopped, and — when no criterion latched at all — the numbers
+    // the stable-stall acceptance judged it on.
+    //
+    // Together these replace inference from `update_norm`, which is the
+    // μ-DAMPED accepted step and is not comparable to
+    // `convergence_tol` in either direction.
+    //
+    // # Layout
+    //
+    // The five integers are grouped ahead of the five doubles for
+    // legibility of the two families; the block pads once (4 bytes
+    // after the ints) and the struct grows by 64 bytes. The documented
+    // reading order — `termination` first, then the step diagnostics,
+    // then the `stall_*` family — would pack to the same 64 bytes;
+    // only a strict int/double alternation would cost more (80).
+    /// Which criterion ended the solve that produced the published
+    /// state (`EMPYREAN_SOLVER_STOP_*`).
+    ///
+    /// [`NOT_REPORTED`](EMPYREAN_SOLVER_STOP_NOT_REPORTED) (0) means the
+    /// result did not come from a solver run; every fit this library
+    /// delivers names its stop. A code the engine could not name is
+    /// [`UNRECOGNIZED`](EMPYREAN_SOLVER_STOP_UNRECOGNIZED) (9), never
+    /// folded into 0 or into a specific criterion.
+    pub termination: i32,
+    /// Steps the solve actually ACCEPTED — trials that passed the
+    /// gain-ratio test and moved the iterate.
+    ///
+    /// `0` says the solver latched a criterion at its starting point and
+    /// never moved: the incoming orbit was already stationary for this
+    /// observation set. That is the ordinary outcome of re-fitting an
+    /// already-converged orbit, and it is what disambiguates
+    /// [`update_norm`](Self::update_norm)'s `0.0` sentinel.
+    ///
+    /// Counted per SOLVE, not per fit: it describes the same solve as
+    /// [`final_solve_iterations`](Self::final_solve_iterations), never a
+    /// total across the rejection–refit passes.
+    ///
+    /// # Two conventions, selected by the solver that ran
+    ///
+    /// The gain-ratio reading above is the ordinary LM path. The Schur
+    /// path — station-bias / nuisance fits, identified by
+    /// [`termination`](Self::termination) being
+    /// [`SCHUR_STEP_TOLERANCE`](EMPYREAN_SOLVER_STOP_SCHUR_STEP_TOLERANCE)
+    /// or by [`mu_final`](Self::mu_final) being NaN — has no
+    /// accept/reject at all: it APPLIES every step it computes. There
+    /// this count is applied steps, equals
+    /// [`final_solve_iterations`](Self::final_solve_iterations) exactly,
+    /// and `0` is unreachable for any `max_iterations >= 1`. A consumer
+    /// grouping a catalog by "did this fit move" must branch on the
+    /// path.
+    pub accepted_steps: u32,
+    /// Iterations spent by the solve that produced the published state —
+    /// the one [`update_norm`](Self::update_norm),
+    /// [`termination`](Self::termination),
+    /// [`gn_step_qnorm`](Self::gn_step_qnorm) and
+    /// [`accepted_steps`](Self::accepted_steps) all describe.
+    ///
+    /// Additive disambiguator for [`iterations`](Self::iterations),
+    /// whose composition varies by entry point (it totals the solves the
+    /// delivered path ran); this one never does.
+    ///
+    /// `-1` when absent — the result did not come from a solver run.
+    /// Negative rather than `0`, because `0` iterations is a reachable
+    /// count.
+    pub final_solve_iterations: i32,
+    /// 1 when this fit was delivered by the stable-stall acceptance —
+    /// its final solve latched no solver convergence criterion and was
+    /// accepted as converged-in-practice instead, being stationary to a
+    /// small fraction of the fit's own formal σ with χ² clearing the
+    /// fit-quality bars. 0 is the ordinary case.
+    ///
+    /// When 1, [`termination`](Self::termination) reads
+    /// [`STALLED_DELIVERED`](EMPYREAN_SOLVER_STOP_STALLED_DELIVERED) and
+    /// the four `stall_*` fields below carry the numbers that earned the
+    /// delivery. When 0 they are absent (0 / NaN). A consumer that wants
+    /// the strict convergence contract rejects `stall_delivered == 1`.
+    pub stall_delivered: i32,
+    /// What the SOLVER reported before the stall acceptance overrode the
+    /// verdict (`EMPYREAN_SOLVER_STOP_*`) — always
+    /// [`DAMPING_EXHAUSTED`](EMPYREAN_SOLVER_STOP_DAMPING_EXHAUSTED) or
+    /// [`INNER_TRIALS_EXHAUSTED`](EMPYREAN_SOLVER_STOP_INNER_TRIALS_EXHAUSTED),
+    /// the only two stops the acceptance considers.
+    ///
+    /// [`NOT_REPORTED`](EMPYREAN_SOLVER_STOP_NOT_REPORTED) (0) when
+    /// `stall_delivered == 0`. Kept beside
+    /// [`termination`](Self::termination) so the delivery's verdict and
+    /// the solver's own are both readable and neither is inferred from
+    /// the other.
+    pub stall_underlying_stop: i32,
+    /// Quadratic form of the **undamped** Gauss-Newton step — the ONLY
+    /// number on this struct comparable to
+    /// [`EmpyreanODConfig::convergence_tol`], and the one the solver's
+    /// step test is decided on.
+    ///
+    /// \\(q = \mathbf{h}_{\text{GN}}^\top A\,\mathbf{h}_{\text{GN}}\\)
+    /// with \\(A = \Sigma^{-1}\\), so \\(\sqrt{q}\\) is the remaining
+    /// step measured in the fit's own formal σ.
+    ///
+    /// `q <= convergence_tol` is guaranteed only under
+    /// [`STEP_TOLERANCE`](EMPYREAN_SOLVER_STOP_STEP_TOLERANCE) (or
+    /// [`SCHUR_STEP_TOLERANCE`](EMPYREAN_SOLVER_STOP_SCHUR_STEP_TOLERANCE)).
+    /// Under the gradient, cost and stall verdicts the fit is delivered
+    /// as converged with `q` legitimately above the tolerance: those
+    /// criteria measure other things, and a long dense arc has a `q`
+    /// floor set by the residual model's accuracy rather than by the
+    /// parameters.
+    ///
+    /// **NaN when absent**, which is not a failure: the undamped system
+    /// was singular at the returned point, or the Schur loop ran at
+    /// solved width > 6 (where the only step norm it forms is
+    /// λ-shrunken, and publishing it here would break this field's
+    /// promise), or the result did not come from a solver run.
+    pub gn_step_qnorm: f64,
+    /// Levenberg-Marquardt damping at termination. Large μ beside a
+    /// small [`update_norm`](Self::update_norm) is the signature of a
+    /// stalled solve rather than a converged one.
+    ///
+    /// **NaN when absent**: the Schur path runs its own λ schedule and
+    /// forms no comparable quantity, and non-solve results have none.
+    /// NaN here is therefore also the marker that identifies the Schur
+    /// path, alongside
+    /// [`SCHUR_STEP_TOLERANCE`](EMPYREAN_SOLVER_STOP_SCHUR_STEP_TOLERANCE).
+    pub mu_final: f64,
+    /// Stall delivery: \\(q\\) of the undamped Gauss-Newton step at the
+    /// delivered iterate — the quantity `convergence_tol` bounds and did
+    /// not bound here. \\(\sqrt{q}\\) is the remaining step in the fit's
+    /// own formal σ.
+    ///
+    /// **NaN when `stall_delivered == 0`.**
+    pub stall_gn_qnorm: f64,
+    /// Stall delivery: the **resolved** convergence tolerance the stall
+    /// was judged against.
+    ///
+    /// Delivered rather than left to the caller because
+    /// [`EmpyreanODConfig::convergence_tol`] carries a `0.0` sentinel
+    /// meaning "engine default", so the value actually enforced is not
+    /// recoverable from the config a caller passed in. Pair it with
+    /// [`stall_gn_qnorm`](Self::stall_gn_qnorm) to see by how much the
+    /// bar was missed.
+    ///
+    /// **NaN when `stall_delivered == 0`.**
+    pub stall_convergence_tol: f64,
+    /// Stall delivery: reduced χ² of the OPTICAL family alone at the
+    /// delivered iterate.
+    ///
+    /// The full objective's reduced χ² and the bar both were held to are
+    /// already on [`acceptability`](Self::acceptability)
+    /// (`reduced_chi2_value` / `reduced_chi2_threshold`), and the
+    /// delivery's μ and iteration count are already
+    /// [`mu_final`](Self::mu_final) and
+    /// [`final_solve_iterations`](Self::final_solve_iterations) — a
+    /// stall-delivered fit's final solve IS the stalled solve. Only the
+    /// optical-only χ², which has no other home, is republished here.
+    ///
+    /// **NaN when `stall_delivered == 0`.**
+    pub stall_optical_reduced_chi2: f64,
 }
 
 // ── Per-object failure codes (EmpyreanODObjectResult::error_code) ──
@@ -1952,7 +2205,18 @@ pub struct EmpyreanODConfig {
     pub output_epoch: EmpyreanOutputEpoch,
     /// Maximum DC iterations. 0 → upstream default (100).
     pub max_iterations: u32,
-    /// DC convergence tolerance on Δx^T N Δx. 0.0 → upstream default (0.1).
+    /// DC convergence tolerance on the quadratic form Δx^T N Δx of the
+    /// **undamped Gauss-Newton step**, under the prior-augmented normal
+    /// matrix. `0.0` → upstream default (1e-5).
+    ///
+    /// The test is deliberately on the undamped step: a μ-shrunken step
+    /// says nothing about stationarity. So this bounds
+    /// [`EmpyreanODResult::gn_step_qnorm`] — **not**
+    /// [`EmpyreanODResult::update_norm`], which is the damped accepted
+    /// step and is not comparable to this value in either direction.
+    ///
+    /// Since N = Σ⁻¹, √(Δx^T N Δx) is the remaining step measured in the
+    /// fit's own formal σ; the 1e-5 default asks for 0.0032 σ.
     pub convergence_tol: f64,
     /// Allow the outward-expansion pipeline to truncate a sub-arc it
     /// cannot fit as one piece. Tri-state: `-1` (or any negative) =
@@ -2780,6 +3044,25 @@ fn poisoned_od_result() -> EmpyreanODResult {
         thrust_correction_covariances: [[[f64::NAN; 3]; 3]; EMPYREAN_MAX_THRUST_SEGMENTS],
         warnings: std::ptr::null_mut(),
         num_warnings: 0,
+        // The three enumerated codes take -1, outside every
+        // EMPYREAN_SOLVER_STOP_* value set — deliberately NOT
+        // NOT_REPORTED (0), which is a real delivered reading ("this
+        // result did not come from a solver run") and would let a
+        // poisoned slot pass for a rebuild.
+        termination: -1,
+        // Counts and iteration budgets are 0 / -1 exactly as on a
+        // delivered result: `accepted_steps` has no out-of-set value
+        // (every u32 is a plausible count), so the flag to test remains
+        // `delivered`.
+        accepted_steps: 0,
+        final_solve_iterations: -1,
+        stall_delivered: -1,
+        stall_underlying_stop: -1,
+        gn_step_qnorm: f64::NAN,
+        mu_final: f64::NAN,
+        stall_gn_qnorm: f64::NAN,
+        stall_convergence_tol: f64::NAN,
+        stall_optical_reduced_chi2: f64::NAN,
     }
 }
 
@@ -3191,8 +3474,55 @@ pub(crate) unsafe fn write_od_result_fields(
         (*result_out).station_biases = sb_ptr;
         (*result_out).num_station_biases = sb_n;
         populate_wide_fitting_fields(result_out, od)?;
+        write_solver_termination_fields(result_out, od);
     }
     Ok(())
+}
+
+/// Populate the solver-termination + stall-delivery block. ALWAYS writes
+/// every field — the absent value (0 for the codes, `-1` for
+/// `final_solve_iterations`, NaN for the doubles) rather than leaving a
+/// slot at whatever the caller's struct held, per the full-population
+/// contract.
+///
+/// The two verdicts are kept independent on purpose: `termination` is
+/// the DELIVERY's stop (`STALLED_DELIVERED` for a stall-delivered fit)
+/// and `stall_underlying_stop` is what the solver itself reported before
+/// the acceptance overrode it. Neither is inferred from the other.
+unsafe fn write_solver_termination_fields(result_out: *mut EmpyreanODResult, od: &ODResult) {
+    let termination = od
+        .termination
+        .as_ref()
+        .map_or(EMPYREAN_SOLVER_STOP_NOT_REPORTED, solver_stop_to_int);
+    let (stall_delivered, stall_stop, stall_q, stall_tol, stall_optical_chi2) =
+        match &od.stall_delivery {
+            Some(s) => (
+                1,
+                solver_stop_to_int(&s.solver_stop),
+                s.gn_qnorm,
+                s.convergence_tol,
+                s.optical_reduced_chi2,
+            ),
+            None => (
+                0,
+                EMPYREAN_SOLVER_STOP_NOT_REPORTED,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+            ),
+        };
+    unsafe {
+        (*result_out).termination = termination;
+        (*result_out).accepted_steps = od.accepted_steps as u32;
+        (*result_out).final_solve_iterations = od.final_solve_iterations.map_or(-1, |n| n as i32);
+        (*result_out).stall_delivered = stall_delivered;
+        (*result_out).stall_underlying_stop = stall_stop;
+        (*result_out).gn_step_qnorm = od.gn_step_qnorm.unwrap_or(f64::NAN);
+        (*result_out).mu_final = od.mu_final.unwrap_or(f64::NAN);
+        (*result_out).stall_gn_qnorm = stall_q;
+        (*result_out).stall_convergence_tol = stall_tol;
+        (*result_out).stall_optical_reduced_chi2 = stall_optical_chi2;
+    }
 }
 
 /// Populate the v0.9.0 wide-fitting fields on a result out-pointer from
@@ -3485,6 +3815,33 @@ fn v_force_model_tier_to_int(t: UpstreamForceModelTier) -> i32 {
         Ok(tier) => force_model_tier_to_int(tier),
         // Defensively map an unknown villeneuve tier to Standard.
         Err(_) => 2,
+    }
+}
+
+/// Map scott's `SolverStop` to its `EMPYREAN_SOLVER_STOP_*` code.
+///
+/// The upstream enum is `#[non_exhaustive]`, so the wildcard arm is
+/// mandatory. It maps to
+/// [`UNRECOGNIZED`](EMPYREAN_SOLVER_STOP_UNRECOGNIZED) and NOT to
+/// [`NOT_REPORTED`](EMPYREAN_SOLVER_STOP_NOT_REPORTED): a stop that
+/// fired but cannot be named here is not the same as no stop at all,
+/// and reporting an unrecognized stop as some specific criterion would
+/// be a diagnostic that lies — the same reasoning that put
+/// `SolverStop::Unrecognized` upstream.
+fn solver_stop_to_int(s: &SolverStop) -> i32 {
+    match s {
+        SolverStop::GradientTolerance => EMPYREAN_SOLVER_STOP_GRADIENT_TOLERANCE,
+        SolverStop::StepTolerance => EMPYREAN_SOLVER_STOP_STEP_TOLERANCE,
+        SolverStop::CostTolerance => EMPYREAN_SOLVER_STOP_COST_TOLERANCE,
+        SolverStop::MaxIterations => EMPYREAN_SOLVER_STOP_MAX_ITERATIONS,
+        SolverStop::DampingExhausted { .. } => EMPYREAN_SOLVER_STOP_DAMPING_EXHAUSTED,
+        SolverStop::InnerTrialsExhausted { .. } => EMPYREAN_SOLVER_STOP_INNER_TRIALS_EXHAUSTED,
+        SolverStop::StalledDelivered => EMPYREAN_SOLVER_STOP_STALLED_DELIVERED,
+        SolverStop::SchurStepTolerance => EMPYREAN_SOLVER_STOP_SCHUR_STEP_TOLERANCE,
+        SolverStop::Unrecognized => EMPYREAN_SOLVER_STOP_UNRECOGNIZED,
+        // `#[non_exhaustive]` upstream: an arm added after this build
+        // deliberately lands on the same honest code.
+        _ => EMPYREAN_SOLVER_STOP_UNRECOGNIZED,
     }
 }
 
@@ -6391,6 +6748,27 @@ mod batch_determine_tests {
         assert_eq!(r.trust_event_kind, -1);
         assert_eq!(r.orbit.origin, -1);
         assert_eq!(r.orbit.frame, -1);
+        // Solver termination + stall delivery. Asserted BY NAME, and
+        // the enumerated codes at -1 rather than at their NOT_REPORTED
+        // (0) reading: 0 is a real delivered value here, so a field
+        // left at zero would slip through a blanket "not the delivered
+        // sentinel" check.
+        assert!(r.gn_step_qnorm.is_nan(), "gn_step_qnorm must be NaN");
+        assert!(r.mu_final.is_nan(), "mu_final must be NaN");
+        assert!(r.stall_gn_qnorm.is_nan(), "stall_gn_qnorm must be NaN");
+        assert!(
+            r.stall_convergence_tol.is_nan(),
+            "stall_convergence_tol must be NaN"
+        );
+        assert!(
+            r.stall_optical_reduced_chi2.is_nan(),
+            "stall_optical_reduced_chi2 must be NaN"
+        );
+        assert_eq!(r.termination, -1);
+        assert_eq!(r.stall_delivered, -1);
+        assert_eq!(r.stall_underlying_stop, -1);
+        assert_eq!(r.final_solve_iterations, -1);
+        assert_eq!(r.accepted_steps, 0);
         // Owned pointers null / counts zero so the free path is a no-op.
         assert!(r.observations.is_null() && r.num_observations == 0);
         assert!(r.station_biases.is_null() && r.num_station_biases == 0);
@@ -7525,6 +7903,183 @@ mod od_output_joint_tests {
             msg.contains("99") && msg.contains("kind"),
             "the message must name the offending tag: {msg}"
         );
+    }
+}
+
+/// The solver-termination + stall-delivery block on a real fit.
+///
+/// The struct-level tests upstream of this one pin the poisoned slot and
+/// the constants; this one pins the only thing they cannot — that a fit
+/// which actually ran writes the block, and writes it consistently with
+/// itself. Before this block existed a caller had `update_norm` and
+/// nothing else, and reading it as a convergence metric is wrong in both
+/// directions.
+#[cfg(test)]
+mod solver_termination_tests {
+    use super::tests::{read_eros_observations, standard_od_config};
+    use super::*;
+
+    /// A converged Eros fit names its stop, publishes step diagnostics
+    /// that obey their own absent-convention, and — not being a stall —
+    /// leaves the whole `stall_*` family absent.
+    #[test]
+    fn a_real_fit_reports_how_its_solver_stopped() {
+        let Some(ctx) =
+            crate::testing::context_or_skip("a_real_fit_reports_how_its_solver_stopped")
+        else {
+            return;
+        };
+        let (obs_ptr, obs_n) = read_eros_observations();
+        let cfg = standard_od_config();
+        let mut out: EmpyreanDetermineResults = unsafe { std::mem::zeroed() };
+        let code = unsafe {
+            empyrean_determine(
+                &ctx,
+                obs_ptr,
+                obs_n,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                &cfg,
+                &mut out,
+            )
+        };
+        unsafe { crate::od::empyrean_observations_free(obs_ptr, obs_n) };
+        assert_eq!(code, 0, "the bundled Eros arc must deliver a fit");
+        let slot = unsafe { &*out.objects };
+        assert_eq!(slot.delivered, 1);
+        let r = &slot.result;
+
+        // A fit that ran names its stop. NOT_REPORTED is reserved for
+        // results that never saw a solver, so seeing it here would mean
+        // the marshal wrote a default instead of the engine's verdict.
+        assert!(
+            r.termination > EMPYREAN_SOLVER_STOP_NOT_REPORTED
+                && r.termination <= EMPYREAN_SOLVER_STOP_UNRECOGNIZED,
+            "a delivered fit must name its stop, got {}",
+            r.termination
+        );
+        assert_ne!(
+            r.termination, EMPYREAN_SOLVER_STOP_UNRECOGNIZED,
+            "an unrecognized stop means this build's mapping has fallen \
+             behind the solver's own enum"
+        );
+
+        // The step norm is either a real number or the documented NaN,
+        // never 0.0 standing in for absence — and it IS present under
+        // the one stop that promises it is bounded by the tolerance.
+        assert!(
+            r.gn_step_qnorm.is_finite() || r.gn_step_qnorm.is_nan(),
+            "gn_step_qnorm must be finite or NaN, got {}",
+            r.gn_step_qnorm
+        );
+        if r.termination == EMPYREAN_SOLVER_STOP_STEP_TOLERANCE {
+            assert!(
+                r.gn_step_qnorm.is_finite(),
+                "a StepTolerance stop is DECIDED on the undamped step, so that \
+                 step must be published"
+            );
+        }
+        assert!(
+            r.mu_final.is_finite() || r.mu_final.is_nan(),
+            "mu_final must be finite or NaN, got {}",
+            r.mu_final
+        );
+        // μ is absent exactly on the Schur path, which forms no
+        // comparable damping — so its absence and that path's own stop
+        // must agree. They are the two independent ways a caller is told
+        // which loop ran, and a fit where they disagree would send a
+        // consumer down the wrong reading of `accepted_steps`.
+        assert_eq!(
+            r.mu_final.is_nan(),
+            r.termination == EMPYREAN_SOLVER_STOP_SCHUR_STEP_TOLERANCE,
+            "mu_final's absence and a SchurStepTolerance stop must agree"
+        );
+
+        // `accepted_steps` disambiguates `update_norm`'s 0.0 sentinel,
+        // and this arc is the case that needs it: `determine` converges,
+        // transfers to the mid-arc epoch and re-solves, so its FINAL
+        // solve is a re-fit of an already-stationary orbit. It therefore
+        // latches at its starting point, accepts nothing, and reports
+        // `update_norm` of exactly 0.0 — which on the pre-0.10.0 surface
+        // was indistinguishable from "a step of size zero was taken",
+        // and is the ambiguity this whole block exists to remove.
+        //
+        // Branching rather than pinning zero: an entry point whose final
+        // solve does move is equally valid, and the contract worth
+        // holding is that the two fields never disagree — ON A CONVERGED
+        // (or stall-delivered) fit. The engine publishes INFINITY for a
+        // no-step iterate delivered without convergence (a refine that
+        // stalls outside the stall contract), so the guard below is part
+        // of the contract, not caution.
+        if r.accepted_steps == 0 && r.converged != 0 {
+            assert_eq!(
+                r.update_norm, 0.0,
+                "a converged solve that accepted no step took no step, so \
+                 its damped step norm is exactly 0.0 — any other value \
+                 would mean the two fields describe different solves"
+            );
+        } else if r.accepted_steps != 0 {
+            assert!(
+                r.update_norm.is_finite(),
+                "a solve that accepted a step must report that step's norm"
+            );
+        }
+        assert!(
+            r.final_solve_iterations >= 0,
+            "a delivered fit's final solve must report its iteration count"
+        );
+        assert!(
+            r.final_solve_iterations as u32 <= r.iterations,
+            "the final solve's iterations ({}) cannot exceed the total across \
+             every solve the path ran ({})",
+            r.final_solve_iterations,
+            r.iterations
+        );
+
+        // Stall delivery: absent on the ordinary path, and when absent
+        // EVERY member of the family is absent. Branching rather than
+        // asserting `== 0` outright, because a stall delivery is a
+        // legitimate outcome and the contract worth pinning is that the
+        // flag and the numbers never disagree.
+        if r.stall_delivered == 0 {
+            assert_eq!(
+                r.stall_underlying_stop, EMPYREAN_SOLVER_STOP_NOT_REPORTED,
+                "no stall block means no underlying stop to report"
+            );
+            assert!(
+                r.stall_gn_qnorm.is_nan()
+                    && r.stall_convergence_tol.is_nan()
+                    && r.stall_optical_reduced_chi2.is_nan(),
+                "a non-stall fit must leave every stall float NaN, not 0.0"
+            );
+            assert_ne!(
+                r.termination, EMPYREAN_SOLVER_STOP_STALLED_DELIVERED,
+                "a StalledDelivered termination without a stall block would \
+                 leave the numbers that earned the delivery unreadable"
+            );
+        } else {
+            assert_eq!(r.stall_delivered, 1);
+            assert_eq!(
+                r.termination, EMPYREAN_SOLVER_STOP_STALLED_DELIVERED,
+                "a stall-delivered fit's termination is the DELIVERY's verdict"
+            );
+            assert!(
+                r.stall_underlying_stop == EMPYREAN_SOLVER_STOP_DAMPING_EXHAUSTED
+                    || r.stall_underlying_stop == EMPYREAN_SOLVER_STOP_INNER_TRIALS_EXHAUSTED,
+                "the acceptance considers only those two stops, got {}",
+                r.stall_underlying_stop
+            );
+            assert!(
+                r.stall_gn_qnorm.is_finite()
+                    && r.stall_convergence_tol.is_finite()
+                    && r.stall_optical_reduced_chi2.is_finite(),
+                "a stall block must carry the numbers that earned the delivery"
+            );
+        }
+
+        unsafe { empyrean_determine_results_free(&mut out) };
     }
 }
 

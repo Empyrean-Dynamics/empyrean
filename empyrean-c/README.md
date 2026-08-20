@@ -265,7 +265,7 @@ if (radar) empyrean_radar_observations_free(radar, n_radar);
 
 `EmpyreanODConfig` follows a sentinel rule — `0` / `0.0` on a primitive
 field requests the upstream default (`max_iterations = 0` → 100,
-`convergence_tol = 0.0` → 0.1, `epsilon = 0.0` → 1e-9). The exceptions
+`convergence_tol = 0.0` → 1e-5, `epsilon = 0.0` → 1e-9). The exceptions
 are load-bearing and documented inline in the header; four of them are
 worth naming here, because on each a zero-initialized struct is an
 **active choice**, not "unset":
@@ -566,10 +566,10 @@ its whole layout, not merely append: keeping an existing prefix and writing
 `photometry` at its old offset lands eight bytes past where the library reads
 it, corrupting the photometry config and the two bytes before it with no
 diagnostic. Every other frozen struct grows by appending —
-`CoordinateState` 360→512, `EmpyreanOrbit` 648→832,
+`CoordinateState` 360→512, `EmpyreanOrbit` 648→832→912,
 `EmpyreanPropagatedState` 2392→2576, `EmpyreanNonGravParams` 160→176,
-`EmpyreanObservatoryConfig` 40→64, `EmpyreanODResult` 7688→8128 (carrying
-`EmpyreanODObjectResult` 7720→8160 with it).
+`EmpyreanObservatoryConfig` 40→64, `EmpyreanODResult` 7688→8128→8192
+(carrying `EmpyreanODObjectResult` 7720→8160→8224 with it).
 
 The source-breaking changes are the two semantic ones (`EmpyreanSolveFor`'s
 encoding and the thrust Δv index space) plus the `thrust_segments` →

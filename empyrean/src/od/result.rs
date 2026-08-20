@@ -1161,6 +1161,201 @@ impl CovarianceTrust {
     }
 }
 
+/// Which criterion ended the solve that produced a fit's published
+/// state.
+///
+/// Read this rather than inferring convergence from
+/// [`DetermineResult::update_norm`], which is the μ-damped accepted step
+/// and is not comparable to `ODConfig::convergence_tol` in either
+/// direction.
+///
+/// # Fieldless, deliberately
+///
+/// The engine's own enum carries a payload on two arms — the damping
+/// value that exceeded the cap, and the trial count of the exhausted
+/// iteration. Neither crosses the C ABI as part of the stop code: μ at
+/// termination is published for every path as
+/// [`DetermineResult::mu_final`], which is where a
+/// [`DampingExhausted`](Self::DampingExhausted) fit's μ is read, and the
+/// trial count has no ABI field. Carrying half a payload here would
+/// invite matching on a value that is only sometimes present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SolverStop {
+    /// The scaled gradient at the accepted point fell below `gtol`
+    /// (MINPACK cosine form). Tested before the step test, so it says
+    /// nothing about how large the remaining Gauss-Newton step was.
+    GradientTolerance,
+    /// The **undamped** Gauss-Newton step's quadratic form fell below
+    /// [`ODConfig::convergence_tol`](crate::ODConfig::convergence_tol).
+    /// The only stop on the ordinary LM path under which
+    /// [`DetermineResult::gn_step_qnorm`] is bounded by that tolerance.
+    StepTolerance,
+    /// Actual and predicted reduction of the last accepted step both
+    /// fell below `ftol`·Φ under a consistent model.
+    CostTolerance,
+    /// The outer iteration budget ran out while the solve was still
+    /// moving. **Not** a convergence.
+    MaxIterations,
+    /// Damping exceeded the driver's cap while rejecting trials: no
+    /// improving step exists from that point at any μ. Not a
+    /// convergence — but see [`StalledDelivered`](Self::StalledDelivered),
+    /// the verdict when such a point is nonetheless statistically
+    /// stationary. The μ that exceeded the cap is
+    /// [`DetermineResult::mu_final`].
+    DampingExhausted,
+    /// The inner trial budget ran out inside one outer iteration without
+    /// an acceptance. Not a convergence; same caveat as
+    /// [`DampingExhausted`](Self::DampingExhausted).
+    InnerTrialsExhausted,
+    /// No solver criterion latched, and the iterate was delivered anyway
+    /// by the stable-stall acceptance.
+    /// [`DetermineResult::stall_delivery`] carries the numbers that
+    /// earned it, including the solver's own verdict underneath.
+    StalledDelivered,
+    /// The Schur (nuisance-block) loop's own step test, under the Schur
+    /// complement rather than the prior-augmented normal matrix.
+    /// Deliberately not [`StepTolerance`](Self::StepTolerance): they are
+    /// quantities of different systems.
+    /// [`DetermineResult::gn_step_qnorm`] is published on this path only
+    /// at solved width ≤ 6, where the loop runs undamped.
+    SchurStepTolerance,
+    /// The solver reported a termination this engine build cannot name —
+    /// the optimizer grew a variant ahead of the mapping.
+    ///
+    /// Never folded into one of the arms above, and never reported as
+    /// absent: a stop that fired but cannot be named is not the same as
+    /// no stop at all.
+    Unrecognized,
+}
+
+impl SolverStop {
+    /// Decode the C-ABI `EMPYREAN_SOLVER_STOP_*` code. `None` ⇔
+    /// `NOT_REPORTED` — the result did not come from a solver run.
+    ///
+    /// A code this build does not know maps to
+    /// [`Unrecognized`](Self::Unrecognized) rather than to `None`, for
+    /// the same reason the engine has that variant: an unnamed stop is
+    /// not a missing one.
+    pub(super) fn from_int(code: i32) -> Option<Self> {
+        match code {
+            empyrean_sys::EMPYREAN_SOLVER_STOP_NOT_REPORTED => None,
+            empyrean_sys::EMPYREAN_SOLVER_STOP_GRADIENT_TOLERANCE => {
+                Some(SolverStop::GradientTolerance)
+            }
+            empyrean_sys::EMPYREAN_SOLVER_STOP_STEP_TOLERANCE => Some(SolverStop::StepTolerance),
+            empyrean_sys::EMPYREAN_SOLVER_STOP_COST_TOLERANCE => Some(SolverStop::CostTolerance),
+            empyrean_sys::EMPYREAN_SOLVER_STOP_MAX_ITERATIONS => Some(SolverStop::MaxIterations),
+            empyrean_sys::EMPYREAN_SOLVER_STOP_DAMPING_EXHAUSTED => {
+                Some(SolverStop::DampingExhausted)
+            }
+            empyrean_sys::EMPYREAN_SOLVER_STOP_INNER_TRIALS_EXHAUSTED => {
+                Some(SolverStop::InnerTrialsExhausted)
+            }
+            empyrean_sys::EMPYREAN_SOLVER_STOP_STALLED_DELIVERED => {
+                Some(SolverStop::StalledDelivered)
+            }
+            empyrean_sys::EMPYREAN_SOLVER_STOP_SCHUR_STEP_TOLERANCE => {
+                Some(SolverStop::SchurStepTolerance)
+            }
+            _ => Some(SolverStop::Unrecognized),
+        }
+    }
+
+    /// Stable lowercase tag, matching the engine's own serialization.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SolverStop::GradientTolerance => "gradient_tolerance",
+            SolverStop::StepTolerance => "step_tolerance",
+            SolverStop::CostTolerance => "cost_tolerance",
+            SolverStop::MaxIterations => "max_iterations",
+            SolverStop::DampingExhausted => "damping_exhausted",
+            SolverStop::InnerTrialsExhausted => "inner_trials_exhausted",
+            SolverStop::StalledDelivered => "stalled_delivered",
+            SolverStop::SchurStepTolerance => "schur_step_tolerance",
+            SolverStop::Unrecognized => "unrecognized",
+        }
+    }
+
+    /// Whether this stop is one of the solver's own convergence criteria
+    /// — the solve ended because it arrived, not because it ran out of
+    /// budget or damping.
+    ///
+    /// [`StalledDelivered`](Self::StalledDelivered) is deliberately
+    /// `false`: the acceptance delivers such a fit, but no criterion
+    /// latched, and a consumer asking this question is asking about the
+    /// solver.
+    pub fn is_solver_criterion(&self) -> bool {
+        matches!(
+            self,
+            SolverStop::GradientTolerance
+                | SolverStop::StepTolerance
+                | SolverStop::CostTolerance
+                | SolverStop::SchurStepTolerance
+        )
+    }
+}
+
+/// The numbers behind a fit delivered by the stable-stall acceptance —
+/// one whose final solve latched no convergence criterion but was
+/// stationary to a small fraction of its own formal σ with χ² clearing
+/// the fit-quality bars.
+///
+/// Present as [`DetermineResult::stall_delivery`] exactly when
+/// [`DetermineResult::termination`] is
+/// [`SolverStop::StalledDelivered`]. `None` is the ordinary case; a
+/// consumer that wants the strict convergence contract checks for it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StallDelivery {
+    /// What the SOLVER reported before the acceptance overrode the
+    /// verdict — always [`SolverStop::DampingExhausted`] or
+    /// [`SolverStop::InnerTrialsExhausted`], the only two stops the
+    /// acceptance considers. Kept beside
+    /// [`DetermineResult::termination`] so the delivery's verdict and
+    /// the solver's own are both readable and neither is inferred from
+    /// the other.
+    pub underlying_stop: SolverStop,
+    /// \\(q\\) of the undamped Gauss-Newton step at the delivered
+    /// iterate — the quantity `convergence_tol` bounds and did not bound
+    /// here. \\(\sqrt{q}\\) is the remaining step in the fit's own
+    /// formal σ.
+    pub gn_qnorm: f64,
+    /// The **resolved** convergence tolerance the stall was judged
+    /// against, delivered because `ODConfig::convergence_tol` carries a
+    /// "use the engine default" sentinel and the enforced value is
+    /// therefore not recoverable from the config that was passed in.
+    pub convergence_tol: f64,
+    /// Reduced χ² of the OPTICAL family alone at the delivered iterate.
+    ///
+    /// The full objective's reduced χ² and the bar both were held to are
+    /// already on [`DetermineResult::acceptability`], and the delivery's
+    /// μ and iteration count are already
+    /// [`DetermineResult::mu_final`] and
+    /// [`DetermineResult::final_solve_iterations`] — a stall-delivered
+    /// fit's final solve IS the stalled solve.
+    pub optical_reduced_chi2: f64,
+}
+
+impl StallDelivery {
+    /// The remaining undamped Gauss-Newton step in units of the fit's
+    /// own formal 1σ, \\(\sqrt{q}\\) — the number to quote when saying
+    /// how far from stationary the delivered iterate is.
+    pub fn step_sigmas(&self) -> f64 {
+        self.gn_qnorm.sqrt()
+    }
+
+    /// Decode the C-ABI `stall_*` field group. `None` when the fit was
+    /// not stall-delivered.
+    pub(super) fn from_ffi(r: &empyrean_sys::EmpyreanODResult) -> Option<Self> {
+        (r.stall_delivered == 1).then(|| StallDelivery {
+            underlying_stop: SolverStop::from_int(r.stall_underlying_stop)
+                .unwrap_or(SolverStop::Unrecognized),
+            gn_qnorm: r.stall_gn_qnorm,
+            convergence_tol: r.stall_convergence_tol,
+            optical_reduced_chi2: r.stall_optical_reduced_chi2,
+        })
+    }
+}
+
 /// Result of a differential-correction orbit determination.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DetermineResult {
@@ -1180,7 +1375,34 @@ pub struct DetermineResult {
     pub summary: ResidualSummary,
     /// Iterations used in the final DC pass.
     pub iterations: u32,
-    /// Final iteration's convergence metric Δx^T N Δx.
+    /// **NOT the quantity
+    /// [`ODConfig::convergence_tol`](crate::ODConfig::convergence_tol)
+    /// bounds.** The μ-DAMPED last ACCEPTED step's \\(q\\)-norm
+    /// (Δx^T N Δx) — the size of the step the solver actually took,
+    /// after Levenberg-Marquardt damping.
+    ///
+    /// The tolerance is tested on the *undamped* Gauss-Newton step,
+    /// published as [`gn_step_qnorm`](Self::gn_step_qnorm). The two are
+    /// incomparable in BOTH directions: a converged fit routinely
+    /// reports an `update_norm` orders of magnitude ABOVE
+    /// `convergence_tol` (damping is light near the optimum, so the step
+    /// taken is large), while a solve thrashing to
+    /// [`SolverStop::DampingExhausted`] reports one orders of magnitude
+    /// BELOW it (μ has crushed every step to nothing). Read
+    /// [`termination`](Self::termination) and
+    /// [`gn_step_qnorm`](Self::gn_step_qnorm) for convergence, or
+    /// [`acceptability`](Self::acceptability) for the fit-quality
+    /// verdict.
+    ///
+    /// On the Schur path (station-bias / nuisance fits) this carries
+    /// that loop's own step norm under the Schur complement instead —
+    /// the quantity IT tests against `convergence_tol`.
+    /// [`termination`](Self::termination) says which loop ran.
+    ///
+    /// Exactly `0.0` with [`accepted_steps`](Self::accepted_steps)` == 0`
+    /// means the solver latched a criterion at its STARTING point and
+    /// never accepted a step — the incoming iterate was already
+    /// stationary. It does not mean "a step of size zero was taken".
     pub update_norm: f64,
     /// Did the DC reach its stopping criterion?
     pub converged: bool,
@@ -1262,6 +1484,70 @@ pub struct DetermineResult {
     /// dropped prior cross term changes how the σ for that slot should
     /// be read.
     pub warnings: Vec<String>,
+    /// Which criterion ended the solve that produced the published
+    /// state. `None` only on a result that did not come from a solver
+    /// run; every fit this crate delivers names its stop.
+    pub termination: Option<SolverStop>,
+    /// Quadratic form of the **undamped** Gauss-Newton step — the only
+    /// number here comparable to
+    /// [`ODConfig::convergence_tol`](crate::ODConfig::convergence_tol),
+    /// and the one the solver's step test is decided on.
+    ///
+    /// \\(q = \mathbf{h}_{\text{GN}}^\top A\,\mathbf{h}_{\text{GN}}\\)
+    /// with \\(A = \Sigma^{-1}\\), so \\(\sqrt{q}\\) is the remaining
+    /// step measured in the fit's own formal σ.
+    ///
+    /// `q <= convergence_tol` is guaranteed only under
+    /// [`SolverStop::StepTolerance`] (or
+    /// [`SolverStop::SchurStepTolerance`]). Under the gradient, cost and
+    /// stall verdicts the fit is delivered as converged with `q`
+    /// legitimately above the tolerance.
+    ///
+    /// `None` when the undamped system was singular at the returned
+    /// point, when the Schur loop ran at solved width > 6 (its only step
+    /// norm there is λ-shrunken, which is what this field promises it is
+    /// not), or on a non-solver result.
+    pub gn_step_qnorm: Option<f64>,
+    /// Levenberg-Marquardt damping at termination. Large μ beside a
+    /// small [`update_norm`](Self::update_norm) is the signature of a
+    /// stalled solve rather than a converged one.
+    ///
+    /// `None` on the Schur path, which runs its own λ schedule and forms
+    /// no comparable quantity — so its absence, alongside
+    /// [`SolverStop::SchurStepTolerance`], is what identifies that path
+    /// — and on non-solver results.
+    pub mu_final: Option<f64>,
+    /// Steps the solve actually ACCEPTED — trials that passed the
+    /// gain-ratio test and moved the iterate.
+    ///
+    /// `0` says the solver latched a criterion at its starting point and
+    /// never moved: the incoming orbit was already stationary for this
+    /// observation set. That is what disambiguates
+    /// [`update_norm`](Self::update_norm)'s `0.0` sentinel.
+    ///
+    /// Counted per SOLVE, so it describes the same solve as
+    /// [`final_solve_iterations`](Self::final_solve_iterations), never a
+    /// total across the rejection–refit passes. The Schur path applies
+    /// every step it computes rather than accepting some, so there this
+    /// is applied steps and equals `final_solve_iterations`.
+    pub accepted_steps: u32,
+    /// Iterations spent by the solve that produced the published state —
+    /// the one [`update_norm`](Self::update_norm),
+    /// [`termination`](Self::termination),
+    /// [`gn_step_qnorm`](Self::gn_step_qnorm) and
+    /// [`accepted_steps`](Self::accepted_steps) all describe.
+    ///
+    /// Additive disambiguator for [`iterations`](Self::iterations),
+    /// whose composition varies by entry point; this one never does.
+    /// `None` on a result that did not come from a solver run.
+    pub final_solve_iterations: Option<usize>,
+    /// `Some` when this fit was delivered by the stable-stall acceptance
+    /// rather than by a convergence criterion — see [`StallDelivery`]
+    /// for the numbers that earned it.
+    ///
+    /// `None` is the ordinary case. A consumer that wants the strict
+    /// convergence contract checks `stall_delivery.is_none()`.
+    pub stall_delivery: Option<StallDelivery>,
 }
 
 impl DetermineResult {
@@ -1679,6 +1965,14 @@ mod batch_tests {
             dv_frame: None,
             photometry: None,
             covariance_trust: None,
+            // A hand-built fixture, not a solver run: `None` throughout
+            // is exactly what that reads as on the real surface.
+            termination: None,
+            gn_step_qnorm: None,
+            mu_final: None,
+            accepted_steps: 0,
+            final_solve_iterations: None,
+            stall_delivery: None,
         }
     }
 
@@ -1896,5 +2190,50 @@ mod batch_tests {
         assert!(rows[1].fractional_sigma_a.is_nan());
         assert!(!rows[1].fit_acceptable && !rows[1].extrapolation_acceptable);
         assert_eq!(rows[1].error.as_deref(), Some("no viable IOD seed"));
+    }
+
+    #[test]
+    fn solver_stop_criterion_line_matches_the_engine() {
+        // The four genuine convergence criteria and nothing else — the
+        // same line scott draws; StalledDelivered explicitly means no
+        // criterion latched.
+        use super::SolverStop as S;
+        let all = [
+            S::GradientTolerance,
+            S::StepTolerance,
+            S::CostTolerance,
+            S::MaxIterations,
+            S::DampingExhausted,
+            S::InnerTrialsExhausted,
+            S::StalledDelivered,
+            S::SchurStepTolerance,
+            S::Unrecognized,
+        ];
+        let criteria: Vec<_> = all.iter().filter(|s| s.is_solver_criterion()).collect();
+        assert_eq!(
+            criteria,
+            [
+                &S::GradientTolerance,
+                &S::StepTolerance,
+                &S::CostTolerance,
+                &S::SchurStepTolerance
+            ]
+        );
+        // Tag strings are the stable wire vocabulary — all distinct.
+        let mut tags: Vec<_> = all.iter().map(|s| s.as_str()).collect();
+        tags.sort_unstable();
+        tags.dedup();
+        assert_eq!(tags.len(), all.len());
+    }
+
+    #[test]
+    fn stall_step_sigmas_is_the_root_of_the_quadratic_form() {
+        let stall = super::StallDelivery {
+            underlying_stop: super::SolverStop::DampingExhausted,
+            gn_qnorm: 4.0e-4,
+            convergence_tol: 1.0e-5,
+            optical_reduced_chi2: 1.1,
+        };
+        assert_eq!(stall.step_sigmas(), 2.0e-2);
     }
 }

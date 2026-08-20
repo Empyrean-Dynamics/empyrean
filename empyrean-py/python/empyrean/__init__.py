@@ -92,6 +92,7 @@ from empyrean.od.result import (
     SolvedCovariance,
     SolveFor,
     SolveForParams,
+    StallDelivery,
     StationRaDecConfig,
     TrustGateEvent,
     WeightingConfig,
@@ -323,8 +324,8 @@ _B612_TO_VILLENEUVE_FILENAME = {
     "de440": "de440.bsp",
     "sb441_n16": "sb441-n16.bsp",
     "earth_high_prec": "earth_latest_high_prec.bpc",
-    "earth_historical": "earth_620120_250826.bpc",
-    "earth_predict": "earth_2025_250826_2125_predict.bpc",
+    "earth_historical": "earth_620120_260806.bpc",
+    "earth_predict": "earth_2026_260806_2126_predict.bpc",
     "mpc_obscodes": "obscodes_extended.json",
 }
 
@@ -542,6 +543,16 @@ def download_data(*, data_dir: str | pathlib.Path | None = None) -> str:
         Build against an already-provisioned directory with
         :func:`initialize` and ``refresh=False`` instead, or unset the
         variable for the process that must provision.
+    RuntimeError
+        If a kernel fetch was attempted and failed — a 404 from an upstream
+        that rotated or withdrew a pinned kernel, a refused connection, a
+        mid-transfer failure. The message leads with ``"Data download
+        failed: "`` and carries the request context (``GET <url>: ...``),
+        so the kernel that could not be fetched is named by its URL. The
+        remedy is connectivity, or — when the URL 404s — staging that file
+        by hand into ``data_dir``, or moving to a release whose kernel pin
+        is still served. Retrying this call does not help, and neither does
+        local file repair: nothing is wrong on disk.
     """
     # Prefer installed B612 data packages — symlink the kernels they ship into
     # the data dir (no network) and let the engine fetch only the remainder.

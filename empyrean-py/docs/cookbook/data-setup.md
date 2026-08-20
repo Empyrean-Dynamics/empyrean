@@ -62,8 +62,12 @@ demand and cached under the same XDG data dir:
 
 | File                              | When fetched                                          | Source                                                    |
 |-----------------------------------|-------------------------------------------------------|-----------------------------------------------------------|
-| `moon_pa_de440_200625.bpc`        | First {func}`empyrean.initialize` (~30 MB)            | `https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/` |
+| `moon_pa_de440_*.bpc`             | First {func}`empyrean.initialize` (~30 MB)            | `https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/` |
 | Spacecraft SPK (JWST, Gaia, HST)  | Only when an observation cites that observatory code  | `https://naif.jpl.nasa.gov/pub/naif/…`                    |
+
+The Moon-orientation file is named for its release date; whichever dated
+release is present is resolved by the loader's glob, so a mirror does not
+have to match one exact filename.
 
 ## Offline and air-gapped operation
 

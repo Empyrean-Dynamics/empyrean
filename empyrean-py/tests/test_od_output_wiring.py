@@ -121,3 +121,67 @@ def test_fitted_orbit_predicts_magnitudes(apophis_observations):
     mags = eph.mag.to_pylist()
     assert all(m is not None for m in mags), f"fitted-orbit ephemeris mag was None: {mags}"
     assert all(0.0 < m < 40.0 for m in mags), f"unphysical magnitude: {mags}"
+
+
+_SOLVER_STOPS = {
+    "gradient_tolerance",
+    "step_tolerance",
+    "cost_tolerance",
+    "max_iterations",
+    "damping_exhausted",
+    "inner_trials_exhausted",
+    "stalled_delivered",
+    "schur_step_tolerance",
+    "unrecognized",
+}
+
+
+def test_fit_reports_how_its_solver_stopped(apophis_observations):
+    """The solver-termination block survives the whole chain — engine → C ABI
+    → Rust wrapper → pyo3 dict → dataclass — with its absent-value convention
+    intact.
+
+    Before it existed, ``update_norm`` was the only convergence-adjacent number
+    a Python caller had, and reading it as one is wrong in both directions: it
+    is the mu-DAMPED accepted step, while the tolerance is tested on the
+    undamped Gauss-Newton step (``gn_step_qnorm``)."""
+    fit = determine(apophis_observations).single()
+    assert fit.converged
+
+    assert fit.termination in _SOLVER_STOPS, f"unknown stop tag: {fit.termination!r}"
+    assert fit.termination != "unrecognized", (
+        "an unrecognized stop means the bindings' mapping has fallen behind the solver's own enum"
+    )
+
+    # Absent readings are None, never 0.0 / NaN standing in for absence.
+    assert fit.gn_step_qnorm is None or fit.gn_step_qnorm == fit.gn_step_qnorm
+    if fit.termination == "step_tolerance":
+        assert fit.gn_step_qnorm is not None, (
+            "a step_tolerance stop is DECIDED on the undamped step, so that step must reach Python"
+        )
+    # mu is absent exactly on the Schur path, which forms no comparable damping.
+    assert (fit.mu_final is None) == (fit.termination == "schur_step_tolerance")
+
+    assert fit.final_solve_iterations is not None
+    assert fit.final_solve_iterations <= fit.iterations, (
+        "the final solve's iterations cannot exceed the total across every solve the path ran"
+    )
+
+    # accepted_steps disambiguates update_norm's 0.0 sentinel: determine
+    # converges, transfers to the mid-arc epoch and re-solves, so its final
+    # solve can legitimately latch at its starting point without moving.
+    if fit.accepted_steps == 0:
+        assert fit.update_norm == 0.0
+    else:
+        assert fit.update_norm == fit.update_norm  # not NaN
+
+    # This arc converges on a solver criterion, so there is no stall block.
+    if fit.stall_delivery is None:
+        assert fit.termination != "stalled_delivered"
+    else:
+        assert fit.termination == "stalled_delivered"
+        assert fit.stall_delivery.underlying_stop in {
+            "damping_exhausted",
+            "inner_trials_exhausted",
+        }
+        assert fit.stall_delivery.step_sigmas >= 0.0

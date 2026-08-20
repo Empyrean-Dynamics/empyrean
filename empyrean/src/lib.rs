@@ -173,8 +173,9 @@ pub use od::{
     ObservationResidual, Observations, OriginPolicy, OutputEpoch, PhotometryConfig,
     PhotometryModel, PhotometryResult, RadarMeasurement, RadarObservation, RadarResidual,
     RadarResidualKind, RejectionConfig, RejectionKind, RejectionReason, ResidualSummary,
-    SigmaPolicy, SolveFor, SolveForParams, SolvedCovariance, StationBias, StationRaDecConfig,
-    TrustGateEvent, WeightingConfig, WeightingLayer, WeightingPreset,
+    SigmaPolicy, SolveFor, SolveForParams, SolvedCovariance, SolverStop, StallDelivery,
+    StationBias, StationRaDecConfig, TrustGateEvent, WeightingConfig, WeightingLayer,
+    WeightingPreset,
 };
 pub use orbit::{Orbit, PhaseFunction};
 pub use planning::{

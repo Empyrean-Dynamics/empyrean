@@ -72,7 +72,8 @@ pub use result::{
     DetermineFailure, DetermineFailureKind, DetermineResult, DetermineResults, EvaluateResult,
     GateRecord, MAX_THRUST_SEGMENTS, ObservationResidual, OriginPolicy, OutputEpoch,
     PhotometryModel, PhotometryResult, RadarResidual, RadarResidualKind, RejectionReason,
-    ResidualSummary, SolveFor, SolveForParams, SolvedCovariance, StationBias, TrustGateEvent,
+    ResidualSummary, SolveFor, SolveForParams, SolvedCovariance, SolverStop, StallDelivery,
+    StationBias, TrustGateEvent,
 };
 pub use weighting::{SigmaPolicy, WeightingConfig, WeightingLayer, WeightingPreset};
 
@@ -616,6 +617,17 @@ fn ffi_od_result_to_rust(
         thrust_correction_covariances,
         dispositions,
         warnings,
+        // NaN is the C ABI's absent marker for these two — exactly NaN,
+        // so the reconstruction is `!is_nan()`, the marshal's inverse.
+        // (`is_finite()` would silently fold a ±∞ reading into "not
+        // reported", which is a real value disappearing.)
+        termination: SolverStop::from_int(result.termination),
+        gn_step_qnorm: (!result.gn_step_qnorm.is_nan()).then_some(result.gn_step_qnorm),
+        mu_final: (!result.mu_final.is_nan()).then_some(result.mu_final),
+        accepted_steps: result.accepted_steps,
+        final_solve_iterations: (result.final_solve_iterations >= 0)
+            .then_some(result.final_solve_iterations as usize),
+        stall_delivery: StallDelivery::from_ffi(result),
     })
 }
 

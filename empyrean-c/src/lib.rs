@@ -719,12 +719,36 @@ pub unsafe extern "C" fn empyrean_context_from_data_dir_with(
 /// copy moved (the refreshing path); on a warm, complete directory it
 /// issues only the staleness checks and downloads nothing.
 ///
-/// Returns `0` on success. On failure returns the engine error code —
-/// `-2` when a required resource could not be obtained, with the
-/// structured file list available through
-/// [`empyrean_missing_data_files`]; `-1` for a non-UTF-8 `data_dir` or
-/// another invalid argument; `-99` on a caught panic. Call
-/// `empyrean_last_error()` for the message on any non-zero return.
+/// Returns `0` on success. On failure returns the engine error code:
+/// `-1` for a non-UTF-8 `data_dir` or another invalid argument, `-99` on
+/// a caught panic, and `-2` when a required resource could not be
+/// obtained. Call `empyrean_last_error()` for the message on any
+/// non-zero return.
+///
+/// # Reading a `-2`
+///
+/// `-2` is the missing-data **category**, and two of its shapes carry a
+/// signature this entry point's callers can key on:
+///
+/// * **Files absent, no fetch attempted** — `num_files > 0` from
+///   [`empyrean_missing_data_files`] names every file, and the message
+///   reads `"Missing data files: <names>"`. The
+///   remedy is to fetch or stage exactly those names.
+/// * **A fetch was attempted and failed** — `num_files == 0` (the list
+///   is empty, which is not itself an error), and the message starts
+///   `"Data download failed: "`, naming the failing
+///   kernel by its URL. The remedy is connectivity, or — when the URL
+///   404s because an upstream rotated or withdrew a pinned kernel —
+///   staging that file by hand or moving to an engine whose pin is
+///   still served. Never local file repair.
+///
+/// The implications hold in one direction only: a populated list always
+/// means the named-files shape, and the download prefix always means a
+/// failed acquisition. A `-2` with an empty list and any other message
+/// is one of the category's other residents (a kernel that read but
+/// would not parse, a coverage gap) — the message states its own
+/// remedy. An empty list after a `-2` therefore does **not** mean
+/// "nothing was missing": read `empyrean_last_error()`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn empyrean_download_data(data_dir: *const c_char) -> i32 {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

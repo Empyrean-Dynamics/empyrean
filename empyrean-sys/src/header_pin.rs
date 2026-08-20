@@ -74,7 +74,7 @@ mod tests {
     #[test]
     fn a_file_with_no_pin_reads_as_absent() {
         assert_eq!(
-            pinned_header_sha("# Pinned for v0.10.0-rc.1.\nlibempyrean-macos-aarch64 abc\n"),
+            pinned_header_sha("# Pinned for v0.10.0-rc.2.\nlibempyrean-macos-aarch64 abc\n"),
             None,
         );
         // Present-but-empty is absent too: a truncated regeneration must

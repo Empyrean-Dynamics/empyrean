@@ -32,7 +32,9 @@
 //   as `i32` — EMPYREAN_DATA_TIER_*, EMPYREAN_COVARIANCE_TRUST_*,
 //              EMPYREAN_TRUST_EVENT_*, EMPYREAN_EPHEMERIS_OVERLAP_POLICY_*,
 //              EMPYREAN_OD_FAILURE_*, EMPYREAN_PARAM_COLUMN_* (the
-//              EmpyreanParamColumn::kind tags).
+//              EmpyreanParamColumn::kind tags), EMPYREAN_SOLVER_STOP_* (the
+//              EmpyreanODResult::termination / ::stall_underlying_stop codes,
+//              added in 0.10.0-rc.2).
 //
 // TWO DELIBERATE EXCEPTIONS, both of the same shape — a family that shipped at
 // bindgen's `u32` before the rule existed keeps it rather than splitting.
@@ -97,6 +99,16 @@ pub const EMPYREAN_COVARIANCE_TRUST_WEAKLY_DETERMINED_HIGH_N: i32 = 3;
 pub const EMPYREAN_TRUST_EVENT_NONE: i32 = 0;
 pub const EMPYREAN_TRUST_EVENT_CLOSE_APPROACH: i32 = 1;
 pub const EMPYREAN_TRUST_EVENT_HIGH_NONLINEARITY: i32 = 2;
+pub const EMPYREAN_SOLVER_STOP_NOT_REPORTED: i32 = 0;
+pub const EMPYREAN_SOLVER_STOP_GRADIENT_TOLERANCE: i32 = 1;
+pub const EMPYREAN_SOLVER_STOP_STEP_TOLERANCE: i32 = 2;
+pub const EMPYREAN_SOLVER_STOP_COST_TOLERANCE: i32 = 3;
+pub const EMPYREAN_SOLVER_STOP_MAX_ITERATIONS: i32 = 4;
+pub const EMPYREAN_SOLVER_STOP_DAMPING_EXHAUSTED: i32 = 5;
+pub const EMPYREAN_SOLVER_STOP_INNER_TRIALS_EXHAUSTED: i32 = 6;
+pub const EMPYREAN_SOLVER_STOP_STALLED_DELIVERED: i32 = 7;
+pub const EMPYREAN_SOLVER_STOP_SCHUR_STEP_TOLERANCE: i32 = 8;
+pub const EMPYREAN_SOLVER_STOP_UNRECOGNIZED: i32 = 9;
 pub const EMPYREAN_REJECTION_ACCEPTED: u32 = 0;
 pub const EMPYREAN_REJECTION_CHI_SQUARED: u32 = 1;
 pub const EMPYREAN_REJECTION_SIGMA_CLIP: u32 = 2;
@@ -1334,7 +1346,7 @@ pub struct EmpyreanObserver {
     pub vx: f64,
     pub vy: f64,
     pub vz: f64,
-    #[doc = " Observing night as YYYYMMDD integer, or -1 if unavailable."]
+    #[doc = " Observing night as YYYYMMDD integer, or -1 if unavailable\n (space-based observers, or a site without a longitude). -1 means\n the same on input: the night is treated as absent, never as a\n date.\n\n The night is the local calendar date on which the observing night\n began: the UTC epoch is shifted by the site's east longitude to\n local mean solar time, and epochs before local noon stamp the\n previous date. MPC east-of-Greenwich longitudes in [0, 360) are\n wrapped to signed [-180, 180] before the fold, so a site west of\n Greenwich (e.g. 289 E in Chile) shifts by -71 degrees, not +19\n hours."]
     pub observing_night: i32,
     #[doc = " Reference frame the state is expressed in: 0=ICRF,\n 1=EclipticJ2000 (same encoding as\n `EmpyreanPropagationConfig::frame`).\n\n Appended at the tail of the struct deliberately: growing a\n `#[repr(C)]` record at the end is the only way to extend it\n without moving an existing field's offset."]
     pub frame: i32,
@@ -2245,7 +2257,7 @@ pub struct EmpyreanODConfig {
     pub output_epoch: EmpyreanOutputEpoch,
     #[doc = " Maximum DC iterations. 0 → upstream default (100)."]
     pub max_iterations: u32,
-    #[doc = " DC convergence tolerance on Δx^T N Δx. 0.0 → upstream default (0.1)."]
+    #[doc = " DC convergence tolerance on the quadratic form Δx^T N Δx of the\n **undamped Gauss-Newton step**, under the prior-augmented normal\n matrix. `0.0` → upstream default (1e-5).\n\n The test is deliberately on the undamped step: a μ-shrunken step\n says nothing about stationarity. So this bounds\n [`EmpyreanODResult::gn_step_qnorm`] — **not**\n [`EmpyreanODResult::update_norm`], which is the damped accepted\n step and is not comparable to this value in either direction.\n\n Since N = Σ⁻¹, √(Δx^T N Δx) is the remaining step measured in the\n fit's own formal σ; the 1e-5 default asks for 0.0032 σ."]
     pub convergence_tol: f64,
     #[doc = " Allow the outward-expansion pipeline to truncate a sub-arc it\n cannot fit as one piece. Tri-state: `-1` (or any negative) =\n engine default (allowed), `1` = allowed, `0` = **forbidden**.\n\n Forbidding truncation makes an arc that spans a dynamical\n discontinuity FAIL loudly instead of delivering a fit of the\n reconcilable sub-arc with the rest tagged\n `EMPYREAN_REJECTION_OUTSIDE_ARC`. Two interactions matter before\n relying on `0`: per-observation rejection is orthogonal and still\n runs (set `rejection.enabled = 0` as well to fit the whole arc or\n fail), and under `EMPYREAN_ORIGIN_POLICY_AUTO` the refusal is a\n cascade trigger rather than a final answer — pin the origin with\n `EMPYREAN_ORIGIN_POLICY_EXPLICIT` to get a pure loud failure."]
     pub allow_arc_truncation: i8,
@@ -3080,7 +3092,7 @@ pub struct EmpyreanODResult {
     pub num_observations: usize,
     pub summary: EmpyreanResidualSummary,
     pub iterations: u32,
-    #[doc = " Convergence metric at the final DC iteration (Δx^T N Δx)."]
+    #[doc = " **NOT the quantity [`EmpyreanODConfig::convergence_tol`] bounds.**\n This is the μ-DAMPED last ACCEPTED step's \\\\(q\\\\)-norm\n (Δx^T N Δx) — the size of the step the solver actually took,\n after Levenberg-Marquardt damping.\n\n The tolerance is tested on the *undamped* Gauss-Newton step,\n published as [`gn_step_qnorm`](Self::gn_step_qnorm). The two are\n incomparable in BOTH directions: a converged fit routinely\n reports an `update_norm` orders of magnitude ABOVE\n `convergence_tol` (damping is light near the optimum, so the step\n taken is large), while a solve thrashing to\n [`DAMPING_EXHAUSTED`](EMPYREAN_SOLVER_STOP_DAMPING_EXHAUSTED)\n reports one orders of magnitude BELOW it (μ has crushed every\n step to nothing). Read [`termination`](Self::termination) and\n [`gn_step_qnorm`](Self::gn_step_qnorm) for convergence, or\n [`acceptability`](Self::acceptability) for the fit-quality\n verdict.\n\n On the Schur path (station-bias / nuisance fits) this carries\n that loop's own step norm under the Schur complement instead —\n the quantity IT tests against `convergence_tol`.\n [`termination`](Self::termination) says which loop ran.\n\n Exactly `0.0` with [`accepted_steps`](Self::accepted_steps)` == 0`\n means the solver latched a criterion at its STARTING point and\n never accepted a step — the incoming iterate was already\n stationary. It does not mean \"a step of size zero was taken\"."]
     pub update_norm: f64,
     #[doc = " Solver reached its stopping criterion (1 = yes).\n Equivalent to `acceptability.converged_ok`; kept for backwards\n compatibility with the v0.7.0 surface that pre-dated the\n structured acceptability report."]
     pub converged: u8,
@@ -3167,10 +3179,30 @@ pub struct EmpyreanODResult {
     pub warnings: *mut *mut ::std::os::raw::c_char,
     #[doc = " Number of warning strings. 0 when the fit used everything it was\n given."]
     pub num_warnings: usize,
+    #[doc = " Which criterion ended the solve that produced the published\n state (`EMPYREAN_SOLVER_STOP_*`).\n\n [`NOT_REPORTED`](EMPYREAN_SOLVER_STOP_NOT_REPORTED) (0) means the\n result did not come from a solver run; every fit this library\n delivers names its stop. A code the engine could not name is\n [`UNRECOGNIZED`](EMPYREAN_SOLVER_STOP_UNRECOGNIZED) (9), never\n folded into 0 or into a specific criterion."]
+    pub termination: i32,
+    #[doc = " Steps the solve actually ACCEPTED — trials that passed the\n gain-ratio test and moved the iterate.\n\n `0` says the solver latched a criterion at its starting point and\n never moved: the incoming orbit was already stationary for this\n observation set. That is the ordinary outcome of re-fitting an\n already-converged orbit, and it is what disambiguates\n [`update_norm`](Self::update_norm)'s `0.0` sentinel.\n\n Counted per SOLVE, not per fit: it describes the same solve as\n [`final_solve_iterations`](Self::final_solve_iterations), never a\n total across the rejection–refit passes.\n\n # Two conventions, selected by the solver that ran\n\n The gain-ratio reading above is the ordinary LM path. The Schur\n path — station-bias / nuisance fits, identified by\n [`termination`](Self::termination) being\n [`SCHUR_STEP_TOLERANCE`](EMPYREAN_SOLVER_STOP_SCHUR_STEP_TOLERANCE)\n or by [`mu_final`](Self::mu_final) being NaN — has no\n accept/reject at all: it APPLIES every step it computes. There\n this count is applied steps, equals\n [`final_solve_iterations`](Self::final_solve_iterations) exactly,\n and `0` is unreachable for any `max_iterations >= 1`. A consumer\n grouping a catalog by \"did this fit move\" must branch on the\n path."]
+    pub accepted_steps: u32,
+    #[doc = " Iterations spent by the solve that produced the published state —\n the one [`update_norm`](Self::update_norm),\n [`termination`](Self::termination),\n [`gn_step_qnorm`](Self::gn_step_qnorm) and\n [`accepted_steps`](Self::accepted_steps) all describe.\n\n Additive disambiguator for [`iterations`](Self::iterations),\n whose composition varies by entry point (it totals the solves the\n delivered path ran); this one never does.\n\n `-1` when absent — the result did not come from a solver run.\n Negative rather than `0`, because `0` iterations is a reachable\n count."]
+    pub final_solve_iterations: i32,
+    #[doc = " 1 when this fit was delivered by the stable-stall acceptance —\n its final solve latched no solver convergence criterion and was\n accepted as converged-in-practice instead, being stationary to a\n small fraction of the fit's own formal σ with χ² clearing the\n fit-quality bars. 0 is the ordinary case.\n\n When 1, [`termination`](Self::termination) reads\n [`STALLED_DELIVERED`](EMPYREAN_SOLVER_STOP_STALLED_DELIVERED) and\n the four `stall_*` fields below carry the numbers that earned the\n delivery. When 0 they are absent (0 / NaN). A consumer that wants\n the strict convergence contract rejects `stall_delivered == 1`."]
+    pub stall_delivered: i32,
+    #[doc = " What the SOLVER reported before the stall acceptance overrode the\n verdict (`EMPYREAN_SOLVER_STOP_*`) — always\n [`DAMPING_EXHAUSTED`](EMPYREAN_SOLVER_STOP_DAMPING_EXHAUSTED) or\n [`INNER_TRIALS_EXHAUSTED`](EMPYREAN_SOLVER_STOP_INNER_TRIALS_EXHAUSTED),\n the only two stops the acceptance considers.\n\n [`NOT_REPORTED`](EMPYREAN_SOLVER_STOP_NOT_REPORTED) (0) when\n `stall_delivered == 0`. Kept beside\n [`termination`](Self::termination) so the delivery's verdict and\n the solver's own are both readable and neither is inferred from\n the other."]
+    pub stall_underlying_stop: i32,
+    #[doc = " Quadratic form of the **undamped** Gauss-Newton step — the ONLY\n number on this struct comparable to\n [`EmpyreanODConfig::convergence_tol`], and the one the solver's\n step test is decided on.\n\n \\\\(q = \\mathbf{h}_{\\text{GN}}^\\top A\\,\\mathbf{h}_{\\text{GN}}\\\\)\n with \\\\(A = \\Sigma^{-1}\\\\), so \\\\(\\sqrt{q}\\\\) is the remaining\n step measured in the fit's own formal σ.\n\n `q <= convergence_tol` is guaranteed only under\n [`STEP_TOLERANCE`](EMPYREAN_SOLVER_STOP_STEP_TOLERANCE) (or\n [`SCHUR_STEP_TOLERANCE`](EMPYREAN_SOLVER_STOP_SCHUR_STEP_TOLERANCE)).\n Under the gradient, cost and stall verdicts the fit is delivered\n as converged with `q` legitimately above the tolerance: those\n criteria measure other things, and a long dense arc has a `q`\n floor set by the residual model's accuracy rather than by the\n parameters.\n\n **NaN when absent**, which is not a failure: the undamped system\n was singular at the returned point, or the Schur loop ran at\n solved width > 6 (where the only step norm it forms is\n λ-shrunken, and publishing it here would break this field's\n promise), or the result did not come from a solver run."]
+    pub gn_step_qnorm: f64,
+    #[doc = " Levenberg-Marquardt damping at termination. Large μ beside a\n small [`update_norm`](Self::update_norm) is the signature of a\n stalled solve rather than a converged one.\n\n **NaN when absent**: the Schur path runs its own λ schedule and\n forms no comparable quantity, and non-solve results have none.\n NaN here is therefore also the marker that identifies the Schur\n path, alongside\n [`SCHUR_STEP_TOLERANCE`](EMPYREAN_SOLVER_STOP_SCHUR_STEP_TOLERANCE)."]
+    pub mu_final: f64,
+    #[doc = " Stall delivery: \\\\(q\\\\) of the undamped Gauss-Newton step at the\n delivered iterate — the quantity `convergence_tol` bounds and did\n not bound here. \\\\(\\sqrt{q}\\\\) is the remaining step in the fit's\n own formal σ.\n\n **NaN when `stall_delivered == 0`.**"]
+    pub stall_gn_qnorm: f64,
+    #[doc = " Stall delivery: the **resolved** convergence tolerance the stall\n was judged against.\n\n Delivered rather than left to the caller because\n [`EmpyreanODConfig::convergence_tol`] carries a `0.0` sentinel\n meaning \"engine default\", so the value actually enforced is not\n recoverable from the config a caller passed in. Pair it with\n [`stall_gn_qnorm`](Self::stall_gn_qnorm) to see by how much the\n bar was missed.\n\n **NaN when `stall_delivered == 0`.**"]
+    pub stall_convergence_tol: f64,
+    #[doc = " Stall delivery: reduced χ² of the OPTICAL family alone at the\n delivered iterate.\n\n The full objective's reduced χ² and the bar both were held to are\n already on [`acceptability`](Self::acceptability)\n (`reduced_chi2_value` / `reduced_chi2_threshold`), and the\n delivery's μ and iteration count are already\n [`mu_final`](Self::mu_final) and\n [`final_solve_iterations`](Self::final_solve_iterations) — a\n stall-delivered fit's final solve IS the stalled solve. Only the\n optical-only χ², which has no other home, is republished here.\n\n **NaN when `stall_delivered == 0`.**"]
+    pub stall_optical_reduced_chi2: f64,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of EmpyreanODResult"][::std::mem::size_of::<EmpyreanODResult>() - 8128usize];
+    ["Size of EmpyreanODResult"][::std::mem::size_of::<EmpyreanODResult>() - 8192usize];
     ["Alignment of EmpyreanODResult"][::std::mem::align_of::<EmpyreanODResult>() - 8usize];
     ["Offset of field: EmpyreanODResult::orbit"]
         [::std::mem::offset_of!(EmpyreanODResult, orbit) - 0usize];
@@ -3270,6 +3302,26 @@ const _: () = {
         [::std::mem::offset_of!(EmpyreanODResult, warnings) - 8112usize];
     ["Offset of field: EmpyreanODResult::num_warnings"]
         [::std::mem::offset_of!(EmpyreanODResult, num_warnings) - 8120usize];
+    ["Offset of field: EmpyreanODResult::termination"]
+        [::std::mem::offset_of!(EmpyreanODResult, termination) - 8128usize];
+    ["Offset of field: EmpyreanODResult::accepted_steps"]
+        [::std::mem::offset_of!(EmpyreanODResult, accepted_steps) - 8132usize];
+    ["Offset of field: EmpyreanODResult::final_solve_iterations"]
+        [::std::mem::offset_of!(EmpyreanODResult, final_solve_iterations) - 8136usize];
+    ["Offset of field: EmpyreanODResult::stall_delivered"]
+        [::std::mem::offset_of!(EmpyreanODResult, stall_delivered) - 8140usize];
+    ["Offset of field: EmpyreanODResult::stall_underlying_stop"]
+        [::std::mem::offset_of!(EmpyreanODResult, stall_underlying_stop) - 8144usize];
+    ["Offset of field: EmpyreanODResult::gn_step_qnorm"]
+        [::std::mem::offset_of!(EmpyreanODResult, gn_step_qnorm) - 8152usize];
+    ["Offset of field: EmpyreanODResult::mu_final"]
+        [::std::mem::offset_of!(EmpyreanODResult, mu_final) - 8160usize];
+    ["Offset of field: EmpyreanODResult::stall_gn_qnorm"]
+        [::std::mem::offset_of!(EmpyreanODResult, stall_gn_qnorm) - 8168usize];
+    ["Offset of field: EmpyreanODResult::stall_convergence_tol"]
+        [::std::mem::offset_of!(EmpyreanODResult, stall_convergence_tol) - 8176usize];
+    ["Offset of field: EmpyreanODResult::stall_optical_reduced_chi2"]
+        [::std::mem::offset_of!(EmpyreanODResult, stall_optical_reduced_chi2) - 8184usize];
 };
 impl Default for EmpyreanODResult {
     fn default() -> Self {
@@ -3297,7 +3349,7 @@ pub struct EmpyreanODObjectResult {
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of EmpyreanODObjectResult"][::std::mem::size_of::<EmpyreanODObjectResult>() - 8160usize];
+    ["Size of EmpyreanODObjectResult"][::std::mem::size_of::<EmpyreanODObjectResult>() - 8224usize];
     ["Alignment of EmpyreanODObjectResult"]
         [::std::mem::align_of::<EmpyreanODObjectResult>() - 8usize];
     ["Offset of field: EmpyreanODObjectResult::object_id"]
@@ -3307,9 +3359,9 @@ const _: () = {
     ["Offset of field: EmpyreanODObjectResult::result"]
         [::std::mem::offset_of!(EmpyreanODObjectResult, result) - 16usize];
     ["Offset of field: EmpyreanODObjectResult::error"]
-        [::std::mem::offset_of!(EmpyreanODObjectResult, error) - 8144usize];
+        [::std::mem::offset_of!(EmpyreanODObjectResult, error) - 8208usize];
     ["Offset of field: EmpyreanODObjectResult::error_code"]
-        [::std::mem::offset_of!(EmpyreanODObjectResult, error_code) - 8152usize];
+        [::std::mem::offset_of!(EmpyreanODObjectResult, error_code) - 8216usize];
 };
 impl Default for EmpyreanODObjectResult {
     fn default() -> Self {
@@ -4418,13 +4470,13 @@ pub type EmpyreanSession = Session;
 pub struct EmpyreanSessionDiff {
     #[doc = " Δ reduced χ² (positive ⇒ current fit is worse than prior)."]
     pub reduced_chi2_delta: f64,
-    #[doc = " Δ iteration count."]
+    #[doc = " Δ iteration count, over\n [`EmpyreanODResult::iterations`](crate::od::EmpyreanODResult::iterations)\n — a TOTAL across each fit's solves. Two fits that reached the\n same orbit by different ladders differ here without either being\n worse."]
     pub iterations_delta: i64,
     #[doc = " Δ number of observations used (negative ⇒ observations were\n masked between prior and current)."]
     pub n_observations_delta: i64,
-    #[doc = " Final update-norm convergence metric on the current fit."]
+    #[doc = " [`EmpyreanODResult::update_norm`](crate::od::EmpyreanODResult::update_norm)\n on the current fit — the μ-DAMPED last accepted step, **not** a\n convergence metric and **not** comparable to\n [`EmpyreanODConfig::convergence_tol`](crate::od::EmpyreanODConfig::convergence_tol).\n It is here as a damping-trajectory diagnostic between two fits of\n the same arc. For whether either fit converged, and on what, read\n that fit's `termination` / `gn_step_qnorm`."]
     pub update_norm_current: f64,
-    #[doc = " Final update-norm convergence metric on the prior fit."]
+    #[doc = " The same quantity on the prior fit, with the same caveat."]
     pub update_norm_prior: f64,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
@@ -5348,7 +5400,7 @@ impl EmpyreanLib {
     ) -> *mut EmpyreanContext {
         (self.empyrean_context_from_data_dir_with)(data_dir, options)
     }
-    #[doc = " Provision the complete Standard-tier kernel set into `data_dir`\n **without building a context**.\n\n Runs the same download-and-cache pass\n [`empyrean_context_from_data_dir`] performs, but stops at the resolved\n kernel paths: nothing is loaded or parsed, and no `EmpyreanContext` is\n allocated. This is the cheap provisioning primitive behind the\n wrapper's `download_data` — it exists so a caller that only wants to\n warm a data directory does not pay for a full Standard-tier context\n build (and discard). After it returns `0`, a later\n [`empyrean_context_from_data_dir`] over the same directory loads with\n no further downloads.\n\n Pass `NULL` for `data_dir` to provision the platform data directory\n (`~/.local/share/empyrean/data` on Linux, `~/Library/Application\n Support/empyrean/data` on macOS).\n\n Always reaches the network when a kernel is missing or its upstream\n copy moved (the refreshing path); on a warm, complete directory it\n issues only the staleness checks and downloads nothing.\n\n Returns `0` on success. On failure returns the engine error code —\n `-2` when a required resource could not be obtained, with the\n structured file list available through\n [`empyrean_missing_data_files`]; `-1` for a non-UTF-8 `data_dir` or\n another invalid argument; `-99` on a caught panic. Call\n `empyrean_last_error()` for the message on any non-zero return."]
+    #[doc = " Provision the complete Standard-tier kernel set into `data_dir`\n **without building a context**.\n\n Runs the same download-and-cache pass\n [`empyrean_context_from_data_dir`] performs, but stops at the resolved\n kernel paths: nothing is loaded or parsed, and no `EmpyreanContext` is\n allocated. This is the cheap provisioning primitive behind the\n wrapper's `download_data` — it exists so a caller that only wants to\n warm a data directory does not pay for a full Standard-tier context\n build (and discard). After it returns `0`, a later\n [`empyrean_context_from_data_dir`] over the same directory loads with\n no further downloads.\n\n Pass `NULL` for `data_dir` to provision the platform data directory\n (`~/.local/share/empyrean/data` on Linux, `~/Library/Application\n Support/empyrean/data` on macOS).\n\n Always reaches the network when a kernel is missing or its upstream\n copy moved (the refreshing path); on a warm, complete directory it\n issues only the staleness checks and downloads nothing.\n\n Returns `0` on success. On failure returns the engine error code:\n `-1` for a non-UTF-8 `data_dir` or another invalid argument, `-99` on\n a caught panic, and `-2` when a required resource could not be\n obtained. Call `empyrean_last_error()` for the message on any\n non-zero return.\n\n # Reading a `-2`\n\n `-2` is the missing-data **category**, and two of its shapes carry a\n signature this entry point's callers can key on:\n\n * **Files absent, no fetch attempted** — `num_files > 0` from\n   [`empyrean_missing_data_files`] names every file, and the message\n   reads `\"Missing data files: <names>\"`. The\n   remedy is to fetch or stage exactly those names.\n * **A fetch was attempted and failed** — `num_files == 0` (the list\n   is empty, which is not itself an error), and the message starts\n   `\"Data download failed: \"`, naming the failing\n   kernel by its URL. The remedy is connectivity, or — when the URL\n   404s because an upstream rotated or withdrew a pinned kernel —\n   staging that file by hand or moving to an engine whose pin is\n   still served. Never local file repair.\n\n The implications hold in one direction only: a populated list always\n means the named-files shape, and the download prefix always means a\n failed acquisition. A `-2` with an empty list and any other message\n is one of the category's other residents (a kernel that read but\n would not parse, a coverage gap) — the message states its own\n remedy. An empty list after a `-2` therefore does **not** mean\n \"nothing was missing\": read `empyrean_last_error()`."]
     pub unsafe fn empyrean_download_data(&self, data_dir: *const ::std::os::raw::c_char) -> i32 {
         (self.empyrean_download_data)(data_dir)
     }

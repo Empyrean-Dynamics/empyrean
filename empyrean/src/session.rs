@@ -30,14 +30,24 @@ use std::ptr::NonNull;
 pub struct SessionDiff {
     /// Δ reduced χ² (positive ⇒ current fit is worse than prior).
     pub reduced_chi2_delta: f64,
-    /// Δ iteration count.
+    /// Δ iteration count, over
+    /// [`DetermineResult::iterations`] — a TOTAL across each fit's
+    /// solves. Two fits that reached the same orbit by different ladders
+    /// differ here without either being worse.
     pub iterations_delta: i64,
     /// Δ number of observations used (negative ⇒ observations were
     /// masked between prior and current).
     pub n_observations_delta: i64,
-    /// Final update-norm convergence metric on the current fit.
+    /// [`DetermineResult::update_norm`] on the current fit — the
+    /// μ-DAMPED last accepted step, **not** a convergence metric and
+    /// **not** comparable to
+    /// [`ODConfig::convergence_tol`](crate::ODConfig::convergence_tol).
+    /// It is here as a damping-trajectory diagnostic between two fits of
+    /// the same arc. For whether either fit converged, and on what, read
+    /// that fit's [`DetermineResult::termination`] /
+    /// [`DetermineResult::gn_step_qnorm`].
     pub update_norm_current: f64,
-    /// Final update-norm convergence metric on the prior fit.
+    /// The same quantity on the prior fit, with the same caveat.
     pub update_norm_prior: f64,
 }
 

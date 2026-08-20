@@ -685,6 +685,11 @@ class ODConfig:
     output_epoch: OutputEpoch = field(default_factory=OutputEpoch)
     max_iterations: int = 100
     convergence_tol: float = 1e-5
+    """DC convergence tolerance, tested on the **undamped** Gauss–Newton
+    step's quadratic form — the number published back as
+    :attr:`DetermineResult.gn_step_qnorm`, NOT the μ-damped
+    :attr:`DetermineResult.update_norm`, which this tolerance does not
+    bound. The engine default is 1e-5."""
     allow_arc_truncation: bool = True
     """Allow the outward-expansion pipeline to truncate a sub-arc it
     cannot fit as one piece.
@@ -1073,6 +1078,53 @@ class CovarianceTrust:
 
 
 @dataclass
+class StallDelivery:
+    """The numbers behind a fit delivered by the stable-stall acceptance
+    — one whose final solve latched no convergence criterion but was
+    stationary to a small fraction of its own formal σ, with χ² clearing
+    the fit-quality bars.
+
+    Present as :attr:`DetermineResult.stall_delivery` exactly when
+    :attr:`DetermineResult.termination` is ``"stalled_delivered"``.
+    ``None`` is the ordinary case; a consumer that wants the strict
+    convergence contract checks for it."""
+
+    underlying_stop: str
+    """What the SOLVER reported before the acceptance overrode the
+    verdict — always ``"damping_exhausted"`` or
+    ``"inner_trials_exhausted"``, the only two stops the acceptance
+    considers. Kept beside :attr:`DetermineResult.termination` so the
+    delivery's verdict and the solver's own are both readable and
+    neither is inferred from the other."""
+    gn_qnorm: float
+    """q of the undamped Gauss-Newton step at the delivered iterate — the
+    quantity ``convergence_tol`` bounds and did not bound here. ``√q`` is
+    the remaining step in the fit's own formal σ."""
+    convergence_tol: float
+    """The **resolved** tolerance the stall was judged against.
+
+    Delivered because :attr:`ODConfig.convergence_tol` carries a "use the
+    engine default" sentinel, so the value actually enforced is not
+    recoverable from the config that was passed in."""
+    optical_reduced_chi2: float
+    """Reduced χ² of the OPTICAL family alone at the delivered iterate.
+
+    The full objective's reduced χ² and the bar both were held to are
+    already on :attr:`DetermineResult.acceptability`, and the delivery's
+    μ and iteration count are already
+    :attr:`DetermineResult.mu_final` and
+    :attr:`DetermineResult.final_solve_iterations` — a stall-delivered
+    fit's final solve IS the stalled solve."""
+
+    @property
+    def step_sigmas(self) -> float:
+        """The remaining undamped Gauss-Newton step in units of the fit's
+        own formal 1σ, ``√q`` — the number to quote when saying how far
+        from stationary the delivered iterate is."""
+        return float(np.sqrt(self.gn_qnorm))
+
+
+@dataclass
 class DetermineResult:
     """Result of orbit determination — returned by both
     :func:`~empyrean.od.determine.determine` (full IOD + DC pipeline)
@@ -1090,6 +1142,29 @@ class DetermineResult:
     summary: ResidualSummary
     iterations: int
     update_norm: float
+    """**NOT the quantity :attr:`ODConfig.convergence_tol` bounds.** The
+    μ-DAMPED last ACCEPTED step's q-norm — the size of the step the
+    solver actually took, after Levenberg-Marquardt damping.
+
+    The tolerance is tested on the *undamped* Gauss-Newton step, reported
+    as :attr:`gn_step_qnorm`. The two are incomparable in BOTH
+    directions: a converged fit routinely reports an ``update_norm``
+    orders of magnitude ABOVE ``convergence_tol`` (damping is light near
+    the optimum, so the step taken is large), while a solve thrashing to
+    ``"damping_exhausted"`` reports one orders of magnitude BELOW it (μ
+    has crushed every step to nothing). Read :attr:`termination` and
+    :attr:`gn_step_qnorm` for convergence, or :attr:`acceptability` for
+    the fit-quality verdict.
+
+    On the Schur path (station-bias / nuisance fits) this carries that
+    loop's own step norm under the Schur complement instead — the
+    quantity IT tests against ``convergence_tol``. :attr:`termination`
+    says which loop ran.
+
+    Exactly ``0.0`` with :attr:`accepted_steps` ``== 0`` means the solver
+    latched a criterion at its STARTING point and never accepted a step:
+    the incoming iterate was already stationary. It does not mean "a step
+    of size zero was taken"."""
     converged: bool
     covariance: np.ndarray
     """Fitted 6×6 state covariance, in :attr:`covariance_representation`."""
@@ -1150,6 +1225,66 @@ class DetermineResult:
     Delivered as payload rather than written to a log, because a dropped
     prior cross term changes how the σ for that slot should be read.
     Empty when the fit used everything it was given."""
+    termination: str | None
+    """Which criterion ended the solve that produced the published state,
+    as a stable lowercase tag — ``"gradient_tolerance"``,
+    ``"step_tolerance"``, ``"cost_tolerance"``, ``"max_iterations"``,
+    ``"damping_exhausted"``, ``"inner_trials_exhausted"``,
+    ``"stalled_delivered"``, ``"schur_step_tolerance"``, or
+    ``"unrecognized"`` for a stop this build cannot name.
+
+    ``None`` only on a result that did not come from a solver run; every
+    fit this package delivers names its stop. An unrecognized stop is
+    ``"unrecognized"`` rather than ``None``: a stop that fired but cannot
+    be named is not the same as no stop at all."""
+    gn_step_qnorm: float | None
+    """Quadratic form of the **undamped** Gauss-Newton step — the only
+    number here comparable to :attr:`ODConfig.convergence_tol`, and the
+    one the solver's step test is decided on. ``√q`` is the remaining
+    step measured in the fit's own formal σ.
+
+    ``q <= convergence_tol`` is guaranteed only under
+    ``"step_tolerance"`` (or ``"schur_step_tolerance"``). Under the
+    gradient, cost and stall verdicts the fit is delivered as converged
+    with ``q`` legitimately above the tolerance.
+
+    ``None`` when the undamped system was singular at the returned point,
+    when the Schur loop ran at solved width > 6 (its only step norm there
+    is λ-shrunken, which is what this field promises it is not), or on a
+    non-solver result."""
+    mu_final: float | None
+    """Levenberg-Marquardt damping at termination. Large μ beside a small
+    :attr:`update_norm` is the signature of a stalled solve rather than a
+    converged one.
+
+    ``None`` on the Schur path, which runs its own λ schedule and forms
+    no comparable quantity — so its absence, alongside
+    ``termination == "schur_step_tolerance"``, is what identifies that
+    path — and on non-solver results."""
+    accepted_steps: int
+    """Steps the solve actually ACCEPTED — trials that passed the
+    gain-ratio test and moved the iterate.
+
+    ``0`` says the solver latched a criterion at its starting point and
+    never moved: the incoming orbit was already stationary for this
+    observation set. That is what disambiguates :attr:`update_norm`'s
+    ``0.0`` sentinel. Counted per SOLVE, so it describes the same solve
+    as :attr:`final_solve_iterations`, never a total across the
+    rejection–refit passes."""
+    final_solve_iterations: int | None
+    """Iterations spent by the solve that produced the published state —
+    the one :attr:`update_norm`, :attr:`termination`,
+    :attr:`gn_step_qnorm` and :attr:`accepted_steps` all describe.
+
+    Additive disambiguator for :attr:`iterations`, whose composition
+    varies by entry point; this one never does. ``None`` on a result that
+    did not come from a solver run."""
+    stall_delivery: StallDelivery | None
+    """Set when this fit was delivered by the stable-stall acceptance
+    rather than by a convergence criterion — see :class:`StallDelivery`.
+
+    ``None`` is the ordinary case. A consumer that wants the strict
+    convergence contract checks ``stall_delivery is None``."""
 
 
 @dataclass

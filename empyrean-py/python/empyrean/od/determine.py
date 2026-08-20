@@ -49,6 +49,7 @@ from empyrean.od.result import (
     PhotometryResult,
     SolvedCovariance,
     SolveFor,
+    StallDelivery,
     TrustGateEvent,
 )
 from empyrean.orbits.orbits import CartesianOrbits
@@ -1254,6 +1255,22 @@ def _build_covariance_trust(d: dict[str, Any] | None) -> CovarianceTrust | None:
     )
 
 
+def _build_stall_delivery(d: dict[str, Any] | None) -> StallDelivery | None:
+    """Assemble a :class:`StallDelivery` from the nested stall dict.
+
+    ``None`` in → ``None`` out: the binding omits the key entirely on the
+    ordinary path, where the solver met one of its own criteria and there
+    is no stall to describe."""
+    if d is None:
+        return None
+    return StallDelivery(
+        underlying_stop=str(d["underlying_stop"]),
+        gn_qnorm=float(d["gn_qnorm"]),
+        convergence_tol=float(d["convergence_tol"]),
+        optical_reduced_chi2=float(d["optical_reduced_chi2"]),
+    )
+
+
 def _dispositions_from_result(result: ResultDict) -> SolveFor:
     """Decode the partition the fit actually ran.
 
@@ -1335,6 +1352,20 @@ def _build_determine_result(result: ResultDict) -> DetermineResult:
     photometry = _build_photometry_result(result.get("photometry"))
     covariance_trust = _build_covariance_trust(result.get("covariance_trust"))
 
+    # Solver termination + step diagnostics. Same `.get` discipline: the
+    # binding omits an absent reading's key entirely, so a non-solver
+    # result reads as None rather than as 0 / NaN.
+    termination = result.get("termination")
+    gn_step_qnorm = result.get("gn_step_qnorm")
+    gn_step_qnorm = float(gn_step_qnorm) if gn_step_qnorm is not None else None
+    mu_final = result.get("mu_final")
+    mu_final = float(mu_final) if mu_final is not None else None
+    final_solve_iterations = result.get("final_solve_iterations")
+    final_solve_iterations = (
+        int(final_solve_iterations) if final_solve_iterations is not None else None
+    )
+    stall_delivery = _build_stall_delivery(result.get("stall_delivery"))
+
     # Carry the post-OD photometric fit onto the fitted orbit so downstream
     # ephemeris generation can predict apparent magnitudes. The C ABI returns
     # the H/G solution only as a side-channel (`photometry`) and leaves the
@@ -1372,4 +1403,10 @@ def _build_determine_result(result: ResultDict) -> DetermineResult:
         # it was handed says so here, because that changes how the sigma
         # for the affected slot should be read.
         warnings=list(result.get("warnings", [])),
+        termination=str(termination) if termination is not None else None,
+        gn_step_qnorm=gn_step_qnorm,
+        mu_final=mu_final,
+        accepted_steps=int(result["accepted_steps"]),
+        final_solve_iterations=final_solve_iterations,
+        stall_delivery=stall_delivery,
     )

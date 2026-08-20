@@ -132,12 +132,36 @@ Always reaches the network when a kernel is missing or its upstream
 copy moved (the refreshing path); on a warm, complete directory it
 issues only the staleness checks and downloads nothing.
 
-Returns `0` on success. On failure returns the engine error code —
-`-2` when a required resource could not be obtained, with the
-structured file list available through
-[`empyrean_missing_data_files`]; `-1` for a non-UTF-8 `data_dir` or
-another invalid argument; `-99` on a caught panic. Call
-`empyrean_last_error()` for the message on any non-zero return.*/
+Returns `0` on success. On failure returns the engine error code:
+`-1` for a non-UTF-8 `data_dir` or another invalid argument, `-99` on
+a caught panic, and `-2` when a required resource could not be
+obtained. Call `empyrean_last_error()` for the message on any
+non-zero return.
+
+# Reading a `-2`
+
+`-2` is the missing-data **category**, and two of its shapes carry a
+signature this entry point's callers can key on:
+
+* **Files absent, no fetch attempted** — `num_files > 0` from
+  [`empyrean_missing_data_files`] names every file, and the message
+  reads `"Missing data files: <names>"`. The
+  remedy is to fetch or stage exactly those names.
+* **A fetch was attempted and failed** — `num_files == 0` (the list
+  is empty, which is not itself an error), and the message starts
+  `"Data download failed: "`, naming the failing
+  kernel by its URL. The remedy is connectivity, or — when the URL
+  404s because an upstream rotated or withdrew a pinned kernel —
+  staging that file by hand or moving to an engine whose pin is
+  still served. Never local file repair.
+
+The implications hold in one direction only: a populated list always
+means the named-files shape, and the download prefix always means a
+failed acquisition. A `-2` with an empty list and any other message
+is one of the category's other residents (a kernel that read but
+would not parse, a coverage gap) — the message states its own
+remedy. An empty list after a `-2` therefore does **not** mean
+"nothing was missing": read `empyrean_last_error()`.*/
 #[inline]
 pub unsafe fn empyrean_download_data(data_dir: *const ::std::os::raw::c_char) -> i32 {
     unsafe { lib().empyrean_download_data(data_dir) }
@@ -170,7 +194,9 @@ no-op; the struct is left zeroed so a double free is safe.*/
 pub unsafe fn empyrean_missing_data_files_free(out: *mut EmpyreanMissingDataFiles) {
     unsafe { lib().empyrean_missing_data_files_free(out) }
 }
-/** Free an `EmpyreanContext` previously returned by `empyrean_context_new()`.
+/**Free an `EmpyreanContext` previously returned by
+`empyrean_context_from_data_dir`, `empyrean_context_from_data_dir_with`
+or `empyrean_context_new_minimal`.
 
 Passing null is a no-op.*/
 #[inline]
@@ -703,7 +729,24 @@ pub unsafe fn empyrean_orbits_read_json(
 ) -> i32 {
     unsafe { lib().empyrean_orbits_read_json(path, out) }
 }
-/** Write an orbit batch to JSON.*/
+/**Write an orbit batch to JSON.
+
+This is **not** the engine's orbit schema — it is this crate's own
+flat row shape (`OrbitRow`), and it is the least capable of the three
+orbit formats. It carries the state, the 6×6 and the Marsden
+coefficients with their g(r) exponents, and nothing else.
+
+A batch carrying a state↔Marsden border or a wide cross-covariance
+carrier is **refused by name**, pointing at parquet — the format is
+unable to represent the joint, and writing the row short would
+produce a file that reads back as a block-diagonal covariance with no
+signal that anything was lost.
+
+Fields this format drops without refusing, because they predate the
+joint surface and a refusal would break callers who write them today:
+the non-grav DT and its prior variance, the Marsden 3×3, the SRP slot
+and the photometric block. Round-trip through parquet if you need
+them.*/
 #[inline]
 pub unsafe fn empyrean_orbits_write_json(
     path: *const ::std::os::raw::c_char,
@@ -1122,7 +1165,16 @@ Batch `empyrean_determine()` results are released with
 pub unsafe fn empyrean_od_result_free(result: *mut EmpyreanODResult) {
     unsafe { lib().empyrean_od_result_free(result) }
 }
-/** Evaluate residuals for a single orbit against observations.*/
+/**Evaluate residuals for a single orbit against observations.
+
+# A supplied joint covariance changes nothing here
+
+Evaluation measures how well a FIXED orbit predicts observations; it
+forms no prior and performs no estimation, so an orbit carrying a
+state↔Marsden border or a wide carrier scores exactly as the same
+orbit without one. Nothing is dropped — there is simply nothing for
+the joint to affect, and this result type carries no orbit to echo
+one back on. The nine other orbit-reading entry points consume it.*/
 #[inline]
 pub unsafe fn empyrean_evaluate(
     ctx: *const EmpyreanContext,
@@ -1710,6 +1762,49 @@ pub unsafe fn empyrean_transform_coordinates_single(
     }
 }
 
+/**The propagated joint's CROSS terms at a single `(orbit_index,
+epoch_index)` — the state↔Marsden border and the wide carrier that
+[`EmpyreanTaggedCovariance::matrix`] is the state block of.
+
+# Why this is a separate call
+
+[`EmpyreanTaggedCovariance`] is a plain-old-data struct: a caller
+declares one on the stack, fills it through
+[`empyrean_propagation_covariance_at_cartesian`], and frees nothing.
+Putting the carrier on it would have made every such caller — code
+that is correct today and recompiles without a murmur — leak two
+allocations per call. Nothing would fail; memory would simply grow.
+So the joint is opt-in through this call instead, and the tagged
+covariance keeps its contract.
+
+The same `(orbit_index, epoch_index)` addresses both surfaces, so a
+consumer walking a series
+([`empyrean_propagation_covariance_series_cartesian`]) can ask for
+the joint of any entry without the series itself owning anything new.
+
+# Absence is reported, never fabricated
+
+`has_non_grav_cross = 0` with null carrier pointers means the engine
+produced no cross terms at this row — not that they were zero. Every
+uncertainty method that reaches this accessor carries the payload
+when it has one, including the sampled paths, which recover the
+state↔parameter columns from the cloud. A row genuinely without a
+joint is one whose orbit declared no solved-parameter block.
+
+# Ownership
+
+On success `out` owns two heap arrays; release them with
+[`empyrean_orbit_covariance_free`]. On any non-zero return `out` is
+untouched and there is nothing to free.
+
+# Returns
+
+The same `EMPYREAN_TAGGED_COV_*` codes as the tagged-covariance
+accessors, so a caller branches on one set.
+
+# Safety
+`result` and `out` must be valid pointers; `result` from
+`empyrean_propagate`.*/
 #[inline]
 pub unsafe fn empyrean_propagation_joint_at(
     result: *const EmpyreanPropagationResult,
@@ -1720,6 +1815,17 @@ pub unsafe fn empyrean_propagation_joint_at(
     unsafe { lib().empyrean_propagation_joint_at(result, orbit_index, epoch_index, out) }
 }
 
+/**Release the arrays owned by an [`EmpyreanOrbitCovariance`](crate::joint::EmpyreanOrbitCovariance)
+written by [`empyrean_propagation_joint_at`].
+
+Idempotent — the pointers are nulled and the counts zeroed — and a
+null argument is a no-op. Do **not** call it on the `orbit_cov` of an
+OD result or a propagated state: those are owned by their parent and
+released by the parent's own free function.
+
+# Safety
+`cov` must be null or a struct written by
+[`empyrean_propagation_joint_at`] and not already freed.*/
 #[inline]
 pub unsafe fn empyrean_orbit_covariance_free(cov: *mut EmpyreanOrbitCovariance) {
     unsafe { lib().empyrean_orbit_covariance_free(cov) }

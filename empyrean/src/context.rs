@@ -1,6 +1,6 @@
 //! Thread-safe empyrean context (SPK, GM, ephemeris state).
 
-use crate::error::{Error, Result, dedupe_io_prefix};
+use crate::error::{DOWNLOAD_FAILED_PREFIX, Error, Result, dedupe_io_prefix};
 use std::ffi::{CStr, CString};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
@@ -457,7 +457,17 @@ fn augment_with_unusable_data_dir(base: &str, dir: &Path, bad: &UnusableDataDir)
 /// The native cause is kept up front, so the real failure reason is never hidden
 /// behind the remedy. Phrased non-committally — an absent core kernel is one
 /// likely cause, not asserted as *the* cause.
+///
+/// A failed acquisition is the one case that gets no kernel remedy. Its
+/// message already names the kernel it could not fetch, by URL; every core
+/// kernel is absent *because* the fetch failed, so naming one of them would
+/// blame a symptom, and `download_data` — the remedy this otherwise offers —
+/// is the call that just failed. Name the directory and stop, exactly as
+/// [`augment_with_unusable_data_dir`] deliberately names no kernel.
 fn augment_with_data_dir(base: &str, dir: &Path, missing: Option<&str>) -> String {
+    if base.starts_with(DOWNLOAD_FAILED_PREFIX) {
+        return format!("{base} (data directory: '{}')", dir.display());
+    }
     match missing {
         Some(file) => format!(
             "{base} — empyrean data directory '{}' may be incompletely provisioned \
@@ -500,6 +510,17 @@ fn construction_error(data_dir: Option<&Path>) -> Error {
 /// [`Context::from_data_dir_with`] can reach it after it has decided the
 /// failure was *not* a structured missing-files one.
 fn augment_construction_error(mut err: Error, data_dir: Option<&Path>) -> Error {
+    // A failed acquisition is missing-data by its message alone. The
+    // kernel probe below cannot see it: a withdrawn dated Earth BPC 404s
+    // while every CORE kernel sits present on disk, so probe-keyed
+    // recategorization would ship the fetch failure under the generic
+    // invalid-argument code `from_null_ptr` defaults to.
+    if err
+        .message
+        .starts_with(crate::error::DOWNLOAD_FAILED_PREFIX)
+    {
+        err.code = -2;
+    }
     let resolved = data_dir
         .map(Path::to_path_buf)
         .or_else(|| default_data_dir().ok());
@@ -662,6 +683,25 @@ pub fn default_data_dir() -> Result<std::path::PathBuf> {
 /// `--no-refresh`), or unset the variable for the process that must
 /// provision.
 ///
+/// # Errors
+///
+/// Success returns the resolved directory. A failure carries the engine's
+/// own code in [`Error::code`]:
+///
+/// * `-2` — the missing-data axis, in either of its two shapes.
+///   [`Error::missing_data_files`] is **non-empty** when a named set of
+///   files is absent and no fetch was attempted (the `EMPYREAN_OFFLINE`
+///   refusal above resolves this way), and **empty** when a fetch was
+///   attempted and failed — a 404 from an upstream that rotated or
+///   withdrew a pinned kernel, a refused connection, a mid-transfer
+///   failure. In that second shape the message leads with `"Data download
+///   failed: "` and names the failing kernel by its URL, and the remedy is
+///   connectivity or a pin that is still served — never local file repair,
+///   and never a retry of this same call.
+/// * `-1` — an invalid argument: a `data_dir` that is not valid UTF-8 or
+///   contains a NUL byte.
+/// * `-99` — a panic caught at the C boundary.
+///
 /// ```no_run
 /// # fn main() -> Result<(), empyrean::Error> {
 /// let dir = empyrean::download_data(None)?; // ensures a usable data directory
@@ -715,7 +755,10 @@ fn path_to_cstring(path: &Path) -> Result<CString> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CORE_KERNELS, augment_with_data_dir, first_missing_core_kernel};
+    use super::{
+        CORE_KERNELS, augment_construction_error, augment_with_data_dir, first_missing_core_kernel,
+    };
+    use crate::error::Error;
     use std::path::Path;
 
     #[test]
@@ -742,6 +785,45 @@ mod tests {
         let g = augment_with_data_dir("boom", Path::new("/tmp/dd"), None);
         assert!(g.contains("/tmp/dd"));
         assert!(!g.contains("download_data"));
+    }
+
+    #[test]
+    fn a_failed_download_gets_no_kernel_remedy() {
+        // Every core kernel is absent because the fetch failed, so the
+        // probe finds one — and naming it, or pointing back at
+        // `download_data`, would blame a symptom and recommend the call
+        // that just failed. The URL the engine named survives up front.
+        let base = "Data download failed: GET https://naif.jpl.nasa.gov/x.bpc: http status: 404";
+        let m = augment_with_data_dir(base, Path::new("/tmp/dd"), Some("bias.dat"));
+        assert!(m.starts_with(base), "native cause kept up front: {m}");
+        assert!(m.contains("/tmp/dd"), "names the data directory: {m}");
+        assert!(
+            !m.contains("download_data"),
+            "no circular provisioning remedy: {m}"
+        );
+        assert!(!m.contains("bias.dat"), "blames no kernel: {m}");
+    }
+
+    #[test]
+    fn a_failed_download_is_missing_data_even_with_core_kernels_present() {
+        // The flagship case: a withdrawn dated Earth BPC 404s while every
+        // CORE kernel sits on disk, so the kernel probe sees nothing
+        // missing. The message prefix alone must carry the failure onto
+        // the missing-data code — otherwise the null-returning
+        // constructor ships it under `from_null_ptr`'s generic -1.
+        let err = Error {
+            code: -1,
+            message: "Data download failed: GET https://naif.jpl.nasa.gov/pub/naif/\
+                      generic_kernels/pck/earth_620120_260806.bpc: http status: 404"
+                .to_string(),
+            missing_data_files: Vec::new(),
+        };
+        let out = augment_construction_error(err, Some(Path::new("/nonexistent-dir")));
+        assert_eq!(
+            out.code, -2,
+            "a failed acquisition is missing-data regardless of the probe: {}",
+            out.message
+        );
     }
 
     #[test]

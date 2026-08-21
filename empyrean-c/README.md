@@ -444,8 +444,14 @@ silent.
   that could disagree with the one on its orbit.
 - `empyrean_propagation_joint_at(result, orbit_index, epoch_index, out)`
   returns the propagated joint at one row; `empyrean_orbit_covariance_free`
-  releases what it wrote. These are the **only two new exported symbols** in
-  this release.
+  releases what it wrote. These are the two new exported symbols the
+  joint itself adds; with the four
+  [OD handle entry points](#reusable-force-model-handle--guard-codes)
+  they are the 0.10.0 break's own symbol movement — the retired
+  counter's additions (strict-offline construction, provisioning, the
+  missing-file list, the fit-summary writers, the single-state
+  transform, the batch free) reach consumers for the first time here
+  as well (see [The 0.10.0 ABI](#the-0100-abi)).
 
 They are a separate call rather than fields on `EmpyreanTaggedCovariance` to
 preserve that struct's plain-old-data contract: a caller declares one on the
@@ -536,6 +542,19 @@ the boundary, plus the riders queued behind a break:
   `_THRUST`, `EMPYREAN_PARAM_FIXED` / `_SOLVED` / `_CONSIDERED`,
   `EMPYREAN_MAX_THRUST_SEGMENTS`, and
   `EMPYREAN_REJECTION_PER_OBSERVATION_SITE_REQUIRED` (15).
+- **The solver's stopping verdict.** `EmpyreanODResult` gains ten
+  tail fields — `termination`, `gn_step_qnorm`, `mu_final`,
+  `accepted_steps`, `final_solve_iterations` and the five `stall_*` —
+  described under [How the solver stopped](#how-the-solver-stopped),
+  with ten new `EMPYREAN_SOLVER_STOP_*` constants.
+- **Photometric parameter uncertainty gets a slot.** `EmpyreanOrbit`
+  gains `has_phot_covariance` + `phot_covariance[3][3]` over
+  (H, slope1, slope2), appended at the tail. Three engine-side
+  producers had been computing that 3×3 — the post-OD photometry fit,
+  the SBDB `phys_par` ingest, the orbit-file readers — and all three
+  died at this boundary, so `mag_sigma` was always the state
+  contribution alone. **`mag_sigma` will increase** for every orbit
+  that now carries an H uncertainty, SBDB-queried orbits included.
 - **Riders.** `EmpyreanODResult` gains `warnings` / `num_warnings`.
   `EmpyreanObservatoryConfig` gains `min_elevation_deg` plus
   `has_max_sun_altitude_deg` / `max_sun_altitude_deg`. The impact, B-plane and
@@ -626,6 +645,41 @@ distinct from `0` on purpose: "no radar" must never read as "radar
 failed". It currently always reports `-1`; the axis is reserved for a
 joint optical+radar acceptability gate, and the radar residuals
 themselves are already on every observation row (below).
+
+### How the solver stopped
+
+A fit that met `gtol` and a fit that ran out of damping used to arrive
+through the same success path, with nothing on the result to tell them
+apart. `EmpyreanODResult` closes with ten fields that do — ints before
+doubles, the block padding once and growing the struct by 64 bytes:
+
+- `termination` — the solver's own verdict, one of the ten
+  `EMPYREAN_SOLVER_STOP_*` codes: `GRADIENT_TOLERANCE` (1),
+  `STEP_TOLERANCE` (2), `COST_TOLERANCE` (3), `MAX_ITERATIONS` (4),
+  `DAMPING_EXHAUSTED` (5), `INNER_TRIALS_EXHAUSTED` (6),
+  `STALLED_DELIVERED` (7), `SCHUR_STEP_TOLERANCE` (8). The two ends of
+  the range are different claims and must not be collapsed:
+  `NOT_REPORTED` (0) is *no stop was reported*, `UNRECOGNIZED` (9) is
+  *a stop fired that this engine build cannot name*.
+- `gn_step_qnorm` — the **undamped** Gauss-Newton step's quadratic form
+  at the delivered iterate. This is the quantity `convergence_tol`
+  bounds, and the only step norm comparable to it. `update_norm` is the
+  μ-**damped** last accepted step and is not comparable to
+  `convergence_tol`; read `gn_step_qnorm` for convergence.
+- `mu_final`, `accepted_steps`, `final_solve_iterations` — the damping
+  at termination, the number of steps accepted (`0` is a real reading:
+  the solver latched a criterion at its starting point and never
+  moved), and the iteration count of the **final** solve.
+- `stall_delivered`, `stall_underlying_stop`, `stall_gn_qnorm`,
+  `stall_convergence_tol`, `stall_optical_reduced_chi2` — populated
+  when the stable-stall acceptance delivered the iterate rather than a
+  convergence criterion, carrying the solver's own verdict underneath
+  and the numbers that earned the delivery.
+
+Every fit this library delivers names its stop, so `NOT_REPORTED` on a
+delivered result means the result did not come from a solver run at
+all. In a batch table the block follows the slot's NaN-poisoning rule
+like every other field: read `delivered` first.
 
 ### Covariance trust & per-observation diagnostics
 

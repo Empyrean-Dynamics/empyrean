@@ -25,14 +25,11 @@ DuckDB, and pages through what it wrote without leaving the terminal.
 
 ## Install
 
-Current release: **0.10.0-rc.2** (release candidate).
+Current release: **0.10.0**.
 
 ```sh
-cargo install empyrean-cli --version 0.10.0-rc.2
+cargo install empyrean-cli
 ```
-
-A release candidate is not selected by a bare `cargo install`, so the
-`--version` is required until the final release.
 
 `cargo install` fetches the closed-source `libempyrean` engine
 automatically (a checksum-pinned download at build time). Prebuilt
@@ -88,6 +85,17 @@ same `orbit_id` / `object_id` join keys, same time scales, same physical
 units — so you can mix-and-match channels for the same workflow.
 
 `empyrean show` browses what they wrote — see [Browsing output](#browsing-output).
+
+**Known gap — the sixteen SB441-N16 bodies.** At Standard tier
+1 Ceres, 2 Pallas, 4 Vesta and their thirteen siblings are
+simultaneously the target and part of the force model, and resolving
+that needs the ephemeris overlap policy — which this command does not
+expose. `empyrean ephemeris --object-id 1` therefore fails, with no
+in-CLI remedy; reach for the Python, Rust, or C channel for those
+bodies. `empyrean propagate` still works on them, but note what it
+returns: under the same default the engine serves that body's own SPK
+solution rather than integrating your initial conditions — exact for
+the body, and not a trajectory you supplied.
 
 Beyond the headline pipelines: `propagate` takes `--uncertainty-method`
 (`first-order` / `second-order` / `sigma-point` / `monte-carlo` /

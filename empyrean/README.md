@@ -25,7 +25,7 @@ raw FFI pointers.
 
 ```toml
 [dependencies]
-empyrean = "0.10.0-rc.2"
+empyrean = "0.10.0"
 ```
 
 ## What it does
@@ -33,7 +33,7 @@ empyrean = "0.10.0-rc.2"
 - **Propagation** — N-body (Sun, planets, Moon, Pluto) with EIH general relativity, Sun J2 and Earth J2–J4 zonal harmonics, 16 asteroid perturbers, and the Marsden non-gravitational model — selectable across Approximate / Basic / Standard force-model tiers (Standard is the default). GR15 and DOP853 integrators. Optional finite-burn thrust arcs — constant-RTN, velocity-tangent, or inertial-fixed steering, with per-arc Δv targeting corrections — layer on as a continuous-thrust force input.
 - **Uncertainty** — First-order (Jet1) state transition matrices; second-order (Jet2) state transition tensors; unscented sigma-point and Monte Carlo sampling; an adaptive Auto mode that escalates the method automatically through close approaches and relaxes it elsewhere. Optional per-epoch tagged-covariance readback. A fit over the state and *P* parameters produces one (6+*P*)×(6+*P*) covariance, and the **off-diagonal** blocks travel with it — onto the fitted orbit, through propagation, and into impact probability, B-planes and ephemeris — so a chained calculation is conditioned on the covariance the fit actually computed rather than on its diagonal blocks.
 - **Ephemeris** — RA/Dec, rates, photometry (H–G, H–G₁G₂, H–G₁₂), light time, phase angle, solar elongation, local horizon. Each row carries the 6×6 sky-plane covariance over (ρ, RA, Dec) and their rates, and the aberrated barycentric ICRF state at the photon-emission epoch with its own 6×6 covariance — both present when the input orbit carries a state covariance.
-- **Orbit determination** — Gauss, Herget, and systematic-ranging (admissible region + Manifold of Variations) IOD → N-body differential correction over optical and radar (delay / Doppler) observations fitted jointly, with span-grouped Jacobian reuse and outlier rejection. One call fits **every** object in an ADES set and returns per-object results keyed by designation. Solves beyond the six-element state for the Marsden A1/A2/A3 non-gravitational block, the cometary outgassing time delay DT, the SRP area-to-mass ratio AMRAT, and thrust Δv-correction segments — each partial supplied analytically by the hyperdual integrator, and each axis carrying a *disposition* (solved / considered / fixed) rather than a flag — and returns a tagged solved covariance that names every fitted parameter, a re-feedable orbit carrying that covariance's off-diagonal blocks, and an event-aware trust verdict on the delivered covariance. Optional post-fit photometry recovers H and the phase-function slope. Validated against `find_orb` and JPL SBDB.
+- **Orbit determination** — Gauss, Herget, and systematic-ranging (admissible region + Manifold of Variations) IOD → N-body differential correction over optical and radar (delay / Doppler) observations fitted jointly, with span-grouped Jacobian reuse and outlier rejection. One call fits **every** object in an ADES set and returns per-object results keyed by designation. Solves beyond the six-element state for the Marsden A1/A2/A3 non-gravitational block, the cometary outgassing time delay DT, the SRP area-to-mass ratio AMRAT, and thrust Δv-correction segments — each partial supplied analytically by the hyperdual integrator, and each axis carrying a *disposition* (solved / considered / fixed) rather than a flag — and returns a tagged solved covariance that names every fitted parameter, a re-feedable orbit carrying that covariance's off-diagonal blocks, and an event-aware trust verdict on the delivered covariance. Every fit reports the solver's own stopping verdict, so a converged orbit and one the solver merely stopped producing steps for are distinguishable. Reusable through a pre-built force-model handle (build once, refit many) and through `Session` for mask-and-refit iteration on one arc. Optional post-fit photometry recovers H and the phase-function slope. Validated against `find_orb` and JPL SBDB.
 - **Events** — Close approach (start/end), periapsis, gravitational capture (start/end), shadow entry/exit, atmospheric entry/exit, impact, and possible impact.
 
 ## Quick start
@@ -100,6 +100,24 @@ second-order state-only correction can recover it), or
 `WeaklyDeterminedHighN` for wider-than-state fits. `None` means no
 trust gate ran — absence of a verdict is not trust.
 
+Every fit also reports **how the solver stopped**.
+`result.termination` is an `Option<SolverStop>` carrying the solver's
+own verdict — `GradientTolerance`, `StepTolerance`, `CostTolerance`,
+`MaxIterations`, `DampingExhausted`, `InnerTrialsExhausted`,
+`StalledDelivered`, `SchurStepTolerance`, or `Unrecognized` for a stop
+this engine build cannot name (never `None`, which means nothing was
+reported at all). Beside it, `gn_step_qnorm` is the undamped
+Gauss-Newton step's quadratic form at the delivered iterate — the
+quantity `ODConfig::convergence_tol` bounds, and the only step norm
+comparable to it — with `mu_final`, `accepted_steps`,
+`final_solve_iterations`, and an `Option<StallDelivery>` describing a
+fit the stable-stall acceptance delivered rather than a convergence
+criterion. A fit that met `gtol` and a fit that ran out of damping
+used to arrive through the same success path with nothing to tell them
+apart. `accepted_steps` is a plain `u32` because `0` is a real
+reading: the solver latched a criterion at its starting point and
+never moved.
+
 `ODConfig::default()` is the production hot path: the **VFCC2017**
 weighting preset — Vereš, Farnocchia, Chesley & Chamberlin (2017)
 per-station σ floors, with 1/√N same-night de-weighting chained on top —
@@ -162,6 +180,54 @@ against, so a fit that did not clear one says which and by how much. Use
 the first verdict to gate publication and the second to gate forward
 propagation, ephemeris generation, or impact-risk assessment; tighten
 either through `AcceptabilityThresholds`.
+
+## Iterating on one arc: `Session`
+
+[`Session`] is the stateful counterpart to the one-shot call — it owns
+one observation set, its mask state, and the fit history, so
+"mask a night, refit, compare" is three calls rather than three
+rebuilds. `Session::new` takes ownership of the `Observations`, so
+collect any indices you mean to mask before moving them in.
+`mask` / `unmask` / `unmask_all` / `is_masked` move the mask,
+`n_observations` / `n_masked` / `n_active` report it, `refine` fits the
+active set and appends to the history, and `history(i)` reads any
+earlier `DetermineResult` back whole.
+
+`diff(prior_idx)` compares the current fit against a history entry and
+returns a `SessionDiff`: `reduced_chi2_delta`, `iterations_delta`,
+`n_observations_delta`, and the two `update_norm_*` values. Read those
+last two as a damping-trajectory diagnostic only — `update_norm` is the
+μ-*damped* last accepted step and is not comparable to
+`convergence_tol`. For whether either fit converged, and on what, read
+that fit's `termination` and `gn_step_qnorm`.
+
+```rust,no_run
+# use empyrean::{Context, ODConfig, Session};
+# let ctx = Context::from_data_dir(None)?;
+let obs = ctx.read_ades("apophis.psv")?;
+
+// Find the noisy station's rows before `obs` moves into the session.
+let noisy: Vec<usize> = obs
+    .iter()
+    .enumerate()
+    .filter(|(_, o)| o.obs_code == "T05")
+    .map(|(i, _)| i)
+    .collect();
+
+let mut sess = Session::new(obs, ODConfig::default())?;
+sess.refine(&ctx)?;              // initial fit -> history[0]
+for i in noisy {
+    sess.mask(i)?;
+}
+let refit = sess.refine(&ctx)?;  // refit without T05
+
+let d = sess.diff(0)?;
+println!(
+    "Δχ²/dof = {:+.3}, Δn_obs = {:+}, stopped on {:?}",
+    d.reduced_chi2_delta, d.n_observations_delta, refit.termination,
+);
+# Ok::<(), empyrean::Error>(())
+```
 
 ## Wide-parameter fitting
 
@@ -581,7 +647,10 @@ sky-plane covariance over (ρ, RA, Dec) and their rates (AU / degree
 units), and the aberrated — light-time corrected — barycentric ICRF
 Cartesian state at the photon-emission epoch with its own 6×6
 covariance; both covariances are `None` when the input orbit carried no
-state covariance. Non-fatal generation warnings (an Earth-orientation
+state covariance. The sky covariance is the **marginal** over whatever
+force-model parameter uncertainty the orbit declares, not the
+conditional: an orbit declaring none is unaffected, and any Marsden
+3×3, DT / AMRAT variance or Δv block widens every sky σ. Non-fatal generation warnings (an Earth-orientation
 kernel coverage gap handled by the analytic IAU 2006 fallback, a row
 whose observation-sensitivity chain was skipped) come back on
 `EphemerisResult::warnings` — empty when the run had nothing to report.
@@ -921,6 +990,16 @@ kernel set and stops there, so a provisioning step never pays for a
 context assembly it would immediately discard. It is idempotent: files
 already present are kept.
 
+A fetch that was attempted and failed is missing data, not an I/O
+fault: it comes back on `Error::code`'s missing-data category with a
+message leading `"Data download failed: "` and naming the failing
+kernel by URL. The two shapes of that category are distinguishable — a
+non-empty `Error::missing_data_files()` is a named set the directory
+does not have with no fetch attempted; the `"Data download failed: "`
+prefix is an acquisition that was tried and did not land. The remedy
+for the second is connectivity or a pin the upstream still serves,
+never the local file repair the generic I/O category used to point at.
+
 ```rust,no_run
 use empyrean::{Context, DataDirOptions, DataTier};
 
@@ -996,9 +1075,11 @@ see its README for installation paths and the cross-channel quickstart.
 
 ## Accuracy
 
-Validated against JPL Horizons, ASSIST, and `find_orb` on
-43 objects across 13 dynamical populations (NEOs, MBAs, Trojans, TNOs,
-comets, and more). Sub-meter propagation accuracy on bounded timescales;
+Validated against JPL Horizons, `find_orb`, and GRSS across a curated
+catalog of 50 objects in 13 dynamical populations (NEOs, MBAs, Trojans,
+TNOs, comets, and more), with ASSIST as an additional propagation
+reference on a 39-object subset. Sub-meter propagation accuracy on
+bounded timescales;
 see the [validation notes](https://github.com/Empyrean-Dynamics/empyrean#validation)
 in the main repository for the comparison setup.
 

@@ -6,6 +6,48 @@ project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-08-20
+
+The 0.10.0 final. Identical in content to 0.10.0-rc.2 — no code changes
+since — and the release of record for everything the three candidates
+below carried. Relative to 0.9.0, one generation:
+
+**C ABI version 3, source-breaking for C consumers** (recompile against
+the version-3 header; the rc.0 entry enumerates every signature and
+layout change). Orbit determination is batch-first at every layer and
+carries the full output surface: the wide joint covariance
+(Schmidt–Kalman consider analysis, the tri-state `ParamDisposition`
+solve partition, the wide cross-covariance wire format), GMM mixture
+read-back, photometry riding the fitted orbit with an H-uncertainty
+input, the four extrapolation gate axes, and — new at rc.2 — the
+solver's own stopping verdict on every delivered fit, converged or not
+(`EMPYREAN_SOLVER_STOP_*`, `gn_step_qnorm`, the stall-delivery block),
+with the long-mislabeled `update_norm` documented for what it is.
+Orbit determination runs through a reusable force-model handle
+(BuiltSystem entry points; build once, refit many). Context
+construction is honest about data: strict-offline with a complete
+structured missing-file list, `EMPYREAN_OFFLINE=1` as a floor, failed
+kernel fetches on the missing-data axis naming the kernel by URL,
+symlinked data directories followed, and the Earth-orientation kernel
+lineage resolved through the loader's own glob so a NAIF withdrawal of
+a dated name no longer strands a warm directory. The ephemeris path
+delivers the marginal sky covariance. Python's time model is
+`Epochs`-only: every timed entry point takes an `Epochs` table
+(thirteen signatures), a bare float or array raises `TypeError`, and
+`Epochs.from_mjd` / `from_jd` require `scale` — a time never crosses
+the boundary without naming its scale. The CLI gains `show` (a
+streaming pager over output artifacts) and `--no-refresh`. The release
+pipeline itself gained the pin-currency and header-currency guards
+that make a stale-binary republish fail closed.
+
+The rc.2 known issue ships in the final unchanged: the second/
+third-order covariance closure applies twice the correct Isserlis
+coefficient, so a delivered second/third-order 6×6 overstates its
+quadratic correction by up to ~20% in the strongly nonlinear regime
+(conservative direction — σ inflates), and the expansion-suspect /
+mixture-escalation thresholds keyed on it fire early by up to √2.
+First-order covariances are unaffected; the fix is targeted at 0.11.0.
+
 ## [0.10.0-rc.2] — 2026-08-19
 
 Engine chain: empyrean-core v0.10.2 (villeneuve v1.24.0 / scott v1.18.0).

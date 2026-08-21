@@ -24,7 +24,7 @@ type-check, or RAII-manage the underlying handles.
 
 ```toml
 [dependencies]
-empyrean-sys = "0.10.0-rc.2"
+empyrean-sys = "0.10.0"
 ```
 
 ```rust
@@ -93,14 +93,24 @@ This is what closes leg chaining: the engine's propagated border is non-zero
 the correlation, so a caller who chained legs on the 6×6 alone was quoting a
 tighter uncertainty than the propagation supports.
 
-**Two new exported symbols** — the first movement of the symbol set in this
-release: `empyrean_propagation_joint_at(result, orbit_index, epoch_index,
+**Two new exported symbols carry it**:
+`empyrean_propagation_joint_at(result, orbit_index, epoch_index,
 out)` returns the propagated joint at one row, and
 `empyrean_orbit_covariance_free` releases what it wrote. They are a separate
 call rather than fields on `EmpyreanTaggedCovariance` to keep that struct
 free of owned storage — a caller declares one on the stack and frees nothing,
 and giving it owned arrays would have turned correct, silently recompiling
 code into a leaking caller at two allocations per call.
+
+Four more join them for orbit determination through the pre-built
+force-model handle: `empyrean_builtsystem_new_for_od` freezes the
+recipe a fit actually runs under, and
+`empyrean_builtsystem_determine` / `_evaluate` / `_refine` mirror
+their one-shots with the handle prepended, exactly as
+`empyrean_builtsystem_propagate` mirrors `empyrean_propagate`. Six
+exported symbols in all for the 0.10.0 break itself — the retired
+counter's own additions, which reach consumers for the first time
+here, are in the ABI 3 notes below.
 
 Three new input structs carry the terms: `EmpyreanParamColumn` (16 bytes),
 `EmpyreanStateParamCross` (64), `EmpyreanParamPairCross` (40), plus
@@ -328,6 +338,21 @@ at the repository root for field-level semantics.
   removal (+∞ marks an indispensable observation), and
   `along_cross_covariance_arcsec2` completing the 2×2 along/cross-track
   covariance.
+- **The solver's stopping verdict.** `EmpyreanODResult` closes with ten
+  fields saying how the solve ended, ints before doubles:
+  `termination` (one of the ten `EMPYREAN_SOLVER_STOP_*` codes, where
+  `NOT_REPORTED` (`0`) is nothing-reported and `UNRECOGNIZED` (`9`) is a
+  stop the engine build cannot name — never the same claim),
+  `gn_step_qnorm` (the **undamped** Gauss-Newton step's quadratic form
+  at the delivered iterate, the quantity `convergence_tol` bounds and
+  the only step norm comparable to it), `mu_final`, `accepted_steps`,
+  `final_solve_iterations`, and the five `stall_*` fields
+  (`stall_delivered`, `stall_underlying_stop`, `stall_gn_qnorm`,
+  `stall_convergence_tol`, `stall_optical_reduced_chi2`) describing a
+  fit the stable-stall acceptance delivered rather than a convergence
+  criterion. `update_norm` is the μ-**damped** last accepted step and is
+  not comparable to `convergence_tol`; read these instead. The block
+  pads once (4 bytes) and grows the struct by 64.
 - **Covariance trust verdict.** `EmpyreanODResult::covariance_trust`
   reports an event-aware verdict on the delivered covariance
   (`EMPYREAN_COVARIANCE_TRUST_*`): `TRUSTED`, `ENCOUNTER_INTERVENES`
@@ -388,6 +413,20 @@ a checksum-pinned download from the GitHub release tagged
 `v{crate version}` (in that order).
 The FFI bindings are pre-generated and committed, so no C header,
 libclang, or bindgen is needed to build.
+
+`checksums.txt` pins one more thing than the tarball hashes. A hash
+proves *which bytes* were downloaded, never which struct layouts they
+hold, and `EMPYREAN_ABI_VERSION` cannot close the gap either — it
+encodes the base version, so every build inside one release cycle
+reports the same number while `EmpyreanOrbit` can grow underneath it.
+So the file also carries a `# Header-SHA256:` line naming the
+`include/empyrean.h` the pinned binaries were built from, and in a
+checkout `build.rs` refuses to link a downloaded prebuilt when the
+header in the tree hashes to anything else — pointing at a local
+`empyrean-c` build or an `EMPYREAN_LIB_DIR` engine built from that
+exact header. The guard is inert for the packaged crate from
+crates.io, which ships no header, and for `EMPYREAN_LIB_DIR`, which is
+an override the caller owns.
 
 Prebuilt engine binaries are currently published for four targets:
 macOS arm64 (`macos-aarch64`), macOS x86_64 (`macos-x86_64`), Linux

@@ -56,7 +56,7 @@ bodies like asteroids and comets, with plans to extend to cislunar space.
 | CLI    | `cargo install empyrean-cli` (or grab a binary from [Releases](https://github.com/Empyrean-Dynamics/empyrean/releases)) |
 | C      | download `libempyrean-<target>.tar.gz` from [Releases](https://github.com/Empyrean-Dynamics/empyrean/releases) — ships the shared library, `empyrean.h`, and LICENSE |
 
-Current release: **0.10.0-rc.2** (release candidate) — see the [CHANGELOG](CHANGELOG.md).
+Current release: **0.10.0** — see the [CHANGELOG](CHANGELOG.md).
 
 Prebuilt binaries — the engine cdylib, the CLI, and the Python wheels —
 target four platforms: macOS arm64 (`macos-aarch64`), macOS x86_64
@@ -86,7 +86,9 @@ wherever you make it; what differs is reach.
 | Multi-object `determine` keyed by ADES designation | ● | ● | ● | ● |
 | Iterative `Session` refit — mask / refine / diff | ● | ● | ● | — |
 | Impact probability + B-plane geometry | ● | ● | ● | — |
-| Reusable built-system handle + `describe()` provenance | ● | ● | ● | — |
+| Reusable built-system handle — propagate / ephemeris / OD, `describe()` provenance | ● | ● | ● | — |
+| Solver stopping verdict on every fit | ● | ● | ● | — |
+| Gaussian-mixture read-back at close approach | ● | ● | ● | — |
 | Query APIs — SBDB / Horizons / MPC astrometry + radar | ● | ● | ● | — |
 | SBDB orbit input by id + Horizons state vectors | ● | ● | ● | ● |
 | Strict-offline context construction | ● | ● | ● | ● |
@@ -256,7 +258,11 @@ covariance over (ρ, RA, Dec) and their rates (AU / degree units),
 mapped from the orbit's state covariance — absent when the input orbit
 carries none, never zero-filled — plus the aberrated (light-time
 corrected) barycentric ICRF Cartesian state at the photon-emission
-epoch, with its own 6×6 covariance. A generate call additionally
+epoch, with its own 6×6 covariance. The sky covariance is the
+**marginal** over whatever force-model parameter uncertainty the orbit
+declares, not the conditional: an orbit declaring none is unchanged,
+and any Marsden 3×3, DT / AMRAT variance or Δv block widens every sky
+σ. A generate call additionally
 returns its non-fatal warnings — an Earth-orientation kernel coverage
 gap bridged by the analytic IAU 2006 fallback, a row whose sensitivity
 chain was skipped — so a silent run is a clean run.
@@ -442,6 +448,18 @@ rejected recent tail — rather than only that it is not. A quantity that
 could not be computed is NaN, never `0.0`, which would read as a
 measurement at the floor.
 
+Every delivered fit also says **how the solver stopped** — including
+one that did not converge, which is exactly the case the verdict is
+for. `termination` is the solver's own verdict (met `gtol`, ran
+out of damping, exhausted its iteration budget, was delivered by the
+stable-stall acceptance, …), and `gn_step_qnorm` is the undamped
+Gauss-Newton step's quadratic form at the delivered iterate, the one
+step norm comparable to `convergence_tol`. A fit that converged and a
+fit the solver merely stopped producing steps for used to arrive
+through the same success path, indistinguishable; now they are not.
+`accepted_steps`, `final_solve_iterations`, `mu_final` and the
+stall-delivery block travel alongside.
+
 Underneath, the fit is the engine's, and three of its lanes are what
 carry the hard objects. Optical and radar are solved together rather
 than in sequence — radar rows are grouped by the same object identifier
@@ -544,6 +562,11 @@ and the global `--no-refresh` flag on every CLI command, where
 `empyrean init --no-refresh` becomes a pure verifier that downloads
 nothing and reports exactly what the directory lacks.
 
+A fetch that was attempted and failed is reported on the same
+missing-data axis rather than as a generic I/O fault, and the message
+names the kernel by URL — a withdrawn or rotated upstream pin reads as
+the connectivity problem it is, not as a local disk to repair.
+
 `EMPYREAN_OFFLINE=1` in the environment is a floor, not a switch: it
 downgrades a requested refresh to off and announces it on stderr, and it
 can only ever remove network access, never restore it. It binds **data
@@ -566,8 +589,8 @@ variable at all by design: a C caller states the policy in the
 
 ## Validation
 
-Every release is validated against JPL Horizons, ASSIST, `find_orb`,
-GRSS, and OpenOrb on a curated catalog of 50 objects across 13
+Every release is validated against JPL Horizons, `find_orb`, and GRSS
+on a curated catalog of 50 objects across 13
 dynamical populations — NEOs, MBAs, SB441-N16 self-perturbers, Jupiter
 / Neptune / Earth Trojans, TNOs, Centaurs, comets, interstellar objects,
 temporarily-captured objects, confirmed impactors, and short-arc NEOs.
@@ -575,7 +598,9 @@ The same plan runs through all four channels, so cross-channel parity is
 measured rather than assumed. Propagated states agree with JPL Horizons
 at the sub-meter level on bounded timescales; orbit determination
 results are cross-checked against `find_orb` fits and JPL SBDB
-solutions, and radar delay / Doppler residuals against GRSS. Per-release
+solutions, and radar delay / Doppler residuals against GRSS; ASSIST
+serves as an additional propagation reference on a 39-object subset.
+Per-release
 changes are tracked in the [CHANGELOG](CHANGELOG.md).
 
 ## Citing

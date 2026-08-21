@@ -18,11 +18,10 @@ Uncertainty-first orbit propagation, ephemeris, orbit determination, and event d
 ---
 
 ```bash
-pip install --pre empyrean==0.10.0rc2
+pip install empyrean
 ```
 
-Current release: **0.10.0rc2** (release candidate) — `--pre` is required
-until 0.10.0 is final.
+Current release: **0.10.0**.
 
 A plain install pulls empyrean
 together with the B612 Foundation's
@@ -55,7 +54,7 @@ point the loader at an engine of your own.
 - **Propagation** — N-body (Sun, planets, Moon, Pluto) with EIH general relativity, Sun J2 and Earth J2–J4 zonal harmonics, 16 asteroid perturbers, and the Marsden non-gravitational model — selectable across Approximate / Basic / Standard force-model tiers (Standard is the default). GR15 and DOP853 integrators. Optional finite-burn thrust arcs — constant-RTN, velocity-tangent, or inertial-fixed steering, with per-arc Δv targeting corrections — layer on as a continuous-thrust force input.
 - **Uncertainty** — First-order (Jet1) state transition matrices; second-order (Jet2) state transition tensors; unscented sigma-point and Monte Carlo sampling; an adaptive Auto mode that escalates the method automatically through close approaches and relaxes it elsewhere. Optional per-epoch tagged-covariance readback.
 - **Ephemeris** — RA/Dec, rates, photometry (H–G, H–G₁G₂, H–G₁₂), light time, phase angle, solar elongation, local horizon, and the aberrated (light-time corrected) barycentric state per row — with sky-plane and aberrated-state covariances when the input orbit carries one.
-- **Orbit determination** — batch-first: one `determine()` call fits every object in an ADES set and returns per-object results. Gauss, Herget, and systematic-ranging (admissible region + Manifold of Variations) IOD, plus a co-orbital lane that recovers Earth co-orbitals of the 2010 TK7 / 2020 XL5 class → N-body differential correction over optical and radar (delay / Doppler) observations solved jointly rather than in sequence, with STM caching and outlier rejection. Long comet arcs deliver as full-arc fits. Solves the state — escalating to the Marsden A1/A2/A3 non-gravitational coefficients on a poor fit — plus, on the refine path, the cometary outgassing time delay DT, SRP area-to-mass, and continuous-thrust Δv corrections, all differentiated analytically, returned in a tagged solved covariance. Every deselected observation carries a typed reason. Optional post-OD H–G photometry fit recovers absolute magnitude H with an honest σ. Validated against `find_orb` and JPL SBDB.
+- **Orbit determination** — batch-first: one `determine()` call fits every object in an ADES set and returns per-object results. Gauss, Herget, and systematic-ranging (admissible region + Manifold of Variations) IOD, plus a co-orbital lane that recovers Earth co-orbitals of the 2010 TK7 / 2020 XL5 class → N-body differential correction over optical and radar (delay / Doppler) observations solved jointly rather than in sequence, with span-grouped Jacobian reuse and outlier rejection. Long comet arcs deliver as full-arc fits. Solves the state — escalating to the Marsden A1/A2/A3 non-gravitational coefficients on a poor fit — plus, on the refine path, the cometary outgassing time delay DT, SRP area-to-mass, and continuous-thrust Δv corrections, all differentiated analytically, returned in a tagged solved covariance. Every deselected observation carries a typed reason. Optional post-OD H–G photometry fit recovers absolute magnitude H with an honest σ. Validated against `find_orb` and JPL SBDB.
 - **Events** — Close approach (start/end), periapsis, gravitational capture (start/end), shadow entry/exit, atmospheric entry/exit, impact, and possible impact.
 
 ## Quick start
@@ -219,6 +218,79 @@ event-aware verdict on the delivered covariance: `trusted`,
 high-nonlinearity event and whether a second-order state-only
 correction can recover it), or `weakly_determined_high_n`. It is
 `None` when no trust gate ran — absence of a verdict is not trust.
+
+### How the solver stopped
+
+Every fit says how its solve ended, so a converged orbit and one the
+solver merely stopped producing steps for are no longer the same
+success:
+
+```python
+print(result.termination)            # "gradient_tolerance", "stalled_delivered", ...
+print(result.gn_step_qnorm)          # undamped Gauss-Newton step qnorm, or None
+print(result.accepted_steps)         # 0 is a real reading, not "unknown"
+print(result.final_solve_iterations, result.mu_final)
+print(result.stall_delivery)         # StallDelivery, or None
+```
+
+`termination` is a stable lowercase tag — `"gradient_tolerance"`,
+`"step_tolerance"`, `"cost_tolerance"`, `"max_iterations"`,
+`"damping_exhausted"`, `"inner_trials_exhausted"`,
+`"stalled_delivered"`, `"schur_step_tolerance"` — or `"unrecognized"`
+for a stop this engine build cannot name. `None` means nothing was
+reported, which is never the same claim as `"unrecognized"`: a stop
+that fired but cannot be named is not no stop at all.
+
+`gn_step_qnorm` is the **undamped** Gauss-Newton step's quadratic form
+at the delivered iterate — the quantity `convergence_tol` bounds, and
+the only step norm comparable to it. `update_norm` is the μ-*damped*
+last accepted step and is **not** comparable to `convergence_tol`;
+read `termination` and `gn_step_qnorm` for convergence. `update_norm`
+of exactly `0.0` beside `accepted_steps == 0` means the solver latched
+a criterion at its starting point and never moved — the ordinary
+outcome of refitting an already-stationary orbit, and previously
+indistinguishable from a step of size zero having been taken.
+`stall_delivery` is populated exactly when `termination` is
+`"stalled_delivered"`, carrying the solver's own verdict underneath
+and the numbers that earned the delivery.
+
+### Iterating on one arc: `Session`
+
+`Session` is the stateful counterpart to the one-shot call — it owns one
+observation set, its mask state, and the fit history, so "mask a night,
+refit, compare" is three calls rather than three rebuilds. Construct it
+from a path, PSV text, or an `ADESObservations` table (no PSV round
+trip):
+
+```python
+import empyrean
+
+obs, _radar = empyrean.read_ades("apophis.psv")
+
+sess = empyrean.Session.from_observations(obs)     # or Session("apophis.psv")
+sess.refine()                                      # initial fit -> history[0]
+
+for i, code in enumerate(obs.stn.to_pylist()):
+    if code == "T05":
+        sess.mask(i)
+refit = sess.refine()                              # refit without T05
+
+print(sess.n_observations, sess.n_masked, sess.n_active)
+
+diff = sess.diff(0)                                # current vs history[0]
+print(f"Δχ²/dof = {diff.reduced_chi2_delta:+.3f}")
+print(f"Δn_obs  = {diff.n_observations_delta:+d}")
+print(f"stopped on {refit.termination}")
+```
+
+`mask` / `unmask` / `unmask_all` / `is_masked` move the mask;
+`n_observations` / `n_masked` / `n_active` and `history_len` are
+properties; `history(i)` reads any earlier `DetermineResult` back whole.
+`diff(prior_idx)` returns a `SessionDiff` carrying
+`reduced_chi2_delta`, `iterations_delta`, `n_observations_delta`, and
+the two `update_norm_*` values — read those last two as a
+damping-trajectory diagnostic only, never as convergence, for the
+reason above.
 
 ### Weighting
 
@@ -534,6 +606,11 @@ print(eph.ephemeris.mag.to_numpy(zero_copy_only=False))  # apparent V (nullable)
 print(eph.ephemeris.coordinates.covariance.to_matrix().shape)      # (N, 6, 6)
 print(eph.ephemeris.aberrated_state.covariance.to_matrix().shape)  # (N, 6, 6)
 ```
+
+That sky covariance is the **marginal** over whatever force-model
+parameter uncertainty the orbit declares, not the conditional: an orbit
+declaring none is unaffected, and any Marsden 3×3, DT / AMRAT variance
+or Δv block widens every sky σ.
 
 `eph.warnings` lists non-fatal generation warnings — e.g. an
 Earth-orientation kernel coverage gap handled by the analytic IAU 2006
@@ -1007,12 +1084,25 @@ except FileNotFoundError as e:
 Setting `EMPYREAN_OFFLINE=1` in the environment applies the same policy
 to every `initialize()` in the process and announces itself on stderr. It
 is a floor, not a switch: it can turn network access off, never back on.
+`download_data()` has no offline form — reaching the network is the
+whole call — so under the floor it refuses rather than provisioning
+anyway.
+
+A fetch that was attempted and failed is missing data, not an I/O
+fault: the message leads with `"Data download failed: "` and names the
+failing kernel by URL. The two shapes are distinguishable — a
+populated `missing_data_files` is a named set the directory does not
+have with no fetch attempted, while the download prefix is an
+acquisition that was tried and did not land. The remedy for the second
+is connectivity, or a pin the upstream still serves.
 
 ## Accuracy
 
-Validated against JPL Horizons, ASSIST, and `find_orb` on
-43 objects across 13 dynamical populations (NEOs, MBAs, Trojans, TNOs,
-comets, etc.). Sub-meter propagation accuracy on bounded timescales.
+Validated against JPL Horizons, `find_orb`, and GRSS across a curated
+catalog of 50 objects in 13 dynamical populations (NEOs, MBAs, Trojans,
+TNOs, comets, etc.), with ASSIST as an additional propagation reference
+on a 39-object subset. Sub-meter propagation accuracy on bounded
+timescales.
 See [the validation notes](https://github.com/Empyrean-Dynamics/empyrean#validation).
 
 ## No guarantee of accuracy

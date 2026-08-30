@@ -235,10 +235,31 @@ pub struct ObservationSensitivity {
     /// Hessian ∂²(observable)/∂(input)², row-major `[6][n_params][n_params]`
     /// flattened. Empty unless a second-order method ran.
     ///
+    /// The tensor is COMPOSED to the same input axis as
+    /// [`jacobian`](Self::jacobian) — the orbit-epoch state in
+    /// `frame`/`origin` — so the pair is one second-order expansion
+    /// (villeneuve 1.25.0; earlier engines published the LOCAL
+    /// topocentric second derivative here, a different input domain from
+    /// the Jacobian beside it, and any consumer that contracted the two
+    /// together read the wrong quantity). Populated on `SecondOrder`
+    /// rows of orbits declaring a state covariance and no solved
+    /// force-model parameters, where `n_params == 6`; empty on every
+    /// other row.
+    ///
     /// Leading index is the observable, in the same order and the same
     /// units-per-input-unit as [`jacobian`](Self::jacobian) — index it
     /// with the same `SENSITIVITY_ROW_*` constants. Element `(row, i, j)`
     /// is `hessian[(row * np + i) * np + j]` with `np = n_params as usize`.
+    ///
+    /// # Consumer note (fold builders)
+    ///
+    /// The per-row sky covariance delivered alongside this tensor under
+    /// a second-order method is the moment **about the published
+    /// nominal**: it already contains the mean-shift outer product
+    /// `δμ_a · δμ_b`, with `δμ_a = ½ tr(H_a Σ)` built from THIS tensor.
+    /// A consumer building its own bias-corrected update must not ALSO
+    /// subtract that shift from the innovation while using the delivered
+    /// matrix as its noise term — that double-counts the correction.
     pub hessian: Vec<f64>,
     /// Frame of the input axis (Frame enum as int).
     pub frame: i32,

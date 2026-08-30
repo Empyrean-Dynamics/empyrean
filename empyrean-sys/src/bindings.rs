@@ -201,6 +201,7 @@ pub const EMPYREAN_COVARIANCE_KIND_THIRD_ORDER: u32 = 2;
 pub const EMPYREAN_COVARIANCE_KIND_MIXTURE: u32 = 3;
 pub const EMPYREAN_COVARIANCE_KIND_MONTE_CARLO: u32 = 4;
 pub const EMPYREAN_COVARIANCE_KIND_SIGMA_POINT: u32 = 5;
+pub const EMPYREAN_COVARIANCE_KIND_UNKNOWN: u32 = 254;
 pub const EMPYREAN_COVARIANCE_QUALITY_POSITIVE_DEFINITE: u32 = 0;
 pub const EMPYREAN_COVARIANCE_QUALITY_INDEFINITE: u32 = 1;
 pub const EMPYREAN_COVARIANCE_QUALITY_REPAIRED: u32 = 2;
@@ -219,6 +220,7 @@ pub const EMPYREAN_TAGGED_COV_EPOCH_INDEX_OUT_OF_RANGE: i32 = -8;
 pub const EMPYREAN_TAGGED_COV_SAMPLE_COVARIANCE_MISSING: i32 = -9;
 pub const EMPYREAN_TAGGED_COV_CHAIN_ORBIT_COUNT_MISMATCH: i32 = -10;
 pub const EMPYREAN_TAGGED_COV_SAMPLE_ROW_EPOCH_MISMATCH: i32 = -11;
+pub const EMPYREAN_TAGGED_COV_UNKNOWN: i32 = -98;
 pub const EMPYREAN_TAGGED_COV_PANIC: i32 = -99;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -1377,7 +1379,7 @@ const _: () = {
     ["Offset of field: EmpyreanObserver::origin"]
         [::std::mem::offset_of!(EmpyreanObserver, origin) - 72usize];
 };
-#[doc = " Ephemeris-generation configuration.\n\n Wraps the inner [`EmpyreanPropagationConfig`] plus the light-time\n iteration controls and a diagnostics toggle. The propagation runs\n internally to bring each orbit to its observation epoch, so the\n propagation-level knobs the integrator consults apply here too:\n `force_model`, `excluded_perturbers_naif`, `uncertainty_method`,\n `compute_stm`, `frame`, `num_threads`, `ephemeris_overlap_policy`, and the\n whole `advanced` block.\n\n Two blocks do **not** apply: `events` and `diagnostics`. Ephemeris\n generation runs with event detection and timeseries diagnostics off\n and [`EmpyreanEphemerisResult`] carries no channel for either, so\n setting a field in either block is refused with an error naming it\n rather than accepted and dropped. Leave both zeroed (a `memset(0)`\n config is valid); use `empyrean_propagate` when you need them.\n\n # Generating for an SB441-N16 body\n\n `ephemeris_overlap_policy` matters more here than on `empyrean_propagate`.\n Under the default `EMPYREAN_EPHEMERIS_OVERLAP_POLICY_SUBSTITUTE_SPK` the engine\n skips integration for a target that coincides with one of its own\n perturbers — and ephemeris generation reads the dense trajectory that\n integration would have produced, so the call **fails** for any\n SB441-N16 body at Standard tier. Pass\n `EMPYREAN_EPHEMERIS_OVERLAP_POLICY_EXCLUDE_AND_INTEGRATE` (or exclude the body\n via `excluded_perturbers_naif`) to generate ephemerides for one."]
+#[doc = " Ephemeris-generation configuration.\n\n Wraps the inner [`EmpyreanPropagationConfig`] plus the light-time\n iteration controls and a diagnostics toggle. The propagation runs\n internally to bring each orbit to its observation epoch, so the\n propagation-level knobs the integrator consults apply here too:\n `force_model`, `excluded_perturbers_naif`, `uncertainty_method`,\n `compute_stm`, `frame`, `num_threads`, `ephemeris_overlap_policy`, and the\n whole `advanced` block.\n\n Two blocks do **not** apply: `events` and `diagnostics`. Ephemeris\n generation runs with event detection and timeseries diagnostics off\n and [`EmpyreanEphemerisResult`] carries no channel for either, so\n setting a field in either block is refused with an error naming it\n rather than accepted and dropped. Leave both zeroed (a `memset(0)`\n config is valid); use `empyrean_propagate` when you need them.\n\n # Generating for an SB441-N16 body\n\n `ephemeris_overlap_policy` decides WHICH trajectory the rows come\n from when a target coincides with one of its own perturbers. Both\n settings produce rows, and the result's warnings channel says which\n answer you got — read it, because the two are not interchangeable.\n\n Under the default `EMPYREAN_EPHEMERIS_OVERLAP_POLICY_SUBSTITUTE_SPK`\n the engine skips integration and serves the rows off the body's own\n SPK — the authoritative solution for that body, but **not** a\n propagation of the initial condition you supplied. Those rows carry\n **no sky covariance**, and if the input orbit declared one, the\n warning says it was dropped.\n\n Under `EMPYREAN_EPHEMERIS_OVERLAP_POLICY_EXCLUDE_AND_INTEGRATE` the\n body is removed from its own force model and your initial condition\n is integrated, so the covariance is transported and the rows are\n differentiable — at the cost of a force model one perturber short,\n which its warning states. Naming the body in\n `excluded_perturbers_naif` is the other route to the same place.\n\n Radar generation is the one product that still **fails** outright\n under the substituting policy: its Jacobian is composed on the STM,\n which an SPK substitution does not produce."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct EmpyreanEphemerisConfig {
@@ -1556,7 +1558,7 @@ pub struct EmpyreanObservationSensitivity {
     pub jacobian: *mut f64,
     #[doc = " Length of `jacobian` (`6 * n_params`), 0 when null."]
     pub jacobian_len: usize,
-    #[doc = " Hessian ∂²(observable)/∂(input)², row-major `[6][n_params][n_params]`\n flattened (length `6 * n_params * n_params`). Null unless a\n second-order method (Jet2) ran.\n\n Leading index is the observable, in the same order and the same\n units-per-input-unit as `jacobian` — index it with the same\n `EMPYREAN_SENSITIVITY_ROW_*` constants. Element `(row, i, j)` is\n `hessian[(row * n_params + i) * n_params + j]`."]
+    #[doc = " Hessian ∂²(observable)/∂(input)², row-major `[6][n_params][n_params]`\n flattened (length `6 * n_params * n_params`). Null unless a\n second-order method (Jet2) ran.\n\n The tensor is COMPOSED to the same input axis as `jacobian` — the\n orbit-epoch state in `frame`/`origin` — so the pair is one\n second-order expansion (villeneuve 1.25.0; earlier engines\n published the LOCAL topocentric second derivative here, a\n different input domain from the Jacobian beside it, and any\n consumer that contracted the two together read the wrong\n quantity). Populated on `SECOND_ORDER` rows of orbits declaring a\n state covariance and no solved force-model parameters, where\n `n_params == 6`; null on every other row.\n\n Leading index is the observable, in the same order and the same\n units-per-input-unit as `jacobian` — index it with the same\n `EMPYREAN_SENSITIVITY_ROW_*` constants. Element `(row, i, j)` is\n `hessian[(row * n_params + i) * n_params + j]`.\n\n # Consumer note (fold builders)\n\n The per-row sky covariance delivered alongside this tensor under\n a second-order method is the moment **about the published\n nominal**: it already contains the mean-shift outer product\n `δμ_a · δμ_b`, with `δμ_a = ½ tr(H_a Σ)` built from THIS tensor.\n A consumer building its own bias-corrected update must not ALSO\n subtract that shift from the innovation while using the delivered\n matrix as its noise term — that double-counts the correction.\n Either subtract the shift and build your own noise term from this\n tensor, or take the delivered matrix as-is and leave the\n innovation alone."]
     pub hessian: *mut f64,
     #[doc = " Length of `hessian` (`6 * n_params²`), 0 when null."]
     pub hessian_len: usize,
@@ -4357,9 +4359,9 @@ pub struct EmpyreanTaggedCovariance {
     pub matrix: [[f64; 6usize]; 6usize],
     #[doc = " `EMPYREAN_COVARIANCE_KIND_*`."]
     pub kind: u8,
-    #[doc = " RNG seed — valid iff `has_mc_seed == 1` (kind == MONTE_CARLO)."]
+    #[doc = " RNG seed — valid iff `has_mc_seed == 1`, which implies\n `kind == EMPYREAN_COVARIANCE_KIND_MONTE_CARLO` but is **not**\n implied by it: a Monte-Carlo run seeded from system entropy\n rather than a caller-supplied seed produces an ensemble that is\n not reproducible by construction, and such a row carries\n `has_mc_seed == 0`. Read the flag, not the kind."]
     pub mc_seed: u64,
-    #[doc = " Disambiguates a real `mc_seed == 0` from \"no seed\". 0 on the\n `_cartesian` accessor (MC resolves to an error there)."]
+    #[doc = " Disambiguates a real `mc_seed == 0` from \"no seed\" — including\n the entropy-seeded Monte-Carlo row above, whose seed is absent\n rather than zero. 0 on the `_cartesian` accessor (MC resolves to\n an error there)."]
     pub has_mc_seed: u8,
     #[doc = " Second-order propagation mean shift δμ_prop (zero at t₀).\n Zero-filled when `has_mean_shift_prop == 0`."]
     pub mean_shift_prop: [f64; 6usize],

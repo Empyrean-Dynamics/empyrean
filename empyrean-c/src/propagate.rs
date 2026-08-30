@@ -750,11 +750,26 @@ pub struct EmpyreanPropagationConfig {
 ///
 /// The SPK is the authoritative solution for that body, so the returned
 /// states are exact *for the body itself* — but the caller's own initial
-/// condition is discarded, and nothing is integrated, so there is no
-/// dense trajectory, no STM, and no sensitivity chain. Ephemeris
-/// generation and the radar forward model both read the dense trajectory
-/// and therefore **fail** for an overlapped body under this policy; pass
-/// [`EMPYREAN_EPHEMERIS_OVERLAP_POLICY_EXCLUDE_AND_INTEGRATE`] there.
+/// condition is discarded, and nothing is integrated, so there is no STM
+/// and no sensitivity chain.
+///
+/// **Optical ephemeris generation succeeds** under this policy: it is
+/// served off the body's own SPK-backed trajectory — the best available
+/// solution for that body — and the substitution is reported on the
+/// result's warnings channel, naming the body and saying whether a
+/// declared covariance was dropped. Those rows carry **no sky
+/// covariance**: a covariance belongs to the caller's initial condition,
+/// and that is exactly what a substitution discards.
+///
+/// **Radar generation still fails** under this policy. Its Jacobian is a
+/// non-optional part of the radar contract and is composed on the STM,
+/// which a substituted trajectory does not have; the refusal names the
+/// body and both remedies.
+///
+/// Pass [`EMPYREAN_EPHEMERIS_OVERLAP_POLICY_EXCLUDE_AND_INTEGRATE`] when
+/// you need the caller's own initial condition propagated — a covariance
+/// transported to the observation epochs, a radar prediction, or
+/// anything differential.
 pub const EMPYREAN_EPHEMERIS_OVERLAP_POLICY_SUBSTITUTE_SPK: i32 = 0;
 /// Drop the overlapped perturber from the force model and integrate the
 /// caller's own initial conditions, reporting the overlap.
@@ -802,6 +817,27 @@ pub const EMPYREAN_COVARIANCE_KIND_MONTE_CARLO: u8 = 4;
 /// canonical 2N+1 sigma-point set. Deterministic and parameter-free —
 /// no per-row payload.
 pub const EMPYREAN_COVARIANCE_KIND_SIGMA_POINT: u8 = 5;
+/// The engine produced a covariance kind this ABI has no tag for — a
+/// version-skew tripwire, not a kind.
+///
+/// `CovarianceKind` is `#[non_exhaustive]` on the engine side, so a
+/// library built against a newer engine than the tags above describe can
+/// resolve a kind that has no number here. Rather than fold it onto
+/// `LINEAR` (or any other concrete tag), which would hand a consumer a
+/// covariance labelled with a construction that did not produce it, such
+/// a row is tagged with this value. It is **not** a covariance kind a
+/// caller can interpret: the matrix beside it is whatever the newer
+/// engine produced, and the only correct response is to stop and update
+/// the ABI. Both wrappers above this layer already do stop — the safe
+/// Rust wrapper's tag decode errors on any unrecognised value, and the
+/// Python decode table has no entry for one.
+///
+/// Numbered away from the concrete kinds on purpose: `6..` stays free
+/// for real kinds as the engine grows them, and `0xFF` is already the
+/// "not applicable" sentinel that
+/// [`EmpyreanEvent::resolved_kind`](EmpyreanEvent::resolved_kind) fills
+/// on non-regime events, which this must not be confused with.
+pub const EMPYREAN_COVARIANCE_KIND_UNKNOWN: u8 = 0xFE;
 
 // ── Covariance definiteness (TaggedCovariance.quality) ──────────────
 /// All eigenvalues positive within round-off; `quality_min_eig` is NaN.
@@ -871,6 +907,21 @@ pub const EMPYREAN_TAGGED_COV_CHAIN_ORBIT_COUNT_MISMATCH: i32 = -10;
 /// exist). Refused at the seam: a covariance served under another
 /// epoch's label is invisible in the returned series.
 pub const EMPYREAN_TAGGED_COV_SAMPLE_ROW_EPOCH_MISMATCH: i32 = -11;
+/// The engine refused with a failure this ABI has no code for — a
+/// version-skew tripwire, not a diagnosis.
+///
+/// `CovarianceSeriesError` is `#[non_exhaustive]`, so an engine newer
+/// than the codes above can refuse for a reason none of them names.
+/// Reporting the nearest-looking specific code would send an operator to
+/// the wrong remedy — "widen the coverage window" for a failure that has
+/// nothing to do with coverage — so an unnamed refusal gets its own
+/// code. The call failed and produced nothing either way; what this adds
+/// is that the reason is unavailable at this ABI version, and the fix is
+/// to give it a code of its own. Numbered beside
+/// [`EMPYREAN_TAGGED_COV_PANIC`] because it is the same kind of
+/// boundary condition — something the ABI could not describe — rather
+/// than the next entry in the sequence of real, diagnosable failures.
+pub const EMPYREAN_TAGGED_COV_UNKNOWN: i32 = -98;
 /// A panic was caught at the boundary.
 pub const EMPYREAN_TAGGED_COV_PANIC: i32 = -99;
 
@@ -1172,6 +1223,14 @@ pub(crate) fn covariance_kind_to_u8(k: empyrean_core::propagation::CovarianceKin
         K::Mixture => EMPYREAN_COVARIANCE_KIND_MIXTURE,
         K::MonteCarlo { .. } => EMPYREAN_COVARIANCE_KIND_MONTE_CARLO,
         K::SigmaPoint => EMPYREAN_COVARIANCE_KIND_SIGMA_POINT,
+        // `CovarianceKind` is `#[non_exhaustive]`, so this arm is what a
+        // kind added by a newer engine lands in. It gets its own tag
+        // instead of a fallback onto `LINEAR`: a mislabelled covariance
+        // is undetectable downstream, whereas
+        // `EMPYREAN_COVARIANCE_KIND_UNKNOWN` is refused by every decoder
+        // above this layer. Delete this arm's reason for existing by
+        // giving the new kind a tag of its own — do not widen this one.
+        _ => EMPYREAN_COVARIANCE_KIND_UNKNOWN,
     }
 }
 
@@ -2309,10 +2368,17 @@ pub struct EmpyreanTaggedCovariance {
     pub matrix: [[f64; 6]; 6],
     /// `EMPYREAN_COVARIANCE_KIND_*`.
     pub kind: u8,
-    /// RNG seed — valid iff `has_mc_seed == 1` (kind == MONTE_CARLO).
+    /// RNG seed — valid iff `has_mc_seed == 1`, which implies
+    /// `kind == EMPYREAN_COVARIANCE_KIND_MONTE_CARLO` but is **not**
+    /// implied by it: a Monte-Carlo run seeded from system entropy
+    /// rather than a caller-supplied seed produces an ensemble that is
+    /// not reproducible by construction, and such a row carries
+    /// `has_mc_seed == 0`. Read the flag, not the kind.
     pub mc_seed: u64,
-    /// Disambiguates a real `mc_seed == 0` from "no seed". 0 on the
-    /// `_cartesian` accessor (MC resolves to an error there).
+    /// Disambiguates a real `mc_seed == 0` from "no seed" — including
+    /// the entropy-seeded Monte-Carlo row above, whose seed is absent
+    /// rather than zero. 0 on the `_cartesian` accessor (MC resolves to
+    /// an error there).
     pub has_mc_seed: u8,
     /// Second-order propagation mean shift δμ_prop (zero at t₀).
     /// Zero-filled when `has_mean_shift_prop == 0`.
@@ -2383,8 +2449,19 @@ fn flatten_tagged_covariance(
         CovarianceKind::SecondOrder => (EMPYREAN_COVARIANCE_KIND_SECOND_ORDER, 0, 0),
         CovarianceKind::ThirdOrder => (EMPYREAN_COVARIANCE_KIND_THIRD_ORDER, 0, 0),
         CovarianceKind::Mixture => (EMPYREAN_COVARIANCE_KIND_MIXTURE, 0, 0),
-        CovarianceKind::MonteCarlo { seed } => (EMPYREAN_COVARIANCE_KIND_MONTE_CARLO, seed, 1),
+        // `has_mc_seed` exists precisely to carry presence, so an
+        // entropy-seeded run (`seed: None` — an ensemble that is not
+        // reproducible by construction) clears the flag rather than
+        // reporting seed 0, which is a real, reproducible seed.
+        CovarianceKind::MonteCarlo { seed: Some(s) } => {
+            (EMPYREAN_COVARIANCE_KIND_MONTE_CARLO, s, 1)
+        }
+        CovarianceKind::MonteCarlo { seed: None } => (EMPYREAN_COVARIANCE_KIND_MONTE_CARLO, 0, 0),
         CovarianceKind::SigmaPoint => (EMPYREAN_COVARIANCE_KIND_SIGMA_POINT, 0, 0),
+        // See `covariance_kind_to_u8`: a kind this ABI has no tag for is
+        // labelled UNKNOWN, never folded onto a concrete kind. It
+        // carries no seed.
+        _ => (EMPYREAN_COVARIANCE_KIND_UNKNOWN, 0, 0),
     };
 
     // Every quality tag gets its own arm and its own payload slot. An
@@ -2487,6 +2564,12 @@ fn cov_series_err_code(e: &empyrean_core::propagation::CovarianceSeriesError) ->
         // coverage window when the pairing is what is wrong.
         E::ChainOrbitCountMismatch { .. } => EMPYREAN_TAGGED_COV_CHAIN_ORBIT_COUNT_MISMATCH,
         E::SampleRowEpochMismatch { .. } => EMPYREAN_TAGGED_COV_SAMPLE_ROW_EPOCH_MISMATCH,
+        // `CovarianceSeriesError` is `#[non_exhaustive]`: a refusal
+        // added by a newer engine lands here. It reports UNKNOWN rather
+        // than borrowing a sibling's code — the codes above are read as
+        // remedies, and the wrong remedy is worse than none. Give the
+        // new variant its own code instead of widening this arm.
+        _ => EMPYREAN_TAGGED_COV_UNKNOWN,
     }
 }
 
@@ -3429,11 +3512,24 @@ mod tagged_covariance_tests {
     #[test]
     fn flatten_monte_carlo_carries_seed_with_flag() {
         let mut tc = sample_tagged();
-        tc.kind = CovarianceKind::MonteCarlo { seed: 42 };
+        tc.kind = CovarianceKind::MonteCarlo { seed: Some(42) };
         let f = flatten_tagged_covariance(60000.0, [0.0; 6], &tc).unwrap();
         assert_eq!(f.kind, EMPYREAN_COVARIANCE_KIND_MONTE_CARLO);
         assert_eq!(f.has_mc_seed, 1);
         assert_eq!(f.mc_seed, 42);
+    }
+
+    /// An entropy-seeded Monte-Carlo ensemble carries no seed, and the
+    /// presence flag — not the kind — is what says so. Reporting seed 0
+    /// with the flag set would hand a caller a reproducible-looking run
+    /// it cannot reproduce.
+    #[test]
+    fn flatten_monte_carlo_without_seed_clears_flag() {
+        let mut tc = sample_tagged();
+        tc.kind = CovarianceKind::MonteCarlo { seed: None };
+        let f = flatten_tagged_covariance(60000.0, [0.0; 6], &tc).unwrap();
+        assert_eq!(f.kind, EMPYREAN_COVARIANCE_KIND_MONTE_CARLO);
+        assert_eq!(f.has_mc_seed, 0);
     }
 
     #[test]

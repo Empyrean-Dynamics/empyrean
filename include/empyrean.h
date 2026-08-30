@@ -1082,11 +1082,26 @@ typedef struct Session Session;
  *
  * The SPK is the authoritative solution for that body, so the returned
  * states are exact *for the body itself* — but the caller's own initial
- * condition is discarded, and nothing is integrated, so there is no
- * dense trajectory, no STM, and no sensitivity chain. Ephemeris
- * generation and the radar forward model both read the dense trajectory
- * and therefore **fail** for an overlapped body under this policy; pass
- * [`EMPYREAN_EPHEMERIS_OVERLAP_POLICY_EXCLUDE_AND_INTEGRATE`] there.
+ * condition is discarded, and nothing is integrated, so there is no STM
+ * and no sensitivity chain.
+ *
+ * **Optical ephemeris generation succeeds** under this policy: it is
+ * served off the body's own SPK-backed trajectory — the best available
+ * solution for that body — and the substitution is reported on the
+ * result's warnings channel, naming the body and saying whether a
+ * declared covariance was dropped. Those rows carry **no sky
+ * covariance**: a covariance belongs to the caller's initial condition,
+ * and that is exactly what a substitution discards.
+ *
+ * **Radar generation still fails** under this policy. Its Jacobian is a
+ * non-optional part of the radar contract and is composed on the STM,
+ * which a substituted trajectory does not have; the refusal names the
+ * body and both remedies.
+ *
+ * Pass [`EMPYREAN_EPHEMERIS_OVERLAP_POLICY_EXCLUDE_AND_INTEGRATE`] when
+ * you need the caller's own initial condition propagated — a covariance
+ * transported to the observation epochs, a radar prediction, or
+ * anything differential.
  */
 #define EMPYREAN_EPHEMERIS_OVERLAP_POLICY_SUBSTITUTE_SPK 0
 
@@ -1126,6 +1141,30 @@ typedef struct Session Session;
  * no per-row payload.
  */
 #define EMPYREAN_COVARIANCE_KIND_SIGMA_POINT 5
+
+/**
+ * The engine produced a covariance kind this ABI has no tag for — a
+ * version-skew tripwire, not a kind.
+ *
+ * `CovarianceKind` is `#[non_exhaustive]` on the engine side, so a
+ * library built against a newer engine than the tags above describe can
+ * resolve a kind that has no number here. Rather than fold it onto
+ * `LINEAR` (or any other concrete tag), which would hand a consumer a
+ * covariance labelled with a construction that did not produce it, such
+ * a row is tagged with this value. It is **not** a covariance kind a
+ * caller can interpret: the matrix beside it is whatever the newer
+ * engine produced, and the only correct response is to stop and update
+ * the ABI. Both wrappers above this layer already do stop — the safe
+ * Rust wrapper's tag decode errors on any unrecognised value, and the
+ * Python decode table has no entry for one.
+ *
+ * Numbered away from the concrete kinds on purpose: `6..` stays free
+ * for real kinds as the engine grows them, and `0xFF` is already the
+ * "not applicable" sentinel that
+ * [`EmpyreanEvent::resolved_kind`](EmpyreanEvent::resolved_kind) fills
+ * on non-regime events, which this must not be confused with.
+ */
+#define EMPYREAN_COVARIANCE_KIND_UNKNOWN 254
 
 /**
  * All eigenvalues positive within round-off; `quality_min_eig` is NaN.
@@ -1243,6 +1282,24 @@ typedef struct Session Session;
  * epoch's label is invisible in the returned series.
  */
 #define EMPYREAN_TAGGED_COV_SAMPLE_ROW_EPOCH_MISMATCH -11
+
+/**
+ * The engine refused with a failure this ABI has no code for — a
+ * version-skew tripwire, not a diagnosis.
+ *
+ * `CovarianceSeriesError` is `#[non_exhaustive]`, so an engine newer
+ * than the codes above can refuse for a reason none of them names.
+ * Reporting the nearest-looking specific code would send an operator to
+ * the wrong remedy — "widen the coverage window" for a failure that has
+ * nothing to do with coverage — so an unnamed refusal gets its own
+ * code. The call failed and produced nothing either way; what this adds
+ * is that the reason is unavailable at this ABI version, and the fix is
+ * to give it a code of its own. Numbered beside
+ * [`EMPYREAN_TAGGED_COV_PANIC`] because it is the same kind of
+ * boundary condition — something the ABI could not describe — rather
+ * than the next entry in the sequence of real, diagnosable failures.
+ */
+#define EMPYREAN_TAGGED_COV_UNKNOWN -98
 
 /**
  * A panic was caught at the boundary.
@@ -2738,14 +2795,28 @@ struct EmpyreanObserver {
  *
  * # Generating for an SB441-N16 body
  *
- * `ephemeris_overlap_policy` matters more here than on `empyrean_propagate`.
- * Under the default `EMPYREAN_EPHEMERIS_OVERLAP_POLICY_SUBSTITUTE_SPK` the engine
- * skips integration for a target that coincides with one of its own
- * perturbers — and ephemeris generation reads the dense trajectory that
- * integration would have produced, so the call **fails** for any
- * SB441-N16 body at Standard tier. Pass
- * `EMPYREAN_EPHEMERIS_OVERLAP_POLICY_EXCLUDE_AND_INTEGRATE` (or exclude the body
- * via `excluded_perturbers_naif`) to generate ephemerides for one.
+ * `ephemeris_overlap_policy` decides WHICH trajectory the rows come
+ * from when a target coincides with one of its own perturbers. Both
+ * settings produce rows, and the result's warnings channel says which
+ * answer you got — read it, because the two are not interchangeable.
+ *
+ * Under the default `EMPYREAN_EPHEMERIS_OVERLAP_POLICY_SUBSTITUTE_SPK`
+ * the engine skips integration and serves the rows off the body's own
+ * SPK — the authoritative solution for that body, but **not** a
+ * propagation of the initial condition you supplied. Those rows carry
+ * **no sky covariance**, and if the input orbit declared one, the
+ * warning says it was dropped.
+ *
+ * Under `EMPYREAN_EPHEMERIS_OVERLAP_POLICY_EXCLUDE_AND_INTEGRATE` the
+ * body is removed from its own force model and your initial condition
+ * is integrated, so the covariance is transported and the rows are
+ * differentiable — at the cost of a force model one perturber short,
+ * which its warning states. Naming the body in
+ * `excluded_perturbers_naif` is the other route to the same place.
+ *
+ * Radar generation is the one product that still **fails** outright
+ * under the substituting policy: its Jacobian is composed on the STM,
+ * which an SPK substitution does not produce.
  */
 struct EmpyreanEphemerisConfig {
     /**
@@ -2991,10 +3062,33 @@ struct EmpyreanObservationSensitivity {
      * flattened (length `6 * n_params * n_params`). Null unless a
      * second-order method (Jet2) ran.
      *
+     * The tensor is COMPOSED to the same input axis as `jacobian` — the
+     * orbit-epoch state in `frame`/`origin` — so the pair is one
+     * second-order expansion (villeneuve 1.25.0; earlier engines
+     * published the LOCAL topocentric second derivative here, a
+     * different input domain from the Jacobian beside it, and any
+     * consumer that contracted the two together read the wrong
+     * quantity). Populated on `SECOND_ORDER` rows of orbits declaring a
+     * state covariance and no solved force-model parameters, where
+     * `n_params == 6`; null on every other row.
+     *
      * Leading index is the observable, in the same order and the same
      * units-per-input-unit as `jacobian` — index it with the same
      * `EMPYREAN_SENSITIVITY_ROW_*` constants. Element `(row, i, j)` is
      * `hessian[(row * n_params + i) * n_params + j]`.
+     *
+     * # Consumer note (fold builders)
+     *
+     * The per-row sky covariance delivered alongside this tensor under
+     * a second-order method is the moment **about the published
+     * nominal**: it already contains the mean-shift outer product
+     * `δμ_a · δμ_b`, with `δμ_a = ½ tr(H_a Σ)` built from THIS tensor.
+     * A consumer building its own bias-corrected update must not ALSO
+     * subtract that shift from the innovation while using the delivered
+     * matrix as its noise term — that double-counts the correction.
+     * Either subtract the shift and build your own noise term from this
+     * tensor, or take the delivered matrix as-is and leave the
+     * innovation alone.
      */
     double *hessian;
     /**
@@ -6007,12 +6101,19 @@ struct EmpyreanTaggedCovariance {
      */
     uint8_t kind;
     /**
-     * RNG seed — valid iff `has_mc_seed == 1` (kind == MONTE_CARLO).
+     * RNG seed — valid iff `has_mc_seed == 1`, which implies
+     * `kind == EMPYREAN_COVARIANCE_KIND_MONTE_CARLO` but is **not**
+     * implied by it: a Monte-Carlo run seeded from system entropy
+     * rather than a caller-supplied seed produces an ensemble that is
+     * not reproducible by construction, and such a row carries
+     * `has_mc_seed == 0`. Read the flag, not the kind.
      */
     uint64_t mc_seed;
     /**
-     * Disambiguates a real `mc_seed == 0` from "no seed". 0 on the
-     * `_cartesian` accessor (MC resolves to an error there).
+     * Disambiguates a real `mc_seed == 0` from "no seed" — including
+     * the entropy-seeded Monte-Carlo row above, whose seed is absent
+     * rather than zero. 0 on the `_cartesian` accessor (MC resolves to
+     * an error there).
      */
     uint8_t has_mc_seed;
     /**

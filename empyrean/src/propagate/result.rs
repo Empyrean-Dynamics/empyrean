@@ -130,7 +130,9 @@ pub struct TaggedCovariance {
     pub matrix: [[f64; 6]; 6],
     /// How the covariance was derived.
     pub kind: CovarianceKind,
-    /// Monte-Carlo run seed (`Some` only when `kind == MonteCarlo`).
+    /// Monte-Carlo run seed. `Some` only when `kind == MonteCarlo`, but
+    /// not on every such row: an ensemble seeded from system entropy is
+    /// not reproducible by construction and carries `None`.
     pub mc_seed: Option<u64>,
     /// Second-order propagation mean shift δμ_prop (zero at t₀).
     pub mean_shift_prop: Option<[f64; 6]>,
@@ -417,7 +419,7 @@ pub struct Event {
 }
 
 impl Event {
-    pub(crate) fn from_ffi(e: &empyrean_sys::EmpyreanEvent) -> Self {
+    pub(crate) fn from_ffi(e: &empyrean_sys::EmpyreanEvent) -> Result<Self> {
         fn cstr_to_string(ptr: *const std::ffi::c_char) -> String {
             if ptr.is_null() {
                 String::new()
@@ -433,17 +435,24 @@ impl Event {
         } else {
             Origin::from_naif_id(e.body_naif_id)
         };
-        // `0xFF` is the C ABI's "not a regime event" sentinel; any other
-        // tag that fails to resolve also degrades to `None` rather than
-        // failing the whole batch.
-        let kind_opt = |tag: u8| {
+        // `0xFF` is the C ABI's "not a regime event" sentinel and the
+        // ONLY tag that legitimately means "no kind here".
+        //
+        // Every other unresolvable tag is an error, not a `None`. The C
+        // ABI grew `EMPYREAN_COVARIANCE_KIND_UNKNOWN` (0xFE) precisely so
+        // that a kind this ABI has no tag for is refused rather than
+        // folded onto a concrete one — and swallowing it here would undo
+        // that at the last hop, reporting "this event has no covariance
+        // kind" for an event that has one this build cannot name. The two
+        // facts are not the same and must not share a representation.
+        let kind_opt = |tag: u8| -> Result<Option<CovarianceKind>> {
             if tag == 0xFF {
-                None
+                Ok(None)
             } else {
-                CovarianceKind::from_u8(tag).ok()
+                CovarianceKind::from_u8(tag).map(Some)
             }
         };
-        Self {
+        Ok(Self {
             event_type: cstr_to_string(e.event_type),
             orbit_id: cstr_to_string(e.orbit_id),
             object_id: cstr_to_string(e.object_id),
@@ -477,12 +486,12 @@ impl Event {
             nonlinearity: e.nonlinearity,
             ip_agm: e.ip_agm,
             ip_mc: e.ip_mc,
-            previous_kind: kind_opt(e.previous_kind),
-            regime_resolved_kind: kind_opt(e.resolved_kind),
+            previous_kind: kind_opt(e.previous_kind)?,
+            regime_resolved_kind: kind_opt(e.resolved_kind)?,
             kappa: e.kappa,
             threshold_below: e.threshold_below,
             threshold_above: e.threshold_above,
-        }
+        })
     }
 }
 
@@ -1050,6 +1059,64 @@ mod tests {
             CovarianceKind::SigmaPoint
         );
         assert!(CovarianceKind::from_u8(6).is_err(), "unknown tags reject");
+    }
+}
+
+#[cfg(test)]
+mod event_kind_decode_tests {
+    use super::Event;
+
+    /// A zeroed `EmpyreanEvent` — every pointer null (the string readers
+    /// handle null) and every payload 0 — so a test can set exactly the
+    /// two tag fields it is about. `#[repr(C)]` POD with raw pointers,
+    /// so an all-zero bit pattern is a valid value.
+    fn blank_event() -> empyrean_sys::EmpyreanEvent {
+        unsafe { std::mem::zeroed() }
+    }
+
+    /// `0xFF` is the only tag that means "this event has no covariance
+    /// kind", and it must keep decoding to `None`.
+    #[test]
+    fn the_not_applicable_sentinel_decodes_to_none() {
+        let mut e = blank_event();
+        e.previous_kind = 0xFF;
+        e.resolved_kind = 0xFF;
+        let ev = Event::from_ffi(&e).expect("0xFF is not an error — it is 'no kind here'");
+        assert!(ev.previous_kind.is_none());
+        assert!(ev.regime_resolved_kind.is_none());
+    }
+
+    /// `EMPYREAN_COVARIANCE_KIND_UNKNOWN` (0xFE) must ERROR, not decode
+    /// to `None`.
+    ///
+    /// The two facts are different and must not share a representation:
+    /// `None` says "this event carries no covariance kind", while 0xFE
+    /// says "it carries one this build has no name for". Swallowing the
+    /// second into the first would undo, at the last hop, the entire
+    /// reason the UNKNOWN tag exists — and the C ABI's own documentation
+    /// promises the wrappers above it stop on an unrecognised tag.
+    #[test]
+    fn the_unknown_kind_tag_errors_rather_than_reading_as_absent() {
+        let mut e = blank_event();
+        e.previous_kind = 0xFF;
+        e.resolved_kind = 0xFE;
+        let err = Event::from_ffi(&e)
+            .expect_err("an UNKNOWN covariance kind must not decode as 'no kind'");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("254") || msg.to_lowercase().contains("unknown"),
+            "the error must name the tag it could not resolve, got {msg:?}"
+        );
+
+        // ...and on the other tag field too — both are decoded, so both
+        // must refuse.
+        let mut e = blank_event();
+        e.previous_kind = 0xFE;
+        e.resolved_kind = 0xFF;
+        assert!(
+            Event::from_ffi(&e).is_err(),
+            "previous_kind must refuse an UNKNOWN tag as well"
+        );
     }
 }
 

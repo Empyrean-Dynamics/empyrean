@@ -78,6 +78,14 @@ pub enum UncertaintyMethod {
     /// [`FirstOrder`](Self::FirstOrder) — that is expected, not a bug.
     /// Construct with [`gaussian_mixture()`](Self::gaussian_mixture) for
     /// the engine defaults. Reference: DeMars-Bishop-Jah (JGCD 2013).
+    ///
+    /// **Propagation only.** Ephemeris generation refuses this method,
+    /// naming it and the seam, rather than composing a first-order sky
+    /// covariance under a mixture's name: components are born during
+    /// propagation and retained on-grid only, so no per-observation sky
+    /// projection exists yet. The on-grid moment-matched mixture
+    /// covariance is available from the propagation result's covariance
+    /// series.
     Mixture {
         /// Nonlinearity threshold above which the splitter fires
         /// (default: 1.0).
@@ -385,10 +393,18 @@ pub enum EphemerisOverlapPolicy {
     /// the caller's initial condition is **discarded** (two inputs within
     /// the detection threshold produce identical output, which makes the
     /// path useless for anything differential — an OD step, a covariance
-    /// sweep), and **no trajectory is produced**, so there is no dense
-    /// trajectory, no STM, and no sensitivity chain. Ephemeris and radar
-    /// generation both read those, and therefore fail outright for an
-    /// overlapped body under this policy.
+    /// sweep), and nothing is integrated, so there is no STM and no
+    /// sensitivity chain.
+    ///
+    /// Optical ephemeris generation **succeeds** here, served off the
+    /// body's own SPK-backed trajectory, and reports the substitution on
+    /// the result's warnings channel — naming the body and saying
+    /// whether a declared covariance was dropped. Those rows carry no
+    /// sky covariance, because a covariance describes the initial
+    /// condition this policy discards.
+    ///
+    /// Radar generation still fails outright: its Jacobian is composed
+    /// on the STM a substitution never produces.
     #[default]
     SubstituteSpk,
     /// Integrate normally, with the matched perturber removed from the

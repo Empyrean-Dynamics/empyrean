@@ -153,12 +153,22 @@ def propagate(
           (reproducibly, for a fixed ``seed``) and reports the
           Monte-Carlo impact probability on the
           :attr:`~empyrean.PossibleImpacts.ip_mc` column of any
-          possible-impact event. It does **not** reconstruct a per-epoch
-          state covariance — the propagated states carry no state
-          covariance under ``MONTE_CARLO`` (use ``SIGMA_POINT`` for a
-          sampled state covariance, or
-          :func:`~empyrean.compute_impact_probabilities` for the
-          full Monte-Carlo impact-probability workflow).
+          possible-impact event. It also publishes the per-epoch
+          ensemble covariance — the centered sample second moment about
+          the ensemble mean — read back tagged ``monte_carlo`` with the
+          run's seed.
+
+          Two absences are honest rather than missing. Below a floor of
+          **7 draws** no covariance is published at all: ``n`` draws give
+          a sample moment of rank at most ``n − 1``, so a 6×6 built from
+          fewer is rank-deficient by construction. The engine names that
+          case with a warning the propagate path cannot yet surface at
+          this layer, so from Python the sub-floor case is visible only
+          as the absent (all-NaN) covariance — see
+          ``bd empyrean-snr0w``. And a run seeded from system entropy
+          (``MonteCarlo(seed=None)``) publishes its covariance with a
+          **null** seed, never ``0``: that ensemble is not reproducible
+          by construction, and ``0`` is a real, reproducible seed.
         * ``GAUSSIAN_MIXTURE`` splits the input Gaussian into an adaptive
           mixture at close approaches; its distinctive product is the
           mixture-corrected impact probability. Away from encounters the

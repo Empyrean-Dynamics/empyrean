@@ -22,9 +22,9 @@ use std::ffi::{CStr, CString, c_char};
 use std::panic::AssertUnwindSafe;
 
 use empyrean_core::planning::{
-    CandidateInfo, CandidateKind, CovarianceMetrics, ObservatoryConfig, PlanResult,
-    PlannedObservation, PlanningConfig, RadarMode, RadarPlanSpec, Station, TargetRadarProperties,
-    evaluate_plan_single,
+    CandidateInfo, CandidateKind, CovarianceMetrics, EngineUncertaintyMethod, ObservatoryConfig,
+    PlanResult, PlannedObservation, PlanningConfig, RadarMode, RadarPlanSpec, Station,
+    TargetRadarProperties, evaluate_plan_single,
 };
 use empyrean_core::time::Epoch;
 
@@ -478,6 +478,18 @@ fn build_planning_config(c: &EmpyreanPlanningConfig) -> Result<PlanningConfig, S
             Some(c.num_threads as usize)
         },
         encounter: None,
+        // Both are pinned to the behaviour this seam has always had,
+        // not left to `Default`: the engine's default for either field
+        // may move, and this ABI exposes no knob for a caller to move
+        // it back. `FirstOrder` is the single-linearization Gaussian
+        // fold every previous release of `empyrean_evaluate_plan`
+        // computed; `None` is the raw per-candidate σ it has always
+        // consumed unmodified. Exposing the two as C-ABI knobs — with
+        // the uncertainty-method flat struct the propagation entry
+        // points already carry, and a weighting config the OD seam
+        // would share — is bd empyrean-848gm.10.
+        uncertainty_method: EngineUncertaintyMethod::FirstOrder,
+        weighting: None,
     })
 }
 

@@ -264,10 +264,33 @@ def test_sbdb_cometary_sigma_point_is_genuine(sbdb_orbit, sbdb_grid) -> None:
     _assert_sigma_point_is_not_linear(res_fo, res_sp)
 
 
-def test_sbdb_generate_ephemeris_rejects_sampling(sbdb_orbit, sbdb_grid) -> None:
-    """generate_ephemeris rejects the sampling methods with a typed error
-    (the silent-ignore fix), on a real SBDB orbit + observer."""
+def test_sbdb_generate_ephemeris_sampling_is_the_engines_call(
+    sbdb_orbit, sbdb_orbit_cartesian, sbdb_grid
+) -> None:
+    """generate_ephemeris adds no wrapper gate on the sampling methods
+    (villeneuve 1.25.0, bd empyrean-848gm.1): the engine decides, and on
+    a real SBDB record both of its answers are pinned. The record as
+    queried carries a Cometary primary coordinate, which the sampled sky
+    delivery does not cover yet (it flies the state and state+Marsden
+    solved spaces; the joint machinery is 848gm.1 residue) — so the
+    engine refuses BY NAME, as a ``RuntimeError``, never as a wrapper
+    ``ValueError``. The same record as a Cartesian orbit is delivered: a
+    finite sky covariance that is not the first-order projection."""
     observers = empyrean.get_observer_states(["500"], Epochs.from_mjd(sbdb_grid, scale="tdb"))
-    for method in (UncertaintyMethod.SIGMA_POINT, UncertaintyMethod.MONTE_CARLO):
-        with pytest.raises(ValueError, match="sampling uncertainty methods"):
+
+    for method in (UncertaintyMethod.SIGMA_POINT, MonteCarlo(n_samples=64, seed=7)):
+        with pytest.raises(RuntimeError, match="Cometary primary coordinate"):
             empyrean.generate_ephemeris(sbdb_orbit, observers, uncertainty_method=method)
+
+    def sky(method):
+        cov = empyrean.generate_ephemeris(
+            sbdb_orbit_cartesian, observers, uncertainty_method=method
+        ).ephemeris.coordinates.covariance
+        assert cov is not None, f"{method}: sky covariance column missing"
+        return cov.to_matrix()
+
+    fo = sky(UncertaintyMethod.FIRST_ORDER)
+    for method in (UncertaintyMethod.SIGMA_POINT, MonteCarlo(n_samples=64, seed=7)):
+        m = sky(method)
+        assert np.isfinite(m).all(), f"{method}: sampled sky covariance not finite"
+        assert not np.array_equal(m, fo), f"{method}: sky covariance is the first-order one"

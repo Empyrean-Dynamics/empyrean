@@ -3329,9 +3329,14 @@ fn _generate_ephemeris<'py>(
     // ephemeris path in this distribution. `uncertainty_method`, the
     // `sigma_*` / `mc_*` sampling params, and the `gm_*` GaussianMixture
     // params are all consumed below (built into the method and validated)
-    // rather than silently discarded. GaussianMixture is analytic (an
-    // AD/Jet2 method, honorable in ephemeris) so it flows onto the config
-    // normally — only the sampling methods are rejected below.
+    // rather than silently discarded. Every method flows onto the config
+    // as requested: the engine honors the canonical sampling methods on
+    // this seam (sampled sky moments, villeneuve 1.25.0, bd
+    // empyrean-848gm.1) and refuses by name what it does not deliver —
+    // non-canonical sigma knobs, sub-floor Monte-Carlo draws, and
+    // GaussianMixture (analytic, but without a per-observation sky
+    // projection yet: bd empyrean-oihdg). Pinned by
+    // tests/test_uncertainty_methods.py and tests/test_gaussian_mixture.py.
     let _ = epsilon;
     let ctx = get_context()?;
 
@@ -3582,30 +3587,13 @@ fn _generate_ephemeris<'py>(
         auto_gmm_max_depth,
         auto_gmm_components_per_split,
     )?;
-    // Sampling methods cannot be honored on the ephemeris path: villeneuve
-    // derives the sky-plane covariance from a first-order STM projection
-    // (J·Φ·Σ·Φᵀ·Jᵀ) and does not consume a sampled ensemble. SigmaPoint
-    // would silently collapse to that first-order sky covariance (it is
-    // not dispatched below the ephemeris propagate seam), and MonteCarlo
-    // would fail the dense-trajectory-cache requirement with an opaque
-    // integrator error.
-    // Rather than silently degrade or surface a confusing failure, reject
-    // them here with a typed, descriptive error (no hidden fallback).
-    if matches!(
-        uncertainty,
-        empyrean::UncertaintyMethod::SigmaPoint { .. }
-            | empyrean::UncertaintyMethod::MonteCarlo { .. }
-    ) {
-        return Err(PyValueError::new_err(
-            "sampling uncertainty methods (SIGMA_POINT, MONTE_CARLO) are not \
-             supported for generate_ephemeris: the sky-plane covariance is a \
-             first-order STM projection and does not consume a sampled \
-             ensemble. Use FIRST_ORDER, SECOND_ORDER, or AUTO for ephemeris \
-             uncertainty; for a sampled state covariance use \
-             propagate(uncertainty_method=SIGMA_POINT), and for Monte-Carlo \
-             impact probability use compute_impact_probabilities.",
-        ));
-    }
+    // The sampling methods are the engine's to honor or refuse: canonical
+    // SigmaPoint and MonteCarlo (>= 8 draws) fly the member set through
+    // the generation pipeline and deliver the ensemble's sky moments; a
+    // non-canonical knob or a sub-floor draw count comes back as the
+    // engine's typed refusal naming the method and the seam — the same
+    // route GaussianMixture takes. No pre-flight here: this layer must
+    // not be stricter than the C ABI and the Rust wrapper beneath it.
     eph_config.propagation.uncertainty_method = uncertainty;
     // Dispatch through the reusable handle when supplied, else one-shot.
     // Both release the GIL around the native call; the handle path runs

@@ -156,8 +156,10 @@ class TaggedCovariance:
         a nonzero second-order correction. Read-only provenance —
         guard with :func:`math.isfinite` before any arithmetic.
     mc_seed : int, optional
-        Monte-Carlo run seed (set only when ``kind`` is
-        :attr:`CovarianceKind.MONTE_CARLO`).
+        Monte-Carlo run seed. Set only when ``kind`` is
+        :attr:`CovarianceKind.MONTE_CARLO`, but not on every such row:
+        an ensemble seeded from system entropy is not reproducible by
+        construction and carries ``None``.
     mean_shift_prop : np.ndarray, optional
         Second-order propagation mean shift ``δμ_prop`` (zero at t₀),
         shape ``(6,)`` or ``None``.
@@ -277,7 +279,9 @@ class TaggedCovariances(qv.Table):
     ``quality``. Read-only provenance — check ``np.isfinite`` first."""
 
     mc_seed = qv.UInt64Column(nullable=True)
-    """Monte-Carlo run seed; null unless ``kind`` is ``monte_carlo``."""
+    """Monte-Carlo run seed; null unless ``kind`` is ``monte_carlo``, and
+    null on a ``monte_carlo`` row whose ensemble was seeded from system
+    entropy (not reproducible by construction)."""
 
     # Second-order propagation mean shift δμ_prop (zero at t₀).
     mean_shift_prop_x = qv.Float64Column(nullable=True)

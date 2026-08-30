@@ -206,7 +206,7 @@ pub(crate) fn marshal_propagation_result(
         unsafe { std::slice::from_raw_parts(ffi_result.events, ffi_result.num_events) }
             .iter()
             .map(Event::from_ffi)
-            .collect()
+            .collect::<Result<Vec<_>>>()?
     };
 
     // Per-orbit AGM mixture chains. The C ABI emits one row per input

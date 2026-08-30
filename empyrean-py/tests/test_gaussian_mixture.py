@@ -5,11 +5,22 @@ mixture, AGM) uncertainty method in :func:`empyrean.propagate` and
 GaussianMixture is exposed as a top-level uncertainty method (tag 5)
 reusing the AGM parameter slots the C ABI already carried for ``Auto``;
 the flat ``tag`` disambiguates a standalone mixture from Auto's internal
-splitter. Unlike the sampling methods (``SIGMA_POINT`` / ``MONTE_CARLO``),
-GaussianMixture is analytic (an AD / Jet2 method like ``SECOND_ORDER``)
-and is therefore HONORED on both the ``propagate`` and the
-``generate_ephemeris`` paths — it must never be rejected the way the
-sampling methods are.
+splitter.
+
+It is HONORED on ``propagate``, where the mixture is born and retained.
+It is REFUSED on ``generate_ephemeris``: since villeneuve 1.25.0 (the
+uniform uncertainty-method gate, bd empyrean-848gm) the optical seams
+refuse any method they have no delivery for, by name, rather than
+silently composing a first-order sky covariance under the requested
+method's label. Mixture components are born during propagation and
+retained on-grid only, so no per-observation sky projection exists yet —
+that delivery is bd empyrean-oihdg, and the on-grid moment-matched
+mixture covariance is reachable through ``covariance_series`` meanwhile.
+
+So both GaussianMixture and the sampling methods are refused on the
+ephemeris path, but by different mechanisms and for different reasons —
+a distinction these tests pin, because collapsing them would hide which
+layer is doing the refusing.
 
 Its distinctive product is the mixture-corrected impact probability at
 close approaches; away from encounters the output-state covariance is the
@@ -222,7 +233,7 @@ def test_propagate_gaussian_mixture_wire_dict_path_consistent(
 
 
 # ══════════════════════════════════════════════════════════════════
-#  generate_ephemeris — GaussianMixture is ACCEPTED (analytic)
+#  generate_ephemeris — GaussianMixture is REFUSED BY NAME (no delivery)
 # ══════════════════════════════════════════════════════════════════
 
 
@@ -231,35 +242,63 @@ def test_propagate_gaussian_mixture_wire_dict_path_consistent(
     [UncertaintyMethod.GAUSSIAN_MIXTURE, GaussianMixture()],
     ids=["enum", "dataclass"],
 )
-def test_generate_ephemeris_accepts_gaussian_mixture(
+def test_generate_ephemeris_refuses_gaussian_mixture_by_name(
     orbit: CartesianOrbits, observers, method
 ) -> None:
-    """Unlike the sampling methods (which ``generate_ephemeris`` rejects
-    with a ``ValueError``), GaussianMixture is analytic and MUST be
-    accepted — the call runs and yields a finite sky-plane covariance."""
-    eph = empyrean.generate_ephemeris(orbit, observers, uncertainty_method=method)
-    cov = eph.ephemeris.coordinates.covariance
-    assert cov is not None, "GaussianMixture: sky covariance column missing"
-    m = cov.to_matrix()
-    assert np.isfinite(m).all(), "GaussianMixture: sky covariance not finite"
+    """The optical seam has no mixture sky delivery, so it REFUSES —
+    naming both the method and the seam that refused it — rather than
+    composing a first-order sky covariance and labelling it
+    GaussianMixture (bd empyrean-848gm; the delivery itself is
+    bd empyrean-oihdg).
+
+    A silent downgrade here would be undetectable downstream: the caller
+    asked for a mixture, would receive a linear projection, and nothing
+    in the result would say so. Both the enum and the dataclass request
+    forms must refuse identically — a knob that refuses one spelling and
+    honors the other is worse than either.
+
+    Mirrors villeneuve ``tests/test_ephemeris_marginal_covariance.rs::
+    sampled_methods_are_refused_by_name_at_the_optical_entries``, which
+    pins the same refusal at the engine seam.
+    """
+    with pytest.raises(RuntimeError) as excinfo:
+        empyrean.generate_ephemeris(orbit, observers, uncertainty_method=method)
+
+    msg = str(excinfo.value)
+    assert "GaussianMixture" in msg, f"the refusal must name the method, got {msg!r}"
+    assert "generate_optical_with_system" in msg, (
+        f"the refusal must name the seam that refused it, got {msg!r}"
+    )
+    assert "silently downgraded" in msg, (
+        "the refusal must say what it declined to do instead — that is the "
+        f"whole reason it is an error and not a quiet first-order row: {msg!r}"
+    )
 
 
-def test_generate_ephemeris_gaussian_mixture_not_in_rejection(
+def test_generate_ephemeris_refuses_the_mixture_by_name_while_sampling_is_delivered(
     orbit: CartesianOrbits, observers
 ) -> None:
-    """Explicit differential against the sampling-method rejection: the
-    same call shape that raises for SIGMA_POINT / MONTE_CARLO must NOT
-    raise for GAUSSIAN_MIXTURE."""
-    # sampling methods are rejected...
-    with pytest.raises(ValueError, match="sampling uncertainty methods"):
-        empyrean.generate_ephemeris(
-            orbit, observers, uncertainty_method=UncertaintyMethod.SIGMA_POINT
-        )
-    # ...GaussianMixture is not.
+    """The wrapper adds no gate of its own on the ephemeris path: the
+    engine decides. ``SIGMA_POINT`` is delivered (the sampled sky moment,
+    villeneuve 1.25.0, bd empyrean-848gm.1 — pinned in
+    ``test_uncertainty_methods.py``), while ``GAUSSIAN_MIXTURE`` is
+    refused by the engine as a missing delivery (``RuntimeError`` naming
+    the method), because a mixture IS analytic and the gap is a
+    per-observation sky projection that has not been built yet
+    (bd empyrean-oihdg), not a category error.
+
+    Collapsing the two would tell a caller to change their method when
+    the honest answer is "this one is coming".
+    """
     eph = empyrean.generate_ephemeris(
-        orbit, observers, uncertainty_method=UncertaintyMethod.GAUSSIAN_MIXTURE
+        orbit, observers, uncertainty_method=UncertaintyMethod.SIGMA_POINT
     )
     assert eph.ephemeris.coordinates.covariance is not None
+
+    with pytest.raises(RuntimeError, match="GaussianMixture"):
+        empyrean.generate_ephemeris(
+            orbit, observers, uncertainty_method=UncertaintyMethod.GAUSSIAN_MIXTURE
+        )
 
 
 # ══════════════════════════════════════════════════════════════════

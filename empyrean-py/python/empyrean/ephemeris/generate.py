@@ -96,22 +96,39 @@ def generate_ephemeris(
         if ``config`` is given.
     uncertainty_method : UncertaintyMethod | SigmaPoint | MonteCarlo | GaussianMixture | str
         Optional quick override for ``config.propagation.uncertainty_method``.
-        Only the analytic methods are supported for ephemeris:
-        ``FIRST_ORDER``, ``SECOND_ORDER``, ``AUTO``, and
-        ``GAUSSIAN_MIXTURE`` (``SECOND_ORDER`` additionally populates
-        observation Hessians on the resulting
-        :class:`~empyrean.types.ObservationSensitivity`;
-        ``GAUSSIAN_MIXTURE`` is an adaptive-Gaussian-mixture method that is
-        likewise analytic on this path). The sky-plane covariance is a
-        first-order STM projection (``J·Φ·Σ·Φᵀ·Jᵀ``) that does not consume
-        a sampled ensemble, so the sampling methods ``SIGMA_POINT`` and
-        ``MONTE_CARLO`` are **rejected with a** :class:`ValueError`
-        rather than silently downgraded to first order. For a sampled
-        state covariance use
-        :func:`~empyrean.propagate` with ``SIGMA_POINT``; for Monte-Carlo
-        impact probability use
-        :func:`~empyrean.compute_impact_probabilities`. Ignored if
-        ``config`` is given.
+        Honored here: ``FIRST_ORDER``, ``SECOND_ORDER`` and ``AUTO``
+        (``SECOND_ORDER`` additionally populates observation Hessians on
+        the resulting :class:`~empyrean.types.ObservationSensitivity`),
+        and the two sampling methods, which fly the member set through
+        the generation pipeline (light time and all) and deliver the
+        ensemble's sky moments as the row covariance:
+
+        * ``SIGMA_POINT`` — the canonical 2N+1 unscented set, which is
+          parameter-free; pass ``SigmaPoint()`` and leave ``n_sigma`` /
+          ``samples_per_plane`` at their defaults (``1.0`` / ``8``). Any
+          other value is refused by the engine.
+        * ``MONTE_CARLO`` — ``n_samples`` draws with the run's ``seed``
+          (same seed, same rows bit for bit); fewer than 8 draws is
+          refused by the engine, because the sky moment of a smaller
+          ensemble is rank-deficient.
+
+        Refusals come from the engine as :class:`RuntimeError` naming
+        the method and the seam, never as a silent downgrade to a
+        first-order sky covariance wearing the requested method's name.
+        A prior wide enough that the sampled members disperse beyond the
+        engine's sky chart is refused the same way, and so is an orbit
+        whose primary coordinate is not Cartesian (a Cometary record as
+        queried from SBDB, for instance): the delivery flies the state
+        and state+Marsden solved spaces today, so bring such an orbit to
+        a Cartesian state first. ``GAUSSIAN_MIXTURE``
+        is refused on this path too: the mixture is analytic, so this is
+        a delivery that does not exist yet rather than a category error —
+        components are born during propagation and retained on-grid only,
+        so there is no per-observation sky projection to make; the
+        on-grid moment-matched mixture covariance is reachable meanwhile
+        through the covariance series on :func:`~empyrean.propagate`.
+
+        Ignored if ``config`` is given.
 
     Returns
     -------

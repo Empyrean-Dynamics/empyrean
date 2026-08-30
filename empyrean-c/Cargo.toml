@@ -21,7 +21,12 @@ crate-type = ["cdylib", "staticlib"]
 [dependencies]
 # C ABI is a thin shell over empyrean-core. The internal Rust API is
 # never re-exported through this crate — only the C symbols are.
-empyrean-core = { git = "ssh://git@github.com/Empyrean-Dynamics/empyrean-core.git", tag = "v0.10.2", features = ["parquet"] }
+# ENGINE-TRACKING PIN (TEMP pre-tag co-development state): empyrean-core is
+# pinned to the pushed tip of its engine-tracking branch
+# (feature/uncertainty-method-adoption — itself pinned to villeneuve main and
+# scott's tracking tip) instead of the v0.10.2 tag. Release assembly swaps it
+# back to `tag = "vX.Y.Z"`.
+empyrean-core = { git = "ssh://git@github.com/Empyrean-Dynamics/empyrean-core.git", rev = "da04d2e30fae1ec750f98a995739fc90c54e75cb", features = ["parquet"] }
 arrow = "58"
 parquet = "58"
 serde = { version = "1", features = ["derive"] }

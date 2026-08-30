@@ -6,6 +6,90 @@ project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Changed
+- The observation-sensitivity `hessian` payload on the C ABI (and every
+  channel above it) is now the tensor COMPOSED to the same input axis as
+  the `jacobian` beside it — the orbit-epoch state — so the pair is one
+  second-order expansion. Earlier releases published the LOCAL topocentric
+  second derivative under the same field, a different input domain; a
+  consumer that contracted the two together read the wrong quantity. The
+  tensor is populated on `SECOND_ORDER` rows of orbits declaring a state
+  covariance and no solved force-model parameters (`n_params == 6`), and
+  is null elsewhere — the `6 * n_params²` length contract is unchanged.
+- Ephemeris generation for a body that is also one of its own perturbers
+  (any of the sixteen SB441-N16 asteroids at Standard tier) now SUCCEEDS
+  under the default `SUBSTITUTE_SPK` overlap policy, where it previously
+  failed outright for want of a dense trajectory. The rows are served off
+  the body's own SPK — the authoritative solution for that body, but not a
+  propagation of the caller's initial condition — and the substitution is
+  reported on the result's warnings channel, naming the body and saying
+  whether a declared covariance was dropped. Those rows carry no sky
+  covariance, because a covariance describes the initial condition the
+  substitution discards. `EXCLUDE_AND_INTEGRATE` is unchanged and remains
+  the way to propagate the supplied state (and its covariance); it now
+  reports its exclusion on the same channel. Radar generation still
+  refuses under the substituting policy — its Jacobian is composed on an
+  STM a substitution never produces.
+- `SIGMA_POINT` and `MONTE_CARLO` on the ephemeris path
+  (`empyrean_generate_ephemeris`, the handle-based
+  `empyrean_builtsystem_generate_ephemeris`, and every channel above them)
+  now deliver the sampled ensemble's sky moments as the row covariance:
+  the member set flies through the generation pipeline, light time and
+  all. Under the previous engine the same `SIGMA_POINT` call returned a
+  first-order STM projection under the sigma-point name, and `MONTE_CARLO`
+  failed with an opaque integrator error — so a C or Rust caller passing
+  either method gets different numbers from the same call. The engine
+  enforces the envelope by name: the unscented set is the parameter-free
+  canonical 2N+1 construction (`n_sigma == 1.0`, `samples_per_plane == 8`;
+  anything else is refused), fewer than 8 Monte-Carlo draws is refused
+  (no full-rank sky moment), a prior whose members disperse beyond the
+  engine's sky chart is refused rather than folded, and so is an orbit
+  whose primary coordinate is not Cartesian (the delivery flies the state
+  and state+Marsden solved spaces today). The Python wrapper,
+  which had pre-emptively refused both methods on this path with its own
+  `ValueError`, now passes them through like the C ABI and the Rust
+  wrapper do; the engine's refusals surface as `RuntimeError` naming the
+  method.
+- **BREAKING** — `GaussianMixture` on the ephemeris path is now a typed
+  refusal naming the method and the seam, where it previously returned a
+  first-order sky covariance under the mixture's name. Nothing about the
+  numbers changed; what changed is that the silent downgrade is now an
+  error a caller can see. Mixture components are born during propagation
+  and retained on-grid only, so no per-observation sky projection exists
+  yet; the on-grid moment-matched mixture covariance remains available
+  from the propagation result's covariance series, and `GaussianMixture`
+  on `propagate` is unaffected. Callers who were requesting it on the
+  ephemeris path were receiving first-order results and should now either
+  request `FIRST_ORDER` explicitly or move to the covariance series.
+- Monte-Carlo propagation now publishes a per-epoch state covariance — the
+  centered sample second moment about the ensemble mean, tagged
+  `MONTE_CARLO` with the run's seed — where the states previously carried
+  none. Two absences are deliberate: an ensemble below a floor of 7 draws
+  publishes no covariance (n draws give a sample moment of rank at most
+  n−1, so a 6×6 built from fewer is rank-deficient by construction), and
+  an entropy-seeded run publishes its covariance with no seed beside it.
+- A Monte-Carlo covariance row no longer always carries a seed. The engine's
+  result tag now records the run's seed as optional, so a Monte-Carlo run
+  seeded from system entropy (`mc_seed_some = 0` on the request) produces a
+  row tagged `EMPYREAN_COVARIANCE_KIND_MONTE_CARLO` with `has_mc_seed == 0` —
+  honest about an ensemble that is not reproducible by construction, rather
+  than reporting seed `0`, which is a real and reproducible seed. `kind ==
+  MONTE_CARLO` therefore no longer implies a valid `mc_seed`: read
+  `has_mc_seed`. Unchanged for every run given an explicit seed, and the
+  layers above already modelled the seed as nullable (`Option<u64>` in the
+  Rust wrapper, a nullable `mc_seed` column in Python), so both surface the
+  absence as `None` / null with no signature change.
+- Two version-skew tripwire codes joined the C ABI, for the case where the
+  engine resolves a covariance kind — or refuses a covariance series for a
+  reason — that this ABI has no tag for. `EMPYREAN_COVARIANCE_KIND_UNKNOWN`
+  (254) can now appear anywhere a `resolved_kind` / tagged-covariance `kind`
+  does, and `EMPYREAN_TAGGED_COV_UNKNOWN` (-98) anywhere the tagged-covariance
+  accessors return a code. Neither is a value to interpret: both say the
+  engine outran the ABI, and both exist so that such a row is never folded
+  onto a concrete kind or a sibling error code, which would be undetectable
+  downstream. Additive — no existing code or tag changed value, and the
+  shipped engine/ABI pairing emits neither.
+
 ## [0.10.0] — 2026-08-20
 
 The 0.10.0 final. Identical in content to 0.10.0-rc.2 — no code changes

@@ -208,10 +208,33 @@ pub struct EmpyreanObservationSensitivity {
     /// flattened (length `6 * n_params * n_params`). Null unless a
     /// second-order method (Jet2) ran.
     ///
+    /// The tensor is COMPOSED to the same input axis as `jacobian` — the
+    /// orbit-epoch state in `frame`/`origin` — so the pair is one
+    /// second-order expansion (villeneuve 1.25.0; earlier engines
+    /// published the LOCAL topocentric second derivative here, a
+    /// different input domain from the Jacobian beside it, and any
+    /// consumer that contracted the two together read the wrong
+    /// quantity). Populated on `SECOND_ORDER` rows of orbits declaring a
+    /// state covariance and no solved force-model parameters, where
+    /// `n_params == 6`; null on every other row.
+    ///
     /// Leading index is the observable, in the same order and the same
     /// units-per-input-unit as `jacobian` — index it with the same
     /// `EMPYREAN_SENSITIVITY_ROW_*` constants. Element `(row, i, j)` is
     /// `hessian[(row * n_params + i) * n_params + j]`.
+    ///
+    /// # Consumer note (fold builders)
+    ///
+    /// The per-row sky covariance delivered alongside this tensor under
+    /// a second-order method is the moment **about the published
+    /// nominal**: it already contains the mean-shift outer product
+    /// `δμ_a · δμ_b`, with `δμ_a = ½ tr(H_a Σ)` built from THIS tensor.
+    /// A consumer building its own bias-corrected update must not ALSO
+    /// subtract that shift from the innovation while using the delivered
+    /// matrix as its noise term — that double-counts the correction.
+    /// Either subtract the shift and build your own noise term from this
+    /// tensor, or take the delivered matrix as-is and leave the
+    /// innovation alone.
     pub hessian: *mut f64,
     /// Length of `hessian` (`6 * n_params²`), 0 when null.
     pub hessian_len: usize,
@@ -266,14 +289,28 @@ pub struct EmpyreanEphemerisResult {
 ///
 /// # Generating for an SB441-N16 body
 ///
-/// `ephemeris_overlap_policy` matters more here than on `empyrean_propagate`.
-/// Under the default `EMPYREAN_EPHEMERIS_OVERLAP_POLICY_SUBSTITUTE_SPK` the engine
-/// skips integration for a target that coincides with one of its own
-/// perturbers — and ephemeris generation reads the dense trajectory that
-/// integration would have produced, so the call **fails** for any
-/// SB441-N16 body at Standard tier. Pass
-/// `EMPYREAN_EPHEMERIS_OVERLAP_POLICY_EXCLUDE_AND_INTEGRATE` (or exclude the body
-/// via `excluded_perturbers_naif`) to generate ephemerides for one.
+/// `ephemeris_overlap_policy` decides WHICH trajectory the rows come
+/// from when a target coincides with one of its own perturbers. Both
+/// settings produce rows, and the result's warnings channel says which
+/// answer you got — read it, because the two are not interchangeable.
+///
+/// Under the default `EMPYREAN_EPHEMERIS_OVERLAP_POLICY_SUBSTITUTE_SPK`
+/// the engine skips integration and serves the rows off the body's own
+/// SPK — the authoritative solution for that body, but **not** a
+/// propagation of the initial condition you supplied. Those rows carry
+/// **no sky covariance**, and if the input orbit declared one, the
+/// warning says it was dropped.
+///
+/// Under `EMPYREAN_EPHEMERIS_OVERLAP_POLICY_EXCLUDE_AND_INTEGRATE` the
+/// body is removed from its own force model and your initial condition
+/// is integrated, so the covariance is transported and the rows are
+/// differentiable — at the cost of a force model one perturber short,
+/// which its warning states. Naming the body in
+/// `excluded_perturbers_naif` is the other route to the same place.
+///
+/// Radar generation is the one product that still **fails** outright
+/// under the substituting policy: its Jacobian is composed on the STM,
+/// which an SPK substitution does not produce.
 #[repr(C)]
 pub struct EmpyreanEphemerisConfig {
     /// Inner propagation configuration applied to the trajectory that
@@ -786,9 +823,13 @@ pub(crate) fn marshal_ephemeris_result(
             } else {
                 (Vec::new(), 6u8)
             };
-            let hess = if let Some(hw) = chain.hessian_wide(i) {
-                flatten_3d(&hw.tensor)
-            } else if let Some(h) = chain.hessian(i) {
+            // villeneuve 1.25.0: ONE Hessian surface — the x0-composed
+            // tensor in the Jacobian's own input domain, populated on
+            // SecondOrder state-only rows (where n_params == 6, so the
+            // `6 * n_params²` length contract holds unchanged). The wide
+            // sibling accessor is gone; it returns with the wide
+            // second-order transport.
+            let hess = if let Some(h) = chain.hessian(i) {
                 flatten_3d(&h.tensor)
             } else {
                 Vec::new()

@@ -43,7 +43,27 @@ not moved; carry it with the next version bump.
   BuiltSystem path is 15 of the engine's error variants, because that path
   receives the engine's typed error rather than a rendered string.
 
+- `PropagationResult::into_states()` — takes the propagated states and
+  releases the retained engine result immediately, instead of at the end
+  of the caller's scope. The retained result is what backs the lazy
+  tagged-covariance / mixture / joint accessors, and it is the larger half
+  of a `PropagationResult` by an order of magnitude: measured at ≈ 64 kB
+  per (orbit, epoch) against ≈ 4 kB for the states themselves
+  (`empyrean/examples/retained_bytes.rs`). Consuming `self` is what makes
+  it safe — the lazy accessors take `&self`, so the type system proves
+  none can be called afterwards, and no config flag is involved.
+
 ### Changed
+
+- **BREAKING (Rust wrapper)** — `PropagatedState::stt` is now
+  `Option<Box<[[[f64; 6]; 6]; 6]>>`. The 1728-byte state transition tensor
+  was inline, so every propagated state carried it whether or not the
+  request asked for second order: `PropagatedState` was **2616 bytes** and
+  is now **888**. Reads are unchanged at the use site (`Option` deref
+  keeps `stt[k][a][b]` working); a binding that names the inline type needs
+  a `.map(|t| *t)`. The C ABI is untouched — `EmpyreanPropagatedState`
+  still carries the tensor inline at its 2576-byte layout, and the Python
+  side reads through the same Arrow arrays it always did.
 
 - Non-finite input is refused at the C boundary, by the row it belongs to.
   A NaN or infinite epoch, element, declared covariance entry or declared

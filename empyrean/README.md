@@ -1001,6 +1001,34 @@ when the boundary or the engine supplied that value, so absent means
 present after the message, so a caller that only logs the error still
 sees it.
 
+## Result weight
+
+`PropagationResult` holds two independent things: the owned copies you
+read (`states`, `object_ids`, `events`, `mixtures`) and the engine-side
+result that backs the lazy accessors — `covariance_series_cartesian`,
+`covariance_at_cartesian`, `joint_at`, `mixture_at`. The second is the
+larger by an order of magnitude, around 64 kB per (orbit, epoch) against
+roughly 4 kB for the states, and it is held for the whole scope.
+
+`into_states` gives it back at the point you take the states:
+
+```rust,no_run
+# let ctx = empyrean::Context::from_data_dir(None)?;
+# let orbits: Vec<empyrean::Orbit> = Vec::new();
+# let epochs: Vec<empyrean::Epoch> = Vec::new();
+# let config = empyrean::PropagationConfig::default();
+let states = ctx.propagate(&orbits, &epochs, &config)?.into_states();
+# let _ = states;
+# Ok::<(), empyrean::Error>(())
+```
+
+Consuming `self` is what makes it safe: the lazy accessors take `&self`,
+so the type system proves none can be called afterwards. There is no
+config flag to set and nothing to get wrong — a caller that wants the
+tagged covariance simply does not call it. Those are the numbers to size
+a chunk from; both are resident-set figures on one machine, so read them
+as the ratio and the order of magnitude.
+
 ## Data directory and offline operation
 
 `Context::from_data_dir` loads the Standard-tier kernel set, acquiring

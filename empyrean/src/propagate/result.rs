@@ -251,7 +251,18 @@ pub struct PropagatedState {
     /// `stt[k][a][b] = ∂²x_k / ∂x₀_a ∂x₀_b`. `None` unless
     /// [`UncertaintyMethod::SecondOrder`](super::UncertaintyMethod::SecondOrder)
     /// was used.
-    pub stt: Option<[[[f64; 6]; 6]; 6]>,
+    ///
+    /// **Boxed.** The tensor is 1728 bytes and inlining it
+    /// made every `PropagatedState` carry that weight whether or not the
+    /// request asked for second-order — a first-order raster reading
+    /// nothing but [`position`](Self::position) still paid it, on every
+    /// state of every orbit. Behind a `Box` the absent case costs one
+    /// pointer, and the present case pays the same 1728 bytes it always
+    /// did, on the heap. Read it exactly as before: `Option` deref makes
+    /// `stt[k][a][b]` unchanged at the use site; only a `let stt:
+    /// Option<[[[f64; 6]; 6]; 6]> = state.stt` style binding needs a
+    /// `.map(|t| *t)`.
+    pub stt: Option<Box<[[[f64; 6]; 6]; 6]>>,
     /// Resolved covariance kind at this epoch — the cheap per-state hint
     /// (Linear outside `Auto` CA windows). The full provenance is on
     /// [`PropagationResult::covariance_series_cartesian`].
@@ -290,7 +301,7 @@ impl PropagatedState {
             frame,
             covariance: (s.has_covariance != 0).then_some(s.covariance),
             stm: (s.has_stm != 0).then_some(s.stm),
-            stt: (s.has_stt != 0).then_some(s.stt),
+            stt: (s.has_stt != 0).then(|| Box::new(s.stt)),
             resolved_kind: CovarianceKind::from_u8(s.resolved_kind)?,
             joint: unsafe { crate::JointCovariance::from_ffi(&s.orbit_cov) }?,
         })
@@ -719,6 +730,13 @@ impl MixtureChain {
 /// accessors ([`covariance_series_cartesian`](Self::covariance_series_cartesian)
 /// / [`covariance_at_cartesian`](Self::covariance_at_cartesian)) can
 /// recompute the resolved-kind readback; it is freed on drop.
+///
+/// That retained result is the larger half of this value — about 60 kB
+/// per (orbit, epoch) against roughly 4 kB for the states, measured — so
+/// a caller that reads nothing but [`states`](Self::states) is holding
+/// fifteen sixteenths of the weight for nothing until the value goes out
+/// of scope. [`into_states`](Self::into_states) is the way to hand it
+/// back at the point the states are taken, and carries the measurement.
 #[derive(Debug)]
 pub struct PropagationResult {
     /// Propagated states (flat, orbit-major order). Within each orbit,
@@ -753,7 +771,54 @@ pub struct PropagationResult {
     /// `object_ids` / `events` / `mixtures` above are independent
     /// copies; this is kept solely to back the lazy tagged-covariance
     /// accessors.
-    ffi: Box<empyrean_sys::EmpyreanPropagationResult>,
+    ffi: RetainedFfiResult,
+}
+
+/// The retained C-ABI result, owned so that dropping it frees the
+/// engine-side rich result behind `lazy_handle`.
+///
+/// The `Drop` lives here rather than on [`PropagationResult`] for one
+/// reason: a type with a `Drop` impl cannot be destructured, and
+/// [`PropagationResult::into_states`] is exactly a destructuring — it
+/// hands back the owned states and releases everything else. With the
+/// guard one level down, that method is ordinary safe code instead of a
+/// `ManuallyDrop` / `ptr::read` dance.
+#[derive(Debug)]
+struct RetainedFfiResult(Box<empyrean_sys::EmpyreanPropagationResult>);
+
+#[cfg(test)]
+thread_local! {
+    /// How many retained engine results this thread has released.
+    ///
+    /// Test-only, and the only way a test can watch a release that is
+    /// otherwise invisible: the free happens across the FFI boundary and
+    /// leaves nothing behind for the caller to inspect. Counting here is
+    /// what lets [`PropagationResult::into_states`] be shown to release
+    /// **early** rather than merely eventually — the distinction the
+    /// method exists for.
+    ///
+    /// Per-thread rather than process-wide because the test harness runs
+    /// tests concurrently: a global counter would be moved by whatever
+    /// unrelated test happened to drop a result at the same moment, and
+    /// a delta assertion on it would be a coin flip.
+    pub(crate) static RETAINED_RESULT_FREES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+impl Drop for RetainedFfiResult {
+    fn drop(&mut self) {
+        unsafe { empyrean_sys::empyrean_propagation_result_free(&mut *self.0) };
+        #[cfg(test)]
+        RETAINED_RESULT_FREES.with(|n| n.set(n.get() + 1));
+    }
+}
+
+impl std::ops::Deref for RetainedFfiResult {
+    type Target = empyrean_sys::EmpyreanPropagationResult;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 // SAFETY: the retained `EmpyreanPropagationResult` (and the rich result
@@ -762,12 +827,6 @@ pub struct PropagationResult {
 // and only read the retained result, and drop frees it exactly once on
 // the owning thread, so the value is sound to move between threads.
 unsafe impl Send for PropagationResult {}
-
-impl Drop for PropagationResult {
-    fn drop(&mut self) {
-        unsafe { empyrean_sys::empyrean_propagation_result_free(&mut *self.ffi) };
-    }
-}
 
 impl PropagationResult {
     pub(crate) fn new(
@@ -782,8 +841,95 @@ impl PropagationResult {
             object_ids,
             events,
             mixtures,
-            ffi: Box::new(ffi),
+            ffi: RetainedFfiResult(Box::new(ffi)),
         }
+    }
+
+    /// Take the propagated states and release the retained engine result
+    /// **now**, instead of at the end of this value's scope.
+    ///
+    /// A `PropagationResult` holds two independent things: the owned
+    /// copies a caller reads directly ([`states`](Self::states),
+    /// [`object_ids`](Self::object_ids), [`events`](Self::events),
+    /// [`mixtures`](Self::mixtures)) and the engine-side rich result
+    /// that backs the lazy accessors —
+    /// [`covariance_series_cartesian`](Self::covariance_series_cartesian),
+    /// [`covariance_at_cartesian`](Self::covariance_at_cartesian),
+    /// [`joint_at`](Self::joint_at), [`mixture_at`](Self::mixture_at).
+    /// The second is the larger of the two and it is retained for the
+    /// whole scope, so a caller that reads only the states still holds
+    /// the engine's per-(orbit, epoch) sensitivity storage until the
+    /// value goes out of scope. Chunking a large raster, that is what
+    /// sets the peak.
+    ///
+    /// This is the release valve, and it is the type system that makes
+    /// it safe: the lazy accessors take `&self`, so consuming `self`
+    /// proves none of them can be called afterwards. There is no config
+    /// flag and no "no lazy readback" mode to get wrong — a caller that
+    /// wants the tagged covariance simply does not call this.
+    ///
+    /// # What it releases
+    ///
+    /// Measured on a 64-orbit × 2-epoch call, accumulating 24 such calls
+    /// and reading resident-set growth (macOS aarch64, one thread; the
+    /// harness is `empyrean/examples/retained_bytes.rs` in the
+    /// repository, which this crate's package does not ship):
+    ///
+    /// | held | per (orbit, epoch) |
+    /// |---|---|
+    /// | whole `PropagationResult` | ≈ 64 kB |
+    /// | states alone, after `into_states` | ≈ 4 kB |
+    ///
+    /// So roughly **60 kB per (orbit, epoch)** — about fifteen sixteenths
+    /// of what a result weighs — is the engine-side storage behind the
+    /// lazy accessors, and this method is what gives it back. Both
+    /// figures held to within a few percent across FirstOrder and
+    /// SecondOrder requests: the engine retains its sensitivity storage
+    /// either way, so the request shape moves the number far less than
+    /// the cell count does.
+    ///
+    /// The ≈ 4 kB is **not** `size_of::<PropagatedState>()`, which the
+    /// sibling test pins at 888 bytes. It is resident set: the boxed
+    /// tensor when one is present, the [`joint`](PropagatedState::joint)
+    /// carrier's heap allocation, the per-orbit id strings, `Vec` growth
+    /// slack, and allocator rounding — none of which a `size_of` sees.
+    /// Both columns are measured the same way, so the ratio between them
+    /// is the number to trust.
+    ///
+    /// Those are the numbers to size a chunk from. A caller holding the
+    /// results of a 4096-cell chunk is holding ≈ 260 MB it may have no
+    /// use for; the same chunk through this method is ≈ 16 MB. Both are
+    /// resident-set figures on one machine and one allocator — read them
+    /// as the ratio and the order of magnitude, not as a guarantee.
+    ///
+    /// ```no_run
+    /// # fn main() -> Result<(), empyrean::Error> {
+    /// # let ctx = empyrean::Context::from_data_dir(None)?;
+    /// # let orbits: Vec<empyrean::Orbit> = Vec::new();
+    /// # let epochs: Vec<empyrean::Epoch> = Vec::new();
+    /// # let config = empyrean::PropagationConfig::default();
+    /// let states = ctx.propagate(&orbits, &epochs, &config)?.into_states();
+    /// // the engine-side result is already freed here
+    /// # let _ = states;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn into_states(self) -> Vec<PropagatedState> {
+        let Self {
+            states,
+            object_ids,
+            events,
+            mixtures,
+            ffi,
+        } = self;
+        // Free the engine result first, so the peak this method exists
+        // to lower is actually lowered before the owned side arrays are
+        // released.
+        drop(ffi);
+        drop(object_ids);
+        drop(events);
+        drop(mixtures);
+        states
     }
 
     /// Retained mixture components for one orbit at a close-approach
@@ -1298,6 +1444,150 @@ mod mixture_marshal_tests {
         assert!(
             result.mixture_at(1, 60000.0, 1.0).is_none(),
             "orbit out of range"
+        );
+    }
+}
+
+#[cfg(test)]
+mod result_weight_tests {
+    use super::PropagatedState;
+
+    /// The pre-boxing layout, so the win is measured rather than
+    /// asserted from memory: identical to [`PropagatedState`] except
+    /// that the STT is inline. Kept in step with the real type by the
+    /// field-for-field assertions below — if a field is added to one and
+    /// not the other, `size_without_stt` stops agreeing and this test
+    /// fails rather than silently comparing two unrelated numbers.
+    #[allow(dead_code)]
+    struct InlineSttState {
+        epoch: crate::Epoch,
+        position: [f64; 3],
+        velocity: [f64; 3],
+        origin: crate::Origin,
+        frame: crate::Frame,
+        covariance: Option<[[f64; 6]; 6]>,
+        stm: Option<[[f64; 6]; 6]>,
+        stt: Option<[[[f64; 6]; 6]; 6]>,
+        resolved_kind: super::CovarianceKind,
+        joint: crate::JointCovariance,
+    }
+
+    /// Boxing the STT is the whole of F4's per-state win, and it is
+    /// large: 1728 bytes of tensor that a request which never asked for
+    /// second order was carrying on every state of every orbit.
+    ///
+    /// The numbers are pinned rather than merely compared so a future
+    /// field addition has to come here and say so.
+    #[test]
+    fn boxing_the_stt_is_worth_1728_bytes_per_state() {
+        let inline = std::mem::size_of::<InlineSttState>();
+        let boxed = std::mem::size_of::<PropagatedState>();
+        assert_eq!(
+            std::mem::size_of::<Option<[[[f64; 6]; 6]; 6]>>(),
+            1736,
+            "the inline STT slot is the 1728-byte tensor plus its discriminant word"
+        );
+        assert_eq!(
+            std::mem::size_of::<Option<Box<[[[f64; 6]; 6]; 6]>>>(),
+            8,
+            "a boxed STT slot is one niche-optimized pointer — no discriminant word"
+        );
+        assert_eq!(inline, 2616, "PropagatedState with the tensor inline");
+        assert_eq!(boxed, 888, "PropagatedState with the tensor boxed");
+        assert_eq!(
+            inline - boxed,
+            1728,
+            "the saving is exactly the tensor: 6 * 6 * 6 * 8 bytes"
+        );
+    }
+
+    /// The positive control for the assertions above: the two layouts
+    /// really are the same struct apart from the STT slot, so the
+    /// difference measured there is the STT and nothing else.
+    #[test]
+    fn the_two_layouts_differ_only_in_the_stt_slot() {
+        let inline_without_stt = std::mem::size_of::<InlineSttState>()
+            - std::mem::size_of::<Option<[[[f64; 6]; 6]; 6]>>();
+        let boxed_without_stt = std::mem::size_of::<PropagatedState>()
+            - std::mem::size_of::<Option<Box<[[[f64; 6]; 6]; 6]>>>();
+        assert_eq!(
+            inline_without_stt, boxed_without_stt,
+            "everything other than the STT slot must weigh the same in both layouts"
+        );
+    }
+
+    /// The C-ABI row is untouched. The boundary hands back a flat
+    /// `EmpyreanPropagatedState` with the tensor inline, exactly as it
+    /// did in 0.10.0 — the boxing is a wrapper-side layout choice made
+    /// while copying off that row, not an ABI change. A C consumer that
+    /// hand-mirrored this struct keeps its layout.
+    #[test]
+    fn the_c_abi_row_still_carries_the_tensor_inline() {
+        assert_eq!(
+            std::mem::size_of::<empyrean_sys::EmpyreanPropagatedState>(),
+            2576,
+            "the C row must not move: F4 is a wrapper-side change"
+        );
+    }
+}
+
+#[cfg(test)]
+mod into_states_tests {
+    use super::{PropagationResult, RETAINED_RESULT_FREES};
+
+    /// Releases counted on this thread so far.
+    fn frees() -> usize {
+        RETAINED_RESULT_FREES.with(|n| n.get())
+    }
+
+    /// A result with nothing in it. `empyrean_propagation_result_free`
+    /// guards every pointer on null and every count on zero, so a zeroed
+    /// C struct is a safe thing to hand it — which is what lets these
+    /// tests exercise the release path without a data directory.
+    fn empty_result() -> PropagationResult {
+        PropagationResult::new(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            empyrean_sys::EmpyreanPropagationResult::default(),
+        )
+    }
+
+    /// The point of the method: the engine-side result is gone by the
+    /// time the states are handed back, not at the end of the caller's
+    /// scope.
+    #[test]
+    fn into_states_releases_the_handle_before_it_returns() {
+        let before = frees();
+        let states = empty_result().into_states();
+        assert_eq!(
+            frees(),
+            before + 1,
+            "into_states must free the retained result, not defer it"
+        );
+        assert!(states.is_empty());
+    }
+
+    /// The positive control, and the reason the assertion above means
+    /// anything: an ordinary result that is merely *held* has not been
+    /// released, and is released exactly once when it finally drops. A
+    /// counter that incremented on construction, or that never
+    /// incremented at all, would pass the first test and fail this one.
+    #[test]
+    fn a_held_result_is_released_only_when_it_drops() {
+        let before = frees();
+        let held = empty_result();
+        assert_eq!(
+            frees(),
+            before,
+            "constructing a result must not release anything"
+        );
+        drop(held);
+        assert_eq!(
+            frees(),
+            before + 1,
+            "dropping a result releases the retained result exactly once"
         );
     }
 }

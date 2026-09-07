@@ -433,6 +433,15 @@ pub unsafe extern "C" fn empyrean_builtsystem_propagate(
                 return EMPYREAN_BUILTSYSTEM_INVALID_ARGUMENT;
             }
         };
+        // Same refusal as the one-shot path — a frozen force model does
+        // not change what a config may ask for.
+        if let Err(e) = crate::propagate::refuse_detection_off_with_ca_driven_method(
+            cfg.events.detection_enabled,
+            config_ref.uncertainty_method.tag,
+        ) {
+            set_last_error(&e);
+            return EMPYREAN_BUILTSYSTEM_INVALID_ARGUMENT;
+        }
         let times: Vec<Epoch> = times_slice
             .iter()
             .map(|&t| Epoch::from_mjd_tdb(t))

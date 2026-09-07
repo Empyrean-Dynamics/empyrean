@@ -59,13 +59,68 @@ pub struct PropagateArgs {
     /// is set so the thrust is never silently dropped.
     #[arg(long)]
     pub thrust_arcs: Option<PathBuf>,
+
+    /// Switch per-substep event detection off
+    /// (`EventConfig::detection_enabled = false`).
+    ///
+    /// The events file comes back empty and the propagation runs
+    /// measurably faster — 1.5x on a 64-orbit covariance-free batch —
+    /// because no observational detector is installed and the
+    /// per-substep dispatch is skipped. The propagated states are
+    /// unchanged: detection is observation, not dynamics. Runs
+    /// in-process — the daemon fast path is skipped when this is set, so
+    /// the flag is never silently dropped.
+    #[arg(long)]
+    pub no_events: bool,
 }
 
 /// Astronomical unit in km (IAU 2012, exact). The tagged-covariance
 /// matrices are AU-based; position σ is reported in km.
 const AU_KM: f64 = 149_597_870.7;
 
+/// Whether these arguments may be served by a running daemon.
+///
+/// The daemon protocol returns a summary string and its wire request
+/// carries neither thrust fields nor event fields, so three flags must
+/// fall through to the in-process path rather than be silently ignored:
+/// `--tagged-covariance` (the daemon cannot stream the per-epoch
+/// series), `--thrust-arcs` (the burn would be dropped) and
+/// `--no-events` (detection would run anyway and the caller would be
+/// handed the events it asked not to pay for).
+///
+/// Lifted out of [`run`] so the predicate can be asserted directly.
+fn daemon_eligible(args: &PropagateArgs) -> bool {
+    !args.tagged_covariance && args.thrust_arcs.is_none() && !args.no_events
+}
+
+/// The propagation config these arguments ask for.
+///
+/// Lifted out of [`run`] so the mapping from flags to engine config has
+/// exactly one definition and can be asserted directly, rather than
+/// re-derived by a test that would then be checking itself.
+fn propagation_config(args: &PropagateArgs) -> PropagationConfig {
+    PropagationConfig {
+        force_model: args.force_model.to_empyrean(),
+        uncertainty_method: args.uncertainty_method.to_empyrean(),
+        events: empyrean::EventConfig {
+            // `--no-events` is the negation, the way `--no-refresh` is
+            // the negation of `refresh`.
+            detection_enabled: !args.no_events,
+            ..empyrean::EventConfig::default()
+        },
+        ..PropagationConfig::default()
+    }
+}
+
 pub fn run(data: &DataOptions, args: PropagateArgs) -> Result<()> {
+    // Refuse an unserviceable flag pairing before anything expensive.
+    // The wrapper refuses it too, but only once a context is loaded —
+    // and making a caller wait half a minute to be told its flags
+    // contradict each other is a worse way to say the same thing.
+    propagation_config(&args)
+        .validate()
+        .context("--no-events is not compatible with this --uncertainty-method")?;
+
     // Try daemon first — but only when neither the tagged-covariance
     // readback nor a thrust file is requested, and only when the caller
     // did not ask for a strict-offline context. The daemon protocol
@@ -76,7 +131,10 @@ pub fn run(data: &DataOptions, args: PropagateArgs) -> Result<()> {
     // `--no-refresh` falls through for the same reason: a daemon already
     // holding a context built under its own policy cannot honour the
     // request, and serving it anyway would quietly ignore the flag.
-    if !args.tagged_covariance && args.thrust_arcs.is_none() && data.daemon_eligible() {
+    // `--no-events` joins them: the wire request carries no event
+    // fields, so a daemon would run detection anyway and hand back the
+    // events the caller asked not to pay for.
+    if daemon_eligible(&args) && data.daemon_eligible() {
         let request = crate::daemon::protocol::Request::Propagate {
             object_ids: args.object_ids.clone(),
             input_path: args.input.as_ref().map(|p| p.display().to_string()),
@@ -119,11 +177,7 @@ pub fn run(data: &DataOptions, args: PropagateArgs) -> Result<()> {
         }
     }
 
-    let config = PropagationConfig {
-        force_model: args.force_model.to_empyrean(),
-        uncertainty_method: args.uncertainty_method.to_empyrean(),
-        ..PropagationConfig::default()
-    };
+    let config = propagation_config(&args);
 
     eprintln!(
         "Propagating {} orbit(s) to MJD {:.1}...",
@@ -141,7 +195,7 @@ pub fn run(data: &DataOptions, args: PropagateArgs) -> Result<()> {
         .context("propagation failed")?;
     eprintln!("Propagation complete ({:.1}s)", t1.elapsed().as_secs_f64());
 
-    print_event_summary(&result);
+    print_event_summary(&result, args.no_events);
 
     if args.tagged_covariance {
         print_tagged_covariance_series(&batch, &result);
@@ -155,9 +209,22 @@ pub fn run(data: &DataOptions, args: PropagateArgs) -> Result<()> {
     Ok(())
 }
 
-fn print_event_summary(result: &PropagationResult) {
+/// What an empty event list means, which is not one thing.
+///
+/// "No events detected" is a finding: the detectors ran and found
+/// nothing. Under `--no-events` they never ran, and reporting the
+/// finding would be reporting a search that did not happen.
+fn empty_events_line(detection_off: bool) -> &'static str {
+    if detection_off {
+        "\n  Event detection was off (--no-events); no events were looked for."
+    } else {
+        "\n  No events detected."
+    }
+}
+
+fn print_event_summary(result: &PropagationResult, detection_off: bool) {
     if result.events.is_empty() {
-        eprintln!("\n  No events detected.");
+        eprintln!("{}", empty_events_line(detection_off));
     } else {
         let mut counts: HashMap<&str, usize> = HashMap::new();
         for ev in &result.events {
@@ -388,6 +455,130 @@ mod tests {
         assert!(
             err.contains("first-order"),
             "error must list valid set: {err}"
+        );
+    }
+
+    /// `--no-events` must reach `EventConfig::detection_enabled`, and
+    /// its absence must leave detection on. The flag exists to stop the
+    /// engine paying for detectors the caller will not read; a flag that
+    /// parsed but never reached the config would look identical from
+    /// outside except for the wall-clock it was added to save.
+    ///
+    /// Driven from a real command line so the flag's spelling is part of
+    /// what is pinned.
+    #[test]
+    fn no_events_maps_to_detection_enabled() {
+        use clap::Parser as _;
+
+        #[derive(clap::Parser)]
+        struct Harness {
+            #[command(flatten)]
+            args: PropagateArgs,
+        }
+
+        let base = ["propagate", "--epoch", "61000", "--out-dir", "/tmp/x"];
+        let on = Harness::parse_from(base).args;
+        assert!(
+            propagation_config(&on).events.detection_enabled,
+            "detection stays on when the flag is absent"
+        );
+
+        let off = Harness::parse_from(base.iter().copied().chain(["--no-events"])).args;
+        assert!(
+            !propagation_config(&off).events.detection_enabled,
+            "--no-events must switch detection off"
+        );
+    }
+
+    /// The flag must not be reachable through the daemon: the wire
+    /// request carries no event fields, so a daemon would run detection
+    /// anyway and hand back events the caller asked not to pay for.
+    /// Same reasoning as `--tagged-covariance` and `--thrust-arcs`.
+    ///
+    /// Asserted against the predicate itself rather than against the
+    /// source text that implements it — a text assertion would still
+    /// pass if the gate were deleted and the words survived in a comment.
+    #[test]
+    fn no_events_falls_through_to_the_in_process_path() {
+        let args = |no_events: bool, tagged_covariance: bool| {
+            use clap::Parser as _;
+            #[derive(clap::Parser)]
+            struct Harness {
+                #[command(flatten)]
+                args: PropagateArgs,
+            }
+            let mut argv = vec!["propagate", "--epoch", "61000", "--out-dir", "/tmp/x"];
+            if no_events {
+                argv.push("--no-events");
+            }
+            if tagged_covariance {
+                argv.push("--tagged-covariance");
+            }
+            Harness::parse_from(argv).args
+        };
+
+        assert!(
+            daemon_eligible(&args(false, false)),
+            "a plain propagate is daemon-eligible"
+        );
+        assert!(
+            !daemon_eligible(&args(true, false)),
+            "--no-events must fall through to the in-process path"
+        );
+        assert!(
+            !daemon_eligible(&args(false, true)),
+            "--tagged-covariance still falls through (the control)"
+        );
+    }
+
+    /// `--no-events` with an uncertainty method that resolves itself
+    /// from detected close approaches is refused, and refused before any
+    /// context is loaded.
+    #[test]
+    fn no_events_with_a_detection_driven_method_is_refused() {
+        use clap::Parser as _;
+        #[derive(clap::Parser)]
+        struct Harness {
+            #[command(flatten)]
+            args: PropagateArgs,
+        }
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["propagate", "--epoch", "61000", "--out-dir", "/tmp/x"];
+            argv.extend_from_slice(extra);
+            Harness::parse_from(argv).args
+        };
+
+        let err = propagation_config(&parse(&["--no-events", "--uncertainty-method", "auto"]))
+            .validate()
+            .expect_err("--no-events with auto must be refused");
+        assert!(
+            err.message.contains("uncertainty_method = Auto"),
+            "the refusal must name the method: {}",
+            err.message
+        );
+
+        // The controls: either flag alone is fine.
+        propagation_config(&parse(&["--no-events"]))
+            .validate()
+            .expect("--no-events alone is legal");
+        propagation_config(&parse(&["--uncertainty-method", "auto"]))
+            .validate()
+            .expect("auto alone is legal");
+    }
+
+    /// An empty event list under `--no-events` must not be reported as
+    /// a finding. The detectors never ran; saying "no events detected"
+    /// would claim a search that did not happen.
+    #[test]
+    fn an_empty_event_list_says_which_kind_of_empty_it_is() {
+        assert!(
+            empty_events_line(false).contains("No events detected"),
+            "detection on: an empty list is a finding"
+        );
+        let off = empty_events_line(true);
+        assert!(
+            off.contains("--no-events") && off.contains("looked for"),
+            "detection off: the line must say nothing was looked for, got {off:?}"
         );
     }
 

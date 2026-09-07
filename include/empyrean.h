@@ -875,8 +875,26 @@ typedef struct Session Session;
  * build provenance of the closed-source engine crates behind this
  * boundary, not this distribution's version.
  *
- * **A boundary change since this number was last set.** This release
- * adds two exports and one struct —
+ * **A boundary change since this number was last set.**
+ * [`EmpyreanEventConfig`](crate::propagate::EmpyreanEventConfig) grew
+ * 40 → 56 bytes by value, shifting every field after `events` in
+ * [`EmpyreanPropagationConfig`](crate::propagate::EmpyreanPropagationConfig)
+ * (296 → 312) and
+ * [`EmpyreanEphemerisConfig`](crate::ephemeris::EmpyreanEphemerisConfig)
+ * (320 → 336); this is a layout break and `EMPYREAN_ABI_VERSION` must
+ * move with the next version bump.
+ *
+ * The shifted offsets, for a consumer re-deriving a hand-mirrored
+ * struct: `diagnostics` 160→176, `num_threads` 200→216, `advanced`
+ * 208→224, `ephemeris_overlap_policy` 288→304, and
+ * `compute_diagnostics` 312→328. Re-derive the whole layout rather than
+ * appending to it — writing `num_threads` at its old offset lands
+ * inside `diagnostics` with no diagnostic of any kind. Recompiling
+ * against the current header is the fix; a caller compiled against the
+ * 0.10.0 header and this library refuse each other at load by the version
+ * handshake.
+ *
+ * The release's other boundary additions —
  * [`empyrean_error_location`](crate::empyrean_error_location),
  * [`empyrean_error_location_free`](crate::empyrean_error_location_free)
  * and [`EmpyreanErrorLocation`](crate::EmpyreanErrorLocation) — which
@@ -1083,6 +1101,83 @@ typedef struct Session Session;
 #define EMPYREAN_UNCERTAINTY_AUTO 4
 
 #define EMPYREAN_UNCERTAINTY_MIXTURE 5
+
+/**
+ * Let the engine's own default stand: detection **on**. The `memset(0)`
+ * default, so a config written before this field existed behaves
+ * exactly as it did.
+ *
+ * Reachable from raw C only. Every layer above this one — the safe
+ * wrapper, Python, the CLI — holds a resolved value and writes the
+ * explicit rung, so the benefit of this rung (a future engine default
+ * reaching a caller with no ABI change) accrues to C callers alone.
+ * The same is true of the other two `_DEFAULT` rungs below.
+ */
+#define EMPYREAN_EVENT_DETECTION_DEFAULT 0
+
+/**
+ * Detection on, spelled explicitly. Identical to
+ * [`EMPYREAN_EVENT_DETECTION_DEFAULT`] today; say it when you want the
+ * choice on the record rather than inherited.
+ */
+#define EMPYREAN_EVENT_DETECTION_ON 1
+
+/**
+ * Detection **off**: install no observational detector and skip the
+ * per-substep dispatch. The propagated state, STM and dense trajectory
+ * are unchanged; the event list comes back empty and the call is
+ * measurably faster. For a caller that reads states and discards
+ * events, this is the whole win.
+ */
+#define EMPYREAN_EVENT_DETECTION_OFF 2
+
+/**
+ * The engine's own default: body-centric. The `memset(0)` default.
+ */
+#define EMPYREAN_DENSE_ORIGIN_DEFAULT 0
+
+/**
+ * Dense encounter states relative to the encounter body. Precise
+ * body-relative vectors through the encounter, and the natural frame
+ * for a body-centered close-approach view.
+ */
+#define EMPYREAN_DENSE_ORIGIN_BODYCENTRIC 1
+
+/**
+ * Dense encounter states relative to the Solar System Barycenter, so
+ * the dense arc splices into a barycentric main trajectory with no
+ * client-side re-centering.
+ */
+#define EMPYREAN_DENSE_ORIGIN_BARYCENTRIC 2
+
+/**
+ * The engine's own default: the population criterion. The `memset(0)`
+ * default.
+ */
+#define EMPYREAN_CAPTURE_CRITERION_DEFAULT 0
+
+/**
+ * Granvik+ 2012 / Fedorets+ 2018 composite: energy-bound within
+ * 3 Hill radii. The canonical mini-moon population definition.
+ */
+#define EMPYREAN_CAPTURE_CRITERION_POPULATION 1
+
+/**
+ * Fedorets+ 2020 individual-object criterion: energy-bound within a
+ * tight body-specific scale (≈ 1 lunar distance for Earth). Use it when
+ * comparing against per-object mini-moon characterization papers, whose
+ * reported capture window is anchored on a closest-approach distance
+ * rather than a Hill-sphere fraction.
+ */
+#define EMPYREAN_CAPTURE_CRITERION_INDIVIDUAL 2
+
+/**
+ * Energy-only: \\(\tfrac{1}{2}v_\text{rel}^2 - \mu/r < 0\\), with no
+ * distance gate beyond the close-approach tracking radius. The most
+ * permissive of the three, and what villeneuve did before the criterion
+ * was selectable.
+ */
+#define EMPYREAN_CAPTURE_CRITERION_ENERGY_ONLY 3
 
 /**
  * Substitute the perturber's SPK state and skip integration. The
@@ -2013,6 +2108,22 @@ struct EmpyreanUncertaintyMethod {
  * `body_filter_naif` is non-owning: caller must keep the array alive
  * for the duration of the propagation call. Pass `null` /
  * `num_body_filter = 0` to monitor all bodies.
+ *
+ * # Two kinds of field, two zero conventions
+ *
+ * The five per-type flags are **filters** on what gets emitted, and
+ * they read `0` as off, as they always have — a `memset(0)` config asks
+ * for none of those five event types.
+ *
+ * The three tri-state `i32` fields at the tail are **not** filters: they
+ * select among engine behaviours whose default is not zero-shaped
+ * (detection is on, dense output is body-centric, capture is the
+ * population criterion). They therefore spend `0` on `_DEFAULT` and
+ * shift their ladders by one, exactly as
+ * [`EmpyreanDataDirOptions::refresh`](crate::EmpyreanDataDirOptions)
+ * does — so a `memset(0)` config keeps meaning precisely what it meant
+ * before these fields existed, and a caller who wants a non-default
+ * says so by name.
  */
 struct EmpyreanEventConfig {
     uint8_t close_approaches;
@@ -2037,6 +2148,64 @@ struct EmpyreanEventConfig {
      * Cadence (days) of dense output. 0.0 → upstream default (5 minutes).
      */
     double dense_output_cadence_days;
+    /**
+     * Master switch for per-substep event detection — see the
+     * `EMPYREAN_EVENT_DETECTION_*` constants. `0` = `_DEFAULT` (the
+     * engine's own default, which is on).
+     *
+     * **This is a performance field, and it is the only one on this
+     * struct.** The five flags above filter what is *emitted*; the
+     * detectors still run per accepted integrator substep and still
+     * cost what they cost. Switching detection off installs no
+     * observational detector at all and skips the per-substep dispatch
+     * entirely — measured at **1.5× faster** on a 64-orbit,
+     * covariance-free, two-epoch Standard-tier batch.
+     *
+     * **State accuracy is unchanged**: the trajectory, the STM and the
+     * dense output are bit-for-bit identical either way, because
+     * detection is observation and not dynamics. Origin-switch zones do
+     * alter the integrated trajectory and are **not** governed here —
+     * they follow `EmpyreanAdvancedIntegratorConfig`'s origin-switching
+     * field alone.
+     *
+     * **Everything the detectors produce is gone**, which is more than
+     * the event list: no events, no close approaches, and therefore no
+     * impact probabilities, which the engine computes from the nominal
+     * close approaches. The five per-type flags, `body_filter` and the
+     * enrichment pass are all moot.
+     *
+     * **Two uncertainty methods resolve themselves from that output,
+     * and pairing either with detection off is refused** rather than
+     * served degraded: `Auto` (tag
+     * [`EMPYREAN_UNCERTAINTY_AUTO`]) picks its refinement windows from
+     * detected close approaches and gates its second pass on their
+     * impact probabilities, and the adaptive Gaussian mixture (tag
+     * [`EMPYREAN_UNCERTAINTY_MIXTURE`]) splits at those same close
+     * approaches. Every other method computes its covariance along the
+     * trajectory and is served normally.
+     */
+    int32_t detection_enabled;
+    /**
+     * Reference origin for dense encounter-trajectory output — see the
+     * `EMPYREAN_DENSE_ORIGIN_*` constants. `0` = `_DEFAULT`
+     * (body-centric). Read only when `dense_output` is on.
+     *
+     * A pure translation by the (deterministic) body ephemeris, so the
+     * per-point covariance is the same in either origin; what changes is
+     * which frame the dense arc arrives in.
+     */
+    int32_t dense_origin;
+    /**
+     * Criterion the capture detector applies when emitting
+     * capture start / end — see the `EMPYREAN_CAPTURE_CRITERION_*`
+     * constants. `0` = `_DEFAULT` (the population criterion).
+     *
+     * This selects a **published definition of capture**, not a
+     * tolerance: the three answers come from different papers and
+     * disagree about which encounters count. Read the constants before
+     * moving off the default.
+     */
+    int32_t capture_criterion;
 };
 
 /**

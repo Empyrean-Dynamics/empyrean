@@ -853,8 +853,26 @@ pub const EMPYREAN_PHOTOMETRY_MODEL_HG1G2: i32 = 4;
 /// build provenance of the closed-source engine crates behind this
 /// boundary, not this distribution's version.
 ///
-/// **A boundary change since this number was last set.** This release
-/// adds two exports and one struct —
+/// **A boundary change since this number was last set.**
+/// [`EmpyreanEventConfig`](crate::propagate::EmpyreanEventConfig) grew
+/// 40 → 56 bytes by value, shifting every field after `events` in
+/// [`EmpyreanPropagationConfig`](crate::propagate::EmpyreanPropagationConfig)
+/// (296 → 312) and
+/// [`EmpyreanEphemerisConfig`](crate::ephemeris::EmpyreanEphemerisConfig)
+/// (320 → 336); this is a layout break and `EMPYREAN_ABI_VERSION` must
+/// move with the next version bump.
+///
+/// The shifted offsets, for a consumer re-deriving a hand-mirrored
+/// struct: `diagnostics` 160→176, `num_threads` 200→216, `advanced`
+/// 208→224, `ephemeris_overlap_policy` 288→304, and
+/// `compute_diagnostics` 312→328. Re-derive the whole layout rather than
+/// appending to it — writing `num_threads` at its old offset lands
+/// inside `diagnostics` with no diagnostic of any kind. Recompiling
+/// against the current header is the fix; a caller compiled against the
+/// 0.10.0 header and this library refuse each other at load by the version
+/// handshake.
+///
+/// The release's other boundary additions —
 /// [`empyrean_error_location`](crate::empyrean_error_location),
 /// [`empyrean_error_location_free`](crate::empyrean_error_location_free)
 /// and [`EmpyreanErrorLocation`](crate::EmpyreanErrorLocation) — which

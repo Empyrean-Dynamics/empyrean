@@ -139,6 +139,49 @@ the boundary or the engine supplied that value, so an absent field means
 *not known*, never *not applicable*, and a failure belonging to no single
 orbit reports no position rather than defaulting to row 0.
 
+## Turning event detection off
+
+Every propagation runs the built-in detector set on each accepted
+integrator substep. The five per-type flags on `EmpyreanEventConfig`
+filter what gets *emitted*; they do not stop the detectors running.
+`detection_enabled` does:
+
+```c
+struct EmpyreanPropagationConfig config;
+memset(&config, 0, sizeof config);
+config.events.detection_enabled = EMPYREAN_EVENT_DETECTION_OFF;
+```
+
+Measured on a 64-orbit, covariance-free, two-epoch Standard-tier batch,
+single-threaded over a 400-day arc: 272 ms with detection on, 185 ms with
+it off — 1.47x.
+
+**State accuracy is unchanged** — trajectory, STM and dense output are
+bit-for-bit identical either way, because detection is observation and
+not dynamics. **What is gone is everything the detectors produce**: no
+events, no close approaches, and therefore no impact probabilities.
+
+Two uncertainty methods resolve *themselves* from that output, so
+pairing either with detection off is **refused** rather than served
+degraded — `EMPYREAN_UNCERTAINTY_AUTO`, which picks its refinement
+windows from detected close approaches and gates its second pass on
+their impact probabilities, and `EMPYREAN_UNCERTAINTY_MIXTURE`, which
+splits at those same close approaches. Every other method is served
+normally.
+
+The three tri-states at the tail of the struct — `detection_enabled`,
+`dense_origin` and `capture_criterion` — spend `0` on `_DEFAULT` rather
+than on the first value of their ladder, so a `memset(0)` config keeps
+meaning exactly what it meant before they existed. A value off the end
+of a ladder is refused by name and value; it never resolves to the
+default.
+
+**These three grew the struct.** `EmpyreanEventConfig` went from 40 to 56
+bytes, and it is embedded by value, so `EmpyreanPropagationConfig`
+(296 → 312) and `EmpyreanEphemerisConfig` (320 → 336) both moved every
+field that follows it. Re-derive a hand-mirrored layout rather than
+appending to it.
+
 ## Data directory & strict offline
 
 `empyrean_context_from_data_dir_with` is the superset of

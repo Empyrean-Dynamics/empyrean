@@ -34,7 +34,9 @@
 //              EMPYREAN_OD_FAILURE_*, EMPYREAN_PARAM_COLUMN_* (the
 //              EmpyreanParamColumn::kind tags), EMPYREAN_SOLVER_STOP_* (the
 //              EmpyreanODResult::termination / ::stall_underlying_stop codes,
-//              added in 0.10.0-rc.2).
+//              added in 0.10.0-rc.2), EMPYREAN_EVENT_DETECTION_* /
+//              EMPYREAN_DENSE_ORIGIN_* / EMPYREAN_CAPTURE_CRITERION_* (the
+//              three EmpyreanEventConfig tri-states).
 //
 // TWO DELIBERATE EXCEPTIONS, both of the same shape — a family that shipped at
 // bindgen's `u32` before the rule existed keeps it rather than splitting.
@@ -193,6 +195,16 @@ pub const EMPYREAN_UNCERTAINTY_SIGMA_POINT: u32 = 2;
 pub const EMPYREAN_UNCERTAINTY_MONTE_CARLO: u32 = 3;
 pub const EMPYREAN_UNCERTAINTY_AUTO: u32 = 4;
 pub const EMPYREAN_UNCERTAINTY_MIXTURE: u32 = 5;
+pub const EMPYREAN_EVENT_DETECTION_DEFAULT: i32 = 0;
+pub const EMPYREAN_EVENT_DETECTION_ON: i32 = 1;
+pub const EMPYREAN_EVENT_DETECTION_OFF: i32 = 2;
+pub const EMPYREAN_DENSE_ORIGIN_DEFAULT: i32 = 0;
+pub const EMPYREAN_DENSE_ORIGIN_BODYCENTRIC: i32 = 1;
+pub const EMPYREAN_DENSE_ORIGIN_BARYCENTRIC: i32 = 2;
+pub const EMPYREAN_CAPTURE_CRITERION_DEFAULT: i32 = 0;
+pub const EMPYREAN_CAPTURE_CRITERION_POPULATION: i32 = 1;
+pub const EMPYREAN_CAPTURE_CRITERION_INDIVIDUAL: i32 = 2;
+pub const EMPYREAN_CAPTURE_CRITERION_ENERGY_ONLY: i32 = 3;
 pub const EMPYREAN_EPHEMERIS_OVERLAP_POLICY_SUBSTITUTE_SPK: i32 = 0;
 pub const EMPYREAN_EPHEMERIS_OVERLAP_POLICY_EXCLUDE_AND_INTEGRATE: i32 = 1;
 pub const EMPYREAN_COVARIANCE_KIND_LINEAR: u32 = 0;
@@ -735,7 +747,7 @@ const _: () = {
         auto_gmm_components_per_split
     ) - 80usize];
 };
-#[doc = " Event-detection configuration. Mirrors\n [`villeneuve::events::EventConfig`] (less the `enrichment` sub-config,\n which carries internal nested data that doesn't translate cleanly\n through C — it always uses upstream defaults).\n\n `body_filter_naif` is non-owning: caller must keep the array alive\n for the duration of the propagation call. Pass `null` /\n `num_body_filter = 0` to monitor all bodies."]
+#[doc = " Event-detection configuration. Mirrors\n [`villeneuve::events::EventConfig`] (less the `enrichment` sub-config,\n which carries internal nested data that doesn't translate cleanly\n through C — it always uses upstream defaults).\n\n `body_filter_naif` is non-owning: caller must keep the array alive\n for the duration of the propagation call. Pass `null` /\n `num_body_filter = 0` to monitor all bodies.\n\n # Two kinds of field, two zero conventions\n\n The five per-type flags are **filters** on what gets emitted, and\n they read `0` as off, as they always have — a `memset(0)` config asks\n for none of those five event types.\n\n The three tri-state `i32` fields at the tail are **not** filters: they\n select among engine behaviours whose default is not zero-shaped\n (detection is on, dense output is body-centric, capture is the\n population criterion). They therefore spend `0` on `_DEFAULT` and\n shift their ladders by one, exactly as\n [`EmpyreanDataDirOptions::refresh`](crate::EmpyreanDataDirOptions)\n does — so a `memset(0)` config keeps meaning precisely what it meant\n before these fields existed, and a caller who wants a non-default\n says so by name."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct EmpyreanEventConfig {
@@ -752,10 +764,16 @@ pub struct EmpyreanEventConfig {
     pub dense_output: u8,
     #[doc = " Cadence (days) of dense output. 0.0 → upstream default (5 minutes)."]
     pub dense_output_cadence_days: f64,
+    #[doc = " Master switch for per-substep event detection — see the\n `EMPYREAN_EVENT_DETECTION_*` constants. `0` = `_DEFAULT` (the\n engine's own default, which is on).\n\n **This is a performance field, and it is the only one on this\n struct.** The five flags above filter what is *emitted*; the\n detectors still run per accepted integrator substep and still\n cost what they cost. Switching detection off installs no\n observational detector at all and skips the per-substep dispatch\n entirely — measured at **1.5× faster** on a 64-orbit,\n covariance-free, two-epoch Standard-tier batch.\n\n **State accuracy is unchanged**: the trajectory, the STM and the\n dense output are bit-for-bit identical either way, because\n detection is observation and not dynamics. Origin-switch zones do\n alter the integrated trajectory and are **not** governed here —\n they follow `EmpyreanAdvancedIntegratorConfig`'s origin-switching\n field alone.\n\n **Everything the detectors produce is gone**, which is more than\n the event list: no events, no close approaches, and therefore no\n impact probabilities, which the engine computes from the nominal\n close approaches. The five per-type flags, `body_filter` and the\n enrichment pass are all moot.\n\n **Two uncertainty methods resolve themselves from that output,\n and pairing either with detection off is refused** rather than\n served degraded: `Auto` (tag\n [`EMPYREAN_UNCERTAINTY_AUTO`]) picks its refinement windows from\n detected close approaches and gates its second pass on their\n impact probabilities, and the adaptive Gaussian mixture (tag\n [`EMPYREAN_UNCERTAINTY_MIXTURE`]) splits at those same close\n approaches. Every other method computes its covariance along the\n trajectory and is served normally."]
+    pub detection_enabled: i32,
+    #[doc = " Reference origin for dense encounter-trajectory output — see the\n `EMPYREAN_DENSE_ORIGIN_*` constants. `0` = `_DEFAULT`\n (body-centric). Read only when `dense_output` is on.\n\n A pure translation by the (deterministic) body ephemeris, so the\n per-point covariance is the same in either origin; what changes is\n which frame the dense arc arrives in."]
+    pub dense_origin: i32,
+    #[doc = " Criterion the capture detector applies when emitting\n capture start / end — see the `EMPYREAN_CAPTURE_CRITERION_*`\n constants. `0` = `_DEFAULT` (the population criterion).\n\n This selects a **published definition of capture**, not a\n tolerance: the three answers come from different papers and\n disagree about which encounters count. Read the constants before\n moving off the default."]
+    pub capture_criterion: i32,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of EmpyreanEventConfig"][::std::mem::size_of::<EmpyreanEventConfig>() - 40usize];
+    ["Size of EmpyreanEventConfig"][::std::mem::size_of::<EmpyreanEventConfig>() - 56usize];
     ["Alignment of EmpyreanEventConfig"][::std::mem::align_of::<EmpyreanEventConfig>() - 8usize];
     ["Offset of field: EmpyreanEventConfig::close_approaches"]
         [::std::mem::offset_of!(EmpyreanEventConfig, close_approaches) - 0usize];
@@ -775,6 +793,12 @@ const _: () = {
         [::std::mem::offset_of!(EmpyreanEventConfig, dense_output) - 24usize];
     ["Offset of field: EmpyreanEventConfig::dense_output_cadence_days"]
         [::std::mem::offset_of!(EmpyreanEventConfig, dense_output_cadence_days) - 32usize];
+    ["Offset of field: EmpyreanEventConfig::detection_enabled"]
+        [::std::mem::offset_of!(EmpyreanEventConfig, detection_enabled) - 40usize];
+    ["Offset of field: EmpyreanEventConfig::dense_origin"]
+        [::std::mem::offset_of!(EmpyreanEventConfig, dense_origin) - 44usize];
+    ["Offset of field: EmpyreanEventConfig::capture_criterion"]
+        [::std::mem::offset_of!(EmpyreanEventConfig, capture_criterion) - 48usize];
 };
 impl Default for EmpyreanEventConfig {
     fn default() -> Self {
@@ -932,7 +956,7 @@ pub struct EmpyreanPropagationConfig {
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of EmpyreanPropagationConfig"]
-        [::std::mem::size_of::<EmpyreanPropagationConfig>() - 296usize];
+        [::std::mem::size_of::<EmpyreanPropagationConfig>() - 312usize];
     ["Alignment of EmpyreanPropagationConfig"]
         [::std::mem::align_of::<EmpyreanPropagationConfig>() - 8usize];
     ["Offset of field: EmpyreanPropagationConfig::force_model"]
@@ -950,13 +974,13 @@ const _: () = {
     ["Offset of field: EmpyreanPropagationConfig::events"]
         [::std::mem::offset_of!(EmpyreanPropagationConfig, events) - 120usize];
     ["Offset of field: EmpyreanPropagationConfig::diagnostics"]
-        [::std::mem::offset_of!(EmpyreanPropagationConfig, diagnostics) - 160usize];
+        [::std::mem::offset_of!(EmpyreanPropagationConfig, diagnostics) - 176usize];
     ["Offset of field: EmpyreanPropagationConfig::num_threads"]
-        [::std::mem::offset_of!(EmpyreanPropagationConfig, num_threads) - 200usize];
+        [::std::mem::offset_of!(EmpyreanPropagationConfig, num_threads) - 216usize];
     ["Offset of field: EmpyreanPropagationConfig::advanced"]
-        [::std::mem::offset_of!(EmpyreanPropagationConfig, advanced) - 208usize];
+        [::std::mem::offset_of!(EmpyreanPropagationConfig, advanced) - 224usize];
     ["Offset of field: EmpyreanPropagationConfig::ephemeris_overlap_policy"]
-        [::std::mem::offset_of!(EmpyreanPropagationConfig, ephemeris_overlap_policy) - 288usize];
+        [::std::mem::offset_of!(EmpyreanPropagationConfig, ephemeris_overlap_policy) - 304usize];
 };
 impl Default for EmpyreanPropagationConfig {
     fn default() -> Self {
@@ -1433,17 +1457,17 @@ pub struct EmpyreanEphemerisConfig {
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of EmpyreanEphemerisConfig"]
-        [::std::mem::size_of::<EmpyreanEphemerisConfig>() - 320usize];
+        [::std::mem::size_of::<EmpyreanEphemerisConfig>() - 336usize];
     ["Alignment of EmpyreanEphemerisConfig"]
         [::std::mem::align_of::<EmpyreanEphemerisConfig>() - 8usize];
     ["Offset of field: EmpyreanEphemerisConfig::propagation"]
         [::std::mem::offset_of!(EmpyreanEphemerisConfig, propagation) - 0usize];
     ["Offset of field: EmpyreanEphemerisConfig::max_light_time_iterations"]
-        [::std::mem::offset_of!(EmpyreanEphemerisConfig, max_light_time_iterations) - 296usize];
+        [::std::mem::offset_of!(EmpyreanEphemerisConfig, max_light_time_iterations) - 312usize];
     ["Offset of field: EmpyreanEphemerisConfig::light_time_tolerance_days"]
-        [::std::mem::offset_of!(EmpyreanEphemerisConfig, light_time_tolerance_days) - 304usize];
+        [::std::mem::offset_of!(EmpyreanEphemerisConfig, light_time_tolerance_days) - 320usize];
     ["Offset of field: EmpyreanEphemerisConfig::compute_diagnostics"]
-        [::std::mem::offset_of!(EmpyreanEphemerisConfig, compute_diagnostics) - 312usize];
+        [::std::mem::offset_of!(EmpyreanEphemerisConfig, compute_diagnostics) - 328usize];
 };
 impl Default for EmpyreanEphemerisConfig {
     fn default() -> Self {

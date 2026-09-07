@@ -594,6 +594,9 @@ class PropagationConfig:
                 "body_filter_naif": [origin_to_naif(o) for o in (events.body_filter or [])],
                 "dense_output": events.dense_output,
                 "dense_output_cadence_days": events.dense_output_cadence_days,
+                "detection_enabled": events.detection_enabled,
+                "dense_origin": events.dense_origin,
+                "capture_criterion": events.capture_criterion,
             },
             "diagnostics": {
                 "sensitivity": diag.sensitivity,

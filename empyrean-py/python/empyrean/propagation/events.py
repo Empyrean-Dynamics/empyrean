@@ -358,6 +358,43 @@ class EventConfig:
     dense_output_cadence_days : float
         Cadence (days) of dense output points around close approaches.
         Default 5 minutes (= ``5.0 / 1440.0``).
+    detection_enabled : bool
+        Master switch for per-substep event detection. Default True.
+
+        The only performance field here. The five flags above filter what
+        is *emitted*; the detectors still run on every accepted
+        integrator substep and still cost what they cost. Setting this
+        False installs no observational detector and skips the
+        per-substep dispatch entirely -- measured at 1.5x faster on a
+        64-orbit, covariance-free, two-epoch Standard-tier batch.
+
+        State accuracy is unchanged: the states, their covariance and
+        the STM come back bit-for-bit identical either way, because
+        detection is observation and not dynamics. What is gone is
+        everything the detectors produce -- no events, no close
+        approaches, and therefore no impact probabilities -- so the
+        events table comes back empty and the five flags and
+        ``body_filter`` are moot.
+
+        ``"auto"`` and ``"gaussian_mixture"`` resolve themselves from
+        that output (Auto picks its refinement windows from detected
+        close approaches and gates its second pass on their impact
+        probabilities; the mixture splits at those same close
+        approaches), so pairing either with ``detection_enabled=False``
+        raises rather than returning a silently linear answer.
+    dense_origin : {"bodycentric", "barycentric"}
+        Reference origin for dense encounter-trajectory output; read only
+        when ``dense_output`` is set. Default ``"bodycentric"``. A pure
+        translation by the (deterministic) body ephemeris, so the
+        per-point covariance is the same either way.
+    capture_criterion : {"population", "individual", "energy_only"}
+        Which published definition of temporary capture the capture
+        detector applies. Default ``"population"`` (Granvik+ 2012 /
+        Fedorets+ 2018, energy-bound within 3 Hill radii).
+        ``"individual"`` is the Fedorets+ 2020 per-object criterion
+        (~1 lunar distance for Earth); ``"energy_only"`` drops the
+        distance gate entirely. Not a tolerance to tune -- the three come
+        from different papers and disagree about which encounters count.
     """
 
     close_approaches: bool = True
@@ -368,3 +405,6 @@ class EventConfig:
     body_filter: list[Origin | str] | None = None
     dense_output: bool = False
     dense_output_cadence_days: float = 5.0 / 1440.0
+    detection_enabled: bool = True
+    dense_origin: str = "bodycentric"
+    capture_criterion: str = "population"

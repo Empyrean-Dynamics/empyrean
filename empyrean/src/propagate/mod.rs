@@ -81,8 +81,9 @@ mod config;
 mod result;
 
 pub use config::{
-    AdvancedIntegratorConfig, DiagnosticsConfig, EphemerisOverlapPolicy, EventConfig,
-    ForceModelTier, IntegratorChoice, OriginSwitchingConfig, PropagationConfig, UncertaintyMethod,
+    AdvancedIntegratorConfig, CaptureCriterion, DenseOrigin, DiagnosticsConfig,
+    EphemerisOverlapPolicy, EventConfig, ForceModelTier, IntegratorChoice, OriginSwitchingConfig,
+    PropagationConfig, UncertaintyMethod,
 };
 pub use result::{
     CovarianceKind, CovarianceQuality, Event, MixtureChain, MixtureComponent, PropagatedState,
@@ -125,6 +126,9 @@ impl Context {
         // Hold the per-orbit identifier CStrings alive across the FFI
         // call — `EmpyreanOrbit.orbit_id` / `.object_id` borrow into
         // their backing storage.
+        // Refuse an unserviceable pairing before any work starts, so a
+        // caller never receives a silently downgraded uncertainty.
+        config.validate()?;
         let (ffi_orbits, _orbit_keep) = crate::orbit::orbits_to_ffi(orbits)?;
         let (ffi_config, _config_keep) = config.to_ffi_with();
         let epochs_mjd_tdb: Vec<f64> = epochs

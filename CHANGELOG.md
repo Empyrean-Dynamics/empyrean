@@ -6,10 +6,21 @@ project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
-**Release note.** The C boundary gains `EmpyreanErrorLocation` and two
-accessors. They are additive — nothing existing moves — but
-`EMPYREAN_ABI_VERSION` encodes the distribution's own version and so has
-not moved; carry it with the next version bump.
+**Release note.** `EmpyreanEventConfig` grew 40 → 56 bytes by value,
+shifting every field after `events` in `EmpyreanPropagationConfig`
+(296 → 312) and `EmpyreanEphemerisConfig` (320 → 336); this is a layout
+break, and it ships under `EMPYREAN_ABI_VERSION` 1100, the 0.11.0 cycle.
+
+The shifted offsets, for a consumer re-deriving a hand-mirrored struct:
+`diagnostics` 160→176, `num_threads` 200→216, `advanced` 208→224,
+`ephemeris_overlap_policy` 288→304, and `compute_diagnostics` 312→328.
+Re-derive the whole layout rather than appending to it — writing
+`num_threads` at its old offset now lands inside `diagnostics`, silently.
+Recompiling against the current header is the fix; a 0.10.0 caller and a
+library from this cycle refuse each other at load by the version handshake.
+
+`EmpyreanErrorLocation` and its two accessors are additive by contrast —
+they take nothing away from any existing layout.
 
 ### Added
 
@@ -71,6 +82,58 @@ not moved; carry it with the next version bump.
   invalid-argument naming that orbit's index and id, instead of
   integrating into a NaN trajectory and surfacing from deep inside the
   engine as prose with no index in it.
+
+### Fixed
+
+- **Event detection can be switched off, and switching it off is worth
+  1.5×.** The C boundary dropped `EventConfig::detection_enabled`, so no
+  distribution caller could reach it: turning all five per-type detectors
+  off stopped events being *emitted* but left every detector running on
+  every accepted integrator substep. Measured on a 64-orbit,
+  covariance-free, two-epoch Standard-tier batch, single-threaded, over a
+  400-day arc: **272 ms with detection on, 185 ms with it off — 1.47×**,
+  reproducing the 1.48× seen independently on a longer arc. It is carried
+  now at every layer under the engine's own name —
+  `EventConfig::detection_enabled` in Rust and Python,
+  `EmpyreanEventConfig::detection_enabled` with the
+  `EMPYREAN_EVENT_DETECTION_*` tri-state in C, and `--no-events` on the
+  CLI's `propagate`.
+
+  **State accuracy is unchanged** — trajectory, covariance and STM are
+  bit-for-bit identical either way, asserted directly on a
+  covariance-carrying batch. **What is gone is everything the detectors
+  produce**: no events, no close approaches, and therefore no impact
+  probabilities.
+
+  **Two uncertainty methods resolve themselves from that output, and
+  pairing either with detection off is refused rather than served
+  degraded.** `Auto` picks its refinement windows from detected close
+  approaches and gates its second pass on their impact probabilities;
+  the adaptive Gaussian mixture splits at those same close approaches.
+  Given neither, both would return successfully with a linear covariance
+  and no impact probabilities — a silent downgrade of a scientific
+  output, which this distribution does not do. The refusal names both
+  halves and why, identically at every layer, and every other method is
+  served normally.
+
+  The wrapper's ephemeris path now says `detection_enabled = false`
+  outright rather than leaving it to be inferred from five cleared
+  filters — that path reads states and sensitivities and discards events.
+
+- The same marshalling gap silently dropped two more engine
+  `EventConfig` fields, and both are carried now: `dense_origin`
+  (`bodycentric` / `barycentric`, the reference origin of the dense
+  encounter trajectory) and `capture_criterion` (`population` /
+  `individual` / `energy_only`, which published definition of temporary
+  capture the capture detector applies — Granvik+ 2012, Fedorets+ 2020,
+  or energy-only). All three arrive as tri-states whose `0` is
+  `_DEFAULT`, so a `memset(0)` C config keeps meaning exactly what it
+  meant before the fields existed, and a value off the end of a ladder is
+  refused by name and value rather than resolving to the default.
+
+  `EventConfig::enrichment` remains the one engine field this boundary
+  does not carry. That omission is documented on both structs rather than
+  silent, and is unchanged here.
 
 ## [0.10.0] — 2026-08-20
 

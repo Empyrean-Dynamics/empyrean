@@ -184,10 +184,10 @@ pub use planning::{
     RadarPlanSpec, RadarStation, TargetRadarProperties,
 };
 pub use propagate::{
-    AdvancedIntegratorConfig, CovarianceKind, CovarianceQuality, DiagnosticsConfig,
-    EphemerisOverlapPolicy, Event, EventConfig, ForceModelTier, IntegratorChoice,
-    OriginSwitchingConfig, PropagatedState, PropagationConfig, PropagationResult, TaggedCovariance,
-    TargetFunctional, UncertaintyMethod,
+    AdvancedIntegratorConfig, CaptureCriterion, CovarianceKind, CovarianceQuality, DenseOrigin,
+    DiagnosticsConfig, EphemerisOverlapPolicy, Event, EventConfig, ForceModelTier,
+    IntegratorChoice, OriginSwitchingConfig, PropagatedState, PropagationConfig, PropagationResult,
+    TaggedCovariance, TargetFunctional, UncertaintyMethod,
 };
 pub use query::{
     query_horizons, query_horizons_vectors, query_observations, query_radar, query_sbdb,

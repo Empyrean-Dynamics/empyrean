@@ -970,6 +970,55 @@ for c in &plan.candidates {
 # Ok::<(), empyrean::Error>(())
 ```
 
+## Turning event detection off
+
+Every propagation runs the built-in detector set on each accepted
+integrator substep. The five per-type flags on `EventConfig` filter what
+gets *emitted*; they do not stop the detectors running. When a caller
+wants states and nothing else, `detection_enabled` is the switch that
+stops the work:
+
+```rust,no_run
+# let ctx = empyrean::Context::from_data_dir(None)?;
+# let orbits: Vec<empyrean::Orbit> = Vec::new();
+# let epochs: Vec<empyrean::Epoch> = Vec::new();
+let config = empyrean::PropagationConfig {
+    events: empyrean::EventConfig {
+        detection_enabled: false,
+        ..empyrean::EventConfig::default()
+    },
+    ..empyrean::PropagationConfig::default()
+};
+let result = ctx.propagate(&orbits, &epochs, &config)?;
+assert!(result.events.is_empty());
+# Ok::<(), empyrean::Error>(())
+```
+
+Measured on a 64-orbit, covariance-free, two-epoch Standard-tier batch,
+single-threaded over a 400-day arc: **272 ms with detection on, 185 ms
+with it off — 1.47×**.
+
+**State accuracy is unchanged** — trajectory, STM and dense output come
+back bit-for-bit identical either way, because detection is observation
+and not dynamics. Origin-switch zones do alter the integrated trajectory
+and are governed separately, by `OriginSwitchingConfig`. **What is gone
+is everything the detectors produce**: no events, no close approaches,
+and therefore no impact probabilities.
+
+`UncertaintyMethod::Auto` and `UncertaintyMethod::Mixture` resolve
+*themselves* from that output — Auto picks its refinement windows from
+detected close approaches and gates its second pass on their impact
+probabilities, the mixture splits at those same close approaches — so
+pairing either with detection off is **refused** by
+`PropagationConfig::validate`, not served as a silently linear answer.
+Every other method is served normally.
+
+`EventConfig` also carries `dense_origin` (which origin the dense
+encounter trajectory arrives in) and `capture_criterion` (which published
+definition of temporary capture the capture detector applies — Granvik+
+2012, Fedorets+ 2020, or energy-only). Both were silently dropped at the
+boundary until now.
+
 ## When a batch fails, it names the orbit
 
 A batch call takes N orbits and M epochs and fails as a whole. When the

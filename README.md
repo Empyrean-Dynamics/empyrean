@@ -179,6 +179,12 @@ empyrean --no-refresh init
 # Propagate Apophis 10 years past its SBDB epoch (epoch ≈ 61269 → 64922 MJD TDB).
 empyrean propagate --object-id 99942 --epoch 64922.0 --out-dir ./out
 
+# When only the states are wanted, --no-events switches event detection
+# off entirely. The detectors otherwise run on every accepted integrator
+# substep whether or not anything reads them, and skipping them is worth
+# about 1.5x. The propagated states are unchanged.
+empyrean propagate --object-id 99942 --epoch 64922.0 --out-dir ./out --no-events
+
 # Inspect the result Parquet — states + events tables, both with the
 # same orbit_id / object_id keys you can join in pandas / Polars / DuckDB.
 ls out/    # states.parquet  events.parquet

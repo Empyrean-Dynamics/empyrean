@@ -6333,6 +6333,39 @@ fn apply_propagation_config_dict(
         if let Some(v) = get_f64(&events, "dense_output_cadence_days")? {
             cfg.events.dense_output_cadence_days = v;
         }
+        if let Some(v) = get_bool(&events, "detection_enabled")? {
+            cfg.events.detection_enabled = v;
+        }
+        // The two enum fields arrive as the engine's own variant names,
+        // lowercased. An unrecognised value is refused by name rather
+        // than falling back to the default — a config string that is
+        // silently ignored is the failure this whole reader guards
+        // against.
+        if let Some(s) = get_str(&events, "dense_origin")? {
+            cfg.events.dense_origin = match s.to_ascii_lowercase().as_str() {
+                "bodycentric" => empyrean::DenseOrigin::Bodycentric,
+                "barycentric" => empyrean::DenseOrigin::Barycentric,
+                other => {
+                    return Err(PyValueError::new_err(format!(
+                        "unknown dense_origin: {other} (expected \"bodycentric\" or \
+                         \"barycentric\")"
+                    )));
+                }
+            };
+        }
+        if let Some(s) = get_str(&events, "capture_criterion")? {
+            cfg.events.capture_criterion = match s.to_ascii_lowercase().as_str() {
+                "population" => empyrean::CaptureCriterion::Population,
+                "individual" => empyrean::CaptureCriterion::Individual,
+                "energy_only" | "energyonly" => empyrean::CaptureCriterion::EnergyOnly,
+                other => {
+                    return Err(PyValueError::new_err(format!(
+                        "unknown capture_criterion: {other} (expected \"population\", \
+                         \"individual\" or \"energy_only\")"
+                    )));
+                }
+            };
+        }
     }
     if let Some(diag) = get_dict(d, "diagnostics")? {
         if let Some(v) = get_bool(&diag, "sensitivity")? {

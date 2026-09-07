@@ -359,6 +359,9 @@ impl BuiltSystem {
         epochs: &[crate::Epoch],
         config: &PropagationConfig,
     ) -> Result<PropagationResult> {
+        // Same refusal as the one-shot path — the handle changes when
+        // the force model is assembled, not what a config may ask for.
+        config.validate()?;
         let (ffi_orbits, _orbit_keep) = orbits_to_ffi(orbits)?;
         let (ffi_config, _config_keep) = config.to_ffi_with();
         let epochs_mjd_tdb: Vec<f64> = epochs

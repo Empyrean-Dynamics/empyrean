@@ -300,6 +300,7 @@ fn run_refine_path(
     );
     let seeds = ctx
         .determine(observations, None, &base_config)
+        .map_err(crate::commands::with_orbit_context)
         .context("refine-path pass 1 (seed solve) failed")?;
 
     let wide_config = empyrean::ODConfig {
@@ -644,6 +645,7 @@ pub fn run(data: &DataOptions, args: DetermineArgs) -> Result<()> {
             ..empyrean::ODConfig::default()
         };
         ctx.determine(&observations, None, &config)
+            .map_err(crate::commands::with_orbit_context)
             .context("orbit determination failed")?
     };
     eprintln!(

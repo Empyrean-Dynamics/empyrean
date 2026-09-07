@@ -137,6 +137,7 @@ pub fn run(data: &DataOptions, args: PropagateArgs) -> Result<()> {
             &[empyrean::Epoch::from_mjd_tdb(args.epoch)],
             &config,
         )
+        .map_err(crate::commands::with_orbit_context)
         .context("propagation failed")?;
     eprintln!("Propagation complete ({:.1}s)", t1.elapsed().as_secs_f64());
 

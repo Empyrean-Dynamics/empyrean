@@ -194,6 +194,43 @@ no-op; the struct is left zeroed so a double free is safe.*/
 pub unsafe fn empyrean_missing_data_files_free(out: *mut EmpyreanMissingDataFiles) {
     unsafe { lib().empyrean_missing_data_files_free(out) }
 }
+/** Retrieve the position of the most recent failure on this thread.
+
+The companion to `empyrean_last_error()`: that returns the prose,
+this returns where in the caller's batch the prose applies. A batch
+call fails as a whole, so without this the only way from "the call
+failed" to "orbit 2317 failed" is to re-run the batch one orbit at a
+time.
+
+Returns 0 and fills `out` on success. An `out` with `orbit_id` null,
+`has_orbit_index == 0` and `has_epoch == 0` means the last error on
+this thread carried no position; it is not itself an error.
+
+Returns `-1` for a null `out`, `-5` when the recorded `orbit_id`
+contains an interior NUL and so cannot be handed back as a C string,
+and `-99` on a caught panic. **On any non-zero return `out` is left
+exactly as the caller passed it** — nothing was handed over, so do
+not call [`empyrean_error_location_free`] unless this returned 0.
+
+Nothing here is inferred from the message text. A field is filled
+only when the boundary or the engine supplied that value directly, so
+an absent field means "not known", never "not applicable".
+
+The position is thread-local and is cleared by the next call that
+records an error on this thread, so read it immediately after the
+failing call. **The caller owns `out` and must release it with
+[`empyrean_error_location_free`].***/
+#[inline]
+pub unsafe fn empyrean_error_location(out: *mut EmpyreanErrorLocation) -> i32 {
+    unsafe { lib().empyrean_error_location(out) }
+}
+/** Free an [`EmpyreanErrorLocation`] populated by
+[`empyrean_error_location`]. Passing a null or zeroed struct is a
+no-op; the struct is left zeroed so a double free is safe.*/
+#[inline]
+pub unsafe fn empyrean_error_location_free(out: *mut EmpyreanErrorLocation) {
+    unsafe { lib().empyrean_error_location_free(out) }
+}
 /**Free an `EmpyreanContext` previously returned by
 `empyrean_context_from_data_dir`, `empyrean_context_from_data_dir_with`
 or `empyrean_context_new_minimal`.

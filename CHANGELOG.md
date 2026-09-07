@@ -6,6 +6,52 @@ project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+**Release note.** The C boundary gains `EmpyreanErrorLocation` and two
+accessors. They are additive — nothing existing moves — but
+`EMPYREAN_ABI_VERSION` encodes the distribution's own version and so has
+not moved; carry it with the next version bump.
+
+### Added
+
+- **A failed batch names the orbit it failed on.** Every batch entry
+  point takes N orbits × M epochs and fails as a whole; a failure that
+  belongs to one orbit now carries that orbit's index in the batch, its
+  `orbit_id`, and the epoch. A downstream caller was re-running 4096-state
+  chunks one state at a time purely to find the bad member.
+  - Rust: `Error::orbit_index()`, `Error::orbit_id()`,
+    `Error::epoch_mjd_tdb()` (and the matching public fields).
+    `Display` renders the position after the message.
+  - C: `EmpyreanErrorLocation` plus `empyrean_error_location()` /
+    `empyrean_error_location_free()`, the positional companion to
+    `empyrean_last_error()` — the same shape as the existing
+    `empyrean_missing_data_files()` pair, thread-local and cleared by the
+    next error on the thread.
+  - Python: `orbit_index` / `orbit_id` / `epoch_mjd_tdb` attributes, set
+    unconditionally (`None` included) on every exception raised from a
+    wrapper failure, so a caller reads them without `getattr`.
+  - CLI: the offending row is printed as its own context line by
+    `propagate`, `ephemeris` and `determine`, the way the strict-offline
+    absent-file list already was.
+
+  Nothing is inferred from the message text. A field is filled only when
+  the boundary or the engine supplied that value, so absent means *not
+  known*, never *not applicable* — and a failure belonging to no single
+  orbit reports no position rather than defaulting to row 0. Populated
+  today by every failure raised while marshaling the caller's orbit array,
+  by the retained-result accessors (which are addressed by index), and by
+  every engine propagation failure that names an orbit — which on the
+  BuiltSystem path is 15 of the engine's error variants, because that path
+  receives the engine's typed error rather than a rendered string.
+
+### Changed
+
+- Non-finite input is refused at the C boundary, by the row it belongs to.
+  A NaN or infinite epoch, element, declared covariance entry or declared
+  non-grav border on any orbit of a propagation batch now fails with
+  invalid-argument naming that orbit's index and id, instead of
+  integrating into a NaN trajectory and surfacing from deep inside the
+  engine as prose with no index in it.
+
 ## [0.10.0] — 2026-08-20
 
 The 0.10.0 final. Identical in content to 0.10.0-rc.2 — no code changes

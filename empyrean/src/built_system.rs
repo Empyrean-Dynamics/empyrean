@@ -605,6 +605,9 @@ mod tests {
                 code,
                 message: String::new(),
                 missing_data_files: Vec::new(),
+                orbit_index: None,
+                orbit_id: None,
+                epoch_mjd_tdb: None,
             };
             assert_eq!(err.builtsystem_guard(), Some(expected), "code {code}");
         }
@@ -613,6 +616,9 @@ mod tests {
             code: -3,
             message: String::new(),
             missing_data_files: Vec::new(),
+            orbit_index: None,
+            orbit_id: None,
+            epoch_mjd_tdb: None,
         };
         assert_eq!(ok.builtsystem_guard(), None);
     }

@@ -286,6 +286,46 @@ impl Default for EmpyreanMissingDataFiles {
         }
     }
 }
+#[doc = " Where in the caller's batch the most recent failure happened.\n\n Populated by [`empyrean_error_location`]; release it with\n [`empyrean_error_location_free`].\n\n Each of the three positions carries its own presence flag rather than\n a sentinel, because every value they can hold is a legitimate one: a\n zeroed struct reads as \"nothing known\", `orbit_index` `0` is the first\n orbit and not a null, and `epoch_mjd_tdb` has no unused double."]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct EmpyreanErrorLocation {
+    #[doc = " The caller's `orbit_id` for the offending orbit, or null when the\n failure named no orbit. Heap-allocated, NUL-terminated UTF-8."]
+    pub orbit_id: *mut ::std::os::raw::c_char,
+    #[doc = " Zero-based index of the offending orbit in the caller's batch.\n Read only when `has_orbit_index` is non-zero."]
+    pub orbit_index: usize,
+    #[doc = " The epoch that identifies the failure, MJD TDB — the requested\n output epoch when the failure is tied to one, otherwise the\n offending orbit's own epoch. Read only when `has_epoch` is\n non-zero."]
+    pub epoch_mjd_tdb: f64,
+    #[doc = " Whether `orbit_index` carries a value."]
+    pub has_orbit_index: u8,
+    #[doc = " Whether `epoch_mjd_tdb` carries a value."]
+    pub has_epoch: u8,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of EmpyreanErrorLocation"][::std::mem::size_of::<EmpyreanErrorLocation>() - 32usize];
+    ["Alignment of EmpyreanErrorLocation"]
+        [::std::mem::align_of::<EmpyreanErrorLocation>() - 8usize];
+    ["Offset of field: EmpyreanErrorLocation::orbit_id"]
+        [::std::mem::offset_of!(EmpyreanErrorLocation, orbit_id) - 0usize];
+    ["Offset of field: EmpyreanErrorLocation::orbit_index"]
+        [::std::mem::offset_of!(EmpyreanErrorLocation, orbit_index) - 8usize];
+    ["Offset of field: EmpyreanErrorLocation::epoch_mjd_tdb"]
+        [::std::mem::offset_of!(EmpyreanErrorLocation, epoch_mjd_tdb) - 16usize];
+    ["Offset of field: EmpyreanErrorLocation::has_orbit_index"]
+        [::std::mem::offset_of!(EmpyreanErrorLocation, has_orbit_index) - 24usize];
+    ["Offset of field: EmpyreanErrorLocation::has_epoch"]
+        [::std::mem::offset_of!(EmpyreanErrorLocation, has_epoch) - 25usize];
+};
+impl Default for EmpyreanErrorLocation {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
 #[doc = " Per-crate version strings reported by the empyrean stack.\n\n Mirrors [`empyrean_core::Versions`]. Each pointer is a heap-allocated\n NUL-terminated UTF-8 string owned by [`EmpyreanVersions`]; release\n the whole struct with [`empyrean_versions_free`] (do not free the\n individual fields with [`empyrean_string_free`])."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -321,7 +361,7 @@ impl Default for EmpyreanVersions {
         }
     }
 }
-#[doc = " Flat C-ABI compatible coordinate state.\n\n Carries [`empyrean_core::convert::CoordinateState`]'s fields plus the\n state↔Marsden border; the duplicate definition exists so cbindgen\n (which has `parse_deps = false`) can emit the matching C struct in\n `empyrean.h` without traversing into the empyrean-core crate.\n\n `Copy` is a Rust-side convenience only (the batched transform writes\n whole rows into a caller-owned array); the C layout is unaffected.\n\n # The border sits here, beside the 6×6 it borders\n\n [`non_grav_cross`](Self::non_grav_cross) is the \\\\(6 \\times 3\\\\) half\n of one `ExtendedCovariance`, whose other half is the state\n [`covariance`](Self::covariance). Putting it one level up on\n `EmpyreanOrbit` would split a single matrix across two structs, and\n `empyrean_transform_coordinates` takes a `CoordinateState` *without*\n its orbit — so the two halves could be transformed apart. Here they\n travel together, and the transform rotates the pair.\n\n The orbit's wide **carrier** stays on `EmpyreanOrbit`, mirroring the\n engine's own split: a carrier's thrust tags are an orbit-level\n concept a coordinate has no business knowing.\n\n One consequence a caller should know: `empyrean_transform_coordinates`\n transforms a coordinate and its border, **not a whole joint**. An\n orbit's carrier is not in scope at that signature, so an orbit-level\n joint cannot be re-expressed in another basis through the C ABI in\n this release. Transform the orbit before attaching its carrier, or\n supply the joint in the basis you want it consumed in."]
+#[doc = " Flat C-ABI compatible coordinate state.\n\n Carries [`empyrean_core::convert::CoordinateState`]'s fields plus the\n state↔Marsden border; the duplicate definition exists so cbindgen\n (which has `parse_deps = false`) can emit the matching C struct in\n `empyrean.h` without traversing into the empyrean-core crate.\n\n `Copy` is a Rust-side convenience only (the batched transform writes\n whole rows into a caller-owned array); the C layout is unaffected.\n\n # The border sits here, beside the 6×6 it borders\n\n [`non_grav_cross`](Self::non_grav_cross) is the \\\\(6 \\times 3\\\\) half\n of one `ExtendedCovariance`, whose other half is the state\n [`covariance`](Self::covariance). Putting it one level up on\n `EmpyreanOrbit` would split a single matrix across two structs, and\n `empyrean_transform_coordinates` takes a `CoordinateState` *without*\n its orbit — so the two halves could be transformed apart. Here they\n travel together, and the transform rotates the pair.\n\n The orbit's wide **carrier** stays on `EmpyreanOrbit`, mirroring the\n engine's own split: a carrier's thrust tags are an orbit-level\n concept a coordinate has no business knowing.\n\n One consequence a caller should know: `empyrean_transform_coordinates`\n transforms a coordinate and its border, **not a whole joint**. An\n orbit's carrier is not in scope at that signature, so an orbit-level\n joint cannot be re-expressed in another basis through the C ABI in\n this release. Transform the orbit before attaching its carrier, or\n supply the joint in the basis you want it consumed in.\n\n # Non-finite values are refused, by the row they belong to\n\n A propagation batch is checked row by row before anything is\n integrated, and a NaN or infinite value in a **declared** field\n fails the call with invalid-argument, naming that orbit's index and\n `orbit_id` (readable through\n [`empyrean_error_location`]). A NaN\n element otherwise integrates into a NaN trajectory and surfaces from\n deep inside the engine with no index in the message.\n\n Checked always: [`epoch_mjd_tdb`](Self::epoch_mjd_tdb) and all six\n [`elements`](Self::elements). Checked only when the row declares\n them: [`covariance`](Self::covariance) (when `has_covariance` is\n non-zero) and [`non_grav_cross`](Self::non_grav_cross) (when\n `has_non_grav_cross` is non-zero) — an undeclared block is\n uninitialized memory as far as this ABI is concerned, and reading it\n would reject rows the engine never looks at.\n\n **Deliberately not checked**, because NaN is their documented\n \"absent\" sentinel rather than a mistake: `EmpyreanOrbit`'s\n `non_grav_dt`, `non_grav_dt_variance`, `srp_amrat_variance`, and the\n photometry slots."]
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
 pub struct CoordinateState {
@@ -4577,6 +4617,8 @@ pub struct EmpyreanLib {
     pub empyrean_missing_data_files:
         unsafe extern "C" fn(out: *mut EmpyreanMissingDataFiles) -> i32,
     pub empyrean_missing_data_files_free: unsafe extern "C" fn(out: *mut EmpyreanMissingDataFiles),
+    pub empyrean_error_location: unsafe extern "C" fn(out: *mut EmpyreanErrorLocation) -> i32,
+    pub empyrean_error_location_free: unsafe extern "C" fn(out: *mut EmpyreanErrorLocation),
     pub empyrean_context_free: unsafe extern "C" fn(ctx: *mut EmpyreanContext),
     pub empyrean_default_data_dir: unsafe extern "C" fn() -> *mut ::std::os::raw::c_char,
     pub empyrean_string_free: unsafe extern "C" fn(s: *mut ::std::os::raw::c_char),
@@ -5035,6 +5077,12 @@ impl EmpyreanLib {
         let empyrean_missing_data_files_free = __library
             .get(b"empyrean_missing_data_files_free\0")
             .map(|sym| *sym)?;
+        let empyrean_error_location = __library
+            .get(b"empyrean_error_location\0")
+            .map(|sym| *sym)?;
+        let empyrean_error_location_free = __library
+            .get(b"empyrean_error_location_free\0")
+            .map(|sym| *sym)?;
         let empyrean_context_free = __library.get(b"empyrean_context_free\0").map(|sym| *sym)?;
         let empyrean_default_data_dir = __library
             .get(b"empyrean_default_data_dir\0")
@@ -5273,6 +5321,8 @@ impl EmpyreanLib {
             empyrean_download_data,
             empyrean_missing_data_files,
             empyrean_missing_data_files_free,
+            empyrean_error_location,
+            empyrean_error_location_free,
             empyrean_context_free,
             empyrean_default_data_dir,
             empyrean_string_free,
@@ -5411,6 +5461,14 @@ impl EmpyreanLib {
     #[doc = " Free an [`EmpyreanMissingDataFiles`] populated by\n [`empyrean_missing_data_files`]. Passing a null or zeroed struct is a\n no-op; the struct is left zeroed so a double free is safe."]
     pub unsafe fn empyrean_missing_data_files_free(&self, out: *mut EmpyreanMissingDataFiles) {
         (self.empyrean_missing_data_files_free)(out)
+    }
+    #[doc = " Retrieve the position of the most recent failure on this thread.\n\n The companion to `empyrean_last_error()`: that returns the prose,\n this returns where in the caller's batch the prose applies. A batch\n call fails as a whole, so without this the only way from \"the call\n failed\" to \"orbit 2317 failed\" is to re-run the batch one orbit at a\n time.\n\n Returns 0 and fills `out` on success. An `out` with `orbit_id` null,\n `has_orbit_index == 0` and `has_epoch == 0` means the last error on\n this thread carried no position; it is not itself an error.\n\n Returns `-1` for a null `out`, `-5` when the recorded `orbit_id`\n contains an interior NUL and so cannot be handed back as a C string,\n and `-99` on a caught panic. **On any non-zero return `out` is left\n exactly as the caller passed it** — nothing was handed over, so do\n not call [`empyrean_error_location_free`] unless this returned 0.\n\n Nothing here is inferred from the message text. A field is filled\n only when the boundary or the engine supplied that value directly, so\n an absent field means \"not known\", never \"not applicable\".\n\n The position is thread-local and is cleared by the next call that\n records an error on this thread, so read it immediately after the\n failing call. **The caller owns `out` and must release it with\n [`empyrean_error_location_free`].**"]
+    pub unsafe fn empyrean_error_location(&self, out: *mut EmpyreanErrorLocation) -> i32 {
+        (self.empyrean_error_location)(out)
+    }
+    #[doc = " Free an [`EmpyreanErrorLocation`] populated by\n [`empyrean_error_location`]. Passing a null or zeroed struct is a\n no-op; the struct is left zeroed so a double free is safe."]
+    pub unsafe fn empyrean_error_location_free(&self, out: *mut EmpyreanErrorLocation) {
+        (self.empyrean_error_location_free)(out)
     }
     #[doc = " Free an `EmpyreanContext` previously returned by\n `empyrean_context_from_data_dir`, `empyrean_context_from_data_dir_with`\n or `empyrean_context_new_minimal`.\n\n Passing null is a no-op."]
     pub unsafe fn empyrean_context_free(&self, ctx: *mut EmpyreanContext) {

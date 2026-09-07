@@ -45,11 +45,11 @@ use crate::ephemeris::{
 };
 use crate::observers::EmpyreanObserver;
 use crate::propagate::{
-    EmpyreanOrbit, EmpyreanPropagationConfig, EmpyreanPropagationResult,
-    build_orbits_for_propagation, build_propagation_config_from_c, free_c_str, int_to_force_model,
-    marshal_propagation_result, to_c_str,
+    EmpyreanOrbit, EmpyreanPropagationConfig, EmpyreanPropagationResult, batch_epochs,
+    batch_orbit_id, build_orbits_for_propagation, build_propagation_config_from_c, free_c_str,
+    int_to_force_model, marshal_propagation_result, to_c_str,
 };
-use crate::{EmpyreanContext, set_last_error};
+use crate::{EmpyreanContext, ErrorBatch, set_last_error};
 
 // ────────────────────────────────────────────────────────────────────
 // Return codes — split by identity-guard axis
@@ -422,7 +422,7 @@ pub unsafe extern "C" fn empyrean_builtsystem_propagate(
             match build_orbits_for_propagation(orbit_slice) {
                 Ok(t) => t,
                 Err(e) => {
-                    set_last_error(&e);
+                    e.report();
                     return EMPYREAN_BUILTSYSTEM_INVALID_ARGUMENT;
                 }
             };
@@ -444,7 +444,18 @@ pub unsafe extern "C" fn empyrean_builtsystem_propagate(
         // divisor — mapped here to distinct loud codes. NO silent rebuild.
         let prop_result = match handle.system.propagate(&orbits, &times, &cfg) {
             Ok(res) => res,
-            Err(e) => return map_prop_error_to_code(&e),
+            Err(e) => {
+                // The batch is assembled only on the failing path: it
+                // exists to resolve an engine-named orbit back to a row,
+                // and paying for it on every successful call would be a
+                // per-call allocation for nothing.
+                let epochs = batch_epochs(orbit_slice);
+                let batch = ErrorBatch {
+                    orbit_ids: &input_orbit_ids,
+                    epochs_mjd_tdb: &epochs,
+                };
+                return map_prop_error_to_code(&e, Some(&batch));
+            }
         };
 
         marshal_propagation_result(
@@ -542,7 +553,22 @@ pub unsafe extern "C" fn empyrean_builtsystem_generate_ephemeris(
         // optical forward model (check_fresh + check_key run inside).
         let eph_result = match handle.system.generate_optical(&orbits, &observers, &config) {
             Ok(res) => res,
-            Err(e) => return map_eph_error_to_code(&e),
+            Err(e) => {
+                // Assembled on the failing path only — one String per
+                // orbit is not a cost a successful ephemeris call should
+                // carry.
+                let ids: Vec<String> = orbit_slice
+                    .iter()
+                    .enumerate()
+                    .map(|(i, o)| batch_orbit_id(o, i))
+                    .collect();
+                let epochs = batch_epochs(orbit_slice);
+                let batch = ErrorBatch {
+                    orbit_ids: &ids,
+                    epochs_mjd_tdb: &epochs,
+                };
+                return map_eph_error_to_code(&e, Some(&batch));
+            }
         };
 
         marshal_ephemeris_result(&eph_result, result_out)
@@ -650,7 +676,7 @@ fn guard_handle_for_od(
         .system
         .generate_optical(&probe, &[], &od_key_config_for(cfg.force_model))
     {
-        return Err(map_eph_error_to_code(&e));
+        return Err(map_eph_error_to_code(&e, None));
     }
     Ok(Arc::clone(&handle.system))
 }
@@ -978,8 +1004,8 @@ pub unsafe extern "C" fn empyrean_builtsystem_description_free(
 /// The `KeyMismatch` axes and staleness each get a distinct loud code; every
 /// other propagation failure surfaces its message under the generic
 /// propagation code — never a silent success.
-fn map_prop_error_to_code(e: &PropagationError) -> i32 {
-    match e {
+fn map_prop_error_to_code(e: &PropagationError, batch: Option<&ErrorBatch<'_>>) -> i32 {
+    let code = match e {
         PropagationError::KeyMismatch(SystemKeyMismatch::Frame { .. }) => {
             set_last_error(&format!("BuiltSystem key mismatch: {e}"));
             EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_FRAME
@@ -1000,14 +1026,69 @@ fn map_prop_error_to_code(e: &PropagationError) -> i32 {
             set_last_error(&format!("BuiltSystem propagation failed: {other}"));
             EMPYREAN_BUILTSYSTEM_PROPAGATION
         }
+    };
+    // The message is set; attach the row it applies to, when the engine
+    // named one. `set_last_error` above cleared the slot, so this order
+    // is the only one that survives.
+    if let Some(orbit_id) = propagation_error_orbit_id(e) {
+        crate::set_error_location(match batch {
+            Some(b) => b.locate(orbit_id),
+            None => crate::ErrorLocation::named(orbit_id),
+        });
+    }
+    code
+}
+
+/// The orbit an engine propagation failure names, when it names one.
+///
+/// This is where the distribution's positional error reporting is
+/// richest, and the reason is structural: the handle path hands this
+/// boundary villeneuve's own typed error, whose per-orbit variants each
+/// carry the `orbit_id` the failure belongs to. The one-shot entry
+/// points reach the engine through a facade that renders the same error
+/// to a string first, so on that path only the variants the facade keeps
+/// structured survive.
+///
+/// Matched by variant rather than scraped out of the message: a rendered
+/// string is a presentation detail that may be rephrased, and an id
+/// recovered by pattern-matching prose would name the wrong orbit the
+/// first time an id contains the surrounding punctuation.
+fn propagation_error_orbit_id(e: &PropagationError) -> Option<&str> {
+    match e {
+        PropagationError::Integration { orbit_id, .. }
+        | PropagationError::KeplerDTBackPropagation { orbit_id, .. }
+        | PropagationError::Transform { orbit_id, .. }
+        | PropagationError::InvalidDTConfiguration { orbit_id, .. }
+        | PropagationError::ExtendedCovarianceWithoutState { orbit_id, .. }
+        | PropagationError::ExtendedCovarianceWithoutNonGravCovariance { orbit_id, .. }
+        | PropagationError::ExtendedCovarianceNotPositiveSemidefinite { orbit_id, .. }
+        | PropagationError::WideCrossPartitionViolation { orbit_id, .. }
+        | PropagationError::WideCrossParameterNotSolved { orbit_id, .. }
+        | PropagationError::WideCrossRepresentationUnsupported { orbit_id, .. }
+        | PropagationError::ExtendedCovarianceParamsMismatch { orbit_id, .. }
+        | PropagationError::OutputAssembly { orbit_id, .. }
+        | PropagationError::DuplicateOrbitId { orbit_id, .. }
+        | PropagationError::SigmaPointConstruction { orbit_id, .. }
+        | PropagationError::SampledParameterOutOfDomain { orbit_id, .. } => Some(orbit_id),
+        // The remaining variants are batch-wide or body-wide — an
+        // empty epoch grid, a missing GM, a thread-pool failure, the
+        // identity guards — and have no single offending row. Reporting
+        // none is the honest answer; naming orbit 0 would not be.
+        //
+        // The arm is a wildcard because the engine's error enum is
+        // `#[non_exhaustive]`, which means an engine bump that adds a
+        // per-orbit variant lands here silently rather than failing the
+        // build. Re-audit this match against the enum whenever the
+        // pinned engine moves.
+        _ => None,
     }
 }
 
 /// Map a handle-dispatch [`EphemerisGenerationError`] onto its C code,
 /// delegating the identity-guard axes to [`map_prop_error_to_code`].
-fn map_eph_error_to_code(e: &EphemerisGenerationError) -> i32 {
+fn map_eph_error_to_code(e: &EphemerisGenerationError, batch: Option<&ErrorBatch<'_>>) -> i32 {
     match e {
-        EphemerisGenerationError::Propagation(inner) => map_prop_error_to_code(inner),
+        EphemerisGenerationError::Propagation(inner) => map_prop_error_to_code(inner, batch),
         other => {
             set_last_error(&format!("BuiltSystem ephemeris generation failed: {other}"));
             EMPYREAN_BUILTSYSTEM_PROPAGATION

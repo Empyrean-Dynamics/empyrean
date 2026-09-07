@@ -35,8 +35,80 @@ fn get_context() -> PyResult<&'static empyrean::Context> {
     })
 }
 
-fn to_pyerr(e: impl std::fmt::Display) -> PyErr {
-    PyRuntimeError::new_err(e.to_string())
+/// Map a wrapper failure into a Python exception **without dropping any
+/// of its structured payload**.
+///
+/// [`empyrean::Error`] carries two things the message only renders as
+/// text, and both reach Python as real attributes rather than as prose a
+/// caller would have to parse back apart:
+///
+/// * `missing_data_files` — the files a data shortfall named. Present
+///   whenever the engine named a shortfall, and the exception is then a
+///   [`FileNotFoundError`] (an `OSError`, which is what a Python caller
+///   reaches for when files are absent) instead of a `RuntimeError`.
+/// * `orbit_index` / `orbit_id` / `epoch_mjd_tdb` — where in the
+///   caller's batch the failure happened. A batch call fails as a whole,
+///   so without these the only route to the offending member is to
+///   re-run the batch one orbit at a time.
+///
+/// The positional attributes are set unconditionally, `None` included,
+/// so `except Exception as e: e.orbit_index` is always readable and a
+/// caller never has to `getattr` defensively. `missing_data_files` stays
+/// conditional: it selects the exception type, and attaching an empty
+/// list to every `RuntimeError` would claim a data shortfall that did
+/// not happen.
+fn to_pyerr(e: empyrean::Error) -> PyErr {
+    Python::attach(|py| {
+        let files = e.missing_data_files();
+        let err = if files.is_empty() {
+            PyRuntimeError::new_err(e.to_string())
+        } else {
+            let err = pyo3::exceptions::PyFileNotFoundError::new_err(e.to_string());
+            match PyList::new(py, files) {
+                Ok(list) => {
+                    if let Err(attach_failed) = err.value(py).setattr("missing_data_files", list) {
+                        // Never let the bookkeeping failure mask the
+                        // real one; chain it so neither is lost.
+                        attach_failed.set_cause(py, Some(err));
+                        return attach_failed;
+                    }
+                    err
+                }
+                Err(build_failed) => {
+                    build_failed.set_cause(py, Some(err));
+                    return build_failed;
+                }
+            }
+        };
+        attach_error_location(py, err, &e)
+    })
+}
+
+/// Attach the three positional attributes to an exception, whatever its
+/// type.
+///
+/// Split out of [`to_pyerr`] because the contract is "set on **every**
+/// exception raised from a wrapper failure", and the `BuiltSystem`
+/// identity guard raises its own `ValueError` without going through
+/// `to_pyerr`. A caller writing `except Exception as e: e.orbit_index`
+/// must not hit an `AttributeError` there.
+///
+/// Set unconditionally, `None` included, so the attributes are always
+/// readable and no caller has to `getattr` defensively.
+fn attach_error_location(py: Python<'_>, err: PyErr, e: &empyrean::Error) -> PyErr {
+    let attached = {
+        let value = err.value(py);
+        value
+            .setattr("orbit_index", e.orbit_index())
+            .and_then(|()| value.setattr("orbit_id", e.orbit_id()))
+            .and_then(|()| value.setattr("epoch_mjd_tdb", e.epoch_mjd_tdb()))
+    };
+    if let Err(attach_failed) = attached {
+        // Never let the bookkeeping failure mask the real one.
+        attach_failed.set_cause(py, Some(err));
+        return attach_failed;
+    }
+    err
 }
 
 /// Map a NAIF integer code (the wire format the Python side emits) to
@@ -185,48 +257,9 @@ fn _initialize(
         }
     });
 
-    let ctx = built.map_err(|e| context_error_to_pyerr(py, &e))?;
+    let ctx = built.map_err(to_pyerr)?;
     let _ = CONTEXT.set(ctx);
     Ok(())
-}
-
-/// Map a context-construction failure into a Python exception **without
-/// dropping the structured missing-file list**.
-///
-/// [`empyrean::Error::missing_data_files`] is populated whenever the
-/// engine names a data shortfall — a strict-offline (`refresh=false`)
-/// construction, and equally one floored there by `EMPYREAN_OFFLINE=1` —
-/// and it is the actionable half
-/// of that failure: fetch exactly those files and the same call succeeds.
-/// Flattening it into the message would force a caller to split the text
-/// back apart on a separator a filename may itself contain, so it is
-/// carried as a real Python list on the raised exception:
-///
-/// * missing files present — [`FileNotFoundError`] (an `OSError`, which
-///   is what a Python caller reaches for when files are absent) with a
-///   `missing_data_files` attribute holding the list.
-/// * every other failure — `RuntimeError`, exactly as before.
-fn context_error_to_pyerr(py: Python<'_>, e: &empyrean::Error) -> PyErr {
-    let files = e.missing_data_files();
-    if files.is_empty() {
-        return PyRuntimeError::new_err(e.to_string());
-    }
-    let err = pyo3::exceptions::PyFileNotFoundError::new_err(e.to_string());
-    match PyList::new(py, files) {
-        Ok(list) => {
-            if let Err(attach_failed) = err.value(py).setattr("missing_data_files", list) {
-                // Never let the bookkeeping failure mask the real one;
-                // chain it so neither is lost.
-                attach_failed.set_cause(py, Some(err));
-                return attach_failed;
-            }
-        }
-        Err(build_failed) => {
-            build_failed.set_cause(py, Some(err));
-            return build_failed;
-        }
-    }
-    err
 }
 
 // ══════════════════════════════════════════════════════════
@@ -1183,10 +1216,10 @@ fn _propagate<'py>(
     let prop_result = match handle_ref {
         Some(h) => py
             .detach(|| h.propagate(ctx, &orbits, &times_slice, &config))
-            .map_err(builtsystem_guard_err)?,
+            .map_err(|e| builtsystem_guard_err(with_caller_orbit_id(e, &orbit_ids)))?,
         None => py
             .detach(|| ctx.propagate(&orbits, &times_slice, &config))
-            .map_err(to_pyerr)?,
+            .map_err(|e| to_pyerr(with_caller_orbit_id(e, &orbit_ids)))?,
     };
 
     let m = prop_result.states.len();
@@ -1896,6 +1929,34 @@ fn fill_mixtures(
 //  optional, because an omittable parameter channel is a silent-default
 //  channel.
 // ══════════════════════════════════════════════════════════
+
+/// Re-seat the caller's own `orbit_id` on a failure that names a batch
+/// row, replacing the positional `orbit_N` the boundary substituted.
+///
+/// This layer marshals orbits without their ids — it hands the boundary
+/// bare states and joins the caller's ids back on by position afterwards
+/// ([`parse_fabricated_orbit_index`] is the other half of the same
+/// convention). So a failure comes back naming `orbit_2` where the
+/// caller's own batch calls that row `2024 YR4`, and an id a caller
+/// cannot find in the batch it passed is worse than no id at all.
+///
+/// The index is the authoritative half and is left exactly as the
+/// boundary reported it; the id is looked up from the caller's array and
+/// replaced only when that lookup lands. A failure carrying no index
+/// keeps whatever id it had.
+///
+/// Only the **attribute** is re-seated, not the rendered message: the
+/// message came back from the boundary already formatted, so
+/// `e.orbit_id` reads `"2024 YR4"` while `str(e)` still names the
+/// positional id the boundary used. The attribute is the one to act on;
+/// re-rendering the message would mean parsing and rewriting prose this
+/// layer did not write.
+fn with_caller_orbit_id(mut e: empyrean::Error, caller_orbit_ids: &[String]) -> empyrean::Error {
+    if let Some(id) = e.orbit_index().and_then(|i| caller_orbit_ids.get(i)) {
+        e.orbit_id = Some(id.clone());
+    }
+    e
+}
 
 /// Parse an index out of the fabricated `"orbit_N"` strings that the
 /// C ABI emits in event `orbit_id` fields (see
@@ -7669,7 +7730,14 @@ fn builtsystem_guard_err(e: empyrean::Error) -> PyErr {
                      use the module-level call, which is free to choose the tier"
                 }
             };
-            PyValueError::new_err(format!("BuiltSystem identity guard: {detail} ({e})"))
+            // Through the shared attach, not straight out: the guard
+            // raises its own exception type, and the positional
+            // attributes are promised on every wrapper failure.
+            Python::attach(|py| {
+                let err =
+                    PyValueError::new_err(format!("BuiltSystem identity guard: {detail} ({e})"));
+                attach_error_location(py, err, &e)
+            })
         }
         None => to_pyerr(e),
     }

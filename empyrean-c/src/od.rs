@@ -852,6 +852,14 @@ pub const EMPYREAN_PHOTOMETRY_MODEL_HG1G2: i32 = 4;
 /// installed; `empyrean_version_string()` reports something else — the
 /// build provenance of the closed-source engine crates behind this
 /// boundary, not this distribution's version.
+///
+/// **A boundary change since this number was last set.** This release
+/// adds two exports and one struct —
+/// [`empyrean_error_location`](crate::empyrean_error_location),
+/// [`empyrean_error_location_free`](crate::empyrean_error_location_free)
+/// and [`EmpyreanErrorLocation`](crate::EmpyreanErrorLocation) — which
+/// take nothing away from any existing layout; they ship under this
+/// cycle's number, 1100.
 pub const EMPYREAN_ABI_VERSION: u32 = 1100;
 
 /// The constant above is the crate's own version, encoded — and this

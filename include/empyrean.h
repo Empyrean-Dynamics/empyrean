@@ -874,6 +874,14 @@ typedef struct Session Session;
  * installed; `empyrean_version_string()` reports something else — the
  * build provenance of the closed-source engine crates behind this
  * boundary, not this distribution's version.
+ *
+ * **A boundary change since this number was last set.** This release
+ * adds two exports and one struct —
+ * [`empyrean_error_location`](crate::empyrean_error_location),
+ * [`empyrean_error_location_free`](crate::empyrean_error_location_free)
+ * and [`EmpyreanErrorLocation`](crate::EmpyreanErrorLocation) — which
+ * take nothing away from any existing layout; they ship under this
+ * cycle's number, 1100.
  */
 #define EMPYREAN_ABI_VERSION 1100
 
@@ -1330,6 +1338,45 @@ struct EmpyreanMissingDataFiles {
 };
 
 /**
+ * Where in the caller's batch the most recent failure happened.
+ *
+ * Populated by [`empyrean_error_location`]; release it with
+ * [`empyrean_error_location_free`].
+ *
+ * Each of the three positions carries its own presence flag rather than
+ * a sentinel, because every value they can hold is a legitimate one: a
+ * zeroed struct reads as "nothing known", `orbit_index` `0` is the first
+ * orbit and not a null, and `epoch_mjd_tdb` has no unused double.
+ */
+struct EmpyreanErrorLocation {
+    /**
+     * The caller's `orbit_id` for the offending orbit, or null when the
+     * failure named no orbit. Heap-allocated, NUL-terminated UTF-8.
+     */
+    char *orbit_id;
+    /**
+     * Zero-based index of the offending orbit in the caller's batch.
+     * Read only when `has_orbit_index` is non-zero.
+     */
+    uintptr_t orbit_index;
+    /**
+     * The epoch that identifies the failure, MJD TDB — the requested
+     * output epoch when the failure is tied to one, otherwise the
+     * offending orbit's own epoch. Read only when `has_epoch` is
+     * non-zero.
+     */
+    double epoch_mjd_tdb;
+    /**
+     * Whether `orbit_index` carries a value.
+     */
+    uint8_t has_orbit_index;
+    /**
+     * Whether `epoch_mjd_tdb` carries a value.
+     */
+    uint8_t has_epoch;
+};
+
+/**
  * Per-crate version strings reported by the empyrean stack.
  *
  * Mirrors [`empyrean_core::Versions`]. Each pointer is a heap-allocated
@@ -1387,6 +1434,29 @@ struct EmpyreanVersions {
  * joint cannot be re-expressed in another basis through the C ABI in
  * this release. Transform the orbit before attaching its carrier, or
  * supply the joint in the basis you want it consumed in.
+ *
+ * # Non-finite values are refused, by the row they belong to
+ *
+ * A propagation batch is checked row by row before anything is
+ * integrated, and a NaN or infinite value in a **declared** field
+ * fails the call with invalid-argument, naming that orbit's index and
+ * `orbit_id` (readable through
+ * [`empyrean_error_location`]). A NaN
+ * element otherwise integrates into a NaN trajectory and surfaces from
+ * deep inside the engine with no index in the message.
+ *
+ * Checked always: [`epoch_mjd_tdb`](Self::epoch_mjd_tdb) and all six
+ * [`elements`](Self::elements). Checked only when the row declares
+ * them: [`covariance`](Self::covariance) (when `has_covariance` is
+ * non-zero) and [`non_grav_cross`](Self::non_grav_cross) (when
+ * `has_non_grav_cross` is non-zero) — an undeclared block is
+ * uninitialized memory as far as this ABI is concerned, and reading it
+ * would reject rows the engine never looks at.
+ *
+ * **Deliberately not checked**, because NaN is their documented
+ * "absent" sentinel rather than a mistake: `EmpyreanOrbit`'s
+ * `non_grav_dt`, `non_grav_dt_variance`, `srp_amrat_variance`, and the
+ * photometry slots.
  */
 struct CoordinateState {
     double epoch_mjd_tdb;
@@ -6357,6 +6427,43 @@ EmpyreanContext *empyrean_context_from_data_dir_with(const char *data_dir,
  * no-op; the struct is left zeroed so a double free is safe.
  */
  void empyrean_missing_data_files_free(struct EmpyreanMissingDataFiles *out);
+
+/**
+ * Retrieve the position of the most recent failure on this thread.
+ *
+ * The companion to `empyrean_last_error()`: that returns the prose,
+ * this returns where in the caller's batch the prose applies. A batch
+ * call fails as a whole, so without this the only way from "the call
+ * failed" to "orbit 2317 failed" is to re-run the batch one orbit at a
+ * time.
+ *
+ * Returns 0 and fills `out` on success. An `out` with `orbit_id` null,
+ * `has_orbit_index == 0` and `has_epoch == 0` means the last error on
+ * this thread carried no position; it is not itself an error.
+ *
+ * Returns `-1` for a null `out`, `-5` when the recorded `orbit_id`
+ * contains an interior NUL and so cannot be handed back as a C string,
+ * and `-99` on a caught panic. **On any non-zero return `out` is left
+ * exactly as the caller passed it** — nothing was handed over, so do
+ * not call [`empyrean_error_location_free`] unless this returned 0.
+ *
+ * Nothing here is inferred from the message text. A field is filled
+ * only when the boundary or the engine supplied that value directly, so
+ * an absent field means "not known", never "not applicable".
+ *
+ * The position is thread-local and is cleared by the next call that
+ * records an error on this thread, so read it immediately after the
+ * failing call. **The caller owns `out` and must release it with
+ * [`empyrean_error_location_free`].**
+ */
+ int32_t empyrean_error_location(struct EmpyreanErrorLocation *out);
+
+/**
+ * Free an [`EmpyreanErrorLocation`] populated by
+ * [`empyrean_error_location`]. Passing a null or zeroed struct is a
+ * no-op; the struct is left zeroed so a double free is safe.
+ */
+ void empyrean_error_location_free(struct EmpyreanErrorLocation *out);
 
 /**
  * Free an `EmpyreanContext` previously returned by

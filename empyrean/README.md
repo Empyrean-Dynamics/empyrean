@@ -970,6 +970,37 @@ for c in &plan.candidates {
 # Ok::<(), empyrean::Error>(())
 ```
 
+## When a batch fails, it names the orbit
+
+A batch call takes N orbits and M epochs and fails as a whole. When the
+failure belongs to one orbit, `Error` says which — so the offending row
+is read off the failure instead of found by re-running the batch one
+orbit at a time.
+
+```rust,no_run
+# let ctx = empyrean::Context::from_data_dir(None)?;
+# let orbits: Vec<empyrean::Orbit> = Vec::new();
+# let epochs: Vec<empyrean::Epoch> = Vec::new();
+# let config = empyrean::PropagationConfig::default();
+match ctx.propagate(&orbits, &epochs, &config) {
+    Ok(result) => { let _ = result; }
+    Err(e) => {
+        if let Some(i) = e.orbit_index() {
+            eprintln!("orbit {i} ({:?}) at {:?}", e.orbit_id(), e.epoch_mjd_tdb());
+        }
+    }
+}
+# Ok::<(), empyrean::Error>(())
+```
+
+All three are `None` when the failure belongs to no single orbit — an
+empty epoch grid, a missing kernel, a config the whole call was refused
+on. Nothing is inferred from the message text: a field is filled only
+when the boundary or the engine supplied that value, so absent means
+*not known*, never *not applicable*. `Display` renders whatever is
+present after the message, so a caller that only logs the error still
+sees it.
+
 ## Data directory and offline operation
 
 `Context::from_data_dir` loads the Standard-tier kernel set, acquiring

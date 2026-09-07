@@ -124,6 +124,7 @@ pub fn run(data: &DataOptions, args: EphemerisArgs) -> Result<()> {
     let config = empyrean::EphemerisConfig::with_force_model(args.force_model.to_empyrean());
     let entries = ctx
         .generate_ephemeris(&batch.orbits, &observers, &config)
+        .map_err(crate::commands::with_orbit_context)
         .context("ephemeris generation failed")?
         .entries;
     eprintln!("Ephemeris complete ({:.1}s)", t1.elapsed().as_secs_f64());

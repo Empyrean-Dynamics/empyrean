@@ -540,6 +540,31 @@ empyrean show out/fit_summary.csv \
 empyrean show out/residuals.parquet | grep missing_jacobian | head
 ```
 
+## When a batch fails, it names the orbit
+
+Every batch entry point takes N orbits and M epochs and fails as a
+whole. A failure that belongs to one orbit says which one — the index in
+the batch, the `orbit_id` it was tagged with, and the epoch — so the
+offending row is read off the failure rather than found by re-running
+the batch one orbit at a time.
+
+```python
+try:
+    result = empyrean.propagate(orbits, epochs)
+except Exception as e:
+    print(e.orbit_index, e.orbit_id, e.epoch_mjd_tdb)   # 2317 '2024 YR4' 60800.5
+```
+
+The same three values are `Error::orbit_index()` / `orbit_id()` /
+`epoch_mjd_tdb()` in Rust, `empyrean_error_location()` in C, and a line
+of their own on any CLI command that runs a batch. They are `None` when
+the failure belongs to no single orbit — an empty epoch grid, a missing
+kernel, a config the whole call was refused on — because an index that
+is always present is an index that means nothing. Nothing is inferred
+from the message text: a field is filled only when the boundary or the
+engine supplied that value, so absent means *not known*, never *not
+applicable*.
+
 ## Data and offline operation
 
 `empyrean init` (CLI), `empyrean.download_data()` (Python), and

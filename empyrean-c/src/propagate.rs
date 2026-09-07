@@ -1700,7 +1700,7 @@ pub unsafe extern "C" fn empyrean_propagate(
             match build_orbits_for_propagation(orbit_slice) {
                 Ok(t) => t,
                 Err(e) => {
-                    set_last_error(&e);
+                    e.report();
                     return -1;
                 }
             };
@@ -1721,7 +1721,18 @@ pub unsafe extern "C" fn empyrean_propagate(
         let prop_result = match propagate(ctx_ref, &orbits, &times, &cfg) {
             Ok(r) => r,
             Err(e) => {
-                set_last_error(&e.to_string());
+                // `set_last_error_from` rather than a bare message: it
+                // keeps the structured payloads (the missing-file list,
+                // and the orbit an ephemeris overlap names) instead of
+                // leaving a caller to parse them back out of prose. The
+                // batch it resolves against is assembled here, on the
+                // failing path, rather than on every call.
+                let epochs = batch_epochs(orbit_slice);
+                let batch = crate::ErrorBatch {
+                    orbit_ids: &input_orbit_ids,
+                    epochs_mjd_tdb: &epochs,
+                };
+                crate::set_last_error_from(&e, Some(&batch));
                 return -2;
             }
         };
@@ -1761,7 +1772,7 @@ pub(crate) fn build_orbits_for_propagation(
         Vec<String>,
         Vec<String>,
     ),
-    String,
+    BatchInputError,
 > {
     let mut orbits: Orbits<empyrean_core::coordinates::AU> = Orbits::empty();
     // Per-orbit identifiers. We use these to:
@@ -1774,38 +1785,140 @@ pub(crate) fn build_orbits_for_propagation(
     let mut input_orbit_ids: Vec<String> = Vec::with_capacity(orbit_slice.len());
     let mut input_object_ids: Vec<String> = Vec::with_capacity(orbit_slice.len());
     for (i, orbit) in orbit_slice.iter().enumerate() {
+        let id = batch_orbit_id(orbit, i);
+        let at = BatchInputError::locator(i, &id, orbit.state.epoch_mjd_tdb);
+        // Refuse a non-finite input row here, at the boundary that knows
+        // which row it is. A NaN element otherwise integrates into a NaN
+        // trajectory and surfaces from deep inside the engine as prose
+        // with no index in it, which is what forces a caller to re-run a
+        // batch one orbit at a time to find the offender.
+        if let Some(bad) = non_finite_state_field(&orbit.state) {
+            return Err(at(bad));
+        }
         let state = orbit.state.to_empyrean();
-        let coords =
-            coordinate_state_to_coordinates(&state).map_err(|e| format!("orbit {i}: {e}"))?;
-        // Use the caller-supplied orbit_id when present; fall back
-        // to the positional fabrication only if null/empty so older
-        // callers that haven't set the field keep working.
-        let id = c_str_to_string(orbit.orbit_id).unwrap_or_default();
-        let id = if id.is_empty() {
-            format!("orbit_{i}")
-        } else {
-            id
-        };
+        let coords = coordinate_state_to_coordinates(&state).map_err(|e| at(e.to_string()))?;
         let obj = c_str_to_string(orbit.object_id).unwrap_or_default();
         input_orbit_ids.push(id.clone());
         input_object_ids.push(obj);
-        crate::joint::push_orbit_with_joint(&mut orbits, id, coords, orbit)
-            .map_err(|e| format!("orbit {i}: {e}"))?;
+        crate::joint::push_orbit_with_joint(&mut orbits, id, coords, orbit).map_err(&at)?;
         if let Some(params) = empyrean_orbit_non_grav_params(orbit) {
             orbits.set_non_grav_params(i, Some(params));
         }
         match empyrean_orbit_thrust_params(orbit) {
             Ok(Some(tp)) => orbits.set_thrust_params(i, Some(tp)),
             Ok(None) => {}
-            Err(e) => return Err(format!("orbit {i}: {e}")),
+            Err(e) => return Err(at(e)),
         }
         match empyrean_orbit_srp_params(orbit) {
             Ok(Some(srp)) => orbits.set_srp_params(i, Some(srp)),
             Ok(None) => {}
-            Err(e) => return Err(format!("orbit {i}: {e}")),
+            Err(e) => return Err(at(e)),
         }
     }
     Ok((orbits, input_orbit_ids, input_object_ids))
+}
+
+/// A failure marshaling one row of the caller's orbit array, carrying
+/// the row it failed on.
+///
+/// The message reads as it always did; what is new is that the position
+/// travels beside it as numbers instead of only inside the prose, so a
+/// caller reads the index off [`empyrean_error_location`](crate::empyrean_error_location)
+/// rather than parsing it back out of a string.
+pub(crate) struct BatchInputError {
+    /// Which row failed.
+    pub at: crate::ErrorLocation,
+    /// The rendered message, index and id included.
+    pub message: String,
+}
+
+impl BatchInputError {
+    /// A per-row error builder: give it one row's position once, then
+    /// call it with whatever went wrong on that row.
+    ///
+    /// The position is captured by value so the caller may go on to move
+    /// the id into the batch it is building, and every failure on the
+    /// row renders through one format instead of each site restating it.
+    pub(crate) fn locator(
+        index: usize,
+        orbit_id: &str,
+        epoch_mjd_tdb: f64,
+    ) -> impl Fn(String) -> Self + use<> {
+        let at = crate::ErrorLocation::at_orbit(index, orbit_id, epoch_mjd_tdb);
+        let id = orbit_id.to_string();
+        move |e: String| Self {
+            at: at.clone(),
+            message: format!("orbit {index} ({id}): {e}"),
+        }
+    }
+
+    /// Record this failure as the thread's last error, message and
+    /// position together.
+    pub(crate) fn report(&self) {
+        crate::set_last_error(&self.message);
+        crate::set_error_location(self.at.clone());
+    }
+}
+
+/// The id one row of the caller's batch travels under.
+///
+/// The caller-supplied `orbit_id` when it is present, and the positional
+/// `"orbit_{i}"` fabrication when it is null or empty, so callers that
+/// never set the field keep working. **One definition**, shared by the
+/// batch the engine integrates and by the error position handed back:
+/// two definitions that drifted would let a failure name an id that
+/// appears nowhere in the result.
+pub(crate) fn batch_orbit_id(orbit: &EmpyreanOrbit, index: usize) -> String {
+    let id = c_str_to_string(orbit.orbit_id).unwrap_or_default();
+    if id.is_empty() {
+        format!("orbit_{index}")
+    } else {
+        id
+    }
+}
+
+/// The per-orbit input epochs of a caller's batch, positional with
+/// [`batch_orbit_id`], for resolving an engine error that names an orbit
+/// back to the epoch that orbit was handed in at.
+pub(crate) fn batch_epochs(orbit_slice: &[EmpyreanOrbit]) -> Vec<f64> {
+    orbit_slice.iter().map(|o| o.state.epoch_mjd_tdb).collect()
+}
+
+/// The first non-finite field of an input state, named, or `None` when
+/// every value the engine will read is finite.
+///
+/// Checks the epoch and the six elements always, and the 6×6 covariance
+/// and the 6×3 non-grav border only when the row declares them — an
+/// undeclared block is uninitialized memory as far as this ABI is
+/// concerned, and reading it would reject rows the engine never looks at.
+fn non_finite_state_field(state: &crate::CoordinateState) -> Option<String> {
+    if !state.epoch_mjd_tdb.is_finite() {
+        return Some(format!("epoch_mjd_tdb is {}", state.epoch_mjd_tdb));
+    }
+    for (k, v) in state.elements.iter().enumerate() {
+        if !v.is_finite() {
+            return Some(format!("elements[{k}] is {v}"));
+        }
+    }
+    if state.has_covariance != 0 {
+        for (r, row) in state.covariance.iter().enumerate() {
+            for (c, v) in row.iter().enumerate() {
+                if !v.is_finite() {
+                    return Some(format!("covariance[{r}][{c}] is {v}"));
+                }
+            }
+        }
+    }
+    if state.has_non_grav_cross != 0 {
+        for (r, row) in state.non_grav_cross.iter().enumerate() {
+            for (c, v) in row.iter().enumerate() {
+                if !v.is_finite() {
+                    return Some(format!("non_grav_cross[{r}][{c}] is {v}"));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Tear down a partially- or fully-built states array and its parallel
@@ -2514,6 +2627,59 @@ fn nominal_state_at(
     Ok([coord.x, coord.y, coord.z, coord.vx, coord.vy, coord.vz])
 }
 
+/// Where a lazy-accessor failure happened, in the caller's own index
+/// space.
+///
+/// The accessors are addressed by `(orbit_index, epoch_index)`, so the
+/// index is always known and is reported unconditionally — including for
+/// the out-of-range case, where the index the caller passed is the whole
+/// diagnosis. The id and epoch come off the retained result's own row
+/// when that row exists, and are left absent when it does not; an
+/// out-of-range index has no row to name.
+fn accessor_location(
+    handle: &PropagationResultHandle,
+    orbit_index: usize,
+    epoch_index: usize,
+) -> crate::ErrorLocation {
+    let Some(flat_idx) = accessor_row(
+        handle.result.states.len(),
+        handle.n_times,
+        orbit_index,
+        epoch_index,
+    ) else {
+        return crate::ErrorLocation::at_orbit_index(orbit_index);
+    };
+    // `nth` is a linear walk on this iterator; it runs only on a failure
+    // path, so the cost is irrelevant and the clarity is worth more.
+    match handle.result.states.iter().nth(flat_idx) {
+        Some((id, coord, _)) => crate::ErrorLocation::at_orbit(orbit_index, id, coord.t.mjd_tdb()),
+        None => crate::ErrorLocation::at_orbit_index(orbit_index),
+    }
+}
+
+/// The flat row an `(orbit_index, epoch_index)` pair addresses, or
+/// `None` when either index is out of range.
+///
+/// Both are bounded, and that is the whole point. An out-of-range
+/// `epoch_index` still derives an **in-range** row whenever orbits
+/// follow it — with two epochs and three orbits, orbit 0 / epoch 5 lands
+/// on row 5, which belongs to orbit 2. Reporting orbit 0's index beside
+/// orbit 2's id and epoch is worse than reporting no id at all: it is a
+/// position that contradicts itself and points at an innocent row.
+///
+/// Split out from [`accessor_location`] so the arithmetic can be
+/// asserted without standing up an engine result.
+fn accessor_row(
+    n_states: usize,
+    n_times: usize,
+    orbit_index: usize,
+    epoch_index: usize,
+) -> Option<usize> {
+    let n_times = n_times.max(1);
+    let n_orbits = n_states / n_times;
+    (epoch_index < n_times && orbit_index < n_orbits).then(|| orbit_index * n_times + epoch_index)
+}
+
 /// Resolved-kind tagged covariance at every output epoch for one orbit,
 /// Cartesian basis. On success `out_series` owns the array; free with
 /// [`empyrean_tagged_covariance_series_free`]. On error `out_series` is
@@ -2547,6 +2713,7 @@ pub unsafe extern "C" fn empyrean_propagation_covariance_series_cartesian(
             Ok(s) => s,
             Err(e) => {
                 set_last_error(&e.to_string());
+                crate::set_error_location(accessor_location(handle, orbit_index, 0));
                 return cov_series_err_code(&e);
             }
         };
@@ -2675,6 +2842,7 @@ pub unsafe extern "C" fn empyrean_propagation_joint_at(
         };
         if epoch_index >= n_times.max(1) || row >= handle.result.states.len() {
             set_last_error("orbit or epoch index out of range");
+            crate::set_error_location(accessor_location(handle, orbit_index, epoch_index));
             return EMPYREAN_TAGGED_COV_EPOCH_INDEX_OUT_OF_RANGE;
         }
 
@@ -2758,6 +2926,7 @@ pub unsafe extern "C" fn empyrean_propagation_covariance_at_cartesian(
             Some(u) => u,
             None => {
                 set_last_error("orbit or epoch index out of range");
+                crate::set_error_location(accessor_location(handle, orbit_index, epoch_index));
                 return EMPYREAN_TAGGED_COV_EPOCH_INDEX_OUT_OF_RANGE;
             }
         };
@@ -2765,6 +2934,7 @@ pub unsafe extern "C" fn empyrean_propagation_covariance_at_cartesian(
             Ok(tc) => tc,
             Err(e) => {
                 set_last_error(&e.to_string());
+                crate::set_error_location(accessor_location(handle, orbit_index, epoch_index));
                 return EMPYREAN_TAGGED_COV_UNCERTAINTY;
             }
         };
@@ -4875,5 +5045,63 @@ mod photometry_absence_tests {
         let err = empyrean_orbit_photometric_params(&orbit)
             .expect_err("a NaN variance is not an uncertainty");
         assert!(err.contains("not a finite number"), "{err}");
+    }
+}
+
+/// `accessor_location` must never hand back a position that contradicts
+/// itself.
+///
+/// The retained-result accessors are addressed by `(orbit_index,
+/// epoch_index)` and reach this resolver on the out-of-range path with
+/// an `epoch_index` already known to be bad. Deriving a flat row from a
+/// bad epoch index lands on a *different orbit's* row whenever orbits
+/// follow it, so the index reported and the id reported would name two
+/// different orbits.
+#[cfg(test)]
+mod accessor_row_tests {
+    use super::accessor_row;
+
+    /// Three orbits × two epochs. Orbit 0, epoch 5 derives row 5 — a
+    /// real row, belonging to orbit 2. It must resolve to no row, so the
+    /// caller is told the index it passed and nothing borrowed.
+    #[test]
+    fn an_out_of_range_epoch_resolves_to_no_row() {
+        assert_eq!(
+            accessor_row(6, 2, 0, 5),
+            None,
+            "epoch 5 of a two-epoch grid must not borrow orbit 2's row"
+        );
+    }
+
+    /// An out-of-range orbit index is bounded the same way.
+    #[test]
+    fn an_out_of_range_orbit_resolves_to_no_row() {
+        assert_eq!(accessor_row(6, 2, 9, 0), None);
+        assert_eq!(accessor_row(6, 2, 3, 0), None, "one past the last orbit");
+    }
+
+    /// The positive control, and the reason the two above mean
+    /// something: every in-range pair still resolves, orbit-major. A
+    /// resolver that always returned `None` would pass both tests above
+    /// and fail this one.
+    #[test]
+    fn every_in_range_pair_resolves_orbit_major() {
+        for orbit in 0..3 {
+            for epoch in 0..2 {
+                assert_eq!(
+                    accessor_row(6, 2, orbit, epoch),
+                    Some(orbit * 2 + epoch),
+                    "({orbit}, {epoch})"
+                );
+            }
+        }
+    }
+
+    /// A zero `n_times` is the degenerate grid the accessors guard with
+    /// `max(1)`; it must not divide by zero.
+    #[test]
+    fn a_zero_epoch_count_is_treated_as_one() {
+        assert_eq!(accessor_row(3, 0, 1, 0), Some(1));
+        assert_eq!(accessor_row(3, 0, 1, 1), None);
     }
 }

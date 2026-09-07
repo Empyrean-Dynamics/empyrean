@@ -1020,6 +1020,27 @@ empty cell. A carrier holding thrust Δv terms is refused wherever it is
 offered, because no orbit-file format can serialize the thrust arcs
 those terms describe.
 
+## When a batch fails, it names the orbit
+
+A batch call takes N orbits and M epochs and fails as a whole. When the
+failure belongs to one orbit, the exception says which — so the
+offending row is read off the failure instead of found by re-running the
+batch one orbit at a time.
+
+```python
+try:
+    result = empyrean.propagate(orbits, epochs)
+except Exception as e:
+    print(e.orbit_index, e.orbit_id, e.epoch_mjd_tdb)   # 2317 '2024 YR4' 60800.5
+```
+
+The three attributes are set on every exception raised from an engine
+failure, `None` included, so a caller reads them directly rather than
+guarding each access with `getattr`. They are `None` together when the
+failure belongs to no single orbit — an empty epoch grid, a missing
+kernel, a config the whole call was refused on. `orbit_id` is the id from
+the batch you passed, so it joins directly against the rows you sent.
+
 ## Data files
 
 empyrean needs a set of SPICE kernels. Most arrive via PyPI as

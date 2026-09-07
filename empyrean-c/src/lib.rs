@@ -115,6 +115,29 @@ const _: () = {
 /// joint cannot be re-expressed in another basis through the C ABI in
 /// this release. Transform the orbit before attaching its carrier, or
 /// supply the joint in the basis you want it consumed in.
+///
+/// # Non-finite values are refused, by the row they belong to
+///
+/// A propagation batch is checked row by row before anything is
+/// integrated, and a NaN or infinite value in a **declared** field
+/// fails the call with invalid-argument, naming that orbit's index and
+/// `orbit_id` (readable through
+/// [`empyrean_error_location`]). A NaN
+/// element otherwise integrates into a NaN trajectory and surfaces from
+/// deep inside the engine with no index in the message.
+///
+/// Checked always: [`epoch_mjd_tdb`](Self::epoch_mjd_tdb) and all six
+/// [`elements`](Self::elements). Checked only when the row declares
+/// them: [`covariance`](Self::covariance) (when `has_covariance` is
+/// non-zero) and [`non_grav_cross`](Self::non_grav_cross) (when
+/// `has_non_grav_cross` is non-zero) — an undeclared block is
+/// uninitialized memory as far as this ABI is concerned, and reading it
+/// would reject rows the engine never looks at.
+///
+/// **Deliberately not checked**, because NaN is their documented
+/// "absent" sentinel rather than a mistake: `EmpyreanOrbit`'s
+/// `non_grav_dt`, `non_grav_dt_variance`, `srp_amrat_variance`, and the
+/// photometry slots.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CoordinateState {
@@ -263,6 +286,106 @@ thread_local! {
     /// last error was anything else — [`set_last_error`] clears it, so a
     /// stale list can never be read against an unrelated failure.
     static LAST_MISSING_DATA_FILES: RefCell<Vec<CString>> = const { RefCell::new(Vec::new()) };
+    /// Where in the caller's batch the most recent failure happened,
+    /// drained by [`empyrean_error_location`]. Absent whenever the last
+    /// error had no positional anchor — [`set_last_error`] clears it, so
+    /// a stale position can never be read against an unrelated failure.
+    static LAST_ERROR_LOCATION: RefCell<Option<ErrorLocation>> = const { RefCell::new(None) };
+}
+
+/// Where in the caller's batch a failure happened.
+///
+/// A batch call takes \\(N\\) orbits × \\(M\\) epochs and fails as a
+/// whole, so a caller told only *that* it failed has to re-run the batch
+/// one orbit at a time to find the offending member. This is the payload
+/// that removes the bisection: the message stays prose, and the position
+/// travels beside it as numbers.
+///
+/// Every field is independently optional and every one of them is
+/// populated only from something the boundary actually knows. A failure
+/// raised while marshaling the caller's own input knows all three; an
+/// engine error that names an orbit by id knows the other two once the
+/// batch resolves that id; a failure with no positional anchor reports
+/// nothing rather than guessing. There is no inference from message text.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct ErrorLocation {
+    /// Zero-based index of the offending orbit in the caller's batch.
+    pub orbit_index: Option<usize>,
+    /// The caller's `orbit_id` for that orbit, or the positional
+    /// `"orbit_{i}"` the boundary substitutes when the caller left the
+    /// field unset.
+    pub orbit_id: Option<String>,
+    /// The epoch that identifies the failure, MJD TDB — the requested
+    /// output epoch when the failure is tied to one, otherwise the
+    /// offending orbit's own epoch.
+    pub epoch_mjd_tdb: Option<f64>,
+}
+
+impl ErrorLocation {
+    /// The offending orbit, addressed by its index in the caller's batch.
+    pub(crate) fn at_orbit(index: usize, orbit_id: &str, epoch_mjd_tdb: f64) -> Self {
+        Self {
+            orbit_index: Some(index),
+            orbit_id: Some(orbit_id.to_string()),
+            epoch_mjd_tdb: Some(epoch_mjd_tdb),
+        }
+    }
+
+    /// The offending orbit index alone — for the accessors that are
+    /// handed an index and nothing else.
+    pub(crate) fn at_orbit_index(index: usize) -> Self {
+        Self {
+            orbit_index: Some(index),
+            ..Self::default()
+        }
+    }
+
+    /// The offending orbit id alone — for a failure that names an orbit
+    /// on a path with no batch to resolve the id against.
+    pub(crate) fn named(orbit_id: &str) -> Self {
+        Self {
+            orbit_id: Some(orbit_id.to_string()),
+            ..Self::default()
+        }
+    }
+}
+
+/// The caller's batch, so an engine error that names an orbit by id can
+/// be resolved back to the index and epoch the caller indexes by.
+///
+/// The id is the only handle the engine hands back; the index is what a
+/// caller slices its own inputs with. Resolution is an exact match
+/// against the ids this boundary pushed into the batch, and an id that
+/// matches nothing (or matches more than one row, which a caller
+/// supplying duplicate ids can produce) resolves to the id alone —
+/// naming a wrong index would be worse than naming none.
+pub(crate) struct ErrorBatch<'a> {
+    /// Per-orbit ids, positional with the caller's orbit array.
+    pub orbit_ids: &'a [String],
+    /// Per-orbit input epochs (MJD TDB), positional with `orbit_ids`.
+    pub epochs_mjd_tdb: &'a [f64],
+}
+
+impl ErrorBatch<'_> {
+    /// Resolve an engine-reported `orbit_id` to a full position.
+    pub(crate) fn locate(&self, orbit_id: &str) -> ErrorLocation {
+        let mut matches = self
+            .orbit_ids
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| id.as_str() == orbit_id);
+        match (matches.next(), matches.next()) {
+            (Some((i, _)), None) => ErrorLocation {
+                orbit_index: Some(i),
+                orbit_id: Some(orbit_id.to_string()),
+                epoch_mjd_tdb: self.epochs_mjd_tdb.get(i).copied(),
+            },
+            _ => ErrorLocation {
+                orbit_id: Some(orbit_id.to_string()),
+                ..ErrorLocation::default()
+            },
+        }
+    }
 }
 
 pub(crate) fn set_last_error(msg: &str) {
@@ -271,26 +394,64 @@ pub(crate) fn set_last_error(msg: &str) {
             CString::new(msg).unwrap_or_else(|_| CString::new("unknown error").unwrap());
     });
     LAST_MISSING_DATA_FILES.with(|f| f.borrow_mut().clear());
+    LAST_ERROR_LOCATION.with(|l| *l.borrow_mut() = None);
 }
 
-/// Record an engine error, keeping the structured payload the message
+/// Attach the position of the failure the caller is about to be told
+/// about, for [`empyrean_error_location`] to hand back.
+///
+/// The companion of [`set_last_error`], never a replacement for it: the
+/// message setter clears this slot, so this is called **after** the
+/// message, on the same thread, and the pair reads as two adjacent lines
+/// at every site. That ordering is what makes a stale position
+/// unreadable — an error recorded with no call to this function leaves
+/// the slot empty rather than carrying the previous failure's index.
+pub(crate) fn set_error_location(at: ErrorLocation) {
+    LAST_ERROR_LOCATION.with(|slot| *slot.borrow_mut() = Some(at));
+}
+
+/// Record an engine error, keeping the structured payloads the message
 /// only renders as text.
 ///
-/// `MissingDataFiles` is the one variant that carries an actionable list
-/// rather than prose: the caller can fetch exactly those files. Parsing
-/// them back out of `"Missing data files: a, b, c"` would be a
-/// comma-in-a-filename bug waiting to happen, so the list is stashed for
-/// [`empyrean_missing_data_files`] alongside the human-readable message.
+/// Two variants carry something actionable rather than prose, and both
+/// are stashed beside the message instead of being left for a caller to
+/// parse back out of it:
+///
+/// * `MissingDataFiles` names files the caller can fetch. Splitting them
+///   back out of `"Missing data files: a, b, c"` would be a
+///   comma-in-a-filename bug waiting to happen, so the list goes to
+///   [`empyrean_missing_data_files`].
+/// * `EphemerisOverlap` names the orbit whose initial state landed on a
+///   perturber — the engine knows which body it dropped, and this is
+///   what makes the message say so positionally. `batch` is the caller's
+///   orbit array, which turns that id into the index and epoch the
+///   caller slices by; pass `None` from any path that has no batch, and
+///   the id travels alone.
+///
 /// Every other variant behaves exactly like [`set_last_error`].
-pub(crate) fn set_last_error_from(e: &empyrean_core::Error) -> i32 {
+pub(crate) fn set_last_error_from(e: &empyrean_core::Error, batch: Option<&ErrorBatch<'_>>) -> i32 {
     set_last_error(&e.to_string());
-    if let empyrean_core::Error::MissingDataFiles(files) = e {
-        LAST_MISSING_DATA_FILES.with(|slot| {
-            *slot.borrow_mut() = files
-                .iter()
-                .map(|f| CString::new(f.as_str()).unwrap_or_else(|_| CString::new("?").unwrap()))
-                .collect();
-        });
+    match e {
+        empyrean_core::Error::MissingDataFiles(files) => {
+            LAST_MISSING_DATA_FILES.with(|slot| {
+                *slot.borrow_mut() = files
+                    .iter()
+                    .map(|f| {
+                        CString::new(f.as_str()).unwrap_or_else(|_| CString::new("?").unwrap())
+                    })
+                    .collect();
+            });
+        }
+        empyrean_core::Error::EphemerisOverlap { orbit_id, .. } => {
+            set_error_location(match batch {
+                Some(b) => b.locate(orbit_id),
+                None => ErrorLocation {
+                    orbit_id: Some(orbit_id.clone()),
+                    ..ErrorLocation::default()
+                },
+            });
+        }
+        _ => {}
     }
     e.error_code()
 }
@@ -474,7 +635,7 @@ pub unsafe extern "C" fn empyrean_context_from_data_dir(
                 // `MissingDataFiles` payload, so the same failure reached
                 // through the older constructor arrived with no file list
                 // for `empyrean_missing_data_files` to hand back.
-                set_last_error_from(&e);
+                set_last_error_from(&e, None);
                 std::ptr::null_mut()
             }
         }
@@ -683,7 +844,7 @@ pub unsafe extern "C" fn empyrean_context_from_data_dir_with(
             Ok(ctx) => Box::into_raw(Box::new(ctx)),
             Err(e) => {
                 // Keeps the missing-file list, not just its rendering.
-                set_last_error_from(&e);
+                set_last_error_from(&e, None);
                 std::ptr::null_mut()
             }
         }
@@ -781,7 +942,7 @@ pub unsafe extern "C" fn empyrean_download_data(data_dir: *const c_char) -> i32 
             // Keeps the missing-file list, not just its rendering, and
             // returns the engine's own error code — same contract as
             // `empyrean_context_from_data_dir_with`.
-            Err(e) => set_last_error_from(&e),
+            Err(e) => set_last_error_from(&e, None),
         }
     }));
 
@@ -884,6 +1045,122 @@ pub unsafe extern "C" fn empyrean_missing_data_files_free(out: *mut EmpyreanMiss
         unsafe {
             (*out).files = std::ptr::null_mut();
             (*out).num_files = 0;
+        }
+    }));
+}
+
+/// Where in the caller's batch the most recent failure happened.
+///
+/// Populated by [`empyrean_error_location`]; release it with
+/// [`empyrean_error_location_free`].
+///
+/// Each of the three positions carries its own presence flag rather than
+/// a sentinel, because every value they can hold is a legitimate one: a
+/// zeroed struct reads as "nothing known", `orbit_index` `0` is the first
+/// orbit and not a null, and `epoch_mjd_tdb` has no unused double.
+#[repr(C)]
+pub struct EmpyreanErrorLocation {
+    /// The caller's `orbit_id` for the offending orbit, or null when the
+    /// failure named no orbit. Heap-allocated, NUL-terminated UTF-8.
+    pub orbit_id: *mut c_char,
+    /// Zero-based index of the offending orbit in the caller's batch.
+    /// Read only when `has_orbit_index` is non-zero.
+    pub orbit_index: usize,
+    /// The epoch that identifies the failure, MJD TDB — the requested
+    /// output epoch when the failure is tied to one, otherwise the
+    /// offending orbit's own epoch. Read only when `has_epoch` is
+    /// non-zero.
+    pub epoch_mjd_tdb: f64,
+    /// Whether `orbit_index` carries a value.
+    pub has_orbit_index: u8,
+    /// Whether `epoch_mjd_tdb` carries a value.
+    pub has_epoch: u8,
+}
+
+/// Retrieve the position of the most recent failure on this thread.
+///
+/// The companion to `empyrean_last_error()`: that returns the prose,
+/// this returns where in the caller's batch the prose applies. A batch
+/// call fails as a whole, so without this the only way from "the call
+/// failed" to "orbit 2317 failed" is to re-run the batch one orbit at a
+/// time.
+///
+/// Returns 0 and fills `out` on success. An `out` with `orbit_id` null,
+/// `has_orbit_index == 0` and `has_epoch == 0` means the last error on
+/// this thread carried no position; it is not itself an error.
+///
+/// Returns `-1` for a null `out`, `-5` when the recorded `orbit_id`
+/// contains an interior NUL and so cannot be handed back as a C string,
+/// and `-99` on a caught panic. **On any non-zero return `out` is left
+/// exactly as the caller passed it** — nothing was handed over, so do
+/// not call [`empyrean_error_location_free`] unless this returned 0.
+///
+/// Nothing here is inferred from the message text. A field is filled
+/// only when the boundary or the engine supplied that value directly, so
+/// an absent field means "not known", never "not applicable".
+///
+/// The position is thread-local and is cleared by the next call that
+/// records an error on this thread, so read it immediately after the
+/// failing call. **The caller owns `out` and must release it with
+/// [`empyrean_error_location_free`].**
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn empyrean_error_location(out: *mut EmpyreanErrorLocation) -> i32 {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if out.is_null() {
+            return -1;
+        }
+        let located = LAST_ERROR_LOCATION.with(|slot| slot.borrow().clone());
+        let Some(at) = located else {
+            unsafe {
+                (*out).orbit_id = std::ptr::null_mut();
+                (*out).orbit_index = 0;
+                (*out).epoch_mjd_tdb = 0.0;
+                (*out).has_orbit_index = 0;
+                (*out).has_epoch = 0;
+            }
+            return 0;
+        };
+        let id = match at.orbit_id {
+            Some(id) => match CString::new(id) {
+                Ok(c) => c.into_raw(),
+                Err(_) => return -5,
+            },
+            None => std::ptr::null_mut(),
+        };
+        unsafe {
+            (*out).orbit_id = id;
+            (*out).orbit_index = at.orbit_index.unwrap_or(0);
+            (*out).epoch_mjd_tdb = at.epoch_mjd_tdb.unwrap_or(0.0);
+            (*out).has_orbit_index = u8::from(at.orbit_index.is_some());
+            (*out).has_epoch = u8::from(at.epoch_mjd_tdb.is_some());
+        }
+        0
+    }));
+    // A panic here leaves the thread-local position untouched and `out`
+    // whatever the caller passed in — nothing was handed over, so there
+    // is nothing to free.
+    result.unwrap_or(-99)
+}
+
+/// Free an [`EmpyreanErrorLocation`] populated by
+/// [`empyrean_error_location`]. Passing a null or zeroed struct is a
+/// no-op; the struct is left zeroed so a double free is safe.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn empyrean_error_location_free(out: *mut EmpyreanErrorLocation) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if out.is_null() {
+            return;
+        }
+        let id = unsafe { (*out).orbit_id };
+        if !id.is_null() {
+            drop(unsafe { CString::from_raw(id) });
+        }
+        unsafe {
+            (*out).orbit_id = std::ptr::null_mut();
+            (*out).orbit_index = 0;
+            (*out).epoch_mjd_tdb = 0.0;
+            (*out).has_orbit_index = 0;
+            (*out).has_epoch = 0;
         }
     }));
 }
@@ -1259,7 +1536,7 @@ mod missing_data_files_tests {
             "de440.bsp".to_string(),
             "bias.dat".to_string(),
         ]);
-        let code = set_last_error_from(&e);
+        let code = set_last_error_from(&e, None);
         assert_eq!(code, -2, "missing data is the -2 axis");
         assert_eq!(drain(), vec!["de440.bsp", "bias.dat"]);
     }
@@ -1268,9 +1545,10 @@ mod missing_data_files_tests {
     /// caller's copy, not a move — but any later error clears it.
     #[test]
     fn any_other_error_clears_the_list() {
-        set_last_error_from(&empyrean_core::Error::MissingDataFiles(vec![
-            "de440.bsp".to_string(),
-        ]));
+        set_last_error_from(
+            &empyrean_core::Error::MissingDataFiles(vec!["de440.bsp".to_string()]),
+            None,
+        );
         assert_eq!(drain().len(), 1);
         assert_eq!(drain().len(), 1, "reading does not consume the list");
 
@@ -1280,11 +1558,12 @@ mod missing_data_files_tests {
             "an unrelated error must not leave a stale file list behind"
         );
 
-        set_last_error_from(&empyrean_core::Error::MissingDataFiles(vec![
-            "gm_de440.tpc".to_string(),
-        ]));
+        set_last_error_from(
+            &empyrean_core::Error::MissingDataFiles(vec!["gm_de440.tpc".to_string()]),
+            None,
+        );
         assert_eq!(drain(), vec!["gm_de440.tpc"]);
-        set_last_error_from(&empyrean_core::Error::InvalidArgument("nope".into()));
+        set_last_error_from(&empyrean_core::Error::InvalidArgument("nope".into()), None);
         assert!(
             drain().is_empty(),
             "a non-missing-files engine error must also clear it"
@@ -1299,5 +1578,157 @@ mod missing_data_files_tests {
             -1
         );
         unsafe { empyrean_missing_data_files_free(std::ptr::null_mut()) };
+    }
+}
+
+#[cfg(test)]
+mod error_location_tests {
+    use super::*;
+
+    /// Read the thread's error position back through the C accessor, in
+    /// the shape a C caller sees it.
+    fn drain() -> (Option<usize>, Option<String>, Option<f64>) {
+        let mut out = EmpyreanErrorLocation {
+            orbit_id: std::ptr::null_mut(),
+            orbit_index: 0,
+            epoch_mjd_tdb: 0.0,
+            has_orbit_index: 0,
+            has_epoch: 0,
+        };
+        assert_eq!(unsafe { empyrean_error_location(&mut out) }, 0);
+        let id = (!out.orbit_id.is_null()).then(|| {
+            unsafe { CStr::from_ptr(out.orbit_id) }
+                .to_string_lossy()
+                .into_owned()
+        });
+        let index = (out.has_orbit_index != 0).then_some(out.orbit_index);
+        let epoch = (out.has_epoch != 0).then_some(out.epoch_mjd_tdb);
+        unsafe { empyrean_error_location_free(&mut out) };
+        (index, id, epoch)
+    }
+
+    /// A position recorded beside a message comes back whole.
+    #[test]
+    fn a_recorded_position_round_trips() {
+        set_last_error("orbit 2317 (2024 YR4): elements[3] is NaN");
+        set_error_location(ErrorLocation::at_orbit(2317, "2024 YR4", 60800.5));
+        assert_eq!(
+            drain(),
+            (Some(2317), Some("2024 YR4".to_string()), Some(60800.5))
+        );
+        // Reading it does not consume it — the caller gets its own copy.
+        assert_eq!(
+            drain(),
+            (Some(2317), Some("2024 YR4".to_string()), Some(60800.5))
+        );
+    }
+
+    /// The positive control for the pairing rule: recording a *new*
+    /// message clears the previous position, so a caller can never read
+    /// one failure's index against another failure's prose.
+    #[test]
+    fn a_later_error_clears_the_position() {
+        set_last_error("orbit 4 (x): bad");
+        set_error_location(ErrorLocation::at_orbit(4, "x", 60000.0));
+        assert_eq!(drain().0, Some(4));
+
+        set_last_error("something else went wrong");
+        assert_eq!(
+            drain(),
+            (None, None, None),
+            "an unrelated error must not leave a stale position behind"
+        );
+    }
+
+    /// Index zero is a position, not an absence. The flags exist so that
+    /// the first orbit in a batch is distinguishable from "no orbit".
+    #[test]
+    fn orbit_zero_is_reported_as_present() {
+        set_last_error("orbit 0 (a): bad");
+        set_error_location(ErrorLocation::at_orbit(0, "a", 0.0));
+        let (index, _, epoch) = drain();
+        assert_eq!(index, Some(0), "index 0 must read as present, not absent");
+        assert_eq!(epoch, Some(0.0), "epoch 0.0 must read as present too");
+    }
+
+    /// Partial positions are honest: an accessor that knows only the
+    /// index reports only the index, and an engine error that names only
+    /// an id reports only the id.
+    #[test]
+    fn partial_positions_report_only_what_is_known() {
+        set_last_error("orbit index out of range");
+        set_error_location(ErrorLocation::at_orbit_index(7));
+        assert_eq!(drain(), (Some(7), None, None));
+
+        set_last_error("ephemeris overlap");
+        set_error_location(ErrorLocation::named("2024 YR4"));
+        assert_eq!(drain(), (None, Some("2024 YR4".to_string()), None));
+    }
+
+    /// An engine error that names an orbit resolves to the index and
+    /// epoch of the batch row carrying that id.
+    #[test]
+    fn a_batch_resolves_an_engine_named_orbit_to_its_row() {
+        let ids = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let epochs = vec![60000.0, 60001.0, 60002.0];
+        let batch = ErrorBatch {
+            orbit_ids: &ids,
+            epochs_mjd_tdb: &epochs,
+        };
+        assert_eq!(
+            batch.locate("b"),
+            ErrorLocation {
+                orbit_index: Some(1),
+                orbit_id: Some("b".to_string()),
+                epoch_mjd_tdb: Some(60001.0),
+            }
+        );
+    }
+
+    /// Resolution refuses to guess. An id that matches nothing, and an
+    /// id that matches more than one row (which a caller supplying
+    /// duplicate ids produces), both come back as the id alone — naming
+    /// a wrong row would be worse than naming none.
+    #[test]
+    fn an_ambiguous_or_unknown_id_resolves_to_the_id_alone() {
+        let ids = vec!["a".to_string(), "dup".to_string(), "dup".to_string()];
+        let epochs = vec![60000.0, 60001.0, 60002.0];
+        let batch = ErrorBatch {
+            orbit_ids: &ids,
+            epochs_mjd_tdb: &epochs,
+        };
+        for id in ["dup", "absent"] {
+            let at = batch.locate(id);
+            assert_eq!(at.orbit_id.as_deref(), Some(id));
+            assert_eq!(at.orbit_index, None, "{id} must not resolve to a row");
+            assert_eq!(at.epoch_mjd_tdb, None);
+        }
+    }
+
+    /// A null `out` is refused, not dereferenced.
+    #[test]
+    fn a_null_out_is_refused() {
+        assert_eq!(unsafe { empyrean_error_location(std::ptr::null_mut()) }, -1);
+    }
+
+    /// Freeing a zeroed struct is a no-op, and freeing twice is safe:
+    /// the free zeroes what it released.
+    #[test]
+    fn freeing_is_idempotent() {
+        set_last_error("orbit 1 (z): bad");
+        set_error_location(ErrorLocation::at_orbit(1, "z", 60000.0));
+        let mut out = EmpyreanErrorLocation {
+            orbit_id: std::ptr::null_mut(),
+            orbit_index: 0,
+            epoch_mjd_tdb: 0.0,
+            has_orbit_index: 0,
+            has_epoch: 0,
+        };
+        assert_eq!(unsafe { empyrean_error_location(&mut out) }, 0);
+        assert!(!out.orbit_id.is_null());
+        unsafe { empyrean_error_location_free(&mut out) };
+        assert!(out.orbit_id.is_null());
+        unsafe { empyrean_error_location_free(&mut out) };
+        unsafe { empyrean_error_location_free(std::ptr::null_mut()) };
     }
 }

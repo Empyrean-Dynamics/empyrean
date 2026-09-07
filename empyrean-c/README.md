@@ -102,6 +102,43 @@ cc main.c -I include -L <libdir> -lempyrean -Wl,-rpath,<libdir>
 cc main.c -I include -L <libdir> -lempyrean -Wl,-rpath,<libdir>
 ```
 
+## When a batch fails, it names the orbit
+
+`empyrean_last_error()` returns the prose. `empyrean_error_location()` is
+its positional companion: where in the batch the prose applies. A batch
+call takes N orbits and M epochs and fails as a whole, so without it the
+only way from "the call failed" to "orbit 2317 failed" is to re-run the
+batch one orbit at a time.
+
+```c
+struct EmpyreanPropagationResult result;
+if (empyrean_propagate(ctx, orbits, n, times, m, &config, &result) != 0) {
+    fprintf(stderr, "%s\n", empyrean_last_error());
+    struct EmpyreanErrorLocation at = {0};
+    /* A non-zero return hands nothing over, so there is nothing to free. */
+    if (empyrean_error_location(&at) == 0) {
+        if (at.has_orbit_index) {
+            fprintf(stderr, "  orbit %zu (%s)\n", at.orbit_index,
+                    at.orbit_id ? at.orbit_id : "unnamed");
+        }
+        empyrean_error_location_free(&at);
+    }
+}
+```
+
+Each of the three positions carries its own presence flag rather than a
+sentinel, because every value they can hold is legitimate: a zeroed
+struct means nothing is known, `orbit_index` `0` is the first orbit and
+not a null, and `epoch_mjd_tdb` has no unused double. Like the
+missing-file list, it is thread-local, is cleared by the next error
+recorded on the thread, and is owned by the caller — release it with
+`empyrean_error_location_free`.
+
+Nothing is inferred from the message text. A field is filled only when
+the boundary or the engine supplied that value, so an absent field means
+*not known*, never *not applicable*, and a failure belonging to no single
+orbit reports no position rather than defaulting to row 0.
+
 ## Data directory & strict offline
 
 `empyrean_context_from_data_dir_with` is the superset of

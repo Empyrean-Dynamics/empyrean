@@ -144,6 +144,7 @@ pub fn write_residuals_parquet(
     path: impl AsRef<Path>,
     residuals: &[ObservationResidual],
 ) -> Result<()> {
+    crate::context::ensure_engine_loaded()?;
     write_residuals_via(path.as_ref(), residuals, |p, ptr, n| unsafe {
         empyrean_sys::empyrean_residuals_write_parquet(p, ptr, n)
     })
@@ -154,6 +155,7 @@ pub fn write_residuals_json(
     path: impl AsRef<Path>,
     residuals: &[ObservationResidual],
 ) -> Result<()> {
+    crate::context::ensure_engine_loaded()?;
     write_residuals_via(path.as_ref(), residuals, |p, ptr, n| unsafe {
         empyrean_sys::empyrean_residuals_write_json(p, ptr, n)
     })
@@ -164,6 +166,7 @@ pub fn write_residuals_csv(
     path: impl AsRef<Path>,
     residuals: &[ObservationResidual],
 ) -> Result<()> {
+    crate::context::ensure_engine_loaded()?;
     write_residuals_via(path.as_ref(), residuals, |p, ptr, n| unsafe {
         empyrean_sys::empyrean_residuals_write_csv(p, ptr, n)
     })

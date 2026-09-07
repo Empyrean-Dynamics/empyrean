@@ -31,6 +31,14 @@ pub struct Error {
     /// -5 is local I/O — a read or write against the filesystem. A
     /// failed acquisition is **not** -5: its remedy is connectivity or
     /// a stale kernel pin, never local file repair.
+    ///
+    /// -6 is the one code libempyrean never returns, because it is the
+    /// code for libempyrean not being there: the engine library could
+    /// not be found or opened, so no call was made and no engine error
+    /// exists to report. Its
+    /// [`message`](Self::message) names every location the lookup tried,
+    /// in order, with the reason each did not serve. See
+    /// [`Context::from_data_dir`](crate::Context::from_data_dir).
     pub code: i32,
     /// Error message captured from `empyrean_last_error()` at the time
     /// of the failure.
@@ -86,6 +94,28 @@ impl Error {
         }
     }
 
+    /// Build an error for an engine library that could not be found or
+    /// opened.
+    ///
+    /// Carries [`ENGINE_NOT_LOADED`] rather than one of the engine's own
+    /// codes: those come back from a call into libempyrean, and here
+    /// there is no libempyrean to call. `message` is the loader's
+    /// full account — every location tried, in order, with the reason
+    /// each did not serve — because a single path is not enough to act
+    /// on when the lookup has five rules in it.
+    ///
+    /// Takes the diagnosis as anything printable rather than the loader's
+    /// own type, so the mapping — which code, and that the whole account
+    /// survives into the message — is exercisable without a broken
+    /// install to hand.
+    pub(crate) fn engine_not_loaded(diagnosis: impl fmt::Display) -> Self {
+        Error {
+            code: ENGINE_NOT_LOADED,
+            message: diagnosis.to_string(),
+            missing_data_files: Vec::new(),
+        }
+    }
+
     /// The data files a construction found absent, or an empty slice for
     /// any failure that is not a named data shortfall.
     ///
@@ -137,6 +167,13 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// The code for an engine library that could not be found or opened.
+///
+/// Outside the engine's own -1..-5 range on purpose: those are categories
+/// libempyrean reports, and this is the failure of libempyrean to be there
+/// at all. Nothing that reaches the engine can ever carry it.
+pub const ENGINE_NOT_LOADED: i32 = -6;
+
 /// The engine's category prefix on a failed acquisition — a fetch that was
 /// attempted and errored, as opposed to files that are simply absent. The
 /// rest of the message is the request context, naming the kernel by URL.
@@ -180,7 +217,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]
 mod tests {
-    use super::dedupe_io_prefix;
+    use super::{ENGINE_NOT_LOADED, Error, dedupe_io_prefix};
 
     #[test]
     fn collapses_doubled_io_prefix() {
@@ -223,6 +260,47 @@ mod tests {
         assert_eq!(
             dedupe_io_prefix("I/O error: Data download failed: nope"),
             "I/O error: Data download failed: nope"
+        );
+    }
+
+    #[test]
+    fn a_missing_engine_keeps_its_own_code_and_the_whole_diagnosis() {
+        // The loader's account is multi-line and names every location it
+        // tried. Truncating it, or filing it under one of the engine's own
+        // categories, is what left the container report with nothing to act
+        // on.
+        let diagnosis = "could not load libempyrean.so, the empyrean engine library. \
+                         2 locations were tried, in order:\n  \
+                         1. EMPYREAN_LIB — not set\n  \
+                         2. beside the running executable — /app/libempyrean.so — no file there";
+        let err = Error::engine_not_loaded(diagnosis);
+
+        assert_eq!(err.code, ENGINE_NOT_LOADED);
+        assert_ne!(
+            err.code, -2,
+            "a missing engine is not a missing-data failure; the remedies are unrelated"
+        );
+        assert!(err.missing_data_files().is_empty());
+        assert!(
+            err.message.contains("/app/libempyrean.so"),
+            "{}",
+            err.message
+        );
+        assert!(err.message.contains("EMPYREAN_LIB"), "{}", err.message);
+        // Display appends the code, and keeps the account intact.
+        let shown = err.to_string();
+        assert!(shown.contains("2 locations were tried"), "{shown}");
+        assert!(shown.ends_with("(code -6)"), "{shown}");
+    }
+
+    #[test]
+    fn the_engine_load_code_sits_outside_the_engine_s_own_range() {
+        // Positive control for the test above: -6 has to be a code the
+        // engine can never return, or a caller cannot tell "libempyrean
+        // said no" from "there was no libempyrean to ask".
+        assert!(
+            !(-5..=0).contains(&ENGINE_NOT_LOADED),
+            "the engine reports -1..-5; this one means the engine is absent"
         );
     }
 }

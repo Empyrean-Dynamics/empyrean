@@ -18,6 +18,7 @@ use std::path::Path;
 /// order. Throws if any object cannot be found or the SBDB API returns
 /// an error.
 pub fn query_sbdb(object_ids: &[&str], cache_dir: Option<&Path>) -> Result<OrbitBatch> {
+    crate::context::ensure_engine_loaded()?;
     if object_ids.is_empty() {
         return OrbitBatch::new(Vec::new(), Vec::new(), Vec::new());
     }
@@ -178,6 +179,7 @@ pub fn query_horizons(
     times_mjd_tdb: &[f64],
     cache_dir: Option<&Path>,
 ) -> Result<Vec<EphemerisEntry>> {
+    crate::context::ensure_engine_loaded()?;
     if object_ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -241,6 +243,7 @@ pub fn query_horizons_vectors(
     epoch_mjd_tdb: f64,
     cache_dir: Option<&Path>,
 ) -> Result<([f64; 3], [f64; 3])> {
+    crate::context::ensure_engine_loaded()?;
     let command_c = CString::new(command.as_bytes())
         .map_err(|_| Error::invalid_input(format!("command contains a NUL byte: {command}")))?;
     let cache_cstring = cache_path_to_cstring(cache_dir)?;
@@ -272,6 +275,7 @@ pub fn query_horizons_vectors(
 /// Returns an [`Observations`] set parsed from the MPC ADES_DF JSON.
 /// Optionally caches the JSON on disk under `cache_dir`.
 pub fn query_observations(designations: &[&str], cache_dir: Option<&Path>) -> Result<Observations> {
+    crate::context::ensure_engine_loaded()?;
     if designations.is_empty() {
         return Ok(Observations::default_empty());
     }
@@ -333,6 +337,7 @@ pub fn query_radar(
     designations: &[&str],
     cache_dir: Option<&Path>,
 ) -> Result<Vec<RadarObservation>> {
+    crate::context::ensure_engine_loaded()?;
     if designations.is_empty() {
         return Ok(Vec::new());
     }

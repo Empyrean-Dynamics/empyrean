@@ -96,6 +96,7 @@ where
 
 /// Write events to a parquet file.
 pub fn write_events_parquet(path: impl AsRef<Path>, events: &[Event]) -> Result<()> {
+    crate::context::ensure_engine_loaded()?;
     write_events_via(path.as_ref(), events, |p, ptr, n| unsafe {
         empyrean_sys::empyrean_events_write_parquet(p, ptr, n)
     })
@@ -103,6 +104,7 @@ pub fn write_events_parquet(path: impl AsRef<Path>, events: &[Event]) -> Result<
 
 /// Write events to JSON.
 pub fn write_events_json(path: impl AsRef<Path>, events: &[Event]) -> Result<()> {
+    crate::context::ensure_engine_loaded()?;
     write_events_via(path.as_ref(), events, |p, ptr, n| unsafe {
         empyrean_sys::empyrean_events_write_json(p, ptr, n)
     })
@@ -110,6 +112,7 @@ pub fn write_events_json(path: impl AsRef<Path>, events: &[Event]) -> Result<()>
 
 /// Write events to CSV.
 pub fn write_events_csv(path: impl AsRef<Path>, events: &[Event]) -> Result<()> {
+    crate::context::ensure_engine_loaded()?;
     write_events_via(path.as_ref(), events, |p, ptr, n| unsafe {
         empyrean_sys::empyrean_events_write_csv(p, ptr, n)
     })

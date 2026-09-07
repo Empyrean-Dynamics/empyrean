@@ -173,12 +173,25 @@ fn main() -> Result<()> {
             // tell which build of the cdylib this CLI is talking to.
             println!("empyrean-cli {}", env!("CARGO_PKG_VERSION"));
             match empyrean::version_string() {
-                Ok(s) => println!("{s}"),
+                Ok(s) => {
+                    println!("{s}");
+                    Ok(())
+                }
+                // An engine that could not be opened is a broken install,
+                // not a missing detail on an otherwise fine one: reporting
+                // it and exiting 0 would let `empyrean version && …` in a
+                // provisioning script sail past exactly the failure it is
+                // there to catch. The message already names every location
+                // the lookup tried.
+                Err(e) if e.code == empyrean::ENGINE_NOT_LOADED => Err(e.into()),
+                // Anything else is the engine answering, so it is present:
+                // the version report is unavailable, the install is not
+                // broken, and the exit status stays clean.
                 Err(e) => {
                     eprintln!("warning: empyrean::version_string failed: {e}");
+                    Ok(())
                 }
             }
-            Ok(())
         }
         Command::Stop => {
             use daemon::protocol::Request;

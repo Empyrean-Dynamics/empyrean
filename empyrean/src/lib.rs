@@ -146,7 +146,7 @@ pub use ephemeris::{
     SENSITIVITY_ROW_RA, SENSITIVITY_ROW_RANGE, SENSITIVITY_ROW_VDEC, SENSITIVITY_ROW_VRA,
     SENSITIVITY_ROW_VRANGE,
 };
-pub use error::{Error, Result};
+pub use error::{ENGINE_NOT_LOADED, Error, Result};
 pub use impact::{BPlane, ImpactProbability};
 pub use io::{
     FitSummaryRow, OrbitBatch, read_orbits_csv, read_orbits_json, read_orbits_parquet,

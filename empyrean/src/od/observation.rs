@@ -363,6 +363,7 @@ impl Observations {
     /// [`Context::determine`](super::Context::determine). Either slice
     /// may be empty (the corresponding FFI array is then null / length 0).
     pub fn from_arrays(observations: &[Observation], radar: &[RadarObservation]) -> Result<Self> {
+        crate::context::ensure_engine_loaded()?;
         // ── Optical array ────────────────────────────────────────────
         let (opt_ptr, opt_len) = Self::build_optical_ffi(observations)?;
         // ── Radar array ──────────────────────────────────────────────

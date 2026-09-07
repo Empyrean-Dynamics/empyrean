@@ -140,6 +140,7 @@ impl Epoch {
 /// # Ok::<(), empyrean::Error>(())
 /// ```
 pub fn iso_to_mjd(iso: &str, scale: TimeScale) -> Result<f64> {
+    crate::context::ensure_engine_loaded()?;
     let c_iso = CString::new(iso)
         .map_err(|_| Error::invalid_input("ISO string contains an interior NUL byte"))?;
     let mut out: f64 = 0.0;
@@ -166,6 +167,7 @@ pub fn iso_to_mjd(iso: &str, scale: TimeScale) -> Result<f64> {
 /// # Ok::<(), empyrean::Error>(())
 /// ```
 pub fn mjd_to_iso(mjd: f64, scale: TimeScale) -> Result<String> {
+    crate::context::ensure_engine_loaded()?;
     let mut buf = vec![0u8; 64];
     let code = unsafe {
         empyrean_sys::empyrean_mjd_to_iso(

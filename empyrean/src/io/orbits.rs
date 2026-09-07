@@ -234,6 +234,7 @@ fn read_orbits_via<F>(path: &Path, c_call: F) -> Result<OrbitBatch>
 where
     F: FnOnce(*const std::ffi::c_char, *mut empyrean_sys::EmpyreanOrbitBatch) -> i32,
 {
+    crate::context::ensure_engine_loaded()?;
     let path_c = path_to_cstring(path)?;
     let mut batch = empyrean_sys::EmpyreanOrbitBatch {
         orbits: std::ptr::null_mut(),
@@ -278,6 +279,7 @@ pub fn read_orbits_parquet(path: impl AsRef<Path>) -> Result<OrbitBatch> {
 
 /// Write an orbit batch to a parquet file.
 pub fn write_orbits_parquet(path: impl AsRef<Path>, batch: &OrbitBatch) -> Result<()> {
+    crate::context::ensure_engine_loaded()?;
     write_orbits_via(path.as_ref(), batch, |p, b| unsafe {
         empyrean_sys::empyrean_orbits_write_parquet(p, b)
     })
@@ -292,6 +294,7 @@ pub fn read_orbits_json(path: impl AsRef<Path>) -> Result<OrbitBatch> {
 
 /// Write an orbit batch to JSON.
 pub fn write_orbits_json(path: impl AsRef<Path>, batch: &OrbitBatch) -> Result<()> {
+    crate::context::ensure_engine_loaded()?;
     write_orbits_via(path.as_ref(), batch, |p, b| unsafe {
         empyrean_sys::empyrean_orbits_write_json(p, b)
     })
@@ -306,6 +309,7 @@ pub fn read_orbits_csv(path: impl AsRef<Path>) -> Result<OrbitBatch> {
 
 /// Write an orbit batch to CSV.
 pub fn write_orbits_csv(path: impl AsRef<Path>, batch: &OrbitBatch) -> Result<()> {
+    crate::context::ensure_engine_loaded()?;
     write_orbits_via(path.as_ref(), batch, |p, b| unsafe {
         empyrean_sys::empyrean_orbits_write_csv(p, b)
     })

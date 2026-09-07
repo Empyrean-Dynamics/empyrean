@@ -405,14 +405,93 @@ empyrean-sys opens `libempyrean.{dylib,so}` at run time via
 `libloading` (dlopen). The library is distributed separately as a
 binary release on
 [GitHub](https://github.com/Empyrean-Dynamics/empyrean/releases) and
-inside the published Python wheel. The path is resolved from the
-`EMPYREAN_LIB` environment variable if set, else a `libempyrean.*`
-sitting next to the loaded module, else a build-time location — an
-`EMPYREAN_LIB_DIR` override, a sibling `../target/release` build, or
-a checksum-pinned download from the GitHub release tagged
-`v{crate version}` (in that order).
+inside the published Python wheel.
 The FFI bindings are pre-generated and committed, so no C header,
 libclang, or bindgen is needed to build.
+
+### Lookup order
+
+Every location below is tried in order, and the first that opens wins.
+
+| # | Location | What it is for |
+|---|----------|----------------|
+| 1 | `EMPYREAN_LIB` | Explicit override. A full path names an exact file; a bare name defers to the OS loader search. |
+| 2 | Beside the **loaded module** (`dladdr`) | A relocatable artifact that bundles its own engine — a Python wheel finding the `libempyrean.*` shipped beside its extension. |
+| 3 | Beside the **running executable** (`current_exe`) | A binary that ships the engine next to itself. Uses `/proc/self/exe` (Linux) or `_NSGetExecutablePath` (macOS), so it holds however the process was started. |
+| 4 | An explicitly set, **absolute `EMPYREAN_DATA_DIR`**, then a `lib/` sibling of it | A deployment already staging kernels under one mount can stage the engine with them. Explicit and absolute only — see below. |
+| 5 | The path recorded at **build time** | An `EMPYREAN_LIB_DIR` override, a sibling `../target/release` build, or a checksum-pinned download from the GitHub release tagged `v{crate version}` — in that order, resolved by `build.rs` on the machine that runs the build. This is what `cargo add empyrean` relies on: the engine `build.rs` downloaded into the cache is found again here. |
+
+Rules 2 and 3 answer the same question by different means, and both are
+needed. `dladdr` names the module that links this crate, which is the
+only thing that can find a wheel's bundled engine — but for a *main
+executable* glibc echoes back a relative `argv[0]`, so a binary started
+as `./myapp` or by bare name through `PATH` yields a relative directory.
+Resolving that against the working directory would let a library planted
+there load first, so it is refused; `current_exe` asks the kernel
+instead, where there is no relative form to guard against.
+
+**Why rule 4 is narrow.** It is the only rule whose directory is
+routinely user-writable, so it is the only one with conditions. The
+platform default data directory is **not** searched: it is where the
+engine *downloads kernels into*, and nothing ever deliberately stages an
+engine there — treating a download target as a code location would rank
+it ahead of the build-time path, the one candidate whose contents were
+checksum-pinned. And a relative `EMPYREAN_DATA_DIR` is refused by name
+rather than used, for the same reason rule 2 refuses a relative module
+directory: it would resolve against the process's working directory, so a
+`libempyrean` planted wherever the program happened to be started from
+would load ahead of everything after it. Set it to an absolute path.
+
+**Why rule 5 is last, not gone.** It is the one candidate that describes
+the *build* machine rather than this one — `../target/release` under a
+checkout, `~/.cache/empyrean/...` under the builder's home — and on that
+machine it is exactly right, which is what makes `cargo add empyrean`
+work with no setup at all. Ordering is what makes it safe: everything
+that could have travelled with the binary is tried first, so a copied or
+containerized binary resolves an engine that is actually there rather
+than one the build host happened to have.
+
+Note that no candidate is checksum-verified at *run* time. The pin in
+`checksums.txt` is enforced when `build.rs` downloads, which is why the
+order above is the whole of the trust story.
+
+When every rule fails, the error names each one in turn with the reason
+it did not serve, and the `empyrean` wrapper returns it from every entry
+point reachable before a context exists — the `Context` constructors, and
+the free functions (`version_string`, `read_orbits_*`, `query_*`, the
+time and math helpers, `Session::new`) a program may well call first. The
+code is `-6`, outside the engine's own `-1..-5`, because the engine is
+what failed to be there. Through the Python API it arrives as a
+`RuntimeError` carrying the same message; Python has no equivalent of the
+`ENGINE_NOT_LOADED` constant to match on, so key on the text if you need
+to. Nothing panics deep in a later call, and nothing has to be guessed
+from a single path.
+
+### Containers
+
+The engine is not on the image unless it was put there, and nothing about
+the build host survives into it. Two things to bake:
+
+```dockerfile
+# 1. The engine, beside the binary — rule 3 finds it with no environment set.
+COPY libempyrean.so /app/
+COPY target/release/myapp /app/
+# (or leave it anywhere and name it: ENV EMPYREAN_LIB=/opt/empyrean/libempyrean.so)
+
+# 2. The kernels, and a refusal to reach the network for them.
+COPY data/ /opt/empyrean/data/
+ENV EMPYREAN_DATA_DIR=/opt/empyrean/data
+ENV EMPYREAN_OFFLINE=1
+```
+
+`EMPYREAN_DATA_DIR` must be absolute; a relative value is refused, and
+the error says so. `EMPYREAN_OFFLINE=1` is a floor, not a switch: it
+downgrades a refreshing context construction to strict offline and says
+so on stderr, and it can never turn strict offline back into a download.
+A strict context either has the whole requested tier on disk or fails
+naming every file it does not have. Staging the engine under
+`$EMPYREAN_DATA_DIR` (or a `lib/` sibling of it) also works — that is
+rule 4 — which keeps a single mount carrying both halves.
 
 `checksums.txt` pins one more thing than the tarball hashes. A hash
 proves *which bytes* were downloaded, never which struct layouts they

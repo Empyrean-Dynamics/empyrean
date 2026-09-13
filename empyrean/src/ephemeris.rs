@@ -410,6 +410,17 @@ impl EphemerisConfig {
             body_filter_naif: std::ptr::null(),
             dense_output: 0,
             dense_output_cadence_days: 0.0,
+            // Say it, rather than leaving it to be inferred from five
+            // cleared filters: this path reads states and sensitivities
+            // and discards events, so there is nothing for a detector to
+            // produce and no reason to run one on every substep. The
+            // five flags above only stop events being *emitted*; this is
+            // what stops them being *looked for*.
+            detection_enabled: empyrean_sys::EMPYREAN_EVENT_DETECTION_OFF,
+            // Moot with detection off, and `_DEFAULT` is the honest
+            // "not requested" for both.
+            dense_origin: empyrean_sys::EMPYREAN_DENSE_ORIGIN_DEFAULT,
+            capture_criterion: empyrean_sys::EMPYREAN_CAPTURE_CRITERION_DEFAULT,
         };
         prop_ffi.diagnostics = empyrean_sys::EmpyreanDiagnosticsConfig {
             sensitivity: 0,
@@ -686,6 +697,60 @@ mod ephemeris_config_validation_tests {
     /// every detection flag on because that is right for `propagate`;
     /// treating that as an ephemeris event request would reject every
     /// call made without an explicit config.
+    /// The ephemeris path reads states and sensitivities and discards
+    /// events, so it says `detection_enabled = false` outright rather
+    /// than leaving it to be inferred from five cleared filters. Pinned
+    /// because the saving is invisible from the outside: the events were
+    /// already being thrown away, so nothing about the output changes
+    /// when this regresses — only the wall clock.
+    #[test]
+    fn the_ephemeris_path_switches_detection_off() {
+        let (ffi, _keep) = EphemerisConfig::default()
+            .to_ffi_with()
+            .expect("config marshals");
+        assert_eq!(
+            ffi.propagation.events.detection_enabled,
+            empyrean_sys::EMPYREAN_EVENT_DETECTION_OFF,
+            "the ephemeris path must not pay for detectors it discards"
+        );
+        // The five filters stay cleared too — this is the "not
+        // requested" state, not a partial one.
+        assert_eq!(ffi.propagation.events.close_approaches, 0);
+        assert_eq!(ffi.propagation.events.impacts, 0);
+    }
+
+    /// Switching detection off on this path must not drag the
+    /// propagation-side refusal in with it.
+    ///
+    /// `Auto` paired with `detection_enabled = false` is refused for a
+    /// *propagation*, because there the caller chose both halves. Here
+    /// the caller chose only the method — the ephemeris path clears
+    /// detection itself, on a call that asks for sky positions and never
+    /// for close approaches. Refusing it would reject a legitimate
+    /// request for a setting the caller never made, which is exactly
+    /// what an over-broad guard does.
+    #[test]
+    fn an_auto_ephemeris_is_not_caught_by_the_propagation_refusal() {
+        let mut cfg = EphemerisConfig::default();
+        cfg.propagation.uncertainty_method = crate::UncertaintyMethod::auto();
+        cfg.validate()
+            .expect("Auto is a legal ephemeris uncertainty method");
+        let (ffi, _keep) = cfg
+            .to_ffi_with()
+            .expect("an Auto ephemeris config marshals");
+        assert_eq!(
+            ffi.propagation.events.detection_enabled,
+            empyrean_sys::EMPYREAN_EVENT_DETECTION_OFF,
+            "the path still switches detection off"
+        );
+
+        // And the mixture likewise.
+        let mut cfg = EphemerisConfig::default();
+        cfg.propagation.uncertainty_method = crate::UncertaintyMethod::gaussian_mixture();
+        cfg.to_ffi_with()
+            .expect("a mixture ephemeris config marshals");
+    }
+
     #[test]
     fn the_default_config_is_not_an_event_request() {
         EphemerisConfig::default()

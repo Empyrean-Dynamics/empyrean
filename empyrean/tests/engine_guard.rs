@@ -39,6 +39,11 @@ const ALLOWED: &[(&str, &str)] = &[
         "reads the error a completed FFI call left behind",
     ),
     (
+        "error.rs::capture_location",
+        "drains the position of the error a completed FFI call left behind; \
+         only `capture` calls it, after that call returned",
+    ),
+    (
         "ephemeris.rs::marshal_ephemeris_result",
         "unpacks a result a Context method produced",
     ),

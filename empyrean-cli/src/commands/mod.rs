@@ -89,6 +89,29 @@ impl DataOptions {
     }
 }
 
+/// Re-print the offending batch member of a failed engine call as its
+/// own context line.
+///
+/// A batch call fails as a whole. When the failure belongs to one orbit,
+/// [`empyrean::Error`] says which — and that line is the remedy, in the
+/// same way the absent-file list is the remedy for a strict-offline
+/// failure, so it gets the same treatment: its own block rather than a
+/// clause buried at the end of one long line. A failure that names no
+/// orbit passes through untouched.
+pub fn with_orbit_context(e: empyrean::Error) -> anyhow::Error {
+    let mut named = match (e.orbit_index(), e.orbit_id()) {
+        (Some(i), Some(id)) => format!("the batch failed on orbit {i} (orbit_id {id:?})"),
+        (Some(i), None) => format!("the batch failed on orbit {i}"),
+        (None, Some(id)) => format!("the batch failed on orbit_id {id:?}"),
+        (None, None) => return anyhow::Error::new(e),
+    };
+    if let Some(epoch) = e.epoch_mjd_tdb() {
+        named.push_str(&format!(" at MJD {epoch} TDB"));
+    }
+    named.push_str("; fix or drop that row and re-issue the call");
+    anyhow::Error::new(e).context(named)
+}
+
 /// Load a context for a command, printing how long it took (the existing
 /// `Loaded context (Ns)` line every subcommand emits) and, when
 /// `--no-refresh` is in force, saying so before the attempt — an offline
@@ -243,5 +266,84 @@ mod data_options_tests {
             refresh: true,
         };
         assert_eq!(none.dir(), None);
+    }
+}
+
+#[cfg(test)]
+mod orbit_context_tests {
+    use super::with_orbit_context;
+
+    /// A wrapper error carrying a message and no position — the shape
+    /// of every failure that belongs to no single orbit. Built as a
+    /// literal rather than provoked from the engine so the test needs no
+    /// data directory and touches no network.
+    fn unlocated() -> empyrean::Error {
+        empyrean::Error {
+            code: -4,
+            message: "propagation failed".to_string(),
+            missing_data_files: Vec::new(),
+            orbit_index: None,
+            orbit_id: None,
+            epoch_mjd_tdb: None,
+        }
+    }
+
+    /// A failure that names no orbit is printed exactly as it always
+    /// was — no invented row, no extra block.
+    #[test]
+    fn a_failure_with_no_orbit_is_passed_through() {
+        let e = unlocated();
+        assert_eq!(e.orbit_index(), None, "fixture must carry no position");
+        let rendered = format!("{:#}", with_orbit_context(e));
+        assert!(
+            !rendered.contains("the batch failed on"),
+            "nothing to name, so nothing is added: {rendered}"
+        );
+    }
+
+    /// A failure that names a row gets that row as its own context line,
+    /// the way a strict-offline failure gets its absent-file block.
+    #[test]
+    fn a_located_failure_gains_a_line_naming_the_row() {
+        let mut e = unlocated();
+        e.orbit_index = Some(2317);
+        e.orbit_id = Some("2024 YR4".to_string());
+        e.epoch_mjd_tdb = Some(60800.5);
+
+        let rendered = format!("{:#}", with_orbit_context(e));
+        assert!(
+            rendered.contains("the batch failed on orbit 2317"),
+            "must name the index: {rendered}"
+        );
+        assert!(
+            rendered.contains("2024 YR4"),
+            "must name the id: {rendered}"
+        );
+        assert!(
+            rendered.contains("60800.5"),
+            "must name the epoch: {rendered}"
+        );
+    }
+
+    /// A partial position renders what it has and claims nothing more —
+    /// an index with no id, and an id with no index, both read cleanly.
+    #[test]
+    fn partial_positions_render_only_what_is_known() {
+        let mut by_index = unlocated();
+        by_index.orbit_index = Some(7);
+        let rendered = format!("{:#}", with_orbit_context(by_index));
+        assert!(
+            rendered.contains("the batch failed on orbit 7"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("orbit_id"), "{rendered}");
+
+        let mut by_id = unlocated();
+        by_id.orbit_id = Some("2024 YR4".to_string());
+        let rendered = format!("{:#}", with_orbit_context(by_id));
+        assert!(
+            rendered.contains("the batch failed on orbit_id \"2024 YR4\""),
+            "{rendered}"
+        );
     }
 }

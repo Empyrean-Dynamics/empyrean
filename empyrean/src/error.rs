@@ -60,10 +60,35 @@ pub struct Error {
     /// [`missing_data_files`](Self::missing_data_files) to reading the
     /// field.
     pub missing_data_files: Vec<String>,
+    /// Zero-based index of the offending orbit in the batch the failing
+    /// call was given, when the failure belongs to one orbit.
+    ///
+    /// A batch propagation takes \\(N\\) orbits × \\(M\\) epochs and
+    /// fails as a whole, so without this the only route from "the call
+    /// failed" to "orbit 2317 failed" is to re-run the batch one orbit
+    /// at a time. Read it through
+    /// [`orbit_index`](Self::orbit_index).
+    pub orbit_index: Option<usize>,
+    /// The `orbit_id` of the offending orbit — the caller's own string,
+    /// or the positional `"orbit_{i}"` the boundary substitutes when the
+    /// caller left the field unset. Read it through
+    /// [`orbit_id`](Self::orbit_id).
+    pub orbit_id: Option<String>,
+    /// The epoch that identifies the failure, MJD TDB — the requested
+    /// output epoch when the failure is tied to one, otherwise the
+    /// offending orbit's own epoch. Read it through
+    /// [`epoch_mjd_tdb`](Self::epoch_mjd_tdb).
+    pub epoch_mjd_tdb: Option<f64>,
 }
 
 impl Error {
     /// Capture the current thread-local error from libempyrean.
+    ///
+    /// Drains the engine's positional payload in the same breath as the
+    /// message. The two are thread-local and the next failing call
+    /// overwrites both, so they are read together or not at all —
+    /// capturing the message now and the position later would risk
+    /// pairing one failure's prose with another's index.
     pub(crate) fn capture(code: i32) -> Self {
         let message = unsafe {
             let ptr = empyrean_sys::empyrean_last_error();
@@ -73,10 +98,14 @@ impl Error {
                 CStr::from_ptr(ptr).to_string_lossy().into_owned()
             }
         };
+        let (orbit_index, orbit_id, epoch_mjd_tdb) = capture_location();
         Error {
             code,
             message,
             missing_data_files: Vec::new(),
+            orbit_index,
+            orbit_id,
+            epoch_mjd_tdb,
         }
     }
 
@@ -86,11 +115,17 @@ impl Error {
     }
 
     /// Build an error for an invalid input (path contains nul byte, etc.).
+    ///
+    /// Raised by the wrapper itself, before or after the boundary, so it
+    /// carries no engine position.
     pub(crate) fn invalid_input(msg: impl Into<String>) -> Self {
         Error {
             code: -1,
             message: msg.into(),
             missing_data_files: Vec::new(),
+            orbit_index: None,
+            orbit_id: None,
+            epoch_mjd_tdb: None,
         }
     }
 
@@ -113,7 +148,57 @@ impl Error {
             code: ENGINE_NOT_LOADED,
             message: diagnosis.to_string(),
             missing_data_files: Vec::new(),
+            orbit_index: None,
+            orbit_id: None,
+            epoch_mjd_tdb: None,
         }
+    }
+
+    /// Zero-based index of the offending orbit in the batch the failing
+    /// call was given, or `None` when the failure names no single orbit.
+    ///
+    /// This is the field that lets a failed batch be repaired instead of
+    /// bisected: drop or fix the row it names and re-issue the call. It
+    /// is populated only from a position the boundary or the engine
+    /// supplied directly — never inferred from
+    /// [`message`](Self::message) — so `None` means "not known", never
+    /// "not applicable".
+    ///
+    /// Populated today by every failure the C boundary raises while
+    /// marshaling the caller's orbit array (a non-finite element, an
+    /// unconvertible coordinate, a malformed thrust or SRP block, a
+    /// joint that fails its definiteness gate), by the retained-result
+    /// accessors, which are addressed by index, and by every engine
+    /// propagation failure that names an orbit — which on the
+    /// [`BuiltSystem`](crate::BuiltSystem) path is most of them.
+    pub fn orbit_index(&self) -> Option<usize> {
+        self.orbit_index
+    }
+
+    /// The `orbit_id` of the offending orbit, or `None` when the failure
+    /// names no single orbit.
+    ///
+    /// The caller's own string when it supplied one, and otherwise the
+    /// positional `"orbit_{i}"` the boundary substitutes — the same id
+    /// the results and events of a successful call carry, so it joins
+    /// against them directly.
+    ///
+    /// An id may be present with no [`orbit_index`](Self::orbit_index)
+    /// beside it: the engine names the orbit, and resolving that name to
+    /// an index needs an exact, unique match against the batch. A batch
+    /// carrying duplicate ids resolves to the id alone rather than to a
+    /// guessed row.
+    pub fn orbit_id(&self) -> Option<&str> {
+        self.orbit_id.as_deref()
+    }
+
+    /// The epoch that identifies the failure, MJD TDB, or `None` when
+    /// the failure is tied to no epoch.
+    ///
+    /// The requested output epoch when the failure belongs to one,
+    /// otherwise the offending orbit's own input epoch.
+    pub fn epoch_mjd_tdb(&self) -> Option<f64> {
+        self.epoch_mjd_tdb
     }
 
     /// The data files a construction found absent, or an empty slice for
@@ -155,13 +240,57 @@ impl Error {
     }
 }
 
+/// Drain the engine's positional payload for the failure just reported
+/// on this thread.
+///
+/// Returns all-`None` when the engine recorded no position, which is not
+/// itself an error — most failures are not tied to one orbit.
+fn capture_location() -> (Option<usize>, Option<String>, Option<f64>) {
+    let mut out = empyrean_sys::EmpyreanErrorLocation {
+        orbit_id: std::ptr::null_mut(),
+        orbit_index: 0,
+        epoch_mjd_tdb: 0.0,
+        has_orbit_index: 0,
+        has_epoch: 0,
+    };
+    // A non-zero return means the position could not be read (a null
+    // out, an allocation failure, a caught panic). Nothing was handed
+    // over in that case, so there is nothing to free and nothing to
+    // report — the message still stands on its own.
+    if unsafe { empyrean_sys::empyrean_error_location(&mut out) } != 0 {
+        return (None, None, None);
+    }
+    let orbit_id = (!out.orbit_id.is_null()).then(|| {
+        unsafe { CStr::from_ptr(out.orbit_id) }
+            .to_string_lossy()
+            .into_owned()
+    });
+    let index = (out.has_orbit_index != 0).then_some(out.orbit_index);
+    let epoch = (out.has_epoch != 0).then_some(out.epoch_mjd_tdb);
+    unsafe { empyrean_sys::empyrean_error_location_free(&mut out) };
+    (index, orbit_id, epoch)
+}
+
 impl fmt::Display for Error {
+    /// Renders the position after the message when the failure carries
+    /// one, so a caller that only logs the error still sees which orbit
+    /// it was — the structured fields are for a caller that acts on it.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.message.is_empty() {
-            write!(f, "empyrean error (code {})", self.code)
+            write!(f, "empyrean error (code {})", self.code)?;
         } else {
-            write!(f, "{} (code {})", self.message, self.code)
+            write!(f, "{} (code {})", self.message, self.code)?;
         }
+        match (self.orbit_index, self.orbit_id.as_deref()) {
+            (Some(i), Some(id)) => write!(f, " [orbit {i}: {id}]")?,
+            (Some(i), None) => write!(f, " [orbit {i}]")?,
+            (None, Some(id)) => write!(f, " [orbit {id}]")?,
+            (None, None) => {}
+        }
+        if let Some(epoch) = self.epoch_mjd_tdb {
+            write!(f, " [epoch {epoch} MJD TDB]")?;
+        }
+        Ok(())
     }
 }
 

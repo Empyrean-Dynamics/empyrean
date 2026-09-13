@@ -34,7 +34,9 @@
 //              EMPYREAN_OD_FAILURE_*, EMPYREAN_PARAM_COLUMN_* (the
 //              EmpyreanParamColumn::kind tags), EMPYREAN_SOLVER_STOP_* (the
 //              EmpyreanODResult::termination / ::stall_underlying_stop codes,
-//              added in 0.10.0-rc.2).
+//              added in 0.10.0-rc.2), EMPYREAN_EVENT_DETECTION_* /
+//              EMPYREAN_DENSE_ORIGIN_* / EMPYREAN_CAPTURE_CRITERION_* (the
+//              three EmpyreanEventConfig tri-states).
 //
 // TWO DELIBERATE EXCEPTIONS, both of the same shape — a family that shipped at
 // bindgen's `u32` before the rule existed keeps it rather than splitting.
@@ -193,6 +195,16 @@ pub const EMPYREAN_UNCERTAINTY_SIGMA_POINT: u32 = 2;
 pub const EMPYREAN_UNCERTAINTY_MONTE_CARLO: u32 = 3;
 pub const EMPYREAN_UNCERTAINTY_AUTO: u32 = 4;
 pub const EMPYREAN_UNCERTAINTY_MIXTURE: u32 = 5;
+pub const EMPYREAN_EVENT_DETECTION_DEFAULT: i32 = 0;
+pub const EMPYREAN_EVENT_DETECTION_ON: i32 = 1;
+pub const EMPYREAN_EVENT_DETECTION_OFF: i32 = 2;
+pub const EMPYREAN_DENSE_ORIGIN_DEFAULT: i32 = 0;
+pub const EMPYREAN_DENSE_ORIGIN_BODYCENTRIC: i32 = 1;
+pub const EMPYREAN_DENSE_ORIGIN_BARYCENTRIC: i32 = 2;
+pub const EMPYREAN_CAPTURE_CRITERION_DEFAULT: i32 = 0;
+pub const EMPYREAN_CAPTURE_CRITERION_POPULATION: i32 = 1;
+pub const EMPYREAN_CAPTURE_CRITERION_INDIVIDUAL: i32 = 2;
+pub const EMPYREAN_CAPTURE_CRITERION_ENERGY_ONLY: i32 = 3;
 pub const EMPYREAN_EPHEMERIS_OVERLAP_POLICY_SUBSTITUTE_SPK: i32 = 0;
 pub const EMPYREAN_EPHEMERIS_OVERLAP_POLICY_EXCLUDE_AND_INTEGRATE: i32 = 1;
 pub const EMPYREAN_COVARIANCE_KIND_LINEAR: u32 = 0;
@@ -286,6 +298,46 @@ impl Default for EmpyreanMissingDataFiles {
         }
     }
 }
+#[doc = " Where in the caller's batch the most recent failure happened.\n\n Populated by [`empyrean_error_location`]; release it with\n [`empyrean_error_location_free`].\n\n Each of the three positions carries its own presence flag rather than\n a sentinel, because every value they can hold is a legitimate one: a\n zeroed struct reads as \"nothing known\", `orbit_index` `0` is the first\n orbit and not a null, and `epoch_mjd_tdb` has no unused double."]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct EmpyreanErrorLocation {
+    #[doc = " The caller's `orbit_id` for the offending orbit, or null when the\n failure named no orbit. Heap-allocated, NUL-terminated UTF-8."]
+    pub orbit_id: *mut ::std::os::raw::c_char,
+    #[doc = " Zero-based index of the offending orbit in the caller's batch.\n Read only when `has_orbit_index` is non-zero."]
+    pub orbit_index: usize,
+    #[doc = " The epoch that identifies the failure, MJD TDB — the requested\n output epoch when the failure is tied to one, otherwise the\n offending orbit's own epoch. Read only when `has_epoch` is\n non-zero."]
+    pub epoch_mjd_tdb: f64,
+    #[doc = " Whether `orbit_index` carries a value."]
+    pub has_orbit_index: u8,
+    #[doc = " Whether `epoch_mjd_tdb` carries a value."]
+    pub has_epoch: u8,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of EmpyreanErrorLocation"][::std::mem::size_of::<EmpyreanErrorLocation>() - 32usize];
+    ["Alignment of EmpyreanErrorLocation"]
+        [::std::mem::align_of::<EmpyreanErrorLocation>() - 8usize];
+    ["Offset of field: EmpyreanErrorLocation::orbit_id"]
+        [::std::mem::offset_of!(EmpyreanErrorLocation, orbit_id) - 0usize];
+    ["Offset of field: EmpyreanErrorLocation::orbit_index"]
+        [::std::mem::offset_of!(EmpyreanErrorLocation, orbit_index) - 8usize];
+    ["Offset of field: EmpyreanErrorLocation::epoch_mjd_tdb"]
+        [::std::mem::offset_of!(EmpyreanErrorLocation, epoch_mjd_tdb) - 16usize];
+    ["Offset of field: EmpyreanErrorLocation::has_orbit_index"]
+        [::std::mem::offset_of!(EmpyreanErrorLocation, has_orbit_index) - 24usize];
+    ["Offset of field: EmpyreanErrorLocation::has_epoch"]
+        [::std::mem::offset_of!(EmpyreanErrorLocation, has_epoch) - 25usize];
+};
+impl Default for EmpyreanErrorLocation {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
 #[doc = " Per-crate version strings reported by the empyrean stack.\n\n Mirrors [`empyrean_core::Versions`]. Each pointer is a heap-allocated\n NUL-terminated UTF-8 string owned by [`EmpyreanVersions`]; release\n the whole struct with [`empyrean_versions_free`] (do not free the\n individual fields with [`empyrean_string_free`])."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -321,7 +373,7 @@ impl Default for EmpyreanVersions {
         }
     }
 }
-#[doc = " Flat C-ABI compatible coordinate state.\n\n Carries [`empyrean_core::convert::CoordinateState`]'s fields plus the\n state↔Marsden border; the duplicate definition exists so cbindgen\n (which has `parse_deps = false`) can emit the matching C struct in\n `empyrean.h` without traversing into the empyrean-core crate.\n\n `Copy` is a Rust-side convenience only (the batched transform writes\n whole rows into a caller-owned array); the C layout is unaffected.\n\n # The border sits here, beside the 6×6 it borders\n\n [`non_grav_cross`](Self::non_grav_cross) is the \\\\(6 \\times 3\\\\) half\n of one `ExtendedCovariance`, whose other half is the state\n [`covariance`](Self::covariance). Putting it one level up on\n `EmpyreanOrbit` would split a single matrix across two structs, and\n `empyrean_transform_coordinates` takes a `CoordinateState` *without*\n its orbit — so the two halves could be transformed apart. Here they\n travel together, and the transform rotates the pair.\n\n The orbit's wide **carrier** stays on `EmpyreanOrbit`, mirroring the\n engine's own split: a carrier's thrust tags are an orbit-level\n concept a coordinate has no business knowing.\n\n One consequence a caller should know: `empyrean_transform_coordinates`\n transforms a coordinate and its border, **not a whole joint**. An\n orbit's carrier is not in scope at that signature, so an orbit-level\n joint cannot be re-expressed in another basis through the C ABI in\n this release. Transform the orbit before attaching its carrier, or\n supply the joint in the basis you want it consumed in."]
+#[doc = " Flat C-ABI compatible coordinate state.\n\n Carries [`empyrean_core::convert::CoordinateState`]'s fields plus the\n state↔Marsden border; the duplicate definition exists so cbindgen\n (which has `parse_deps = false`) can emit the matching C struct in\n `empyrean.h` without traversing into the empyrean-core crate.\n\n `Copy` is a Rust-side convenience only (the batched transform writes\n whole rows into a caller-owned array); the C layout is unaffected.\n\n # The border sits here, beside the 6×6 it borders\n\n [`non_grav_cross`](Self::non_grav_cross) is the \\\\(6 \\times 3\\\\) half\n of one `ExtendedCovariance`, whose other half is the state\n [`covariance`](Self::covariance). Putting it one level up on\n `EmpyreanOrbit` would split a single matrix across two structs, and\n `empyrean_transform_coordinates` takes a `CoordinateState` *without*\n its orbit — so the two halves could be transformed apart. Here they\n travel together, and the transform rotates the pair.\n\n The orbit's wide **carrier** stays on `EmpyreanOrbit`, mirroring the\n engine's own split: a carrier's thrust tags are an orbit-level\n concept a coordinate has no business knowing.\n\n One consequence a caller should know: `empyrean_transform_coordinates`\n transforms a coordinate and its border, **not a whole joint**. An\n orbit's carrier is not in scope at that signature, so an orbit-level\n joint cannot be re-expressed in another basis through the C ABI in\n this release. Transform the orbit before attaching its carrier, or\n supply the joint in the basis you want it consumed in.\n\n # Non-finite values are refused, by the row they belong to\n\n A propagation batch is checked row by row before anything is\n integrated, and a NaN or infinite value in a **declared** field\n fails the call with invalid-argument, naming that orbit's index and\n `orbit_id` (readable through\n [`empyrean_error_location`]). A NaN\n element otherwise integrates into a NaN trajectory and surfaces from\n deep inside the engine with no index in the message.\n\n Checked always: [`epoch_mjd_tdb`](Self::epoch_mjd_tdb) and all six\n [`elements`](Self::elements). Checked only when the row declares\n them: [`covariance`](Self::covariance) (when `has_covariance` is\n non-zero) and [`non_grav_cross`](Self::non_grav_cross) (when\n `has_non_grav_cross` is non-zero) — an undeclared block is\n uninitialized memory as far as this ABI is concerned, and reading it\n would reject rows the engine never looks at.\n\n **Deliberately not checked**, because NaN is their documented\n \"absent\" sentinel rather than a mistake: `EmpyreanOrbit`'s\n `non_grav_dt`, `non_grav_dt_variance`, `srp_amrat_variance`, and the\n photometry slots."]
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
 pub struct CoordinateState {
@@ -695,7 +747,7 @@ const _: () = {
         auto_gmm_components_per_split
     ) - 80usize];
 };
-#[doc = " Event-detection configuration. Mirrors\n [`villeneuve::events::EventConfig`] (less the `enrichment` sub-config,\n which carries internal nested data that doesn't translate cleanly\n through C — it always uses upstream defaults).\n\n `body_filter_naif` is non-owning: caller must keep the array alive\n for the duration of the propagation call. Pass `null` /\n `num_body_filter = 0` to monitor all bodies."]
+#[doc = " Event-detection configuration. Mirrors\n [`villeneuve::events::EventConfig`] (less the `enrichment` sub-config,\n which carries internal nested data that doesn't translate cleanly\n through C — it always uses upstream defaults).\n\n `body_filter_naif` is non-owning: caller must keep the array alive\n for the duration of the propagation call. Pass `null` /\n `num_body_filter = 0` to monitor all bodies.\n\n # Two kinds of field, two zero conventions\n\n The five per-type flags are **filters** on what gets emitted, and\n they read `0` as off, as they always have — a `memset(0)` config asks\n for none of those five event types.\n\n The three tri-state `i32` fields at the tail are **not** filters: they\n select among engine behaviours whose default is not zero-shaped\n (detection is on, dense output is body-centric, capture is the\n population criterion). They therefore spend `0` on `_DEFAULT` and\n shift their ladders by one, exactly as\n [`EmpyreanDataDirOptions::refresh`](crate::EmpyreanDataDirOptions)\n does — so a `memset(0)` config keeps meaning precisely what it meant\n before these fields existed, and a caller who wants a non-default\n says so by name."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct EmpyreanEventConfig {
@@ -712,10 +764,16 @@ pub struct EmpyreanEventConfig {
     pub dense_output: u8,
     #[doc = " Cadence (days) of dense output. 0.0 → upstream default (5 minutes)."]
     pub dense_output_cadence_days: f64,
+    #[doc = " Master switch for per-substep event detection — see the\n `EMPYREAN_EVENT_DETECTION_*` constants. `0` = `_DEFAULT` (the\n engine's own default, which is on).\n\n **This is a performance field, and it is the only one on this\n struct.** The five flags above filter what is *emitted*; the\n detectors still run per accepted integrator substep and still\n cost what they cost. Switching detection off installs no\n observational detector at all and skips the per-substep dispatch\n entirely — measured at **1.5× faster** on a 64-orbit,\n covariance-free, two-epoch Standard-tier batch.\n\n **State accuracy is unchanged**: the trajectory, the STM and the\n dense output are bit-for-bit identical either way, because\n detection is observation and not dynamics. Origin-switch zones do\n alter the integrated trajectory and are **not** governed here —\n they follow `EmpyreanAdvancedIntegratorConfig`'s origin-switching\n field alone.\n\n **Everything the detectors produce is gone**, which is more than\n the event list: no events, no close approaches, and therefore no\n impact probabilities, which the engine computes from the nominal\n close approaches. The five per-type flags, `body_filter` and the\n enrichment pass are all moot.\n\n **Two uncertainty methods resolve themselves from that output,\n and pairing either with detection off is refused** rather than\n served degraded: `Auto` (tag\n [`EMPYREAN_UNCERTAINTY_AUTO`]) picks its refinement windows from\n detected close approaches and gates its second pass on their\n impact probabilities, and the adaptive Gaussian mixture (tag\n [`EMPYREAN_UNCERTAINTY_MIXTURE`]) splits at those same close\n approaches. Every other method computes its covariance along the\n trajectory and is served normally."]
+    pub detection_enabled: i32,
+    #[doc = " Reference origin for dense encounter-trajectory output — see the\n `EMPYREAN_DENSE_ORIGIN_*` constants. `0` = `_DEFAULT`\n (body-centric). Read only when `dense_output` is on.\n\n A pure translation by the (deterministic) body ephemeris, so the\n per-point covariance is the same in either origin; what changes is\n which frame the dense arc arrives in."]
+    pub dense_origin: i32,
+    #[doc = " Criterion the capture detector applies when emitting\n capture start / end — see the `EMPYREAN_CAPTURE_CRITERION_*`\n constants. `0` = `_DEFAULT` (the population criterion).\n\n This selects a **published definition of capture**, not a\n tolerance: the three answers come from different papers and\n disagree about which encounters count. Read the constants before\n moving off the default."]
+    pub capture_criterion: i32,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of EmpyreanEventConfig"][::std::mem::size_of::<EmpyreanEventConfig>() - 40usize];
+    ["Size of EmpyreanEventConfig"][::std::mem::size_of::<EmpyreanEventConfig>() - 56usize];
     ["Alignment of EmpyreanEventConfig"][::std::mem::align_of::<EmpyreanEventConfig>() - 8usize];
     ["Offset of field: EmpyreanEventConfig::close_approaches"]
         [::std::mem::offset_of!(EmpyreanEventConfig, close_approaches) - 0usize];
@@ -735,6 +793,12 @@ const _: () = {
         [::std::mem::offset_of!(EmpyreanEventConfig, dense_output) - 24usize];
     ["Offset of field: EmpyreanEventConfig::dense_output_cadence_days"]
         [::std::mem::offset_of!(EmpyreanEventConfig, dense_output_cadence_days) - 32usize];
+    ["Offset of field: EmpyreanEventConfig::detection_enabled"]
+        [::std::mem::offset_of!(EmpyreanEventConfig, detection_enabled) - 40usize];
+    ["Offset of field: EmpyreanEventConfig::dense_origin"]
+        [::std::mem::offset_of!(EmpyreanEventConfig, dense_origin) - 44usize];
+    ["Offset of field: EmpyreanEventConfig::capture_criterion"]
+        [::std::mem::offset_of!(EmpyreanEventConfig, capture_criterion) - 48usize];
 };
 impl Default for EmpyreanEventConfig {
     fn default() -> Self {
@@ -892,7 +956,7 @@ pub struct EmpyreanPropagationConfig {
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of EmpyreanPropagationConfig"]
-        [::std::mem::size_of::<EmpyreanPropagationConfig>() - 296usize];
+        [::std::mem::size_of::<EmpyreanPropagationConfig>() - 312usize];
     ["Alignment of EmpyreanPropagationConfig"]
         [::std::mem::align_of::<EmpyreanPropagationConfig>() - 8usize];
     ["Offset of field: EmpyreanPropagationConfig::force_model"]
@@ -910,13 +974,13 @@ const _: () = {
     ["Offset of field: EmpyreanPropagationConfig::events"]
         [::std::mem::offset_of!(EmpyreanPropagationConfig, events) - 120usize];
     ["Offset of field: EmpyreanPropagationConfig::diagnostics"]
-        [::std::mem::offset_of!(EmpyreanPropagationConfig, diagnostics) - 160usize];
+        [::std::mem::offset_of!(EmpyreanPropagationConfig, diagnostics) - 176usize];
     ["Offset of field: EmpyreanPropagationConfig::num_threads"]
-        [::std::mem::offset_of!(EmpyreanPropagationConfig, num_threads) - 200usize];
+        [::std::mem::offset_of!(EmpyreanPropagationConfig, num_threads) - 216usize];
     ["Offset of field: EmpyreanPropagationConfig::advanced"]
-        [::std::mem::offset_of!(EmpyreanPropagationConfig, advanced) - 208usize];
+        [::std::mem::offset_of!(EmpyreanPropagationConfig, advanced) - 224usize];
     ["Offset of field: EmpyreanPropagationConfig::ephemeris_overlap_policy"]
-        [::std::mem::offset_of!(EmpyreanPropagationConfig, ephemeris_overlap_policy) - 288usize];
+        [::std::mem::offset_of!(EmpyreanPropagationConfig, ephemeris_overlap_policy) - 304usize];
 };
 impl Default for EmpyreanPropagationConfig {
     fn default() -> Self {
@@ -1393,17 +1457,17 @@ pub struct EmpyreanEphemerisConfig {
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of EmpyreanEphemerisConfig"]
-        [::std::mem::size_of::<EmpyreanEphemerisConfig>() - 320usize];
+        [::std::mem::size_of::<EmpyreanEphemerisConfig>() - 336usize];
     ["Alignment of EmpyreanEphemerisConfig"]
         [::std::mem::align_of::<EmpyreanEphemerisConfig>() - 8usize];
     ["Offset of field: EmpyreanEphemerisConfig::propagation"]
         [::std::mem::offset_of!(EmpyreanEphemerisConfig, propagation) - 0usize];
     ["Offset of field: EmpyreanEphemerisConfig::max_light_time_iterations"]
-        [::std::mem::offset_of!(EmpyreanEphemerisConfig, max_light_time_iterations) - 296usize];
+        [::std::mem::offset_of!(EmpyreanEphemerisConfig, max_light_time_iterations) - 312usize];
     ["Offset of field: EmpyreanEphemerisConfig::light_time_tolerance_days"]
-        [::std::mem::offset_of!(EmpyreanEphemerisConfig, light_time_tolerance_days) - 304usize];
+        [::std::mem::offset_of!(EmpyreanEphemerisConfig, light_time_tolerance_days) - 320usize];
     ["Offset of field: EmpyreanEphemerisConfig::compute_diagnostics"]
-        [::std::mem::offset_of!(EmpyreanEphemerisConfig, compute_diagnostics) - 312usize];
+        [::std::mem::offset_of!(EmpyreanEphemerisConfig, compute_diagnostics) - 328usize];
 };
 impl Default for EmpyreanEphemerisConfig {
     fn default() -> Self {
@@ -4577,6 +4641,8 @@ pub struct EmpyreanLib {
     pub empyrean_missing_data_files:
         unsafe extern "C" fn(out: *mut EmpyreanMissingDataFiles) -> i32,
     pub empyrean_missing_data_files_free: unsafe extern "C" fn(out: *mut EmpyreanMissingDataFiles),
+    pub empyrean_error_location: unsafe extern "C" fn(out: *mut EmpyreanErrorLocation) -> i32,
+    pub empyrean_error_location_free: unsafe extern "C" fn(out: *mut EmpyreanErrorLocation),
     pub empyrean_context_free: unsafe extern "C" fn(ctx: *mut EmpyreanContext),
     pub empyrean_default_data_dir: unsafe extern "C" fn() -> *mut ::std::os::raw::c_char,
     pub empyrean_string_free: unsafe extern "C" fn(s: *mut ::std::os::raw::c_char),
@@ -5035,6 +5101,12 @@ impl EmpyreanLib {
         let empyrean_missing_data_files_free = __library
             .get(b"empyrean_missing_data_files_free\0")
             .map(|sym| *sym)?;
+        let empyrean_error_location = __library
+            .get(b"empyrean_error_location\0")
+            .map(|sym| *sym)?;
+        let empyrean_error_location_free = __library
+            .get(b"empyrean_error_location_free\0")
+            .map(|sym| *sym)?;
         let empyrean_context_free = __library.get(b"empyrean_context_free\0").map(|sym| *sym)?;
         let empyrean_default_data_dir = __library
             .get(b"empyrean_default_data_dir\0")
@@ -5273,6 +5345,8 @@ impl EmpyreanLib {
             empyrean_download_data,
             empyrean_missing_data_files,
             empyrean_missing_data_files_free,
+            empyrean_error_location,
+            empyrean_error_location_free,
             empyrean_context_free,
             empyrean_default_data_dir,
             empyrean_string_free,
@@ -5411,6 +5485,14 @@ impl EmpyreanLib {
     #[doc = " Free an [`EmpyreanMissingDataFiles`] populated by\n [`empyrean_missing_data_files`]. Passing a null or zeroed struct is a\n no-op; the struct is left zeroed so a double free is safe."]
     pub unsafe fn empyrean_missing_data_files_free(&self, out: *mut EmpyreanMissingDataFiles) {
         (self.empyrean_missing_data_files_free)(out)
+    }
+    #[doc = " Retrieve the position of the most recent failure on this thread.\n\n The companion to `empyrean_last_error()`: that returns the prose,\n this returns where in the caller's batch the prose applies. A batch\n call fails as a whole, so without this the only way from \"the call\n failed\" to \"orbit 2317 failed\" is to re-run the batch one orbit at a\n time.\n\n Returns 0 and fills `out` on success. An `out` with `orbit_id` null,\n `has_orbit_index == 0` and `has_epoch == 0` means the last error on\n this thread carried no position; it is not itself an error.\n\n Returns `-1` for a null `out`, `-5` when the recorded `orbit_id`\n contains an interior NUL and so cannot be handed back as a C string,\n and `-99` on a caught panic. **On any non-zero return `out` is left\n exactly as the caller passed it** — nothing was handed over, so do\n not call [`empyrean_error_location_free`] unless this returned 0.\n\n Nothing here is inferred from the message text. A field is filled\n only when the boundary or the engine supplied that value directly, so\n an absent field means \"not known\", never \"not applicable\".\n\n The position is thread-local and is cleared by the next call that\n records an error on this thread, so read it immediately after the\n failing call. **The caller owns `out` and must release it with\n [`empyrean_error_location_free`].**"]
+    pub unsafe fn empyrean_error_location(&self, out: *mut EmpyreanErrorLocation) -> i32 {
+        (self.empyrean_error_location)(out)
+    }
+    #[doc = " Free an [`EmpyreanErrorLocation`] populated by\n [`empyrean_error_location`]. Passing a null or zeroed struct is a\n no-op; the struct is left zeroed so a double free is safe."]
+    pub unsafe fn empyrean_error_location_free(&self, out: *mut EmpyreanErrorLocation) {
+        (self.empyrean_error_location_free)(out)
     }
     #[doc = " Free an `EmpyreanContext` previously returned by\n `empyrean_context_from_data_dir`, `empyrean_context_from_data_dir_with`\n or `empyrean_context_new_minimal`.\n\n Passing null is a no-op."]
     pub unsafe fn empyrean_context_free(&self, ctx: *mut EmpyreanContext) {

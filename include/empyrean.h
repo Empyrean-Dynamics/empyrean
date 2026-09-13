@@ -874,6 +874,32 @@ typedef struct Session Session;
  * installed; `empyrean_version_string()` reports something else — the
  * build provenance of the closed-source engine crates behind this
  * boundary, not this distribution's version.
+ *
+ * **A boundary change since this number was last set.**
+ * [`EmpyreanEventConfig`](crate::propagate::EmpyreanEventConfig) grew
+ * 40 → 56 bytes by value, shifting every field after `events` in
+ * [`EmpyreanPropagationConfig`](crate::propagate::EmpyreanPropagationConfig)
+ * (296 → 312) and
+ * [`EmpyreanEphemerisConfig`](crate::ephemeris::EmpyreanEphemerisConfig)
+ * (320 → 336); this is a layout break and `EMPYREAN_ABI_VERSION` must
+ * move with the next version bump.
+ *
+ * The shifted offsets, for a consumer re-deriving a hand-mirrored
+ * struct: `diagnostics` 160→176, `num_threads` 200→216, `advanced`
+ * 208→224, `ephemeris_overlap_policy` 288→304, and
+ * `compute_diagnostics` 312→328. Re-derive the whole layout rather than
+ * appending to it — writing `num_threads` at its old offset lands
+ * inside `diagnostics` with no diagnostic of any kind. Recompiling
+ * against the current header is the fix; a caller compiled against the
+ * 0.10.0 header and this library refuse each other at load by the version
+ * handshake.
+ *
+ * The release's other boundary additions —
+ * [`empyrean_error_location`](crate::empyrean_error_location),
+ * [`empyrean_error_location_free`](crate::empyrean_error_location_free)
+ * and [`EmpyreanErrorLocation`](crate::EmpyreanErrorLocation) — which
+ * take nothing away from any existing layout; they ship under this
+ * cycle's number, 1100.
  */
 #define EMPYREAN_ABI_VERSION 1100
 
@@ -1075,6 +1101,83 @@ typedef struct Session Session;
 #define EMPYREAN_UNCERTAINTY_AUTO 4
 
 #define EMPYREAN_UNCERTAINTY_MIXTURE 5
+
+/**
+ * Let the engine's own default stand: detection **on**. The `memset(0)`
+ * default, so a config written before this field existed behaves
+ * exactly as it did.
+ *
+ * Reachable from raw C only. Every layer above this one — the safe
+ * wrapper, Python, the CLI — holds a resolved value and writes the
+ * explicit rung, so the benefit of this rung (a future engine default
+ * reaching a caller with no ABI change) accrues to C callers alone.
+ * The same is true of the other two `_DEFAULT` rungs below.
+ */
+#define EMPYREAN_EVENT_DETECTION_DEFAULT 0
+
+/**
+ * Detection on, spelled explicitly. Identical to
+ * [`EMPYREAN_EVENT_DETECTION_DEFAULT`] today; say it when you want the
+ * choice on the record rather than inherited.
+ */
+#define EMPYREAN_EVENT_DETECTION_ON 1
+
+/**
+ * Detection **off**: install no observational detector and skip the
+ * per-substep dispatch. The propagated state, STM and dense trajectory
+ * are unchanged; the event list comes back empty and the call is
+ * measurably faster. For a caller that reads states and discards
+ * events, this is the whole win.
+ */
+#define EMPYREAN_EVENT_DETECTION_OFF 2
+
+/**
+ * The engine's own default: body-centric. The `memset(0)` default.
+ */
+#define EMPYREAN_DENSE_ORIGIN_DEFAULT 0
+
+/**
+ * Dense encounter states relative to the encounter body. Precise
+ * body-relative vectors through the encounter, and the natural frame
+ * for a body-centered close-approach view.
+ */
+#define EMPYREAN_DENSE_ORIGIN_BODYCENTRIC 1
+
+/**
+ * Dense encounter states relative to the Solar System Barycenter, so
+ * the dense arc splices into a barycentric main trajectory with no
+ * client-side re-centering.
+ */
+#define EMPYREAN_DENSE_ORIGIN_BARYCENTRIC 2
+
+/**
+ * The engine's own default: the population criterion. The `memset(0)`
+ * default.
+ */
+#define EMPYREAN_CAPTURE_CRITERION_DEFAULT 0
+
+/**
+ * Granvik+ 2012 / Fedorets+ 2018 composite: energy-bound within
+ * 3 Hill radii. The canonical mini-moon population definition.
+ */
+#define EMPYREAN_CAPTURE_CRITERION_POPULATION 1
+
+/**
+ * Fedorets+ 2020 individual-object criterion: energy-bound within a
+ * tight body-specific scale (≈ 1 lunar distance for Earth). Use it when
+ * comparing against per-object mini-moon characterization papers, whose
+ * reported capture window is anchored on a closest-approach distance
+ * rather than a Hill-sphere fraction.
+ */
+#define EMPYREAN_CAPTURE_CRITERION_INDIVIDUAL 2
+
+/**
+ * Energy-only: \\(\tfrac{1}{2}v_\text{rel}^2 - \mu/r < 0\\), with no
+ * distance gate beyond the close-approach tracking radius. The most
+ * permissive of the three, and what villeneuve did before the criterion
+ * was selectable.
+ */
+#define EMPYREAN_CAPTURE_CRITERION_ENERGY_ONLY 3
 
 /**
  * Substitute the perturber's SPK state and skip integration. The
@@ -1330,6 +1433,45 @@ struct EmpyreanMissingDataFiles {
 };
 
 /**
+ * Where in the caller's batch the most recent failure happened.
+ *
+ * Populated by [`empyrean_error_location`]; release it with
+ * [`empyrean_error_location_free`].
+ *
+ * Each of the three positions carries its own presence flag rather than
+ * a sentinel, because every value they can hold is a legitimate one: a
+ * zeroed struct reads as "nothing known", `orbit_index` `0` is the first
+ * orbit and not a null, and `epoch_mjd_tdb` has no unused double.
+ */
+struct EmpyreanErrorLocation {
+    /**
+     * The caller's `orbit_id` for the offending orbit, or null when the
+     * failure named no orbit. Heap-allocated, NUL-terminated UTF-8.
+     */
+    char *orbit_id;
+    /**
+     * Zero-based index of the offending orbit in the caller's batch.
+     * Read only when `has_orbit_index` is non-zero.
+     */
+    uintptr_t orbit_index;
+    /**
+     * The epoch that identifies the failure, MJD TDB — the requested
+     * output epoch when the failure is tied to one, otherwise the
+     * offending orbit's own epoch. Read only when `has_epoch` is
+     * non-zero.
+     */
+    double epoch_mjd_tdb;
+    /**
+     * Whether `orbit_index` carries a value.
+     */
+    uint8_t has_orbit_index;
+    /**
+     * Whether `epoch_mjd_tdb` carries a value.
+     */
+    uint8_t has_epoch;
+};
+
+/**
  * Per-crate version strings reported by the empyrean stack.
  *
  * Mirrors [`empyrean_core::Versions`]. Each pointer is a heap-allocated
@@ -1387,6 +1529,29 @@ struct EmpyreanVersions {
  * joint cannot be re-expressed in another basis through the C ABI in
  * this release. Transform the orbit before attaching its carrier, or
  * supply the joint in the basis you want it consumed in.
+ *
+ * # Non-finite values are refused, by the row they belong to
+ *
+ * A propagation batch is checked row by row before anything is
+ * integrated, and a NaN or infinite value in a **declared** field
+ * fails the call with invalid-argument, naming that orbit's index and
+ * `orbit_id` (readable through
+ * [`empyrean_error_location`]). A NaN
+ * element otherwise integrates into a NaN trajectory and surfaces from
+ * deep inside the engine with no index in the message.
+ *
+ * Checked always: [`epoch_mjd_tdb`](Self::epoch_mjd_tdb) and all six
+ * [`elements`](Self::elements). Checked only when the row declares
+ * them: [`covariance`](Self::covariance) (when `has_covariance` is
+ * non-zero) and [`non_grav_cross`](Self::non_grav_cross) (when
+ * `has_non_grav_cross` is non-zero) — an undeclared block is
+ * uninitialized memory as far as this ABI is concerned, and reading it
+ * would reject rows the engine never looks at.
+ *
+ * **Deliberately not checked**, because NaN is their documented
+ * "absent" sentinel rather than a mistake: `EmpyreanOrbit`'s
+ * `non_grav_dt`, `non_grav_dt_variance`, `srp_amrat_variance`, and the
+ * photometry slots.
  */
 struct CoordinateState {
     double epoch_mjd_tdb;
@@ -1943,6 +2108,22 @@ struct EmpyreanUncertaintyMethod {
  * `body_filter_naif` is non-owning: caller must keep the array alive
  * for the duration of the propagation call. Pass `null` /
  * `num_body_filter = 0` to monitor all bodies.
+ *
+ * # Two kinds of field, two zero conventions
+ *
+ * The five per-type flags are **filters** on what gets emitted, and
+ * they read `0` as off, as they always have — a `memset(0)` config asks
+ * for none of those five event types.
+ *
+ * The three tri-state `i32` fields at the tail are **not** filters: they
+ * select among engine behaviours whose default is not zero-shaped
+ * (detection is on, dense output is body-centric, capture is the
+ * population criterion). They therefore spend `0` on `_DEFAULT` and
+ * shift their ladders by one, exactly as
+ * [`EmpyreanDataDirOptions::refresh`](crate::EmpyreanDataDirOptions)
+ * does — so a `memset(0)` config keeps meaning precisely what it meant
+ * before these fields existed, and a caller who wants a non-default
+ * says so by name.
  */
 struct EmpyreanEventConfig {
     uint8_t close_approaches;
@@ -1967,6 +2148,64 @@ struct EmpyreanEventConfig {
      * Cadence (days) of dense output. 0.0 → upstream default (5 minutes).
      */
     double dense_output_cadence_days;
+    /**
+     * Master switch for per-substep event detection — see the
+     * `EMPYREAN_EVENT_DETECTION_*` constants. `0` = `_DEFAULT` (the
+     * engine's own default, which is on).
+     *
+     * **This is a performance field, and it is the only one on this
+     * struct.** The five flags above filter what is *emitted*; the
+     * detectors still run per accepted integrator substep and still
+     * cost what they cost. Switching detection off installs no
+     * observational detector at all and skips the per-substep dispatch
+     * entirely — measured at **1.5× faster** on a 64-orbit,
+     * covariance-free, two-epoch Standard-tier batch.
+     *
+     * **State accuracy is unchanged**: the trajectory, the STM and the
+     * dense output are bit-for-bit identical either way, because
+     * detection is observation and not dynamics. Origin-switch zones do
+     * alter the integrated trajectory and are **not** governed here —
+     * they follow `EmpyreanAdvancedIntegratorConfig`'s origin-switching
+     * field alone.
+     *
+     * **Everything the detectors produce is gone**, which is more than
+     * the event list: no events, no close approaches, and therefore no
+     * impact probabilities, which the engine computes from the nominal
+     * close approaches. The five per-type flags, `body_filter` and the
+     * enrichment pass are all moot.
+     *
+     * **Two uncertainty methods resolve themselves from that output,
+     * and pairing either with detection off is refused** rather than
+     * served degraded: `Auto` (tag
+     * [`EMPYREAN_UNCERTAINTY_AUTO`]) picks its refinement windows from
+     * detected close approaches and gates its second pass on their
+     * impact probabilities, and the adaptive Gaussian mixture (tag
+     * [`EMPYREAN_UNCERTAINTY_MIXTURE`]) splits at those same close
+     * approaches. Every other method computes its covariance along the
+     * trajectory and is served normally.
+     */
+    int32_t detection_enabled;
+    /**
+     * Reference origin for dense encounter-trajectory output — see the
+     * `EMPYREAN_DENSE_ORIGIN_*` constants. `0` = `_DEFAULT`
+     * (body-centric). Read only when `dense_output` is on.
+     *
+     * A pure translation by the (deterministic) body ephemeris, so the
+     * per-point covariance is the same in either origin; what changes is
+     * which frame the dense arc arrives in.
+     */
+    int32_t dense_origin;
+    /**
+     * Criterion the capture detector applies when emitting
+     * capture start / end — see the `EMPYREAN_CAPTURE_CRITERION_*`
+     * constants. `0` = `_DEFAULT` (the population criterion).
+     *
+     * This selects a **published definition of capture**, not a
+     * tolerance: the three answers come from different papers and
+     * disagree about which encounters count. Read the constants before
+     * moving off the default.
+     */
+    int32_t capture_criterion;
 };
 
 /**
@@ -6357,6 +6596,43 @@ EmpyreanContext *empyrean_context_from_data_dir_with(const char *data_dir,
  * no-op; the struct is left zeroed so a double free is safe.
  */
  void empyrean_missing_data_files_free(struct EmpyreanMissingDataFiles *out);
+
+/**
+ * Retrieve the position of the most recent failure on this thread.
+ *
+ * The companion to `empyrean_last_error()`: that returns the prose,
+ * this returns where in the caller's batch the prose applies. A batch
+ * call fails as a whole, so without this the only way from "the call
+ * failed" to "orbit 2317 failed" is to re-run the batch one orbit at a
+ * time.
+ *
+ * Returns 0 and fills `out` on success. An `out` with `orbit_id` null,
+ * `has_orbit_index == 0` and `has_epoch == 0` means the last error on
+ * this thread carried no position; it is not itself an error.
+ *
+ * Returns `-1` for a null `out`, `-5` when the recorded `orbit_id`
+ * contains an interior NUL and so cannot be handed back as a C string,
+ * and `-99` on a caught panic. **On any non-zero return `out` is left
+ * exactly as the caller passed it** — nothing was handed over, so do
+ * not call [`empyrean_error_location_free`] unless this returned 0.
+ *
+ * Nothing here is inferred from the message text. A field is filled
+ * only when the boundary or the engine supplied that value directly, so
+ * an absent field means "not known", never "not applicable".
+ *
+ * The position is thread-local and is cleared by the next call that
+ * records an error on this thread, so read it immediately after the
+ * failing call. **The caller owns `out` and must release it with
+ * [`empyrean_error_location_free`].**
+ */
+ int32_t empyrean_error_location(struct EmpyreanErrorLocation *out);
+
+/**
+ * Free an [`EmpyreanErrorLocation`] populated by
+ * [`empyrean_error_location`]. Passing a null or zeroed struct is a
+ * no-op; the struct is left zeroed so a double free is safe.
+ */
+ void empyrean_error_location_free(struct EmpyreanErrorLocation *out);
 
 /**
  * Free an `EmpyreanContext` previously returned by

@@ -852,6 +852,9 @@ mod tests {
                       generic_kernels/pck/earth_620120_260806.bpc: http status: 404"
                 .to_string(),
             missing_data_files: Vec::new(),
+            orbit_index: None,
+            orbit_id: None,
+            epoch_mjd_tdb: None,
         };
         let out = augment_construction_error(err, Some(Path::new("/nonexistent-dir")));
         assert_eq!(

@@ -970,6 +970,114 @@ for c in &plan.candidates {
 # Ok::<(), empyrean::Error>(())
 ```
 
+## Turning event detection off
+
+Every propagation runs the built-in detector set on each accepted
+integrator substep. The five per-type flags on `EventConfig` filter what
+gets *emitted*; they do not stop the detectors running. When a caller
+wants states and nothing else, `detection_enabled` is the switch that
+stops the work:
+
+```rust,no_run
+# let ctx = empyrean::Context::from_data_dir(None)?;
+# let orbits: Vec<empyrean::Orbit> = Vec::new();
+# let epochs: Vec<empyrean::Epoch> = Vec::new();
+let config = empyrean::PropagationConfig {
+    events: empyrean::EventConfig {
+        detection_enabled: false,
+        ..empyrean::EventConfig::default()
+    },
+    ..empyrean::PropagationConfig::default()
+};
+let result = ctx.propagate(&orbits, &epochs, &config)?;
+assert!(result.events.is_empty());
+# Ok::<(), empyrean::Error>(())
+```
+
+Measured on a 64-orbit, covariance-free, two-epoch Standard-tier batch,
+single-threaded over a 400-day arc: **272 ms with detection on, 185 ms
+with it off — 1.47×**.
+
+**State accuracy is unchanged** — trajectory, STM and dense output come
+back bit-for-bit identical either way, because detection is observation
+and not dynamics. Origin-switch zones do alter the integrated trajectory
+and are governed separately, by `OriginSwitchingConfig`. **What is gone
+is everything the detectors produce**: no events, no close approaches,
+and therefore no impact probabilities.
+
+`UncertaintyMethod::Auto` and `UncertaintyMethod::Mixture` resolve
+*themselves* from that output — Auto picks its refinement windows from
+detected close approaches and gates its second pass on their impact
+probabilities, the mixture splits at those same close approaches — so
+pairing either with detection off is **refused** by
+`PropagationConfig::validate`, not served as a silently linear answer.
+Every other method is served normally.
+
+`EventConfig` also carries `dense_origin` (which origin the dense
+encounter trajectory arrives in) and `capture_criterion` (which published
+definition of temporary capture the capture detector applies — Granvik+
+2012, Fedorets+ 2020, or energy-only). Both were silently dropped at the
+boundary until now.
+
+## When a batch fails, it names the orbit
+
+A batch call takes N orbits and M epochs and fails as a whole. When the
+failure belongs to one orbit, `Error` says which — so the offending row
+is read off the failure instead of found by re-running the batch one
+orbit at a time.
+
+```rust,no_run
+# let ctx = empyrean::Context::from_data_dir(None)?;
+# let orbits: Vec<empyrean::Orbit> = Vec::new();
+# let epochs: Vec<empyrean::Epoch> = Vec::new();
+# let config = empyrean::PropagationConfig::default();
+match ctx.propagate(&orbits, &epochs, &config) {
+    Ok(result) => { let _ = result; }
+    Err(e) => {
+        if let Some(i) = e.orbit_index() {
+            eprintln!("orbit {i} ({:?}) at {:?}", e.orbit_id(), e.epoch_mjd_tdb());
+        }
+    }
+}
+# Ok::<(), empyrean::Error>(())
+```
+
+All three are `None` when the failure belongs to no single orbit — an
+empty epoch grid, a missing kernel, a config the whole call was refused
+on. Nothing is inferred from the message text: a field is filled only
+when the boundary or the engine supplied that value, so absent means
+*not known*, never *not applicable*. `Display` renders whatever is
+present after the message, so a caller that only logs the error still
+sees it.
+
+## Result weight
+
+`PropagationResult` holds two independent things: the owned copies you
+read (`states`, `object_ids`, `events`, `mixtures`) and the engine-side
+result that backs the lazy accessors — `covariance_series_cartesian`,
+`covariance_at_cartesian`, `joint_at`, `mixture_at`. The second is the
+larger by an order of magnitude, around 64 kB per (orbit, epoch) against
+roughly 4 kB for the states, and it is held for the whole scope.
+
+`into_states` gives it back at the point you take the states:
+
+```rust,no_run
+# let ctx = empyrean::Context::from_data_dir(None)?;
+# let orbits: Vec<empyrean::Orbit> = Vec::new();
+# let epochs: Vec<empyrean::Epoch> = Vec::new();
+# let config = empyrean::PropagationConfig::default();
+let states = ctx.propagate(&orbits, &epochs, &config)?.into_states();
+# let _ = states;
+# Ok::<(), empyrean::Error>(())
+```
+
+Consuming `self` is what makes it safe: the lazy accessors take `&self`,
+so the type system proves none can be called afterwards. There is no
+config flag to set and nothing to get wrong — a caller that wants the
+tagged covariance simply does not call it. Those are the numbers to size
+a chunk from; both are resident-set figures on one machine, so read them
+as the ratio and the order of magnitude.
+
 ## Data directory and offline operation
 
 `Context::from_data_dir` loads the Standard-tier kernel set, acquiring

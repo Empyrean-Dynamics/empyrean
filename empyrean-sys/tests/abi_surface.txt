@@ -27,6 +27,8 @@ empyrean_ephemeris_result_free
 empyrean_ephemeris_write_csv
 empyrean_ephemeris_write_json
 empyrean_ephemeris_write_parquet
+empyrean_error_location
+empyrean_error_location_free
 empyrean_evaluate
 empyrean_evaluate_plan
 empyrean_evaluate_result_free

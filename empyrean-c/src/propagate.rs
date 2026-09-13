@@ -11,9 +11,9 @@ use empyrean_core::nongrav::{
 };
 use empyrean_core::orbits::Orbits;
 use empyrean_core::photometry::PhotometricParams;
-use empyrean_core::propagation::events::DynamicalEvent;
+use empyrean_core::propagation::events::{CaptureCriterion, DynamicalEvent};
 use empyrean_core::propagation::{
-    AdvancedIntegratorConfig, DiagnosticsConfig, EphemerisOverlapPolicy, EventConfig,
+    AdvancedIntegratorConfig, DenseOrigin, DiagnosticsConfig, EphemerisOverlapPolicy, EventConfig,
     IntegratorChoice, OriginSwitchingConfig, PropagationConfig, PropagationResult,
     UncertaintyMethod, propagate,
 };
@@ -653,6 +653,22 @@ pub struct EmpyreanUncertaintyMethod {
 /// `body_filter_naif` is non-owning: caller must keep the array alive
 /// for the duration of the propagation call. Pass `null` /
 /// `num_body_filter = 0` to monitor all bodies.
+///
+/// # Two kinds of field, two zero conventions
+///
+/// The five per-type flags are **filters** on what gets emitted, and
+/// they read `0` as off, as they always have — a `memset(0)` config asks
+/// for none of those five event types.
+///
+/// The three tri-state `i32` fields at the tail are **not** filters: they
+/// select among engine behaviours whose default is not zero-shaped
+/// (detection is on, dense output is body-centric, capture is the
+/// population criterion). They therefore spend `0` on `_DEFAULT` and
+/// shift their ladders by one, exactly as
+/// [`EmpyreanDataDirOptions::refresh`](crate::EmpyreanDataDirOptions)
+/// does — so a `memset(0)` config keeps meaning precisely what it meant
+/// before these fields existed, and a caller who wants a non-default
+/// says so by name.
 #[repr(C)]
 pub struct EmpyreanEventConfig {
     pub close_approaches: u8,
@@ -669,7 +685,115 @@ pub struct EmpyreanEventConfig {
     pub dense_output: u8,
     /// Cadence (days) of dense output. 0.0 → upstream default (5 minutes).
     pub dense_output_cadence_days: f64,
+    /// Master switch for per-substep event detection — see the
+    /// `EMPYREAN_EVENT_DETECTION_*` constants. `0` = `_DEFAULT` (the
+    /// engine's own default, which is on).
+    ///
+    /// **This is a performance field, and it is the only one on this
+    /// struct.** The five flags above filter what is *emitted*; the
+    /// detectors still run per accepted integrator substep and still
+    /// cost what they cost. Switching detection off installs no
+    /// observational detector at all and skips the per-substep dispatch
+    /// entirely — measured at **1.5× faster** on a 64-orbit,
+    /// covariance-free, two-epoch Standard-tier batch.
+    ///
+    /// **State accuracy is unchanged**: the trajectory, the STM and the
+    /// dense output are bit-for-bit identical either way, because
+    /// detection is observation and not dynamics. Origin-switch zones do
+    /// alter the integrated trajectory and are **not** governed here —
+    /// they follow `EmpyreanAdvancedIntegratorConfig`'s origin-switching
+    /// field alone.
+    ///
+    /// **Everything the detectors produce is gone**, which is more than
+    /// the event list: no events, no close approaches, and therefore no
+    /// impact probabilities, which the engine computes from the nominal
+    /// close approaches. The five per-type flags, `body_filter` and the
+    /// enrichment pass are all moot.
+    ///
+    /// **Two uncertainty methods resolve themselves from that output,
+    /// and pairing either with detection off is refused** rather than
+    /// served degraded: `Auto` (tag
+    /// [`EMPYREAN_UNCERTAINTY_AUTO`]) picks its refinement windows from
+    /// detected close approaches and gates its second pass on their
+    /// impact probabilities, and the adaptive Gaussian mixture (tag
+    /// [`EMPYREAN_UNCERTAINTY_MIXTURE`]) splits at those same close
+    /// approaches. Every other method computes its covariance along the
+    /// trajectory and is served normally.
+    pub detection_enabled: i32,
+    /// Reference origin for dense encounter-trajectory output — see the
+    /// `EMPYREAN_DENSE_ORIGIN_*` constants. `0` = `_DEFAULT`
+    /// (body-centric). Read only when `dense_output` is on.
+    ///
+    /// A pure translation by the (deterministic) body ephemeris, so the
+    /// per-point covariance is the same in either origin; what changes is
+    /// which frame the dense arc arrives in.
+    pub dense_origin: i32,
+    /// Criterion the capture detector applies when emitting
+    /// capture start / end — see the `EMPYREAN_CAPTURE_CRITERION_*`
+    /// constants. `0` = `_DEFAULT` (the population criterion).
+    ///
+    /// This selects a **published definition of capture**, not a
+    /// tolerance: the three answers come from different papers and
+    /// disagree about which encounters count. Read the constants before
+    /// moving off the default.
+    pub capture_criterion: i32,
 }
+
+// ── Event detection master switch (EmpyreanEventConfig::detection_enabled) ──
+
+/// Let the engine's own default stand: detection **on**. The `memset(0)`
+/// default, so a config written before this field existed behaves
+/// exactly as it did.
+///
+/// Reachable from raw C only. Every layer above this one — the safe
+/// wrapper, Python, the CLI — holds a resolved value and writes the
+/// explicit rung, so the benefit of this rung (a future engine default
+/// reaching a caller with no ABI change) accrues to C callers alone.
+/// The same is true of the other two `_DEFAULT` rungs below.
+pub const EMPYREAN_EVENT_DETECTION_DEFAULT: i32 = 0;
+/// Detection on, spelled explicitly. Identical to
+/// [`EMPYREAN_EVENT_DETECTION_DEFAULT`] today; say it when you want the
+/// choice on the record rather than inherited.
+pub const EMPYREAN_EVENT_DETECTION_ON: i32 = 1;
+/// Detection **off**: install no observational detector and skip the
+/// per-substep dispatch. The propagated state, STM and dense trajectory
+/// are unchanged; the event list comes back empty and the call is
+/// measurably faster. For a caller that reads states and discards
+/// events, this is the whole win.
+pub const EMPYREAN_EVENT_DETECTION_OFF: i32 = 2;
+
+// ── Dense encounter output origin (EmpyreanEventConfig::dense_origin) ──
+
+/// The engine's own default: body-centric. The `memset(0)` default.
+pub const EMPYREAN_DENSE_ORIGIN_DEFAULT: i32 = 0;
+/// Dense encounter states relative to the encounter body. Precise
+/// body-relative vectors through the encounter, and the natural frame
+/// for a body-centered close-approach view.
+pub const EMPYREAN_DENSE_ORIGIN_BODYCENTRIC: i32 = 1;
+/// Dense encounter states relative to the Solar System Barycenter, so
+/// the dense arc splices into a barycentric main trajectory with no
+/// client-side re-centering.
+pub const EMPYREAN_DENSE_ORIGIN_BARYCENTRIC: i32 = 2;
+
+// ── Capture criterion (EmpyreanEventConfig::capture_criterion) ──
+
+/// The engine's own default: the population criterion. The `memset(0)`
+/// default.
+pub const EMPYREAN_CAPTURE_CRITERION_DEFAULT: i32 = 0;
+/// Granvik+ 2012 / Fedorets+ 2018 composite: energy-bound within
+/// 3 Hill radii. The canonical mini-moon population definition.
+pub const EMPYREAN_CAPTURE_CRITERION_POPULATION: i32 = 1;
+/// Fedorets+ 2020 individual-object criterion: energy-bound within a
+/// tight body-specific scale (≈ 1 lunar distance for Earth). Use it when
+/// comparing against per-object mini-moon characterization papers, whose
+/// reported capture window is anchored on a closest-approach distance
+/// rather than a Hill-sphere fraction.
+pub const EMPYREAN_CAPTURE_CRITERION_INDIVIDUAL: i32 = 2;
+/// Energy-only: \\(\tfrac{1}{2}v_\text{rel}^2 - \mu/r < 0\\), with no
+/// distance gate beyond the close-approach tracking radius. The most
+/// permissive of the three, and what villeneuve did before the criterion
+/// was selectable.
+pub const EMPYREAN_CAPTURE_CRITERION_ENERGY_ONLY: i32 = 3;
 
 /// Propagation configuration.
 ///
@@ -1322,6 +1446,53 @@ fn build_event_config_from_c(c: &EmpyreanEventConfig) -> Result<EventConfig, Str
     } else {
         e.body_filter = None;
     }
+    // The three tri-states. `_DEFAULT` leaves the engine's own value in
+    // place rather than restating it here, so a future engine default
+    // reaches a `memset(0)` caller without an ABI change. Anything
+    // outside each ladder is refused by name and value: a silently
+    // ignored config field is the failure mode this whole function exists
+    // to avoid.
+    e.detection_enabled = match c.detection_enabled {
+        EMPYREAN_EVENT_DETECTION_DEFAULT => e.detection_enabled,
+        EMPYREAN_EVENT_DETECTION_ON => true,
+        EMPYREAN_EVENT_DETECTION_OFF => false,
+        other => {
+            return Err(format!(
+                "events.detection_enabled must be \
+                 {EMPYREAN_EVENT_DETECTION_DEFAULT} = DEFAULT, \
+                 {EMPYREAN_EVENT_DETECTION_ON} = ON or \
+                 {EMPYREAN_EVENT_DETECTION_OFF} = OFF, got {other}"
+            ));
+        }
+    };
+    e.dense_origin = match c.dense_origin {
+        EMPYREAN_DENSE_ORIGIN_DEFAULT => e.dense_origin,
+        EMPYREAN_DENSE_ORIGIN_BODYCENTRIC => DenseOrigin::Bodycentric,
+        EMPYREAN_DENSE_ORIGIN_BARYCENTRIC => DenseOrigin::Barycentric,
+        other => {
+            return Err(format!(
+                "events.dense_origin must be \
+                 {EMPYREAN_DENSE_ORIGIN_DEFAULT} = DEFAULT, \
+                 {EMPYREAN_DENSE_ORIGIN_BODYCENTRIC} = BODYCENTRIC or \
+                 {EMPYREAN_DENSE_ORIGIN_BARYCENTRIC} = BARYCENTRIC, got {other}"
+            ));
+        }
+    };
+    e.capture_criterion = match c.capture_criterion {
+        EMPYREAN_CAPTURE_CRITERION_DEFAULT => e.capture_criterion,
+        EMPYREAN_CAPTURE_CRITERION_POPULATION => CaptureCriterion::Population,
+        EMPYREAN_CAPTURE_CRITERION_INDIVIDUAL => CaptureCriterion::Individual,
+        EMPYREAN_CAPTURE_CRITERION_ENERGY_ONLY => CaptureCriterion::EnergyOnly,
+        other => {
+            return Err(format!(
+                "events.capture_criterion must be \
+                 {EMPYREAN_CAPTURE_CRITERION_DEFAULT} = DEFAULT, \
+                 {EMPYREAN_CAPTURE_CRITERION_POPULATION} = POPULATION, \
+                 {EMPYREAN_CAPTURE_CRITERION_INDIVIDUAL} = INDIVIDUAL or \
+                 {EMPYREAN_CAPTURE_CRITERION_ENERGY_ONLY} = ENERGY_ONLY, got {other}"
+            ));
+        }
+    };
     Ok(e)
 }
 
@@ -1362,6 +1533,67 @@ pub(crate) fn build_propagation_config_from_c(
     cfg.ephemeris_overlap_policy = int_to_ephemeris_overlap_policy(c.ephemeris_overlap_policy)?;
 
     Ok(cfg)
+}
+
+/// The refusal for `Auto` under `detection_enabled = false`.
+///
+/// Duplicated from the safe wrapper's own copy so a raw C caller — who
+/// never goes through the wrapper — gets the same sentence. Neither side
+/// can provoke the other's copy (both refuse the same pairing), so each
+/// pins its own against the written-out sentence in its own test:
+/// `refusal_sentences_are_the_published_ones`, here and in the wrapper.
+/// Editing one without the other fails that side's test.
+pub(crate) const DETECTION_OFF_WITH_AUTO: &str = "detection_enabled = false is incompatible with uncertainty_method = Auto: \
+     Auto selects its refinement windows from detected close approaches";
+
+/// The refusal for the adaptive Gaussian mixture under
+/// `detection_enabled = false`. Pinned the same way as
+/// [`DETECTION_OFF_WITH_AUTO`].
+pub(crate) const DETECTION_OFF_WITH_MIXTURE: &str = "detection_enabled = false is incompatible with uncertainty_method = GaussianMixture: \
+     the mixture splits at detected close approaches";
+
+/// Refuse an uncertainty method that resolves itself from detector
+/// output when the caller has switched detection off.
+///
+/// `detection_enabled = false` installs no observational detector, so no
+/// close approach is found and no impact probability is computed. Two
+/// methods read exactly those outputs to decide what they do:
+///
+/// * `Auto` builds its second-pass refinement windows from the first
+///   pass's close approaches and gates that pass on their linear impact
+///   probabilities. Given neither, it does not fail — it resolves
+///   `Linear` at every epoch and returns no impact probabilities.
+/// * `Mixture` splits at detected close approaches, so with none it
+///   never splits and the caller gets a single Gaussian under a name
+///   that promises a mixture.
+///
+/// Both are silent downgrades of a scientific output, which this ABI
+/// does not do — so the pairing is refused by name instead. Every other
+/// method computes its covariance along the trajectory and is
+/// unaffected, so every other pairing is served.
+///
+/// Called from the **propagation** entry points only, never from the
+/// shared config converter: the ephemeris path routes through that same
+/// converter and sets `detection_enabled = false` itself, on a call
+/// where the caller asked for an ephemeris and not for close approaches.
+/// Refusing there would reject a legitimate `Auto` ephemeris for a
+/// setting the caller never chose.
+///
+/// This check belongs to the engine, where one refusal would cover every
+/// caller. It is filed there; remove this copy once a tracking bump
+/// makes the engine's own refusal reachable.
+pub(crate) fn refuse_detection_off_with_ca_driven_method(
+    detection_enabled: bool,
+    uncertainty_tag: u8,
+) -> Result<(), String> {
+    if detection_enabled {
+        return Ok(());
+    }
+    match uncertainty_tag {
+        EMPYREAN_UNCERTAINTY_AUTO => Err(DETECTION_OFF_WITH_AUTO.to_string()),
+        EMPYREAN_UNCERTAINTY_MIXTURE => Err(DETECTION_OFF_WITH_MIXTURE.to_string()),
+        _ => Ok(()),
+    }
 }
 
 /// Build the non-gravitational parameters carried by an [`EmpyreanOrbit`],
@@ -1700,7 +1932,7 @@ pub unsafe extern "C" fn empyrean_propagate(
             match build_orbits_for_propagation(orbit_slice) {
                 Ok(t) => t,
                 Err(e) => {
-                    set_last_error(&e);
+                    e.report();
                     return -1;
                 }
             };
@@ -1712,6 +1944,15 @@ pub unsafe extern "C" fn empyrean_propagate(
                 return -1;
             }
         };
+        // Checked against the caller's own tag rather than the converted
+        // enum: the tag is what the caller wrote.
+        if let Err(e) = refuse_detection_off_with_ca_driven_method(
+            cfg.events.detection_enabled,
+            config_ref.uncertainty_method.tag,
+        ) {
+            set_last_error(&e);
+            return -1;
+        }
 
         let times: Vec<Epoch> = times_slice
             .iter()
@@ -1721,7 +1962,18 @@ pub unsafe extern "C" fn empyrean_propagate(
         let prop_result = match propagate(ctx_ref, &orbits, &times, &cfg) {
             Ok(r) => r,
             Err(e) => {
-                set_last_error(&e.to_string());
+                // `set_last_error_from` rather than a bare message: it
+                // keeps the structured payloads (the missing-file list,
+                // and the orbit an ephemeris overlap names) instead of
+                // leaving a caller to parse them back out of prose. The
+                // batch it resolves against is assembled here, on the
+                // failing path, rather than on every call.
+                let epochs = batch_epochs(orbit_slice);
+                let batch = crate::ErrorBatch {
+                    orbit_ids: &input_orbit_ids,
+                    epochs_mjd_tdb: &epochs,
+                };
+                crate::set_last_error_from(&e, Some(&batch));
                 return -2;
             }
         };
@@ -1761,7 +2013,7 @@ pub(crate) fn build_orbits_for_propagation(
         Vec<String>,
         Vec<String>,
     ),
-    String,
+    BatchInputError,
 > {
     let mut orbits: Orbits<empyrean_core::coordinates::AU> = Orbits::empty();
     // Per-orbit identifiers. We use these to:
@@ -1774,38 +2026,140 @@ pub(crate) fn build_orbits_for_propagation(
     let mut input_orbit_ids: Vec<String> = Vec::with_capacity(orbit_slice.len());
     let mut input_object_ids: Vec<String> = Vec::with_capacity(orbit_slice.len());
     for (i, orbit) in orbit_slice.iter().enumerate() {
+        let id = batch_orbit_id(orbit, i);
+        let at = BatchInputError::locator(i, &id, orbit.state.epoch_mjd_tdb);
+        // Refuse a non-finite input row here, at the boundary that knows
+        // which row it is. A NaN element otherwise integrates into a NaN
+        // trajectory and surfaces from deep inside the engine as prose
+        // with no index in it, which is what forces a caller to re-run a
+        // batch one orbit at a time to find the offender.
+        if let Some(bad) = non_finite_state_field(&orbit.state) {
+            return Err(at(bad));
+        }
         let state = orbit.state.to_empyrean();
-        let coords =
-            coordinate_state_to_coordinates(&state).map_err(|e| format!("orbit {i}: {e}"))?;
-        // Use the caller-supplied orbit_id when present; fall back
-        // to the positional fabrication only if null/empty so older
-        // callers that haven't set the field keep working.
-        let id = c_str_to_string(orbit.orbit_id).unwrap_or_default();
-        let id = if id.is_empty() {
-            format!("orbit_{i}")
-        } else {
-            id
-        };
+        let coords = coordinate_state_to_coordinates(&state).map_err(|e| at(e.to_string()))?;
         let obj = c_str_to_string(orbit.object_id).unwrap_or_default();
         input_orbit_ids.push(id.clone());
         input_object_ids.push(obj);
-        crate::joint::push_orbit_with_joint(&mut orbits, id, coords, orbit)
-            .map_err(|e| format!("orbit {i}: {e}"))?;
+        crate::joint::push_orbit_with_joint(&mut orbits, id, coords, orbit).map_err(&at)?;
         if let Some(params) = empyrean_orbit_non_grav_params(orbit) {
             orbits.set_non_grav_params(i, Some(params));
         }
         match empyrean_orbit_thrust_params(orbit) {
             Ok(Some(tp)) => orbits.set_thrust_params(i, Some(tp)),
             Ok(None) => {}
-            Err(e) => return Err(format!("orbit {i}: {e}")),
+            Err(e) => return Err(at(e)),
         }
         match empyrean_orbit_srp_params(orbit) {
             Ok(Some(srp)) => orbits.set_srp_params(i, Some(srp)),
             Ok(None) => {}
-            Err(e) => return Err(format!("orbit {i}: {e}")),
+            Err(e) => return Err(at(e)),
         }
     }
     Ok((orbits, input_orbit_ids, input_object_ids))
+}
+
+/// A failure marshaling one row of the caller's orbit array, carrying
+/// the row it failed on.
+///
+/// The message reads as it always did; what is new is that the position
+/// travels beside it as numbers instead of only inside the prose, so a
+/// caller reads the index off [`empyrean_error_location`](crate::empyrean_error_location)
+/// rather than parsing it back out of a string.
+pub(crate) struct BatchInputError {
+    /// Which row failed.
+    pub at: crate::ErrorLocation,
+    /// The rendered message, index and id included.
+    pub message: String,
+}
+
+impl BatchInputError {
+    /// A per-row error builder: give it one row's position once, then
+    /// call it with whatever went wrong on that row.
+    ///
+    /// The position is captured by value so the caller may go on to move
+    /// the id into the batch it is building, and every failure on the
+    /// row renders through one format instead of each site restating it.
+    pub(crate) fn locator(
+        index: usize,
+        orbit_id: &str,
+        epoch_mjd_tdb: f64,
+    ) -> impl Fn(String) -> Self + use<> {
+        let at = crate::ErrorLocation::at_orbit(index, orbit_id, epoch_mjd_tdb);
+        let id = orbit_id.to_string();
+        move |e: String| Self {
+            at: at.clone(),
+            message: format!("orbit {index} ({id}): {e}"),
+        }
+    }
+
+    /// Record this failure as the thread's last error, message and
+    /// position together.
+    pub(crate) fn report(&self) {
+        crate::set_last_error(&self.message);
+        crate::set_error_location(self.at.clone());
+    }
+}
+
+/// The id one row of the caller's batch travels under.
+///
+/// The caller-supplied `orbit_id` when it is present, and the positional
+/// `"orbit_{i}"` fabrication when it is null or empty, so callers that
+/// never set the field keep working. **One definition**, shared by the
+/// batch the engine integrates and by the error position handed back:
+/// two definitions that drifted would let a failure name an id that
+/// appears nowhere in the result.
+pub(crate) fn batch_orbit_id(orbit: &EmpyreanOrbit, index: usize) -> String {
+    let id = c_str_to_string(orbit.orbit_id).unwrap_or_default();
+    if id.is_empty() {
+        format!("orbit_{index}")
+    } else {
+        id
+    }
+}
+
+/// The per-orbit input epochs of a caller's batch, positional with
+/// [`batch_orbit_id`], for resolving an engine error that names an orbit
+/// back to the epoch that orbit was handed in at.
+pub(crate) fn batch_epochs(orbit_slice: &[EmpyreanOrbit]) -> Vec<f64> {
+    orbit_slice.iter().map(|o| o.state.epoch_mjd_tdb).collect()
+}
+
+/// The first non-finite field of an input state, named, or `None` when
+/// every value the engine will read is finite.
+///
+/// Checks the epoch and the six elements always, and the 6×6 covariance
+/// and the 6×3 non-grav border only when the row declares them — an
+/// undeclared block is uninitialized memory as far as this ABI is
+/// concerned, and reading it would reject rows the engine never looks at.
+fn non_finite_state_field(state: &crate::CoordinateState) -> Option<String> {
+    if !state.epoch_mjd_tdb.is_finite() {
+        return Some(format!("epoch_mjd_tdb is {}", state.epoch_mjd_tdb));
+    }
+    for (k, v) in state.elements.iter().enumerate() {
+        if !v.is_finite() {
+            return Some(format!("elements[{k}] is {v}"));
+        }
+    }
+    if state.has_covariance != 0 {
+        for (r, row) in state.covariance.iter().enumerate() {
+            for (c, v) in row.iter().enumerate() {
+                if !v.is_finite() {
+                    return Some(format!("covariance[{r}][{c}] is {v}"));
+                }
+            }
+        }
+    }
+    if state.has_non_grav_cross != 0 {
+        for (r, row) in state.non_grav_cross.iter().enumerate() {
+            for (c, v) in row.iter().enumerate() {
+                if !v.is_finite() {
+                    return Some(format!("non_grav_cross[{r}][{c}] is {v}"));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Tear down a partially- or fully-built states array and its parallel
@@ -2514,6 +2868,59 @@ fn nominal_state_at(
     Ok([coord.x, coord.y, coord.z, coord.vx, coord.vy, coord.vz])
 }
 
+/// Where a lazy-accessor failure happened, in the caller's own index
+/// space.
+///
+/// The accessors are addressed by `(orbit_index, epoch_index)`, so the
+/// index is always known and is reported unconditionally — including for
+/// the out-of-range case, where the index the caller passed is the whole
+/// diagnosis. The id and epoch come off the retained result's own row
+/// when that row exists, and are left absent when it does not; an
+/// out-of-range index has no row to name.
+fn accessor_location(
+    handle: &PropagationResultHandle,
+    orbit_index: usize,
+    epoch_index: usize,
+) -> crate::ErrorLocation {
+    let Some(flat_idx) = accessor_row(
+        handle.result.states.len(),
+        handle.n_times,
+        orbit_index,
+        epoch_index,
+    ) else {
+        return crate::ErrorLocation::at_orbit_index(orbit_index);
+    };
+    // `nth` is a linear walk on this iterator; it runs only on a failure
+    // path, so the cost is irrelevant and the clarity is worth more.
+    match handle.result.states.iter().nth(flat_idx) {
+        Some((id, coord, _)) => crate::ErrorLocation::at_orbit(orbit_index, id, coord.t.mjd_tdb()),
+        None => crate::ErrorLocation::at_orbit_index(orbit_index),
+    }
+}
+
+/// The flat row an `(orbit_index, epoch_index)` pair addresses, or
+/// `None` when either index is out of range.
+///
+/// Both are bounded, and that is the whole point. An out-of-range
+/// `epoch_index` still derives an **in-range** row whenever orbits
+/// follow it — with two epochs and three orbits, orbit 0 / epoch 5 lands
+/// on row 5, which belongs to orbit 2. Reporting orbit 0's index beside
+/// orbit 2's id and epoch is worse than reporting no id at all: it is a
+/// position that contradicts itself and points at an innocent row.
+///
+/// Split out from [`accessor_location`] so the arithmetic can be
+/// asserted without standing up an engine result.
+fn accessor_row(
+    n_states: usize,
+    n_times: usize,
+    orbit_index: usize,
+    epoch_index: usize,
+) -> Option<usize> {
+    let n_times = n_times.max(1);
+    let n_orbits = n_states / n_times;
+    (epoch_index < n_times && orbit_index < n_orbits).then(|| orbit_index * n_times + epoch_index)
+}
+
 /// Resolved-kind tagged covariance at every output epoch for one orbit,
 /// Cartesian basis. On success `out_series` owns the array; free with
 /// [`empyrean_tagged_covariance_series_free`]. On error `out_series` is
@@ -2547,6 +2954,7 @@ pub unsafe extern "C" fn empyrean_propagation_covariance_series_cartesian(
             Ok(s) => s,
             Err(e) => {
                 set_last_error(&e.to_string());
+                crate::set_error_location(accessor_location(handle, orbit_index, 0));
                 return cov_series_err_code(&e);
             }
         };
@@ -2675,6 +3083,7 @@ pub unsafe extern "C" fn empyrean_propagation_joint_at(
         };
         if epoch_index >= n_times.max(1) || row >= handle.result.states.len() {
             set_last_error("orbit or epoch index out of range");
+            crate::set_error_location(accessor_location(handle, orbit_index, epoch_index));
             return EMPYREAN_TAGGED_COV_EPOCH_INDEX_OUT_OF_RANGE;
         }
 
@@ -2758,6 +3167,7 @@ pub unsafe extern "C" fn empyrean_propagation_covariance_at_cartesian(
             Some(u) => u,
             None => {
                 set_last_error("orbit or epoch index out of range");
+                crate::set_error_location(accessor_location(handle, orbit_index, epoch_index));
                 return EMPYREAN_TAGGED_COV_EPOCH_INDEX_OUT_OF_RANGE;
             }
         };
@@ -2765,6 +3175,7 @@ pub unsafe extern "C" fn empyrean_propagation_covariance_at_cartesian(
             Ok(tc) => tc,
             Err(e) => {
                 set_last_error(&e.to_string());
+                crate::set_error_location(accessor_location(handle, orbit_index, epoch_index));
                 return EMPYREAN_TAGGED_COV_UNCERTAINTY;
             }
         };
@@ -4875,5 +5286,246 @@ mod photometry_absence_tests {
         let err = empyrean_orbit_photometric_params(&orbit)
             .expect_err("a NaN variance is not an uncertainty");
         assert!(err.contains("not a finite number"), "{err}");
+    }
+}
+
+/// The three `EmpyreanEventConfig` tri-states, and the rule that makes
+/// them safe to append to a struct C callers already zero-initialize.
+///
+/// `detection_enabled` is the one that matters: the ABI dropped it
+/// entirely until now, so a caller who turned every detector off
+/// still paid per-substep detection and had no way to say otherwise.
+/// The other two were dropped the same way, silently, and are carried
+/// here for the same reason — an engine field the boundary does not
+/// marshal is a default the caller cannot see, let alone change.
+#[cfg(test)]
+mod event_config_tristate_tests {
+    use super::*;
+
+    /// A `memset(0)` config resolves to the engine's own defaults, so a
+    /// C consumer who zero-initializes gets exactly the behaviour it got
+    /// before these three fields existed. Zero is DEFAULT here — not
+    /// OFF, and not `Barycentric`.
+    #[test]
+    fn zero_init_resolves_to_the_engine_defaults() {
+        // SAFETY: `#[repr(C)]`; the pointer field is null in the
+        // all-zero pattern and `build_event_config_from_c` guards on it.
+        // This is exactly what `memset(0)` gives a C caller.
+        let c: EmpyreanEventConfig = unsafe { std::mem::zeroed() };
+        assert_eq!(c.detection_enabled, EMPYREAN_EVENT_DETECTION_DEFAULT);
+        assert_eq!(c.dense_origin, EMPYREAN_DENSE_ORIGIN_DEFAULT);
+        assert_eq!(c.capture_criterion, EMPYREAN_CAPTURE_CRITERION_DEFAULT);
+
+        let e = build_event_config_from_c(&c).expect("a zeroed config is valid");
+        let d = EventConfig::default();
+        assert_eq!(
+            e.detection_enabled, d.detection_enabled,
+            "memset(0) must leave detection where the engine puts it (on)"
+        );
+        assert_eq!(e.dense_origin, d.dense_origin);
+        assert_eq!(e.capture_criterion, d.capture_criterion);
+    }
+
+    /// Every explicit value on each ladder reaches the engine config —
+    /// the whole point of carrying the fields at all.
+    #[test]
+    fn every_explicit_value_is_carried_through() {
+        let zeroed = || -> EmpyreanEventConfig {
+            // SAFETY: see `zero_init_resolves_to_the_engine_defaults`.
+            unsafe { std::mem::zeroed() }
+        };
+
+        for (value, want) in [
+            (EMPYREAN_EVENT_DETECTION_ON, true),
+            (EMPYREAN_EVENT_DETECTION_OFF, false),
+        ] {
+            let mut c = zeroed();
+            c.detection_enabled = value;
+            assert_eq!(
+                build_event_config_from_c(&c).unwrap().detection_enabled,
+                want,
+                "detection_enabled = {value}"
+            );
+        }
+
+        for (value, want) in [
+            (EMPYREAN_DENSE_ORIGIN_BODYCENTRIC, DenseOrigin::Bodycentric),
+            (EMPYREAN_DENSE_ORIGIN_BARYCENTRIC, DenseOrigin::Barycentric),
+        ] {
+            let mut c = zeroed();
+            c.dense_origin = value;
+            assert_eq!(
+                build_event_config_from_c(&c).unwrap().dense_origin,
+                want,
+                "dense_origin = {value}"
+            );
+        }
+
+        for (value, want) in [
+            (
+                EMPYREAN_CAPTURE_CRITERION_POPULATION,
+                CaptureCriterion::Population,
+            ),
+            (
+                EMPYREAN_CAPTURE_CRITERION_INDIVIDUAL,
+                CaptureCriterion::Individual,
+            ),
+            (
+                EMPYREAN_CAPTURE_CRITERION_ENERGY_ONLY,
+                CaptureCriterion::EnergyOnly,
+            ),
+        ] {
+            let mut c = zeroed();
+            c.capture_criterion = value;
+            assert_eq!(
+                build_event_config_from_c(&c).unwrap().capture_criterion,
+                want,
+                "capture_criterion = {value}"
+            );
+        }
+    }
+
+    /// The positive control for the assertions above, and the reason
+    /// they are trustworthy: a value off the end of a ladder is refused
+    /// by name and value rather than quietly resolving to the default.
+    /// A boundary that silently accepted `7` would pass every test
+    /// above while dropping the caller's request.
+    #[test]
+    fn a_value_off_the_ladder_is_refused() {
+        /// One field of the struct, addressed by name and by a setter,
+        /// so the loop below can put an off-ladder value into each in
+        /// turn without three near-identical bodies.
+        type OffLadderCase = (&'static str, fn(&mut EmpyreanEventConfig));
+
+        let cases: [OffLadderCase; 3] = [
+            ("detection_enabled", |c| c.detection_enabled = 7),
+            ("dense_origin", |c| c.dense_origin = 7),
+            ("capture_criterion", |c| c.capture_criterion = 7),
+        ];
+        for (field, set) in cases {
+            // SAFETY: see `zero_init_resolves_to_the_engine_defaults`.
+            let mut c: EmpyreanEventConfig = unsafe { std::mem::zeroed() };
+            set(&mut c);
+            let Err(err) = build_event_config_from_c(&c) else {
+                panic!("{field} = 7 must be refused, not resolved to a default");
+            };
+            assert!(
+                err.contains(field) && err.contains('7'),
+                "the refusal must name the field and the value it got: {err}"
+            );
+        }
+    }
+}
+
+/// The two refusal sentences, pinned.
+///
+/// They are published contract — a caller greps for them — and the safe
+/// wrapper carries a byte-identical copy that cannot be cross-checked
+/// against this one through the FFI, because both sides refuse the same
+/// pairing and neither can provoke the other. Pinning each side to the
+/// written-out sentence is what keeps them equal.
+#[cfg(test)]
+mod detection_refusal_tests {
+    use super::*;
+
+    #[test]
+    fn refusal_sentences_are_the_published_ones() {
+        assert_eq!(
+            DETECTION_OFF_WITH_AUTO,
+            "detection_enabled = false is incompatible with uncertainty_method = Auto: Auto selects its refinement windows from detected close approaches"
+        );
+        assert_eq!(
+            DETECTION_OFF_WITH_MIXTURE,
+            "detection_enabled = false is incompatible with uncertainty_method = GaussianMixture: the mixture splits at detected close approaches"
+        );
+    }
+
+    /// The pairing is refused; neither half alone is.
+    #[test]
+    fn only_the_pairing_is_refused() {
+        assert_eq!(
+            refuse_detection_off_with_ca_driven_method(false, EMPYREAN_UNCERTAINTY_AUTO)
+                .expect_err("Auto + detection off is refused"),
+            DETECTION_OFF_WITH_AUTO
+        );
+        assert_eq!(
+            refuse_detection_off_with_ca_driven_method(false, EMPYREAN_UNCERTAINTY_MIXTURE)
+                .expect_err("Mixture + detection off is refused"),
+            DETECTION_OFF_WITH_MIXTURE
+        );
+
+        // Detection on serves both tags, and detection off serves every
+        // other tag. Without these a blanket refusal would pass above.
+        for tag in [EMPYREAN_UNCERTAINTY_AUTO, EMPYREAN_UNCERTAINTY_MIXTURE] {
+            refuse_detection_off_with_ca_driven_method(true, tag)
+                .unwrap_or_else(|e| panic!("tag {tag} with detection on is legal: {e}"));
+        }
+        for tag in [
+            EMPYREAN_UNCERTAINTY_FIRST,
+            EMPYREAN_UNCERTAINTY_SECOND,
+            EMPYREAN_UNCERTAINTY_SIGMA_POINT,
+            EMPYREAN_UNCERTAINTY_MONTE_CARLO,
+        ] {
+            refuse_detection_off_with_ca_driven_method(false, tag)
+                .unwrap_or_else(|e| panic!("tag {tag} with detection off is legal: {e}"));
+        }
+    }
+}
+
+/// `accessor_location` must never hand back a position that contradicts
+/// itself.
+///
+/// The retained-result accessors are addressed by `(orbit_index,
+/// epoch_index)` and reach this resolver on the out-of-range path with
+/// an `epoch_index` already known to be bad. Deriving a flat row from a
+/// bad epoch index lands on a *different orbit's* row whenever orbits
+/// follow it, so the index reported and the id reported would name two
+/// different orbits.
+#[cfg(test)]
+mod accessor_row_tests {
+    use super::accessor_row;
+
+    /// Three orbits × two epochs. Orbit 0, epoch 5 derives row 5 — a
+    /// real row, belonging to orbit 2. It must resolve to no row, so the
+    /// caller is told the index it passed and nothing borrowed.
+    #[test]
+    fn an_out_of_range_epoch_resolves_to_no_row() {
+        assert_eq!(
+            accessor_row(6, 2, 0, 5),
+            None,
+            "epoch 5 of a two-epoch grid must not borrow orbit 2's row"
+        );
+    }
+
+    /// An out-of-range orbit index is bounded the same way.
+    #[test]
+    fn an_out_of_range_orbit_resolves_to_no_row() {
+        assert_eq!(accessor_row(6, 2, 9, 0), None);
+        assert_eq!(accessor_row(6, 2, 3, 0), None, "one past the last orbit");
+    }
+
+    /// The positive control, and the reason the two above mean
+    /// something: every in-range pair still resolves, orbit-major. A
+    /// resolver that always returned `None` would pass both tests above
+    /// and fail this one.
+    #[test]
+    fn every_in_range_pair_resolves_orbit_major() {
+        for orbit in 0..3 {
+            for epoch in 0..2 {
+                assert_eq!(
+                    accessor_row(6, 2, orbit, epoch),
+                    Some(orbit * 2 + epoch),
+                    "({orbit}, {epoch})"
+                );
+            }
+        }
+    }
+
+    /// A zero `n_times` is the degenerate grid the accessors guard with
+    /// `max(1)`; it must not divide by zero.
+    #[test]
+    fn a_zero_epoch_count_is_treated_as_one() {
+        assert_eq!(accessor_row(3, 0, 1, 0), Some(1));
+        assert_eq!(accessor_row(3, 0, 1, 1), None);
     }
 }

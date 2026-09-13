@@ -1020,6 +1020,64 @@ empty cell. A carrier holding thrust Δv terms is refused wherever it is
 offered, because no orbit-file format can serialize the thrust arcs
 those terms describe.
 
+## Turning event detection off
+
+Every propagation runs the built-in detector set on each accepted
+integrator substep. The five per-type flags on `EventConfig` filter what
+gets *emitted*; they do not stop the detectors running. When you want
+states and nothing else, `detection_enabled` is the switch that stops
+the work:
+
+```python
+config = empyrean.PropagationConfig(
+    events=empyrean.EventConfig(detection_enabled=False),
+)
+result = empyrean.propagate(orbits, epochs, config=config)
+assert len(result.events.summary) == 0
+```
+
+Measured on a 64-orbit, covariance-free, two-epoch Standard-tier batch,
+single-threaded over a 400-day arc: **272 ms with detection on, 185 ms
+with it off — 1.47x**.
+
+**State accuracy is unchanged** — the propagated states, their
+covariance and the STM come back bit-for-bit identical either way,
+because detection is observation and not dynamics. **What is gone is
+everything the detectors produce**: no events, no close approaches, and
+therefore no impact probabilities.
+
+`"auto"` and `"gaussian_mixture"` resolve *themselves* from that output,
+so pairing either with `detection_enabled=False` raises rather than
+returning a silently linear answer. Every other method is served
+normally.
+
+`EventConfig` also carries `dense_origin` (`"bodycentric"` or
+`"barycentric"`) and `capture_criterion` (`"population"`, `"individual"`
+or `"energy_only"`); both were silently dropped at the boundary until
+now, and an unrecognised value for either is now refused rather than
+ignored.
+
+## When a batch fails, it names the orbit
+
+A batch call takes N orbits and M epochs and fails as a whole. When the
+failure belongs to one orbit, the exception says which — so the
+offending row is read off the failure instead of found by re-running the
+batch one orbit at a time.
+
+```python
+try:
+    result = empyrean.propagate(orbits, epochs)
+except Exception as e:
+    print(e.orbit_index, e.orbit_id, e.epoch_mjd_tdb)   # 2317 '2024 YR4' 60800.5
+```
+
+The three attributes are set on every exception raised from an engine
+failure, `None` included, so a caller reads them directly rather than
+guarding each access with `getattr`. They are `None` together when the
+failure belongs to no single orbit — an empty epoch grid, a missing
+kernel, a config the whole call was refused on. `orbit_id` is the id from
+the batch you passed, so it joins directly against the rows you sent.
+
 ## Data files
 
 empyrean needs a set of SPICE kernels. Most arrive via PyPI as

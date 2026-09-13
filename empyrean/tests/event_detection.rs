@@ -241,7 +241,15 @@ fn time_once(ctx: &Context, orbits: &[Orbit], detection_enabled: bool) -> Durati
 /// slack against the effect it guards — the measured saving is around a
 /// third of the call, and the assertion only requires a tenth — so this
 /// catches the switch being dropped again without failing under load.
+///
+/// A wall-clock measurement, so it is not part of the per-commit run: a
+/// shared continuous-integration runner moves even the ratio between two
+/// back-to-back calls by more than the bound. It runs on request
+/// (`cargo test -- --ignored detection_off_is_measurably_faster`) and in
+/// the validation suite; the switch's correctness is pinned by the
+/// bit-identity test above, which does run per commit.
 #[test]
+#[ignore = "wall-clock measurement; run on request or in the validation suite"]
 fn detection_off_is_measurably_faster() {
     let Some(ctx) = try_context() else { return };
     let orbits = batch();

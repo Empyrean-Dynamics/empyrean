@@ -24,7 +24,7 @@ type-check, or RAII-manage the underlying handles.
 
 ```toml
 [dependencies]
-empyrean-sys = "0.10.0"
+empyrean-sys = "0.11.0-rc.0"
 ```
 
 ```rust
@@ -67,6 +67,9 @@ The scheme begins with 0.10.0. Every release before it reported an
 independent counter instead, now retired, whose last published value is
 2 (v0.9.0); that counter is the subject of the historical notes below,
 and no library has ever reported a value between it and 1000.
+
+The 0.11.0 cycle reports 1100. Every layout change of that cycle ships
+under it, whichever pre-release carries the change first.
 
 Only the base version is encoded — the pre-release suffix is not, so
 `0.10.0-rc.1` and `0.10.0` both report `1000`. The handshake therefore

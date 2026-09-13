@@ -1,0 +1,34 @@
+   Compiling empyrean-core v0.10.2 (ssh://git@github.com/Empyrean-Dynamics/empyrean-core.git?tag=v0.10.2#82288810)
+    Finished `release` profile [optimized] target(s) in 4m 13s
+C_BUILD_EXIT=0
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+test last_error_is_empty_before_any_call ... ok
+test context_new_with_missing_files_returns_null_and_sets_error ... ok
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.42s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+SYS_EXIT=0
+test error::tests::a_missing_engine_keeps_its_own_code_and_the_whole_diagnosis ... ok
+test error::tests::collapses_behind_the_download_prefix ... ok
+test error::tests::collapses_doubled_io_prefix ... ok
+test error::tests::the_engine_load_code_sits_outside_the_engine_s_own_range ... ok
+test joint::tests::an_unknown_tag_is_an_error_never_a_default ... ok
+test propagate::result::mixture_marshal_tests::malformed_offset_errors_rather_than_reading_out_of_bounds ... ok
+test propagate::result::mixture_marshal_tests::null_parallel_array_with_nonzero_count_errors ... ok
+test propagate::result::mixture_marshal_tests::offset_past_end_errors_on_its_own_axis ... ok
+test propagate::result::mixture_marshal_tests::unknown_basis_tags_error_rather_than_default ... ok
+test context::data_dir_shape_tests::the_older_constructors_error_builder_carries_the_file_list ... ok
+test result: ok. 118 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.29s
+WRAP_EXIT=0
+test commands::show::error::tests::head_is_bounded ... ok
+test commands::show::error::tests::head_escapes_non_printables ... ok
+test commands::show::error::tests::every_message_names_the_file ... ok
+test result: ok. 124 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test every_input_object_gets_a_fit_summary_row_in_both_formats ... FAILED
+test output_is_independent_of_input_row_order ... FAILED
+    I/O error: No such file or directory (os error 2) (data directory: '/Users/moeyensj/.empyrean/data') (code -1)
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.77s
+error: test failed, to rerun pass `-p empyrean-cli --test determine_batch`
+CLI_EXIT=101
+FMT_EXIT=0
+ALL DONE

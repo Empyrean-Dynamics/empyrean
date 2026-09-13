@@ -852,7 +852,7 @@ pub const EMPYREAN_PHOTOMETRY_MODEL_HG1G2: i32 = 4;
 /// installed; `empyrean_version_string()` reports something else — the
 /// build provenance of the closed-source engine crates behind this
 /// boundary, not this distribution's version.
-pub const EMPYREAN_ABI_VERSION: u32 = 1000;
+pub const EMPYREAN_ABI_VERSION: u32 = 1100;
 
 /// The constant above is the crate's own version, encoded — and this
 /// assertion is what keeps it that way. Under the retired counter the

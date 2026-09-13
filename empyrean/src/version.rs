@@ -29,6 +29,7 @@ pub struct Versions {
 /// Use for `--version`-style output and for verifying the build
 /// provenance of a deployed cdylib.
 pub fn version_string() -> Result<String> {
+    crate::context::ensure_engine_loaded()?;
     let raw = unsafe { empyrean_sys::empyrean_version_string() };
     if raw.is_null() {
         return Err(Error::capture(-1));
@@ -43,6 +44,7 @@ pub fn version_string() -> Result<String> {
 
 /// Per-crate version strings for the empyrean stack.
 pub fn versions() -> Result<Versions> {
+    crate::context::ensure_engine_loaded()?;
     let mut raw = empyrean_sys::EmpyreanVersions {
         empyrean_core: std::ptr::null_mut(),
         villeneuve: std::ptr::null_mut(),

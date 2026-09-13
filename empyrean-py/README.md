@@ -21,7 +21,7 @@ Uncertainty-first orbit propagation, ephemeris, orbit determination, and event d
 pip install empyrean
 ```
 
-Current release: **0.10.0**.
+Current release: **0.10.0**. In development: **0.11.0rc0**, the 0.11.0 cycle.
 
 A plain install pulls empyrean
 together with the B612 Foundation's

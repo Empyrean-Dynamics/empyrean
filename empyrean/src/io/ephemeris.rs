@@ -74,6 +74,7 @@ where
 
 /// Write ephemeris entries to a parquet file.
 pub fn write_ephemeris_parquet(path: impl AsRef<Path>, entries: &[EphemerisEntry]) -> Result<()> {
+    crate::context::ensure_engine_loaded()?;
     write_ephemeris_via(path.as_ref(), entries, |p, ptr, n| unsafe {
         empyrean_sys::empyrean_ephemeris_write_parquet(p, ptr, n)
     })
@@ -81,6 +82,7 @@ pub fn write_ephemeris_parquet(path: impl AsRef<Path>, entries: &[EphemerisEntry
 
 /// Write ephemeris entries to JSON.
 pub fn write_ephemeris_json(path: impl AsRef<Path>, entries: &[EphemerisEntry]) -> Result<()> {
+    crate::context::ensure_engine_loaded()?;
     write_ephemeris_via(path.as_ref(), entries, |p, ptr, n| unsafe {
         empyrean_sys::empyrean_ephemeris_write_json(p, ptr, n)
     })
@@ -88,6 +90,7 @@ pub fn write_ephemeris_json(path: impl AsRef<Path>, entries: &[EphemerisEntry]) 
 
 /// Write ephemeris entries to CSV.
 pub fn write_ephemeris_csv(path: impl AsRef<Path>, entries: &[EphemerisEntry]) -> Result<()> {
+    crate::context::ensure_engine_loaded()?;
     write_ephemeris_via(path.as_ref(), entries, |p, ptr, n| unsafe {
         empyrean_sys::empyrean_ephemeris_write_csv(p, ptr, n)
     })

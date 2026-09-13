@@ -875,7 +875,7 @@ typedef struct Session Session;
  * build provenance of the closed-source engine crates behind this
  * boundary, not this distribution's version.
  */
-#define EMPYREAN_ABI_VERSION 1000
+#define EMPYREAN_ABI_VERSION 1100
 
 /**
  * Auto: selects the central body (heliocentric vs Earth-centric)

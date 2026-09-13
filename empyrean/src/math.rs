@@ -5,6 +5,7 @@ use crate::error::{Error, Result};
 /// Compute the largest eigenvalue and corresponding eigenvector of a
 /// 6×6 symmetric matrix.
 pub fn eigenvector_max_6x6(matrix: &[[f64; 6]; 6]) -> Result<(f64, [f64; 6])> {
+    crate::context::ensure_engine_loaded()?;
     let mut eigenvalue: f64 = 0.0;
     let mut eigenvector: [f64; 6] = [0.0; 6];
     let code = unsafe {
@@ -37,6 +38,7 @@ pub fn split_gaussian(
     covariance: &[[f64; 6]; 6],
     k: usize,
 ) -> Result<Vec<MixtureComponent>> {
+    crate::context::ensure_engine_loaded()?;
     let mut weights: Vec<f64> = vec![0.0; k];
     let mut means: Vec<[f64; 6]> = vec![[0.0; 6]; k];
     let mut covs: Vec<[[f64; 6]; 6]> = vec![[[0.0; 6]; 6]; k];

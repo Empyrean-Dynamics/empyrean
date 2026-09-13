@@ -5,6 +5,31 @@ use std::ffi::{CStr, CString};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 
+/// Open the engine library, or report every location the lookup tried.
+///
+/// Called by every entry point that can be reached before a `Context`
+/// exists — the constructors, and every free function or constructor that
+/// touches the engine without one. That is what turns a misplaced
+/// `libempyrean` into an ordinary `Err` at start-up instead of a panic out
+/// of whichever `empyrean_*` call happened to run first: a broken install
+/// is most often met by asking for the version or reading a file of
+/// orbits, and those have to answer with the diagnosis rather than abort.
+/// The engine is opened once per process, so on every later call this is a
+/// resolved-atomic read.
+///
+/// A binary built on one machine and run on another is where this earns its
+/// keep: the lookup order (`empyrean_sys` crate docs) ends at a path
+/// recorded on the build host, which is the last candidate precisely
+/// because it describes that host rather than this one. The error names
+/// each rule in turn with the reason it did not serve, so the fix — stage
+/// the library beside the executable, or set `EMPYREAN_LIB` — is readable
+/// off the message.
+pub(crate) fn ensure_engine_loaded() -> Result<()> {
+    empyrean_sys::try_lib()
+        .map(|_| ())
+        .map_err(Error::engine_not_loaded)
+}
+
 /// Handle to loaded SPICE kernels, gravitational parameters, and ephemeris
 /// state required for every propagation, ephemeris, or OD call.
 ///
@@ -56,6 +81,11 @@ use std::ptr::NonNull;
 /// Contexts may also be *constructed* concurrently — libempyrean
 /// serializes native construction at the C ABI — but that serialization
 /// means concurrent construction buys nothing over the pattern above.
+///
+/// Two `Context`s in one process share **nothing**: each owns its own
+/// copy of the loaded kernels, so a second one costs the full kernel
+/// footprint again in memory as well as the load time — which is the
+/// other half of why the `Arc` above is the pattern, not a nicety.
 pub struct Context {
     raw: NonNull<empyrean_sys::EmpyreanContext>,
 }
@@ -160,6 +190,7 @@ impl Context {
     /// the full Standard-tier kernel set (downloading any missing
     /// files on first use).
     pub fn new_minimal(de440_path: impl AsRef<Path>, gm_path: impl AsRef<Path>) -> Result<Self> {
+        ensure_engine_loaded()?;
         let de440_c = path_to_cstring(de440_path.as_ref())?;
         let gm_c = path_to_cstring(gm_path.as_ref())?;
         let raw =
@@ -190,6 +221,7 @@ impl Context {
     /// variable, so a run that stopped downloading is never a mystery.
     /// Nothing else about this constructor changes.
     pub fn from_data_dir(data_dir: Option<&Path>) -> Result<Self> {
+        ensure_engine_loaded()?;
         // The floor, applied where the network request is actually made.
         // `DataDirOptions::default()` is documented as exactly this
         // constructor's behaviour, so routing the floored case through the
@@ -282,6 +314,7 @@ impl Context {
     /// yourself on a host where the variable must mean "no outbound
     /// requests at all".
     pub fn from_data_dir_with(data_dir: Option<&Path>, options: DataDirOptions) -> Result<Self> {
+        ensure_engine_loaded()?;
         let c_path = match data_dir {
             Some(d) => Some(path_to_cstring(d)?),
             None => None,
@@ -647,6 +680,7 @@ fn drain_missing_data_files() -> Vec<String> {
 /// This is the same path [`Context::from_data_dir`] writes kernels
 /// to when called with `None`.
 pub fn default_data_dir() -> Result<std::path::PathBuf> {
+    ensure_engine_loaded()?;
     let raw = unsafe { empyrean_sys::empyrean_default_data_dir() };
     if raw.is_null() {
         return Err(Error::capture(-1));
@@ -710,6 +744,7 @@ pub fn default_data_dir() -> Result<std::path::PathBuf> {
 /// # }
 /// ```
 pub fn download_data(data_dir: Option<&Path>) -> Result<PathBuf> {
+    ensure_engine_loaded()?;
     refuse_download_under_offline_floor()?;
     // Provision without building a context: the C ABI's
     // `empyrean_download_data` runs the engine's download-and-cache pass and

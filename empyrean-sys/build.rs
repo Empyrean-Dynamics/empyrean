@@ -16,6 +16,16 @@
 //!      `include/empyrean.h` those binaries were built from — into a
 //!      persistent per-version cache.
 //!
+//! # What the recorded path is worth at run time
+//!
+//! It is where the engine sits *on the machine that ran this build*, which is
+//! the whole point for `cargo add empyrean`: the build script downloads a
+//! checksum-pinned engine into the cache, and this is what finds it again. It
+//! is equally why it is the resolver's **last** candidate rather than an early
+//! one — a binary carried to another host, or into a container, has to be able
+//! to find an engine that travelled with it first. See the crate docs for the
+//! full run-time lookup order.
+//!
 //! Download and extraction are done in-process (ureq + flate2 + tar), so the
 //! build needs no system `curl` / `wget` / `tar`. FFI bindings are pre-generated
 //! and committed, so it needs no C header and no `libclang` / `bindgen` either.

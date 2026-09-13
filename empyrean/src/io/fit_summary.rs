@@ -224,6 +224,7 @@ where
 
 /// Write the per-object fit summary to a parquet file.
 pub fn write_fit_summary_parquet(path: impl AsRef<Path>, rows: &[FitSummaryRow]) -> Result<()> {
+    crate::context::ensure_engine_loaded()?;
     write_via(path.as_ref(), rows, |p, ptr, n| unsafe {
         empyrean_sys::empyrean_fit_summary_write_parquet(p, ptr, n)
     })
@@ -231,6 +232,7 @@ pub fn write_fit_summary_parquet(path: impl AsRef<Path>, rows: &[FitSummaryRow])
 
 /// Write the per-object fit summary to JSON.
 pub fn write_fit_summary_json(path: impl AsRef<Path>, rows: &[FitSummaryRow]) -> Result<()> {
+    crate::context::ensure_engine_loaded()?;
     write_via(path.as_ref(), rows, |p, ptr, n| unsafe {
         empyrean_sys::empyrean_fit_summary_write_json(p, ptr, n)
     })
@@ -238,6 +240,7 @@ pub fn write_fit_summary_json(path: impl AsRef<Path>, rows: &[FitSummaryRow]) ->
 
 /// Write the per-object fit summary to CSV.
 pub fn write_fit_summary_csv(path: impl AsRef<Path>, rows: &[FitSummaryRow]) -> Result<()> {
+    crate::context::ensure_engine_loaded()?;
     write_via(path.as_ref(), rows, |p, ptr, n| unsafe {
         empyrean_sys::empyrean_fit_summary_write_csv(p, ptr, n)
     })

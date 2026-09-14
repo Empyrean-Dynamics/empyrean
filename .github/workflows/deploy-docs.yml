@@ -9,18 +9,46 @@ name: Deploy docs to Cloudflare Pages
 # `empyrean-py/pyproject.toml` has a `[tool.uv.sources]` entry pointing
 # at `../../empyrean-sphinx-theme` (a sibling repo). Cloudflare's
 # auto-build container can't satisfy that on its own.
+#
+# Where a build lands depends on what triggered it:
+#
+#   - A release tag (`vX.Y.Z`) publishes to production,
+#     docs.empyrean-dynamics.com, once a guard has proved the tag names
+#     the version in `empyrean-py/pyproject.toml`.
+#   - A pre-release tag (`vX.Y.Z-rc.N`) publishes to the `rc` preview,
+#     rc.empyrean-docs.pages.dev, under the same guard.
+#   - A push to main publishes to the `dev` preview,
+#     dev.empyrean-docs.pages.dev. main carries the next version's number
+#     from the first commit after a tag, so a main build describes an
+#     unreleased version and must never reach the public site (that is
+#     how 0.11.0rc0 appeared on docs.empyrean-dynamics.com on 2026-09-13).
+#   - A manual run lands on the preview unless `target: production` is
+#     chosen while running from a tag, which then passes the same guard.
+#     Use that to republish the current release without a new tag.
 
 on:
   push:
     branches: [main]
+    tags: ['v*']
+    # Path filters apply to branch pushes only; a tag push always builds.
     paths:
       - 'empyrean-py/docs/**'
       - 'empyrean-py/pyproject.toml'
       - '.github/workflows/deploy-docs.yml'
   workflow_dispatch:
+    inputs:
+      target:
+        description: 'production is docs.empyrean-dynamics.com and needs a tag; preview is the dev/rc pages.dev alias'
+        type: choice
+        options: [preview, production]
+        default: preview
 
 permissions:
   contents: read
+
+concurrency:
+  group: deploy-docs-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build-and-deploy:
@@ -30,6 +58,56 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: empyrean
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Decide the Pages branch before anything expensive runs, and refuse
+      # a production publish whose tag does not name the packaged version.
+      # Tags are compared as PEP 440 versions, so `v0.10.0-rc.2` and the
+      # pyproject's `0.10.0rc2` are the same release.
+      - name: Resolve publish target
+        id: target
+        working-directory: empyrean
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          REQUESTED: ${{ inputs.target || '' }}
+        run: |
+          python -m pip install --quiet packaging
+          python - <<'EOF'
+          import os, sys, tomllib
+          from packaging.version import Version
+
+          event = os.environ["EVENT"]
+          ref_type = os.environ["REF_TYPE"]
+          ref = os.environ["REF_NAME"]
+          requested = os.environ["REQUESTED"]
+
+          with open("empyrean-py/pyproject.toml", "rb") as f:
+              packaged = Version(tomllib.load(f)["project"]["version"])
+
+          if ref_type == "tag":
+              tag = Version(ref.removeprefix("v"))
+              if tag != packaged:
+                  sys.exit(
+                      f"refusing to publish: tag {ref} names {tag} but "
+                      f"empyrean-py/pyproject.toml says {packaged}"
+                  )
+              production = (event == "push" and not tag.is_prerelease) or requested == "production"
+              branch = "main" if production else "rc"
+          else:
+              if requested == "production":
+                  sys.exit(f"refusing to publish: production docs come from a release tag, not {ref}")
+              branch = "dev"
+
+          print(f"{event} on {ref_type} {ref}, packaged {packaged} -> Pages branch {branch}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"branch={branch}\nversion={packaged}\n")
+          EOF
 
       - name: Checkout empyrean-sphinx-theme (sibling)
         uses: actions/checkout@v4
@@ -54,11 +132,6 @@ jobs:
           for repo in empyrean-core empyrean-validation villeneuve scott; do
             git clone --depth 1 https://x-access-token:${{ secrets.GH_PAT }}@github.com/Empyrean-Dynamics/$repo.git "$repo"
           done
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
 
       # empyrean-py links libempyrean from target/release. empyrean-c is a
       # workspace member, not a cargo dependency of empyrean-py, so the
@@ -100,4 +173,14 @@ jobs:
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: pages deploy empyrean/empyrean-py/docs/_build/html --project-name=empyrean-docs --branch=main
+          command: pages deploy empyrean/empyrean-py/docs/_build/html --project-name=empyrean-docs --branch=${{ steps.target.outputs.branch }}
+
+      - name: Record what was published
+        run: |
+          {
+            echo "Published empyrean ${{ steps.target.outputs.version }} docs to Pages branch \`${{ steps.target.outputs.branch }}\`"
+            echo
+            echo "- \`main\` is docs.empyrean-dynamics.com"
+            echo "- \`rc\` is rc.empyrean-docs.pages.dev"
+            echo "- \`dev\` is dev.empyrean-docs.pages.dev"
+          } >> "$GITHUB_STEP_SUMMARY"

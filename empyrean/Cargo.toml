@@ -53,3 +53,4 @@ empyrean-sys = { path = "../empyrean-sys", version = "0.11.0-rc.0" }
 # identical inputs (the chaotic impactor amplifies 1-ULP differences).
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
+rusty-hook = "^0.11.2"

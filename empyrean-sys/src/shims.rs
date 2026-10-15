@@ -194,6 +194,31 @@ no-op; the struct is left zeroed so a double free is safe.*/
 pub unsafe fn empyrean_missing_data_files_free(out: *mut EmpyreanMissingDataFiles) {
     unsafe { lib().empyrean_missing_data_files_free(out) }
 }
+/** Read one BPC file's Earth-orientation (ITRF93) coverage and check it
+against a kernel role's mandate, without building a context.
+
+Reuses the engine's own BPC reader and its per-kernel Earth-orientation
+mandate — the same reader and the same requirement the three-Earth-kernel
+mandate applies when a context loads — so a slot verified here and a
+context built from the same files later agree by construction. It never
+parses a BPC a second way.
+
+`role` is one of the `EMPYREAN_EARTH_KERNEL_ROLE_*` constants. On success
+the call writes `*out` and returns `0`; `out.satisfied` says whether the
+file passed, and the window and required bounds name exactly what was
+short. Returns `-1` for a null `path` / `out` or an unknown `role`, `-2`
+when the file could not be read as a BPC, `-3` when the file carries no
+Earth ITRF93 segments (`*out` is still written, with NaN bounds and
+`satisfied == 0`), and `-99` on a caught panic. Call
+`empyrean_last_error()` for the message on any non-zero return.*/
+#[inline]
+pub unsafe fn empyrean_earth_orientation_kernel_coverage(
+    path: *const ::std::os::raw::c_char,
+    role: i32,
+    out: *mut EmpyreanEarthOrientationCoverage,
+) -> i32 {
+    unsafe { lib().empyrean_earth_orientation_kernel_coverage(path, role, out) }
+}
 /** Retrieve the position of the most recent failure on this thread.
 
 The companion to `empyrean_last_error()`: that returns the prose,

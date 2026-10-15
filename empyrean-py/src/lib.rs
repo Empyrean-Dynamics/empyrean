@@ -330,6 +330,42 @@ fn _default_data_dir() -> PyResult<String> {
 }
 
 // ══════════════════════════════════════════════════════════
+//  _earth_orientation_kernel_coverage
+// ══════════════════════════════════════════════════════════
+
+/// Earth-orientation (ITRF93) coverage of one BPC file, checked against a
+/// kernel role (`0` historical, `1` high-precision, `2` predict). Returns
+/// `(satisfied, start_mjd_tdb, end_mjd_tdb, required_floor_mjd_tdb,
+/// required_horizon_mjd_tdb)`; `satisfied` is the engine's own per-kernel
+/// mandate verdict. Mirrors `empyrean::earth_orientation_kernel_coverage`.
+#[pyfunction]
+fn _earth_orientation_kernel_coverage(
+    path: &str,
+    role: i32,
+) -> PyResult<(bool, f64, f64, f64, f64)> {
+    use empyrean::EarthOrientationKernelRole as R;
+    let role = match role {
+        0 => R::Historical,
+        1 => R::HighPrecision,
+        2 => R::Predict,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unknown Earth kernel role {other} (expected 0 historical, 1 high-precision, 2 predict)"
+            )));
+        }
+    };
+    let cov = empyrean::earth_orientation_kernel_coverage(std::path::Path::new(path), role)
+        .map_err(to_pyerr)?;
+    Ok((
+        cov.satisfied,
+        cov.start_mjd_tdb,
+        cov.end_mjd_tdb,
+        cov.required_floor_mjd_tdb,
+        cov.required_horizon_mjd_tdb,
+    ))
+}
+
+// ══════════════════════════════════════════════════════════
 //  _version_string / _versions
 // ══════════════════════════════════════════════════════════
 
@@ -8580,6 +8616,7 @@ fn _empyrean_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_initialize, m)?)?;
     m.add_function(wrap_pyfunction!(_download_data, m)?)?;
     m.add_function(wrap_pyfunction!(_default_data_dir, m)?)?;
+    m.add_function(wrap_pyfunction!(_earth_orientation_kernel_coverage, m)?)?;
     m.add_function(wrap_pyfunction!(_version_string, m)?)?;
     m.add_function(wrap_pyfunction!(_versions, m)?)?;
     m.add_function(wrap_pyfunction!(_transform_coordinates, m)?)?;

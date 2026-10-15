@@ -37,7 +37,8 @@
 //              (EmpyreanOrbitOutcome::status), EMPYREAN_PROPAGATE_FAILURE_* and
 //              EMPYREAN_EPHEMERIS_FAILURE_* (EmpyreanOrbitOutcome::error_code
 //              on a propagation / ephemeris result — the per-orbit outcome
-//              channel, 0.11.0).
+//              channel, 0.11.0), EMPYREAN_EARTH_KERNEL_ROLE_* (the `role`
+//              argument of empyrean_earth_orientation_kernel_coverage, 0.11.0).
 //
 // Negative `#define`s — the EMPYREAN_PUSH_* (-40..-49) packed-joint input
 // codes, EMPYREAN_TRANSFORM_COVARIANCE_UNSUPPORTED (-50) and the BUILTSYSTEM /
@@ -67,6 +68,9 @@ pub const EMPYREAN_DATA_TIER_APPROXIMATE: i32 = 1;
 pub const EMPYREAN_DATA_TIER_BASIC: i32 = 2;
 pub const EMPYREAN_DATA_TIER_STANDARD: i32 = 3;
 pub const EMPYREAN_DATA_TIER_FULL: i32 = 4;
+pub const EMPYREAN_EARTH_KERNEL_ROLE_HISTORICAL: i32 = 0;
+pub const EMPYREAN_EARTH_KERNEL_ROLE_HIGH_PRECISION: i32 = 1;
+pub const EMPYREAN_EARTH_KERNEL_ROLE_PREDICT: i32 = 2;
 pub const EMPYREAN_BUILTSYSTEM_OK: u32 = 0;
 pub const EMPYREAN_BUILTSYSTEM_NULL_POINTER: i32 = -1;
 pub const EMPYREAN_BUILTSYSTEM_INVALID_ARGUMENT: i32 = -2;
@@ -422,6 +426,42 @@ impl Default for EmpyreanMissingDataFiles {
         }
     }
 }
+#[doc = " One Earth-orientation (ITRF93) BPC file's coverage, read and checked\n against one kernel role's mandate by\n [`empyrean_earth_orientation_kernel_coverage`].\n\n The window is the aggregate ITRF93 coverage read from the file with the\n engine's own BPC reader; the required bounds and `satisfied` are the\n engine's own per-kernel mandate. A provisioner verifies the file it\n links into a slot against the slot's role here, naming exactly what was\n short, rather than discovering the shortfall when a context is built."]
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct EmpyreanEarthOrientationCoverage {
+    #[doc = " Start of the file's Earth ITRF93 coverage (MJD TDB). NaN when the\n file carries no Earth ITRF93 segments."]
+    pub start_mjd_tdb: f64,
+    #[doc = " End of the file's Earth ITRF93 coverage (MJD TDB). NaN when absent."]
+    pub end_mjd_tdb: f64,
+    #[doc = " Latest start the role allows — coverage must begin at or before this\n (MJD TDB). NaN for a role with no start-floor requirement (predict)."]
+    pub required_floor_mjd_tdb: f64,
+    #[doc = " Earliest end the role allows — coverage must reach at or beyond this\n (MJD TDB)."]
+    pub required_horizon_mjd_tdb: f64,
+    #[doc = " `1` when the file's coverage satisfies the role, `0` otherwise."]
+    pub satisfied: u8,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of EmpyreanEarthOrientationCoverage"]
+        [::std::mem::size_of::<EmpyreanEarthOrientationCoverage>() - 40usize];
+    ["Alignment of EmpyreanEarthOrientationCoverage"]
+        [::std::mem::align_of::<EmpyreanEarthOrientationCoverage>() - 8usize];
+    ["Offset of field: EmpyreanEarthOrientationCoverage::start_mjd_tdb"]
+        [::std::mem::offset_of!(EmpyreanEarthOrientationCoverage, start_mjd_tdb) - 0usize];
+    ["Offset of field: EmpyreanEarthOrientationCoverage::end_mjd_tdb"]
+        [::std::mem::offset_of!(EmpyreanEarthOrientationCoverage, end_mjd_tdb) - 8usize];
+    ["Offset of field: EmpyreanEarthOrientationCoverage::required_floor_mjd_tdb"][::std::mem::offset_of!(
+        EmpyreanEarthOrientationCoverage,
+        required_floor_mjd_tdb
+    ) - 16usize];
+    ["Offset of field: EmpyreanEarthOrientationCoverage::required_horizon_mjd_tdb"][::std::mem::offset_of!(
+        EmpyreanEarthOrientationCoverage,
+        required_horizon_mjd_tdb
+    ) - 24usize];
+    ["Offset of field: EmpyreanEarthOrientationCoverage::satisfied"]
+        [::std::mem::offset_of!(EmpyreanEarthOrientationCoverage, satisfied) - 32usize];
+};
 #[doc = " Where in the caller's batch the most recent failure happened.\n\n Populated by [`empyrean_error_location`]; release it with\n [`empyrean_error_location_free`].\n\n Each of the three positions carries its own presence flag rather than\n a sentinel, because every value they can hold is a legitimate one: a\n zeroed struct reads as \"nothing known\", `orbit_index` `0` is the first\n orbit and not a null, and `epoch_mjd_tdb` has no unused double."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -1761,7 +1801,7 @@ impl Default for EmpyreanEphemerisEntry {
         }
     }
 }
-#[doc = " One observation-sensitivity row — the partial derivatives of the\n sky-plane observable w.r.t. the input state, for a single\n `(orbit, observer, epoch)`. One row per observation epoch within each\n `(orbit_id, obs_code)` chain. Owning struct: free\n the whole result with [`empyrean_ephemeris_result_free`].\n\n The Jacobian composes d(obs)/d(state at t_obs) * Phi(t_obs, t0) and\n omits the light-time terms (the -v * dtau/dx partial; the STM is\n sampled at t_obs rather than emission t_obs - tau): both are O(tau),\n landing in the velocity columns of the angle rows with fractional\n error ~ tau/dt (tau ~ 0.006-0.017 d) — negligible for multi-night\n arcs, growing as the arc shrinks toward intra-night.\n\n The six output rows are the topocentric spherical observable, in the\n order given by the `EMPYREAN_SENSITIVITY_ROW_*` constants. Index with\n those rather than by hand — the row order is part of this ABI and the\n range row sits ahead of the angles, so a hand-written `0` reads range\n where RA was meant."]
+#[doc = " One observation-sensitivity row — the partial derivatives of the\n sky-plane observable w.r.t. the input state, for a single\n `(orbit, observer, epoch)`. One row per observation epoch within each\n `(orbit_id, obs_code)` chain; the array of these rows is delivered in\n observer-input order (see the `sensitivity` field on\n `EmpyreanEphemerisResult`). Owning struct: free\n the whole result with [`empyrean_ephemeris_result_free`].\n\n The Jacobian composes d(obs)/d(state at t_obs) * Phi(t_obs, t0) and\n omits the light-time terms (the -v * dtau/dx partial; the STM is\n sampled at t_obs rather than emission t_obs - tau): both are O(tau),\n landing in the velocity columns of the angle rows with fractional\n error ~ tau/dt (tau ~ 0.006-0.017 d) — negligible for multi-night\n arcs, growing as the arc shrinks toward intra-night.\n\n The six output rows are the topocentric spherical observable, in the\n order given by the `EMPYREAN_SENSITIVITY_ROW_*` constants. Index with\n those rather than by hand — the row order is part of this ABI and the\n range row sits ahead of the angles, so a hand-written `0` reads range\n where RA was meant."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct EmpyreanObservationSensitivity {
@@ -1832,7 +1872,7 @@ impl Default for EmpyreanObservationSensitivity {
 pub struct EmpyreanEphemerisResult {
     pub entries: *mut EmpyreanEphemerisEntry,
     pub num_entries: usize,
-    #[doc = " Per-`(orbit, observer, epoch)` sensitivity rows. Null / 0 when no\n STM was traced (e.g. an f64-only path)."]
+    #[doc = " Per-`(orbit, observer, epoch)` sensitivity rows, in **observer-input\n order**: within each orbit block, row `k` pairs positionally with\n `entries[k]`, the same pairing the entry array carries. A row the\n engine skipped shortens this array (`num_sensitivity < num_entries`);\n realign that case on the rows' `(obs_code, epoch_mjd_tdb)`. Null / 0\n when no STM was traced (e.g. an f64-only path)."]
     pub sensitivity: *mut EmpyreanObservationSensitivity,
     pub num_sensitivity: usize,
     #[doc = " Non-fatal generation warnings: conditions the generator handled\n but the caller should be aware of — e.g. Earth-orientation kernel\n coverage gaps at one or more requested epochs (the analytic\n IAU 2006 fallback was used), or ephemeris rows whose\n observation-sensitivity chain could not be built (the row's\n astrometry is still present; only its partials are missing).\n Heap array of `num_warnings` NUL-terminated UTF-8 strings; null\n when `num_warnings == 0` (a clean run). One list per call, not\n per row; each message names the affected orbit id, observatory\n code, and epoch (MJD TDB) where applicable. Freed by\n `empyrean_ephemeris_result_free`."]
@@ -4880,6 +4920,11 @@ pub struct EmpyreanLib {
     pub empyrean_missing_data_files:
         unsafe extern "C" fn(out: *mut EmpyreanMissingDataFiles) -> i32,
     pub empyrean_missing_data_files_free: unsafe extern "C" fn(out: *mut EmpyreanMissingDataFiles),
+    pub empyrean_earth_orientation_kernel_coverage: unsafe extern "C" fn(
+        path: *const ::std::os::raw::c_char,
+        role: i32,
+        out: *mut EmpyreanEarthOrientationCoverage,
+    ) -> i32,
     pub empyrean_error_location: unsafe extern "C" fn(out: *mut EmpyreanErrorLocation) -> i32,
     pub empyrean_error_location_free: unsafe extern "C" fn(out: *mut EmpyreanErrorLocation),
     pub empyrean_context_free: unsafe extern "C" fn(ctx: *mut EmpyreanContext),
@@ -5348,6 +5393,9 @@ impl EmpyreanLib {
         let empyrean_missing_data_files_free = __library
             .get(b"empyrean_missing_data_files_free\0")
             .map(|sym| *sym)?;
+        let empyrean_earth_orientation_kernel_coverage = __library
+            .get(b"empyrean_earth_orientation_kernel_coverage\0")
+            .map(|sym| *sym)?;
         let empyrean_error_location = __library
             .get(b"empyrean_error_location\0")
             .map(|sym| *sym)?;
@@ -5595,6 +5643,7 @@ impl EmpyreanLib {
             empyrean_download_data,
             empyrean_missing_data_files,
             empyrean_missing_data_files_free,
+            empyrean_earth_orientation_kernel_coverage,
             empyrean_error_location,
             empyrean_error_location_free,
             empyrean_context_free,
@@ -5736,6 +5785,15 @@ impl EmpyreanLib {
     #[doc = " Free an [`EmpyreanMissingDataFiles`] populated by\n [`empyrean_missing_data_files`]. Passing a null or zeroed struct is a\n no-op; the struct is left zeroed so a double free is safe."]
     pub unsafe fn empyrean_missing_data_files_free(&self, out: *mut EmpyreanMissingDataFiles) {
         (self.empyrean_missing_data_files_free)(out)
+    }
+    #[doc = " Read one BPC file's Earth-orientation (ITRF93) coverage and check it\n against a kernel role's mandate, without building a context.\n\n Reuses the engine's own BPC reader and its per-kernel Earth-orientation\n mandate — the same reader and the same requirement the three-Earth-kernel\n mandate applies when a context loads — so a slot verified here and a\n context built from the same files later agree by construction. It never\n parses a BPC a second way.\n\n `role` is one of the `EMPYREAN_EARTH_KERNEL_ROLE_*` constants. On success\n the call writes `*out` and returns `0`; `out.satisfied` says whether the\n file passed, and the window and required bounds name exactly what was\n short. Returns `-1` for a null `path` / `out` or an unknown `role`, `-2`\n when the file could not be read as a BPC, `-3` when the file carries no\n Earth ITRF93 segments (`*out` is still written, with NaN bounds and\n `satisfied == 0`), and `-99` on a caught panic. Call\n `empyrean_last_error()` for the message on any non-zero return."]
+    pub unsafe fn empyrean_earth_orientation_kernel_coverage(
+        &self,
+        path: *const ::std::os::raw::c_char,
+        role: i32,
+        out: *mut EmpyreanEarthOrientationCoverage,
+    ) -> i32 {
+        (self.empyrean_earth_orientation_kernel_coverage)(path, role, out)
     }
     #[doc = " Retrieve the position of the most recent failure on this thread.\n\n The companion to `empyrean_last_error()`: that returns the prose,\n this returns where in the caller's batch the prose applies. A batch\n call fails as a whole, so without this the only way from \"the call\n failed\" to \"orbit 2317 failed\" is to re-run the batch one orbit at a\n time.\n\n Returns 0 and fills `out` on success. An `out` with `orbit_id` null,\n `has_orbit_index == 0` and `has_epoch == 0` means the last error on\n this thread carried no position; it is not itself an error.\n\n Returns `-1` for a null `out`, `-5` when the recorded `orbit_id`\n contains an interior NUL and so cannot be handed back as a C string,\n and `-99` on a caught panic. **On any non-zero return `out` is left\n exactly as the caller passed it** — nothing was handed over, so do\n not call [`empyrean_error_location_free`] unless this returned 0.\n\n Nothing here is inferred from the message text. A field is filled\n only when the boundary or the engine supplied that value directly, so\n an absent field means \"not known\", never \"not applicable\".\n\n The position is thread-local and is cleared by the next call that\n records an error on this thread, so read it immediately after the\n failing call. **The caller owns `out` and must release it with\n [`empyrean_error_location_free`].**"]
     pub unsafe fn empyrean_error_location(&self, out: *mut EmpyreanErrorLocation) -> i32 {

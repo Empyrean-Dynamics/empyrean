@@ -987,6 +987,166 @@ pub unsafe extern "C" fn empyrean_missing_data_files_free(out: *mut EmpyreanMiss
     }));
 }
 
+/// Which of the three Earth-orientation kernels a coverage check concerns,
+/// for [`empyrean_earth_orientation_kernel_coverage`]. The historical and
+/// high-precision kernels must cover a band (both a floor and a horizon);
+/// the long-term predict kernel is the only one that must reach the 2125
+/// mandate horizon and is checked on its end alone.
+pub const EMPYREAN_EARTH_KERNEL_ROLE_HISTORICAL: i32 = 0;
+/// See [`EMPYREAN_EARTH_KERNEL_ROLE_HISTORICAL`].
+pub const EMPYREAN_EARTH_KERNEL_ROLE_HIGH_PRECISION: i32 = 1;
+/// See [`EMPYREAN_EARTH_KERNEL_ROLE_HISTORICAL`].
+pub const EMPYREAN_EARTH_KERNEL_ROLE_PREDICT: i32 = 2;
+
+/// One Earth-orientation (ITRF93) BPC file's coverage, read and checked
+/// against one kernel role's mandate by
+/// [`empyrean_earth_orientation_kernel_coverage`].
+///
+/// The window is the aggregate ITRF93 coverage read from the file with the
+/// engine's own BPC reader; the required bounds and `satisfied` are the
+/// engine's own per-kernel mandate. A provisioner verifies the file it
+/// links into a slot against the slot's role here, naming exactly what was
+/// short, rather than discovering the shortfall when a context is built.
+#[repr(C)]
+pub struct EmpyreanEarthOrientationCoverage {
+    /// Start of the file's Earth ITRF93 coverage (MJD TDB). NaN when the
+    /// file carries no Earth ITRF93 segments.
+    pub start_mjd_tdb: f64,
+    /// End of the file's Earth ITRF93 coverage (MJD TDB). NaN when absent.
+    pub end_mjd_tdb: f64,
+    /// Latest start the role allows — coverage must begin at or before this
+    /// (MJD TDB). NaN for a role with no start-floor requirement (predict).
+    pub required_floor_mjd_tdb: f64,
+    /// Earliest end the role allows — coverage must reach at or beyond this
+    /// (MJD TDB).
+    pub required_horizon_mjd_tdb: f64,
+    /// `1` when the file's coverage satisfies the role, `0` otherwise.
+    pub satisfied: u8,
+}
+
+/// Read one BPC file's Earth-orientation (ITRF93) coverage and check it
+/// against a kernel role's mandate, without building a context.
+///
+/// Reuses the engine's own BPC reader and its per-kernel Earth-orientation
+/// mandate — the same reader and the same requirement the three-Earth-kernel
+/// mandate applies when a context loads — so a slot verified here and a
+/// context built from the same files later agree by construction. It never
+/// parses a BPC a second way.
+///
+/// `role` is one of the `EMPYREAN_EARTH_KERNEL_ROLE_*` constants. On success
+/// the call writes `*out` and returns `0`; `out.satisfied` says whether the
+/// file passed, and the window and required bounds name exactly what was
+/// short. Returns `-1` for a null `path` / `out` or an unknown `role`, `-2`
+/// when the file could not be read as a BPC, `-3` when the file carries no
+/// Earth ITRF93 segments (`*out` is still written, with NaN bounds and
+/// `satisfied == 0`), and `-99` on a caught panic. Call
+/// `empyrean_last_error()` for the message on any non-zero return.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn empyrean_earth_orientation_kernel_coverage(
+    path: *const c_char,
+    role: i32,
+    out: *mut EmpyreanEarthOrientationCoverage,
+) -> i32 {
+    use empyrean_core::data::{
+        BPCSet, EARTH_HIGH_PREC_REQUIRED_FLOOR_MJD_TDB, EARTH_HIGH_PREC_REQUIRED_HORIZON_MJD_TDB,
+        EarthKernelRole, MANDATE_EARTH_ORIENTATION_FLOOR_MJD_TDB,
+        MANDATE_EARTH_ORIENTATION_HORIZON_MJD_TDB,
+    };
+
+    // NAIF Earth ITRF93 body / reference-frame ids the engine keys its
+    // Earth-orientation segments on
+    // (villeneuve::development_ephemeris::bpc::{EARTH_ITRF93_BODY,
+    // ITRF93_REF_FRAME} at the pinned rev). empyrean-core does not re-export
+    // them; mirrored here as the NAIF ids they are, not re-derived.
+    const EARTH_ITRF93_BODY: i32 = 3000;
+    const ITRF93_REF_FRAME: i32 = 17;
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if out.is_null() {
+            set_last_error("empyrean_earth_orientation_kernel_coverage: out is null");
+            return -1;
+        }
+        if path.is_null() {
+            set_last_error("empyrean_earth_orientation_kernel_coverage: path is null");
+            return -1;
+        }
+        let path_str = match unsafe { CStr::from_ptr(path) }.to_str() {
+            Ok(s) => s,
+            Err(e) => {
+                set_last_error(&format!("invalid UTF-8 in path: {e}"));
+                return -1;
+            }
+        };
+
+        // Map the role to the engine enum and the bounds it checks against —
+        // the floor it must begin at or before and the horizon it must reach.
+        // `satisfied` below comes from the engine's own `is_satisfied_by`, so
+        // these bounds are for naming the shortfall, never the verdict.
+        let (role_enum, required_floor, required_horizon) = match role {
+            EMPYREAN_EARTH_KERNEL_ROLE_HISTORICAL => (
+                EarthKernelRole::Historical,
+                MANDATE_EARTH_ORIENTATION_FLOOR_MJD_TDB,
+                EARTH_HIGH_PREC_REQUIRED_FLOOR_MJD_TDB,
+            ),
+            EMPYREAN_EARTH_KERNEL_ROLE_HIGH_PRECISION => (
+                EarthKernelRole::HighPrecision,
+                EARTH_HIGH_PREC_REQUIRED_FLOOR_MJD_TDB,
+                EARTH_HIGH_PREC_REQUIRED_HORIZON_MJD_TDB,
+            ),
+            EMPYREAN_EARTH_KERNEL_ROLE_PREDICT => (
+                EarthKernelRole::Predict,
+                f64::NAN,
+                MANDATE_EARTH_ORIENTATION_HORIZON_MJD_TDB,
+            ),
+            other => {
+                set_last_error(&format!(
+                    "unknown Earth kernel role {other} (expected one of \
+                     EMPYREAN_EARTH_KERNEL_ROLE_HISTORICAL / _HIGH_PRECISION / _PREDICT)"
+                ));
+                return -1;
+            }
+        };
+
+        // Read the file's Earth-orientation coverage with the engine's own
+        // BPC reader — never a second parser.
+        let mut set = BPCSet::empty();
+        if let Err(e) = set.load_file(path_str) {
+            set_last_error(&format!("could not read BPC '{path_str}': {e}"));
+            return -2;
+        }
+        let window = set.coverage_range_mjd_tdb(EARTH_ITRF93_BODY, ITRF93_REF_FRAME);
+        let satisfied = role_enum.is_satisfied_by(window);
+        let (start, end) = window.unwrap_or((f64::NAN, f64::NAN));
+
+        unsafe {
+            *out = EmpyreanEarthOrientationCoverage {
+                start_mjd_tdb: start,
+                end_mjd_tdb: end,
+                required_floor_mjd_tdb: required_floor,
+                required_horizon_mjd_tdb: required_horizon,
+                satisfied: u8::from(satisfied),
+            };
+        }
+
+        if window.is_none() {
+            set_last_error(&format!(
+                "'{path_str}' carries no Earth ITRF93 (body {EARTH_ITRF93_BODY}, \
+                 frame {ITRF93_REF_FRAME}) segments"
+            ));
+            return -3;
+        }
+        0
+    }));
+
+    match result {
+        Ok(code) => code,
+        Err(_) => {
+            set_last_error("panic in empyrean_earth_orientation_kernel_coverage");
+            -99
+        }
+    }
+}
+
 /// Where in the caller's batch the most recent failure happened.
 ///
 /// Populated by [`empyrean_error_location`]; release it with

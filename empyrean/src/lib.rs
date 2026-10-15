@@ -135,7 +135,8 @@ pub use built_system::{
     SystemDescription,
 };
 pub use context::{
-    Context, DataDirOptions, DataTier, default_data_dir, download_data, offline_floor_is_active,
+    Context, DataDirOptions, DataTier, EarthOrientationCoverage, EarthOrientationKernelRole,
+    default_data_dir, download_data, earth_orientation_kernel_coverage, offline_floor_is_active,
 };
 pub use coordinate::{
     CoordinateState, Frame, Origin, Representation, frame_to_int, int_to_frame, int_to_rep,

@@ -2453,10 +2453,10 @@ const _: () = {
     ["Offset of field: EmpyreanAcceptabilityThresholds::fractional_sigma_a"]
         [::std::mem::offset_of!(EmpyreanAcceptabilityThresholds, fractional_sigma_a) - 32usize];
 };
-#[doc = " Per-station RA/Dec bias-fit configuration (mirrors\n [`scott::nuisance::BiasKind::StationRaDec`]).\n\n Activated by [`EmpyreanODConfig::fit_station_biases`]. Per-station\n sigma overrides and `BiasScope` filtering aren't carried across the\n C ABI yet — every active station uses `sigma_prior_arcsec` and the\n scope is always [`BiasScope::AllStations`]. Reach for the\n empyrean-core Rust API when you need finer control."]
+#[doc = " Per-station RA/Dec bias-fit configuration (mirrors\n [`scott::nuisance::BiasKind::StationRADec`]).\n\n Activated by [`EmpyreanODConfig::fit_station_biases`]. Per-station\n sigma overrides and `BiasScope` filtering aren't carried across the\n C ABI yet — every active station uses `sigma_prior_arcsec` and the\n scope is always [`BiasScope::AllStations`]. Reach for the\n empyrean-core Rust API when you need finer control."]
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
-pub struct EmpyreanStationRaDecConfig {
+pub struct EmpyreanStationRADecConfig {
     #[doc = " Default 1-sigma prior on the RA / Dec offset (arcsec). Default = 0.3."]
     pub sigma_prior_arcsec: f64,
     #[doc = " Minimum observations per station for a bias parameter to be\n allocated. Stations below this threshold contribute observations\n at face value. 0 → upstream default (5)."]
@@ -2464,14 +2464,14 @@ pub struct EmpyreanStationRaDecConfig {
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of EmpyreanStationRaDecConfig"]
-        [::std::mem::size_of::<EmpyreanStationRaDecConfig>() - 16usize];
-    ["Alignment of EmpyreanStationRaDecConfig"]
-        [::std::mem::align_of::<EmpyreanStationRaDecConfig>() - 8usize];
-    ["Offset of field: EmpyreanStationRaDecConfig::sigma_prior_arcsec"]
-        [::std::mem::offset_of!(EmpyreanStationRaDecConfig, sigma_prior_arcsec) - 0usize];
-    ["Offset of field: EmpyreanStationRaDecConfig::min_obs_per_station"]
-        [::std::mem::offset_of!(EmpyreanStationRaDecConfig, min_obs_per_station) - 8usize];
+    ["Size of EmpyreanStationRADecConfig"]
+        [::std::mem::size_of::<EmpyreanStationRADecConfig>() - 16usize];
+    ["Alignment of EmpyreanStationRADecConfig"]
+        [::std::mem::align_of::<EmpyreanStationRADecConfig>() - 8usize];
+    ["Offset of field: EmpyreanStationRADecConfig::sigma_prior_arcsec"]
+        [::std::mem::offset_of!(EmpyreanStationRADecConfig, sigma_prior_arcsec) - 0usize];
+    ["Offset of field: EmpyreanStationRADecConfig::min_obs_per_station"]
+        [::std::mem::offset_of!(EmpyreanStationRADecConfig, min_obs_per_station) - 8usize];
 };
 #[doc = " Outlier rejection configuration. Selects among three gates via the\n [`kind`](Self::kind) discriminator:\n\n - `kind = EMPYREAN_REJECTION_KIND_ADAPTIVE` (default): mirrors\n   [`scott::rejection::AdaptiveRejectionConfig`]. Reads\n   `chi2_base` / `lambda` / `max_threshold`. Sentinels:\n   `chi2_base = 0.0` → 9.21, `lambda < 0` → 1.0,\n   `max_threshold = 0.0` → 100.0.\n - `kind = EMPYREAN_REJECTION_KIND_CMC2003`: mirrors\n   [`scott::rejection::CMC2003Config`]. Reads `chi2_rej` / `chi2_rec`\n   (the upper / lower hysteresis thresholds). Sentinels:\n   `chi2_rej = 0.0` → 8.0, `chi2_rec = 0.0` → 7.0.\n - `kind = EMPYREAN_REJECTION_KIND_BLUNDER`: the CMC2003 mechanics at\n   blunder scale, carrying no thresholds — the `chi2_*` fields are\n   ignored. The recommended pairing for a heavy-tailed\n   [`EmpyreanNoiseModel`].\n\n # The `enabled` tri-state\n\n [`enabled`](Self::enabled) has three states, and the third is not a\n spelling of either boolean: [`EMPYREAN_REJECTION_ENABLED_DEFAULT`] (0,\n the zero-initialized value) = **engine default** (no opinion — the\n engine decides, today running [`kind`](Self::kind));\n [`EMPYREAN_REJECTION_ENABLED_ON`] (1) = rejection **on**, declared;\n [`EMPYREAN_REJECTION_ENABLED_OFF`] (2) = rejection **off** (a single\n fit, no outlier removal). The distinction bites for a non-Gaussian\n [`EmpyreanNoiseModel`]: such a law with `enabled` left at the engine\n default is refused — the engine will not silently choose whether to\n reject for a law whose covariance and calibration reference are derived\n assuming one answer."]
 #[repr(C)]
@@ -2613,7 +2613,7 @@ pub struct EmpyreanODConfig {
     #[doc = " Schur-eliminate per-station RA/Dec biases. 1 = enable, 0 = off (default)."]
     pub fit_station_biases: u8,
     #[doc = " Per-station RA/Dec bias config. Honored only when\n [`fit_station_biases`] is non-zero."]
-    pub station_radec: EmpyreanStationRaDecConfig,
+    pub station_radec: EmpyreanStationRADecConfig,
     #[doc = " Use span-grouped Jacobian reuse on cache iterations. 0 = off (default)."]
     pub use_span_grouping: u8,
     pub rejection: EmpyreanRejectionConfig,

@@ -94,7 +94,7 @@ from empyrean.od.result import (
     SolveFor,
     SolveForParams,
     StallDelivery,
-    StationRaDecConfig,
+    StationRADecConfig,
     TrustGateEvent,
     WeightingConfig,
     WeightingLayer,

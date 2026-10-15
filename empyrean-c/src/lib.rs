@@ -6,6 +6,8 @@
 // struct-update.
 #![allow(clippy::missing_safety_doc)]
 #![allow(clippy::field_reassign_with_default)]
+// Astronomy acronyms are spelled in all caps.
+#![allow(clippy::upper_case_acronyms)]
 
 mod built_system;
 #[cfg(test)]

@@ -64,7 +64,7 @@ pub use config::{
     AcceptabilityThresholds, AutoEscalationPolicy, IODConfig, ODConfig, PhotometryConfig,
 };
 pub use debiasing::{DebiasingConfig, DebiasingResolution};
-pub use nuisance::StationRaDecConfig;
+pub use nuisance::StationRADecConfig;
 pub use observation::{Observation, Observations, RadarMeasurement, RadarObservation};
 pub use rejection::{RejectionConfig, RejectionKind};
 pub use result::{

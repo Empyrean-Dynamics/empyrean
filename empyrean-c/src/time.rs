@@ -20,14 +20,14 @@ const SCALE_TDB: i32 = 1;
 /// only the (closed-source) `empyrean_core` re-exports.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Scale {
-    Utc,
-    Tdb,
+    UTC,
+    TDB,
 }
 
 fn int_to_scale(val: i32) -> Result<Scale, String> {
     match val {
-        SCALE_UTC => Ok(Scale::Utc),
-        SCALE_TDB => Ok(Scale::Tdb),
+        SCALE_UTC => Ok(Scale::UTC),
+        SCALE_TDB => Ok(Scale::TDB),
         other => Err(format!(
             "unknown time scale: {other} (expected 0=UTC, 1=TDB)"
         )),
@@ -75,8 +75,8 @@ pub unsafe extern "C" fn empyrean_iso_to_mjd(
             }
         };
         let mjd = match target {
-            Scale::Utc => utc_epoch.mjd(),
-            Scale::Tdb => match utc_epoch.to_tdb() {
+            Scale::UTC => utc_epoch.mjd(),
+            Scale::TDB => match utc_epoch.to_tdb() {
                 Ok(e) => e.mjd(),
                 Err(e) => {
                     set_last_error(&format!("UTC→TDB conversion failed: {e}"));
@@ -127,14 +127,14 @@ pub unsafe extern "C" fn empyrean_mjd_to_iso(
             // v1.20.0 deprecated the panicking forms; the fallible forms
             // surface an undefined UTC conversion as a clean error return
             // instead of unwinding across the FFI boundary.
-            Scale::Utc => match Epoch::try_from_mjd_utc(mjd) {
+            Scale::UTC => match Epoch::try_from_mjd_utc(mjd) {
                 Ok(e) => e,
                 Err(err) => {
                     set_last_error(&err.to_string());
                     return -1;
                 }
             },
-            Scale::Tdb => Epoch::from_mjd_tdb(mjd),
+            Scale::TDB => Epoch::from_mjd_tdb(mjd),
         };
         let iso = match epoch.try_to_iso_utc() {
             Ok(s) => s,

@@ -1975,11 +1975,11 @@ fn joint_provenance_from_u8(code: u8) -> PyResult<empyrean::JointProvenance> {
 /// `EMPYREAN_JOINT_ASSERTED_SOURCE_NONE`), carried by any non-asserted joint.
 const JOINT_ASSERTED_SOURCE_NONE: u8 = 255;
 
-/// Map a wrapper asserted source to its C-ABI code: Sbdb=0, ExternalFile=1,
+/// Map a wrapper asserted source to its C-ABI code: SBDB=0, ExternalFile=1,
 /// and the none sentinel (255) when the joint has no asserted source.
 fn joint_asserted_source_to_u8(s: Option<empyrean::AssertedSource>) -> u8 {
     match s {
-        Some(empyrean::AssertedSource::Sbdb) => 0,
+        Some(empyrean::AssertedSource::SBDB) => 0,
         Some(empyrean::AssertedSource::ExternalFile) => 1,
         None => JOINT_ASSERTED_SOURCE_NONE,
     }
@@ -1996,7 +1996,7 @@ fn joint_asserted_source_from_u8(
 ) -> PyResult<Option<empyrean::AssertedSource>> {
     match provenance {
         empyrean::JointProvenance::Asserted => Ok(Some(match code {
-            0 => empyrean::AssertedSource::Sbdb,
+            0 => empyrean::AssertedSource::SBDB,
             1 => empyrean::AssertedSource::ExternalFile,
             other => {
                 return Err(PyValueError::new_err(format!(
@@ -5913,7 +5913,7 @@ fn anchor_policy_name(p: &empyrean::AnchorPolicy) -> &'static str {
         empyrean::AnchorPolicy::NearestObservableToMidnight => "nearest_observable_to_midnight",
         empyrean::AnchorPolicy::Midnight => "midnight",
         empyrean::AnchorPolicy::Transit => "transit",
-        empyrean::AnchorPolicy::ExplicitUtc(_) => "explicit_utc",
+        empyrean::AnchorPolicy::ExplicitUTC(_) => "explicit_utc",
     }
 }
 
@@ -6359,7 +6359,7 @@ fn build_od_config_from_dict(d: &Bound<'_, PyDict>) -> PyResult<empyrean::ODConf
             wc.preset = match s.to_ascii_lowercase().as_str() {
                 "none" => empyrean::WeightingPreset::None,
                 "vfcc2017" => empyrean::WeightingPreset::VFCC2017,
-                "neodys" => empyrean::WeightingPreset::Neodys,
+                "neodys" => empyrean::WeightingPreset::NEODYS,
                 other => {
                     return Err(PyValueError::new_err(format!(
                         "unknown weighting preset: {other}"
@@ -7092,7 +7092,7 @@ fn apply_propagation_config_dict(
     }
     if let Some(s) = get_str(d, "ephemeris_overlap_policy")? {
         cfg.ephemeris_overlap_policy = match s.to_ascii_lowercase().as_str() {
-            "substitute_spk" => empyrean::EphemerisOverlapPolicy::SubstituteSpk,
+            "substitute_spk" => empyrean::EphemerisOverlapPolicy::SubstituteSPK,
             "exclude_and_integrate" => empyrean::EphemerisOverlapPolicy::ExcludeAndIntegrate,
             other => {
                 return Err(PyValueError::new_err(format!(
@@ -8467,9 +8467,9 @@ fn builtsystem_guard_err(e: empyrean::Error) -> PyErr {
 /// Map a wrapper [`empyrean::KernelKind`] to its stable lowercase tag.
 fn kernel_kind_str(k: empyrean::KernelKind) -> &'static str {
     match k {
-        empyrean::KernelKind::Spk => "spk",
-        empyrean::KernelKind::Bpc => "bpc",
-        empyrean::KernelKind::Tpc => "tpc",
+        empyrean::KernelKind::SPK => "spk",
+        empyrean::KernelKind::BPC => "bpc",
+        empyrean::KernelKind::TPC => "tpc",
         empyrean::KernelKind::Gravity => "gravity",
         empyrean::KernelKind::ObsCodes => "obscodes",
     }

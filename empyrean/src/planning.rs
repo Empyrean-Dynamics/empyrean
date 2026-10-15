@@ -342,7 +342,7 @@ pub struct ObservatoryConfig {
     /// [`Context::evaluate_plan`] in no way (that seam reads none of them).
     pub twilight_thresholds: Option<TwilightThresholds>,
     /// A caller-supplied UTC epoch for the
-    /// [`AnchorPolicy::ExplicitUtc`] anchor, or `None` for the three
+    /// [`AnchorPolicy::ExplicitUTC`] anchor, or `None` for the three
     /// site-derived anchors only. Every night whose noon-to-noon span
     /// contains it also carries an explicit anchor there.
     pub explicit_anchor_utc: Option<Epoch>,
@@ -1543,7 +1543,7 @@ pub enum AnchorPolicy {
     /// The target's transit — its maximum altitude while the site is dark.
     Transit,
     /// A caller-supplied UTC epoch (the carried epoch is the request).
-    ExplicitUtc(Epoch),
+    ExplicitUTC(Epoch),
 }
 
 /// How many survey epochs each Earth-orientation realization answered.
@@ -1837,9 +1837,9 @@ fn anchor_from_ffi(a: &empyrean_sys::EmpyreanAnchor) -> Result<Anchor> {
         }
         empyrean_sys::EMPYREAN_ANCHOR_POLICY_MIDNIGHT => AnchorPolicy::Midnight,
         empyrean_sys::EMPYREAN_ANCHOR_POLICY_TRANSIT => AnchorPolicy::Transit,
-        // The ExplicitUtc request epoch is the anchor's own epoch.
+        // The ExplicitUTC request epoch is the anchor's own epoch.
         empyrean_sys::EMPYREAN_ANCHOR_POLICY_EXPLICIT_UTC => {
-            AnchorPolicy::ExplicitUtc(Epoch::from_mjd_tdb(a.epoch_mjd_tdb))
+            AnchorPolicy::ExplicitUTC(Epoch::from_mjd_tdb(a.epoch_mjd_tdb))
         }
         other => {
             return Err(Error::invalid_input(format!(
@@ -2045,7 +2045,7 @@ mod tests {
 
     #[test]
     fn anchor_from_ffi_decodes_policy_and_absent_circumstances() {
-        // ExplicitUtc carries the anchor's own epoch as its request.
+        // ExplicitUTC carries the anchor's own epoch as its request.
         let a = empyrean_sys::EmpyreanAnchor {
             policy: 3, // EMPYREAN_ANCHOR_POLICY_EXPLICIT_UTC
             has_epoch: 1,
@@ -2056,8 +2056,8 @@ mod tests {
         };
         let out = anchor_from_ffi(&a).unwrap();
         match out.policy {
-            AnchorPolicy::ExplicitUtc(e) => assert_eq!(e.mjd_tdb().unwrap(), 61000.25),
-            other => panic!("expected ExplicitUtc, got {other:?}"),
+            AnchorPolicy::ExplicitUTC(e) => assert_eq!(e.mjd_tdb().unwrap(), 61000.25),
+            other => panic!("expected ExplicitUTC, got {other:?}"),
         }
         assert_eq!(out.epoch.map(|e| e.mjd_tdb().unwrap()), Some(61000.25));
         assert!(!out.observable);

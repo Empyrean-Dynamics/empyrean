@@ -228,12 +228,12 @@ fn wire_discriminant_consts_are_stable() {
     assert_eq!(EMPYREAN_JOINT_PROVENANCE_ASSERTED, 1);
 
     // `asserted_source`: the two source values pin the engine's `AssertedSource`
-    // encoding (Sbdb 0 / ExternalFile 1). Like `Asserted`, the source enum is
+    // encoding (SBDB 0 / ExternalFile 1). Like `Asserted`, the source enum is
     // not core-re-exported, so it is pinned by its append-only value, verified
     // against villeneuve `packed_joint.rs`. `_NONE` is the ABI's own
     // not-available sentinel (not an engine discriminant) and must sit above
     // every append-only source value so it never collides.
-    // Sbdb 0 / ExternalFile 1, and the none sentinel at 255 — above every
+    // SBDB 0 / ExternalFile 1, and the none sentinel at 255 — above every
     // append-only engine source discriminant so it never collides.
     assert_eq!(EMPYREAN_JOINT_ASSERTED_SOURCE_SBDB, 0);
     assert_eq!(EMPYREAN_JOINT_ASSERTED_SOURCE_EXTERNAL_FILE, 1);

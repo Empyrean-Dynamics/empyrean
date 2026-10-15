@@ -99,6 +99,8 @@
 //!   [`Frame::EclipticJ2000`] (the integration frame); set
 //!   [`PropagationConfig::frame`] to [`Frame::ICRF`] for ICRF output.
 #![warn(missing_docs)]
+// Astronomy acronyms are spelled in all caps.
+#![allow(clippy::upper_case_acronyms)]
 
 mod built_system;
 mod context;
@@ -179,7 +181,7 @@ pub use od::{
     PhotometryModel, PhotometryResult, RadarMeasurement, RadarObservation, RadarResidual,
     RadarResidualKind, RejectionConfig, RejectionKind, RejectionReason, ResidualSummary,
     SigmaPolicy, SigmaSource, SolveFor, SolveForParams, SolvedCovariance, SolverStop,
-    StallDelivery, StationBias, StationRaDecConfig, TrustGateEvent, WeightingConfig,
+    StallDelivery, StationBias, StationRADecConfig, TrustGateEvent, WeightingConfig,
     WeightingLayer, WeightingPreset,
 };
 pub use orbit::{Orbit, PhaseFunction};

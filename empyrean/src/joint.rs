@@ -291,7 +291,7 @@ impl JointProvenance {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssertedSource {
     /// The JPL Small-Body Database.
-    Sbdb,
+    SBDB,
     /// Another external orbit file or tool.
     ExternalFile,
 }
@@ -299,7 +299,7 @@ pub enum AssertedSource {
 impl AssertedSource {
     pub(crate) fn from_u8(v: u8) -> Result<Self> {
         Ok(match v as u32 {
-            empyrean_sys::EMPYREAN_JOINT_ASSERTED_SOURCE_SBDB => Self::Sbdb,
+            empyrean_sys::EMPYREAN_JOINT_ASSERTED_SOURCE_SBDB => Self::SBDB,
             empyrean_sys::EMPYREAN_JOINT_ASSERTED_SOURCE_EXTERNAL_FILE => Self::ExternalFile,
             other => {
                 return Err(Error::invalid_input(format!(
@@ -312,7 +312,7 @@ impl AssertedSource {
 
     pub(crate) fn to_u8(self) -> u8 {
         (match self {
-            Self::Sbdb => empyrean_sys::EMPYREAN_JOINT_ASSERTED_SOURCE_SBDB,
+            Self::SBDB => empyrean_sys::EMPYREAN_JOINT_ASSERTED_SOURCE_SBDB,
             Self::ExternalFile => empyrean_sys::EMPYREAN_JOINT_ASSERTED_SOURCE_EXTERNAL_FILE,
         }) as u8
     }
@@ -575,7 +575,7 @@ mod tests {
         // across to_ffi → from_ffi with provenance AND source intact.
         let mut pj = width9_cartesian();
         pj.provenance = JointProvenance::Asserted;
-        pj.asserted_source = Some(AssertedSource::Sbdb);
+        pj.asserted_source = Some(AssertedSource::SBDB);
         let tri = pj.tri.clone();
         let c = pj.to_ffi_borrowing(&tri).expect("asserted joint marshals");
         assert_eq!(
@@ -587,7 +587,7 @@ mod tests {
             .expect("round trips")
             .expect("present");
         assert_eq!(back.provenance, JointProvenance::Asserted);
-        assert_eq!(back.asserted_source, Some(AssertedSource::Sbdb));
+        assert_eq!(back.asserted_source, Some(AssertedSource::SBDB));
     }
 
     #[test]
@@ -604,7 +604,7 @@ mod tests {
         // (b) … and a source on a derived joint is refused too.
         let mut pj = width9_cartesian();
         pj.provenance = JointProvenance::Derived;
-        pj.asserted_source = Some(AssertedSource::Sbdb);
+        pj.asserted_source = Some(AssertedSource::SBDB);
         let err = pj
             .to_ffi_borrowing(&pj.tri.clone())
             .expect_err("a derived joint must not carry a source");

@@ -2499,7 +2499,7 @@ pub struct EmpyreanAcceptabilityThresholds {
 }
 
 /// Per-station RA/Dec bias-fit configuration (mirrors
-/// [`scott::nuisance::BiasKind::StationRaDec`]).
+/// [`scott::nuisance::BiasKind::StationRADec`]).
 ///
 /// Activated by [`EmpyreanODConfig::fit_station_biases`]. Per-station
 /// sigma overrides and `BiasScope` filtering aren't carried across the
@@ -2507,7 +2507,7 @@ pub struct EmpyreanAcceptabilityThresholds {
 /// scope is always [`BiasScope::AllStations`]. Reach for the
 /// empyrean-core Rust API when you need finer control.
 #[repr(C)]
-pub struct EmpyreanStationRaDecConfig {
+pub struct EmpyreanStationRADecConfig {
     /// Default 1-sigma prior on the RA / Dec offset (arcsec). Default = 0.3.
     pub sigma_prior_arcsec: f64,
     /// Minimum observations per station for a bias parameter to be
@@ -2684,7 +2684,7 @@ pub struct EmpyreanODConfig {
     pub fit_station_biases: u8,
     /// Per-station RA/Dec bias config. Honored only when
     /// [`fit_station_biases`] is non-zero.
-    pub station_radec: EmpyreanStationRaDecConfig,
+    pub station_radec: EmpyreanStationRADecConfig,
     /// Use span-grouped Jacobian reuse on cache iterations. 0 = off (default).
     pub use_span_grouping: u8,
 
@@ -3703,7 +3703,7 @@ fn od_error_to_c(e: &ODError) -> i32 {
             EMPYREAN_OD_ERROR_POSTERIOR_JOINT_CONSTRUCTION
         }
         ODError::ThreadBudget(_) => EMPYREAN_OD_ERROR_THREAD_BUDGET,
-        ODError::SpkSubstitutedBody { .. } => EMPYREAN_OD_ERROR_SPK_SUBSTITUTED_BODY,
+        ODError::SPKSubstitutedBody { .. } => EMPYREAN_OD_ERROR_SPK_SUBSTITUTED_BODY,
         ODError::UnknownObservatoryCode { .. } => EMPYREAN_OD_ERROR_UNKNOWN_OBSERVATORY_CODE,
         ODError::InvalidWeightingConfig(_) => EMPYREAN_OD_ERROR_INVALID_WEIGHTING_CONFIG,
         ODError::NonFiniteWeightMatrix { .. } => EMPYREAN_OD_ERROR_NON_FINITE_WEIGHT_MATRIX,
@@ -5458,7 +5458,7 @@ pub(crate) fn build_od_config_from_c(c: &EmpyreanODConfig) -> Result<ODConfig, S
         } else {
             5
         };
-        cfg.nuisance.push(BiasKind::StationRaDec {
+        cfg.nuisance.push(BiasKind::StationRADec {
             sigma_prior_arcsec: sigma,
             per_station_sigma_arcsec: std::collections::HashMap::new(),
             scope: BiasScope::AllStations,

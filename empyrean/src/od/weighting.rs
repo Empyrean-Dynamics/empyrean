@@ -145,7 +145,7 @@ pub enum WeightingPreset {
     #[default]
     VFCC2017,
     /// NEODyS production preset.
-    Neodys,
+    NEODYS,
 }
 
 /// Observation weighting pipeline.

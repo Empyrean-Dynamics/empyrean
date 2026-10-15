@@ -143,11 +143,11 @@ impl Error {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelKind {
     /// SPK ephemeris kernel (planetary / small-body / spacecraft states).
-    Spk,
+    SPK,
     /// Binary PCK body-orientation kernel (Earth / Moon rotation).
-    Bpc,
+    BPC,
     /// Text PCK of gravitational parameters.
-    Tpc,
+    TPC,
     /// Gravity-field coefficient model (spherical-harmonics file or built-in field).
     Gravity,
     /// Observatory-code registry.
@@ -519,9 +519,9 @@ fn kernel_record_from_ffi(r: &empyrean_sys::EmpyreanKernelRecord) -> Result<Kern
 /// error — never a silent fallback into a wrong category.
 fn int_to_kernel_kind(v: i32) -> Result<KernelKind> {
     match v {
-        x if x == empyrean_sys::EMPYREAN_KERNEL_KIND_SPK as i32 => Ok(KernelKind::Spk),
-        x if x == empyrean_sys::EMPYREAN_KERNEL_KIND_BPC as i32 => Ok(KernelKind::Bpc),
-        x if x == empyrean_sys::EMPYREAN_KERNEL_KIND_TPC as i32 => Ok(KernelKind::Tpc),
+        x if x == empyrean_sys::EMPYREAN_KERNEL_KIND_SPK as i32 => Ok(KernelKind::SPK),
+        x if x == empyrean_sys::EMPYREAN_KERNEL_KIND_BPC as i32 => Ok(KernelKind::BPC),
+        x if x == empyrean_sys::EMPYREAN_KERNEL_KIND_TPC as i32 => Ok(KernelKind::TPC),
         x if x == empyrean_sys::EMPYREAN_KERNEL_KIND_GRAVITY as i32 => Ok(KernelKind::Gravity),
         x if x == empyrean_sys::EMPYREAN_KERNEL_KIND_OBSCODES as i32 => Ok(KernelKind::ObsCodes),
         other => Err(Error::invalid_input(format!(

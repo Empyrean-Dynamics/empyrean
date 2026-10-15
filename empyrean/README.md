@@ -620,7 +620,7 @@ whose observation-sensitivity chain was skipped) come back on
 
 A target that is itself one of the loaded perturbers (1 Ceres, 2 Pallas,
 4 Vesta, …) needs `EphemerisOverlapPolicy::ExcludeAndIntegrate` on the
-inner propagation config. The default, `SubstituteSpk`, returns that
+inner propagation config. The default, `SubstituteSPK`, returns that
 body's own SPK states — exact for the body, but no trajectory is
 produced, and ephemeris generation has no light-time chain to read.
 

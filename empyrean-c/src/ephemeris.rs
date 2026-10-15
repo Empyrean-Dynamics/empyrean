@@ -1571,7 +1571,7 @@ mod ephemeris_config_conversion_tests {
         let built = build_ephemeris_config_from_c(&cfg).expect("zeroed config converts");
         assert_eq!(
             built.propagation.ephemeris_overlap_policy,
-            EphemerisOverlapPolicy::SubstituteSpk,
+            EphemerisOverlapPolicy::SubstituteSPK,
             "memset(0) must keep meaning the historical behaviour"
         );
 

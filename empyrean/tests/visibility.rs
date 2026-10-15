@@ -74,7 +74,7 @@ fn ground_and_geocenter() -> PlanningConfig {
         max_sun_altitude_deg: None,
         twilight_thresholds: None,
         // An epoch inside the surveyed window → every night it lands in
-        // carries a fourth, ExplicitUtc, anchor.
+        // carries a fourth, ExplicitUTC, anchor.
         explicit_anchor_utc: Some(Epoch::from_mjd_tdb(T0_MJD + 1.0)),
     };
     let geocentre = ObservatoryConfig {
@@ -149,7 +149,7 @@ fn a_ground_site_gets_nights_anchors_and_moon_a_horizonless_one_does_not() {
     let has_four_anchor_night = f51.nights.iter().any(|n| {
         n.anchors
             .iter()
-            .any(|a| matches!(a.policy, AnchorPolicy::ExplicitUtc(_)))
+            .any(|a| matches!(a.policy, AnchorPolicy::ExplicitUTC(_)))
             && n.anchors.len() >= 4
     });
     assert!(

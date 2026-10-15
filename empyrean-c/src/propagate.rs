@@ -833,7 +833,7 @@ pub const EMPYREAN_EPHEMERIS_OVERLAP_POLICY_EXCLUDE_AND_INTEGRATE: i32 = 1;
 pub(crate) fn int_to_ephemeris_overlap_policy(v: i32) -> Result<EphemerisOverlapPolicy, String> {
     match v {
         EMPYREAN_EPHEMERIS_OVERLAP_POLICY_SUBSTITUTE_SPK => {
-            Ok(EphemerisOverlapPolicy::SubstituteSpk)
+            Ok(EphemerisOverlapPolicy::SubstituteSPK)
         }
         EMPYREAN_EPHEMERIS_OVERLAP_POLICY_EXCLUDE_AND_INTEGRATE => {
             Ok(EphemerisOverlapPolicy::ExcludeAndIntegrate)
@@ -4545,11 +4545,11 @@ mod overlap_policy_tests {
         assert_eq!(
             int_to_ephemeris_overlap_policy(EMPYREAN_EPHEMERIS_OVERLAP_POLICY_SUBSTITUTE_SPK)
                 .expect("0 resolves"),
-            EphemerisOverlapPolicy::SubstituteSpk
+            EphemerisOverlapPolicy::SubstituteSPK
         );
         assert_eq!(
             EphemerisOverlapPolicy::default(),
-            EphemerisOverlapPolicy::SubstituteSpk,
+            EphemerisOverlapPolicy::SubstituteSPK,
             "the ABI zero must agree with the engine's own default"
         );
     }
@@ -4589,7 +4589,7 @@ mod overlap_policy_tests {
         let cfg = build_propagation_config_from_c(&c).expect("a zeroed config converts");
         assert_eq!(
             cfg.ephemeris_overlap_policy,
-            EphemerisOverlapPolicy::SubstituteSpk
+            EphemerisOverlapPolicy::SubstituteSPK
         );
 
         c.ephemeris_overlap_policy = EMPYREAN_EPHEMERIS_OVERLAP_POLICY_EXCLUDE_AND_INTEGRATE;

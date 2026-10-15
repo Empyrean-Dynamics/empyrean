@@ -10,7 +10,7 @@
 pub use crate::propagate::ForceModelTier;
 
 use super::debiasing::{DebiasingConfig, DebiasingResolution};
-use super::nuisance::StationRaDecConfig;
+use super::nuisance::StationRADecConfig;
 use super::rejection::{RejectionConfig, RejectionKind};
 use super::result::{OriginPolicy, OutputEpoch, PhotometryModel, SolveForParams};
 use super::weighting::{SigmaPolicy, WeightingConfig, WeightingPreset, weighting_layer_to_ffi};
@@ -210,7 +210,7 @@ pub struct ODConfig {
     pub fit_station_biases: bool,
     /// Per-station RA/Dec bias config. Honored only when
     /// `fit_station_biases` is true.
-    pub station_radec: StationRaDecConfig,
+    pub station_radec: StationRADecConfig,
     /// Use span-grouped Jacobian reuse.
     pub use_span_grouping: bool,
 
@@ -315,7 +315,7 @@ impl Default for ODConfig {
             auto_escalation: AutoEscalationPolicy::default(),
             acceptability: AcceptabilityThresholds::default(),
             fit_station_biases: false,
-            station_radec: StationRaDecConfig::default(),
+            station_radec: StationRADecConfig::default(),
             use_span_grouping: false,
             rejection: RejectionConfig::default(),
             auto_force_model: false,
@@ -370,7 +370,7 @@ impl ODConfig {
             preset: match self.weighting.preset {
                 WeightingPreset::None => empyrean_sys::EMPYREAN_WEIGHTING_PRESET_NONE as u8,
                 WeightingPreset::VFCC2017 => empyrean_sys::EMPYREAN_WEIGHTING_PRESET_VFCC2017 as u8,
-                WeightingPreset::Neodys => empyrean_sys::EMPYREAN_WEIGHTING_PRESET_NEODYS as u8,
+                WeightingPreset::NEODYS => empyrean_sys::EMPYREAN_WEIGHTING_PRESET_NEODYS as u8,
             },
             default_sigma_arcsec: self.weighting.default_sigma_arcsec,
             sigma_policy: match self.weighting.sigma_policy {
@@ -472,7 +472,7 @@ impl ODConfig {
                 fractional_sigma_a: self.acceptability.fractional_sigma_a,
             },
             fit_station_biases: u8::from(self.fit_station_biases),
-            station_radec: empyrean_sys::EmpyreanStationRaDecConfig {
+            station_radec: empyrean_sys::EmpyreanStationRADecConfig {
                 sigma_prior_arcsec: self.station_radec.sigma_prior_arcsec,
                 min_obs_per_station: self.station_radec.min_obs_per_station,
             },

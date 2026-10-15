@@ -28,7 +28,7 @@ pub enum PhaseFunction {
 /// packed [`covariance`](Orbit::covariance) joint (its AMRAT axis) and the OD
 /// solve-for configuration, not by this slot.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct SrpParams {
+pub struct SRPParams {
     /// Area-to-mass ratio AMRAT (m²/kg) — the SRP-effective, fittable
     /// parameter. Must be finite and > 0.
     pub amrat: f64,
@@ -37,7 +37,7 @@ pub struct SrpParams {
     pub cr: f64,
 }
 
-impl SrpParams {
+impl SRPParams {
     /// Reconstruct an SRP slot from a C-ABI orbit's SRP fields (`has_srp` +
     /// `srp_amrat` / `srp_cr`). `has_srp == 0` ⇒ `None`. Shared by every
     /// C→`Orbit` reverse-marshal path.
@@ -145,7 +145,7 @@ pub struct Orbit {
     pub thrust: Option<ThrustParams>,
     /// Solar-radiation-pressure slot. `None` = no SRP. Additive with the
     /// Marsden non-grav above.
-    pub srp: Option<SrpParams>,
+    pub srp: Option<SRPParams>,
     /// The orbit's covariance over the state and solved parameters, as one
     /// packed joint — the single covariance home.
     ///
@@ -340,7 +340,7 @@ impl Orbit {
     /// [`covariance`](Orbit::covariance) joint and the OD solve-for
     /// configuration, not by this slot.
     pub fn with_srp(mut self, amrat: f64, cr: f64) -> Self {
-        self.srp = Some(SrpParams { amrat, cr });
+        self.srp = Some(SRPParams { amrat, cr });
         self
     }
 
@@ -589,7 +589,7 @@ mod srp_tests {
     fn no_srp_marshals_absent() {
         let (ffi, _keep) = cartesian_orbit().to_ffi_with_keep().unwrap();
         assert_eq!(ffi.has_srp, 0);
-        assert!(SrpParams::from_ffi(ffi.srp_amrat, ffi.srp_cr, ffi.has_srp).is_none());
+        assert!(SRPParams::from_ffi(ffi.srp_amrat, ffi.srp_cr, ffi.has_srp).is_none());
     }
 
     #[test]
@@ -599,10 +599,10 @@ mod srp_tests {
         assert_eq!(ffi.has_srp, 1);
         assert_eq!(ffi.srp_amrat, 3.0e-3);
         assert_eq!(ffi.srp_cr, 1.2);
-        let back = SrpParams::from_ffi(ffi.srp_amrat, ffi.srp_cr, ffi.has_srp).unwrap();
+        let back = SRPParams::from_ffi(ffi.srp_amrat, ffi.srp_cr, ffi.has_srp).unwrap();
         assert_eq!(
             back,
-            SrpParams {
+            SRPParams {
                 amrat: 3.0e-3,
                 cr: 1.2
             }

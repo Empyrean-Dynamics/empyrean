@@ -1100,9 +1100,9 @@ fn force_model_facade_to_int(fm: empyrean_core::ForceModelTier) -> i32 {
 /// rather than silently collapsing into a wrong category.
 fn kernel_kind_to_int(kind: KernelKind) -> i32 {
     match kind {
-        KernelKind::Spk => EMPYREAN_KERNEL_KIND_SPK,
-        KernelKind::Bpc => EMPYREAN_KERNEL_KIND_BPC,
-        KernelKind::Tpc => EMPYREAN_KERNEL_KIND_TPC,
+        KernelKind::SPK => EMPYREAN_KERNEL_KIND_SPK,
+        KernelKind::BPC => EMPYREAN_KERNEL_KIND_BPC,
+        KernelKind::TPC => EMPYREAN_KERNEL_KIND_TPC,
         KernelKind::Gravity => EMPYREAN_KERNEL_KIND_GRAVITY,
         KernelKind::ObsCodes => EMPYREAN_KERNEL_KIND_OBSCODES,
     }

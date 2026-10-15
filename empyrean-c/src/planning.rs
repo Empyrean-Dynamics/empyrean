@@ -509,7 +509,7 @@ pub const EMPYREAN_GATE_END_OF_NIGHT: u8 = 5;
 
 /// How a night anchor's epoch was chosen — the
 /// [`EmpyreanAnchor::policy`] value set. Mirrors
-/// `scott::planning::AnchorPolicy`; the `ExplicitUtc` epoch itself rides on
+/// `scott::planning::AnchorPolicy`; the `ExplicitUTC` epoch itself rides on
 /// [`EmpyreanAnchor::epoch_mjd_tdb`].
 pub const EMPYREAN_ANCHOR_POLICY_NEAREST_OBSERVABLE_TO_MIDNIGHT: u8 = 0;
 /// The local solar midnight itself, observable or not.
@@ -1492,7 +1492,7 @@ fn gate_to_c(g: Option<Gate>) -> u8 {
     }
 }
 
-/// `AnchorPolicy` → an `EMPYREAN_ANCHOR_POLICY_*` byte (the `ExplicitUtc`
+/// `AnchorPolicy` → an `EMPYREAN_ANCHOR_POLICY_*` byte (the `ExplicitUTC`
 /// epoch itself rides on [`EmpyreanAnchor::epoch_mjd_tdb`]).
 fn anchor_policy_to_c(p: &AnchorPolicy) -> u8 {
     match p {
@@ -1501,7 +1501,7 @@ fn anchor_policy_to_c(p: &AnchorPolicy) -> u8 {
         }
         AnchorPolicy::Midnight => EMPYREAN_ANCHOR_POLICY_MIDNIGHT,
         AnchorPolicy::Transit => EMPYREAN_ANCHOR_POLICY_TRANSIT,
-        AnchorPolicy::ExplicitUtc(_) => EMPYREAN_ANCHOR_POLICY_EXPLICIT_UTC,
+        AnchorPolicy::ExplicitUTC(_) => EMPYREAN_ANCHOR_POLICY_EXPLICIT_UTC,
     }
 }
 
@@ -1797,7 +1797,7 @@ fn planning_error_code(e: &PlanningError) -> i32 {
         PlanningError::AstrometryFrameNotICRF { .. } => {
             EMPYREAN_PLANNING_ERROR_ASTROMETRY_FRAME_NOT_ICRF
         }
-        PlanningError::SpkSubstitutedBody { .. } => EMPYREAN_PLANNING_ERROR_SPK_SUBSTITUTED_BODY,
+        PlanningError::SPKSubstitutedBody { .. } => EMPYREAN_PLANNING_ERROR_SPK_SUBSTITUTED_BODY,
         PlanningError::NonFinitePriorCovariance { .. } => {
             EMPYREAN_PLANNING_ERROR_NON_FINITE_PRIOR_COVARIANCE
         }
@@ -1810,7 +1810,7 @@ fn planning_error_code(e: &PlanningError) -> i32 {
         // one (never a `_` wildcard) so a new engine variant breaks the
         // build here; the full cause is on `error_message`.
         PlanningError::EncounterPropagation(_)
-        | PlanningError::EncounterStmUnavailable { .. }
+        | PlanningError::EncounterSTMUnavailable { .. }
         | PlanningError::NoCovarianceOnOrbit
         | PlanningError::SingularCovariance
         | PlanningError::SingularInformationMatrix
@@ -1825,7 +1825,7 @@ fn planning_error_code(e: &PlanningError) -> i32 {
         | PlanningError::OutputEpochRequiresHeliocentric { .. }
         | PlanningError::OutputEpochNonFinite { .. }
         | PlanningError::OutputEpochEphemeris { .. }
-        | PlanningError::ReportEpochTransportStmUnavailable { .. }
+        | PlanningError::ReportEpochTransportSTMUnavailable { .. }
         | PlanningError::IndefiniteReportBlock { .. }
         | PlanningError::SigmaFlightFailed { .. }
         | PlanningError::MonteCarloMemberFlightFailed { .. }

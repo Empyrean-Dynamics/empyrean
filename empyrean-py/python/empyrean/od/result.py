@@ -536,7 +536,7 @@ class RejectionConfig:
 
 
 @dataclass
-class StationRaDecConfig:
+class StationRADecConfig:
     """Per-station RA/Dec bias-fit configuration.
 
     Schur-eliminated nuisance parameters that absorb per-station
@@ -715,7 +715,7 @@ class ODConfig:
     acceptability: AcceptabilityThresholds = field(default_factory=AcceptabilityThresholds)
     fit_station_biases: bool = False
     """Enable Schur-eliminated per-station RA/Dec bias fitting."""
-    station_radec: StationRaDecConfig = field(default_factory=StationRaDecConfig)
+    station_radec: StationRADecConfig = field(default_factory=StationRADecConfig)
     use_span_grouping: bool = False
 
     # ── Rejection ──────────────────────────────────────────

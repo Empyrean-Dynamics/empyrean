@@ -1667,7 +1667,7 @@ typedef struct Session Session;
 /**
  * How a night anchor's epoch was chosen — the
  * [`EmpyreanAnchor::policy`] value set. Mirrors
- * `scott::planning::AnchorPolicy`; the `ExplicitUtc` epoch itself rides on
+ * `scott::planning::AnchorPolicy`; the `ExplicitUTC` epoch itself rides on
  * [`EmpyreanAnchor::epoch_mjd_tdb`].
  */
 #define EMPYREAN_ANCHOR_POLICY_NEAREST_OBSERVABLE_TO_MIDNIGHT 0
@@ -4880,7 +4880,7 @@ struct EmpyreanAcceptabilityThresholds {
 
 /**
  * Per-station RA/Dec bias-fit configuration (mirrors
- * [`scott::nuisance::BiasKind::StationRaDec`]).
+ * [`scott::nuisance::BiasKind::StationRADec`]).
  *
  * Activated by [`EmpyreanODConfig::fit_station_biases`]. Per-station
  * sigma overrides and `BiasScope` filtering aren't carried across the
@@ -4888,7 +4888,7 @@ struct EmpyreanAcceptabilityThresholds {
  * scope is always [`BiasScope::AllStations`]. Reach for the
  * empyrean-core Rust API when you need finer control.
  */
-struct EmpyreanStationRaDecConfig {
+struct EmpyreanStationRADecConfig {
     /**
      * Default 1-sigma prior on the RA / Dec offset (arcsec). Default = 0.3.
      */
@@ -5231,7 +5231,7 @@ struct EmpyreanODConfig {
      * Per-station RA/Dec bias config. Honored only when
      * [`fit_station_biases`] is non-zero.
      */
-    struct EmpyreanStationRaDecConfig station_radec;
+    struct EmpyreanStationRADecConfig station_radec;
     /**
      * Use span-grouped Jacobian reuse on cache iterations. 0 = off (default).
      */

@@ -200,7 +200,7 @@ fn ffi_orbit_to_owned(o: &empyrean_sys::EmpyreanOrbit) -> Result<Orbit> {
         // doesn't carry it, so orbit reads never reconstruct it.
         thrust: None,
         // SRP slot carried through from the C EmpyreanOrbit when present.
-        srp: crate::orbit::SrpParams::from_ffi(o.srp_amrat, o.srp_cr, o.has_srp),
+        srp: crate::orbit::SRPParams::from_ffi(o.srp_amrat, o.srp_cr, o.has_srp),
         // The orbit's covariance as one packed joint. The batch a read
         // produces owns the triangle, so it is copied into an owned Vec here —
         // the wrapper's `Orbit` outlives the batch it came from. A width-0

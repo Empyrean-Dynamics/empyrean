@@ -500,7 +500,7 @@ pub enum EphemerisOverlapPolicy {
     /// Radar generation still fails outright: its Jacobian is composed
     /// on the STM a substitution never produces.
     #[default]
-    SubstituteSpk,
+    SubstituteSPK,
     /// Integrate normally, with the matched perturber removed from the
     /// force model for the remainder of that orbit's propagation, and
     /// report the overlap.
@@ -557,7 +557,7 @@ pub struct PropagationConfig {
     // ── Ephemeris-overlap policy ───────────────────────────
     /// What to do when the propagated state coincides with an SB441-N16
     /// perturber's own SPK ephemeris. Default
-    /// [`EphemerisOverlapPolicy::SubstituteSpk`] — the historical behaviour. See
+    /// [`EphemerisOverlapPolicy::SubstituteSPK`] — the historical behaviour. See
     /// [`EphemerisOverlapPolicy`] for what that costs and when to change it.
     ///
     /// Overlap **detection** is on by default and decides whether this
@@ -769,7 +769,7 @@ impl PropagationConfig {
                 },
             },
             ephemeris_overlap_policy: match self.ephemeris_overlap_policy {
-                EphemerisOverlapPolicy::SubstituteSpk => {
+                EphemerisOverlapPolicy::SubstituteSPK => {
                     empyrean_sys::EMPYREAN_EPHEMERIS_OVERLAP_POLICY_SUBSTITUTE_SPK
                 }
                 EphemerisOverlapPolicy::ExcludeAndIntegrate => {
@@ -808,7 +808,7 @@ mod overlap_policy_tests {
     fn the_default_marshals_as_the_abi_zero() {
         assert_eq!(
             EphemerisOverlapPolicy::default(),
-            EphemerisOverlapPolicy::SubstituteSpk
+            EphemerisOverlapPolicy::SubstituteSPK
         );
         let (ffi, _keep) = PropagationConfig::default().to_ffi_with();
         assert_eq!(
@@ -823,7 +823,7 @@ mod overlap_policy_tests {
     fn both_variants_marshal_to_their_contract_values() {
         for (policy, want) in [
             (
-                EphemerisOverlapPolicy::SubstituteSpk,
+                EphemerisOverlapPolicy::SubstituteSPK,
                 empyrean_sys::EMPYREAN_EPHEMERIS_OVERLAP_POLICY_SUBSTITUTE_SPK,
             ),
             (

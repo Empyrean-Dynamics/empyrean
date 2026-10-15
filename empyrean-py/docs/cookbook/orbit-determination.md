@@ -111,11 +111,11 @@ timing bias) alongside the orbit. Enable on
 {class}`~empyrean.ODConfig`:
 
 ```python
-from empyrean import ODConfig, StationRaDecConfig
+from empyrean import ODConfig, StationRADecConfig
 
 cfg = ODConfig(
     fit_station_biases=True,
-    station_radec=StationRaDecConfig(sigma_prior_arcsec=0.5),
+    station_radec=StationRADecConfig(sigma_prior_arcsec=0.5),
     # Per-observation weighting follows Vereš et al. 2017 by default.
 )
 

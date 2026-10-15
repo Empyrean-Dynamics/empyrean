@@ -120,7 +120,7 @@ fn ffi_batch_to_owned(batch: &empyrean_sys::EmpyreanOrbitBatch) -> Result<OrbitB
             thrust: None,
             // SBDB populates an SRP AMR slot for objects it fits area-to-mass
             // for; carry it through when the engine set it.
-            srp: crate::orbit::SrpParams::from_ffi(
+            srp: crate::orbit::SRPParams::from_ffi(
                 ffi_orbit.srp_amrat,
                 ffi_orbit.srp_cr,
                 ffi_orbit.has_srp,

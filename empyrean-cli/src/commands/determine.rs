@@ -40,9 +40,11 @@ pub enum SolveForArg {
     /// State + Marsden + the non-grav time delay DT.
     Dt,
     /// State + SRP AMRAT.
-    Amrat,
+    #[value(name = "amrat")]
+    AMRAT,
     /// State + Marsden + SRP AMRAT.
-    NonGravAmrat,
+    #[value(name = "non-grav-amrat")]
+    NonGravAMRAT,
 }
 
 #[derive(clap::Args)]
@@ -222,8 +224,8 @@ fn solve_for_axes(mode: SolveForArg) -> (bool, bool, bool) {
         SolveForArg::Auto | SolveForArg::StateOnly => (false, false, false),
         SolveForArg::NonGrav => (true, false, false),
         SolveForArg::Dt => (true, true, false),
-        SolveForArg::Amrat => (false, false, true),
-        SolveForArg::NonGravAmrat => (true, false, true),
+        SolveForArg::AMRAT => (false, false, true),
+        SolveForArg::NonGravAMRAT => (true, false, true),
     }
 }
 
@@ -842,6 +844,33 @@ mod tests {
         }
     }
 
+    /// Wire-compat for the `--solve-for` value strings: renaming the variants
+    /// to all-caps acronyms (`AMRAT` / `NonGravAMRAT`) must not move the CLI
+    /// words, which are pinned by `#[value(name = ...)]`.
+    #[test]
+    fn solve_for_cli_words_are_stable() {
+        use clap::ValueEnum;
+        assert_eq!(
+            SolveForArg::AMRAT.to_possible_value().unwrap().get_name(),
+            "amrat"
+        );
+        assert_eq!(
+            SolveForArg::NonGravAMRAT
+                .to_possible_value()
+                .unwrap()
+                .get_name(),
+            "non-grav-amrat"
+        );
+        assert_eq!(
+            SolveForArg::from_str("amrat", true).unwrap(),
+            SolveForArg::AMRAT
+        );
+        assert_eq!(
+            SolveForArg::from_str("non-grav-amrat", true).unwrap(),
+            SolveForArg::NonGravAMRAT
+        );
+    }
+
     #[test]
     fn axes_match_coarse_variants() {
         assert_eq!(
@@ -850,9 +879,9 @@ mod tests {
         );
         assert_eq!(solve_for_axes(SolveForArg::NonGrav), (true, false, false));
         assert_eq!(solve_for_axes(SolveForArg::Dt), (true, true, false));
-        assert_eq!(solve_for_axes(SolveForArg::Amrat), (false, false, true));
+        assert_eq!(solve_for_axes(SolveForArg::AMRAT), (false, false, true));
         assert_eq!(
-            solve_for_axes(SolveForArg::NonGravAmrat),
+            solve_for_axes(SolveForArg::NonGravAMRAT),
             (true, false, true)
         );
     }
@@ -880,12 +909,12 @@ mod tests {
         assert!(dt.thrust.iter().all(|d| *d == OFF));
 
         // AMRAT alone: only the AMRAT column.
-        let amrat = explicit(SolveForArg::Amrat);
+        let amrat = explicit(SolveForArg::AMRAT);
         assert_eq!((amrat.marsden, amrat.dt, amrat.amrat), (OFF, OFF, ON));
         assert!(amrat.thrust.iter().all(|d| *d == OFF));
 
         // Non-grav + AMRAT: Marsden + AMRAT.
-        let both = explicit(SolveForArg::NonGravAmrat);
+        let both = explicit(SolveForArg::NonGravAMRAT);
         assert_eq!((both.marsden, both.dt, both.amrat), (ON, OFF, ON));
         assert!(both.thrust.iter().all(|d| *d == OFF));
     }
@@ -915,11 +944,11 @@ mod tests {
     #[test]
     fn amrat_solve_requires_amrat_and_variance() {
         // No priors at all.
-        let err = validate_prior_flags(&args_with(SolveForArg::Amrat)).unwrap_err();
+        let err = validate_prior_flags(&args_with(SolveForArg::AMRAT)).unwrap_err();
         assert!(err.to_string().contains("--amrat"), "{err}");
 
         // AMRAT value but no variance.
-        let mut a = args_with(SolveForArg::Amrat);
+        let mut a = args_with(SolveForArg::AMRAT);
         a.amrat = Some(3.0e-3);
         let err = validate_prior_flags(&a).unwrap_err();
         assert!(err.to_string().contains("--amrat-variance"), "{err}");
@@ -943,7 +972,7 @@ mod tests {
 
     #[test]
     fn non_grav_amrat_solve_requires_amrat_priors() {
-        let mut a = args_with(SolveForArg::NonGravAmrat);
+        let mut a = args_with(SolveForArg::NonGravAMRAT);
         assert!(validate_prior_flags(&a).is_err());
         a.amrat = Some(3.0e-3);
         a.amrat_variance = Some(1.0e-8);
@@ -965,7 +994,7 @@ mod tests {
         assert!(err.to_string().contains("--cr"), "{err}");
 
         // DT prior set but AMRAT (not DT) solve.
-        let mut a = args_with(SolveForArg::Amrat);
+        let mut a = args_with(SolveForArg::AMRAT);
         a.amrat = Some(3.0e-3);
         a.amrat_variance = Some(1.0e-8);
         a.dt_variance = Some(1.0e-2);

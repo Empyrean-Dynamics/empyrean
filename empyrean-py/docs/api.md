@@ -305,7 +305,7 @@ blocks alongside the 6×6 state block.
    empyrean.SigmaPolicy
    empyrean.DebiasingConfig
    empyrean.DebiasingResolution
-   empyrean.StationRaDecConfig
+   empyrean.StationRADecConfig
    empyrean.RejectionConfig
    empyrean.RejectionKind
    empyrean.SolveForParams

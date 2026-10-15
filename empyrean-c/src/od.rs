@@ -18,8 +18,12 @@ use empyrean_core::orbits::Orbits;
 use empyrean_core::photometry::{
     FittedPhotometryModel, PhotometryConfig, PhotometryModel, PhotometryResult,
 };
+use empyrean_core::propagation::CovarianceKind;
 
-use crate::propagate::{EmpyreanOrbit, EmpyreanPropagatedState, int_to_force_model};
+use crate::propagate::{
+    EmpyreanOrbit, EmpyreanPropagatedState, EmpyreanUncertaintyMethod, covariance_kind_to_u8,
+    flat_to_uncertainty_method, int_to_force_model,
+};
 use crate::{EmpyreanContext, set_last_error};
 
 // ── C-compatible types ──────────────────────────────────────
@@ -1809,6 +1813,30 @@ pub struct EmpyreanODResult {
     ///
     /// **NaN when `stall_delivered == 0`.**
     pub stall_optical_reduced_chi2: f64,
+
+    // ── Resolved covariance kind (0.11.0) ─────────────────────────
+    /// The kind of covariance this fit actually delivered, an
+    /// `EMPYREAN_COVARIANCE_KIND_*` value. **Always
+    /// [`EMPYREAN_COVARIANCE_KIND_LINEAR`](crate::propagate::EMPYREAN_COVARIANCE_KIND_LINEAR)**
+    /// on a delivered OD result: the differential-correction fit is
+    /// first-order by construction — its posterior is the Gauss–Newton
+    /// normal-matrix inverse — so the only kind it resolves to is linear.
+    /// A request for
+    /// [`EMPYREAN_UNCERTAINTY_AUTO`](crate::propagate::EMPYREAN_UNCERTAINTY_AUTO)
+    /// on the config's [`uncertainty_method`](EmpyreanODConfig::uncertainty_method)
+    /// resolves to the linear kind too, and that resolution is also
+    /// reported by name on [`warnings`](Self::warnings) (the engine's
+    /// `AutoUncertaintyResolvedToFirstOrder`). Every richer method
+    /// (`SECOND`/`SIGMA_POINT`/`MONTE_CARLO`/`MIXTURE`) is refused by name
+    /// before a result is produced (`EMPYREAN_OD_FAILURE_OD` with the
+    /// method and entry point in the message), never silently downgraded,
+    /// so this value never reads anything but linear on a fit the OD seam
+    /// delivers. This is the OD analogue of the plan result's
+    /// `resolved_method`: one vocabulary — the covariance-kind vocabulary —
+    /// for what kind of covariance a result carries, the same every other
+    /// covariance-bearing output is tagged in, while the requested method
+    /// stays visible on the config's `uncertainty_method` knob.
+    pub resolved_method: u8,
 }
 
 // ── Per-object failure codes (EmpyreanODObjectResult::error_code) ──
@@ -2190,6 +2218,22 @@ pub struct EmpyreanODConfig {
     /// Post-OD photometric-fit configuration. Honored only when
     /// [`has_photometry`](EmpyreanODConfig::has_photometry) is non-zero.
     pub photometry: EmpyreanPhotometryConfig,
+
+    // ── Uncertainty method (0.11.0) ───────────────────────────────
+    /// Uncertainty method for the fitted covariance — the same flat tag +
+    /// per-variant parameter carrier the propagation config uses
+    /// ([`EmpyreanUncertaintyMethod`](crate::propagate::EmpyreanUncertaintyMethod)).
+    /// A zero-initialized struct selects
+    /// [`EMPYREAN_UNCERTAINTY_FIRST`](crate::propagate::EMPYREAN_UNCERTAINTY_FIRST),
+    /// the historical behaviour, so
+    /// `memset(0)` is byte-identical to a pre-0.11.0 caller. The OD fit is
+    /// first-order by construction: `FIRST` is delivered and `AUTO`
+    /// resolves to first order (reported on
+    /// [`EmpyreanODResult::resolved_method`] and, for `AUTO`, on
+    /// [`warnings`](EmpyreanODResult::warnings)). Every other method is
+    /// refused by name (`EMPYREAN_OD_FAILURE_OD`, the message naming the
+    /// method and entry point) rather than silently downgraded.
+    pub uncertainty_method: EmpyreanUncertaintyMethod,
 }
 
 // ── Helpers ─────────────────────────────────────────────────
@@ -2848,6 +2892,10 @@ fn poisoned_od_result() -> EmpyreanODResult {
             // Filled by `write_orbit_covariance` on the delivered
             // path; absent here so a poisoned slot frees nothing.
             orbit_cov: crate::joint::empty_packed_joint(),
+            // Absent: a poisoned slot carries no mixture accounting, and an
+            // OD fit's covariance is linear in any case.
+            has_mixture_tally: 0,
+            mixture_tally: crate::joint::absent_mixture_tally(),
         },
         observations: std::ptr::null_mut(),
         num_observations: 0,
@@ -2973,6 +3021,11 @@ fn poisoned_od_result() -> EmpyreanODResult {
         stall_gn_qnorm: f64::NAN,
         stall_convergence_tol: f64::NAN,
         stall_optical_reduced_chi2: f64::NAN,
+        // A failed slot resolved no fit; the OD seam's only resolvable
+        // kind is linear, so the linear kind (the zero tag) is the honest
+        // placeholder, read only once the `error` field says a fit was
+        // delivered.
+        resolved_method: covariance_kind_to_u8(CovarianceKind::Linear),
     }
 }
 
@@ -3497,6 +3550,12 @@ unsafe fn populate_wide_fitting_fields(
         let (warn_ptr, num_warnings) = od_warnings_to_c(&od.warnings);
         (*result_out).warnings = warn_ptr;
         (*result_out).num_warnings = num_warnings;
+        // The OD fit is first-order by construction (its posterior is the
+        // Gauss–Newton normal-matrix inverse), and `Auto` resolves to it
+        // — reported both here and, for `Auto`, on `warnings` above. Every
+        // richer method was already refused by name before this point, so
+        // a delivered result always resolves to the linear covariance kind.
+        (*result_out).resolved_method = covariance_kind_to_u8(CovarianceKind::Linear);
         match &od.photometry {
             Some(p) => {
                 (*result_out).has_photometry = 1;
@@ -3895,6 +3954,9 @@ fn od_orbit_to_propagated(
         // Absent at construction: `write_orbit_covariance` fills it
         // from the fitted orbit once the result struct exists.
         orbit_cov: crate::joint::empty_packed_joint(),
+        // An OD fit's covariance is linear, never a mixture.
+        has_mixture_tally: 0,
+        mixture_tally: crate::joint::absent_mixture_tally(),
     })
 }
 
@@ -4575,6 +4637,13 @@ pub(crate) fn build_od_config_from_c(c: &EmpyreanODConfig) -> Result<ODConfig, S
     } else {
         None
     };
+    // Uncertainty method: translated verbatim through the same flat
+    // decoder the propagation seam uses, then converted to the engine
+    // enum. A zero-init struct decodes to `First`, which `ODConfig`'s own
+    // default already carries, so an unset field is behaviour-preserving.
+    // A valid-but-unsupported method (Second/SigmaPoint/MonteCarlo/Mixture)
+    // decodes cleanly here and is refused by name inside `determine`.
+    cfg.uncertainty_method = flat_to_uncertainty_method(&c.uncertainty_method)?.into();
 
     // ── Auto-escalation ───────────────────────────────────────────
     let ae = &c.auto_escalation;
@@ -5885,6 +5954,44 @@ pub(crate) mod tests {
             s.enabled,
             Some(false),
             "enabled == 0 is an explicit off, not the engine-default tri-state"
+        );
+    }
+
+    // ── uncertainty_method translation (0.11.0) ───────────────────
+    //
+    // Drives the production marshal `build_od_config_from_c`, not a copy
+    // of its branch. Mutation guard: pinning `uncertainty_method` back to
+    // `FirstOrder` in `build_od_config_from_c` makes the SecondOrder case
+    // below deliver `FirstOrder` → red.
+
+    #[test]
+    fn a_zero_init_od_config_fits_first_order() {
+        // `memset(0)` carries tag 0 — the historical first-order fit — so
+        // the default is byte-identical to a pre-0.11.0 caller.
+        let cfg = standard_od_config();
+        assert_eq!(
+            cfg.uncertainty_method.tag,
+            crate::propagate::EMPYREAN_UNCERTAINTY_FIRST
+        );
+        let built = build_od_config_from_c(&cfg).expect("a zero-init OD config is well-formed");
+        assert_eq!(
+            built.uncertainty_method,
+            empyrean_core::determination::EngineUncertaintyMethod::FirstOrder
+        );
+    }
+
+    #[test]
+    fn second_order_tag_passes_through_the_od_marshal() {
+        // The marshal accepts a valid-but-unsupported method and passes it
+        // verbatim; the fit itself is what refuses it by name. If the
+        // marshal re-pinned FirstOrder, this would read FirstOrder — the
+        // mutation this test guards.
+        let mut cfg = standard_od_config();
+        cfg.uncertainty_method.tag = crate::propagate::EMPYREAN_UNCERTAINTY_SECOND;
+        let built = build_od_config_from_c(&cfg).expect("a SecondOrder request marshals");
+        assert_eq!(
+            built.uncertainty_method,
+            empyrean_core::determination::EngineUncertaintyMethod::SecondOrder
         );
     }
 

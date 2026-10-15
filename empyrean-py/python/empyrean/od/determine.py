@@ -1326,6 +1326,20 @@ def _build_determine_result(result: ResultDict) -> DetermineResult:
     )
     stall_delivery = _build_stall_delivery(result.get("stall_delivery"))
 
+    # The resolved covariance kind, decoded from its wire code back to a
+    # CovarianceKind — the one vocabulary every covariance-bearing result is
+    # tagged in (the same the plan result reports). Absent only on an older
+    # binding; default to the linear kind, the only kind the OD seam delivers.
+    from empyrean.orbits.joint import _KIND_BY_CODE
+
+    resolved_code = int(result.get("resolved_method", 0))
+    try:
+        resolved_method = _KIND_BY_CODE[resolved_code]
+    except KeyError:
+        raise RuntimeError(
+            f"engine returned an unknown resolved-method covariance-kind code: {resolved_code}"
+        ) from None
+
     # Carry the post-OD photometric fit onto the fitted orbit so downstream
     # ephemeris generation can predict apparent magnitudes. The C ABI returns
     # the H/G solution only as a side-channel (`photometry`) and leaves the
@@ -1369,4 +1383,5 @@ def _build_determine_result(result: ResultDict) -> DetermineResult:
         accepted_steps=int(result["accepted_steps"]),
         final_solve_iterations=final_solve_iterations,
         stall_delivery=stall_delivery,
+        resolved_method=resolved_method,
     )

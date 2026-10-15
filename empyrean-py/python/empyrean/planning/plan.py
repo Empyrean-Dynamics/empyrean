@@ -435,6 +435,14 @@ def evaluate_plan(
         dec_deg=_floats(out, "ephemeris_dec_deg"),
     )
 
+    resolved_code = int(out["resolved_method"])
+    try:
+        resolved_method = _KIND_BY_CODE[resolved_code]
+    except KeyError:
+        raise RuntimeError(
+            f"engine returned an unknown resolved-method covariance-kind code: {resolved_code}"
+        ) from None
+
     return PlanResult(
         orbit_id=str(out["orbit_id"]),
         metrics=_metrics_table(out),
@@ -442,4 +450,5 @@ def evaluate_plan(
         ephemeris=ephemeris,
         active_width=int(out["active_width"]),
         log_det_gain=float(out["log_det_gain"]),
+        resolved_method=resolved_method,
     )

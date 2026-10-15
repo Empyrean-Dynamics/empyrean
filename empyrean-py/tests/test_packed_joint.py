@@ -307,3 +307,33 @@ def test_state_level_transform_refuses_a_covariance_and_names_transform_orbits()
     with pytest.raises(PushError, match="transform_orbits") as exc:
         transform_coordinates(coords, KeplerianCoordinates)
     assert exc.value.variant is PushErrorVariant.TRANSFORM_COVARIANCE_UNSUPPORTED
+
+
+def test_public_kind_wire_table_pins_every_variant() -> None:
+    """The public covariance-kind wire table maps every ``CovarianceKind``
+    variant to its C-ABI code and round-trips — the Python peer of the Rust
+    wrapper's ``CovarianceKind::to_u8`` / ``from_u8``. The leading-underscore
+    names stay as back-compat aliases of the same objects.
+    """
+    from empyrean.orbits.joint import (
+        _KIND_BY_CODE,
+        _KIND_TO_CODE,
+        KIND_BY_CODE,
+        KIND_TO_CODE,
+    )
+
+    assert KIND_TO_CODE == {
+        CovarianceKind.LINEAR: 0,
+        CovarianceKind.SECOND_ORDER: 1,
+        CovarianceKind.MIXTURE: 3,
+        CovarianceKind.MONTE_CARLO: 4,
+        CovarianceKind.SIGMA_POINT: 5,
+    }
+    # The retired third-order code 2 is absent — refused, never mapped.
+    assert 2 not in KIND_TO_CODE.values()
+    # Every variant round-trips code -> kind -> code.
+    for kind, code in KIND_TO_CODE.items():
+        assert KIND_BY_CODE[code] is kind
+    # The old private names are the same objects, not fresh copies.
+    assert _KIND_TO_CODE is KIND_TO_CODE
+    assert _KIND_BY_CODE is KIND_BY_CODE

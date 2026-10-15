@@ -498,6 +498,9 @@ fn od_orbit_to_propagated_local(
                 resolved_kind: 0,
                 // Filled by `write_od_result_fields` below.
                 orbit_cov: crate::joint::empty_packed_joint(),
+                // An OD fit's covariance is linear, never a mixture.
+                has_mixture_tally: 0,
+                mixture_tally: crate::joint::absent_mixture_tally(),
             });
         }
     };
@@ -520,6 +523,9 @@ fn od_orbit_to_propagated_local(
         resolved_kind: 0,
         // Filled by `write_od_result_fields` below.
         orbit_cov: crate::joint::empty_packed_joint(),
+        // An OD fit's covariance is linear, never a mixture.
+        has_mixture_tally: 0,
+        mixture_tally: crate::joint::absent_mixture_tally(),
     })
 }
 

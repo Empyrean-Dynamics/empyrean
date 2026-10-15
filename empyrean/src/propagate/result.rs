@@ -36,9 +36,19 @@ pub enum CovarianceKind {
 }
 
 impl CovarianceKind {
+    /// Decode a [`CovarianceKind`] from its C-ABI `u8` wire tag — the public
+    /// wire contract, the inverse of [`to_u8`](Self::to_u8).
+    ///
+    /// The tag is the `EMPYREAN_COVARIANCE_KIND_*` value every layer of the
+    /// distribution carries (the Rust wrapper, the C ABI, the Python
+    /// `_KIND_TO_CODE` table and the CLI). It is exposed so a consumer can
+    /// map the kind tag it reads off a result's packed joint — or a cross-FFI
+    /// value — without restating the table. A retired tag (2, third-order) or
+    /// any value this build has no variant for is refused by name rather than
+    /// defaulted.
     // The C tag is a `u8` field; bindgen renders the `#define`d
     // constants as `u32`, so compare in `u32`.
-    pub(crate) fn from_u8(tag: u8) -> Result<Self> {
+    pub fn from_u8(tag: u8) -> Result<Self> {
         Ok(match tag as u32 {
             empyrean_sys::EMPYREAN_COVARIANCE_KIND_LINEAR => Self::Linear,
             empyrean_sys::EMPYREAN_COVARIANCE_KIND_SECOND_ORDER => Self::SecondOrder,
@@ -56,8 +66,12 @@ impl CovarianceKind {
         })
     }
 
-    /// The C ABI `u8` tag for this kind — inverse of [`from_u8`](Self::from_u8).
-    pub(crate) fn to_u8(self) -> u8 {
+    /// The C ABI `u8` wire tag for this kind — the public wire contract, the
+    /// inverse of [`from_u8`](Self::from_u8). This is the
+    /// `EMPYREAN_COVARIANCE_KIND_*` value the C ABI, Python and the CLI all
+    /// agree on, exposed so a consumer can encode a kind to the wire without
+    /// restating the table.
+    pub fn to_u8(self) -> u8 {
         let tag = match self {
             Self::Linear => empyrean_sys::EMPYREAN_COVARIANCE_KIND_LINEAR,
             Self::SecondOrder => empyrean_sys::EMPYREAN_COVARIANCE_KIND_SECOND_ORDER,
@@ -66,6 +80,73 @@ impl CovarianceKind {
             Self::SigmaPoint => empyrean_sys::EMPYREAN_COVARIANCE_KIND_SIGMA_POINT,
         };
         tag as u8
+    }
+}
+
+/// The engine's pre-retention Gaussian-mixture accounting, carried beside a
+/// covariance whose kind is [`Mixture`](CovarianceKind::Mixture) — the six
+/// tallies the engine reads off its own `Derivation::Mixture` payload. It
+/// rides WITH the covariance it describes (on every covariance-bearing result
+/// type), distinct from the retained-component status table
+/// ([`PropagationResult::mixtures`]), which is the per-close-approach object.
+///
+/// A count is `None` when the producing site did not carry that tally — "not
+/// carried", which is distinct from a real `0` and is never fabricated as one.
+/// [`n_components_total`](Self::n_components_total) and
+/// [`weight_delivered`](Self::weight_delivered) are always carried on a
+/// mixture; the four refusal / failure counts may each be absent.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MixtureTally {
+    /// Total number of components before retention.
+    pub n_components_total: u32,
+    /// Pre-renormalization surviving mass.
+    pub weight_delivered: f64,
+    /// Members whose sub-propagation failed, or `None` when not carried.
+    pub n_failed: Option<u32>,
+    /// Members still inside a zone at their horizon, or `None` when not carried.
+    pub n_unresolved: Option<u32>,
+    /// Components refused for state-space curvature, or `None` when not carried.
+    pub n_curvature_refused: Option<u32>,
+    /// Components refused because their projected spread overflowed the
+    /// flat-sky linearization, or `None` when not carried. Engine-`None` on the
+    /// propagation seam at the current engine pin — read it as absent, never 0.
+    pub n_sky_linearization_refused: Option<u32>,
+}
+
+impl MixtureTally {
+    /// Decode the mixture tally beside a covariance: `Some` when the carrier's
+    /// `has_mixture_tally` flag is set, `None` otherwise. A `-1` wire count is
+    /// the engine's `None` ("not carried"), mapped to `None` here rather than a
+    /// fabricated `0`.
+    pub(crate) fn from_ffi(has: u8, t: &empyrean_sys::EmpyreanMixtureTally) -> Option<Self> {
+        if has == 0 {
+            return None;
+        }
+        let opt = |v: i64| -> Option<u32> { (v >= 0).then_some(v as u32) };
+        Some(Self {
+            n_components_total: t.n_components_total,
+            weight_delivered: t.weight_delivered,
+            n_failed: opt(t.n_failed),
+            n_unresolved: opt(t.n_unresolved),
+            n_curvature_refused: opt(t.n_curvature_refused),
+            n_sky_linearization_refused: opt(t.n_sky_linearization_refused),
+        })
+    }
+
+    /// Encode this tally to its C-ABI wire form (`None` counts → `-1`). The
+    /// dual of [`from_ffi`](Self::from_ffi), used on the write paths that
+    /// re-marshal a wrapper value back across the FFI boundary. Takes `self`
+    /// by value — the type is `Copy`.
+    pub(crate) fn to_ffi(self) -> empyrean_sys::EmpyreanMixtureTally {
+        let wire = |v: Option<u32>| -> i64 { v.map(|x| x as i64).unwrap_or(-1) };
+        empyrean_sys::EmpyreanMixtureTally {
+            n_components_total: self.n_components_total,
+            weight_delivered: self.weight_delivered,
+            n_failed: wire(self.n_failed),
+            n_unresolved: wire(self.n_unresolved),
+            n_curvature_refused: wire(self.n_curvature_refused),
+            n_sky_linearization_refused: wire(self.n_sky_linearization_refused),
+        }
     }
 }
 
@@ -98,6 +179,10 @@ pub struct TaggedCovariance {
     pub origin: Origin,
     /// Reference frame of the basis.
     pub frame: Frame,
+    /// The engine's pre-retention mixture accounting for this covariance, or
+    /// `None` when its kind is not [`Mixture`](CovarianceKind::Mixture). See
+    /// [`MixtureTally`].
+    pub mixture_tally: Option<MixtureTally>,
 }
 
 impl TaggedCovariance {
@@ -145,6 +230,7 @@ impl TaggedCovariance {
             mean_shift_prop: (s.has_mean_shift_prop != 0).then_some(s.mean_shift_prop),
             origin,
             frame,
+            mixture_tally: MixtureTally::from_ffi(s.has_mixture_tally, &s.mixture_tally),
         })
     }
 }
@@ -218,6 +304,10 @@ pub struct PropagatedState {
     /// [`Orbit::with_covariance`](crate::Orbit::with_covariance) to carry the
     /// whole matrix the first leg computed.
     pub joint: Option<crate::PackedJoint>,
+    /// The engine's pre-retention mixture accounting for this row's resolved
+    /// covariance, or `None` when it was not derived as a mixture. See
+    /// [`MixtureTally`].
+    pub mixture_tally: Option<MixtureTally>,
 }
 
 impl PropagatedState {
@@ -240,6 +330,7 @@ impl PropagatedState {
             stt: (s.has_stt != 0).then(|| Box::new(s.stt)),
             resolved_kind: CovarianceKind::from_u8(s.resolved_kind)?,
             joint: unsafe { crate::PackedJoint::from_ffi(&s.orbit_cov) }?,
+            mixture_tally: MixtureTally::from_ffi(s.has_mixture_tally, &s.mixture_tally),
         })
     }
 }
@@ -1700,6 +1791,7 @@ mod result_weight_tests {
         stt: Option<[[[f64; 6]; 6]; 6]>,
         resolved_kind: super::CovarianceKind,
         joint: Option<crate::PackedJoint>,
+        mixture_tally: Option<super::MixtureTally>,
     }
 
     /// Boxing the STT is the whole of F4's per-state win, and it is
@@ -1722,8 +1814,8 @@ mod result_weight_tests {
             8,
             "a boxed STT slot is one niche-optimized pointer — no discriminant word"
         );
-        assert_eq!(inline, 2472, "PropagatedState with the tensor inline");
-        assert_eq!(boxed, 744, "PropagatedState with the tensor boxed");
+        assert_eq!(inline, 2520, "PropagatedState with the tensor inline");
+        assert_eq!(boxed, 792, "PropagatedState with the tensor boxed");
         assert_eq!(
             inline - boxed,
             1728,
@@ -1755,7 +1847,7 @@ mod result_weight_tests {
     fn the_c_abi_row_still_carries_the_tensor_inline() {
         assert_eq!(
             std::mem::size_of::<empyrean_sys::EmpyreanPropagatedState>(),
-            2448,
+            2504,
             "the C row must not move: F4 is a wrapper-side change"
         );
     }

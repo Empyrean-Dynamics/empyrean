@@ -13,8 +13,8 @@ use anyhow::{Context, Result};
 use empyrean::{DetermineResults, FitSummaryRow, OrbitBatch};
 
 use super::{DataOptions, load_context};
-use crate::ForceModel;
 use crate::io::output::{self, OutputFormat};
+use crate::{ForceModel, UncertaintyMethodArg};
 
 /// Every object delivered a fit.
 pub const EXIT_ALL_DELIVERED: i32 = 0;
@@ -61,6 +61,14 @@ pub struct DetermineArgs {
     /// Parameters to solve for.
     #[arg(long, value_enum, default_value_t = SolveForArg::Auto)]
     pub solve_for: SolveForArg,
+
+    /// Uncertainty method for the fitted covariance (same spelling and
+    /// values as `propagate --uncertainty-method`). The fit is first-order
+    /// by construction: `first-order` is delivered and `auto` resolves to
+    /// it (reported on the fit's warnings); `second-order`, `sigma-point`
+    /// and `monte-carlo` are refused by name rather than downgraded.
+    #[arg(long, value_enum, default_value_t = UncertaintyMethodArg::FirstOrder)]
+    pub uncertainty_method: UncertaintyMethodArg,
 
     /// SRP area-to-mass ratio AMRAT (m²/kg) — the fittable SRP parameter.
     /// Priors the SRP slot on the seed orbit. Required with
@@ -378,6 +386,7 @@ fn run_refine_path(
         max_iterations: args.max_iterations,
         solve_for: base_solve,
         photometry: args.photometry.then(empyrean::PhotometryConfig::default),
+        uncertainty_method: args.uncertainty_method.to_empyrean(),
         ..empyrean::ODConfig::default()
     };
     eprintln!(
@@ -398,6 +407,7 @@ fn run_refine_path(
         max_iterations: args.max_iterations,
         solve_for: build_solve_for(args.solve_for, args.thrust_segments)?,
         photometry: args.photometry.then(empyrean::PhotometryConfig::default),
+        uncertainty_method: args.uncertainty_method.to_empyrean(),
         ..empyrean::ODConfig::default()
     };
     eprintln!(
@@ -710,13 +720,21 @@ pub fn run(data: &DataOptions, args: DetermineArgs) -> Result<()> {
 
     // The daemon protocol only carries force_model + max_iterations, so a
     // fitting request (non-grav / DT / AMRAT / thrust / photometry) must
-    // run in-process — the daemon can't express it yet.
+    // run in-process — the daemon can't express it yet. A non-default
+    // `--uncertainty-method` is in the same bucket: the daemon request
+    // carries no uncertainty field, so serving a non-`FirstOrder` request
+    // through it would silently ignore the method (and drop the typed
+    // refusal a richer method is owed). Route it in-process instead.
     //
     // `--no-refresh` also runs in-process: a running daemon's context was
     // built under its own policy and cannot honour a strict-offline
     // request retroactively, so serving it would quietly ignore the flag.
-    let uses_fitting =
-        args.solve_for != SolveForArg::Auto || args.thrust_segments > 0 || args.photometry;
+    let non_default_uncertainty =
+        !matches!(args.uncertainty_method, UncertaintyMethodArg::FirstOrder);
+    let uses_fitting = args.solve_for != SolveForArg::Auto
+        || args.thrust_segments > 0
+        || args.photometry
+        || non_default_uncertainty;
     if !uses_fitting && data.daemon_eligible() {
         let request = crate::daemon::protocol::Request::Determine {
             ades_path: args.ades_file.display().to_string(),
@@ -760,6 +778,7 @@ pub fn run(data: &DataOptions, args: DetermineArgs) -> Result<()> {
             max_iterations: args.max_iterations,
             solve_for: build_solve_for(args.solve_for, args.thrust_segments)?,
             photometry: args.photometry.then(empyrean::PhotometryConfig::default),
+            uncertainty_method: args.uncertainty_method.to_empyrean(),
             ..empyrean::ODConfig::default()
         };
         ctx.determine(&observations, None, &config)
@@ -814,6 +833,7 @@ mod tests {
             dt_variance: None,
             thrust_segments: 0,
             photometry: false,
+            uncertainty_method: UncertaintyMethodArg::FirstOrder,
             out_dir: PathBuf::from("."),
             format: OutputFormat::Parquet,
         }

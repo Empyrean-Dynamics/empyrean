@@ -322,3 +322,92 @@ fn an_id_less_row_aborts_the_batch_by_name() {
 /// neither. `3` = some objects delivered, `4` = none delivered.
 const EXIT_SOME_DELIVERED: i32 = 3;
 const EXIT_NONE_DELIVERED: i32 = 4;
+
+/// `determine --uncertainty-method second-order` is refused by name. The OD
+/// fit is first-order by construction; the gate fires before IOD, so the
+/// short-arc fixture's failure is the method refusal (naming the method and
+/// the entry point), not an IOD failure — and no object is delivered.
+#[test]
+fn second_order_uncertainty_method_is_refused_by_name() {
+    let Some(data_dir) = resolve_data_dir() else {
+        eprintln!("skipping: no data dir with de440.bsp");
+        return;
+    };
+    if !engine_loads() {
+        eprintln!("skipping: libempyrean does not load for this build");
+        return;
+    }
+
+    let dir = temp_dir("uncertainty-second-order");
+    let psv_path = dir.join("obs.psv");
+    std::fs::write(&psv_path, two_object_psv(false)).expect("write synthetic PSV");
+    let out = run_cli(&[
+        "--data-dir",
+        &data_dir.display().to_string(),
+        "determine",
+        &psv_path.display().to_string(),
+        "--out-dir",
+        &dir.display().to_string(),
+        "--format",
+        "csv",
+        "--uncertainty-method",
+        "second-order",
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_NONE_DELIVERED),
+        "a refused method delivers no orbit\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("SecondOrder"),
+        "the refusal must name the method on stderr\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("determine"),
+        "the refusal must name the entry point on stderr\nstderr:\n{stderr}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `determine --uncertainty-method auto` is honoured, never refused by name:
+/// `Auto` resolves to the first-order fit on the OD seam. The synthetic short
+/// arc still fails IOD, but that is the ordinary outcome — the uncertainty
+/// gate does not fire, so the method-refusal message never appears.
+#[test]
+fn auto_uncertainty_method_is_accepted_not_refused() {
+    let Some(data_dir) = resolve_data_dir() else {
+        eprintln!("skipping: no data dir with de440.bsp");
+        return;
+    };
+    if !engine_loads() {
+        eprintln!("skipping: libempyrean does not load for this build");
+        return;
+    }
+
+    let dir = temp_dir("uncertainty-auto");
+    let psv_path = dir.join("obs.psv");
+    std::fs::write(&psv_path, two_object_psv(false)).expect("write synthetic PSV");
+    let out = run_cli(&[
+        "--data-dir",
+        &data_dir.display().to_string(),
+        "determine",
+        &psv_path.display().to_string(),
+        "--out-dir",
+        &dir.display().to_string(),
+        "--format",
+        "csv",
+        "--uncertainty-method",
+        "auto",
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        !stderr.contains("no honest implementation"),
+        "auto must be honoured (resolved to first order), never refused by name\nstderr:\n{stderr}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}

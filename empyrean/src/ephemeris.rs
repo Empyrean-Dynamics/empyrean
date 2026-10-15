@@ -111,16 +111,42 @@ pub struct EphemerisEntry {
     /// 6×6 Cartesian covariance of the aberrated state, row-major. `None`
     /// when the input orbit carried no state covariance.
     pub aberrated_covariance: Option<[[f64; 6]; 6]>,
+    /// Derivation kind of the row's sky covariance — the same
+    /// [`CovarianceKind`](crate::CovarianceKind) vocabulary the propagation
+    /// result carries. The bare [`covariance`](Self::covariance) 6×6 is the
+    /// moment this names: [`Linear`](crate::CovarianceKind::Linear) under a
+    /// first-order method, [`SecondOrder`](crate::CovarianceKind::SecondOrder)
+    /// under a second-order one, and so on. `Linear` when
+    /// [`covariance`](Self::covariance) is `None` (no uncertainty path ran) —
+    /// read delivery from `covariance` / [`joint`](Self::joint), not this tag.
+    pub cov_kind: crate::CovarianceKind,
+    /// The row's sky covariance as one packed joint — the single covariance
+    /// home, the same [`PackedJoint`](crate::PackedJoint) the propagation rows
+    /// carry, with [`functional`](crate::JointFunctional::Sky) `Sky`. Its
+    /// [`state_block`](crate::PackedJoint::state_block) equals
+    /// [`covariance`](Self::covariance) (the same (AU, deg) sky 6×6). `None`
+    /// when the input orbit carried no state covariance.
+    pub joint: Option<crate::PackedJoint>,
+    /// The engine's pre-retention mixture accounting for this row's sky
+    /// covariance, or `None` when it was not derived as a mixture. See
+    /// [`MixtureTally`](crate::MixtureTally).
+    pub mixture_tally: Option<crate::MixtureTally>,
 }
 
 impl EphemerisEntry {
-    pub(crate) fn from_ffi(e: &empyrean_sys::EmpyreanEphemerisEntry) -> Self {
+    pub(crate) fn from_ffi(e: &empyrean_sys::EmpyreanEphemerisEntry) -> Result<Self> {
         let orbit_id = if e.orbit_id.is_null() {
             String::new()
         } else {
             unsafe { CStr::from_ptr(e.orbit_id).to_string_lossy().into_owned() }
         };
-        Self {
+        // The sky covariance kind and the packed joint beside the bare 6×6.
+        // A kind tag this build has no variant for, or a malformed joint, is
+        // refused by name here (the same loud decode the propagation rows
+        // take) rather than defaulted.
+        let cov_kind = crate::CovarianceKind::from_u8(e.cov_kind)?;
+        let joint = unsafe { crate::PackedJoint::from_ffi(&e.joint) }?;
+        Ok(Self {
             orbit_id,
             epoch: crate::Epoch::from_mjd_tdb(e.epoch_mjd_tdb),
             ra_deg: e.ra_deg,
@@ -146,7 +172,10 @@ impl EphemerisEntry {
             aberrated_state: e.aberrated_state,
             aberrated_covariance: (e.has_aberrated_covariance != 0)
                 .then_some(e.aberrated_covariance),
-        }
+            cov_kind,
+            joint,
+            mixture_tally: crate::MixtureTally::from_ffi(e.has_mixture_tally, &e.mixture_tally),
+        })
     }
 }
 
@@ -559,7 +588,7 @@ impl Context {
         if code != 0 {
             return Err(Error::capture(code));
         }
-        Ok(marshal_ephemeris_result(&mut result))
+        marshal_ephemeris_result(&mut result)
     }
 }
 
@@ -617,9 +646,12 @@ pub(crate) fn observers_to_ffi(
 /// so both produce byte-identical output.
 pub(crate) fn marshal_ephemeris_result(
     result: &mut empyrean_sys::EmpyreanEphemerisResult,
-) -> EphemerisResult {
-    let entries = if result.entries.is_null() {
-        Vec::new()
+) -> Result<EphemerisResult> {
+    // Decode fallibly, but free the C result BEFORE propagating any decode
+    // error (an unknown covariance-kind tag or a malformed joint) so the
+    // error path leaks nothing.
+    let entries_res: Result<Vec<EphemerisEntry>> = if result.entries.is_null() {
+        Ok(Vec::new())
     } else {
         unsafe {
             std::slice::from_raw_parts(result.entries, result.num_entries)
@@ -685,12 +717,13 @@ pub(crate) fn marshal_ephemeris_result(
             .collect()
     };
     unsafe { empyrean_sys::empyrean_ephemeris_result_free(result) };
-    EphemerisResult {
+    let entries = entries_res?;
+    Ok(EphemerisResult {
         entries,
         sensitivity,
         warnings,
         outcomes,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -1045,6 +1078,75 @@ mod outcome_channel_tests {
             observing_night: -1,
             frame: Frame::ICRF,
             origin: Origin::SSB,
+        }
+    }
+
+    /// A covariance-bearing orbit's ephemeris row carries, beside the bare
+    /// sky 6×6, the covariance kind and the self-describing packed joint: the
+    /// kind matches the requested method (SecondOrder → `SecondOrder`,
+    /// FirstOrder → `Linear`), the joint is a width-6 `Sky` functional, and
+    /// its `state_block()` equals the bare `covariance`. Mutation record: drop
+    /// the kind in the C marshaler and the `SecondOrder` branch goes red;
+    /// return the absent joint and the `Some(joint)` / width-6 asserts go red.
+    #[test]
+    fn an_ephemeris_row_carries_sky_cov_kind_and_joint() {
+        let Some(ctx) = try_context() else {
+            eprintln!("skipping an_ephemeris_row_carries_sky_cov_kind_and_joint: no data dir");
+            return;
+        };
+        let mut cov = [[0.0f64; 6]; 6];
+        cov[0][0] = 1e-12;
+        cov[1][1] = 1e-12;
+        cov[2][2] = 1e-12;
+        cov[3][3] = 1e-16;
+        cov[4][4] = 1e-16;
+        cov[5][5] = 1e-16;
+        let state = CoordinateState::cartesian(
+            Epoch::from_mjd_tdb(59000.0),
+            [1.0, 0.1, 0.05, -0.005, 0.015, 0.001],
+            Frame::ICRF,
+            Origin::Sun,
+        )
+        .with_covariance(cov);
+        let orbit = Orbit::new(state).with_orbit_id("cov");
+        let observers = [observer()];
+
+        for (method, want_kind) in [
+            (UncertaintyMethod::FirstOrder, crate::CovarianceKind::Linear),
+            (
+                UncertaintyMethod::SecondOrder,
+                crate::CovarianceKind::SecondOrder,
+            ),
+        ] {
+            let cfg = EphemerisConfig {
+                propagation: PropagationConfig {
+                    uncertainty_method: method.clone(),
+                    ..PropagationConfig::default()
+                },
+                ..EphemerisConfig::default()
+            };
+            let result = ctx
+                .generate_ephemeris(std::slice::from_ref(&orbit), &observers, &cfg)
+                .expect("covariance-bearing ephemeris generates");
+            let row = &result.entries[0];
+            let bare = row.covariance.expect("the sky covariance was delivered");
+            assert_eq!(row.cov_kind, want_kind, "row kind under {method:?}");
+            let joint = row
+                .joint
+                .as_ref()
+                .expect("a delivered row carries its joint");
+            assert_eq!(joint.width, 6, "the sky joint is width 6");
+            assert_eq!(
+                joint.functional,
+                crate::JointFunctional::Sky,
+                "the joint describes the sky functional"
+            );
+            assert_eq!(joint.kind, want_kind, "the joint's own kind matches");
+            assert_eq!(
+                joint.state_block(),
+                bare,
+                "the joint's state block is the bare sky 6×6"
+            );
         }
     }
 

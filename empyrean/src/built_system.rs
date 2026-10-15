@@ -417,7 +417,7 @@ impl BuiltSystem {
         if code != 0 {
             return Err(Error::capture(code));
         }
-        Ok(marshal_ephemeris_result(&mut ffi_result))
+        marshal_ephemeris_result(&mut ffi_result)
     }
 
     /// Return a full reproducibility summary of the frozen force model and

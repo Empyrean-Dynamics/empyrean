@@ -1548,6 +1548,19 @@ pub struct DetermineResult {
     /// `None` is the ordinary case. A consumer that wants the strict
     /// convergence contract checks `stall_delivery.is_none()`.
     pub stall_delivery: Option<StallDelivery>,
+    /// The kind of covariance this fit actually delivered. Always
+    /// [`CovarianceKind::Linear`](crate::CovarianceKind::Linear): the
+    /// differential-correction fit is first-order by construction, and a
+    /// [`UncertaintyMethod::auto`](crate::UncertaintyMethod::auto) request
+    /// on the config resolves to it — a resolution also named on
+    /// [`warnings`](Self::warnings). Every richer method is refused by name
+    /// before a fit is produced, so this never reads anything but the
+    /// linear kind on a delivered result. The OD analogue of
+    /// [`PlanResult::resolved_method`](crate::PlanResult::resolved_method):
+    /// one vocabulary — the covariance-kind vocabulary — for what kind of
+    /// covariance a result carries, while the requested method stays
+    /// visible on the config's `uncertainty_method` knob.
+    pub resolved_method: crate::CovarianceKind,
 }
 
 impl DetermineResult {
@@ -1577,6 +1590,8 @@ impl DetermineResult {
             stm: None,
             stt: None,
             resolved_kind: CovarianceKind::Linear,
+            // An OD fit's covariance is linear, never a mixture.
+            mixture_tally: None,
         }
     }
 }
@@ -1970,6 +1985,7 @@ mod batch_tests {
             accepted_steps: 0,
             final_solve_iterations: None,
             stall_delivery: None,
+            resolved_method: crate::CovarianceKind::Linear,
         }
     }
 

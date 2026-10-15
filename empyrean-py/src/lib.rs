@@ -843,6 +843,56 @@ fn build_uncertainty_method(
     }
 }
 
+/// Read an optional `uncertainty_method` sub-dict — the flat tag + per-variant
+/// slots the OD and planning wire dicts carry, one slot per
+/// `build_uncertainty_method` argument — into a wrapper
+/// [`empyrean::UncertaintyMethod`]. `None` when the key is absent, so the
+/// caller keeps its config default (first order). Mirrors the propagation
+/// seam's flat args field for field: the same single tag decoder maps the same
+/// slots to the same method across every channel.
+fn uncertainty_method_from_subdict(
+    d: &Bound<'_, PyDict>,
+) -> PyResult<Option<empyrean::UncertaintyMethod>> {
+    let Some(sub) = d.get_item("uncertainty_method")? else {
+        return Ok(None);
+    };
+    let sub = sub.downcast::<PyDict>()?;
+    let get_i = |k: &str, default: i64| -> PyResult<i64> {
+        Ok(match sub.get_item(k)? {
+            Some(v) => v.extract()?,
+            None => default,
+        })
+    };
+    let get_f = |k: &str, default: f64| -> PyResult<f64> {
+        Ok(match sub.get_item(k)? {
+            Some(v) => v.extract()?,
+            None => default,
+        })
+    };
+    // `mc_seed` is `Option<u64>`: an absent key or an explicit `None` both mean
+    // "draw from the entropy source", distinct from a real `0` seed.
+    let mc_seed: Option<u64> = match sub.get_item("mc_seed")? {
+        Some(v) if !v.is_none() => Some(v.extract()?),
+        _ => None,
+    };
+    let method = build_uncertainty_method(
+        get_i("tag", 0)? as i32,
+        get_f("sigma_n_sigma", 1.0)?,
+        get_i("sigma_samples_per_plane", 8)? as usize,
+        get_i("mc_n_samples", 1000)? as usize,
+        mc_seed,
+        get_f("gm_threshold", 1.0)?,
+        get_i("gm_max_depth", 3)? as usize,
+        get_i("gm_components_per_split", 3)? as usize,
+        get_f("auto_threshold_first", 0.1)?,
+        get_f("auto_threshold_mixture", 10.0)?,
+        get_f("auto_threshold_ip_skip", 1e-12)?,
+        get_i("auto_gmm_max_depth", 3)? as usize,
+        get_i("auto_gmm_components_per_split", 3)? as usize,
+    )?;
+    Ok(Some(method))
+}
+
 // ══════════════════════════════════════════════════════════
 //  _propagate
 // ══════════════════════════════════════════════════════════
@@ -1280,6 +1330,17 @@ fn _propagate<'py>(
     // block-diagonal input, because propagation generates that
     // correlation.
     let mut out_joint = JointColumns::with_capacity(m);
+    // The engine's pre-retention Gaussian-mixture tallies per state row, by the
+    // validation schema's column names so a channel row maps 1:1. Absent rows
+    // (every row at the current engine pin — no fixture splits) keep the
+    // `-1` / NaN sentinels, the same "absent integer" / "absent float"
+    // convention the event columns use; a `-1` is never a fabricated 0.
+    let mut mix_n_components_total = Array1::<i64>::from_elem(m, -1);
+    let mut mix_weight_delivered = Array1::<f64>::from_elem(m, f64::NAN);
+    let mut mix_n_failed = Array1::<i64>::from_elem(m, -1);
+    let mut mix_n_unresolved = Array1::<i64>::from_elem(m, -1);
+    let mut mix_n_curvature_refused = Array1::<i64>::from_elem(m, -1);
+    let mut mix_n_sky_linearization_refused = Array1::<i64>::from_elem(m, -1);
 
     // Map each delivered flat row to the INPUT orbit it belongs to, from
     // the engine's per-orbit outcome blocks rather than a uniform
@@ -1351,6 +1412,22 @@ fn _propagate<'py>(
         }
         out_resolved_kind[i] = covariance_kind_to_u8(state.resolved_kind);
         out_joint.push(state.joint.clone());
+        if let Some(t) = &state.mixture_tally {
+            mix_n_components_total[i] = t.n_components_total as i64;
+            mix_weight_delivered[i] = t.weight_delivered;
+            if let Some(v) = t.n_failed {
+                mix_n_failed[i] = v as i64;
+            }
+            if let Some(v) = t.n_unresolved {
+                mix_n_unresolved[i] = v as i64;
+            }
+            if let Some(v) = t.n_curvature_refused {
+                mix_n_curvature_refused[i] = v as i64;
+            }
+            if let Some(v) = t.n_sky_linearization_refused {
+                mix_n_sky_linearization_refused[i] = v as i64;
+            }
+        }
     }
 
     let n_events = prop_result.events.len();
@@ -1493,6 +1570,30 @@ fn _propagate<'py>(
     dict.set_item(
         "resolved_kind",
         PyArray1::from_owned_array(py, out_resolved_kind),
+    )?;
+    // The six mixture tallies, by the validation schema's column names.
+    // `-1` counts / NaN weight mean "absent" (no mixture, or an engine-None
+    // count) — read absence by name, never as a 0.
+    dict.set_item(
+        "mix_n_components_total",
+        PyArray1::from_owned_array(py, mix_n_components_total),
+    )?;
+    dict.set_item(
+        "mix_weight_delivered",
+        PyArray1::from_owned_array(py, mix_weight_delivered),
+    )?;
+    dict.set_item("mix_n_failed", PyArray1::from_owned_array(py, mix_n_failed))?;
+    dict.set_item(
+        "mix_n_unresolved",
+        PyArray1::from_owned_array(py, mix_n_unresolved),
+    )?;
+    dict.set_item(
+        "mix_n_curvature_refused",
+        PyArray1::from_owned_array(py, mix_n_curvature_refused),
+    )?;
+    dict.set_item(
+        "mix_n_sky_linearization_refused",
+        PyArray1::from_owned_array(py, mix_n_sky_linearization_refused),
     )?;
     // One packed joint per row, or no key at all when no row carried a
     // joint — the states table then leaves that column unset, as it did
@@ -3711,6 +3812,20 @@ fn _generate_ephemeris<'py>(
     let mut out_aberrated_state = Array2::<f64>::from_elem((m, 6), f64::NAN);
     let mut out_aberrated_cov = Array3::<f64>::from_elem((m, 6, 6), f64::NAN);
     let mut out_has_aberrated_cov: Vec<bool> = Vec::with_capacity(m);
+    // The row's sky-covariance kind tag (the `EMPYREAN_COVARIANCE_KIND_*` wire
+    // code, LINEAR=0 when absent) and the self-describing packed joint beside
+    // the bare 6×6 — the same covariance home the propagation rows carry.
+    let mut out_cov_kind = Array1::<u8>::zeros(m);
+    let mut out_joint_rows: Vec<Option<empyrean::PackedJoint>> = Vec::with_capacity(m);
+    // The engine's pre-retention mixture tallies per ephemeris row, by the
+    // validation schema's column names (1:1 with the propagation states table).
+    // Absent rows keep the `-1` / NaN sentinels — never a fabricated 0.
+    let mut mix_n_components_total = Array1::<i64>::from_elem(m, -1);
+    let mut mix_weight_delivered = Array1::<f64>::from_elem(m, f64::NAN);
+    let mut mix_n_failed = Array1::<i64>::from_elem(m, -1);
+    let mut mix_n_unresolved = Array1::<i64>::from_elem(m, -1);
+    let mut mix_n_curvature_refused = Array1::<i64>::from_elem(m, -1);
+    let mut mix_n_sky_linearization_refused = Array1::<i64>::from_elem(m, -1);
 
     // Same mechanism as in `_propagate`'s events output: the C ABI
     // fabricates per-entry `orbit_id` as `"orbit_{i}"` because
@@ -3767,6 +3882,24 @@ fn _generate_ephemeris<'py>(
             }
         }
         out_has_aberrated_cov.push(e.aberrated_covariance.is_some());
+        out_cov_kind[i] = e.cov_kind.to_u8();
+        out_joint_rows.push(e.joint.clone());
+        if let Some(t) = &e.mixture_tally {
+            mix_n_components_total[i] = t.n_components_total as i64;
+            mix_weight_delivered[i] = t.weight_delivered;
+            if let Some(v) = t.n_failed {
+                mix_n_failed[i] = v as i64;
+            }
+            if let Some(v) = t.n_unresolved {
+                mix_n_unresolved[i] = v as i64;
+            }
+            if let Some(v) = t.n_curvature_refused {
+                mix_n_curvature_refused[i] = v as i64;
+            }
+            if let Some(v) = t.n_sky_linearization_refused {
+                mix_n_sky_linearization_refused[i] = v as i64;
+            }
+        }
     }
 
     let dict = PyDict::new(py);
@@ -3815,6 +3948,43 @@ fn _generate_ephemeris<'py>(
         PyArray3::from_owned_array(py, out_aberrated_cov),
     )?;
     dict.set_item("has_aberrated_covariance", out_has_aberrated_cov)?;
+    // The sky covariance's kind tag per row, and the one packed joint per row
+    // (a flat `EmpyreanPackedJoint`-shaped mapping, or `None` for a row that
+    // carried no covariance) — the same joint accessors the propagation
+    // result exposes, so a consumer reads the sky covariance's provenance the
+    // same way it reads a propagated state's.
+    dict.set_item("cov_kind", PyArray1::from_owned_array(py, out_cov_kind))?;
+    // The six mixture tallies, by the validation schema's column names. `-1`
+    // counts / NaN weight mean "absent" — read absence by name, never as 0.
+    dict.set_item(
+        "mix_n_components_total",
+        PyArray1::from_owned_array(py, mix_n_components_total),
+    )?;
+    dict.set_item(
+        "mix_weight_delivered",
+        PyArray1::from_owned_array(py, mix_weight_delivered),
+    )?;
+    dict.set_item("mix_n_failed", PyArray1::from_owned_array(py, mix_n_failed))?;
+    dict.set_item(
+        "mix_n_unresolved",
+        PyArray1::from_owned_array(py, mix_n_unresolved),
+    )?;
+    dict.set_item(
+        "mix_n_curvature_refused",
+        PyArray1::from_owned_array(py, mix_n_curvature_refused),
+    )?;
+    dict.set_item(
+        "mix_n_sky_linearization_refused",
+        PyArray1::from_owned_array(py, mix_n_sky_linearization_refused),
+    )?;
+    let joint_list = PyList::empty(py);
+    for row in &out_joint_rows {
+        match row {
+            Some(j) => joint_list.append(packed_joint_to_pydict(py, j)?)?,
+            None => joint_list.append(py.None())?,
+        }
+    }
+    dict.set_item("joint", joint_list)?;
 
     // ── Observation sensitivities — one row per
     // (orbit, observer, epoch). jacobian/hessian are row-major-flattened
@@ -5238,6 +5408,9 @@ fn build_planning_config_from_dict(d: &Bound<'_, PyDict>) -> PyResult<empyrean::
         }
         cfg.observatories = observatories;
     }
+    if let Some(m) = uncertainty_method_from_subdict(d)? {
+        cfg.uncertainty_method = m;
+    }
 
     Ok(cfg)
 }
@@ -5546,6 +5719,12 @@ fn _evaluate_plan<'py>(
     dict.set_item("orbit_id", plan.orbit_id)?;
     dict.set_item("active_width", plan.active_width)?;
     dict.set_item("log_det_gain", plan.log_det_gain)?;
+    // The resolved covariance kind the fold ran under, as its
+    // `EMPYREAN_COVARIANCE_KIND_*` tag (Python decodes it to CovarianceKind).
+    dict.set_item(
+        "resolved_method",
+        covariance_kind_to_u8(plan.resolved_method),
+    )?;
     add_covariance_metrics_to_dict(&dict, &plan.prior, "prior_")?;
     add_covariance_metrics_to_dict(&dict, &plan.posterior, "posterior_")?;
 
@@ -6174,6 +6353,9 @@ fn build_od_config_from_dict(d: &Bound<'_, PyDict>) -> PyResult<empyrean::ODConf
                 )));
             }
         };
+    }
+    if let Some(m) = uncertainty_method_from_subdict(d)? {
+        cfg.uncertainty_method = m;
     }
 
     Ok(cfg)
@@ -7098,6 +7280,21 @@ fn pydict_to_ephemeris(dict: &Bound<'_, PyDict>) -> PyResult<Vec<empyrean::Ephem
         .ok_or_else(|| PyValueError::new_err("missing 'dec_deg'"))?
         .extract()?;
     let n = orbit_ids.len();
+    // The row covariance kind rides as its wire code; it is required, like
+    // the angles above, so a caller that omits it is refused by name rather
+    // than having its rows labelled Linear. A retired / unknown code is
+    // refused by name too.
+    let cov_kind_codes: PyReadonlyArray1<u8> = dict
+        .get_item("cov_kind")?
+        .ok_or_else(|| PyValueError::new_err("missing 'cov_kind'"))?
+        .extract()?;
+    let cov_kinds: Vec<empyrean::CovarianceKind> = cov_kind_codes
+        .as_array()
+        .iter()
+        .map(|&c| {
+            empyrean::CovarianceKind::from_u8(c).map_err(|e| PyValueError::new_err(e.to_string()))
+        })
+        .collect::<PyResult<Vec<_>>>()?;
     let rho = read_array_or_zero(dict, "rho_au", n)?;
     let vrho = read_array_or_zero(dict, "vrho_au_day", n)?;
     let vra = read_array_or_zero(dict, "vra_deg_day", n)?;
@@ -7114,6 +7311,44 @@ fn pydict_to_ephemeris(dict: &Bound<'_, PyDict>) -> PyResult<Vec<empyrean::Ephem
     let lunar_elong = read_array_or_nan(dict, "lunar_elongation", n)?;
     let position_angle = read_array_or_nan(dict, "position_angle", n)?;
     let sky_rate = read_array_or_nan(dict, "sky_rate", n)?;
+    // The six pre-retention mixture tallies ride through this file-write path
+    // the same way `cov_kind` does: required keys (a dict without them is
+    // refused by name, never defaulted to absent), each in its wire form — a
+    // `-1` count / NaN weight means "not carried". Presence is read off
+    // `mix_n_components_total >= 0`: a real mixture always carries a
+    // non-negative component count and `-1` is the dedicated absent sentinel,
+    // so this one convention round-trips without ambiguity and needs no
+    // separate has-flag column.
+    let mix_n_components_total: PyReadonlyArray1<i64> = dict
+        .get_item("mix_n_components_total")?
+        .ok_or_else(|| PyValueError::new_err("missing 'mix_n_components_total'"))?
+        .extract()?;
+    let mix_weight_delivered: PyReadonlyArray1<f64> = dict
+        .get_item("mix_weight_delivered")?
+        .ok_or_else(|| PyValueError::new_err("missing 'mix_weight_delivered'"))?
+        .extract()?;
+    let mix_n_failed: PyReadonlyArray1<i64> = dict
+        .get_item("mix_n_failed")?
+        .ok_or_else(|| PyValueError::new_err("missing 'mix_n_failed'"))?
+        .extract()?;
+    let mix_n_unresolved: PyReadonlyArray1<i64> = dict
+        .get_item("mix_n_unresolved")?
+        .ok_or_else(|| PyValueError::new_err("missing 'mix_n_unresolved'"))?
+        .extract()?;
+    let mix_n_curvature_refused: PyReadonlyArray1<i64> = dict
+        .get_item("mix_n_curvature_refused")?
+        .ok_or_else(|| PyValueError::new_err("missing 'mix_n_curvature_refused'"))?
+        .extract()?;
+    let mix_n_sky_linearization_refused: PyReadonlyArray1<i64> = dict
+        .get_item("mix_n_sky_linearization_refused")?
+        .ok_or_else(|| PyValueError::new_err("missing 'mix_n_sky_linearization_refused'"))?
+        .extract()?;
+    let mix_n_components_total = mix_n_components_total.as_array();
+    let mix_weight_delivered = mix_weight_delivered.as_array();
+    let mix_n_failed = mix_n_failed.as_array();
+    let mix_n_unresolved = mix_n_unresolved.as_array();
+    let mix_n_curvature_refused = mix_n_curvature_refused.as_array();
+    let mix_n_sky_linearization_refused = mix_n_sky_linearization_refused.as_array();
     let epochs = epochs.as_array();
     let ra = ra.as_array();
     let dec = dec.as_array();
@@ -7141,12 +7376,33 @@ fn pydict_to_ephemeris(dict: &Bound<'_, PyDict>) -> PyResult<Vec<empyrean::Ephem
             position_angle_deg: position_angle[i],
             sky_rate_deg_day: sky_rate[i],
             obs_code: obs_codes[i].clone(),
-            // The ephemeris file writers (parquet/JSON/CSV) don't carry
-            // covariance columns — these fields exist for the in-memory
-            // FFI result path, not the file-I/O schema.
+            // The ephemeris file writers (parquet/JSON/CSV) carry the row's
+            // covariance KIND (a cov_kind column) but not the covariance
+            // matrix or packed joint — those remain in-memory-FFI-only, a
+            // documented subset of this file-I/O surface. The mixture tally,
+            // by contrast, IS a file column set (the six mix_* columns), so it
+            // round-trips here: `has_mixture_tally` is `mixture_tally.is_some()`
+            // at the FFI marshal, and that `Some`/`None` is set below.
             covariance: None,
             aberrated_state: [f64::NAN; 6],
             aberrated_covariance: None,
+            cov_kind: cov_kinds[i],
+            joint: None,
+            mixture_tally: {
+                // Present when the row carries a non-negative component count;
+                // `-1` is the absent sentinel. Each refusal / failure count is
+                // engine-`None` (not carried) when its own value is `-1`,
+                // distinct from a real `0`.
+                let opt = |v: i64| -> Option<u32> { (v >= 0).then_some(v as u32) };
+                (mix_n_components_total[i] >= 0).then(|| empyrean::MixtureTally {
+                    n_components_total: mix_n_components_total[i] as u32,
+                    weight_delivered: mix_weight_delivered[i],
+                    n_failed: opt(mix_n_failed[i]),
+                    n_unresolved: opt(mix_n_unresolved[i]),
+                    n_curvature_refused: opt(mix_n_curvature_refused[i]),
+                    n_sky_linearization_refused: opt(mix_n_sky_linearization_refused[i]),
+                })
+            },
         });
     }
     Ok(out)
@@ -8099,6 +8355,15 @@ fn determine_result_to_pydict<'py>(
     dict.set_item("iterations", result.iterations)?;
     dict.set_item("update_norm", result.update_norm)?;
     dict.set_item("converged", result.converged)?;
+    // The kind of covariance this fit delivered, as its
+    // `EMPYREAN_COVARIANCE_KIND_*` code (Python decodes it to CovarianceKind,
+    // the one vocabulary every covariance-bearing result is tagged in).
+    // Always the linear kind on the OD seam; an `Auto` request also lands a
+    // resolution note on `warnings`.
+    dict.set_item(
+        "resolved_method",
+        covariance_kind_to_u8(result.resolved_method),
+    )?;
     // How the solve that produced the published state stopped, and how
     // far from stationary it was when it did. An absent reading omits
     // its key entirely rather than emitting 0 / NaN — the loud-None

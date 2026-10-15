@@ -669,6 +669,21 @@ def _build_state_sensitivity(result: dict[str, Any]) -> "StateSensitivities | No
     else:
         resolved_kind_col = [None] * n
 
+    # The engine's pre-retention mixture tallies ride beside the resolved kind.
+    # A `-1` count / NaN weight in the dict is "absent" → `None` here, never 0.
+    def _mix_int(key: str) -> list[int | None]:
+        arr = result.get(key)
+        if arr is None:
+            return [None] * n
+        return [int(v) if int(v) >= 0 else None for v in np.asarray(arr)]
+
+    def _mix_weight() -> list[float | None]:
+        arr = result.get("mix_weight_delivered")
+        if arr is None:
+            return [None] * n
+        a = np.asarray(arr, dtype=np.float64)
+        return [None if np.isnan(v) else float(v) for v in a]
+
     return StateSensitivities.from_kwargs(
         orbit_id=orbit_ids,
         object_id=object_ids,
@@ -676,6 +691,12 @@ def _build_state_sensitivity(result: dict[str, Any]) -> "StateSensitivities | No
         stm=stm_col,
         stt=stt_col,
         resolved_kind=resolved_kind_col,
+        mix_n_components_total=_mix_int("mix_n_components_total"),
+        mix_weight_delivered=_mix_weight(),
+        mix_n_failed=_mix_int("mix_n_failed"),
+        mix_n_unresolved=_mix_int("mix_n_unresolved"),
+        mix_n_curvature_refused=_mix_int("mix_n_curvature_refused"),
+        mix_n_sky_linearization_refused=_mix_int("mix_n_sky_linearization_refused"),
     )
 
 

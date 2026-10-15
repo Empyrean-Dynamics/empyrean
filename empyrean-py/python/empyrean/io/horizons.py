@@ -103,11 +103,18 @@ def query_horizons(
             return pa.array(arr.tolist(), type=pa.float64(), mask=mask)
         return arr
 
+    from empyrean.orbits.joint import CovarianceKind, PackedJoints
+
     return Ephemeris.from_kwargs(
         orbit_id=result["orbit_id"],
         object_id=[s if s else None for s in result["object_id"]],
         obs_code=result["obs_code"],
         coordinates=coordinates,
+        # A Horizons observer-table row carries no sky covariance: the kind is
+        # LINEAR and the packed joint is absent (null), the same shape a native
+        # row takes when it has no covariance.
+        cov_kind=[CovarianceKind.LINEAR.value] * m,
+        joint=PackedJoints.from_joints([None] * m),
         aberrated_state=aberrated_state,
         light_time=_nullable("light_time"),
         phase_angle=_nullable("phase_angle"),
@@ -121,6 +128,14 @@ def query_horizons(
         lunar_elongation=nans,
         position_angle=nans,
         sky_rate=nans,
+        # A Horizons observer-table row has no covariance and no mixture
+        # accounting — the six tallies are absent (null).
+        mix_n_components_total=[None] * m,
+        mix_weight_delivered=[None] * m,
+        mix_n_failed=[None] * m,
+        mix_n_unresolved=[None] * m,
+        mix_n_curvature_refused=[None] * m,
+        mix_n_sky_linearization_refused=[None] * m,
     )
 
 

@@ -259,6 +259,16 @@ pub unsafe extern "C" fn empyrean_query_horizons(
                 aberrated_state: [f64::NAN; 6],
                 has_aberrated_covariance: 0,
                 aberrated_covariance: [[f64::NAN; 6]; 6],
+                // No sky covariance on a Horizons observer-table record, so
+                // the kind is LINEAR and the joint is the absent width-0
+                // joint — the same shape a native row carries when it has no
+                // covariance.
+                cov_kind: crate::propagate::EMPYREAN_COVARIANCE_KIND_LINEAR,
+                joint: crate::joint::empty_packed_joint(),
+                // A Horizons observer-table record carries no sky covariance,
+                // so there is no derivation and no mixture accounting.
+                has_mixture_tally: 0,
+                mixture_tally: crate::joint::absent_mixture_tally(),
             };
             unsafe { ptr.add(i).write(entry) };
         }

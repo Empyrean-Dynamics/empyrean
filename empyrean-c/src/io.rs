@@ -877,6 +877,27 @@ struct EphemerisRow {
     lunar_elongation_deg: f64,
     position_angle_deg: f64,
     sky_rate_deg_day: f64,
+    // The row's covariance-kind wire code, mirroring the events writer's
+    // `resolved_kind`: `kind_code(e.cov_kind)` — `-1` for the `0xFF` sentinel,
+    // else the `EMPYREAN_COVARIANCE_KIND_*` value (a no-covariance row carries
+    // `Linear`, so this is a real kind, never the sentinel, in practice).
+    // Appended last so the file schemas grow append-only. The packed joint is
+    // NOT carried in the files (the propagation file writers carry none
+    // either), so the bare 6×6 angular columns stay the covariance a file row
+    // holds.
+    cov_kind: i32,
+    // The engine's pre-retention Gaussian-mixture accounting for the row's
+    // covariance, appended after `cov_kind` (so the schema still grows only at
+    // the tail). Absent on every non-mixture row: each count is the `-1`
+    // "not carried" sentinel and `mix_weight_delivered` is NaN, never a
+    // fabricated `0`. The engine's i64 counts narrow to i32 here (component
+    // counts are small), mirroring `cov_kind`'s Int32 file column.
+    mix_n_components_total: i32,
+    mix_weight_delivered: f64,
+    mix_n_failed: i32,
+    mix_n_unresolved: i32,
+    mix_n_curvature_refused: i32,
+    mix_n_sky_linearization_refused: i32,
 }
 
 fn ephemeris_to_rows(entries: &[EmpyreanEphemerisEntry]) -> Vec<EphemerisRow> {
@@ -891,6 +912,29 @@ fn ephemeris_to_rows(entries: &[EmpyreanEphemerisEntry]) -> Vec<EphemerisRow> {
                     .into_owned()
             };
             let obs_code = obs_code_bytes_to_string(&e.obs_code);
+            // The engine's pre-retention mixture accounting rides the row when
+            // its covariance was a mixture; absent (every count -1, weight NaN)
+            // otherwise — never fabricated zeros.
+            let (
+                mix_n_components_total,
+                mix_weight_delivered,
+                mix_n_failed,
+                mix_n_unresolved,
+                mix_n_curvature_refused,
+                mix_n_sky_linearization_refused,
+            ) = if e.has_mixture_tally != 0 {
+                let t = e.mixture_tally;
+                (
+                    t.n_components_total as i32,
+                    t.weight_delivered,
+                    t.n_failed as i32,
+                    t.n_unresolved as i32,
+                    t.n_curvature_refused as i32,
+                    t.n_sky_linearization_refused as i32,
+                )
+            } else {
+                (-1, f64::NAN, -1, -1, -1, -1)
+            };
             EphemerisRow {
                 orbit_id,
                 obs_code,
@@ -913,6 +957,13 @@ fn ephemeris_to_rows(entries: &[EmpyreanEphemerisEntry]) -> Vec<EphemerisRow> {
                 lunar_elongation_deg: e.lunar_elongation_deg,
                 position_angle_deg: e.position_angle_deg,
                 sky_rate_deg_day: e.sky_rate_deg_day,
+                cov_kind: kind_code(e.cov_kind),
+                mix_n_components_total,
+                mix_weight_delivered,
+                mix_n_failed,
+                mix_n_unresolved,
+                mix_n_curvature_refused,
+                mix_n_sky_linearization_refused,
             }
         })
         .collect()
@@ -1845,7 +1896,7 @@ fn write_rows_parquet_generic<T>(
 
 // Schema descriptors + append fns per row type.
 
-const EPHEMERIS_PARQUET_FIELDS: [ParquetField; 21] = [
+const EPHEMERIS_PARQUET_FIELDS: [ParquetField; 28] = [
     ParquetField {
         name: "orbit_id",
         data_type: DataType::Utf8,
@@ -1951,6 +2002,47 @@ const EPHEMERIS_PARQUET_FIELDS: [ParquetField; 21] = [
         data_type: DataType::Float64,
         nullable: false,
     },
+    // Appended last (the 22nd field) so a reader of an older 21-column file
+    // still parses — the schema grows only at the tail, every prior column
+    // keeps its name, type and position.
+    ParquetField {
+        name: "cov_kind",
+        data_type: DataType::Int32,
+        nullable: false,
+    },
+    // The six mixture tallies, appended after cov_kind so the schema still
+    // grows only at the tail; every prior column keeps its name, type and
+    // position. Absent on a non-mixture row (counts -1, weight NaN).
+    ParquetField {
+        name: "mix_n_components_total",
+        data_type: DataType::Int32,
+        nullable: false,
+    },
+    ParquetField {
+        name: "mix_weight_delivered",
+        data_type: DataType::Float64,
+        nullable: false,
+    },
+    ParquetField {
+        name: "mix_n_failed",
+        data_type: DataType::Int32,
+        nullable: false,
+    },
+    ParquetField {
+        name: "mix_n_unresolved",
+        data_type: DataType::Int32,
+        nullable: false,
+    },
+    ParquetField {
+        name: "mix_n_curvature_refused",
+        data_type: DataType::Int32,
+        nullable: false,
+    },
+    ParquetField {
+        name: "mix_n_sky_linearization_refused",
+        data_type: DataType::Int32,
+        nullable: false,
+    },
 ];
 
 fn ephemeris_append(row: &EphemerisRow, b: &mut [Builder]) -> Result<(), String> {
@@ -2016,6 +2108,27 @@ fn ephemeris_append(row: &EphemerisRow, b: &mut [Builder]) -> Result<(), String>
     }
     if let Builder::F64(f) = &mut b[20] {
         f.append_value(row.sky_rate_deg_day);
+    }
+    if let Builder::I32(i) = &mut b[21] {
+        i.append_value(row.cov_kind);
+    }
+    if let Builder::I32(i) = &mut b[22] {
+        i.append_value(row.mix_n_components_total);
+    }
+    if let Builder::F64(f) = &mut b[23] {
+        f.append_value(row.mix_weight_delivered);
+    }
+    if let Builder::I32(i) = &mut b[24] {
+        i.append_value(row.mix_n_failed);
+    }
+    if let Builder::I32(i) = &mut b[25] {
+        i.append_value(row.mix_n_unresolved);
+    }
+    if let Builder::I32(i) = &mut b[26] {
+        i.append_value(row.mix_n_curvature_refused);
+    }
+    if let Builder::I32(i) = &mut b[27] {
+        i.append_value(row.mix_n_sky_linearization_refused);
     }
     Ok(())
 }
@@ -3206,6 +3319,304 @@ mod photometry_batch_tests {
 
         unsafe { empyrean_orbits_batch_free(&mut read_back) };
         unsafe { empyrean_orbits_batch_free(&written as *const _ as *mut _) };
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod ephemeris_cov_kind_writer_tests {
+    use super::residual_writer_tests::tmp_dir;
+    use super::*;
+    use arrow::array::Int32Array;
+
+    /// The 21 ephemeris columns that predate the `cov_kind` append, in order.
+    /// The writers must grow only at the tail, so a reader of an older file
+    /// still parses every one of these by name and position.
+    const PRIOR_EPHEMERIS_COLUMNS: [&str; 21] = [
+        "orbit_id",
+        "obs_code",
+        "epoch_mjd_tdb",
+        "ra_deg",
+        "dec_deg",
+        "rho_au",
+        "vrho_au_day",
+        "vra_deg_day",
+        "vdec_deg_day",
+        "light_time_days",
+        "phase_angle_deg",
+        "elongation_deg",
+        "heliocentric_distance_au",
+        "mag",
+        "mag_sigma",
+        "zenith_angle_deg",
+        "azimuth_deg",
+        "hour_angle_deg",
+        "lunar_elongation_deg",
+        "position_angle_deg",
+        "sky_rate_deg_day",
+    ];
+
+    /// A zeroed ephemeris entry carrying a chosen covariance-kind wire value.
+    fn entry(epoch: f64, cov_kind: u8) -> EmpyreanEphemerisEntry {
+        let mut e: EmpyreanEphemerisEntry = unsafe { std::mem::zeroed() };
+        e.epoch_mjd_tdb = epoch;
+        e.ra_deg = 123.5;
+        e.dec_deg = -4.25;
+        e.cov_kind = cov_kind;
+        e
+    }
+
+    /// Each writer carries a per-row `cov_kind` column that round-trips
+    /// through the matching reader, and the file schemas grow ONLY by that
+    /// appended column: the 21 prior columns keep their names and order.
+    ///
+    /// Mutation: dropping the `cov_kind` field from `EphemerisRow` /
+    /// `EPHEMERIS_PARQUET_FIELDS` / `ephemeris_append` drops the column and
+    /// every `cov_kind` lookup below goes red.
+    #[test]
+    fn each_writer_carries_cov_kind_appended_and_round_trips() {
+        let dir = tmp_dir("ephemeris-cov-kind");
+        // Linear, SecondOrder, Mixture — three distinct wire codes.
+        let entries = [entry(60000.0, 0), entry(60001.0, 1), entry(60002.0, 3)];
+        let expected: Vec<i32> = vec![0, 1, 3];
+
+        let pq = dir.join("e.parquet");
+        let js = dir.join("e.json");
+        let cs = dir.join("e.csv");
+        let c_pq = std::ffi::CString::new(pq.to_str().unwrap()).unwrap();
+        let c_js = std::ffi::CString::new(js.to_str().unwrap()).unwrap();
+        let c_cs = std::ffi::CString::new(cs.to_str().unwrap()).unwrap();
+        assert_eq!(
+            unsafe {
+                empyrean_ephemeris_write_parquet(c_pq.as_ptr(), entries.as_ptr(), entries.len())
+            },
+            0
+        );
+        assert_eq!(
+            unsafe {
+                empyrean_ephemeris_write_json(c_js.as_ptr(), entries.as_ptr(), entries.len())
+            },
+            0
+        );
+        assert_eq!(
+            unsafe { empyrean_ephemeris_write_csv(c_cs.as_ptr(), entries.as_ptr(), entries.len()) },
+            0
+        );
+
+        // Parquet: the schema is the 21 prior columns in order, then cov_kind,
+        // and the Int32 column carries the per-row kinds.
+        let file = File::open(&pq).expect("open parquet");
+        let mut reader =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+                .expect("parquet reader")
+                .build()
+                .expect("build reader");
+        let batch = reader.next().expect("one batch").expect("batch ok");
+        let names: Vec<String> = batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert_eq!(
+            &names[..21],
+            &PRIOR_EPHEMERIS_COLUMNS,
+            "the 21 prior columns keep their names and order"
+        );
+        assert_eq!(
+            names[21], "cov_kind",
+            "cov_kind keeps its position after the 21 prior columns"
+        );
+        assert_eq!(
+            names.len(),
+            28,
+            "cov_kind plus the six appended mixture-tally columns"
+        );
+        let idx = batch
+            .schema()
+            .index_of("cov_kind")
+            .expect("cov_kind column");
+        let col = batch
+            .column(idx)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("cov_kind is Int32");
+        let got: Vec<i32> = (0..col.len()).map(|i| col.value(i)).collect();
+        assert_eq!(got, expected, "parquet cov_kind round-trips per row");
+
+        // CSV: cov_kind is the last header column and each data row ends with
+        // its kind.
+        let csv_text = std::fs::read_to_string(&cs).expect("read csv");
+        let mut lines = csv_text.lines();
+        let header: Vec<&str> = lines.next().expect("header").split(',').collect();
+        assert_eq!(&header[..21], &PRIOR_EPHEMERIS_COLUMNS);
+        assert_eq!(header[21], "cov_kind");
+        for (line, want) in lines.zip(expected.iter()) {
+            let field = line.split(',').nth(21).expect("cov_kind field");
+            assert_eq!(field, want.to_string(), "csv cov_kind round-trips per row");
+        }
+
+        // JSON: every object carries the cov_kind key with its kind.
+        let json_text = std::fs::read_to_string(&js).expect("read json");
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&json_text).expect("json");
+        for (row, want) in rows.iter().zip(expected.iter()) {
+            let v = row
+                .get("cov_kind")
+                .and_then(|x| x.as_i64())
+                .expect("cov_kind key present");
+            assert_eq!(v as i32, *want, "json cov_kind round-trips per row");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An entry whose sky covariance was a mixture, carrying the engine's six
+    /// tallies (with `n_unresolved` / `n_sky_linearization_refused` engine-None
+    /// → `-1`).
+    fn mixture_entry(epoch: f64) -> EmpyreanEphemerisEntry {
+        let mut e = entry(epoch, 3);
+        e.has_mixture_tally = 1;
+        e.mixture_tally = crate::joint::EmpyreanMixtureTally {
+            n_components_total: 7,
+            weight_delivered: 0.9,
+            n_failed: 2,
+            n_unresolved: -1,
+            n_curvature_refused: 3,
+            n_sky_linearization_refused: -1,
+        };
+        e
+    }
+
+    /// The ephemeris writers carry the six mixture-tally columns, appended
+    /// after `cov_kind`: a mixture row reports the engine's tallies and a
+    /// non-mixture row reports the absent sentinel (`-1` counts, NaN weight),
+    /// never fabricated zeros.
+    ///
+    /// Mutation: writing `0` instead of the `-1` / NaN sentinel for a
+    /// non-mixture row in `ephemeris_to_rows` turns the absent-row asserts red;
+    /// dropping any `mix_*` field from `EphemerisRow` / the parquet field array
+    /// / `ephemeris_append` drops the column and the lookups go red.
+    #[test]
+    fn each_writer_carries_mixture_tally_appended_and_round_trips() {
+        use arrow::array::Float64Array;
+        let dir = tmp_dir("ephemeris-mixture-tally");
+        // Row 0: a mixture. Row 1: no mixture (absent tally).
+        let entries = [mixture_entry(60000.0), entry(60001.0, 0)];
+
+        let pq = dir.join("e.parquet");
+        let js = dir.join("e.json");
+        let cs = dir.join("e.csv");
+        let c_pq = std::ffi::CString::new(pq.to_str().unwrap()).unwrap();
+        let c_js = std::ffi::CString::new(js.to_str().unwrap()).unwrap();
+        let c_cs = std::ffi::CString::new(cs.to_str().unwrap()).unwrap();
+        assert_eq!(
+            unsafe {
+                empyrean_ephemeris_write_parquet(c_pq.as_ptr(), entries.as_ptr(), entries.len())
+            },
+            0
+        );
+        assert_eq!(
+            unsafe {
+                empyrean_ephemeris_write_json(c_js.as_ptr(), entries.as_ptr(), entries.len())
+            },
+            0
+        );
+        assert_eq!(
+            unsafe { empyrean_ephemeris_write_csv(c_cs.as_ptr(), entries.as_ptr(), entries.len()) },
+            0
+        );
+
+        // Parquet: the six mixture columns follow cov_kind (positions 22..28).
+        let file = File::open(&pq).expect("open parquet");
+        let mut reader =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+                .expect("parquet reader")
+                .build()
+                .expect("build reader");
+        let batch = reader.next().expect("one batch").expect("batch ok");
+        let names: Vec<String> = batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert_eq!(
+            &names[22..28],
+            &[
+                "mix_n_components_total",
+                "mix_weight_delivered",
+                "mix_n_failed",
+                "mix_n_unresolved",
+                "mix_n_curvature_refused",
+                "mix_n_sky_linearization_refused",
+            ],
+            "the six mixture columns follow cov_kind, in order"
+        );
+        let i32_col = |name: &str| -> Vec<i32> {
+            let idx = batch.schema().index_of(name).expect("column");
+            let c = batch
+                .column(idx)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("Int32");
+            (0..c.len()).map(|i| c.value(i)).collect()
+        };
+        assert_eq!(
+            i32_col("mix_n_components_total"),
+            vec![7, -1],
+            "mixture row 7, absent row -1"
+        );
+        assert_eq!(i32_col("mix_n_failed"), vec![2, -1]);
+        assert_eq!(
+            i32_col("mix_n_unresolved"),
+            vec![-1, -1],
+            "engine-None on the mixture row is -1, and the absent row is -1"
+        );
+        assert_eq!(i32_col("mix_n_curvature_refused"), vec![3, -1]);
+        assert_eq!(
+            i32_col("mix_n_sky_linearization_refused"),
+            vec![-1, -1],
+            "sky-linearization refusals are carried as -1 (absent), never 0"
+        );
+        let widx = batch.schema().index_of("mix_weight_delivered").unwrap();
+        let wcol = batch
+            .column(widx)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("Float64");
+        assert_eq!(wcol.value(0), 0.9, "mixture row carries the delivered mass");
+        assert!(
+            wcol.value(1).is_nan(),
+            "an absent weight is NaN, never a fabricated 0"
+        );
+
+        // JSON: the absent row carries -1 counts (never 0) by name.
+        let json_text = std::fs::read_to_string(&js).expect("read json");
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&json_text).expect("json");
+        assert_eq!(
+            rows[0].get("mix_n_components_total").unwrap().as_i64(),
+            Some(7)
+        );
+        assert_eq!(
+            rows[1]
+                .get("mix_n_sky_linearization_refused")
+                .unwrap()
+                .as_i64(),
+            Some(-1),
+            "an absent row reads -1 by name, not 0"
+        );
+
+        // CSV: the six columns are present in the header, after cov_kind.
+        let csv_text = std::fs::read_to_string(&cs).expect("read csv");
+        let header: Vec<&str> = csv_text
+            .lines()
+            .next()
+            .expect("header")
+            .split(',')
+            .collect();
+        assert_eq!(header[22], "mix_n_components_total");
+        assert_eq!(header[27], "mix_n_sky_linearization_refused");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

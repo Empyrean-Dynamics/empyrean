@@ -986,6 +986,17 @@ pub struct EmpyreanPropagatedState {
     ///
     /// **Library-owned** `tri`, freed with the parent result.
     pub orbit_cov: crate::joint::EmpyreanPackedJoint,
+    /// 1 when [`mixture_tally`](Self::mixture_tally) carries the engine's
+    /// pre-retention Gaussian-mixture accounting — i.e. this row's resolved
+    /// covariance was derived as an adaptive Gaussian mixture; 0 otherwise.
+    /// Read presence from this flag, not from `resolved_kind`, the same way
+    /// every other optional payload on this struct is gated.
+    pub has_mixture_tally: u8,
+    /// The engine's pre-retention mixture tallies for this row's covariance,
+    /// valid only when `has_mixture_tally == 1`; the absent sentinel (every
+    /// `n_*` field `-1`) otherwise. See
+    /// [`EmpyreanMixtureTally`](crate::joint::EmpyreanMixtureTally).
+    pub mixture_tally: crate::joint::EmpyreanMixtureTally,
 }
 
 /// A detected dynamical event from propagation.
@@ -2392,18 +2403,45 @@ pub(crate) fn marshal_propagation_result(
         //   value). It is never re-derived from the draws here. A sampled row
         //   below the rank floor (or whose cloud was short at this epoch)
         //   publishes no second moment and is honestly absent (empty joint).
-        let orbit_cov = match resolved_covariance_kind {
+        // The engine's pre-retention mixture accounting rides WITH the
+        // covariance it describes: read it off the delivered `Uncertainty`'s
+        // derivation BEFORE the value is consumed into the
+        // representation-erased joint (which drops the derivation). A Mixture
+        // row — a close approach that split under `Auto` — carries the six
+        // tallies; every other derivation leaves them absent by name. The one
+        // shared helper decides presence for every arm.
+        let (orbit_cov, has_mixture_tally, mixture_tally) = match resolved_covariance_kind {
             Some(
                 empyrean_core::propagation::CovarianceKind::MonteCarlo { .. }
                 | empyrean_core::propagation::CovarianceKind::SigmaPoint,
             ) => match prop_result.states.covariance(i) {
-                Some(unc) => crate::joint::cartesian_uncertainty_to_c(unc.clone()),
-                None => crate::joint::empty_packed_joint(),
+                Some(unc) => {
+                    let (has, tally) =
+                        crate::joint::mixture_tally_from_derivation(unc.derivation());
+                    (
+                        crate::joint::cartesian_uncertainty_to_c(unc.clone()),
+                        has,
+                        tally,
+                    )
+                }
+                None => (
+                    crate::joint::empty_packed_joint(),
+                    0,
+                    crate::joint::absent_mixture_tally(),
+                ),
             },
             _ => match prop_result.uncertainty(orbit_idx, time_idx) {
-                None => crate::joint::empty_packed_joint(),
+                None => (
+                    crate::joint::empty_packed_joint(),
+                    0,
+                    crate::joint::absent_mixture_tally(),
+                ),
                 Some(query) => match query.covariance() {
-                    Ok(unc) => crate::joint::cartesian_uncertainty_to_c(unc),
+                    Ok(unc) => {
+                        let (has, tally) =
+                            crate::joint::mixture_tally_from_derivation(unc.derivation());
+                        (crate::joint::cartesian_uncertainty_to_c(unc), has, tally)
+                    }
                     Err(e) => {
                         set_last_error(&e.to_string());
                         unsafe { free_states_and_ids(states_ptr, ids_ptr, i, n, states_layout) };
@@ -2434,6 +2472,8 @@ pub(crate) fn marshal_propagation_result(
             // joint, sharing the row's provenance with the lazy query it was
             // resolved from.
             orbit_cov,
+            has_mixture_tally,
+            mixture_tally,
         };
 
         unsafe {
@@ -2908,6 +2948,14 @@ pub struct EmpyreanTaggedCovariance {
     pub frame: i32,
     /// Origin NAIF id, same encoding as `EmpyreanPropagatedState.origin`.
     pub origin: i32,
+    /// 1 when [`mixture_tally`](Self::mixture_tally) carries the engine's
+    /// pre-retention Gaussian-mixture accounting (this entry's covariance was
+    /// derived as a mixture); 0 otherwise. Read the flag, not `joint.kind`.
+    pub has_mixture_tally: u8,
+    /// The engine's pre-retention mixture tallies for this covariance, valid
+    /// only when `has_mixture_tally == 1`; the absent sentinel otherwise. See
+    /// [`EmpyreanMixtureTally`](crate::joint::EmpyreanMixtureTally).
+    pub mixture_tally: crate::joint::EmpyreanMixtureTally,
 }
 
 /// Owned series of [`EmpyreanTaggedCovariance`], one entry per output
@@ -2966,6 +3014,13 @@ fn flatten_tagged_covariance(
     let origin = basis.origin.naif_id();
     let frame = frame_to_int(basis.frame);
 
+    // The engine's pre-retention mixture accounting, read off the derivation
+    // BEFORE `unc` is consumed into the representation-erased joint (which
+    // drops it). A mixture entry carries the six tallies; every other
+    // derivation leaves them absent by name.
+    let (has_mixture_tally, mixture_tally) =
+        crate::joint::mixture_tally_from_derivation(unc.derivation());
+
     // The covariance itself is the one packed joint. This CONSUMES `unc`, so
     // every per-entry quantity above is read off it first.
     let joint = crate::joint::cartesian_uncertainty_to_c(unc);
@@ -2980,6 +3035,8 @@ fn flatten_tagged_covariance(
         has_mean_shift_prop,
         frame,
         origin,
+        has_mixture_tally,
+        mixture_tally,
     })
 }
 

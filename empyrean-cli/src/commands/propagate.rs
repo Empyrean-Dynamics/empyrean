@@ -322,8 +322,30 @@ fn print_tagged_covariance_series(input: &OrbitBatch, result: &PropagationResult
                     let m = tagged.matrix();
                     let sigma_km = |i: usize| m[i][i].max(0.0).sqrt() * AU_KM;
                     let mjd = tagged.epoch.mjd_tdb().unwrap_or(f64::NAN);
+                    // The engine's pre-retention mixture tallies ride beside the
+                    // row's covariance; surface them inline only on a mixture
+                    // row (a `-` is an engine-None count, never a fabricated 0),
+                    // so the common non-mixture table stays uncluttered.
+                    let mix = tagged
+                        .mixture_tally
+                        .as_ref()
+                        .map(|t| {
+                            let n = |v: Option<u32>| {
+                                v.map(|x| x.to_string()).unwrap_or_else(|| "-".to_string())
+                            };
+                            format!(
+                                "  [mix: n={} w={:.3} fail={} unres={} curv={} skylin={}]",
+                                t.n_components_total,
+                                t.weight_delivered,
+                                n(t.n_failed),
+                                n(t.n_unresolved),
+                                n(t.n_curvature_refused),
+                                n(t.n_sky_linearization_refused),
+                            )
+                        })
+                        .unwrap_or_default();
                     eprintln!(
-                        "    {:>14.5} {:>12} {:>12.3} {:>12.3} {:>12.3} {:>5} {}",
+                        "    {:>14.5} {:>12} {:>12.3} {:>12.3} {:>12.3} {:>5} {}{}",
                         mjd,
                         kind_str(tagged.kind()),
                         sigma_km(0),
@@ -331,6 +353,7 @@ fn print_tagged_covariance_series(input: &OrbitBatch, result: &PropagationResult
                         sigma_km(2),
                         tagged.solved_width(),
                         quality_str(tagged.quality()),
+                        mix,
                     );
                 }
             }

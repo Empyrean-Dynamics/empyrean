@@ -447,6 +447,235 @@ def _sky_cov(eph) -> np.ndarray:
     return cov.to_matrix()
 
 
+def test_generate_ephemeris_row_carries_sky_cov_kind_and_joint(
+    orbit: CartesianOrbits, observers
+) -> None:
+    """Each ephemeris row carries, beside its bare sky 6x6, the covariance's
+    kind tag and the self-describing packed joint — the same accessors the
+    propagation result exposes. Under SecondOrder the kind is ``second_order``
+    and the joint is a width-6 ``sky`` functional whose state block equals the
+    bare sky covariance; under FirstOrder the kind is ``linear``.
+
+    Mutation record: drop the kind in the C marshaler and the ``second_order``
+    assertion goes red; return the absent joint for a covariance-bearing row
+    and the width-6 / state-block assertions go red.
+    """
+    for method, want in [
+        (UncertaintyMethod.FIRST_ORDER, "linear"),
+        (UncertaintyMethod.SECOND_ORDER, "second_order"),
+    ]:
+        eph = empyrean.generate_ephemeris(orbit, observers, uncertainty_method=method).ephemeris
+        assert len(eph) > 0
+        assert set(eph.cov_kind.to_pylist()) == {want}, f"cov_kind under {method}"
+        bare = eph.coordinates.covariance.to_matrix()
+        for i in range(len(eph)):
+            assert not eph.joint.row_is_empty(i), "a delivered row carries its joint"
+            j = eph.joint.joint(i)
+            assert j is not None
+            assert int(j.width) == 6, "the sky joint is width 6"
+            assert j.functional.value == "sky", "the joint describes the sky functional"
+            assert j.kind.value == want, "the joint's own kind matches cov_kind"
+            np.testing.assert_array_equal(
+                j.state_block(), bare[i], "the joint's state block is the bare sky 6x6"
+            )
+
+
+def test_write_ephemeris_files_carry_cov_kind(orbit: CartesianOrbits, observers, tmp_path) -> None:
+    """The three ephemeris file writers carry each row's covariance KIND as its
+    wire code, so a written parquet / CSV / JSON preserves the kind the CLI and
+    Python API resolved rather than dropping it at the file boundary. Under
+    SecondOrder every row's cov_kind is the SecondOrder code.
+
+    Mutation record: drop cov_kind from ``_ephemeris_to_dict`` (or the C
+    writers) and the files carry the Linear default / no column — every
+    assertion below goes red.
+    """
+    import json
+
+    import pyarrow.parquet as pq
+    from empyrean.io.ephemeris import (
+        write_ephemeris_csv,
+        write_ephemeris_json,
+        write_ephemeris_parquet,
+    )
+    from empyrean.orbits.joint import KIND_TO_CODE, CovarianceKind
+
+    eph = empyrean.generate_ephemeris(
+        orbit, observers, uncertainty_method=UncertaintyMethod.SECOND_ORDER
+    ).ephemeris
+    assert len(eph) > 0
+    want = KIND_TO_CODE[CovarianceKind.SECOND_ORDER]
+
+    pqp, csp, jsp = tmp_path / "e.parquet", tmp_path / "e.csv", tmp_path / "e.json"
+    write_ephemeris_parquet(str(pqp), eph)
+    write_ephemeris_csv(str(csp), eph)
+    write_ephemeris_json(str(jsp), eph)
+
+    t = pq.read_table(str(pqp))
+    assert "cov_kind" in t.column_names, "parquet carries the appended cov_kind column"
+    assert t.column("cov_kind").to_pylist() == [want] * len(eph)
+
+    header = csp.read_text().splitlines()[0].split(",")
+    # cov_kind keeps its position; the six mixture-tally columns were appended
+    # after it, so it is no longer the trailing column.
+    assert "cov_kind" in header, "cov_kind is a CSV column"
+    assert header[-1] == "mix_n_sky_linearization_refused", (
+        "the mixture-tally columns trail cov_kind"
+    )
+
+    rows = json.loads(jsp.read_text())
+    assert [r["cov_kind"] for r in rows] == [want] * len(eph)
+
+
+def test_write_ephemeris_files_round_trip_mixture_tallies(
+    orbit: CartesianOrbits, observers, tmp_path
+) -> None:
+    """The three ephemeris file writers carry each row's six pre-retention
+    mixture tallies through the full Python -> dict -> FFI write path, not just
+    the file schema's empty columns. No fixture splits into a mixture at this
+    engine pin, so a synthetic table stands in: row 0 is a mixture with every
+    tally set to a distinct non-negative value, row 1 is absent (null). After a
+    parquet / CSV / JSON round-trip the mixture row's values survive and the
+    absent row carries the wire's absent encoding (``-1`` counts, NaN weight),
+    never a fabricated 0. The synthetic row's ``cov_kind`` is immaterial here:
+    the write path gates the tally on ``mix_n_components_total >= 0``, not on
+    the kind.
+
+    Mutation record: drop any one of the six ``mix_*`` columns from
+    ``_ephemeris_to_dict`` and ``pydict_to_ephemeris`` refuses the dict by name
+    ("missing 'mix_...'"), so all three writes raise and every assertion below
+    goes red — the columns are required keys, like ``cov_kind``.
+    """
+    import csv
+    import json
+    import math
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from empyrean.io.ephemeris import (
+        write_ephemeris_csv,
+        write_ephemeris_json,
+        write_ephemeris_parquet,
+    )
+
+    base = empyrean.generate_ephemeris(
+        orbit, observers, uncertainty_method=UncertaintyMethod.SECOND_ORDER
+    ).ephemeris
+    assert len(base) >= 2, "need two rows: one synthetic mixture, one absent"
+    eph = (
+        base.take([0, 1])
+        .set_column("mix_n_components_total", pa.array([7, None], type=pa.int64()))
+        .set_column("mix_weight_delivered", pa.array([0.9, None], type=pa.float64()))
+        .set_column("mix_n_failed", pa.array([2, None], type=pa.int64()))
+        .set_column("mix_n_unresolved", pa.array([1, None], type=pa.int64()))
+        .set_column("mix_n_curvature_refused", pa.array([3, None], type=pa.int64()))
+        .set_column("mix_n_sky_linearization_refused", pa.array([4, None], type=pa.int64()))
+    )
+
+    want_mixture = {
+        "mix_n_components_total": 7,
+        "mix_n_failed": 2,
+        "mix_n_unresolved": 1,
+        "mix_n_curvature_refused": 3,
+        "mix_n_sky_linearization_refused": 4,
+    }
+
+    pqp, csp, jsp = tmp_path / "e.parquet", tmp_path / "e.csv", tmp_path / "e.json"
+    write_ephemeris_parquet(str(pqp), eph)
+    write_ephemeris_csv(str(csp), eph)
+    write_ephemeris_json(str(jsp), eph)
+
+    # Parquet: mixture row keeps its values; absent row carries -1 / NaN.
+    t = pq.read_table(str(pqp))
+    for name, want in want_mixture.items():
+        col = t.column(name).to_pylist()
+        assert col[0] == want, f"parquet mixture row keeps {name}={want}"
+        assert col[1] == -1, f"parquet absent row carries -1 for {name}, never 0"
+    w = t.column("mix_weight_delivered").to_pylist()
+    assert w[0] == 0.9, "parquet mixture row keeps the delivered mass"
+    assert math.isnan(w[1]), "parquet absent weight is NaN, never a fabricated 0"
+
+    # JSON: counts are integers (-1 absent, never null); serde maps the absent
+    # weight's NaN to null.
+    rows = json.loads(jsp.read_text())
+    assert len(rows) == 2
+    for name, want in want_mixture.items():
+        assert rows[0][name] == want, f"json mixture row keeps {name}"
+        assert rows[1][name] == -1, f"json absent row carries -1 for {name}, never 0"
+    assert rows[0]["mix_weight_delivered"] == 0.9
+    assert rows[1]["mix_weight_delivered"] is None, "json absent weight serializes as null"
+
+    # CSV: same values via the header-named columns.
+    with open(csp, newline="") as fh:
+        crows = list(csv.DictReader(fh))
+    assert len(crows) == 2
+    for name, want in want_mixture.items():
+        assert int(crows[0][name]) == want, f"csv mixture row keeps {name}"
+        assert int(crows[1][name]) == -1, f"csv absent row carries -1 for {name}, never 0"
+    assert float(crows[0]["mix_weight_delivered"]) == 0.9
+    absent_w = crows[1]["mix_weight_delivered"]
+    assert absent_w == "" or math.isnan(float(absent_w)), (
+        "csv absent weight is the absent encoding (NaN / empty), never 0 or a value"
+    )
+
+
+def test_propagation_states_carry_absent_mixture_tally_by_name(
+    orbit: CartesianOrbits, times: Epochs
+) -> None:
+    """The propagation states' sensitivity table carries the six mixture-tally
+    columns by the validation schema's names. No fixture splits into a mixture
+    at the current engine pin, so every row reads ``None`` (absent) — in
+    particular ``mix_n_sky_linearization_refused`` is read by name and is
+    absent, NOT a fabricated ``0``.
+
+    Mutation record: fabricating ``0`` instead of the ``-1`` / absent sentinel
+    at the C marshal (or wiring the dict to ``0``) turns the ``is None``
+    assertions red — the point of the column is to tell "not carried" from a
+    real ``0``.
+    """
+    result = empyrean.propagate(orbit, times, uncertainty_method=UncertaintyMethod.SECOND_ORDER)
+    sens = result.sensitivity
+    assert sens is not None and len(sens) > 0, "a SecondOrder covariance run traces the STM"
+    for name in (
+        "mix_n_components_total",
+        "mix_weight_delivered",
+        "mix_n_failed",
+        "mix_n_unresolved",
+        "mix_n_curvature_refused",
+        "mix_n_sky_linearization_refused",
+    ):
+        col = getattr(sens, name)
+        assert all(v is None for v in col.to_pylist()), (
+            f"{name} is absent (None) on a non-mixture seam, never a fabricated 0"
+        )
+
+
+def test_generate_ephemeris_rows_carry_absent_mixture_tally_by_name(
+    orbit: CartesianOrbits, observers
+) -> None:
+    """The ephemeris table carries the same six mixture-tally columns by name
+    (1:1 with the states table). No mixture is produced at this engine pin, so
+    every row reads ``None`` — ``mix_n_sky_linearization_refused`` read by name
+    is absent, not ``0``.
+    """
+    eph = empyrean.generate_ephemeris(
+        orbit, observers, uncertainty_method=UncertaintyMethod.SECOND_ORDER
+    ).ephemeris
+    assert len(eph) > 0
+    for name in (
+        "mix_n_components_total",
+        "mix_weight_delivered",
+        "mix_n_failed",
+        "mix_n_unresolved",
+        "mix_n_curvature_refused",
+        "mix_n_sky_linearization_refused",
+    ):
+        col = getattr(eph, name)
+        assert all(v is None for v in col.to_pylist()), (
+            f"{name} is absent (None) on a non-mixture ephemeris row, never 0"
+        )
+
+
 @pytest.mark.parametrize("method", [UncertaintyMethod.SIGMA_POINT, SigmaPoint()])
 def test_generate_ephemeris_sigma_point_delivers_a_sampled_sky_covariance(
     orbit: CartesianOrbits, observers, method

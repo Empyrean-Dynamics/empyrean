@@ -357,6 +357,13 @@ pub struct PlanningConfig {
     /// one orbit and does not shard the work. Any value other than
     /// `None` is rejected rather than accepted and ignored.
     pub num_threads: Option<usize>,
+    /// Uncertainty method for the covariance fold. The default
+    /// [`UncertaintyMethod::FirstOrder`](crate::UncertaintyMethod::FirstOrder)
+    /// is the single-linearization Gaussian fold; the planner also honours
+    /// `SecondOrder`, `SigmaPoint`, `MonteCarlo` and `Auto`, each reported
+    /// on [`PlanResult::resolved_method`] in the covariance-kind
+    /// vocabulary. `Mixture` is refused by name.
+    pub uncertainty_method: crate::UncertaintyMethod,
 }
 
 impl Default for PlanningConfig {
@@ -366,6 +373,7 @@ impl Default for PlanningConfig {
             epsilon: 1e-9,
             observatories: Vec::new(),
             num_threads: None,
+            uncertainty_method: crate::UncertaintyMethod::FirstOrder,
         }
     }
 }
@@ -637,6 +645,15 @@ pub struct PlanResult {
     /// [`PlanCandidate::index`] is its row here. Empty for a radar-only
     /// plan.
     pub ephemeris: Vec<PlanEphemerisPoint>,
+    /// The covariance kind the fold resolved to and reported the prior /
+    /// posterior / cumulative metrics under. `FirstOrder` resolves to
+    /// [`CovarianceKind::Linear`](crate::CovarianceKind::Linear),
+    /// `SecondOrder` / `SigmaPoint` / `MonteCarlo` to their own kinds;
+    /// [`UncertaintyMethod::auto`](crate::UncertaintyMethod::auto) is
+    /// reported as the kind it ran, never as `Auto`. It is the box the
+    /// search is sized to, so a sampled transport's
+    /// [`CovarianceMetrics::log_det_withheld`] reads under this same kind.
+    pub resolved_method: crate::CovarianceKind,
 }
 
 // ── FFI marshaling ──────────────────────────────────────────────────
@@ -1045,6 +1062,7 @@ impl Context {
                     Error::invalid_input(format!("num_threads {n} exceeds the C ABI's i32 range"))
                 })?,
             },
+            uncertainty_method: config.uncertainty_method.to_ffi(),
         };
 
         let mut ffi_result = empyrean_sys::EmpyreanPlanResult::default();
@@ -1183,6 +1201,7 @@ fn plan_result_from_ffi(ffi: &empyrean_sys::EmpyreanPlanResult) -> Result<PlanRe
         active_width,
         ephemeris,
         num_ephemeris,
+        resolved_method,
     } = *ffi;
 
     let mut out_candidates = Vec::with_capacity(num_candidates);
@@ -1216,6 +1235,7 @@ fn plan_result_from_ffi(ffi: &empyrean_sys::EmpyreanPlanResult) -> Result<PlanRe
         candidates: out_candidates,
         active_width,
         ephemeris: out_ephemeris,
+        resolved_method: crate::CovarianceKind::from_u8(resolved_method)?,
     })
 }
 
@@ -1700,5 +1720,29 @@ mod tests {
         assert_eq!(plan.log_det_gain, -12.5);
         assert_eq!(plan.prior.log_det_withheld, None);
         assert_eq!(plan.posterior.log_det_withheld, None);
+    }
+
+    #[test]
+    fn plan_result_from_ffi_decodes_resolved_method() {
+        // A zero-init plan's resolved kind is Linear (the first-order fold);
+        // a SecondOrder tag decodes to SecondOrder. Mutation guard: hard-coding
+        // the decode to Linear fails the second case.
+        let zero = empyrean_sys::EmpyreanPlanResult::default();
+        assert_eq!(
+            plan_result_from_ffi(&zero)
+                .expect("zero-init decodes")
+                .resolved_method,
+            crate::CovarianceKind::Linear
+        );
+        let ffi = empyrean_sys::EmpyreanPlanResult {
+            resolved_method: empyrean_sys::EMPYREAN_COVARIANCE_KIND_SECOND_ORDER as u8,
+            ..Default::default()
+        };
+        assert_eq!(
+            plan_result_from_ffi(&ffi)
+                .expect("second-order plan decodes")
+                .resolved_method,
+            crate::CovarianceKind::SecondOrder
+        );
     }
 }

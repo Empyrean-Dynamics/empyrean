@@ -332,6 +332,67 @@ def _uncertainty_method_params(
     return _UNCERTAINTY_PARAM_DEFAULTS
 
 
+def _uncertainty_method_to_int(uncertainty_method: UncertaintyMethodLike | int) -> int:
+    """Resolve one method spec to its integer tag, the discriminator every
+    distribution channel marshals.
+
+    The parameterized dataclasses map by type, the enum and its wire string by
+    value, and a legacy integer passes through; a ``bool`` is rejected rather
+    than silently read as ``0`` / ``1``. Shared by :func:`_uncertainty_method_to_wire`
+    and the propagate / ephemeris entry points so one tag space serves all.
+    """
+    if isinstance(uncertainty_method, (SigmaPoint, MonteCarlo, GaussianMixture, Auto)):
+        return _DATACLASS_TO_INT[type(uncertainty_method)]
+    if isinstance(uncertainty_method, bool):
+        raise TypeError(
+            "uncertainty_method must be UncertaintyMethod, a SigmaPoint / MonteCarlo / "
+            "GaussianMixture / Auto dataclass, str, or int; got bool"
+        )
+    if isinstance(uncertainty_method, str):
+        tag = _UNCERTAINTY_METHOD_TO_INT.get(uncertainty_method.lower())
+        if tag is None:
+            raise ValueError(f"unknown uncertainty method: {uncertainty_method}")
+        return tag
+    if isinstance(uncertainty_method, UncertaintyMethod):
+        return _UNCERTAINTY_METHOD_TO_INT[uncertainty_method]
+    if isinstance(uncertainty_method, int):
+        return uncertainty_method
+    raise TypeError(
+        "uncertainty_method must be UncertaintyMethod, a SigmaPoint / MonteCarlo / "
+        "GaussianMixture / Auto dataclass, str, or int; got "
+        f"{type(uncertainty_method).__name__}"
+    )
+
+
+def _uncertainty_method_to_wire(
+    uncertainty_method: UncertaintyMethodLike | int,
+) -> dict[str, Any]:
+    """Lower one method spec to the flat sub-dict the OD / planning wire dicts
+    carry: the integer ``tag`` plus every per-variant slot, one key per
+    ``build_uncertainty_method`` argument on the Rust side.
+
+    Reuses the shared :func:`_uncertainty_method_params` lowering, so a config
+    passed to :func:`empyrean.determine` / :func:`empyrean.evaluate_plan`
+    selects exactly the method the same spec would on the propagation seam —
+    the two paths cannot drift. ``mc_seed`` carries ``None`` through unchanged
+    (the entropy-seeded Monte-Carlo case), distinct from a real ``0`` seed.
+    """
+    params = _uncertainty_method_params(uncertainty_method)
+    return {"tag": _uncertainty_method_to_int(uncertainty_method), **params._asdict()}
+
+
+def _uncertainty_method_from_int(tag: int) -> "UncertaintyMethod":
+    """Decode an ``EMPYREAN_UNCERTAINTY_*`` tag a result carries back to the
+    :class:`UncertaintyMethod` enum — the inverse of
+    :func:`_uncertainty_method_to_int` over the non-parameterized names a
+    result reports (a result names the method it resolved to, never its tuning
+    parameters)."""
+    name = _INT_TO_UNCERTAINTY_METHOD.get(tag)
+    if name is None:
+        raise ValueError(f"result carried an unknown uncertainty-method tag: {tag}")
+    return UncertaintyMethod(name)
+
+
 @dataclass
 class DiagnosticsConfig:
     """Per-trajectory diagnostic outputs (sensitivity, nonlinearity,

@@ -41,6 +41,8 @@ import quivr as qv
 from empyrean.errors import PushError, PushErrorVariant
 
 __all__ = [
+    "KIND_BY_CODE",
+    "KIND_TO_CODE",
     "AssertedSource",
     "CovarianceKind",
     "JointFunctional",
@@ -131,14 +133,23 @@ class AssertedSource(str, enum.Enum):
 # Integer-code ↔ enum maps. The codes are the C-ABI wire values the
 # extension emits and consumes; an unknown code is refused by name rather
 # than defaulted, so the distribution never silently coerces a tag.
-_KIND_TO_CODE = {
+#
+# ``KIND_TO_CODE`` / ``KIND_BY_CODE`` are the public covariance-kind wire
+# table — the Python peer of the Rust wrapper's ``CovarianceKind::to_u8`` /
+# ``from_u8`` and the C ABI's ``EMPYREAN_COVARIANCE_KIND_*`` constants — so a
+# consumer maps a kind to its wire code (or back) without restating it. The
+# leading-underscore names are kept as back-compat aliases.
+KIND_TO_CODE = {
     CovarianceKind.LINEAR: 0,
     CovarianceKind.SECOND_ORDER: 1,
     CovarianceKind.MIXTURE: 3,
     CovarianceKind.MONTE_CARLO: 4,
     CovarianceKind.SIGMA_POINT: 5,
 }
-_KIND_BY_CODE = {v: k for k, v in _KIND_TO_CODE.items()}
+KIND_BY_CODE = {v: k for k, v in KIND_TO_CODE.items()}
+# Back-compat aliases for the pre-public names.
+_KIND_TO_CODE = KIND_TO_CODE
+_KIND_BY_CODE = KIND_BY_CODE
 
 _QUALITY_TO_CODE = {
     JointQuality.POSITIVE_DEFINITE: 0,

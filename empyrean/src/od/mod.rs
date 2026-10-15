@@ -628,6 +628,7 @@ fn ffi_od_result_to_rust(
         final_solve_iterations: (result.final_solve_iterations >= 0)
             .then_some(result.final_solve_iterations as usize),
         stall_delivery: StallDelivery::from_ffi(result),
+        resolved_method: crate::CovarianceKind::from_u8(result.resolved_method)?,
     })
 }
 

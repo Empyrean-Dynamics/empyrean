@@ -228,6 +228,18 @@ pub struct ODConfig {
     /// Post-OD photometric fit. `None` (default) disables it; the fit
     /// runs after the orbit is solved and never touches the state.
     pub photometry: Option<PhotometryConfig>,
+    /// Uncertainty method for the fitted covariance. The OD fit is
+    /// first-order by construction, so
+    /// [`UncertaintyMethod::FirstOrder`](crate::UncertaintyMethod::FirstOrder)
+    /// (the default) is delivered and
+    /// [`UncertaintyMethod::auto`](crate::UncertaintyMethod::auto) resolves
+    /// to first order — reported on
+    /// [`DetermineResult::resolved_method`](crate::DetermineResult::resolved_method)
+    /// and, for `Auto`, on
+    /// [`DetermineResult::warnings`](crate::DetermineResult::warnings).
+    /// Every richer method (`SecondOrder` / `SigmaPoint` / `MonteCarlo` /
+    /// `Mixture`) is refused by name rather than silently downgraded.
+    pub uncertainty_method: crate::UncertaintyMethod,
 }
 
 /// Post-OD photometric-fit configuration (mirrors the engine's
@@ -310,6 +322,7 @@ impl Default for ODConfig {
             output_representation: crate::coordinate::Representation::Cartesian,
             allow_unbracketed_maneuvers: false,
             photometry: None,
+            uncertainty_method: crate::UncertaintyMethod::FirstOrder,
         }
     }
 }
@@ -483,6 +496,7 @@ impl ODConfig {
             allow_unbracketed_maneuvers: u8::from(self.allow_unbracketed_maneuvers),
             has_photometry: u8::from(self.photometry.is_some()),
             photometry: self.photometry.map(|p| p.to_ffi()).unwrap_or_default(),
+            uncertainty_method: self.uncertainty_method.to_ffi(),
         };
         let keep = ODConfigKeepalive {
             perturbers,
@@ -499,5 +513,32 @@ impl ODConfig {
             force_model,
             ..Self::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod uncertainty_method_tests {
+    use super::*;
+
+    /// The default config marshals the first-order tag across the FFI
+    /// boundary — the OD seam's historical behaviour, now explicit.
+    /// Mutation guard: dropping `uncertainty_method` from `to_ffi_with`
+    /// would leave the FFI struct's `memset(0)` tag at 0 and pass this one
+    /// but fail the SecondOrder case below.
+    #[test]
+    fn default_od_config_marshals_first_order() {
+        let cfg = ODConfig::default();
+        let (ffi, _keep) = cfg.to_ffi_with().expect("default config marshals");
+        assert_eq!(ffi.uncertainty_method.tag, 0);
+    }
+
+    #[test]
+    fn second_order_marshals_the_second_order_tag() {
+        let cfg = ODConfig {
+            uncertainty_method: crate::UncertaintyMethod::SecondOrder,
+            ..ODConfig::default()
+        };
+        let (ffi, _keep) = cfg.to_ffi_with().expect("config marshals");
+        assert_eq!(ffi.uncertainty_method.tag, 1);
     }
 }

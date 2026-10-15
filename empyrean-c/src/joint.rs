@@ -25,9 +25,13 @@
 //! out. The triangle is in the engine's radian basis on both sides, so a
 //! joint round-trips unchanged.
 
-use empyrean_core::coordinates::{AU, Cartesian, CoordinateRepresentation, Coordinates, Degrees};
+use empyrean_core::coordinates::{
+    AU, Cartesian, CoordinateRepresentation, Coordinates, Degrees, Spherical,
+};
 use empyrean_core::orbits::Orbits;
-use empyrean_core::propagation::{Basis, OrbitUncertainty, Uncertainty};
+use empyrean_core::propagation::{
+    Basis, Derivation, OrbitUncertainty, Provenance, Quality, Uncertainty,
+};
 use empyrean_core::uncertainty::UncertaintyWireError;
 
 use crate::propagate::EmpyreanOrbit;
@@ -294,6 +298,89 @@ pub struct EmpyreanPackedJoint {
     pub asserted_source: u8,
 }
 
+/// The engine's pre-retention Gaussian-mixture accounting, carried beside a
+/// covariance whose derivation is `Mixture` — the same six tallies the
+/// reference channel reads off `Uncertainty::derivation()`. It rides WITH the
+/// covariance it describes (every carrier that holds a `cov_kind` + packed
+/// `joint`), NOT the retained-component status table
+/// ([`EmpyreanMixtureChain`](crate::propagate::EmpyreanMixtureChain)), which is
+/// a separate per-close-approach object.
+///
+/// Read presence from the carrier's `has_mixture_tally` flag, never from the
+/// `kind`: a non-`Mixture` covariance leaves the tally absent. A `-1` in any
+/// `n_*` field is the engine's `None` — "the producing site did not carry that
+/// tally" — and is distinct from a real `0`. `n_components_total` and
+/// `weight_delivered` are always carried on a `Mixture`; the four refusal /
+/// failure counts may each be engine-`None` (`-1`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct EmpyreanMixtureTally {
+    /// Total number of components before retention. Always present on a
+    /// `Mixture`.
+    pub n_components_total: u32,
+    /// Pre-renormalization surviving mass. Always present on a `Mixture`.
+    pub weight_delivered: f64,
+    /// Members whose sub-propagation failed, or `-1` when the producing site
+    /// did not carry the tally.
+    pub n_failed: i64,
+    /// Members still inside a zone at their horizon, or `-1` when not carried.
+    pub n_unresolved: i64,
+    /// Components refused for state-space curvature, or `-1` when not carried.
+    pub n_curvature_refused: i64,
+    /// Components refused because their projected spread overflowed the
+    /// flat-sky linearization, or `-1` when not carried — engine-`None` on the
+    /// propagation seam at this pin, so carried as `-1` (absent) by name,
+    /// never fabricated as `0`.
+    pub n_sky_linearization_refused: i64,
+}
+
+/// The absent mixture tally — the sentinel payload a carrier holds when
+/// `has_mixture_tally == 0` (every non-`Mixture` covariance). Every `n_*`
+/// field is the `-1` "not carried" sentinel, never `0`.
+pub(crate) fn absent_mixture_tally() -> EmpyreanMixtureTally {
+    EmpyreanMixtureTally {
+        n_components_total: 0,
+        weight_delivered: 0.0,
+        n_failed: -1,
+        n_unresolved: -1,
+        n_curvature_refused: -1,
+        n_sky_linearization_refused: -1,
+    }
+}
+
+/// `(has_mixture_tally, tally)` for a delivered covariance's derivation.
+///
+/// A [`Derivation::Mixture`] yields `(1, …)` with the engine's six tallies
+/// read straight off the carried [`MixtureComponents`]; every other derivation
+/// yields `(0, absent)`. An engine `None` on any of the four optional counts
+/// becomes `-1`, never `0` — the same no-fabricated-zeros contract the
+/// reference channel keeps. Representation-generic (`R`), so the Cartesian
+/// propagation seam and the spherical ephemeris seam read a mixture row
+/// identically.
+///
+/// [`MixtureComponents`]: empyrean_core::propagation::MixtureComponents
+pub(crate) fn mixture_tally_from_derivation<R>(
+    derivation: &Derivation<R>,
+) -> (u8, EmpyreanMixtureTally) {
+    match derivation {
+        Derivation::Mixture(mc) => (
+            1,
+            EmpyreanMixtureTally {
+                n_components_total: mc.n_components_total as u32,
+                weight_delivered: mc.weight_delivered,
+                n_failed: mc.n_failed.map(|v| v as i64).unwrap_or(-1),
+                n_unresolved: mc.n_unresolved.map(|v| v as i64).unwrap_or(-1),
+                n_curvature_refused: mc.n_curvature_refused.map(|v| v as i64).unwrap_or(-1),
+                n_sky_linearization_refused: mc
+                    .n_sky_linearization_refused
+                    .map(|v| v as i64)
+                    .unwrap_or(-1),
+            },
+        ),
+        _ => (0, absent_mixture_tally()),
+    }
+}
+
 /// The absent joint — width 0, no triangle, nothing to free.
 pub(crate) fn empty_packed_joint() -> EmpyreanPackedJoint {
     EmpyreanPackedJoint {
@@ -381,34 +468,88 @@ fn orbit_uncertainty_tri(ou: &OrbitUncertainty<AU>) -> &[f64] {
 /// The returned `tri` is heap-allocated and must be released with
 /// [`free_packed_joint`].
 pub(crate) fn orbit_uncertainty_to_c(ou: &OrbitUncertainty<AU>) -> EmpyreanPackedJoint {
-    use empyrean_core::propagation::{Provenance, Quality};
-    let (layout_present, layout_considered, layout_marginalized) = ou.layout().bits();
-    // The provenance and its asserted-source companion are read off the same
-    // engine value: an asserted moment carries its source (written straight
-    // from the engine's `AssertedSource::wire_discriminant`), a derived moment
-    // carries the `_NONE` sentinel. Nothing is defaulted — the source rides the
-    // wire so a re-fed asserted joint round-trips rather than being refused.
-    let provenance = ou.provenance();
-    let asserted_source = match provenance {
-        Provenance::Asserted { source } => source.wire_discriminant(),
-        Provenance::Derived => wire_tags::EMPYREAN_JOINT_ASSERTED_SOURCE_NONE,
-    };
     // The wire triangle, read off the engine joint (radian basis), copied
     // into a library-owned heap buffer and scaled back to this ABI's degree
     // basis on the angular state rows/columns of the representation (the
-    // inverse of the input builder's congruence). The length is carried in
-    // `tri_len` so the thin pointer can be reconstructed and freed in
-    // `free_packed_joint`.
+    // inverse of the input builder's congruence).
     let mut tri_vec: Vec<f64> = orbit_uncertainty_tri(ou).to_vec();
     scale_tri_angular(
         &mut tri_vec,
         ou.representation().angular_element_indices(),
         180.0 / std::f64::consts::PI,
     );
-    let tri_boxed: Box<[f64]> = tri_vec.into_boxed_slice();
+    packed_joint_from_parts(
+        ou.layout().bits(),
+        ou.width() as u8,
+        tri_vec,
+        crate::propagate::covariance_kind_to_u8(ou.kind()),
+        ou.quality(),
+        ou.functional().wire_discriminant(),
+        ou.provenance(),
+    )
+}
+
+/// Marshal one ephemeris row's resolved SKY covariance
+/// (`Uncertainty<Spherical<AU, Degrees>>`) into the owned C packed joint — the
+/// same struct and the same tri packing the propagation rows carry, with
+/// `functional == EMPYREAN_JOINT_FUNCTIONAL_SKY`.
+///
+/// The sky covariance is already published in this ABI's OUTPUT basis — the
+/// facade's `to_degrees()` scaled the joint, so its angular rows/columns are in
+/// degrees. Its packed triangle is therefore copied straight through with NO
+/// further angular congruence (the opposite of [`orbit_uncertainty_to_c`],
+/// whose engine joint is in radians and needs the rad→deg scaling). The row's
+/// bare 6×6 `covariance` field is this joint's `state_block()`; the joint
+/// beside it carries the `kind` tag and the self-describing layout the bare
+/// matrix cannot. The returned `tri` is heap-allocated and must be released
+/// with [`free_packed_joint`].
+pub(crate) fn sky_uncertainty_to_c(
+    unc: &Uncertainty<Spherical<AU, Degrees>>,
+) -> EmpyreanPackedJoint {
+    packed_joint_from_parts(
+        unc.joint().layout().bits(),
+        unc.joint().width() as u8,
+        unc.joint().tri().to_vec(),
+        crate::propagate::covariance_kind_to_u8(unc.kind()),
+        unc.quality(),
+        unc.functional().wire_discriminant(),
+        unc.provenance(),
+    )
+}
+
+/// Assemble the owned C packed joint from its already-marshaled parts: the
+/// layout bitsets, the packed lower triangle **in this ABI's output basis**
+/// (the caller has applied any representation scaling), the kind / functional
+/// wire bytes, the live quality, and the provenance (whose asserted-source
+/// companion is derived here). The triangle is copied into a library-owned
+/// heap buffer released by [`free_packed_joint`]; nothing is recomputed.
+///
+/// Shared by [`orbit_uncertainty_to_c`] (state joints, rad→deg scaled) and
+/// [`sky_uncertainty_to_c`] (sky joints, already in degrees) so both emit a
+/// byte-identical wire struct for the same inputs.
+fn packed_joint_from_parts(
+    layout_bits: (u32, u32, u32),
+    width: u8,
+    tri_out_basis: Vec<f64>,
+    kind: u8,
+    quality: Quality,
+    functional: u8,
+    provenance: Provenance,
+) -> EmpyreanPackedJoint {
+    let (layout_present, layout_considered, layout_marginalized) = layout_bits;
+    // The provenance and its asserted-source companion are read off the same
+    // engine value: an asserted moment carries its source (written straight
+    // from the engine's `AssertedSource::wire_discriminant`), a derived moment
+    // carries the `_NONE` sentinel. Nothing is defaulted — the source rides the
+    // wire so a re-fed asserted joint round-trips rather than being refused.
+    let asserted_source = match provenance {
+        Provenance::Asserted { source } => source.wire_discriminant(),
+        Provenance::Derived => wire_tags::EMPYREAN_JOINT_ASSERTED_SOURCE_NONE,
+    };
+    let tri_boxed: Box<[f64]> = tri_out_basis.into_boxed_slice();
     let tri_len = tri_boxed.len();
     let tri = Box::into_raw(tri_boxed) as *const f64;
-    let (quality, cov_rank, cov_null_axes, cov_min_eig_corr) = match ou.quality() {
+    let (quality_wire, cov_rank, cov_null_axes, cov_min_eig_corr) = match quality {
         Quality::PositiveDefinite => (0u8, 0u8, 0u32, f64::NAN),
         Quality::PositiveSemidefinite { rank, null_axes } => (1, rank, null_axes, f64::NAN),
         Quality::Indefinite { min_eig_corr } => (2, 0, 0, min_eig_corr),
@@ -418,15 +559,15 @@ pub(crate) fn orbit_uncertainty_to_c(ou: &OrbitUncertainty<AU>) -> EmpyreanPacke
         layout_present,
         layout_considered,
         layout_marginalized,
-        width: ou.width() as u8,
+        width,
         tri,
         tri_len,
-        kind: crate::propagate::covariance_kind_to_u8(ou.kind()),
-        quality,
+        kind,
+        quality: quality_wire,
         cov_rank,
         cov_null_axes,
         cov_min_eig_corr,
-        functional: ou.functional().wire_discriminant(),
+        functional,
         provenance: provenance.wire_discriminant(),
         asserted_source,
     }
@@ -634,4 +775,92 @@ pub(crate) fn push_orbit_with_joint(
     let i = orbits.len() - 1;
     orbits.set_uncertainty(i, uncertainty);
     Ok(())
+}
+
+#[cfg(test)]
+mod mixture_tally_tests {
+    use super::*;
+    use empyrean_core::propagation::{MixtureComponents, Shift};
+
+    /// Build a `Derivation::Mixture` from the facade types with the chosen
+    /// per-axis tallies — no fixture produces a real split at this engine pin,
+    /// so the marshal's reachability is proven structurally, from the same
+    /// facade surface the reference channel reads.
+    fn mixture(
+        n_components_total: usize,
+        weight_delivered: f64,
+        n_failed: Option<usize>,
+        n_unresolved: Option<usize>,
+        n_curvature_refused: Option<usize>,
+        n_sky_linearization_refused: Option<usize>,
+    ) -> Derivation<Cartesian<AU>> {
+        Derivation::Mixture(MixtureComponents::<Cartesian<AU>> {
+            components: Vec::new().into_boxed_slice(),
+            component_epoch: 0.0,
+            collapse_shift: Shift::zeros(6),
+            weight_delivered,
+            n_failed,
+            n_unresolved,
+            n_curvature_refused,
+            n_sky_linearization_refused,
+            retained_depth: Some(2),
+            n_components_total,
+            split_criterion: Some(1.5),
+        })
+    }
+
+    /// A mixture derivation reports the engine's six tallies through the
+    /// marshal helper, flag set. Mutation: replacing `mc.n_components_total as
+    /// u32` with `0` in [`mixture_tally_from_derivation`] drops the count and
+    /// the first assert goes red.
+    #[test]
+    fn mixture_tally_from_derivation_fills_every_tally() {
+        let d = mixture(7, 0.9, Some(2), Some(1), Some(3), Some(4));
+        let (has, t) = mixture_tally_from_derivation(&d);
+        assert_eq!(has, 1, "a mixture row is present");
+        assert_eq!(t.n_components_total, 7);
+        assert_eq!(t.weight_delivered, 0.9);
+        assert_eq!(t.n_failed, 2);
+        assert_eq!(t.n_unresolved, 1);
+        assert_eq!(t.n_curvature_refused, 3);
+        assert_eq!(t.n_sky_linearization_refused, 4);
+    }
+
+    /// An engine `None` on an optional count becomes `-1` (absent by name),
+    /// never a fabricated `0`. Mutation: mapping `None` to `0` instead of `-1`
+    /// in the marshal goes red here.
+    #[test]
+    fn mixture_tally_from_derivation_maps_engine_none_to_minus_one() {
+        let d = mixture(5, 1.0, None, None, None, None);
+        let (has, t) = mixture_tally_from_derivation(&d);
+        assert_eq!(has, 1);
+        assert_eq!(t.n_components_total, 5);
+        assert_eq!(t.n_failed, -1, "a not-carried count is -1, not 0");
+        assert_eq!(t.n_unresolved, -1);
+        assert_eq!(t.n_curvature_refused, -1);
+        assert_eq!(
+            t.n_sky_linearization_refused, -1,
+            "sky-linearization refusals are engine-None here, carried as -1"
+        );
+    }
+
+    /// A non-mixture derivation leaves the tally absent at the marshal — the
+    /// flag clear and every count `-1`. Mutation: returning `(1, …)` or a
+    /// zero-filled tally for the `_` arm goes red.
+    #[test]
+    fn mixture_tally_from_derivation_leaves_non_mixture_absent() {
+        for d in [
+            Derivation::<Cartesian<AU>>::Linear,
+            Derivation::<Cartesian<AU>>::SigmaPoint {
+                mean_offset: None,
+                n_nodes: 13,
+            },
+        ] {
+            let (has, t) = mixture_tally_from_derivation(&d);
+            assert_eq!(has, 0, "a non-mixture row carries no tally");
+            assert_eq!(t.n_components_total, 0);
+            assert_eq!(t.n_failed, -1);
+            assert_eq!(t.n_sky_linearization_refused, -1);
+        }
+    }
 }

@@ -27,7 +27,13 @@ import pyarrow.compute as pc
 import quivr as qv
 
 from empyrean.coordinates.epoch import Epochs
-from empyrean.propagation.config import ForceModelTier
+from empyrean.orbits.joint import CovarianceKind
+from empyrean.propagation.config import (
+    ForceModelTier,
+    UncertaintyMethod,
+    UncertaintyMethodLike,
+    _uncertainty_method_to_wire,
+)
 
 # pyarrow's compute functions are generated at runtime into the
 # ``pyarrow.compute`` module namespace, so the bundled type stubs do not
@@ -635,6 +641,16 @@ class PlanningConfig:
     ``ValueError`` — at construction, and again inside
     :func:`empyrean.evaluate_plan` for a config mutated after
     construction — rather than being accepted and ignored."""
+    uncertainty_method: UncertaintyMethodLike = UncertaintyMethod.FIRST_ORDER
+    """Uncertainty method for the covariance fold (same vocabulary as
+    :func:`empyrean.propagate`). The default
+    :attr:`UncertaintyMethod.FIRST_ORDER` is the single-linearization
+    Gaussian fold; the planner also honours ``SECOND_ORDER`` /
+    ``SIGMA_POINT`` / ``MONTE_CARLO`` / ``AUTO``, each reported on
+    :attr:`PlanResult.resolved_method` in the covariance-kind vocabulary
+    (``AUTO`` as the kind it ran, never as ``AUTO``).
+    ``GAUSSIAN_MIXTURE`` is refused by name. **This knob is consulted** —
+    unlike :attr:`observatories` / :attr:`num_threads` above."""
 
     def __post_init__(self) -> None:
         self._reject_unread_knobs()
@@ -700,6 +716,9 @@ class PlanningConfig:
             # The C ABI spells "every available core" as -1; the Python
             # surface spells it 0, matching ODConfig.num_threads.
             "num_threads": -1 if self.num_threads == 0 else int(self.num_threads),
+            # Flat tag + per-variant slots, lowered through the one shared
+            # helper the propagate and OD paths use.
+            "uncertainty_method": _uncertainty_method_to_wire(self.uncertainty_method),
         }
 
 
@@ -1044,3 +1063,11 @@ class PlanResult:
     whole-plan 1σ-volume ratio. Always finite — reached before any
     transport, so it stays available even when :attr:`PlanMetrics.log_det`
     is withheld (NaN) past a nonlinear transport."""
+    resolved_method: CovarianceKind = CovarianceKind.LINEAR
+    """The covariance kind the fold resolved to and reported the metrics
+    under. :attr:`UncertaintyMethod.FIRST_ORDER` resolves to
+    :attr:`CovarianceKind.LINEAR`; ``SECOND_ORDER`` / ``SIGMA_POINT`` /
+    ``MONTE_CARLO`` to their own kinds; :attr:`UncertaintyMethod.AUTO` is
+    reported as the kind it ran, never as ``AUTO``. It is the box the
+    search is sized to, so a sampled transport's withheld
+    :attr:`PlanMetrics.log_det` reads under this same kind."""

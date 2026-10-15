@@ -118,6 +118,28 @@ class StateSensitivities(qv.Table):
     ``linear`` / ``second_order`` / …), or ``None`` if the propagation did
     not resolve a covariance for this row."""
 
+    # The engine's pre-retention Gaussian-mixture accounting for this row's
+    # covariance — the six tallies that ride WITH a mixture covariance
+    # (distinct from the retained-component status table on
+    # :class:`~empyrean.propagation.mixtures.MixtureChains`). The column names
+    # match the validation schema so a channel row maps 1:1. ``None`` on every
+    # non-mixture row, and ``None`` (not 0) on a count the engine did not
+    # carry — read absence by name, never as a 0.
+    mix_n_components_total = qv.Int64Column(nullable=True)
+    """Total components before retention, or ``None`` on a non-mixture row."""
+    mix_weight_delivered = qv.Float64Column(nullable=True)
+    """Pre-renormalization surviving mass, or ``None`` on a non-mixture row."""
+    mix_n_failed = qv.Int64Column(nullable=True)
+    """Members whose sub-propagation failed, or ``None`` when not carried."""
+    mix_n_unresolved = qv.Int64Column(nullable=True)
+    """Members still inside a zone at their horizon, or ``None`` when not carried."""
+    mix_n_curvature_refused = qv.Int64Column(nullable=True)
+    """Components refused for state-space curvature, or ``None`` when not carried."""
+    mix_n_sky_linearization_refused = qv.Int64Column(nullable=True)
+    """Components refused by the flat-sky linearization, or ``None`` when not
+    carried — engine-``None`` on the propagation seam at the current engine
+    pin, so read as absent, never 0."""
+
     # ── Introspection ─────────────────────────────────────────
 
     def orbit_ids_unique(self) -> list[str]:

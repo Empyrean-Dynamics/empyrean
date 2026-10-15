@@ -22,15 +22,16 @@ use std::ffi::{CStr, CString, c_char};
 use std::panic::AssertUnwindSafe;
 
 use empyrean_core::planning::{
-    CandidateInfo, CandidateKind, CovarianceMetrics, EngineUncertaintyMethod, LogDetWithheld,
-    ObservatoryConfig, PlanResult, PlannedObservation, PlanningConfig, RadarMode, RadarPlanSpec,
-    Station, TargetRadarProperties, evaluate_plan_single,
+    CandidateInfo, CandidateKind, CovarianceMetrics, LogDetWithheld, ObservatoryConfig, PlanResult,
+    PlannedObservation, PlanningConfig, RadarMode, RadarPlanSpec, Station, TargetRadarProperties,
+    evaluate_plan_single,
 };
 use empyrean_core::time::Epoch;
 
 use crate::od::empyrean_orbit_to_orbits;
 use crate::propagate::{
-    EMPYREAN_COVARIANCE_KIND_UNKNOWN, EmpyreanOrbit, covariance_kind_to_u8, int_to_force_model,
+    EMPYREAN_COVARIANCE_KIND_UNKNOWN, EmpyreanOrbit, EmpyreanUncertaintyMethod,
+    covariance_kind_to_u8, flat_to_uncertainty_method, int_to_force_model,
 };
 use crate::{EmpyreanContext, set_last_error};
 
@@ -196,6 +197,20 @@ pub struct EmpyreanPlanningConfig {
     pub num_observatories: usize,
     /// Threads for batch operations; -1 = all CPUs.
     pub num_threads: i32,
+
+    // ── Uncertainty method (0.11.0) ───────────────────────────────
+    /// Uncertainty method for the covariance fold — the same flat tag +
+    /// per-variant parameter carrier the propagation config uses
+    /// ([`EmpyreanUncertaintyMethod`](crate::propagate::EmpyreanUncertaintyMethod)).
+    /// A zero-initialized struct selects
+    /// [`EMPYREAN_UNCERTAINTY_FIRST`](crate::propagate::EMPYREAN_UNCERTAINTY_FIRST)
+    /// — the single-linearization Gaussian fold every previous release of
+    /// `empyrean_evaluate_plan` computed — so `memset(0)` is byte-identical
+    /// to a pre-0.11.0 caller. The planning fold honours
+    /// `FIRST` / `SECOND` / `SIGMA_POINT` / `MONTE_CARLO` / `AUTO`, each
+    /// reported on [`EmpyreanPlanResult::resolved_method`] in the
+    /// covariance-kind vocabulary; `MIXTURE` is refused by name.
+    pub uncertainty_method: EmpyreanUncertaintyMethod,
 }
 
 // ── Output structs ──────────────────────────────────────────────────
@@ -391,6 +406,24 @@ pub struct EmpyreanPlanResult {
     pub ephemeris: *mut EmpyreanPlanEphemerisPoint,
     /// Number of entries in `ephemeris` (0 when null).
     pub num_ephemeris: usize,
+
+    // ── Resolved uncertainty method (0.11.0) ──────────────────────
+    /// The covariance kind the fold actually resolved and reported the
+    /// prior / posterior / cumulative metrics under — an
+    /// `EMPYREAN_COVARIANCE_KIND_*` value. `FirstOrder` resolves to
+    /// [`EMPYREAN_COVARIANCE_KIND_LINEAR`](crate::propagate::EMPYREAN_COVARIANCE_KIND_LINEAR),
+    /// `SecondOrder` to
+    /// [`EMPYREAN_COVARIANCE_KIND_SECOND_ORDER`](crate::propagate::EMPYREAN_COVARIANCE_KIND_SECOND_ORDER),
+    /// `SigmaPoint` to
+    /// [`EMPYREAN_COVARIANCE_KIND_SIGMA_POINT`](crate::propagate::EMPYREAN_COVARIANCE_KIND_SIGMA_POINT),
+    /// `MonteCarlo` to
+    /// [`EMPYREAN_COVARIANCE_KIND_MONTE_CARLO`](crate::propagate::EMPYREAN_COVARIANCE_KIND_MONTE_CARLO).
+    /// `Auto` is reported as the kind it actually ran, never as `Auto`.
+    /// Passed through verbatim from the engine's
+    /// `PlanResult::resolved_method`: it is the box the search is sized to,
+    /// so a sampled transport's `log_det_withheld` on the metrics beside
+    /// it reads under the same resolved kind.
+    pub resolved_method: u8,
 }
 
 // ── Conversions ─────────────────────────────────────────────────────
@@ -563,17 +596,19 @@ fn build_planning_config(c: &EmpyreanPlanningConfig) -> Result<PlanningConfig, S
             Some(c.num_threads as usize)
         },
         encounter: None,
-        // Both are pinned to the behaviour this seam has always had,
-        // not left to `Default`: the engine's default for either field
-        // may move, and this ABI exposes no knob for a caller to move
-        // it back. `FirstOrder` is the single-linearization Gaussian
-        // fold every previous release of `empyrean_evaluate_plan`
-        // computed; `None` is the raw per-candidate σ it has always
-        // consumed unmodified. Exposing the two as C-ABI knobs — with
-        // the uncertainty-method flat struct the propagation entry
-        // points already carry, and a weighting config the OD seam
-        // would share — is bd empyrean-848gm.10.
-        uncertainty_method: EngineUncertaintyMethod::FirstOrder,
+        // `uncertainty_method` is now a C-ABI knob: the propagation seam's
+        // flat tag carrier, decoded through the same `flat_to_uncertainty_method`
+        // and converted to the engine enum. A zero-init carrier decodes to
+        // `First`, the single-linearization Gaussian fold every previous
+        // release of `empyrean_evaluate_plan` computed, so an unset field is
+        // behaviour-preserving. A `Mixture` request is refused by name inside
+        // the fold; every other method is honoured and its resolved kind rides
+        // out on `EmpyreanPlanResult::resolved_method`.
+        //
+        // `weighting` stays pinned (not a `Default`, and no C knob yet):
+        // `None` is the raw per-candidate σ this seam has always consumed
+        // unmodified, and the engine's default may move.
+        uncertainty_method: flat_to_uncertainty_method(&c.uncertainty_method)?.into(),
         weighting: None,
     })
 }
@@ -721,6 +756,11 @@ fn plan_result_to_c(plan: &PlanResult, out: *mut EmpyreanPlanResult) {
         (*out).active_width = plan.active_width;
         (*out).ephemeris = eph_ptr;
         (*out).num_ephemeris = num_ephemeris;
+        // The kind the fold resolved to, in the covariance-kind vocabulary
+        // — `Auto` already collapsed to the kind it ran. Passed through
+        // verbatim so the search box's resolved kind and the metrics'
+        // `log_det_withheld` beside it never disagree.
+        (*out).resolved_method = covariance_kind_to_u8(plan.resolved_method);
     }
 }
 
@@ -1004,6 +1044,67 @@ mod observatory_gate_tests {
         assert_eq!(o.max_apparent_mag, 24.5);
         assert_eq!(o.min_elongation_deg, 70.0);
         assert_eq!(o.sigma_arcsec, [0.3, 0.4]);
+    }
+}
+
+/// `uncertainty_method` crosses the planning marshal verbatim (0.11.0).
+///
+/// Drives the production `build_planning_config`, not a copy of its arm.
+/// Mutation guard: re-pinning `uncertainty_method` to `FirstOrder` in
+/// `build_planning_config` makes the SecondOrder / SigmaPoint cases below
+/// fold first order → red.
+#[cfg(test)]
+mod uncertainty_method_tests {
+    use super::*;
+    use crate::propagate::{
+        EMPYREAN_UNCERTAINTY_FIRST, EMPYREAN_UNCERTAINTY_SECOND, EMPYREAN_UNCERTAINTY_SIGMA_POINT,
+    };
+    use empyrean_core::planning::EngineUncertaintyMethod;
+
+    fn cfg_with_method(tag: u8) -> EmpyreanPlanningConfig {
+        // SAFETY: `#[repr(C)]` scalars plus two null-initializing pointers.
+        let mut cfg: EmpyreanPlanningConfig = unsafe { std::mem::zeroed() };
+        cfg.num_threads = -1;
+        cfg.uncertainty_method.tag = tag;
+        cfg
+    }
+
+    #[test]
+    fn a_zero_init_config_folds_first_order() {
+        // `memset(0)` is tag 0 — the single-linearization fold every prior
+        // release computed — so the default is behaviour-preserving.
+        let built = build_planning_config(&cfg_with_method(EMPYREAN_UNCERTAINTY_FIRST))
+            .expect("a zero-init planning config is well-formed");
+        assert_eq!(
+            built.uncertainty_method,
+            EngineUncertaintyMethod::FirstOrder
+        );
+    }
+
+    #[test]
+    fn second_order_tag_folds_second_order() {
+        let built = build_planning_config(&cfg_with_method(EMPYREAN_UNCERTAINTY_SECOND))
+            .expect("a SecondOrder request marshals");
+        assert_eq!(
+            built.uncertainty_method,
+            EngineUncertaintyMethod::SecondOrder
+        );
+    }
+
+    #[test]
+    fn sigma_point_tag_folds_sigma_point_with_its_params() {
+        let mut cfg = cfg_with_method(EMPYREAN_UNCERTAINTY_SIGMA_POINT);
+        cfg.uncertainty_method.sp_n_sigma = 1.0;
+        cfg.uncertainty_method.sp_samples_per_plane = 8;
+        let built = build_planning_config(&cfg).expect("a SigmaPoint request marshals");
+        assert!(
+            matches!(
+                built.uncertainty_method,
+                EngineUncertaintyMethod::SigmaPoint { .. }
+            ),
+            "expected SigmaPoint, got {:?}",
+            built.uncertainty_method
+        );
     }
 }
 

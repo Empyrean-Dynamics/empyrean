@@ -86,8 +86,8 @@ pub use config::{
     PropagationConfig, UncertaintyMethod,
 };
 pub use result::{
-    ComponentStatus, CovarianceKind, Event, MixtureChain, MixtureComponent, OrbitOutcome,
-    PropagatedState, PropagationResult, TaggedCovariance,
+    ComponentStatus, CovarianceKind, Event, MixtureChain, MixtureComponent, MixtureTally,
+    OrbitOutcome, PropagatedState, PropagationResult, TaggedCovariance,
 };
 
 // Internal types other modules in this crate reach for via the

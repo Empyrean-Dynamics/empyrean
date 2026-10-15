@@ -24,11 +24,17 @@ from empyrean.od.residuals import (
     ResidualSummary,
     StationBiases,
 )
+from empyrean.orbits.joint import CovarianceKind
 from empyrean.orbits.orbits import (
     CartesianOrbits,
     CometaryOrbits,
     KeplerianOrbits,
     SphericalOrbits,
+)
+from empyrean.propagation.config import (
+    UncertaintyMethod,
+    UncertaintyMethodLike,
+    _uncertainty_method_to_wire,
 )
 
 # JSON-like value type for the nested wire dicts marshaled across the
@@ -729,6 +735,16 @@ class ODConfig:
     photometry: PhotometryConfig | None = None
     """Post-OD photometric fit. ``None`` (default) disables it; the fit
     runs after the orbit is solved and never touches the state."""
+    uncertainty_method: UncertaintyMethodLike = UncertaintyMethod.FIRST_ORDER
+    """Uncertainty method for the fitted covariance (same vocabulary as
+    :func:`empyrean.propagate`). The OD fit is first-order by
+    construction, so :attr:`UncertaintyMethod.FIRST_ORDER` (the default)
+    is delivered and :attr:`UncertaintyMethod.AUTO` resolves to it —
+    reported on :attr:`DetermineResult.resolved_method` and, for ``AUTO``,
+    on :attr:`DetermineResult.warnings`. ``SECOND_ORDER`` / ``SIGMA_POINT``
+    / ``MONTE_CARLO`` / ``GAUSSIAN_MIXTURE`` are refused by name (a
+    :class:`ValueError` naming the method and ``determine``) rather than
+    silently downgraded."""
 
     def _to_wire_dict(self) -> dict[str, WireValue]:
         """Serialize to the nested dict shape the binding consumes.
@@ -806,6 +822,10 @@ class ODConfig:
             "auto_force_model": self.auto_force_model,
             "output_representation": _enum_value(self.output_representation),
             "allow_unbracketed_maneuvers": self.allow_unbracketed_maneuvers,
+            # Flat tag + per-variant slots, lowered through the one shared
+            # helper the propagate path uses, so a method selects the same
+            # engine variant on either seam.
+            "uncertainty_method": _uncertainty_method_to_wire(self.uncertainty_method),
         }
         # Explicit per-axis solve request and photometry config are only
         # emitted when set — the Rust parser reads these keys only when
@@ -1285,6 +1305,17 @@ class DetermineResult:
 
     ``None`` is the ordinary case. A consumer that wants the strict
     convergence contract checks ``stall_delivery is None``."""
+    resolved_method: CovarianceKind = CovarianceKind.LINEAR
+    """The kind of covariance this fit delivered. Always
+    :attr:`CovarianceKind.LINEAR`: the fit is first-order by construction,
+    and an :attr:`UncertaintyMethod.AUTO` request on the config resolves to
+    it (also named on :attr:`warnings`). Every richer method is refused by
+    name before a fit is produced. The OD analogue of
+    :attr:`~empyrean.planning.result.PlanResult.resolved_method`: one
+    vocabulary — the covariance-kind vocabulary — for what kind of
+    covariance a result carries, while the requested method stays visible on
+    the config's :attr:`~empyrean.od.result.ODConfig.uncertainty_method`
+    knob."""
 
 
 @dataclass

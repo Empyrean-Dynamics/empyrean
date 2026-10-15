@@ -1557,6 +1557,111 @@ mod tests {
         }
     }
 
+    /// An ephemeris row carries, beside its bare sky 6×6, the covariance's
+    /// kind tag and the self-describing packed joint: under SecondOrder the
+    /// kind is SECOND_ORDER, the joint is a width-6 SKY functional, and the
+    /// joint's leading state block equals the bare `covariance` field.
+    ///
+    /// Mutation record: hardcode `cov_kind` to LINEAR (or `covariance_kind_to_u8`
+    /// → LINEAR) in `marshal_ephemeris_result`, and the `SECOND_ORDER`
+    /// assertion goes red; return `empty_packed_joint()` for a covariance-
+    /// bearing row and the width-6 / state-block assertions go red.
+    #[test]
+    fn ephemeris_row_carries_sky_kind_and_joint() {
+        let ctx = match try_context() {
+            Some(c) => c,
+            None => {
+                eprintln!("skipping ephemeris_row_carries_sky_kind_and_joint: no data dir");
+                return;
+            }
+        };
+        let ctx_ptr: *const EmpyreanContext = &ctx;
+
+        // A covariance-bearing orbit (small diagonal state 6×6, flat path) so
+        // the sky covariance is delivered; SecondOrder so its kind is tagged.
+        let mut orbit = base_orbit();
+        let mut cov = [[0.0f64; 6]; 6];
+        cov[0][0] = 1e-12;
+        cov[1][1] = 1e-12;
+        cov[2][2] = 1e-12;
+        cov[3][3] = 1e-16;
+        cov[4][4] = 1e-16;
+        cov[5][5] = 1e-16;
+        orbit.state.covariance = cov;
+        orbit.state.has_covariance = 1;
+        let orbits = [orbit];
+
+        let mut cfg: EmpyreanEphemerisConfig = unsafe { std::mem::zeroed() };
+        cfg.propagation.force_model = 2;
+        cfg.propagation.frame = 0;
+        cfg.propagation.uncertainty_method.tag = crate::propagate::EMPYREAN_UNCERTAINTY_SECOND;
+        cfg.propagation.advanced.dt_initial = f64::NAN;
+        cfg.propagation.advanced.dt_min = f64::NAN;
+        cfg.compute_diagnostics = 1;
+
+        let observers = [EmpyreanObserver {
+            obs_code: [b'5', b'0', b'0', 0],
+            epoch_mjd_tdb: 59010.0,
+            x: 0.9,
+            y: -0.42,
+            z: -0.18,
+            vx: 0.0075,
+            vy: 0.0148,
+            vz: 0.0064,
+            observing_night: -1,
+            frame: 0,
+            origin: 0,
+        }];
+
+        let mut result: EmpyreanEphemerisResult = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            crate::ephemeris::empyrean_generate_ephemeris(
+                ctx_ptr,
+                orbits.as_ptr(),
+                1,
+                observers.as_ptr(),
+                1,
+                &cfg,
+                &mut result,
+            )
+        };
+        assert_eq!(rc, 0, "generate_ephemeris failed: {}", last_err());
+        assert!(result.num_entries > 0, "expected an entry");
+        let e = unsafe { &*result.entries };
+        assert_eq!(e.has_covariance, 1, "the covariance path ran");
+        assert_eq!(
+            e.cov_kind,
+            crate::propagate::EMPYREAN_COVARIANCE_KIND_SECOND_ORDER,
+            "a SecondOrder run tags the row's sky covariance SECOND_ORDER"
+        );
+        assert_eq!(e.joint.width, 6, "the sky joint is width 6");
+        assert_eq!(
+            e.joint.functional,
+            crate::joint::wire_tags::EMPYREAN_JOINT_FUNCTIONAL_SKY,
+            "the joint describes the sky functional"
+        );
+        assert_eq!(
+            e.joint.kind, e.cov_kind,
+            "the joint's kind agrees with the row's cov_kind"
+        );
+        // The joint's leading 6×6 (packed lower triangle, mirrored) equals the
+        // bare sky covariance field.
+        assert!(!e.joint.tri.is_null(), "a width-6 joint carries a triangle");
+        let tri = unsafe { std::slice::from_raw_parts(e.joint.tri, e.joint.tri_len) };
+        for i in 0..6 {
+            for j in 0..=i {
+                let v = tri[i * (i + 1) / 2 + j];
+                assert_eq!(v, e.covariance[i][j], "joint state block ({i},{j})");
+                assert_eq!(
+                    v, e.covariance[j][i],
+                    "joint state block symmetric ({i},{j})"
+                );
+            }
+        }
+
+        unsafe { crate::ephemeris::empyrean_ephemeris_result_free(&mut result) };
+    }
+
     /// The identity guard fires loudly and by-axis for a per-call config that
     /// diverges from the frozen key — never a silent rebuild under the wrong
     /// dynamics.

@@ -214,14 +214,18 @@ pub fn query_horizons(
     if code != 0 {
         return Err(Error::capture(code));
     }
-    let entries: Vec<EphemerisEntry> = unsafe {
+    // Decode fallibly (a Horizons row carries no covariance, so the kind
+    // decode never fails here, but the marshaler is uniformly fallible now);
+    // free the C result BEFORE propagating any decode error so the error path
+    // leaks nothing.
+    let entries: Result<Vec<EphemerisEntry>> = unsafe {
         std::slice::from_raw_parts(result.entries, result.num_entries)
             .iter()
             .map(EphemerisEntry::from_ffi)
             .collect()
     };
     unsafe { empyrean_sys::empyrean_ephemeris_result_free(&mut result) };
-    Ok(entries)
+    entries
 }
 
 /// Query JPL Horizons for a Cartesian state vector at a single epoch.

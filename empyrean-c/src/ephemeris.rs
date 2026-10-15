@@ -13,6 +13,9 @@ use empyrean_core::orbits::Orbits;
 use empyrean_core::propagation::OrbitOutcome;
 use empyrean_core::time::Epoch;
 
+use crate::joint::{
+    EmpyreanPackedJoint, empty_packed_joint, free_packed_joint, sky_uncertainty_to_c,
+};
 use crate::observers::EmpyreanObserver;
 use crate::propagate::{
     EMPYREAN_ORBIT_OUTCOME_DELIVERED, EMPYREAN_ORBIT_OUTCOME_FAILED, EmpyreanOrbit,
@@ -156,6 +159,32 @@ pub struct EmpyreanEphemerisEntry {
     /// 6×6 Cartesian covariance of the aberrated state, row-major.
     /// All-NaN when `has_aberrated_covariance == 0`.
     pub aberrated_covariance: [[f64; 6]; 6],
+    /// Derivation tag of the row's sky covariance — an
+    /// `EMPYREAN_COVARIANCE_KIND_*` value. The bare `covariance` 6×6 above is
+    /// the moment this kind names: `EMPYREAN_COVARIANCE_KIND_LINEAR` (0) under
+    /// a first-order method, `EMPYREAN_COVARIANCE_KIND_SECOND_ORDER` (1) under
+    /// a second-order one, and so on. `EMPYREAN_COVARIANCE_KIND_LINEAR` (0)
+    /// when `has_covariance == 0` (no uncertainty path ran) — read delivery
+    /// from `has_covariance`, not from this tag.
+    pub cov_kind: u8,
+    /// The row's sky covariance as ONE self-describing packed joint — the same
+    /// `EmpyreanPackedJoint` struct and tri packing the propagation rows carry,
+    /// with `functional == EMPYREAN_JOINT_FUNCTIONAL_SKY`. Its leading 6×6
+    /// state block is the bare `covariance` field above (same (AU, deg) units,
+    /// over (rho, RA, Dec, vrho, vRA, vDec)), and `kind` matches `cov_kind`.
+    /// The absent joint (`width == 0`, null `tri`) when `has_covariance == 0`.
+    /// Library-owned; freed by `empyrean_ephemeris_result_free`.
+    pub joint: EmpyreanPackedJoint,
+    /// 1 when [`mixture_tally`](Self::mixture_tally) carries the engine's
+    /// pre-retention Gaussian-mixture accounting for this row's sky covariance
+    /// (its derivation was a mixture); 0 otherwise. Read the flag, not
+    /// `cov_kind`.
+    pub has_mixture_tally: u8,
+    /// The engine's pre-retention mixture tallies for this row's sky
+    /// covariance, valid only when `has_mixture_tally == 1`; the absent
+    /// sentinel otherwise. See
+    /// [`EmpyreanMixtureTally`](crate::joint::EmpyreanMixtureTally).
+    pub mixture_tally: crate::joint::EmpyreanMixtureTally,
 }
 
 /// One observation-sensitivity row — the partial derivatives of the
@@ -872,10 +901,38 @@ pub(crate) fn marshal_ephemeris_result(
         // dropped: the sky covariance, the aberrated
         // Cartesian state, and its covariance. Populate them; NaN-fill the
         // covariances when the input orbit carried none.
-        let (has_covariance, covariance) = match cov {
-            Some(c) => (1u8, c.state_block()),
-            None => (0u8, [[f64::NAN; 6]; 6]),
-        };
+        // The sky covariance drives three row fields at once: the delivery
+        // flag, the bare 6×6 (its state block, byte-identical to before), and
+        // — new — the kind tag plus the self-describing packed joint beside
+        // it. When the row carries no covariance the kind is LINEAR (0) and
+        // the joint is the absent width-0 joint; read delivery from
+        // `has_covariance`, never from the kind.
+        // The engine's pre-retention mixture accounting rides WITH the sky
+        // covariance it describes, read off its derivation the same way the
+        // propagation seam reads the Cartesian one — a mixture row carries the
+        // six tallies, every other derivation leaves them absent by name.
+        let (has_covariance, covariance, cov_kind, joint, has_mixture_tally, mixture_tally) =
+            match cov {
+                Some(c) => {
+                    let (has_mt, mt) = crate::joint::mixture_tally_from_derivation(c.derivation());
+                    (
+                        1u8,
+                        c.state_block(),
+                        crate::propagate::covariance_kind_to_u8(c.kind()),
+                        sky_uncertainty_to_c(c),
+                        has_mt,
+                        mt,
+                    )
+                }
+                None => (
+                    0u8,
+                    [[f64::NAN; 6]; 6],
+                    crate::propagate::EMPYREAN_COVARIANCE_KIND_LINEAR,
+                    empty_packed_joint(),
+                    0u8,
+                    crate::joint::absent_mixture_tally(),
+                ),
+            };
         let aberrated_state = match aberrated {
             Some(a) => [a.x, a.y, a.z, a.vx, a.vy, a.vz],
             None => [f64::NAN; 6],
@@ -931,6 +988,10 @@ pub(crate) fn marshal_ephemeris_result(
             aberrated_state,
             has_aberrated_covariance,
             aberrated_covariance,
+            cov_kind,
+            joint,
+            has_mixture_tally,
+            mixture_tally,
         };
         unsafe {
             out_ptr.add(i).write(entry);
@@ -1066,10 +1127,13 @@ pub unsafe extern "C" fn empyrean_ephemeris_result_free(result: *mut EmpyreanEph
 
         if !res.entries.is_null() && n > 0 {
             for i in 0..n {
-                let entry = unsafe { &*res.entries.add(i) };
+                let entry = unsafe { &mut *res.entries.add(i) };
                 if !entry.orbit_id.is_null() {
                     drop(unsafe { CString::from_raw(entry.orbit_id) });
                 }
+                // Release the library-owned sky-covariance joint triangle.
+                // Idempotent on the absent (width-0, null-tri) joint.
+                unsafe { free_packed_joint(&mut entry.joint) };
             }
             let layout = std::alloc::Layout::array::<EmpyreanEphemerisEntry>(n).unwrap();
             unsafe {

@@ -471,6 +471,17 @@ def generate_ephemeris(
             return pa.array(arr.tolist(), type=pa.float64(), mask=mask)
         return arr
 
+    def _nullable_int(key: str) -> pa.Array | Any:
+        # The mixture-tally count columns carry `-1` as "absent" on the wire;
+        # mask those to null so a reader sees absence by name, never a 0.
+        arr = np.asarray(result[key], dtype=np.int64)
+        mask = arr < 0
+        if mask.any():
+            import pyarrow as pa
+
+            return pa.array(arr.tolist(), type=pa.int64(), mask=mask)
+        return arr
+
     # Aberrated (light-time corrected) barycentric ICRF Cartesian state at
     # the photon-emission epoch, with its covariance when the uncertainty
     # path ran (NaN rows where the engine produced none).
@@ -504,11 +515,26 @@ def generate_ephemeris(
     if aberrated_cov is not None:
         aberrated_kwargs["covariance"] = aberrated_cov
     aberrated_state = CartesianCoordinates.from_kwargs(**aberrated_kwargs)
+
+    # The sky covariance's kind tag and the one packed joint per row — the
+    # same covariance accessors the propagation result carries. ``cov_kind``
+    # decodes the wire code to a CovarianceKind value ("linear" when the row
+    # carried no covariance); ``joint`` is the per-row packed joint, null for
+    # a row with none (the key is absent entirely when no row carried one).
+    from empyrean.orbits.joint import KIND_BY_CODE, PackedJoints
+
+    cov_kind = [KIND_BY_CODE[int(c)].value for c in np.asarray(result["cov_kind"])]
+    joint_col = PackedJoints.from_wire_list(result.get("joint"))
+    if joint_col is None:
+        joint_col = PackedJoints.from_joints([None] * m)
+
     ephemeris = Ephemeris.from_kwargs(
         orbit_id=result["orbit_id"],
         object_id=object_id_list,
         obs_code=result["obs_code"],
         coordinates=coordinates,
+        cov_kind=cov_kind,
+        joint=joint_col,
         aberrated_state=aberrated_state,
         light_time=_nullable_float("light_time"),
         phase_angle=_nullable_float("phase_angle"),
@@ -522,6 +548,12 @@ def generate_ephemeris(
         lunar_elongation=_nullable_float("lunar_elongation"),
         position_angle=_nullable_float("position_angle"),
         sky_rate=_nullable_float("sky_rate"),
+        mix_n_components_total=_nullable_int("mix_n_components_total"),
+        mix_weight_delivered=_nullable_float("mix_weight_delivered"),
+        mix_n_failed=_nullable_int("mix_n_failed"),
+        mix_n_unresolved=_nullable_int("mix_n_unresolved"),
+        mix_n_curvature_refused=_nullable_int("mix_n_curvature_refused"),
+        mix_n_sky_linearization_refused=_nullable_int("mix_n_sky_linearization_refused"),
     )
 
     # ── Observation sensitivities ──

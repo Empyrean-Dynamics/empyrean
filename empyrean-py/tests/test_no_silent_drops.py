@@ -152,6 +152,11 @@ ALLOWED_ALL_NULL: dict[str, str] = {
     # (which external source asserted the joint; None on a derived one). ──
     "PropagatedStates.covariance.cov_min_eig_corr": "by-design (NaN for a positive-definite joint)",
     "PropagatedStates.covariance.asserted_source": "by-design (None for a derived joint)",
+    # The ephemeris row's sky packed joint carries the same two tag-only
+    # sub-fields, null for the same reason on a positive-definite, derived
+    # sky joint.
+    "Ephemeris.joint.cov_min_eig_corr": "by-design (NaN for a positive-definite joint)",
+    "Ephemeris.joint.asserted_source": "by-design (None for a derived joint)",
     "PropagatedStates.photometric": "schema-artifact (input fields on output table)",
     "PropagatedStates.photometric.model": "schema-artifact (input fields on output table)",
     "PropagatedStates.photometric.h": "schema-artifact (input fields on output table)",
@@ -183,6 +188,25 @@ ALLOWED_ALL_NULL: dict[str, str] = {
     # The Hessian stays: it is genuinely Jet2-only and null for the
     # first-order fixture. ──
     "ObservationSensitivities.hessian": "by-design (Jet2 method only)",
+    # ── Pre-retention Gaussian-mixture tallies: populated only on a mixture
+    # covariance, and no fixture splits into a mixture at the current engine
+    # pin, so these ride every covariance-bearing row as absent (null) here.
+    # They are a real, populated surface when a close approach splits — NOT a
+    # silent drop — proven structurally by the C/wrapper unit tests. ──
+    "StateSensitivities.mix_n_components_total": "by-design (no mixture at this engine pin)",
+    "StateSensitivities.mix_weight_delivered": "by-design (no mixture at this engine pin)",
+    "StateSensitivities.mix_n_failed": "by-design (no mixture at this engine pin)",
+    "StateSensitivities.mix_n_unresolved": "by-design (no mixture at this engine pin)",
+    "StateSensitivities.mix_n_curvature_refused": "by-design (no mixture at this engine pin)",
+    "StateSensitivities.mix_n_sky_linearization_refused": (
+        "by-design (no mixture at this engine pin)"
+    ),
+    "Ephemeris.mix_n_components_total": "by-design (no mixture at this engine pin)",
+    "Ephemeris.mix_weight_delivered": "by-design (no mixture at this engine pin)",
+    "Ephemeris.mix_n_failed": "by-design (no mixture at this engine pin)",
+    "Ephemeris.mix_n_unresolved": "by-design (no mixture at this engine pin)",
+    "Ephemeris.mix_n_curvature_refused": "by-design (no mixture at this engine pin)",
+    "Ephemeris.mix_n_sky_linearization_refused": "by-design (no mixture at this engine pin)",
     # ── Impact probabilities: by-design when method != MonteCarlo ──
     "ImpactProbabilities.mc_n_samples": "by-design (MC method only)",
     "ImpactProbabilities.mc_n_impacts": "by-design (MC method only)",
@@ -232,7 +256,9 @@ ALLOWED_ALL_NULL: dict[str, str] = {
     # SAMPLED_MOMENT withholding, which this planning entry point never
     # produces. (log_det_withheld itself is non-nullable and always "none"
     # here, so it is not — and must not be — listed.) ──
-    "PlanMetrics.log_det_withheld_method": "by-design (sampled transport only; this seam runs Linear)",
+    "PlanMetrics.log_det_withheld_method": (
+        "by-design (sampled transport only; this seam runs Linear)"
+    ),
 }
 
 
@@ -1397,8 +1423,9 @@ def test_plan_subtables_coverage_is_complete() -> None:
         # `from __future__ import annotations` makes these strings.
         return t if isinstance(t, str) else getattr(t, "__name__", str(t))
 
-    # The scalar labels (orbit_id, active_width, log_det_gain) are not tables.
-    scalars = {"orbit_id", "active_width", "log_det_gain"}
+    # The scalar labels (orbit_id, active_width, log_det_gain, resolved_method)
+    # are not tables.
+    scalars = {"orbit_id", "active_width", "log_det_gain", "resolved_method"}
     declared = {
         name: class_name(t)
         for name, t in _planmod.PlanResult.__annotations__.items()

@@ -18,6 +18,7 @@ from empyrean.coordinates.coordinates import (
     SphericalCoordinates,
 )
 from empyrean.ephemeris.sensitivity import ObservationSensitivities
+from empyrean.orbits.joint import PackedJoints
 from empyrean.propagation.config import PropagationConfig
 from empyrean.propagation.status import OrbitOutcome, OrbitStatuses
 
@@ -39,6 +40,19 @@ class Ephemeris(qv.Table):
 
     # Topocentric astrometry (covariance lives inside coordinates)
     coordinates = SphericalCoordinates.as_column()
+
+    # Derivation kind of the row's sky covariance — a
+    # :class:`~empyrean.orbits.joint.CovarianceKind` value, the same
+    # vocabulary the propagation result uses. ``"linear"`` when the row
+    # carried no covariance (read delivery from ``joint`` /
+    # ``coordinates.covariance``, not this tag).
+    cov_kind = qv.LargeStringColumn()
+    # The row's sky covariance as the one packed joint — the same
+    # :class:`~empyrean.orbits.joint.PackedJoints` column the propagation rows
+    # carry, with ``functional == JointFunctional.SKY``. Its leading 6x6
+    # state block is the sky covariance on ``coordinates``. Null for a row
+    # with no covariance.
+    joint = PackedJoints.as_column(nullable=True)
 
     # Aberrated state at light-time corrected epoch
     aberrated_state = CartesianCoordinates.as_column(nullable=True)
@@ -94,6 +108,18 @@ class Ephemeris(qv.Table):
     # Sky motion
     position_angle = qv.Float64Column(nullable=True)
     sky_rate = qv.Float64Column(nullable=True)
+
+    # The engine's pre-retention Gaussian-mixture accounting for this row's sky
+    # covariance — the six tallies that ride WITH a mixture covariance. Column
+    # names match the propagation states table and the validation schema so a
+    # channel row maps 1:1. ``None`` on every non-mixture row, and ``None``
+    # (not 0) on a count the engine did not carry.
+    mix_n_components_total = qv.Int64Column(nullable=True)
+    mix_weight_delivered = qv.Float64Column(nullable=True)
+    mix_n_failed = qv.Int64Column(nullable=True)
+    mix_n_unresolved = qv.Int64Column(nullable=True)
+    mix_n_curvature_refused = qv.Int64Column(nullable=True)
+    mix_n_sky_linearization_refused = qv.Int64Column(nullable=True)
 
 
 # ── Configuration ────────────────────────────────────────────

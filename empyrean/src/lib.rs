@@ -188,9 +188,9 @@ pub use planning::{
 };
 pub use propagate::{
     AdvancedIntegratorConfig, CaptureCriterion, CovarianceKind, DenseOrigin, DiagnosticsConfig,
-    EphemerisOverlapPolicy, Event, EventConfig, ForceModelTier, IntegratorChoice, OrbitOutcome,
-    OriginSwitchingConfig, PropagatedState, PropagationConfig, PropagationResult, TaggedCovariance,
-    UncertaintyMethod,
+    EphemerisOverlapPolicy, Event, EventConfig, ForceModelTier, IntegratorChoice, MixtureTally,
+    OrbitOutcome, OriginSwitchingConfig, PropagatedState, PropagationConfig, PropagationResult,
+    TaggedCovariance, UncertaintyMethod,
 };
 pub use query::{
     query_horizons, query_horizons_vectors, query_observations, query_radar, query_sbdb,

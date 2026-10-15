@@ -53,6 +53,14 @@ import empyrean
 import numpy as np
 import pytest
 from empyrean import CartesianCoordinates, CartesianOrbits, Epochs, Observers
+from empyrean.orbits.joint import (
+    CovarianceKind,
+    JointFunctional,
+    JointProvenance,
+    JointQuality,
+    PackedJoint,
+    PackedJoints,
+)
 
 # Epoch of the sample orbit below (MJD TDB), and a plain heliocentric
 # state to propagate. Nothing here depends on the particular orbit — the
@@ -411,13 +419,54 @@ def test_built_system_propagate_refuses_bare_times(sample_orbit: Any, bare: Any)
     _assert_teaches_the_fix(str(excinfo.value))
 
 
+def _orbit_with_joint() -> CartesianOrbits:
+    """The ``sample_orbit`` state carrying a width-6 state joint.
+
+    The sensitivity chain exists only when the propagated orbit carried a
+    covariance — a joint-less orbit raises "sensitivity chain has no initial
+    covariance" — so the lookup-refusal gate pushes a joint to reach the
+    chain it is testing.
+    """
+    cov6 = np.diag([1e-12, 1e-12, 1e-12, 1e-16, 1e-16, 1e-16])
+    tri = [cov6[i, j] for i in range(6) for j in range(i + 1)]
+    joint = PackedJoint(
+        layout_present=0,
+        layout_considered=0,
+        layout_marginalized=0,
+        width=6,
+        tri=np.asarray(tri, dtype=np.float64),
+        kind=CovarianceKind.LINEAR,
+        quality=JointQuality.POSITIVE_DEFINITE,
+        cov_rank=0,
+        cov_null_axes=0,
+        cov_min_eig_corr=float("nan"),
+        functional=JointFunctional.STATE,
+        provenance=JointProvenance.DERIVED,
+        asserted_source=None,
+    )
+    coordinates = CartesianCoordinates.from_kwargs(
+        epoch=[_ORBIT_EPOCH_MJD_TDB],
+        x=[2.0],
+        y=[0.0],
+        z=[0.0],
+        vx=[0.0],
+        vy=[0.01217],
+        vz=[0.0],
+        frame="eclipticj2000",
+        origin=["Sun"],
+    )
+    return CartesianOrbits.from_kwargs(
+        orbit_id=["epochs-gate"],
+        coordinates=coordinates,
+        covariance=PackedJoints.from_joints([joint]),
+    )
+
+
 @pytest.mark.parametrize("method", ["index_at", "up_to"])
 @pytest.mark.parametrize("bare", [61010.0, np.float64(61010.0), [61010.0]])
-def test_sensitivity_epoch_lookup_refuses_bare_times(
-    sample_orbit: Any, method: str, bare: Any
-) -> None:
+def test_sensitivity_epoch_lookup_refuses_bare_times(method: str, bare: Any) -> None:
     result = empyrean.propagate(
-        sample_orbit,
+        _orbit_with_joint(),
         Epochs.from_mjd([61010.0], scale="tdb"),
         config=empyrean.PropagationConfig(compute_stm=True),
     )

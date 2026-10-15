@@ -25,7 +25,7 @@
 mod ephemeris;
 mod events;
 mod fit_summary;
-mod orbits;
+pub(crate) mod orbits;
 mod residuals;
 
 pub use ephemeris::{write_ephemeris_csv, write_ephemeris_json, write_ephemeris_parquet};

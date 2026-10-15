@@ -5,8 +5,8 @@
 //! orbits. Field names, units, and semantics are 1:1 with the engine
 //! surface (`start_mjd_tdb`, `end_mjd_tdb`, `thrust_n`, `mass_kg`,
 //! `isp_s`, `steering`, `sharpness`, `central_body`, plus
-//! `dv_corrections` / `correction_covariances`) so the same fields carry
-//! through the CLI, the wrapper, and the C ABI without renaming.
+//! `dv_corrections`) so the same fields carry through the CLI, the
+//! wrapper, and the C ABI without renaming.
 //!
 //! JSON schema (one file describes one [`empyrean::ThrustParams`], applied
 //! to every orbit in the batch):
@@ -25,8 +25,7 @@
 //!       "central_body":  10
 //!     }
 //!   ],
-//!   "dv_corrections":         [[0.0, 0.0, 0.0]],
-//!   "correction_covariances": [[[1e-20, 0, 0], [0, 1e-20, 0], [0, 0, 1e-20]]]
+//!   "dv_corrections": [[0.0, 0.0, 0.0]]
 //! }
 //! ```
 //!
@@ -37,11 +36,11 @@
 //! - `steering.type` is one of `constant_rtn` (with `alpha_rad`,
 //!   `beta_rad`), `velocity_tangent`, or `inertial_fixed` (with
 //!   `direction`).
-//! - `dv_corrections` is positional with `arcs`. When
-//!   `correction_covariances` is non-empty its length MUST equal
-//!   `dv_corrections`; this selects the burn-sensitivity propagation. A
-//!   mismatch is rejected loudly by the engine at propagation time — never
-//!   silently repaired.
+//! - `dv_corrections` is positional with `arcs`. A per-correction burn
+//!   prior rides the orbit's packed joint (its thrust axes) now, not a
+//!   separate `correction_covariances` carrier — that removed field is
+//!   refused by name if a stale file still carries it, never silently
+//!   dropped.
 
 use std::path::Path;
 
@@ -130,19 +129,17 @@ struct ThrustParamsJson {
     /// Per-arc Δv corrections (AU/day), positional with `arcs`.
     #[serde(default)]
     dv_corrections: Vec<[f64; 3]>,
-    /// 3×3 covariance (AU/day)² per Δv correction. When non-empty its
-    /// length must equal `dv_corrections` (checked by the engine).
-    #[serde(default)]
-    correction_covariances: Vec<[[f64; 3]; 3]>,
 }
 
 /// Load a thrust file and convert it into the wrapper's
 /// [`empyrean::ThrustParams`].
 ///
-/// The length-consistency contract between `dv_corrections` and
-/// `correction_covariances` (and the `ThirdOrder` + covariance
-/// rejection) is enforced by the engine at propagation time and surfaces
-/// as a propagation error — never repaired here.
+/// A per-correction burn prior now rides the orbit's packed joint (its
+/// thrust axes), not a separate `correction_covariances` carrier; a stale
+/// file still naming that removed field is refused by name
+/// (`deny_unknown_fields`), never silently dropped. The `dv_corrections`
+/// length contract is enforced by the engine at propagation time and
+/// surfaces as a propagation error — never repaired here.
 pub fn load_thrust_params(path: &Path) -> Result<ThrustParams> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read thrust file {}", path.display()))?;
@@ -163,9 +160,7 @@ pub fn load_thrust_params(path: &Path) -> Result<ThrustParams> {
         .map(ThrustArcJson::into_arc)
         .collect::<Result<Vec<_>>>()?;
 
-    Ok(ThrustParams::new(arcs)
-        .with_dv_corrections(parsed.dv_corrections)
-        .with_correction_covariances(parsed.correction_covariances))
+    Ok(ThrustParams::new(arcs).with_dv_corrections(parsed.dv_corrections))
 }
 
 #[cfg(test)]
@@ -202,8 +197,7 @@ mod tests {
                 "sharpness": 100.0,
                 "central_body": 10
             }],
-            "dv_corrections": [[1e-6, 2e-6, 3e-6]],
-            "correction_covariances": [[[1e-20, 0, 0], [0, 2e-20, 0], [0, 0, 3e-20]]]
+            "dv_corrections": [[1e-6, 2e-6, 3e-6]]
         }"#;
         let tp = parse(json).expect("parse");
         assert_eq!(tp.arcs.len(), 1);
@@ -223,7 +217,33 @@ mod tests {
             }
         );
         assert_eq!(tp.dv_corrections, vec![[1e-6, 2e-6, 3e-6]]);
-        assert_eq!(tp.correction_covariances.len(), 1);
+    }
+
+    #[test]
+    fn rejects_removed_correction_covariances_field() {
+        // The per-correction burn prior rides the orbit's packed joint now,
+        // so a thrust file still carrying the removed `correction_covariances`
+        // field must be refused by name — never silently dropped.
+        let json = r#"{
+            "arcs": [{
+                "start_mjd_tdb": 59000.0,
+                "end_mjd_tdb": 59010.0,
+                "thrust_n": 1000.0,
+                "mass_kg": 1000.0,
+                "steering": {"type": "velocity_tangent"},
+                "sharpness": 50.0,
+                "central_body": 10
+            }],
+            "dv_corrections": [[0.0, 0.0, 0.0]],
+            "correction_covariances": [[[1e-20, 0, 0], [0, 1e-20, 0], [0, 0, 1e-20]]]
+        }"#;
+        let err = parse(json).expect_err("removed field must be refused");
+        assert!(
+            err.to_string().contains("correction_covariances")
+                || err.to_string().contains("parse")
+                || err.to_string().contains("unknown"),
+            "error must name the removed field: {err}"
+        );
     }
 
     #[test]
@@ -243,9 +263,8 @@ mod tests {
         assert_eq!(tp.arcs[0].isp_s, None);
         assert_eq!(tp.arcs[0].steering, SteeringLaw::VelocityTangent);
         assert_eq!(tp.arcs[0].central_body, Origin::EARTH);
-        // Missing correction arrays default to empty.
+        // A missing dv_corrections array defaults to empty.
         assert!(tp.dv_corrections.is_empty());
-        assert!(tp.correction_covariances.is_empty());
     }
 
     #[test]

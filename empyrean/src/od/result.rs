@@ -1570,13 +1570,10 @@ impl DetermineResult {
             origin: st.origin,
             frame: st.frame,
             covariance: Some(self.covariance),
-            // The fit's own cross terms, from the same orbit this
-            // snapshot flattens — so the flat view and the re-feedable
-            // orbit describe one joint rather than two.
-            joint: crate::JointCovariance {
-                non_grav_cross: st.non_grav_cross,
-                wide_cross: self.orbit.wide_cross.clone(),
-            },
+            // The fit's own packed joint, from the same orbit this snapshot
+            // flattens — so the flat view and the re-feedable orbit describe
+            // one joint rather than two.
+            joint: self.orbit.covariance.clone(),
             stm: None,
             stt: None,
             resolved_kind: CovarianceKind::Linear,

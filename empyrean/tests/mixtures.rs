@@ -180,7 +180,11 @@ fn gaussian_mixture_retains_components_through_an_earth_encounter() {
                 "component mean must be finite"
             );
             assert!(
-                c.covariance.iter().flatten().all(|v| v.is_finite()),
+                c.joint
+                    .state_block()
+                    .iter()
+                    .flatten()
+                    .all(|v| v.is_finite()),
                 "component covariance must be finite"
             );
             // The basis decoded rather than defaulted — an unknown tag
@@ -339,7 +343,7 @@ fn exposed_components_reproduce_the_collapsed_covariance() {
         let Ok(tagged) = result.covariance_at_cartesian(0, k) else {
             continue;
         };
-        if tagged.kind != empyrean::CovarianceKind::Mixture {
+        if tagged.kind() != empyrean::CovarianceKind::Mixture {
             continue;
         }
         let epoch_mjd = tagged.epoch.mjd_tdb().expect("finite epoch");
@@ -350,14 +354,13 @@ fn exposed_components_reproduce_the_collapsed_covariance() {
             continue;
         }
         let collapsed = collapse(components);
-        let reference = tagged;
+        // The 6×6 state block is a derived read-only view of the tagged joint.
+        let ref_matrix = tagged.matrix();
         // Compare relative to the diagonal scale: the collapse is a sum
         // of products of ~1e-10-scale numbers, so an absolute tolerance
         // would be meaningless.
-        let scale: f64 = (0..6)
-            .map(|i| reference.matrix[i][i].abs())
-            .fold(0.0, f64::max);
-        for (r, (got_row, want_row)) in collapsed.iter().zip(reference.matrix).enumerate() {
+        let scale: f64 = (0..6).map(|i| ref_matrix[i][i].abs()).fold(0.0, f64::max);
+        for (r, (got_row, want_row)) in collapsed.iter().zip(ref_matrix).enumerate() {
             for (c, (got, want)) in got_row.iter().zip(want_row).enumerate() {
                 assert!(
                     (got - want).abs() <= 1e-6 * scale.max(f64::MIN_POSITIVE),
@@ -392,9 +395,11 @@ fn collapse(components: &[MixtureComponent]) -> [[f64; 6]; 6] {
     for c in components {
         let w = c.weight / wsum;
         let d: Vec<f64> = c.mean.iter().zip(mean).map(|(m, mu)| m - mu).collect();
+        // The component covariance is the leading 6×6 of its packed joint.
+        let cov = c.joint.state_block();
         for (r, out_row) in out.iter_mut().enumerate() {
             for (col, v) in out_row.iter_mut().enumerate() {
-                *v += w * (c.covariance[r][col] + d[r] * d[col]);
+                *v += w * (cov[r][col] + d[r] * d[col]);
             }
         }
     }

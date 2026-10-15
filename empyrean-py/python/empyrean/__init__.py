@@ -21,7 +21,7 @@ from empyrean.coordinates.enums import Frame, Origin
 from empyrean.coordinates.epoch import Epochs, TimeScale
 
 # ── Function re-exports (organized by subpackage) ────────────
-from empyrean.coordinates.transform import transform_coordinates
+from empyrean.coordinates.transform import transform_coordinates, transform_orbits
 from empyrean.ephemeris.generate import generate_ephemeris
 from empyrean.ephemeris.result import Ephemeris, EphemerisConfig, EphemerisResult
 from empyrean.ephemeris.sensitivity import (
@@ -34,6 +34,7 @@ from empyrean.ephemeris.sensitivity import (
     ObservationSensitivities,
     StateSensitivities,
 )
+from empyrean.errors import PushError, PushErrorVariant
 from empyrean.impact import (
     BPlanes,
     ImpactProbabilities,
@@ -101,6 +102,15 @@ from empyrean.od.result import (
     WeightingPreset,
 )
 from empyrean.od.session import Session, SessionDiff
+from empyrean.orbits.joint import (
+    AssertedSource,
+    CovarianceKind,
+    JointFunctional,
+    JointProvenance,
+    JointQuality,
+    PackedJoint,
+    PackedJoints,
+)
 from empyrean.orbits.nongrav import NonGravParams
 from empyrean.orbits.orbits import (
     CartesianOrbits,
@@ -118,11 +128,11 @@ from empyrean.orbits.thrust import (
     ThrustParams,
     VelocityTangent,
 )
-from empyrean.orbits.wide_cross import WideCross
 from empyrean.planning.plan import evaluate_plan
 from empyrean.planning.result import (
     STAGE_POSTERIOR,
     STAGE_PRIOR,
+    LogDetWithheld,
     ObservatoryConfig,
     PlanCandidates,
     PlanEphemeris,
@@ -165,15 +175,13 @@ from empyrean.propagation.events import (
     ShadowEntries,
     ShadowExits,
 )
-from empyrean.propagation.mixtures import MixtureChains
+from empyrean.propagation.mixtures import ComponentStatus, MixtureChains
 from empyrean.propagation.propagate import propagate
 from empyrean.propagation.result import PropagationResult
+from empyrean.propagation.status import OrbitOutcome, OrbitStatuses
 from empyrean.propagation.tagged_covariance import (
-    CovarianceKind,
-    CovarianceQuality,
     TaggedCovariance,
     TaggedCovariances,
-    TargetFunctional,
 )
 from empyrean.states import get_states
 from empyrean.system import (

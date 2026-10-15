@@ -372,6 +372,36 @@ impl Default for PlanningConfig {
 
 // ── Output types ────────────────────────────────────────────────────
 
+/// Why a [`CovarianceMetrics::log_det`] is `None` — the nonlinear
+/// transport that made the absolute determinant ill-posed, named rather
+/// than left a bare `None`. Mirrors `empyrean_core::planning::LogDetWithheld`
+/// variant for variant.
+///
+/// Carried (`Some`) on [`CovarianceMetrics::log_det_withheld`] exactly
+/// when [`CovarianceMetrics::log_det`] is `None`; a prior-epoch metric and
+/// a report-epoch metric under the single-linearization transport deliver
+/// `log_det` and leave this `None`. The two are complementary — exactly
+/// one is `Some`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogDetWithheld {
+    /// Reached by the closed-form second-order moment transport: the
+    /// about-nominal second moment of a curved cloud carries no
+    /// epoch-invariant determinant identity.
+    SecondOrderMoment,
+    /// Reached by a sampled transport whose products are flown-member
+    /// sample moments, named by the sampled kind that produced them
+    /// ([`SigmaPoint`](crate::CovarianceKind::SigmaPoint) or
+    /// [`MonteCarlo`](crate::CovarianceKind::MonteCarlo)).
+    SampledMoment {
+        /// The sampled transport kind.
+        method: crate::CovarianceKind,
+    },
+    /// Reached by a Gaussian-mixture moment transport. Not produced by
+    /// this planning surface (the single-linearization fold runs), but
+    /// named so the withholding vocabulary is complete.
+    MixtureMoment,
+}
+
 /// Summary metrics for a state covariance — the prior, the posterior, or
 /// a candidate's running total.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -385,16 +415,27 @@ pub struct CovarianceMetrics {
     /// Semi-minor axis of the 1σ position ellipsoid (km).
     pub semi_minor_km: f64,
     /// \\(\\ln \\det \\Sigma\\) over the 6×6 state covariance — the
-    /// D-optimality criterion.
+    /// absolute D-optimality criterion. `Some` at the prior epoch and at a
+    /// report epoch reached under the single-linearization transport —
+    /// the only transport [`Context::evaluate_plan`] runs, so it is
+    /// `Some` on every result this crate returns today. `None` only when
+    /// [`log_det_withheld`](Self::log_det_withheld) names a nonlinear
+    /// transport that made the absolute determinant ill-posed (never a
+    /// `None` without a reason beside it). The epoch-invariant
+    /// [`PlanResult::log_det_gain`] stays available on every rung.
     ///
-    /// **In AU and AU·day⁻¹**, unlike the four fields above, which are
-    /// rescaled to km and m/s. A log-determinant is dimensional, so the
-    /// absolute value depends on that choice: the same covariance
+    /// **In AU and AU·day⁻¹** when present, unlike the four fields above,
+    /// which are rescaled to km and m/s. A log-determinant is dimensional,
+    /// so the absolute value depends on that choice: the same covariance
     /// expressed in km and m/s gives a value larger by
     /// \\(6\\ln(\\mathrm{km/AU}) + 6\\ln(\\mathrm{(m/s)/(AU/day)}) \\approx
     /// 199.13\\). Differences between two `log_det` values on this
     /// surface are unit-invariant and can be compared directly.
-    pub log_det: f64,
+    pub log_det: Option<f64>,
+    /// Why [`log_det`](Self::log_det) is `None`, when it is. `None`
+    /// whenever `log_det` is `Some` — the two are complementary, exactly
+    /// one carries the state.
+    pub log_det_withheld: Option<LogDetWithheld>,
 }
 
 /// One predicted sky position from the plan's optical ephemeris.
@@ -572,6 +613,18 @@ pub struct PlanResult {
     /// [`PlanCandidate::marginal_volume_reduction`] of exactly 1 with
     /// [`PlanCandidate::cumulative`] unchanged from the previous row.
     pub posterior: CovarianceMetrics,
+    /// Epoch-invariant prior→posterior change in the absolute 6×6
+    /// state-block \\(\\ln \\det \\Sigma\\) (nats), formed once at the
+    /// prior's epoch where both are well-posed: negative when the planned
+    /// observations shrink the covariance volume, and
+    /// \\(\\exp(\\text{gain}/6)\\) is the whole-plan 1σ-volume ratio.
+    /// Always finite — it is reached before any transport, so it stays
+    /// available even when [`prior`](Self::prior) /
+    /// [`posterior`](Self::posterior) withhold their `log_det` past a
+    /// nonlinear transport. In the unit-invariant AU/AU·day⁻¹ convention
+    /// of [`CovarianceMetrics::log_det`], though as a *difference* it is
+    /// the same in any consistent unit choice.
+    pub log_det_gain: f64,
     /// Per-candidate analysis, in ascending epoch order rather than the
     /// order the candidates were supplied in.
     pub candidates: Vec<PlanCandidate>,
@@ -634,21 +687,49 @@ fn reject_non_finite(value: Option<f64>, what: &str, index: usize) -> Result<()>
     Ok(())
 }
 
-fn metrics_from_ffi(m: empyrean_sys::EmpyreanCovarianceMetrics) -> CovarianceMetrics {
+fn metrics_from_ffi(m: empyrean_sys::EmpyreanCovarianceMetrics) -> Result<CovarianceMetrics> {
+    // No `..` rest pattern, so a new C-ABI field is a compile error here.
     let empyrean_sys::EmpyreanCovarianceMetrics {
         position_sigma_km,
         velocity_sigma_m_s,
         semi_major_km,
         semi_minor_km,
         log_det,
+        log_det_withheld,
+        log_det_withheld_method,
     } = m;
-    CovarianceMetrics {
+    // The reason tag is authoritative: `_NONE` delivers `log_det` (a
+    // finite number), every other code withholds it and names the
+    // transport. An unknown code from a newer engine is refused by name
+    // rather than mapped to a silent "delivered" or "none".
+    let (log_det, withheld) = match u32::from(log_det_withheld) {
+        empyrean_sys::EMPYREAN_LOG_DET_WITHHELD_NONE => (Some(log_det), None),
+        empyrean_sys::EMPYREAN_LOG_DET_WITHHELD_SECOND_ORDER_MOMENT => {
+            (None, Some(LogDetWithheld::SecondOrderMoment))
+        }
+        empyrean_sys::EMPYREAN_LOG_DET_WITHHELD_SAMPLED_MOMENT => (
+            None,
+            Some(LogDetWithheld::SampledMoment {
+                method: crate::CovarianceKind::from_u8(log_det_withheld_method)?,
+            }),
+        ),
+        empyrean_sys::EMPYREAN_LOG_DET_WITHHELD_MIXTURE_MOMENT => {
+            (None, Some(LogDetWithheld::MixtureMoment))
+        }
+        other => {
+            return Err(Error::invalid_input(format!(
+                "C ABI returned an unknown log-det withheld code: {other}"
+            )));
+        }
+    };
+    Ok(CovarianceMetrics {
         position_sigma_km,
         velocity_sigma_m_s,
         semi_major_km,
         semi_minor_km,
         log_det,
-    }
+        log_det_withheld: withheld,
+    })
 }
 
 /// Keepalive for the `CString`s the planned-observation and observatory
@@ -1096,6 +1177,7 @@ fn plan_result_from_ffi(ffi: &empyrean_sys::EmpyreanPlanResult) -> Result<PlanRe
         orbit_id,
         prior,
         posterior,
+        log_det_gain,
         candidates,
         num_candidates,
         active_width,
@@ -1128,8 +1210,9 @@ fn plan_result_from_ffi(ffi: &empyrean_sys::EmpyreanPlanResult) -> Result<PlanRe
 
     Ok(PlanResult {
         orbit_id: unsafe { cstr_to_string(orbit_id) },
-        prior: metrics_from_ffi(prior),
-        posterior: metrics_from_ffi(posterior),
+        prior: metrics_from_ffi(prior)?,
+        posterior: metrics_from_ffi(posterior)?,
+        log_det_gain,
         candidates: out_candidates,
         active_width,
         ephemeris: out_ephemeris,
@@ -1204,7 +1287,7 @@ fn candidate_from_ffi(c: &empyrean_sys::EmpyreanPlanCandidate) -> Result<PlanCan
         marginal_position_improvement,
         post_along_track_sigma_arcsec: optical_only(is_optical, post_along_track_sigma_arcsec),
         post_cross_track_sigma_arcsec: optical_only(is_optical, post_cross_track_sigma_arcsec),
-        cumulative: metrics_from_ffi(cumulative),
+        cumulative: metrics_from_ffi(cumulative)?,
         active_width,
     })
 }
@@ -1546,5 +1629,76 @@ mod tests {
             0.1,
         );
         assert!(reject_link_budget_inputs_with_given_snr(&budget, 0).is_ok());
+    }
+
+    #[test]
+    fn metrics_from_ffi_decodes_the_log_det_contract() {
+        // Delivered: a finite value and no withheld reason (the two are
+        // complementary — exactly one carries the state).
+        let delivered = empyrean_sys::EmpyreanCovarianceMetrics {
+            log_det: -221.0,
+            log_det_withheld: empyrean_sys::EMPYREAN_LOG_DET_WITHHELD_NONE as u8,
+            log_det_withheld_method: empyrean_sys::EMPYREAN_COVARIANCE_KIND_UNKNOWN as u8,
+            ..Default::default()
+        };
+        let m = metrics_from_ffi(delivered).expect("a delivered metric decodes");
+        assert_eq!(m.log_det, Some(-221.0));
+        assert_eq!(m.log_det_withheld, None);
+
+        // Withheld under the second-order transport: no value, the reason
+        // named — never a bare None without a reason beside it.
+        let second = empyrean_sys::EmpyreanCovarianceMetrics {
+            log_det: f64::NAN,
+            log_det_withheld: empyrean_sys::EMPYREAN_LOG_DET_WITHHELD_SECOND_ORDER_MOMENT as u8,
+            log_det_withheld_method: empyrean_sys::EMPYREAN_COVARIANCE_KIND_UNKNOWN as u8,
+            ..Default::default()
+        };
+        let m = metrics_from_ffi(second).expect("a withheld metric decodes");
+        assert_eq!(m.log_det, None);
+        assert_eq!(m.log_det_withheld, Some(LogDetWithheld::SecondOrderMoment));
+
+        // Sampled: the transport kind rides through in the CovarianceKind
+        // vocabulary.
+        let sampled = empyrean_sys::EmpyreanCovarianceMetrics {
+            log_det: f64::NAN,
+            log_det_withheld: empyrean_sys::EMPYREAN_LOG_DET_WITHHELD_SAMPLED_MOMENT as u8,
+            log_det_withheld_method: empyrean_sys::EMPYREAN_COVARIANCE_KIND_SIGMA_POINT as u8,
+            ..Default::default()
+        };
+        let m = metrics_from_ffi(sampled).expect("a sampled metric decodes");
+        assert_eq!(m.log_det, None);
+        assert_eq!(
+            m.log_det_withheld,
+            Some(LogDetWithheld::SampledMoment {
+                method: crate::CovarianceKind::SigmaPoint,
+            })
+        );
+    }
+
+    #[test]
+    fn an_unknown_log_det_withheld_code_is_refused() {
+        // A newer engine could add a withholding reason; mapping it to
+        // "delivered" would read a NaN as a real log-det.
+        let bad = empyrean_sys::EmpyreanCovarianceMetrics {
+            log_det: f64::NAN,
+            log_det_withheld: 7,
+            ..Default::default()
+        };
+        let err = metrics_from_ffi(bad).expect_err("an unknown withheld code must be refused");
+        assert!(err.message.contains("withheld"), "{}", err.message);
+    }
+
+    #[test]
+    fn plan_result_from_ffi_carries_the_log_det_gain() {
+        // The epoch-invariant gain rides the result beside the metrics; a
+        // zero-init plan decodes its prior/posterior as delivered.
+        let ffi = empyrean_sys::EmpyreanPlanResult {
+            log_det_gain: -12.5,
+            ..Default::default()
+        };
+        let plan = plan_result_from_ffi(&ffi).expect("a zero-init plan decodes");
+        assert_eq!(plan.log_det_gain, -12.5);
+        assert_eq!(plan.prior.log_det_withheld, None);
+        assert_eq!(plan.posterior.log_det_withheld, None);
     }
 }

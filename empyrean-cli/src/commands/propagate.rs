@@ -5,11 +5,21 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use empyrean::{OrbitBatch, PropagationConfig, PropagationResult, UncertaintyMethod};
 
+use super::determine::batch_exit_code;
 use super::{DataOptions, load_context};
 use crate::io::output::OutputFormat;
-use crate::io::{orbit_input, output};
+use crate::io::{orbit_input, output, status};
 use crate::{ForceModel, UncertaintyMethodArg};
 
+/// Propagate orbits to a target epoch.
+///
+/// Batch-first: every input orbit is propagated and accounted for. A
+/// per-orbit failure does not end the batch — the failing orbit is named on
+/// stderr with its reason and recorded in the status table, while the other
+/// orbits still deliver their states.
+///
+/// Exit code: 0 when every orbit delivered, 3 when some delivered and some
+/// failed, 4 when the batch ran but none delivered.
 #[derive(clap::Args)]
 pub struct PropagateArgs {
     /// Object names to query from JPL SBDB.
@@ -161,10 +171,11 @@ pub fn run(data: &DataOptions, args: PropagateArgs) -> Result<()> {
 
     // Attach continuous-thrust parameters, if any. One thrust file
     // describes one `ThrustParams`, applied to every orbit in the batch.
-    // The engine enforces the dv_corrections / correction_covariances
-    // length contract (and rejects ThirdOrder + correction covariances)
-    // at propagation time; any violation surfaces below as a loud
-    // `propagation failed` error rather than being repaired here.
+    // The engine enforces the dv_corrections length contract at
+    // propagation time; any violation surfaces below as a loud
+    // `propagation failed` error rather than being repaired here. A burn
+    // prior now rides the orbit's packed joint (its thrust axes), not a
+    // separate correction-covariance carrier.
     if let Some(thrust_path) = &args.thrust_arcs {
         let thrust = crate::io::thrust_input::load_thrust_params(thrust_path)?;
         eprintln!(
@@ -201,11 +212,24 @@ pub fn run(data: &DataOptions, args: PropagateArgs) -> Result<()> {
         print_tagged_covariance_series(&batch, &result);
     }
 
+    // Per-orbit delivery accounting: the batch's verdict, one line per
+    // input orbit, plus the failures named in full. A failed orbit is
+    // reported here rather than vanishing from a shorter states file.
+    let status_rows = status::status_rows(&result.outcomes, &batch.orbit_ids);
+    status::report_status(&status_rows);
+
     eprintln!("\n  Output: {}/", args.out_dir.display());
     let propagated = propagated_to_batch(&batch, &result);
     output::write_orbits(&args.out_dir, "states", &propagated, args.format)?;
     output::write_events(&args.out_dir, "events", &result.events, args.format)?;
+    status::write_status(&args.out_dir, "status", &status_rows, args.format)?;
 
+    // The exit code is the batch's verdict (shared with `determine` and
+    // `ephemeris`): 0 all delivered, 3 partial, 4 none.
+    let code = batch_exit_code(status::delivered_count(&status_rows), status_rows.len());
+    if code != super::determine::EXIT_ALL_DELIVERED {
+        std::process::exit(code);
+    }
     Ok(())
 }
 
@@ -248,30 +272,29 @@ fn print_event_summary(result: &PropagationResult, detection_off: bool) {
 /// covariance), a one-line note is printed for that orbit and the
 /// remaining orbits are still rendered.
 fn print_tagged_covariance_series(input: &OrbitBatch, result: &PropagationResult) {
-    use empyrean::{CovarianceKind, CovarianceQuality};
+    use empyrean::{CovarianceKind, JointQuality};
 
     fn kind_str(kind: CovarianceKind) -> &'static str {
         match kind {
             CovarianceKind::Linear => "Linear",
             CovarianceKind::SecondOrder => "SecondOrder",
-            CovarianceKind::ThirdOrder => "ThirdOrder",
             CovarianceKind::Mixture => "Mixture",
             CovarianceKind::MonteCarlo => "MonteCarlo",
             CovarianceKind::SigmaPoint => "SigmaPoint",
         }
     }
 
-    fn quality_str(quality: CovarianceQuality) -> String {
+    fn quality_str(quality: JointQuality) -> String {
         match quality {
-            CovarianceQuality::PositiveDefinite => "pos-def".to_string(),
-            CovarianceQuality::Indefinite { min_eig } => {
-                format!("indefinite(min_eig={min_eig:.2e})")
+            JointQuality::PositiveDefinite => "pos-def".to_string(),
+            JointQuality::PositiveSemidefinite { rank, null_axes } => {
+                format!("pos-semidef(rank={rank}, null_axes=0x{null_axes:x})")
             }
-            CovarianceQuality::Repaired { min_eig } => {
-                format!("repaired(min_eig={min_eig:.2e})")
+            JointQuality::Indefinite { min_eig_corr } => {
+                format!("indefinite(min_eig_corr={min_eig_corr:.2e})")
             }
-            CovarianceQuality::ExpansionSuspect { kappa_state } => {
-                format!("expansion-suspect(kappa_state={kappa_state:.2e})")
+            JointQuality::Repaired { min_eig_corr } => {
+                format!("repaired(min_eig_corr={min_eig_corr:.2e})")
             }
         }
     }
@@ -293,18 +316,21 @@ fn print_tagged_covariance_series(input: &OrbitBatch, result: &PropagationResult
                 eprintln!("    {}", "-".repeat(78));
                 for tagged in &series {
                     // Per-axis position 1σ: sqrt of the upper-left 3×3
-                    // diagonal (AU² → AU) scaled to km.
-                    let sigma_km = |i: usize| tagged.matrix[i][i].max(0.0).sqrt() * AU_KM;
+                    // diagonal (AU² → AU) scaled to km. `matrix()` is the
+                    // joint's derived read-only state-block view, so bind it
+                    // once per row rather than re-deriving per axis.
+                    let m = tagged.matrix();
+                    let sigma_km = |i: usize| m[i][i].max(0.0).sqrt() * AU_KM;
                     let mjd = tagged.epoch.mjd_tdb().unwrap_or(f64::NAN);
                     eprintln!(
                         "    {:>14.5} {:>12} {:>12.3} {:>12.3} {:>12.3} {:>5} {}",
                         mjd,
-                        kind_str(tagged.kind),
+                        kind_str(tagged.kind()),
                         sigma_km(0),
                         sigma_km(1),
                         sigma_km(2),
-                        tagged.solved_width,
-                        quality_str(tagged.quality),
+                        tagged.solved_width(),
+                        quality_str(tagged.quality()),
                     );
                 }
             }
@@ -318,61 +344,66 @@ fn print_tagged_covariance_series(input: &OrbitBatch, result: &PropagationResult
 /// Build an [`OrbitBatch`] of propagated states using the input batch's
 /// orbit/object IDs (carried positionally) and the propagation result's
 /// state vectors at the target epoch(s).
-fn propagated_to_batch(input: &OrbitBatch, result: &PropagationResult) -> OrbitBatch {
-    use empyrean::{CoordinateState, Frame, Orbit, Representation};
+/// Build an [`OrbitBatch`] of propagated states, attributing each delivered
+/// row to its input orbit through the engine's per-orbit blocks
+/// ([`rows_for`](empyrean::PropagationResult::rows_for)), never a uniform
+/// `i / n_times` grid. Shared by the in-process command and the daemon server
+/// (one helper, no twin) so both channels attribute rows identically.
+pub(crate) fn propagated_to_batch(input: &OrbitBatch, result: &PropagationResult) -> OrbitBatch {
+    use empyrean::{CoordinateState, Orbit};
     let mut orbits = Vec::with_capacity(result.states.len());
-    let n_in = input.len();
-    let n_times = if n_in > 0 {
-        result.states.len() / n_in
-    } else {
-        1
-    };
     let mut orbit_ids = Vec::with_capacity(result.states.len());
     let mut object_ids = Vec::with_capacity(result.states.len());
-    for (i, state) in result.states.iter().enumerate() {
-        let orbit_idx = if n_times > 0 { i / n_times } else { 0 };
+    // Attribute each delivered row to its orbit through the engine's
+    // per-orbit outcome blocks (`rows_for`), not a uniform `i / n_times`
+    // grid: once an orbit fails or stops short its block is no longer a
+    // clean `n_times` stride, so the former grid mapped every later state's
+    // id/covariance to the wrong input orbit. A failed orbit contributes no
+    // rows (`rows_for` is `None`); a delivered orbit's rows are its exact
+    // block of `states`.
+    for orbit_index in 0..result.num_orbits() {
+        let Some(rows) = result.rows_for(orbit_index) else {
+            continue;
+        };
         let id = input
             .orbit_ids
-            .get(orbit_idx)
+            .get(orbit_index)
             .cloned()
-            .unwrap_or_else(|| format!("orbit_{orbit_idx}"));
-        let obj = input.object_ids.get(orbit_idx).cloned().flatten();
-        let mut cs = CoordinateState::cartesian(
-            state.epoch,
-            [
-                state.position[0],
-                state.position[1],
-                state.position[2],
-                state.velocity[0],
-                state.velocity[1],
-                state.velocity[2],
-            ],
-            state.frame,
-            state.origin,
-        );
-        if let Some(c) = state.covariance {
-            cs = cs.with_covariance(c);
+            .unwrap_or_else(|| format!("orbit_{orbit_index}"));
+        let obj = input.object_ids.get(orbit_index).cloned().flatten();
+        let template = input.orbits.get(orbit_index).cloned();
+        for state in rows {
+            let mut cs = CoordinateState::cartesian(
+                state.epoch,
+                [
+                    state.position[0],
+                    state.position[1],
+                    state.position[2],
+                    state.velocity[0],
+                    state.velocity[1],
+                    state.velocity[2],
+                ],
+                state.frame,
+                state.origin,
+            );
+            if let Some(c) = state.covariance {
+                cs = cs.with_covariance(c);
+            }
+            // Carry the input orbit's non-grav + photometry forward; only
+            // the state is replaced. Functional-update syntax so future
+            // additions to `Orbit` (phot_system / h_mag / slope1 / slope2,
+            // etc.) don't break this site.
+            let orbit = match &template {
+                Some(t) => Orbit {
+                    state: cs,
+                    ..t.clone()
+                },
+                None => Orbit::new(cs),
+            };
+            orbits.push(orbit);
+            orbit_ids.push(id.clone());
+            object_ids.push(obj.clone());
         }
-        let _ = (Frame::ICRF, Representation::Cartesian);
-        let template = input
-            .orbits
-            .get(orbit_idx)
-            .cloned()
-            .unwrap_or_else(|| Orbit::new(cs));
-        // Carry the input orbit's non-grav + photometry forward; only
-        // the state is replaced with the parsed `cs`. `..template`
-        // filled non-state fields when this code was written; once
-        // `Orbit` grew `phot_system` / `h_mag` / `slope1` / `slope2`
-        // for ephemeris-mag support, the explicit struct literal here
-        // stopped covering the full field set. Use functional update
-        // syntax so future additions to `Orbit` don't break this site.
-        let orbit = Orbit {
-            state: cs,
-            ..template
-        };
-        orbits.push(orbit);
-        orbit_ids.push(id);
-        object_ids.push(obj);
     }
     OrbitBatch {
         orbits,

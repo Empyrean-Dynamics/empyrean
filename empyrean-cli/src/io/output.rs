@@ -40,12 +40,14 @@ fn out_path(dir: &Path, stem: &str, fmt: OutputFormat) -> PathBuf {
 pub fn write_orbits(dir: &Path, stem: &str, batch: &OrbitBatch, fmt: OutputFormat) -> Result<()> {
     std::fs::create_dir_all(dir).context("failed to create output directory")?;
     let path = out_path(dir, stem, fmt);
+    // The orbit writers go through the same packed-joint push boundary as
+    // ingestion, so a malformed joint refuses by name here too.
     match fmt {
         OutputFormat::Parquet => write_orbits_parquet(&path, batch),
         OutputFormat::Json => write_orbits_json(&path, batch),
         OutputFormat::Csv => write_orbits_csv(&path, batch),
     }
-    .with_context(|| format!("failed to write {}", path.display()))?;
+    .map_err(|e| super::push_error::wrap(e, format!("failed to write {}", path.display())))?;
     eprintln!("  {} ({} rows)", path.display(), batch.len());
     Ok(())
 }

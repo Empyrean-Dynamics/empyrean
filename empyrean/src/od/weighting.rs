@@ -180,3 +180,32 @@ pub(super) fn weighting_layer_to_ffi(
     }
     Ok(ffi)
 }
+
+#[cfg(test)]
+mod weighting_default_tests {
+    use super::{WeightingConfig, WeightingLayer, WeightingPreset};
+
+    /// The wrapper's OD weighting default mirrors the production default the C
+    /// surface reports: VFCC2017 station floors WITH a nightly-deweighting
+    /// layer, enabled, a 1″ fallback σ.
+    ///
+    /// The wrapper has no engine access, so this is a wrapper-vs-C comparison
+    /// rather than wrapper-vs-engine: it pins the wrapper-side default against
+    /// the same production default the C ruling test pins engine-side (that
+    /// test compares the C preset default against
+    /// `empyrean_core::determination::WeightingConfig::default()`). The two
+    /// must agree, or `determine()` diverges from the direct-engine path on
+    /// same-night / same-station observation clusters.
+    #[test]
+    fn the_default_weighting_mirrors_the_production_default() {
+        let d = WeightingConfig::default();
+        assert!(d.enabled, "weighting is on by default");
+        assert_eq!(d.preset, WeightingPreset::VFCC2017);
+        assert_eq!(d.default_sigma_arcsec, 1.0);
+        assert_eq!(
+            d.additional_layers,
+            vec![WeightingLayer::NightlyDeweighting { max_gap_days: 0.5 }],
+            "production chains nightly de-weighting on top of the preset"
+        );
+    }
+}

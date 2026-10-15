@@ -590,7 +590,7 @@ class SolveFor:
     """Disposition of the SRP AMRAT (requires an SRP AMRAT prior)."""
     thrust: list[ParamDisposition] = field(default_factory=list)
     """Disposition of each **declared** thrust Δv segment, positional with
-    the orbit's ``correction_covariances``.
+    the orbit's ``dv_corrections`` (the burn prior rides the packed joint).
 
     Positional rather than a count: a considered or fixed burn sits
     between solved ones as readily as after them, and a count cannot say

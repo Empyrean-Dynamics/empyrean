@@ -242,3 +242,83 @@ fn output_is_independent_of_input_row_order() {
     std::fs::remove_dir_all(&grouped_dir).ok();
     std::fs::remove_dir_all(&interleaved_dir).ok();
 }
+
+/// Two attributable rows for one object, then one row carrying NO object
+/// identifier (`permID` / `provID` / `trkSub` all empty) at index 2.
+fn one_id_less_psv() -> String {
+    let mut out = String::from(
+        "# version=2022\npermID|provID|trkSub|mode|stn|obsTime|ra|dec|rmsRA|rmsDec|astCat\n",
+    );
+    out.push_str("|SYNTH01||CCD|703|2024-01-10T08:00:00.000Z|120.000000|15.000000|0.5|0.5|Gaia2\n");
+    out.push_str("|SYNTH01||CCD|703|2024-01-10T09:00:00.000Z|120.010000|15.004000|0.5|0.5|Gaia2\n");
+    out.push_str("|||CCD|703|2024-01-10T10:00:00.000Z|130.000000|10.000000|0.5|0.5|Gaia2\n");
+    out
+}
+
+/// scott #126 at the CLI: a batch carrying a row with no object identifier
+/// aborts by name rather than silently skipping the row. The process exit
+/// code is a plain input-error non-zero — never `0`, and never one of the
+/// delivery-outcome codes (`3` some delivered / `4` none delivered) — so a
+/// batch abort cannot be mistaken for a delivery verdict. stderr names the
+/// cause and the offending optical row index, and nothing is written
+/// because the abort precedes every per-object result.
+#[test]
+fn an_id_less_row_aborts_the_batch_by_name() {
+    let Some(data_dir) = resolve_data_dir() else {
+        eprintln!("skipping: no data dir with de440.bsp");
+        return;
+    };
+    if !engine_loads() {
+        eprintln!("skipping: libempyrean does not load for this build");
+        return;
+    }
+
+    let dir = temp_dir("id-less");
+    let out = determine_into(&dir, &one_id_less_psv(), &data_dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    let code = out.status.code();
+    assert_ne!(
+        code,
+        Some(0),
+        "an id-less batch must not succeed\nstderr:\n{stderr}"
+    );
+    assert_ne!(
+        code,
+        Some(EXIT_SOME_DELIVERED),
+        "a batch abort must not read as a delivery outcome\nstderr:\n{stderr}"
+    );
+    assert_ne!(
+        code,
+        Some(EXIT_NONE_DELIVERED),
+        "a batch abort must not read as a delivery outcome\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        code,
+        Some(1),
+        "a batch abort is a plain input error (exit 1)\nstderr:\n{stderr}"
+    );
+
+    assert!(
+        stderr.contains("no object identifier"),
+        "the refusal must name the cause\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("optical rows: [2]"),
+        "the refusal must name the offending optical row index\nstderr:\n{stderr}"
+    );
+
+    // The abort precedes every per-object result, so no summary is written.
+    assert!(
+        !dir.join("fit_summary.csv").exists(),
+        "a batch abort writes no fit_summary\nstderr:\n{stderr}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The determine command's delivery-outcome exit codes, mirrored from
+/// `commands::determine` so the id-less abort can assert it collides with
+/// neither. `3` = some objects delivered, `4` = none delivered.
+const EXIT_SOME_DELIVERED: i32 = 3;
+const EXIT_NONE_DELIVERED: i32 = 4;

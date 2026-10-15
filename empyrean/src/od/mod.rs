@@ -707,35 +707,18 @@ fn ffi_od_result_orbit(result: &empyrean_sys::EmpyreanODResult) -> crate::error:
         if ng.has_dt != 0 {
             orbit = orbit.with_non_grav_dt(Some(ng.non_grav_dt));
         }
-        // Carry the fitted non-grav covariance so the orbit re-feeds into a
-        // StateAndNonGrav refine without losing its non-grav prior.
-        if ng.has_covariance != 0 {
-            orbit = orbit.with_nongrav_covariance(Some(ng.covariance));
-        }
-    }
-    // The DT posterior. It had no wire before the 0.10.0 ABI, so a solved-DT
-    // fit used to round-trip with its DT column closed.
-    if result.has_non_grav != 0 && result.non_grav.has_dt_variance != 0 {
-        orbit = orbit.with_non_grav_dt_variance(Some(result.non_grav.dt_variance));
     }
     // Carry the fitted/absolute SRP slot so a solved AMRAT orbit re-feeds into
-    // propagate / refine without silently dropping its SRP force. When the
-    // AMRAT was solved, `amrat_variance` is the fitted posterior — chaining the
-    // correct prior into a follow-on StateAndAMRAT refine.
+    // propagate / refine without silently dropping its SRP force.
     if result.has_srp != 0 {
         let srp = &result.srp;
         orbit = orbit.with_srp(srp.amrat, srp.cr);
-        if srp.has_amrat_variance != 0 {
-            orbit = orbit.with_srp_amrat_variance(Some(srp.amrat_variance));
-        }
     }
-    // The cross terms — the half of the posterior that is not a diagonal
-    // block. Both halves land where a re-feed reads them: the border on
-    // the coordinate beside its 6×6, the carrier on the orbit. Without
-    // this the returned orbit carries a block-diagonal covariance, which
-    // is a tighter claim than the fit made.
-    let joint = unsafe { crate::JointCovariance::from_ffi(&result.orbit.orbit_cov) }?;
-    orbit.state.non_grav_cross = joint.non_grav_cross;
-    orbit.wide_cross = joint.wide_cross;
+    // The whole fitted posterior rides one packed joint — the state block, the
+    // Marsden / DT / AMRAT / thrust diagonal blocks, and every cross term. A
+    // re-feed reads one field, so the returned orbit carries the full
+    // \\((6+P)\\)-wide matrix the fit made, never a tighter block-diagonal
+    // claim. A width-0 joint reads back as `None`.
+    orbit.covariance = unsafe { crate::PackedJoint::from_ffi(&result.orbit.orbit_cov) }?;
     Ok(orbit)
 }

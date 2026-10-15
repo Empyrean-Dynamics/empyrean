@@ -95,6 +95,7 @@ empyrean_string_free
 empyrean_tagged_covariance_series_free
 empyrean_transform_coordinates
 empyrean_transform_coordinates_single
+empyrean_transform_orbits
 empyrean_version_string
 empyrean_versions
 empyrean_versions_free

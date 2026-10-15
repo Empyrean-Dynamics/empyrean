@@ -12,6 +12,7 @@ from empyrean.planning.plan import evaluate_plan
 from empyrean.planning.result import (
     STAGE_POSTERIOR,
     STAGE_PRIOR,
+    LogDetWithheld,
     ObservatoryConfig,
     PlanCandidates,
     PlanEphemeris,
@@ -27,6 +28,7 @@ from empyrean.planning.result import (
 __all__ = [
     "STAGE_POSTERIOR",
     "STAGE_PRIOR",
+    "LogDetWithheld",
     "ObservatoryConfig",
     "PlanCandidates",
     "PlanEphemeris",

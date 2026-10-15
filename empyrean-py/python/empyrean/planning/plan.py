@@ -21,8 +21,10 @@ import numpy.typing as npt
 from empyrean._convert import AnyOrbits, naif_to_origin
 from empyrean.coordinates.epoch import Epochs
 from empyrean.od.determine import _orbits_to_dict
+from empyrean.orbits.joint import _KIND_BY_CODE
 from empyrean.planning.result import (
     _INT_TO_KIND,
+    _INT_TO_LOG_DET_WITHHELD,
     _INT_TO_RADAR_MODE,
     STAGE_POSTERIOR,
     STAGE_PRIOR,
@@ -112,6 +114,28 @@ def _metrics_table(out: ResultDict) -> PlanMetrics:
     def column(name: str) -> list[float]:
         return [float(out[f"{prefix}{name}"]) for _, prefix in _METRIC_STAGES]
 
+    def withheld(prefix: str) -> str:
+        code = int(out[f"{prefix}log_det_withheld"])
+        try:
+            return _INT_TO_LOG_DET_WITHHELD[code]
+        except KeyError:
+            raise RuntimeError(
+                f"engine returned an unknown log-det withheld code: {code}"
+            ) from None
+
+    def withheld_method(prefix: str) -> str | None:
+        # -1 is the "no sampled method applies" sentinel (every reason but
+        # SAMPLED_MOMENT); it maps to a null, never to a kind.
+        code = int(out[f"{prefix}log_det_withheld_method"])
+        if code < 0:
+            return None
+        try:
+            return _KIND_BY_CODE[code].value
+        except KeyError:
+            raise RuntimeError(
+                f"engine returned an unknown log-det withheld method code: {code}"
+            ) from None
+
     return PlanMetrics.from_kwargs(
         stage=[stage for stage, _ in _METRIC_STAGES],
         position_sigma_km=column("position_sigma_km"),
@@ -119,6 +143,8 @@ def _metrics_table(out: ResultDict) -> PlanMetrics:
         semi_major_km=column("semi_major_km"),
         semi_minor_km=column("semi_minor_km"),
         log_det=column("log_det"),
+        log_det_withheld=[withheld(prefix) for _, prefix in _METRIC_STAGES],
+        log_det_withheld_method=[withheld_method(prefix) for _, prefix in _METRIC_STAGES],
     )
 
 
@@ -415,4 +441,5 @@ def evaluate_plan(
         candidates=candidates,
         ephemeris=ephemeris,
         active_width=int(out["active_width"]),
+        log_det_gain=float(out["log_det_gain"]),
     )

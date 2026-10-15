@@ -21,7 +21,7 @@ Uncertainty-first orbit propagation, ephemeris, orbit determination, and event d
 pip install empyrean
 ```
 
-Current release: **0.10.0**. In development: **0.11.0rc0**, the 0.11.0 cycle.
+Current release: **0.11.0**.
 
 A plain install pulls empyrean
 together with the B612 Foundation's
@@ -372,19 +372,20 @@ than written to a log, because a dropped prior cross term changes how the
 it was given, which is the common case.
 
 `dt`, `amrat`, and thrust are refine-path solves: the seed orbit must
-carry the prior that opens each axis, so run them through `refine`. The
-DT prior is `NonGravParams.dt_variance` (days²) on the orbit's non-grav
-block; Marsden needs a non-grav covariance; AMRAT needs an SRP AMRAT
-prior. Requesting an axis whose prior is absent is rejected loudly —
-the fit never returns a zeroed or defaulted column.
+carry the prior that opens each axis, so run them through `refine`. Each
+prior rides the orbit's packed covariance joint (`orbit.covariance`) on
+the axis it opens — the DT axis for DT (days²), the Marsden block for the
+non-gravitational coefficients, the AMRAT axis for AMRAT — so a fitted
+orbit already carries what reopens the same axis on a refit. Requesting an
+axis whose prior is absent is rejected loudly — the fit never returns a
+zeroed or defaulted column.
 
 ```python
 from empyrean import ODConfig, ParamDisposition, SolveFor
 
 # Solve state + Marsden A1/A2/A3 + the outgassing time delay DT. The
-# seed orbit carries a non-grav covariance (opens Marsden) and a DT
-# prior variance (opens DT), e.g. its non-grav block was built with
-#   NonGravParams.from_kwargs(..., dt=[<days>], dt_variance=[<days**2>])
+# seed orbit's packed covariance joint carries the priors that open each
+# axis — a Marsden block (opens Marsden) and a DT-axis variance (opens DT).
 config = ODConfig(solve_for_flags=SolveFor(marsden="solved", dt="solved"))
 result = empyrean.refine(orbit, obs, config=config)
 
@@ -399,7 +400,7 @@ ParamDisposition.parse("considered") is ParamDisposition.CONSIDERED
 print(result.warnings)      # covariance the fit declined to use; often []
 
 # Per-segment thrust dispositions are positional with the orbit's
-# declared correction covariances — a considered or fixed burn sits
+# declared Δv-correction segments — a considered or fixed burn sits
 # between solved ones as readily as after them, so a count could not
 # say which burn is which. At most three entries (the engine's
 # MAX_THRUST_SEGMENTS, on empyrean.od.result); a longer list raises
@@ -426,69 +427,68 @@ if sc is not None and sc.dt_slot is not None:
 
 ### Carrying the joint onward
 
-The fitted orbit carries the off-diagonal blocks of that same matrix, so
-it can be fed straight back into propagation without falling back to the
-diagonal. They ride in two places: the 6×3 state↔Marsden border on
-`orbit.non_grav.non_grav_cross`, and everything else — state↔DT,
-state↔AMRAT, state↔Δv and the mixed parameter pairs — on
-`orbit.wide_cross`. Entries are keyed by parameter name (`"AMRAT"`,
-`"thrust[0].x"`), never by column index, because which column a
-parameter occupies depends on what else the orbit declares:
+The fitted orbit carries the **whole** matrix, not just its diagonal
+blocks, so it feeds straight back into propagation and every downstream
+entry point. It rides on `orbit.covariance` — a `PackedJoints` column whose
+per-row `joint(i)` is a `PackedJoint` holding the layout, the packed lower
+triangle, and the tags (`kind`, `quality`, `functional`, `provenance`, and
+an asserted joint's `asserted_source`). The joint is the one authority; the
+flat 6×6 state covariance is `joint.state_block()`, a derived read-only
+view of its leading block, never a second, independently settable home.
 
 ```python
-cross = fit.orbit.wide_cross.state_cross(0)   # {tag: 6-vector}, by tag
-sigma_amrat_x = cross["AMRAT"][0]             # cov(x, AMRAT)
+joint = result.orbit.covariance.joint(0)   # the fit's own PackedJoint, or None
+if joint is not None:
+    block = joint.state_block()             # the derived 6×6 state view
+    sigma_x = block[0, 0] ** 0.5
+    width = joint.width                     # 6 + solved parameters
 ```
 
-Propagated states carry the same two columns, holding the joint at each
-output epoch. This is what makes a chained propagation match the
-single-leg answer: the propagated state↔parameter columns are non-zero
-even when the input was block-diagonal, because propagation itself
-generates the correlation, so a second leg handed only the 6×6 reports a
-*tighter* uncertainty than the first leg supports. A row with no cross
-terms is null rather than zero — an absent correlation and a measured
-zero correlation are different claims, and only one of them is yours to
-make.
+`orbit.covariance` is a sub-table column, **never** `None` on a parent
+table — quivr returns a table of parent length regardless. A row with no
+covariance is a per-row absence: test `orbit.covariance.row_is_empty(i)` or
+let `joint(i)` return `None`, never `orbit.covariance is None`.
 
-When you chain legs by hand, carry the parameter blocks the cross terms
-are conditioned on (the non-grav 3×3, the DT and AMRAT prior variances)
-from the orbit that started the chain: propagation passes those through
-unchanged rather than restating them on every output row. A border
-supplied without its parameter block is refused, not quietly ignored.
+Carrying it onward is passing the orbit through whole — there are no halves
+to reassemble. `propagate`, `compute_impact_probabilities`,
+`compute_b_planes`, `generate_ephemeris`, and the `determine` / `evaluate`
+/ `refine` seed path all condition on the joint when the orbit carries it.
+An impact probability computed against a block-diagonal covariance
+materially understates the tails: it asserts an independence the fit never
+found, and the *propagated* joint has non-zero state↔parameter columns even
+from a block-diagonal input, because propagation itself generates the
+correlation — so a second leg handed only the 6×6 reports a *tighter*
+uncertainty than the first leg supports.
 
-The joint is read by every downstream entry point that takes orbits, not
-just `propagate`: `compute_impact_probabilities`, `compute_b_planes`,
-`generate_ephemeris`, and the `determine` / `evaluate` / `refine` seed
-path all condition on it when the orbit carries it. An impact probability
-computed against a block-diagonal covariance materially understates the
-tails, for the same reason chaining does — it asserts an independence the
-fit never found. Feeding a fitted orbit through whole is what avoids the
-question; nothing has to be reassembled by hand.
+Moving a covariance between representations, frames or origins goes through
+`transform_orbits`, whose Jacobian transports the whole joint; the
+bare-state `transform_coordinates` refuses a covariance-bearing input
+rather than drop it silently, raising a `PushError`
+(`PushErrorVariant.TRANSFORM_COVARIANCE_UNSUPPORTED`) that points at
+`transform_orbits`.
 
-`TaggedCovariances` carries the same two columns alongside the 21
-synthesized `cov_*` scalars those columns are the state block of, so the
-per-epoch readback and an orbit table describe one joint the same way.
-It is populated on every uncertainty method that produces a joint,
-including the sampled ones, which recover the state↔parameter columns
-from the propagated cloud. `WideCross` is a nullable sub-table column
-rather than an optional attribute, so it is **never** `None` on a parent
-table — quivr returns a table of parent length regardless. Absence is
-per-row nulls: test `row_is_empty(i)` or the per-row accessors, never
-`orbits.wide_cross is None`.
+Propagated states carry the same joint per output epoch. With
+`tagged_covariance=True`, `result.tagged_covariance_series(i)` and the flat
+`result.tagged_covariance` table hold one `PackedJoint` per epoch on their
+own `covariance` column; `tc.joint` is the authority and `tc.matrix()` its
+derived state 6×6. It is populated on every uncertainty method that
+produces a joint, including the sampled ones, which recover the
+state↔parameter columns from the propagated cloud.
 
 ```python
 result = empyrean.propagate(orbits, epochs, tagged_covariance=True)
 
 tc = result.tagged_covariance_series(0)[-1]   # last epoch of orbit 0
-tc.non_grav_cross              # (6, 3) ndarray, or None
-tc.state_cross["AMRAT"]        # 6-vector, keyed by parameter tag
-tc.param_cross[("AMRAT", "DT")]
-
-# The same thing off the flat table, per row:
-wc = result.tagged_covariance.wide_cross
-wc.row_is_empty(0)
-wc.state_cross(0)              # {tag: 6-vector}
+joint = tc.joint                              # the PackedJoint; tc.matrix() is its 6×6
 ```
+
+The joint crosses the compiled-extension boundary as a flat wire dict:
+`joint.to_wire()` serializes it and `PackedJoint.from_wire(d)` reads it back
+(`PackedJoints.to_wire_list()` / `from_wire_list(rows)` for a whole column).
+A malformed joint — a bad layout, a triangle of the wrong length, a retired
+discriminant — is refused there by a `PushError` carrying the
+`PushErrorVariant` that names the cause, never accepted and quietly turned
+into a wrong answer.
 
 ### Post-OD photometry
 
@@ -1001,24 +1001,17 @@ attribution, influence diagnostics, sky-motion decomposition and radar
 block included — for a 36-column file (the table's 35 plus a `has_radar`
 flag), identical across all three formats; `rejection_reason` and
 `radar_kind` are written as names rather than integer codes, and a
-non-computable number is a literal `NaN` in CSV and `null` in JSON. The
-orbit CSV path goes through the same
-engine writer parquet uses, so the two emit an identical column set
-(state, covariance, non-grav including `dt` and its variance, photometry,
-SRP).
+non-computable number is a literal `NaN` in CSV and `null` in JSON.
 
-Parquet additionally carries the **wide cross-covariance** — the
-state↔parameter and parameter↔parameter terms beyond the state+Marsden
-9×9 — in a tagged tail, so a fitted orbit round-trips through a parquet
-file carrying the joint the fit actually computed rather than its
-diagonal blocks. It is the only orbit format here that can, and the
-other two refuse such a batch by name rather than writing it short —
-both pointing at parquet. The JSON orbit format is a flat row shape
-carrying the 6×6 and nothing beyond it; the reason CSV cannot: this schema makes the difference between an absent
-cross and a supplied zero cross load-bearing, and CSV renders both as an
-empty cell. A carrier holding thrust Δv terms is refused wherever it is
-offered, because no orbit-file format can serialize the thrust arcs
-those terms describe.
+Parquet and JSON round-trip the orbit's covariance; CSV drops it. The
+packed joint rides the orbit as its `covariance` column — the layout, the
+packed lower triangle and the tags — so a fitted orbit written to parquet
+or JSON round-trips carrying the whole joint the fit computed rather than
+its diagonal blocks, and reads back ready to re-feed. CSV is a flat scalar
+row shape that cannot express the layout distinguishing an absent axis
+from a present one, so it carries the state columns and drops the
+covariance rather than writing a projection that would read back as a
+different orbit.
 
 ## Turning event detection off
 

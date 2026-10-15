@@ -6,7 +6,8 @@ use crate::error::{Error, Result};
 use crate::observers::{Observer, obs_code_from_bytes};
 use crate::orbit::Orbit;
 use crate::propagate::{
-    DiagnosticsConfig, EventConfig, ForceModelTier, PropagationConfig, UncertaintyMethod,
+    DiagnosticsConfig, EventConfig, ForceModelTier, OrbitOutcome, PropagationConfig,
+    UncertaintyMethod,
 };
 use std::ffi::CStr;
 
@@ -235,10 +236,31 @@ pub struct ObservationSensitivity {
     /// Hessian ∂²(observable)/∂(input)², row-major `[6][n_params][n_params]`
     /// flattened. Empty unless a second-order method ran.
     ///
+    /// The tensor is COMPOSED to the same input axis as
+    /// [`jacobian`](Self::jacobian) — the orbit-epoch state in
+    /// `frame`/`origin` — so the pair is one second-order expansion
+    /// (villeneuve 1.25.0; earlier engines published the LOCAL
+    /// topocentric second derivative here, a different input domain from
+    /// the Jacobian beside it, and any consumer that contracted the two
+    /// together read the wrong quantity). Populated on `SecondOrder`
+    /// rows of orbits declaring a state covariance and no solved
+    /// force-model parameters, where `n_params == 6`; empty on every
+    /// other row.
+    ///
     /// Leading index is the observable, in the same order and the same
     /// units-per-input-unit as [`jacobian`](Self::jacobian) — index it
     /// with the same `SENSITIVITY_ROW_*` constants. Element `(row, i, j)`
     /// is `hessian[(row * np + i) * np + j]` with `np = n_params as usize`.
+    ///
+    /// # Consumer note (fold builders)
+    ///
+    /// The per-row sky covariance delivered alongside this tensor under
+    /// a second-order method is the moment **about the published
+    /// nominal**: it already contains the mean-shift outer product
+    /// `δμ_a · δμ_b`, with `δμ_a = ½ tr(H_a Σ)` built from THIS tensor.
+    /// A consumer building its own bias-corrected update must not ALSO
+    /// subtract that shift from the innovation while using the delivered
+    /// matrix as its noise term — that double-counts the correction.
     pub hessian: Vec<f64>,
     /// Frame of the input axis (Frame enum as int).
     pub frame: i32,
@@ -305,6 +327,38 @@ pub struct EphemerisResult {
     /// or rows whose observation-sensitivity chain was skipped
     /// (astrometry present, partials absent).
     pub warnings: Vec<String>,
+    /// Per-input-orbit delivery outcome, one entry per input orbit in input
+    /// order. A per-orbit generation failure is carried here rather than ending
+    /// the batch; read delivery from this, never from a row count. A failed
+    /// orbit's [`code`](OrbitOutcome::Failed) is an `EMPYREAN_EPHEMERIS_FAILURE_*`
+    /// value. Map entries to orbits with [`rows_for`](EphemerisResult::rows_for).
+    pub outcomes: Vec<OrbitOutcome>,
+}
+
+impl EphemerisResult {
+    /// The INPUT orbit count — one [`OrbitOutcome`] per input orbit.
+    pub fn num_orbits(&self) -> usize {
+        self.outcomes.len()
+    }
+
+    /// Whether every input orbit was delivered.
+    pub fn all_delivered(&self) -> bool {
+        self.outcomes.iter().all(OrbitOutcome::is_delivered)
+    }
+
+    /// The delivered ephemeris entries of input orbit `orbit_index`, or `None`
+    /// if the index is out of range or the orbit failed. A delivered orbit with
+    /// no entries returns an empty slice — delivery is the outcome, never the
+    /// row count.
+    pub fn rows_for(&self, orbit_index: usize) -> Option<&[EphemerisEntry]> {
+        match self.outcomes.get(orbit_index)? {
+            OrbitOutcome::Delivered {
+                first_row,
+                num_rows,
+            } => self.entries.get(*first_row..*first_row + *num_rows),
+            OrbitOutcome::Failed { .. } => None,
+        }
+    }
 }
 
 /// Ephemeris-generation configuration.
@@ -487,6 +541,8 @@ impl Context {
             num_sensitivity: 0,
             warnings: std::ptr::null_mut(),
             num_warnings: 0,
+            num_orbits: 0,
+            outcomes: std::ptr::null_mut(),
         };
         let (ffi_config, _config_keep) = config.to_ffi_with()?;
         let code = unsafe {
@@ -598,11 +654,42 @@ pub(crate) fn marshal_ephemeris_result(
                 .collect()
         }
     };
+    // Per-input-orbit delivery outcomes. Extracted BEFORE the free, since the
+    // owning C strings are released by `empyrean_ephemeris_result_free`. A
+    // failed orbit's `code` is an `EMPYREAN_EPHEMERIS_FAILURE_*` value.
+    let outcomes: Vec<OrbitOutcome> = if result.outcomes.is_null() {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(result.outcomes, result.num_orbits) }
+            .iter()
+            .map(|o| {
+                if o.status == empyrean_sys::EMPYREAN_ORBIT_OUTCOME_FAILED {
+                    let message = if o.error_message.is_null() {
+                        String::new()
+                    } else {
+                        unsafe { CStr::from_ptr(o.error_message) }
+                            .to_string_lossy()
+                            .into_owned()
+                    };
+                    OrbitOutcome::Failed {
+                        code: o.error_code,
+                        message,
+                    }
+                } else {
+                    OrbitOutcome::Delivered {
+                        first_row: o.first_row,
+                        num_rows: o.num_rows,
+                    }
+                }
+            })
+            .collect()
+    };
     unsafe { empyrean_sys::empyrean_ephemeris_result_free(result) };
     EphemerisResult {
         entries,
         sensitivity,
         warnings,
+        outcomes,
     }
 }
 
@@ -903,5 +990,115 @@ mod ephemeris_config_validation_tests {
         assert!(d.sensitivity_threshold.is_nan());
         assert!(d.lyapunov_threshold.is_nan());
         assert!(d.nonlinearity_threshold.is_nan());
+    }
+}
+
+#[cfg(test)]
+mod outcome_channel_tests {
+    use super::*;
+    use crate::coordinate::CoordinateState;
+    use crate::{Context, Epoch, Frame, Orbit, Origin};
+    use std::path::PathBuf;
+
+    fn try_context() -> Option<Context> {
+        let candidates = [
+            std::env::var("EMPYREAN_DATA_DIR").ok().map(PathBuf::from),
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".empyrean/data")),
+        ];
+        for dir in candidates.into_iter().flatten() {
+            if let Ok(ctx) = Context::from_data_dir(Some(&dir)) {
+                return Some(ctx);
+            }
+        }
+        None
+    }
+
+    fn delivered(id: &str, px: f64) -> Orbit {
+        let state = CoordinateState::cartesian(
+            Epoch::from_mjd_tdb(59000.0),
+            [px, 0.1, 0.05, -0.005, 0.015, 0.001],
+            Frame::ICRF,
+            Origin::Sun,
+        );
+        Orbit::new(state).with_orbit_id(id)
+    }
+
+    /// Out-of-span epoch → carried per-orbit generation failure.
+    fn refused(id: &str) -> Orbit {
+        let state = CoordinateState::cartesian(
+            Epoch::from_mjd_tdb(400_000.0),
+            [1.0, 0.1, 0.05, -0.005, 0.015, 0.001],
+            Frame::ICRF,
+            Origin::Sun,
+        );
+        Orbit::new(state).with_orbit_id(id)
+    }
+
+    fn observer() -> Observer {
+        Observer {
+            obs_code: "500".to_string(),
+            epoch: Epoch::from_mjd_tdb(59200.0),
+            position: [0.9, -0.42, -0.18],
+            velocity: [0.0075, 0.0148, 0.0064],
+            observing_night: -1,
+            frame: Frame::ICRF,
+            origin: Origin::SSB,
+        }
+    }
+
+    /// The mixed batch through the safe wrapper: outcomes by variant,
+    /// `all_delivered()` false, and `rows_for` selecting one orbit's entries.
+    #[test]
+    fn a_mixed_ephemeris_batch_exposes_outcomes_and_rows_for() {
+        let Some(ctx) = try_context() else {
+            eprintln!(
+                "skipping a_mixed_ephemeris_batch_exposes_outcomes_and_rows_for: no data dir"
+            );
+            return;
+        };
+        let orbits = [delivered("a", 1.0), refused("b"), delivered("c", 1.2)];
+        let observers = [observer()];
+        let result = ctx
+            .generate_ephemeris(&orbits, &observers, &EphemerisConfig::default())
+            .expect("a per-orbit failure does not end the batch");
+
+        assert_eq!(result.num_orbits(), 3, "one outcome per input orbit");
+        assert!(!result.all_delivered(), "the middle orbit failed");
+        assert!(result.outcomes[0].is_delivered());
+        match &result.outcomes[1] {
+            OrbitOutcome::Failed { code, message } => {
+                assert_ne!(*code, 0, "a failed orbit carries a classified code");
+                assert!(!message.is_empty(), "a failed orbit carries its message");
+            }
+            other => panic!("orbit 1 should fail, got {other:?}"),
+        }
+        assert!(
+            result.rows_for(1).is_none(),
+            "a failed orbit has no entries"
+        );
+        let rows0 = result.rows_for(0).expect("orbit 0 delivered entries");
+        let rows2 = result.rows_for(2).expect("orbit 2 delivered entries");
+        assert_eq!(
+            rows0.len(),
+            1,
+            "one observer → one entry per delivered orbit"
+        );
+        assert_eq!(rows2.len(), 1);
+        // The failed middle orbit occupies no entries.
+        let OrbitOutcome::Delivered { first_row, .. } = &result.outcomes[2] else {
+            panic!("orbit 2 should deliver");
+        };
+        assert_eq!(
+            *first_row,
+            rows0.len(),
+            "orbit 2's entries follow orbit 0's"
+        );
+        assert_eq!(
+            result.entries.len(),
+            2,
+            "num_entries is delivered rows only"
+        );
     }
 }

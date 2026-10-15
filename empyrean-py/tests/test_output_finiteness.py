@@ -19,10 +19,40 @@ from __future__ import annotations
 import empyrean
 import numpy as np
 import pytest
-from empyrean import Epochs, UncertaintyMethod
+from empyrean import Epochs, Origin, UncertaintyMethod
 from empyrean.coordinates.coordinates import CartesianCoordinates
 from empyrean.coordinates.covariance import CartesianCovariance
+from empyrean.coordinates.transform import transform_orbits
+from empyrean.orbits.joint import (
+    CovarianceKind,
+    JointFunctional,
+    JointProvenance,
+    JointQuality,
+    PackedJoint,
+    PackedJoints,
+)
 from empyrean.orbits.orbits import CartesianOrbits
+
+
+def _state_joint(cov6: np.ndarray) -> PackedJoint:
+    """A width-6 derived state joint whose state block is ``cov6`` (6x6)."""
+    tri = [cov6[i, j] for i in range(6) for j in range(i + 1)]
+    return PackedJoint(
+        layout_present=0,
+        layout_considered=0,
+        layout_marginalized=0,
+        width=6,
+        tri=np.asarray(tri, dtype=np.float64),
+        kind=CovarianceKind.LINEAR,
+        quality=JointQuality.POSITIVE_DEFINITE,
+        cov_rank=0,
+        cov_null_axes=0,
+        cov_min_eig_corr=float("nan"),
+        functional=JointFunctional.STATE,
+        provenance=JointProvenance.DERIVED,
+        asserted_source=None,
+    )
+
 
 # A self-contained, network-free heliocentric orbit with a finite state
 # covariance — enough to exercise the covariance-propagation path without
@@ -99,14 +129,31 @@ def test_propagate_covariance_is_finite(orbit: CartesianOrbits) -> None:
 def _barycentric_orbit() -> CartesianOrbits:
     """The same covariance-bearing orbit, in the barycentric basis the
     planner evaluates in. The origin shift is a pure translation, so the
-    covariance — and every metric derived from it — is unchanged."""
-    orbit = _orbit_with_covariance()
-    coords = empyrean.transform_coordinates(orbit.coordinates, CartesianCoordinates, origin="SSB")
-    return CartesianOrbits.from_kwargs(
-        orbit_id=orbit.orbit_id,
-        object_id=orbit.object_id,
-        coordinates=coords,
+    covariance — and every metric derived from it — is unchanged.
+
+    The covariance rides the orbit's packed joint and is transported by
+    :func:`transform_orbits` (the covariance-bearing transform); the
+    planner then reads the joint's derived state 6x6 as its Cartesian prior.
+    """
+    cov6 = np.diag([1e-14, 1e-14, 1e-14, 1e-18, 1e-18, 1e-18])
+    coords = CartesianCoordinates.from_kwargs(
+        epoch=np.array([_EPOCH_MJD_TDB]),
+        x=[1.6],
+        y=[0.1],
+        z=[0.02],
+        vx=[-0.002],
+        vy=[0.011],
+        vz=[0.001],
+        frame="ecliptic_j2000",
+        origin=["Sun"],
     )
+    helio = CartesianOrbits.from_kwargs(
+        orbit_id=["contract"],
+        object_id=["contract"],
+        coordinates=coords,
+        covariance=PackedJoints.from_joints([_state_joint(cov6)]),
+    )
+    return transform_orbits(helio, CartesianOrbits, origin=Origin.SSB)
 
 
 def test_plan_prior_and_posterior_metrics_are_finite() -> None:

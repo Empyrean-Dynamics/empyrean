@@ -249,6 +249,30 @@ def test_preset_none_uses_user_default_sigma(probe_orbit, f51_observations):
     np.testing.assert_allclose(c_none2, c_uniform / 4.0, rtol=1e-12)
 
 
+def test_python_default_weighting_matches_extension_default(probe_orbit, f51_observations):
+    """Ruling (a) — Python-vs-extension: the default weighting the Python
+    ``WeightingConfig()`` sends is the default the extension reports.
+
+    The Python layer carries no engine, so it pins the default it emits
+    against the extension's own ``WeightingConfig::default()``
+    behaviourally: an empty weighting wire dict leaves every field for the
+    extension to fill from its default, and the resulting fit is compared
+    to the one the Python default ``WeightingConfig()`` produces. The C and
+    wrapper ruling tests pin the default's *values* engine-side (noise model
+    Gaussian, observed covariance); this pins that the minimal Python
+    surface does not disagree with them — the fields it does not expose it
+    can only inherit, so an agreeing fit proves agreement on every field.
+    """
+    c_python_default = _chi2(probe_orbit, f51_observations, WeightingConfig())
+    # The extension's own default: hand it an empty weighting dict so every
+    # field — including the ones the Python surface never sends — is filled
+    # from WeightingConfig::default().
+    c_extension_default = _eval_raw(probe_orbit, f51_observations, {}).summary.chi2
+    assert np.isfinite(c_python_default)
+    assert c_python_default > 0.0
+    np.testing.assert_allclose(c_python_default, c_extension_default, rtol=1e-12)
+
+
 # ── (b) user layers beat preset rules ────────────────────────────────
 
 

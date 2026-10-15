@@ -46,11 +46,46 @@ read-back component, a different type from the top-level
 
 from __future__ import annotations
 
+import enum
 import os
 from dataclasses import dataclass
 
 import numpy as np
+import numpy.typing as npt
 import quivr as qv
+
+from empyrean.orbits.joint import PackedJoint, PackedJoints
+
+__all__ = ["ComponentStatus", "MixtureChains", "MixtureComponent"]
+
+
+class ComponentStatus(str, enum.Enum):
+    """How one adaptive-Gaussian-mixture component resolved at a close approach.
+
+    Subclasses ``str`` so the status serializes directly into an Arrow
+    string column. The states are distinct outcomes, surfaced rather
+    than collapsed — a component that could not be resolved is not the
+    same as one that resolved to a flat curvature, and neither is a
+    failure. The members mirror the wrapper's ``ComponentStatus`` variants
+    by name, so the extension's wire string decodes here by name.
+    """
+
+    RESOLVED = "Resolved"
+    """The component resolved to a usable second moment."""
+    CURVATURE_REFUSED = "CurvatureRefused"
+    """The curvature test refused the second-order correction; the
+    component's :attr:`MixtureComponent.rho` is the measured
+    quadratic/linear ratio that drove the refusal."""
+    UNRESOLVED = "Unresolved"
+    """The component did not resolve at this epoch."""
+    FAILED = "Failed"
+    """The component's sub-propagation failed."""
+    SKY_LINEARIZATION_REFUSED = "SkyLinearizationRefused"
+    """The sampled on-sky ensemble overflowed the flat-sky linearization
+    bound; the component's :attr:`MixtureComponent.rho` carries the measured
+    on-sky angular extent in RADIANS that drove the refusal — a different
+    quantity from the dimensionless ρ of :attr:`CURVATURE_REFUSED`, carried
+    through the same side-value slot."""
 
 
 @dataclass
@@ -67,9 +102,22 @@ class MixtureComponent:
         Propagated sub-Gaussian centroid ``[x, y, z, vx, vy, vz]`` (AU,
         AU/day) at the CA epoch, shape ``(6,)``, in the basis given by
         ``frame`` / ``origin``.
-    covariance : np.ndarray
-        Linearly-mapped component covariance ``Phi Sigma_k Phi^T``,
-        contiguous, shape ``(6, 6)``, same basis as ``mean``.
+    joint : PackedJoint
+        The component covariance as one packed joint — the single
+        covariance home. Its leading ``6x6`` is the linearly-mapped
+        ``Phi Sigma_k Phi^T`` in the same basis as ``mean``.
+    status : ComponentStatus
+        How this component resolved at the close approach.
+    rho : float | None
+        The side value a refusal measured. ``Some`` only for the two
+        refusal statuses, which measure DIFFERENT quantities: the
+        dimensionless curvature ρ for
+        :attr:`ComponentStatus.CURVATURE_REFUSED`, and the on-sky angular
+        extent in RADIANS for
+        :attr:`ComponentStatus.SKY_LINEARIZATION_REFUSED`. ``None`` for
+        every other status, never a fabricated zero. (The name is historical
+        — ρ was the only side value when it was introduced; read it against
+        :attr:`status` to know which quantity it holds.)
     frame : str
         Reference frame of the basis (canonical name, e.g. ``"icrf"``).
     origin : str
@@ -81,9 +129,21 @@ class MixtureComponent:
 
     weight: float
     mean: np.ndarray
-    covariance: np.ndarray
+    joint: PackedJoint
+    status: ComponentStatus
+    rho: float | None
     frame: str
     origin: str
+
+    @property
+    def covariance(self) -> npt.NDArray[np.float64]:
+        """The component's flat ``6x6`` — the derived leading block of
+        :attr:`joint`.
+
+        The joint is the one authority; this is a read-only view of its
+        state block (``Phi Sigma_k Phi^T``), never a second stored copy.
+        """
+        return self.joint.state_block()
 
 
 class MixtureChains(qv.Table):
@@ -123,9 +183,16 @@ class MixtureChains(qv.Table):
     mean_vy = qv.Float64Column()
     mean_vz = qv.Float64Column()
 
-    covariance = qv.LargeListColumn(qv.Float64Column())
-    """6x6 row-major component covariance, 36 values, in the basis named
-    by ``frame`` / ``origin``."""
+    joint = PackedJoints.as_column(nullable=True)
+    """The one packed joint per component — the covariance authority. The
+    flat ``6x6`` is derived from its state block, never stored a second
+    time."""
+
+    status = qv.LargeStringColumn()
+    """How the component resolved (:class:`ComponentStatus` value)."""
+    rho = qv.Float64Column(nullable=True)
+    """The curvature ρ for a ``CurvatureRefused`` component; null
+    otherwise."""
 
     origin = qv.LargeStringColumn()
     """Canonical origin (center body) name of the basis."""
@@ -173,7 +240,8 @@ class MixtureChains(qv.Table):
         idx = self.orbit_index.to_numpy(zero_copy_only=False)
         epochs = self.ca_epoch_mjd_tdb.to_numpy(zero_copy_only=False)
         weights = self.weight.to_numpy(zero_copy_only=False)
-        covs = self.covariance.to_pylist()
+        statuses = self.status.to_pylist()
+        rhos = self.rho.to_pylist()
         origins = self.origin.to_pylist()
         frames = self.frame.to_pylist()
         means = np.column_stack(
@@ -192,13 +260,20 @@ class MixtureChains(qv.Table):
             if current is None or e != current:
                 current = e
                 out.append([])
+            joint = self.joint.joint(i)
+            if joint is None:
+                raise RuntimeError(
+                    f"mixture component row {i} carries no packed joint; every "
+                    "retained component is a resolved Gaussian with a covariance"
+                )
+            rho = rhos[i]
             out[-1].append(
                 MixtureComponent(
                     weight=float(weights[i]),
                     mean=np.ascontiguousarray(means[i], dtype=np.float64),
-                    covariance=np.ascontiguousarray(
-                        np.asarray(covs[i], dtype=np.float64).reshape(6, 6)
-                    ),
+                    joint=joint,
+                    status=ComponentStatus(statuses[i]),
+                    rho=None if rho is None else float(rho),
                     frame=str(frames[i]),
                     origin=str(origins[i]),
                 )
@@ -268,11 +343,20 @@ def build_mixture_chains(result: dict[str, object]) -> MixtureChains:
     component_index = np.asarray(mix["mixture_component_index"], dtype=np.uint32)
     weight = np.asarray(mix["mixture_weight"], dtype=np.float64)
     mean = np.asarray(mix["mixture_mean"], dtype=np.float64)  # (n, 6)
-    covariance = np.asarray(mix["mixture_covariance"], dtype=np.float64)  # (n, 6, 6)
+    status = list(mix["mixture_status"])
+    rho = list(mix["mixture_rho"])
     frame_codes = np.asarray(mix["mixture_frame"], dtype=np.int64)
     origin_codes = np.asarray(mix["mixture_origin"], dtype=np.int64)
 
     n = len(orbit_id)
+    # The component covariance is the one packed joint — the flat 6x6 is
+    # derived from its state block, never carried as a sibling. The key is
+    # absent only when nothing split (zero rows); build an empty / all-null
+    # column of the parent length in that case.
+    wire_joints = mix.get("mixture_covariance") if isinstance(mix, dict) else None
+    joint_col = PackedJoints.from_wire_list(wire_joints)
+    if joint_col is None:
+        joint_col = PackedJoints.from_joints([None] * n)
     return MixtureChains.from_kwargs(
         orbit_id=orbit_id,
         orbit_index=orbit_index,
@@ -285,7 +369,9 @@ def build_mixture_chains(result: dict[str, object]) -> MixtureChains:
         mean_vx=mean[:, 3],
         mean_vy=mean[:, 4],
         mean_vz=mean[:, 5],
-        covariance=[covariance[i].reshape(36).tolist() for i in range(n)],
+        joint=joint_col,
+        status=status,
+        rho=rho,
         origin=[naif_to_origin(int(o)) for o in origin_codes],
         frame=[int_to_frame(int(f)).value for f in frame_codes],
     )

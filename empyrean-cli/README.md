@@ -245,15 +245,14 @@ is never silently dropped.
       "central_body":   10
     }
   ],
-  "dv_corrections":         [[0.0, 0.0, 0.0]],
-  "correction_covariances": [[[1e-20, 0, 0], [0, 1e-20, 0], [0, 0, 1e-20]]]
+  "dv_corrections": [[0.0, 0.0, 0.0]]
 }
 ```
 
 - `isp_s` is optional — omit or `null` for constant mass; otherwise mass depletes over the burn.
 - `steering.type` is `constant_rtn` (with `alpha_rad`, `beta_rad`), `velocity_tangent`, or `inertial_fixed` (with `direction`).
 - `central_body` is a NAIF body code (10 = Sun, 399 = Earth, 301 = Moon) — the reference for the RTN / velocity-tangent frame.
-- `dv_corrections` is positional with `arcs`; `correction_covariances`, when present, must match its length. A mismatch is rejected at propagation time, never silently repaired.
+- `dv_corrections` is positional with `arcs`. A per-correction burn prior rides the orbit's packed covariance joint (its thrust axes), not a separate per-segment covariance carrier; a file still declaring the removed carrier field is refused by name.
 
 ```sh
 empyrean propagate --object-id 99942 --epoch 64922.0 --thrust-arcs burn.json --out-dir ./out

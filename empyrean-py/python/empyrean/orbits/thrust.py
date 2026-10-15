@@ -137,13 +137,9 @@ class ThrustParams:
     """Thrust parameters for one orbit: thrust arcs plus optional
     :math:`\\Delta v` targeting corrections.
 
-    When :attr:`correction_covariances` is non-empty its length MUST equal
-    :attr:`dv_corrections`; a non-empty covariance triggers the wide-Jet
-    burn-sensitivity propagation and its solved segments appear in the
-    propagated
-    :attr:`~empyrean.TaggedCovariance.thrust_segments`. Length or
-    arc/correction mismatches surface loudly as an exception during
-    propagation — never silently repaired or dropped.
+    Arc / correction length mismatches surface loudly as an exception
+    during propagation — never silently repaired or dropped. The burn
+    prior rides the orbit's packed joint covariance.
     """
 
     arcs: list[ThrustArc]
@@ -154,7 +150,3 @@ class ThrustParams:
     acceleration during its arc's window; when seeded as Jet variables it
     provides :math:`\partial\text{state}/\partial\Delta v`. Empty = no
     corrections."""
-    correction_covariances: list[list[tuple[float, float, float]]] = field(default_factory=list)
-    r"""3x3 covariance (AU/day):math:`^2` per :math:`\Delta v` correction,
-    positional with :attr:`dv_corrections`. When non-empty its length must
-    equal ``dv_corrections``. Empty = no burn-sensitivity propagation."""

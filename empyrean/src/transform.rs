@@ -3,8 +3,74 @@
 use crate::context::Context;
 use crate::coordinate::{CoordinateState, Frame, Origin, Representation};
 use crate::error::{Error, Result};
+use crate::io::OrbitBatch;
+use crate::orbit::{Orbit, orbits_to_ffi};
 
 impl Context {
+    /// Transform a batch of **orbits** — coordinate state plus its packed
+    /// joint covariance — to a different representation, frame, and/or origin.
+    ///
+    /// Each orbit's covariance is transported through the \\(6 \times 6\\)
+    /// Jacobian of the transformation. This is the entry point for moving a
+    /// covariance between bases: the state-only
+    /// [`transform_coordinates`](Self::transform_coordinates) /
+    /// [`transform_coordinates_single`](Self::transform_coordinates_single)
+    /// transform bare states and **refuse** a covariance-bearing input rather
+    /// than drop its covariance silently
+    /// ([`PushError::TransformCovarianceUnsupported`](crate::PushError::TransformCovarianceUnsupported),
+    /// which names this method).
+    ///
+    /// The returned [`OrbitBatch`] carries each transformed orbit with its
+    /// joint transported and its identifiers preserved. An empty slice yields
+    /// an empty batch and touches nothing.
+    ///
+    /// # Errors
+    ///
+    /// A per-orbit input refusal surfaces with its packed-joint wire code
+    /// (classify with [`Error::push_error`](crate::Error::push_error)); the
+    /// engine's per-element failure names the failing orbit's index in the
+    /// message.
+    pub fn transform_orbits(
+        &self,
+        orbits: &[Orbit],
+        target_rep: Representation,
+        target_frame: Frame,
+        target_origin: Origin,
+    ) -> Result<OrbitBatch> {
+        if orbits.is_empty() {
+            return OrbitBatch::new(Vec::new(), Vec::new(), Vec::new());
+        }
+        // `_keep` owns the heap storage each input `EmpyreanOrbit` borrows
+        // (ids, thrust arrays, the packed-joint triangle); it must outlive the
+        // call.
+        let (inputs, _keep) = orbits_to_ffi(orbits)?;
+        let mut out = empyrean_sys::EmpyreanOrbitBatch {
+            orbits: std::ptr::null_mut(),
+            orbit_ids: std::ptr::null_mut(),
+            object_ids: std::ptr::null_mut(),
+            num_orbits: 0,
+        };
+        let code = unsafe {
+            empyrean_sys::empyrean_transform_orbits(
+                self.as_raw(),
+                inputs.as_ptr(),
+                inputs.len(),
+                target_rep as i32,
+                target_frame as i32,
+                target_origin.naif_id(),
+                &mut out,
+            )
+        };
+        if code != 0 {
+            return Err(Error::capture(code));
+        }
+        // Copy out into owned Rust values, then release the library-owned
+        // batch before returning.
+        let batch = crate::io::orbits::ffi_batch_to_owned(&out);
+        unsafe { empyrean_sys::empyrean_orbits_batch_free(&mut out) };
+        batch
+    }
+
     /// Transform a **batch** of coordinate states to a different
     /// representation, frame, and/or origin.
     ///
@@ -122,5 +188,154 @@ impl Context {
         } else {
             Err(Error::capture(code))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        AxisLayout, Context, CoordinateState, CovarianceKind, Frame, JointFunctional,
+        JointProvenance, JointQuality, Orbit, Origin, PackedJoint, PushError, Representation,
+    };
+    use std::path::PathBuf;
+
+    /// Resolve a usable data dir (`EMPYREAN_DATA_DIR` else `~/.empyrean/data`),
+    /// or `None` to skip when neither yields a working Context.
+    fn try_context() -> Option<Context> {
+        let candidates = [
+            std::env::var("EMPYREAN_DATA_DIR").ok().map(PathBuf::from),
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".empyrean/data")),
+        ];
+        for dir in candidates.into_iter().flatten() {
+            if let Ok(ctx) = Context::from_data_dir(Some(&dir)) {
+                return Some(ctx);
+            }
+        }
+        None
+    }
+
+    /// A heliocentric Cartesian orbit carrying a width-6 state joint.
+    fn cartesian_orbit_with_joint() -> Orbit {
+        // A small, positive-definite diagonal-ish state triangle (packed lower
+        // triangle of a 6×6), Cartesian basis.
+        let mut tri = vec![0.0_f64; 21];
+        // Diagonal entries (indices 0, 2, 5, 9, 14, 20).
+        for (slot, &idx) in [0usize, 2, 5, 9, 14, 20].iter().enumerate() {
+            tri[idx] = 1.0e-8 * (slot as f64 + 1.0);
+        }
+        let joint = PackedJoint {
+            // State-only: no parameter axes, so width = 6 + popcount(0) = 6.
+            layout: AxisLayout {
+                present: 0,
+                considered: 0,
+                marginalized: 0,
+            },
+            width: 6,
+            tri,
+            kind: CovarianceKind::Linear,
+            quality: JointQuality::PositiveDefinite,
+            functional: JointFunctional::State,
+            provenance: JointProvenance::Derived,
+            asserted_source: None,
+        };
+        Orbit::new(CoordinateState::cartesian(
+            crate::Epoch::from_mjd_tdb(59000.0),
+            [1.2, 0.3, 0.1, -0.004, 0.013, 0.001],
+            Frame::EclipticJ2000,
+            Origin::Sun,
+        ))
+        .with_orbit_id("rt")
+        .with_covariance(joint)
+    }
+
+    /// `transform_orbits` carries the joint through the Jacobian, and a
+    /// Cartesian → Keplerian → Cartesian round trip recovers both the state and
+    /// the joint's state block to the C test's band (≤1e-6 rel — a band, not
+    /// bit-identical, because the transform is a Jacobian congruence, not a
+    /// copy).
+    #[test]
+    fn transform_orbits_round_trips_state_and_joint() {
+        let Some(ctx) = try_context() else {
+            eprintln!("skipping transform_orbits_round_trips_state_and_joint: no data dir");
+            return;
+        };
+        let o = cartesian_orbit_with_joint();
+        let kep = ctx
+            .transform_orbits(
+                std::slice::from_ref(&o),
+                Representation::Keplerian,
+                Frame::EclipticJ2000,
+                Origin::Sun,
+            )
+            .expect("Cartesian → Keplerian");
+        let back = ctx
+            .transform_orbits(
+                &kep.orbits,
+                Representation::Cartesian,
+                Frame::EclipticJ2000,
+                Origin::Sun,
+            )
+            .expect("Keplerian → Cartesian");
+        assert_eq!(back.orbits.len(), 1);
+        let rt = &back.orbits[0];
+        for (i, (a, b)) in rt.state.elements.iter().zip(o.state.elements).enumerate() {
+            let rel = (a - b).abs() / (a.abs() + b.abs()).max(1e-30);
+            assert!(rel <= 1e-6, "state[{i}] round trip rel err {rel:e}");
+        }
+        let got = rt.covariance.as_ref().expect("joint survived round trip");
+        let want = o.covariance.as_ref().unwrap();
+        let (gb, wb) = (got.state_block(), want.state_block());
+        let scale = (0..6).map(|i| wb[i][i].abs()).fold(0.0_f64, f64::max);
+        for i in 0..6 {
+            for j in 0..6 {
+                assert!(
+                    (gb[i][j] - wb[i][j]).abs() <= 1e-6 * scale.max(f64::MIN_POSITIVE),
+                    "joint[{i}][{j}] round trip {} vs {}",
+                    gb[i][j],
+                    wb[i][j]
+                );
+            }
+        }
+    }
+
+    /// The state-only transform refuses a covariance-bearing state by name
+    /// rather than dropping its covariance: the C ABI returns −50 and the
+    /// wrapper classifies it as
+    /// [`PushError::TransformCovarianceUnsupported`], whose message names
+    /// `transform_orbits`.
+    #[test]
+    fn transform_coordinates_refuses_a_covariance_bearing_state() {
+        let Some(ctx) = try_context() else {
+            eprintln!(
+                "skipping transform_coordinates_refuses_a_covariance_bearing_state: no data dir"
+            );
+            return;
+        };
+        let state = CoordinateState::cartesian(
+            crate::Epoch::from_mjd_tdb(59000.0),
+            [1.2, 0.3, 0.1, -0.004, 0.013, 0.001],
+            Frame::EclipticJ2000,
+            Origin::Sun,
+        )
+        .with_covariance([[0.0; 6]; 6]);
+        let err = ctx
+            .transform_coordinates_single(
+                &state,
+                Representation::Keplerian,
+                Frame::EclipticJ2000,
+                Origin::Sun,
+            )
+            .expect_err("a covariance-bearing state must be refused, not silently dropped");
+        assert_eq!(
+            err.push_error(),
+            Some(PushError::TransformCovarianceUnsupported)
+        );
+        assert!(
+            err.message.contains("transform_orbits"),
+            "the refusal must name transform_orbits, got: {}",
+            err.message
+        );
     }
 }

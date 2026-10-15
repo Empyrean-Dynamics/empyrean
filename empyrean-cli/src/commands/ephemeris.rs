@@ -3,10 +3,11 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 
+use super::determine::batch_exit_code;
 use super::{DataOptions, load_context};
 use crate::ForceModel;
 use crate::io::output::OutputFormat;
-use crate::io::{orbit_input, output};
+use crate::io::{orbit_input, output, status};
 
 /// Why there is no `--compute-stm` here.
 ///
@@ -41,6 +42,14 @@ use crate::io::{orbit_input, output};
 /// the Python, Rust, or C channel for those sixteen bodies. Closing it
 /// means growing this command's propagation surface deliberately, not
 /// bolting on one flag.
+///
+/// # Exit code
+///
+/// The batch's verdict, shared with `propagate` and `determine`: 0 when
+/// every orbit delivered an ephemeris, 3 when some delivered and some
+/// failed, 4 when the batch ran but none delivered. A per-orbit failure
+/// does not end the batch — the failing orbit is named on stderr with its
+/// reason and recorded in the status table, while the others still deliver.
 #[derive(clap::Args)]
 pub struct EphemerisArgs {
     /// Object names to query from JPL SBDB.
@@ -122,15 +131,24 @@ pub fn run(data: &DataOptions, args: EphemerisArgs) -> Result<()> {
     eprintln!("Generating ephemeris for {} orbit(s)...", batch.len());
     let t1 = Instant::now();
     let config = empyrean::EphemerisConfig::with_force_model(args.force_model.to_empyrean());
-    let entries = ctx
+    // Keep the whole result: its per-orbit `outcomes` are the delivery
+    // verdict a failed orbit is carried in, not just the delivered entries.
+    let result = ctx
         .generate_ephemeris(&batch.orbits, &observers, &config)
         .map_err(crate::commands::with_orbit_context)
-        .context("ephemeris generation failed")?
-        .entries;
+        .context("ephemeris generation failed")?;
+    let entries = &result.entries;
     eprintln!("Ephemeris complete ({:.1}s)", t1.elapsed().as_secs_f64());
 
+    // Per-orbit delivery accounting: one line per input orbit, failures in
+    // full. A failed orbit is reported here rather than vanishing from a
+    // shorter ephemeris file.
+    let status_rows = status::status_rows(&result.outcomes, &batch.orbit_ids);
+    status::report_status(&status_rows);
+
     eprintln!("\n  Output: {}/", args.out_dir.display());
-    output::write_ephemeris(&args.out_dir, "ephemeris", &entries, args.format)?;
+    output::write_ephemeris(&args.out_dir, "ephemeris", entries, args.format)?;
+    status::write_status(&args.out_dir, "status", &status_rows, args.format)?;
 
     eprintln!(
         "\n  Summary: {} orbit(s), {} observer(s), {} row(s)",
@@ -139,5 +157,11 @@ pub fn run(data: &DataOptions, args: EphemerisArgs) -> Result<()> {
         entries.len()
     );
 
+    // The exit code is the batch's verdict (shared helper): 0 all
+    // delivered, 3 partial, 4 none.
+    let code = batch_exit_code(status::delivered_count(&status_rows), status_rows.len());
+    if code != super::determine::EXIT_ALL_DELIVERED {
+        std::process::exit(code);
+    }
     Ok(())
 }

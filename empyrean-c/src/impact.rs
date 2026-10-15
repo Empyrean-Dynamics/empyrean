@@ -166,15 +166,15 @@ unsafe fn free_c_str(ptr: *mut std::ffi::c_char) {
 /// implementation.
 fn build_orbits_from_c(
     orbit_slice: &[EmpyreanOrbit],
-) -> Result<Orbits<empyrean_core::coordinates::AU>, String> {
+) -> Result<Orbits<empyrean_core::coordinates::AU>, crate::joint::AbiError> {
     let mut orbits: Orbits<empyrean_core::coordinates::AU> = Orbits::empty();
     for (i, orbit) in orbit_slice.iter().enumerate() {
         let state = orbit.state.to_empyrean();
-        let coords =
+        let (coords, state_cov) =
             coordinate_state_to_coordinates(&state).map_err(|e| format!("orbit {i}: {e}"))?;
         let id = format!("orbit_{i}");
-        crate::joint::push_orbit_with_joint(&mut orbits, id, coords, orbit)
-            .map_err(|e| format!("orbit {i}: {e}"))?;
+        crate::joint::push_orbit_with_joint(&mut orbits, id, coords, state_cov, orbit)
+            .map_err(|e| e.prefixed(&format!("orbit {i}")))?;
         // Routed through the shared helper rather than the inline copy
         // this path used to carry. That copy dropped two things: the
         // Marsden 3×3 (`covariance: None`) and — the sharper bug — the
@@ -263,8 +263,8 @@ pub unsafe extern "C" fn empyrean_compute_impact_probabilities(
         let orbits = match build_orbits_from_c(orbit_slice) {
             Ok(o) => o,
             Err(e) => {
-                set_last_error(&e);
-                return -1;
+                set_last_error(&e.message);
+                return e.code.unwrap_or(-1);
             }
         };
         let body_filter = match build_body_filter(body_filter_naif, num_body_filter) {
@@ -317,7 +317,7 @@ pub unsafe extern "C" fn empyrean_compute_impact_probabilities(
                     effective_radius_km: ip.effective_radius_km,
                     sigma_distance_au: ip.sigma_distance_au,
                     sigma_distance_km: ip.sigma_distance_km,
-                    ip_linear: ip.ip_linear,
+                    ip_linear: ip.ip_linear.unwrap_or(f64::NAN),
                     relative_velocity_au_day: ip.relative_velocity_au_day,
                     ip_second_order: ip.ip_second_order.unwrap_or(f64::NAN),
                     nonlinearity: ip.nonlinearity.unwrap_or(f64::NAN),
@@ -456,8 +456,8 @@ pub unsafe extern "C" fn empyrean_compute_b_planes(
         let orbits = match build_orbits_from_c(orbit_slice) {
             Ok(o) => o,
             Err(e) => {
-                set_last_error(&e);
-                return -1;
+                set_last_error(&e.message);
+                return e.code.unwrap_or(-1);
             }
         };
         let body_filter = match build_body_filter(body_filter_naif, num_body_filter) {

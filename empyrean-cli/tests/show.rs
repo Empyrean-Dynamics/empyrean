@@ -4,7 +4,8 @@
 //! use** — `crate::io::output` is a thin wrapper over these `empyrean::`
 //! functions, so the bytes here are the bytes `propagate` / `determine`
 //! produce, schemas and all. That matters: the orbits Parquet schema is
-//! 82 columns wide and no hand-rolled fixture would reproduce it.
+//! ~70 columns wide (the covariance rides the atomic `cov_tri` list plus
+//! its metadata) and no hand-rolled fixture would reproduce it.
 //!
 //! Everything asserted here runs `show` **non-interactively** (stdout is
 //! a pipe under `cargo test`), which is exactly the degraded path the
@@ -328,31 +329,42 @@ fn float_formatting_defaults_readable_and_goes_exact_on_demand() {
 }
 
 /// Six significant digits is the default, so a covariance entry that is
-/// nine orders of magnitude below one still reads.
+/// nine orders of magnitude below one still reads. The scalar covariance
+/// entries live on the CSV schema (`covt_NN`); the parquet packs the
+/// covariance atomically into the `cov_tri` list, so legibility of the
+/// individual entries is exercised on the CSV side.
 #[test]
 fn small_covariance_entries_stay_legible() {
     require_engine!();
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("states.parquet");
-    write_orbits_parquet(&path, &orbit_batch(1)).unwrap();
+    let path = dir.path().join("states.csv");
+    write_orbits_csv(&path, &orbit_batch(1)).unwrap();
 
     let (stdout, _, ok) = show(&[
         path.to_str().unwrap(),
         "--columns",
-        "cov_00,cov_11,cov_55",
+        "covt_00,covt_11,covt_55",
         "--no-header",
     ]);
     assert!(ok);
-    assert_eq!(stdout.trim(), "1e-12   2e-12   6e-12");
+    // The padding follows the (hidden) header widths, so compare the
+    // legible tokens rather than the exact spacing.
+    assert_eq!(
+        stdout.split_whitespace().collect::<Vec<_>>(),
+        vec!["1e-12", "2e-12", "6e-12"],
+        "small covariance entries must stay in 6-sig-digit form, not raw floats"
+    );
 }
 
 // ---------------------------------------------------------------------
 // Wide tables — the column window, driven non-interactively
 // ---------------------------------------------------------------------
 
-/// The orbits Parquet is 82 columns, most of them covariance. That width
-/// is the reason the pager has a horizontal column window at all; here
-/// the same selection is exercised through `--columns`.
+/// The orbits Parquet is still wide — ~70 columns — now that the
+/// covariance rides the atomic `cov_tri` list plus its layout / kind /
+/// mixture metadata rather than 21 scalar entries. That width is the
+/// reason the pager has a horizontal column window at all; here the same
+/// selection is exercised through `--columns`.
 #[test]
 fn a_wide_table_is_readable_a_window_at_a_time() {
     require_engine!();
@@ -369,18 +381,23 @@ fn a_wide_table_is_readable_a_window_at_a_time() {
         "fixture must be a wide table, got {} columns",
         header.len()
     );
-    assert!(header.contains(&"cov_00"));
+    assert!(header.contains(&"cov_tri"), "the atomic covariance column");
     assert!(header.contains(&"srp_amrat"));
 
-    // A window over the far end of the table.
+    // A window over a far column: the atomic covariance renders as a
+    // bracketed list, visible in a window, never dropped.
     let (window, _, ok) = show(&[
         path.to_str().unwrap(),
         "--columns",
-        "cov_54,cov_55,covariance_representation",
+        "cov_tri",
         "--no-header",
     ]);
     assert!(ok);
-    assert_eq!(window.trim(), "0       6e-12   cartesian");
+    let window = window.trim();
+    assert!(
+        window.starts_with('[') && window.contains("1e-12") && window.contains("6e-12"),
+        "the atomic covariance must render as a bracketed list in a window: {window}"
+    );
 }
 
 // ---------------------------------------------------------------------

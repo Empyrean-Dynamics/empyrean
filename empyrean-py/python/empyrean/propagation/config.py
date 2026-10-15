@@ -387,16 +387,29 @@ class EphemerisOverlapPolicy(str, enum.Enum):
     The SPK is the authoritative solution for that body, so for the body
     itself these states are exact. What it costs: the caller's initial
     condition is **discarded**, and nothing is integrated, so there is no
-    dense trajectory, no STM, and no sensitivity chain — which is why
-    :func:`empyrean.generate_ephemeris` fails outright for such a body
-    under this policy."""
+    STM and no sensitivity chain.
+
+    :func:`empyrean.generate_ephemeris` **succeeds** under this policy —
+    the rows are served off the body's own SPK-backed trajectory — and
+    the substitution is reported in
+    :attr:`EphemerisResult.warnings <empyrean.EphemerisResult.warnings>`,
+    naming the body and saying whether a declared covariance was
+    dropped. Those rows carry **no sky covariance**: a covariance
+    describes the initial condition this policy discards. Radar
+    generation still fails outright, because its Jacobian is composed on
+    the STM a substitution never produces."""
 
     EXCLUDE_AND_INTEGRATE = "exclude_and_integrate"
     """Drop the overlapped perturber from the force model, integrate the
     caller's own initial conditions, and report the overlap.
 
-    This is what generating an ephemeris for an SB441-N16 body at
-    Standard tier requires."""
+    This is what generating an ephemeris for an SB441-N16 body from the
+    initial condition you supplied requires — and the only route to a
+    transported sky covariance or a radar prediction for one. The
+    exclusion is reported in
+    :attr:`EphemerisResult.warnings <empyrean.EphemerisResult.warnings>`,
+    because these rows come from a force model one perturber short and a
+    caller reading their σ needs to know that."""
 
 
 @dataclass
@@ -440,8 +453,6 @@ class AdvancedIntegratorConfig:
     """Initial step size in days. ``None`` = auto from orbital timescale."""
     dt_min: float | None = None
     """Minimum allowed step size in days. ``None`` = auto."""
-    encounter_timescale_divisor: float = 1000.0
-    """Divisor K for encounter dynamical-timescale step floor."""
     max_steps: int = 10_000_000
     max_dense_steps: int = 100_000
     cache_integrator_steps: bool = False
@@ -615,7 +626,6 @@ class PropagationConfig:
                 "epsilon": adv.epsilon,
                 "dt_initial": adv.dt_initial,
                 "dt_min": adv.dt_min,
-                "encounter_timescale_divisor": adv.encounter_timescale_divisor,
                 "max_steps": adv.max_steps,
                 "max_dense_steps": adv.max_dense_steps,
                 "cache_integrator_steps": adv.cache_integrator_steps,

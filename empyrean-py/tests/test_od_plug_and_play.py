@@ -47,9 +47,64 @@ from empyrean import (
     refine,
 )
 from empyrean.od.result import ODConfig, SolveForParams
+from empyrean.orbits.joint import (
+    CovarianceKind,
+    JointFunctional,
+    JointProvenance,
+    JointQuality,
+    PackedJoint,
+    PackedJoints,
+)
 from empyrean.orbits.nongrav import NonGravParams
 from empyrean.orbits.orbits import CartesianOrbits
 from empyrean.propagation.config import UncertaintyMethod
+
+
+def _full_matrix(joint: PackedJoint) -> np.ndarray:
+    """Unpack a packed joint's lower triangle into its full symmetric matrix."""
+    w = int(joint.width)
+    tri = np.asarray(joint.tri, dtype=np.float64)
+    mat = np.zeros((w, w), dtype=np.float64)
+    idx = 0
+    for i in range(w):
+        for j in range(i + 1):
+            mat[i, j] = tri[idx]
+            mat[j, i] = tri[idx]
+            idx += 1
+    return mat
+
+
+def _prior_joint(state6: np.ndarray, param_vars: list[float], present_bits: int) -> PackedJoint:
+    """A block-diagonal prior joint: the fit's 6x6 state block plus one
+    diagonal prior variance per parameter axis (zero cross terms).
+
+    The parameter prior (Marsden / AMRAT) rides the packed joint now — the
+    old ``NonGravParams.covariance`` / ``SRPParams.amrat_variance`` columns
+    are gone. ``present_bits`` is the ``layout_present`` mask over the P
+    parameter axes beyond the six state axes (bit 0=A1, 1=A2, 2=A3, 4=AMRAT).
+    """
+    width = 6 + len(param_vars)
+    full = np.zeros((width, width), dtype=np.float64)
+    full[:6, :6] = np.asarray(state6, dtype=np.float64)
+    for k, v in enumerate(param_vars):
+        full[6 + k, 6 + k] = v
+    tri = [full[i, j] for i in range(width) for j in range(i + 1)]
+    return PackedJoint(
+        layout_present=present_bits,
+        layout_considered=0,
+        layout_marginalized=0,
+        width=width,
+        tri=np.asarray(tri, dtype=np.float64),
+        kind=CovarianceKind.LINEAR,
+        quality=JointQuality.POSITIVE_DEFINITE,
+        cov_rank=0,
+        cov_null_axes=0,
+        cov_min_eig_corr=float("nan"),
+        functional=JointFunctional.STATE,
+        provenance=JointProvenance.DERIVED,
+        asserted_source=None,
+    )
+
 
 DATA_DIR = Path(__file__).parent / "fixtures"
 APOPHIS_MULTIAPP = DATA_DIR / "99942_apophis_multiapp.psv"
@@ -303,12 +358,12 @@ def test_default_auto_fit_round_trips_non_grav_as_none(apophis_observations):
 
 def test_fit_orbit_carries_non_grav_covariance(apophis_fit):
     """A StateAndNonGrav fit carries its non-grav covariance on
-    ``fit.orbit.non_grav``, so the orbit re-feeds into a non-grav refine
-    without losing its prior."""
-    cov = apophis_fit.orbit.non_grav.covariance.to_pylist()[0]
-    assert cov is not None, "fitted orbit dropped its non-grav covariance"
-    assert len(cov) == 9
-    mat = np.asarray(cov, dtype=float).reshape(3, 3)
+    the orbit's packed joint — its Marsden axes [6:9] — so the orbit re-feeds
+    into a non-grav refine without losing its prior."""
+    j = apophis_fit.orbit.covariance.joint(0)
+    assert j is not None, "fitted orbit dropped its packed joint covariance"
+    assert j.width == 9, "a StateAndNonGrav fit carries a 6+3 Marsden joint"
+    mat = _full_matrix(j)[6:9, 6:9]
     assert np.all(np.isfinite(mat))
     assert np.all(np.diag(mat) > 0.0), "non-grav variances must be positive"
 
@@ -334,8 +389,11 @@ def test_refine_state_and_non_grav_round_trips(apophis_fit, apophis_observations
         config=ODConfig(solve_for=SolveForParams.STATE_AND_NONGRAV),
     )
     assert refined.converged
-    # Chained re-feed: the refined orbit again carries its non-grav covariance.
-    assert refined.orbit.non_grav.covariance.to_pylist()[0] is not None
+    # Chained re-feed: the refined orbit again carries its non-grav covariance
+    # on the joint's Marsden axes (a width-9 state+Marsden joint).
+    j = refined.orbit.covariance.joint(0)
+    assert j is not None
+    assert j.width == 9
 
 
 def test_evaluate_uses_seed_non_grav_not_gravity_only(apophis_fit, apophis_observations):
@@ -373,14 +431,16 @@ def test_explicit_flag_solve_result_unwraps(apophis_fit, apophis_observations):
     a non-physical solve raises is covered by
     :func:`test_non_physical_amrat_solve_refuses`.
     """
+    state6 = apophis_fit.orbit.covariance.joint(0).state_block()
     primed = CartesianOrbits.from_kwargs(
         orbit_id=apophis_fit.orbit.orbit_id.to_pylist(),
         object_id=apophis_fit.orbit.object_id.to_pylist(),
         coordinates=apophis_fit.orbit.coordinates,
-        srp=SRPParams.from_kwargs(
-            amrat=[_APOPHIS_AMRAT],
-            cr=[1.0],
-            amrat_variance=[_APOPHIS_AMRAT_SIGMA**2],
+        srp=SRPParams.from_kwargs(amrat=[_APOPHIS_AMRAT], cr=[1.0]),
+        # The AMRAT prior rides the packed joint's AMRAT axis (bit 4), not a
+        # removed `amrat_variance` column.
+        covariance=PackedJoints.from_joints(
+            [_prior_joint(state6, [_APOPHIS_AMRAT_SIGMA**2], present_bits=1 << 4)]
         ),
     )
     config = ODConfig(solve_for_flags=SolveFor(amrat="solved"))
@@ -409,11 +469,16 @@ def test_non_physical_amrat_solve_refuses(apophis_fit, apophis_observations):
     this one pins that the refusal reaches Python intact — as an exception
     naming the offending value, not a NaN or a silently clamped fit.
     """
+    state6 = apophis_fit.orbit.covariance.joint(0).state_block()
     unconstrained = CartesianOrbits.from_kwargs(
         orbit_id=apophis_fit.orbit.orbit_id.to_pylist(),
         object_id=apophis_fit.orbit.object_id.to_pylist(),
         coordinates=apophis_fit.orbit.coordinates,
-        srp=SRPParams.from_kwargs(amrat=[1.0e-4], cr=[1.0], amrat_variance=[(1.0e-3) ** 2]),
+        srp=SRPParams.from_kwargs(amrat=[1.0e-4], cr=[1.0]),
+        # A prior so wide it constrains nothing, on the joint's AMRAT axis.
+        covariance=PackedJoints.from_joints(
+            [_prior_joint(state6, [(1.0e-3) ** 2], present_bits=1 << 4)]
+        ),
     )
     config = ODConfig(solve_for_flags=SolveFor(amrat="solved"))
     with pytest.raises(RuntimeError, match="non-physical area-to-mass ratio") as excinfo:
@@ -435,17 +500,23 @@ def test_marsden_solve_seeds_from_zero_coefficients(apophis_fit, apophis_observa
     marshals now read the fit prior on its explicit presence.
     """
     prior = 1.0e-24  # (1e-12 AU/d²)² per component — loose, data-driven.
+    state6 = apophis_fit.orbit.covariance.joint(0).state_block()
     zeroed = CartesianOrbits.from_kwargs(
         orbit_id=apophis_fit.orbit.orbit_id.to_pylist(),
         object_id=apophis_fit.orbit.object_id.to_pylist(),
-        # Re-use the fitted Cartesian state + covariance (refine's state prior).
+        # Re-use the fitted Cartesian state (refine's state prior rides the
+        # joint's state block below).
         coordinates=apophis_fit.orbit.coordinates,
         non_grav=NonGravParams.from_kwargs(
             a1=[0.0],
             a2=[0.0],
             a3=[0.0],
             model=["marsden"],
-            covariance=[[prior, 0.0, 0.0, 0.0, prior, 0.0, 0.0, 0.0, prior]],
+        ),
+        # The Marsden column is declared by the joint's Marsden axes (bits
+        # 0/1/2) carrying the fit prior — not a removed `non_grav.covariance`.
+        covariance=PackedJoints.from_joints(
+            [_prior_joint(state6, [prior, prior, prior], present_bits=0b111)]
         ),
     )
     # Must not raise "requires a covariance"; the zero-seeded column opens.

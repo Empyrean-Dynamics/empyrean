@@ -132,6 +132,23 @@ fn cell_at(
         D::Utf8 => Cell::Text(array.as_string::<i32>().value(row).to_string()),
         D::LargeUtf8 => Cell::Text(array.as_string::<i64>().value(row).to_string()),
         D::Utf8View => Cell::Text(array.as_string_view().value(row).to_string()),
+        // A list column — the packed covariance triangle `cov_tri` is the
+        // one in the 0.11.0 orbit wire — renders as a compact bracketed
+        // cell, the same shape the JSON source gives a nested array. It is
+        // shown, never dropped: the atomic joint stays visible in `show`.
+        D::List(_) | D::LargeList(_) | D::FixedSizeList(_, _) => {
+            use arrow::util::display::{ArrayFormatter, FormatOptions};
+            let fmt = ArrayFormatter::try_new(array.as_ref(), &FormatOptions::default()).map_err(
+                |e| {
+                    ShowError::parquet(
+                        path,
+                        "format a list column of",
+                        parquet::errors::ParquetError::ArrowError(e.to_string()),
+                    )
+                },
+            )?;
+            Cell::Text(fmt.value(row).to_string())
+        }
         other => {
             return Err(ShowError::UnsupportedColumnType {
                 path: path.to_path_buf(),

@@ -8,6 +8,13 @@ use empyrean_core::convert::{
 
 use crate::{CoordinateState, EmpyreanContext, set_last_error};
 
+/// [`empyrean_transform_coordinates`] / `_single` refused a covariance-bearing
+/// input: these entry points transform the bare state only, and the engine's
+/// coordinate transform does not transport a covariance. Use
+/// [`empyrean_transform_orbits`], which carries the full packed joint. Not a
+/// silent drop — refused by name with this code.
+pub const EMPYREAN_TRANSFORM_COVARIANCE_UNSUPPORTED: i32 = -50;
+
 /// Resolve the three target-basis integers once for a whole call.
 ///
 /// Shared by the batched and single-state entry points so neither can
@@ -66,20 +73,14 @@ fn flatten_batch(
     }
     let mut flat = Vec::with_capacity(transformed.len());
     for (i, c) in transformed.iter().enumerate() {
-        match coordinates_to_coordinate_state(c) {
-            Ok(cs) => {
-                let mut out = CoordinateState::from_empyrean(&cs);
-                // The core flat type carries no border, so read it off
-                // the transformed `Coordinates` directly. The engine
-                // rotated it with the 6×6 it borders — dropping it here
-                // would silently return half a joint through a basis
-                // change, which is the failure this whole surface exists
-                // to remove.
-                let (has_border, cross) = crate::joint::border_to_c(c.extended_covariance());
-                out.has_non_grav_cross = has_border;
-                out.non_grav_cross = cross;
-                flat.push(out);
-            }
+        // The transform carries the state only — the engine's
+        // `transform_coordinates` takes and returns a bare `Coordinates`
+        // with no uncertainty — so the marshaled flat state carries no
+        // covariance. A covariance-bearing input is refused up front (see
+        // `coordinate_state_to_coordinates_for_transform`), so nothing is
+        // dropped silently here.
+        match coordinates_to_coordinate_state(c, None) {
+            Ok(cs) => flat.push(CoordinateState::from_empyrean(&cs)),
             Err(e) => return Err(format!("batch element {i} failed to transform: {e}")),
         }
     }
@@ -87,33 +88,39 @@ fn flatten_batch(
 }
 
 /// Rebuild the engine coordinate a flat [`CoordinateState`] describes,
-/// **including** its state↔Marsden border.
+/// for a transform that carries the **state only**.
 ///
-/// Both transform entry points take a bare `CoordinateState` with no
-/// orbit beside it, so there is no `non_grav_covariance` in scope to
-/// pair the border with. The engine only ever rotates the border's
-/// `cross` half through the state Jacobian and never reads `params` on
-/// this path, so a zero parameter block is inert here rather than a
-/// substituted value — and the caller gets the same `cross` back,
-/// rotated, with `params` still living on their orbit.
-///
-/// Note what the entry points therefore do and do not move: a coordinate
-/// and its border, never a whole joint. An orbit's wide carrier is not
-/// in scope at this signature — it is an orbit-level object, and the
-/// coordinate does not carry it.
-fn coordinate_state_to_bordered_coordinates(
+/// The engine's coordinate transform (`transform_coordinates`) takes and
+/// returns a bare `Coordinates` with no uncertainty — this engine
+/// revision does not propagate a covariance through a representation /
+/// frame / origin change. So a covariance-bearing input state has no
+/// honest home on this path: transporting the state while dropping the
+/// 6×6 would return half an answer (a new-basis state wearing an
+/// old-basis — or absent — covariance), and the output contract forbids a
+/// silently dropped field. A state with `has_covariance != 0` is
+/// therefore **refused by name** rather than transformed; the covariance
+/// is propagated through a propagate / OD path instead.
+fn coordinate_state_to_coordinates_for_transform(
     s: &CoordinateState,
 ) -> Result<
     empyrean_core::coordinates::Coordinates<
         empyrean_core::coordinates::AU,
         empyrean_core::coordinates::Degrees,
     >,
-    String,
+    crate::joint::AbiError,
 > {
-    let coords = coordinate_state_to_coordinates(&s.to_empyrean()).map_err(|e| e.to_string())?;
-    let ext =
-        crate::joint::border_from_c(s.has_non_grav_cross, &s.non_grav_cross, [[0.0_f64; 3]; 3]);
-    Ok(crate::joint::coordinates_with_extended(coords, ext))
+    let (coords, uncertainty) =
+        coordinate_state_to_coordinates(&s.to_empyrean()).map_err(|e| e.to_string())?;
+    if uncertainty.is_some() {
+        return Err(crate::joint::AbiError::coded(
+            EMPYREAN_TRANSFORM_COVARIANCE_UNSUPPORTED,
+            "coordinate transform carries the state only and cannot propagate a covariance \
+             through a representation / frame / origin change; call empyrean_transform_orbits, \
+             which transports the full packed joint, or supply has_covariance = 0"
+                .to_string(),
+        ));
+    }
+    Ok(coords)
 }
 
 /// Transform a **batch** of coordinate states to a new representation,
@@ -205,11 +212,11 @@ pub unsafe extern "C" fn empyrean_transform_coordinates(
         // wearing the code that means "your arguments are wrong".
         let mut coords_in = Vec::with_capacity(num_states);
         for (i, s) in in_slice.iter().enumerate() {
-            match coordinate_state_to_bordered_coordinates(s) {
+            match coordinate_state_to_coordinates_for_transform(s) {
                 Ok(c) => coords_in.push(c),
                 Err(e) => {
                     set_last_error(&format!("batch element {i} failed to transform: {e}"));
-                    return -2;
+                    return e.code.unwrap_or(-2);
                 }
             }
         }
@@ -266,8 +273,12 @@ pub unsafe extern "C" fn empyrean_transform_coordinates(
 /// this function on the same context amortizes them just as well. See
 /// that function's docs for the measurement.
 ///
-/// Covariance is propagated through the Jacobian of the transformation
-/// when the input state carries one.
+/// The transform carries the **state only** at this engine revision: a
+/// state with a covariance (`has_covariance = 1`) is refused rather than
+/// transformed, because the engine's coordinate transform does not
+/// propagate a covariance through a representation / frame / origin change
+/// and silently dropping it is forbidden. Propagate the covariance through
+/// a propagate or orbit-determination path instead.
 ///
 /// Returns 0 on success or a negative error code on failure.
 /// Call `empyrean_last_error()` to retrieve the error message on failure.
@@ -298,11 +309,11 @@ pub unsafe extern "C" fn empyrean_transform_coordinates_single(
                 }
             };
 
-        let coords_in = match coordinate_state_to_bordered_coordinates(input_state) {
+        let coords_in = match coordinate_state_to_coordinates_for_transform(input_state) {
             Ok(c) => c,
             Err(e) => {
-                set_last_error(&e);
-                return -1;
+                set_last_error(&e.message);
+                return e.code.unwrap_or(-1);
             }
         };
 
@@ -313,13 +324,9 @@ pub unsafe extern "C" fn empyrean_transform_coordinates_single(
             target_frm,
             target_orig,
         ) {
-            Ok(transformed) => match coordinates_to_coordinate_state(&transformed) {
+            Ok(transformed) => match coordinates_to_coordinate_state(&transformed, None) {
                 Ok(flat) => {
-                    let mut out = CoordinateState::from_empyrean(&flat);
-                    let (has_border, cross) =
-                        crate::joint::border_to_c(transformed.extended_covariance());
-                    out.has_non_grav_cross = has_border;
-                    out.non_grav_cross = cross;
+                    let out = CoordinateState::from_empyrean(&flat);
                     unsafe {
                         *output = out;
                     }
@@ -341,6 +348,137 @@ pub unsafe extern "C" fn empyrean_transform_coordinates_single(
         Ok(code) => code,
         Err(_) => {
             set_last_error("panic in empyrean_transform_coordinates_single");
+            -99
+        }
+    }
+}
+
+/// Transform a batch of **orbits** — state AND its full packed-joint
+/// covariance — to a new representation, frame, and/or origin.
+///
+/// The orbit-level dual of [`empyrean_transform_coordinates`]: where that
+/// transforms a bare [`CoordinateState`] and **refuses** a covariance-bearing
+/// input ([`EMPYREAN_TRANSFORM_COVARIANCE_UNSUPPORTED`]), this transports each
+/// orbit's whole \\((6+P)\\)-wide joint under the first-order element Jacobian,
+/// alongside its state; every force-model parameter (non-grav / SRP / thrust /
+/// photometry) and the ids ride through unchanged.
+///
+/// `orbits` is a caller-owned array of `num_orbits` [`EmpyreanOrbit`]; `out` is
+/// a caller-allocated [`EmpyreanOrbitBatch`] the library fills and the caller
+/// releases with [`empyrean_orbits_batch_free`] — each output joint's triangle
+/// is library-owned, the same ownership the orbit readers use. Each output
+/// orbit's covariance is the transported joint, marshaled through the one
+/// packed-joint wire (angular state rows in degrees); the flat
+/// `CoordinateState.covariance` is its state block, derived from the joint.
+///
+/// # Returns
+///
+/// `0` on success. `-1` for a null pointer or an unresolvable target basis. A
+/// per-orbit input refusal keeps its packed-joint code (−40…−49, e.g. a
+/// malformed wire joint). `-2` when the engine refuses the transform — the
+/// failing orbit's index is named in `empyrean_last_error` (the engine's
+/// `TransformError::Element`) — or when the result cannot be marshaled back
+/// out. `num_orbits == 0` is a valid no-op leaving `out` empty.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn empyrean_transform_orbits(
+    ctx: *const EmpyreanContext,
+    orbits: *const crate::propagate::EmpyreanOrbit,
+    num_orbits: usize,
+    target_representation: i32,
+    target_frame: i32,
+    target_origin: i32,
+    out: *mut crate::io::EmpyreanOrbitBatch,
+) -> i32 {
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        if ctx.is_null() || out.is_null() {
+            set_last_error("null pointer argument");
+            return -1;
+        }
+        let out_ref = unsafe { &mut *out };
+        *out_ref = crate::io::EmpyreanOrbitBatch::empty();
+        // An empty batch is a no-op: `out` stays the empty batch written above.
+        if num_orbits == 0 {
+            return 0;
+        }
+        if orbits.is_null() {
+            set_last_error("null orbits pointer with num_orbits > 0");
+            return -1;
+        }
+        let ctx_ref = unsafe { &*ctx };
+        let orbit_slice = unsafe { std::slice::from_raw_parts(orbits, num_orbits) };
+        let (target_rep, target_frm, target_orig) =
+            match resolve_target(target_representation, target_frame, target_origin) {
+                Ok(t) => t,
+                Err(e) => {
+                    set_last_error(&e);
+                    return -1;
+                }
+            };
+        // Build the engine `Orbits` through the input spine
+        // (`push_orbit_with_joint`, the authority rule enforced), preserving the
+        // caller's ids and force-model params; a malformed wire joint is refused
+        // here with its per-variant code (−40…−49).
+        let (mut orbits_in, _ids, object_ids) =
+            match crate::propagate::build_orbits_for_propagation(orbit_slice) {
+                Ok(t) => t,
+                Err(e) => {
+                    set_last_error(&e.message);
+                    return e.code.unwrap_or(-1);
+                }
+            };
+        // The input builder tracks object ids in a side vector; set them on the
+        // batch so the transformed output carries them (the transform clones
+        // every per-orbit vector, ids included).
+        for (i, obj) in object_ids.iter().enumerate() {
+            if !obj.is_empty() {
+                orbits_in.set_object_id(i, Some(obj.clone()));
+            }
+        }
+        // The SPK set is consulted iff at least one orbit must change origin —
+        // the same rule the coordinate transform uses.
+        let spk = if orbits_in
+            .coordinates()
+            .iter()
+            .any(|c| c.origin() != target_orig)
+        {
+            Some(ctx_ref.spk())
+        } else {
+            None
+        };
+        let transformed = match orbits_in.transform(
+            target_rep,
+            target_frm,
+            target_orig,
+            spk,
+            ctx_ref.gm(),
+            // `Orbits::transform` takes the engine's own method enum (the
+            // re-exported villeneuve type); FirstOrder is the linearized
+            // element transport, matching the bare coordinate transform.
+            &empyrean_core::determination::EngineUncertaintyMethod::FirstOrder,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                // `TransformError::Element` renders with the failing orbit's
+                // index, so the caller can name the object that failed.
+                set_last_error(&e.to_string());
+                return -2;
+            }
+        };
+        match crate::io::orbits_to_batch(&transformed) {
+            Ok(batch) => {
+                *out_ref = batch;
+                0
+            }
+            Err(e) => {
+                set_last_error(&e);
+                -2
+            }
+        }
+    }));
+    match result {
+        Ok(code) => code,
+        Err(_) => {
+            set_last_error("panic in empyrean_transform_orbits");
             -99
         }
     }
@@ -373,8 +511,6 @@ mod batch_contract_tests {
             representation: 0, // Cartesian
             frame: 0,          // ICRF
             origin: 10,        // Sun
-            has_non_grav_cross: 0,
-            non_grav_cross: [[0.0; 3]; 6],
         };
         vec![
             base(59000.0, 1.0),
@@ -393,8 +529,6 @@ mod batch_contract_tests {
                 representation: 0,
                 frame: 0,
                 origin: 0,
-                has_non_grav_cross: 0,
-                non_grav_cross: [[0.0; 3]; 6],
             })
             .collect()
     }
@@ -463,11 +597,16 @@ mod batch_contract_tests {
     /// short write that the caller reads back as zero-filled data.
     #[test]
     fn a_short_result_is_refused_rather_than_short_written() {
+        // `coordinate_state_to_coordinates` now returns the state coordinate
+        // paired with the state-only `OrbitUncertainty` its 6×6 rides; this
+        // row-correspondence guard is about the coordinate marshal, so take
+        // the coordinate half.
         let coords: Vec<_> = inputs()
             .iter()
             .map(|s| {
                 coordinate_state_to_coordinates(&s.to_empyrean())
                     .expect("the fixture states are well-formed")
+                    .0
             })
             .collect();
         assert_eq!(coords.len(), 3);
@@ -501,96 +640,14 @@ mod batch_contract_tests {
         );
     }
 
-    /// The border survives a basis change rather than being dropped.
-    ///
-    /// `CoordinateState` gained the state↔Marsden border in the 0.10.0
-    /// ABI, and both transform entry points take a bare
-    /// `CoordinateState` — so the natural implementation (flatten
-    /// through the core type, which has no border) would silently return
-    /// half a joint through every representation change. The engine
-    /// rotates the border with the 6×6 it borders; this pins that it
-    /// reaches the caller.
-    #[test]
-    fn the_marsden_border_survives_a_basis_change() {
-        let Some(ctx) =
-            crate::testing::context_or_skip("the_marsden_border_survives_a_basis_change")
-        else {
-            return;
-        };
-        let mut input = inputs()[0];
-        // A border needs its 6×6: the engine refuses a cross with no
-        // state block to border, which is the guard this test must stay
-        // on the right side of.
-        for i in 0..6 {
-            input.covariance[i][i] = 1.0e-8 * (i as f64 + 1.0);
-        }
-        input.has_covariance = 1;
-        input.has_non_grav_cross = 1;
-        input.non_grav_cross = [[1.0e-12, 2.0e-12, 3.0e-12]; 6];
-
-        let mut out = zeroed_out(1);
-        // Keplerian + EclipticJ2000: both the representation and the
-        // frame move, so the border goes through a real Jacobian rather
-        // than an identity.
-        let code = unsafe {
-            empyrean_transform_coordinates_single(&ctx, &input, 1, 1, 10, out.as_mut_ptr())
-        };
-        assert_eq!(code, 0, "the transform must accept a bordered state");
-
-        assert_eq!(
-            out[0].has_non_grav_cross, 1,
-            "the border must reach the caller, not be dropped at the flat boundary"
-        );
-        assert!(
-            out[0]
-                .non_grav_cross
-                .iter()
-                .flatten()
-                .all(|v| v.is_finite()),
-            "every border entry must be finite after the rotation"
-        );
-        assert_ne!(
-            out[0].non_grav_cross, input.non_grav_cross,
-            "the border must be ROTATED, not passed through unchanged — a copy \
-             would be a border describing the old basis attached to a new one"
-        );
-
-        // And the batch path agrees with the single path, border included.
-        let mut batch_out = zeroed_out(1);
-        let code = unsafe {
-            empyrean_transform_coordinates(&ctx, &input, 1, 1, 1, 10, batch_out.as_mut_ptr())
-        };
-        assert_eq!(code, 0);
-        assert_eq!(batch_out[0].has_non_grav_cross, out[0].has_non_grav_cross);
-        assert_eq!(
-            batch_out[0].non_grav_cross, out[0].non_grav_cross,
-            "batch element 0 must be bit-identical to the single call, border included"
-        );
-    }
-
-    /// A state with no border transforms exactly as it did before 0.10.0 —
-    /// the zero-init contract, exercised through the shipped entry
-    /// point rather than asserted about the struct.
-    #[test]
-    fn a_borderless_state_is_unchanged_by_the_new_field() {
-        let Some(ctx) =
-            crate::testing::context_or_skip("a_borderless_state_is_unchanged_by_the_new_field")
-        else {
-            return;
-        };
-        let input = inputs()[0];
-        assert_eq!(input.has_non_grav_cross, 0, "the fixture carries no border");
-        let mut out = zeroed_out(1);
-        let code = unsafe {
-            empyrean_transform_coordinates_single(&ctx, &input, 1, 1, 0, out.as_mut_ptr())
-        };
-        assert_eq!(code, 0);
-        assert_eq!(out[0].has_non_grav_cross, 0, "no border in, no border out");
-        assert_eq!(
-            out[0].non_grav_cross, [[0.0; 3]; 6],
-            "and no fabricated values"
-        );
-    }
+    // DELETED (0.11.0 ruling): `the_marsden_border_survives_a_basis_change`
+    // and `a_borderless_state_is_unchanged_by_the_new_field`. The
+    // state-Marsden border is no longer a `CoordinateState` field (it rides
+    // the orbit's packed joint), and the coordinate transform is state-only:
+    // a covariance-bearing input is refused by name
+    // (`EMPYREAN_TRANSFORM_COVARIANCE_UNSUPPORTED`). The live successor of the
+    // "covariance survives a basis change" contract is an
+    // `empyrean_transform_orbits` round trip, added separately.
 
     /// An empty batch is a no-op that touches neither pointer — the
     /// engine's own contract, mirrored so a caller with a zero-row

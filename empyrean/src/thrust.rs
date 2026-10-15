@@ -4,9 +4,9 @@
 //! These are the safe mirror of the engine's thrust surface. Attach a
 //! [`ThrustParams`] to an [`Orbit`](crate::Orbit) via
 //! [`Orbit::with_thrust`](crate::Orbit::with_thrust) to model finite
-//! burns during propagation. The burn-sensitivity segments that a
-//! non-empty `correction_covariances` produces surface in the propagated
-//! [`TaggedCovariance::thrust_segments`](crate::TaggedCovariance).
+//! burns during propagation. The per-correction burn-prior covariance rides
+//! the orbit's packed [`covariance`](crate::Orbit::covariance) joint (its
+//! thrust axes), the one covariance home.
 //!
 //! Field names, units, and semantics match the engine one-for-one so an
 //! orbit round-trips through the wrapper without renaming or reshaping.
@@ -182,16 +182,9 @@ impl ThrustArc {
 /// Attach to an [`Orbit`](crate::Orbit) with
 /// [`Orbit::with_thrust`](crate::Orbit::with_thrust).
 ///
-/// When [`correction_covariances`](Self::correction_covariances) is
-/// non-empty its length MUST equal
-/// [`dv_corrections`](Self::dv_corrections); a non-empty covariance
-/// triggers the wide-Jet burn-sensitivity propagation and its solved
-/// segments appear in
-/// [`TaggedCovariance::thrust_segments`](crate::TaggedCovariance). Length
-/// or arc/correction mismatches are surfaced loudly as an [`Error`]
-/// during propagation — never silently repaired or dropped.
-///
-/// [`Error`]: crate::Error
+/// The per-correction burn-prior covariance rides the orbit's packed
+/// [`covariance`](crate::Orbit::covariance) joint (its thrust axes), not this
+/// type: the joint is the one covariance home.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ThrustParams {
     /// Ordered list of thrust arcs. May overlap in time.
@@ -201,24 +194,16 @@ pub struct ThrustParams {
     /// acceleration during its arc's window; when seeded as Jet
     /// variables it provides ∂state/∂Δv. Empty = no corrections.
     pub dv_corrections: Vec<[f64; 3]>,
-    /// 3×3 covariance (AU/day)² per Δv correction, positional with
-    /// [`dv_corrections`](Self::dv_corrections). When non-empty its
-    /// length must equal `dv_corrections`. Empty = no burn-sensitivity
-    /// propagation.
-    pub correction_covariances: Vec<[[f64; 3]; 3]>,
 }
 
 impl ThrustParams {
     /// Build thrust parameters from a list of arcs, with no Δv
     /// corrections. Add corrections with
-    /// [`with_dv_corrections`](Self::with_dv_corrections) and their
-    /// covariances with
-    /// [`with_correction_covariances`](Self::with_correction_covariances).
+    /// [`with_dv_corrections`](Self::with_dv_corrections).
     pub fn new(arcs: Vec<ThrustArc>) -> Self {
         Self {
             arcs,
             dv_corrections: Vec::new(),
-            correction_covariances: Vec::new(),
         }
     }
 
@@ -226,17 +211,6 @@ impl ThrustParams {
     /// the arcs.
     pub fn with_dv_corrections(mut self, dv_corrections: Vec<[f64; 3]>) -> Self {
         self.dv_corrections = dv_corrections;
-        self
-    }
-
-    /// Attach the 3×3 covariance (AU/day)² per Δv correction. Its length
-    /// must equal [`dv_corrections`](Self::dv_corrections); enabling this
-    /// selects the burn-sensitivity propagation.
-    pub fn with_correction_covariances(
-        mut self,
-        correction_covariances: Vec<[[f64; 3]; 3]>,
-    ) -> Self {
-        self.correction_covariances = correction_covariances;
         self
     }
 }
@@ -330,20 +304,12 @@ mod tests {
         assert_eq!(ffi.n_thrust_arcs, 0);
         assert!(ffi.dv_corrections.is_null());
         assert_eq!(ffi.n_dv_corrections, 0);
-        assert!(ffi.correction_covariances.is_null());
-        assert_eq!(ffi.n_correction_covariances, 0);
     }
 
     #[test]
     fn orbit_with_thrust_populates_side_arrays() {
-        let cov = [
-            [1.0e-20, 0.0, 0.0],
-            [0.0, 2.0e-20, 0.0],
-            [0.0, 0.0, 3.0e-20],
-        ];
-        let thrust = ThrustParams::new(vec![rtn_arc()])
-            .with_dv_corrections(vec![[1.0e-6, 2.0e-6, 3.0e-6]])
-            .with_correction_covariances(vec![cov]);
+        let thrust =
+            ThrustParams::new(vec![rtn_arc()]).with_dv_corrections(vec![[1.0e-6, 2.0e-6, 3.0e-6]]);
         let orbit = Orbit::new(heliocentric_state()).with_thrust(Some(thrust));
 
         // `_keep` owns the side-array storage the FFI struct borrows into;
@@ -352,7 +318,6 @@ mod tests {
         assert!(!ffi.thrust_arcs.is_null());
         assert_eq!(ffi.n_thrust_arcs, 1);
         assert_eq!(ffi.n_dv_corrections, 1);
-        assert_eq!(ffi.n_correction_covariances, 1);
 
         let arcs = unsafe { std::slice::from_raw_parts(ffi.thrust_arcs, ffi.n_thrust_arcs) };
         assert_eq!(arcs[0].thrust_n, 1000.0);
@@ -363,11 +328,6 @@ mod tests {
 
         let dvs = unsafe { std::slice::from_raw_parts(ffi.dv_corrections, ffi.n_dv_corrections) };
         assert_eq!(dvs[0], [1.0e-6, 2.0e-6, 3.0e-6]);
-
-        let covs = unsafe {
-            std::slice::from_raw_parts(ffi.correction_covariances, ffi.n_correction_covariances)
-        };
-        assert_eq!(covs[0], cov);
     }
 
     #[test]
@@ -459,14 +419,7 @@ mod propagate_tests {
             return;
         };
 
-        let eye_small = [
-            [1.0e-20, 0.0, 0.0],
-            [0.0, 1.0e-20, 0.0],
-            [0.0, 0.0, 1.0e-20],
-        ];
-        let thrust = ThrustParams::new(vec![rtn_arc()])
-            .with_dv_corrections(vec![[0.0, 0.0, 0.0]])
-            .with_correction_covariances(vec![eye_small]);
+        let thrust = ThrustParams::new(vec![rtn_arc()]).with_dv_corrections(vec![[0.0, 0.0, 0.0]]);
         let thrusted = Orbit::new(seeded_state())
             .with_orbit_id("thrust-loop")
             .with_thrust(Some(thrust));
@@ -503,51 +456,6 @@ mod propagate_tests {
         assert!(
             delta > 1.0e-3,
             "thrust arc must perturb the trajectory (Δposition = {delta:e} AU)"
-        );
-    }
-
-    /// A `correction_covariances` length that does not match
-    /// `dv_corrections` is a contract violation the engine rejects. The
-    /// wrapper must surface it as an [`Error`](crate::Error) — never
-    /// silently drop or repair the covariance.
-    ///
-    /// This exercises the "surface loudly, never degrade" path shared with
-    /// the `ThirdOrder` + correction-covariance rejection. (`ThirdOrder`
-    /// itself is not directly reachable here: the wrapper's
-    /// `UncertaintyMethod` exposes no `ThirdOrder` input variant — parity
-    /// with the C ABI — so the exact combination cannot be constructed
-    /// through the public API, but the identical non-degrading surface is
-    /// what carries either rejection up as an `Error`.)
-    #[test]
-    fn thrust_correction_covariance_mismatch_surfaces_loudly() {
-        let Some(ctx) = try_context() else {
-            eprintln!(
-                "skipping thrust_correction_covariance_mismatch_surfaces_loudly: no data dir"
-            );
-            return;
-        };
-
-        // One arc, zero Δv corrections, but a correction covariance: the
-        // engine's ThrustParams contract requires the covariance length to
-        // match the Δv-correction length.
-        let eye = [
-            [1.0e-20, 0.0, 0.0],
-            [0.0, 1.0e-20, 0.0],
-            [0.0, 0.0, 1.0e-20],
-        ];
-        let thrust = ThrustParams::new(vec![rtn_arc()]).with_correction_covariances(vec![eye]);
-        let orbit = Orbit::new(seeded_state()).with_thrust(Some(thrust));
-
-        let epochs = vec![Epoch::from_mjd_tdb(59000.0), Epoch::from_mjd_tdb(59005.0)];
-        let cfg = PropagationConfig::default();
-
-        let err = ctx
-            .propagate(&[orbit], &epochs, &cfg)
-            .expect_err("mismatched correction_covariances must error, not degrade");
-        assert!(
-            err.message.contains("correction_covariances"),
-            "error must name the offending field, got: {}",
-            err.message
         );
     }
 }

@@ -25,7 +25,7 @@ raw FFI pointers.
 
 ```toml
 [dependencies]
-empyrean = "0.11.0-rc.0"
+empyrean = "0.11.0"
 ```
 
 ## What it does
@@ -301,11 +301,11 @@ let fit = ctx.determine(&obs, None, &ODConfig {
 })?.into_single()?;
 
 // Refine, additionally solving the outgassing time delay DT. Opening DT
-// requires a prior on it — its variance (days²) — carried on the orbit.
-// Ask for DT without the prior and refine errors, never a zeroed column.
-let prior = fit.orbit
-    .with_non_grav_dt(Some(30.0))
-    .with_non_grav_dt_variance(Some(100.0));
+// requires a prior on it, carried on the orbit's packed covariance joint
+// (its DT axis) — the fitted orbit from the first solve already carries that
+// joint. Ask for DT without the prior and refine errors, never a zeroed
+// column.
+let prior = fit.orbit.with_non_grav_dt(Some(30.0));
 let refined = ctx.refine(&prior, &obs, &ODConfig {
     solve_for: SolveForParams::Explicit(SolveFor {
         marsden: ParamDisposition::Solved,
@@ -328,72 +328,44 @@ if let Some(cov) = &refined.solved_covariance {
 # Ok::<(), empyrean::Error>(())
 ```
 
-## The joint covariance
+## The packed joint covariance
 
-A wide fit produces one (6+*P*)×(6+*P*) matrix. Its diagonal blocks — the 6×6
-state covariance, the Marsden 3×3, a DT variance, an AMRAT variance, a
-per-segment thrust 3×3 — have always crossed the boundary. The
-**off-diagonal** blocks are what `JointCovariance` and `WideCross` carry, and
-they ride the fitted orbit, propagation (in both directions), impact
-probability, B-planes and ephemeris.
+A wide fit produces one (6+*P*)×(6+*P*) matrix — the 6×6 state block plus one
+row and column per solved parameter (Marsden A1/A2/A3, the outgassing delay DT,
+the SRP area-to-mass ratio, each thrust Δv component). `PackedJoint` carries
+the **whole** matrix as one object, and it rides the fitted orbit, propagation
+(in both directions), impact probability, B-planes and ephemeris.
 
-Dropping them is not a conservative simplification. A block-diagonal
-covariance asserts that the data which produced the state and the data which
-produced A2 were independent, when they are the same observations through the
-same fit. Worse, the *propagated* joint has non-zero state↔parameter columns
-**even from a block-diagonal input**, because propagation itself generates the
-correlation — so a second leg handed only the 6×6 reports a *tighter*
-uncertainty than the first leg supports.
+Carrying only the diagonal blocks is not a conservative simplification. A
+block-diagonal covariance asserts that the data which produced the state and
+the data which produced A2 were independent, when they are the same
+observations through the same fit. Worse, the *propagated* joint has non-zero
+state↔parameter columns **even from a block-diagonal input**, because
+propagation itself generates the correlation — so a second leg handed only the
+6×6 reports a *tighter* uncertainty than the first leg supports.
 
-### The four homes
+### One home
 
-One covariance entry belongs to exactly one place, and supplying it in two is
-refused rather than merged:
+`PackedJoint` is the single home for an orbit's covariance. It stores the
+matrix as its packed lower triangle `tri` (`width·(width+1)/2` doubles, the
+leading 6×6 being the state block), an `AxisLayout` naming which parameter axes
+have a column (`present`), which were carried by consider analysis
+(`considered`), and which are present-but-marginalized (`marginalized`), and the
+tags that name what the matrix describes — `kind` (how it was derived),
+`quality` (definiteness), `functional` (which second moment) and `provenance`
+(derived or asserted). The layout names the parameter each column belongs to,
+so a column's meaning does not depend on how many *other* parameters the orbit
+declares.
 
-| block | home |
-|---|---|
-| state ↔ state | `CoordinateState::covariance` |
-| Aᵢ ↔ Aⱼ | `Orbit::ng_covariance` |
-| state ↔ Aᵢ | `CoordinateState::non_grav_cross` (6×3) |
-| Δvᵢ ↔ Δvⱼ, same segment | that segment's own 3×3 on `ThrustParams` |
-| everything else | `Orbit::wide_cross` (a `WideCross`) |
-
-The state↔Marsden border sits on the **coordinate**, beside the 6×6 it
-borders, so a coordinate transform moves both halves of one matrix together;
-`transform_coordinates` rotates the border with the state rather than leaving
-it in the old basis. Everything else — state↔DT, state↔AMRAT, state↔Δv, and
-the mixed parameter pairs — sits on the orbit.
-
-Entries in a `WideCross` are keyed by `ParamColumn` (`Marsden(i)`, `Dt`,
-`Amrat`, `Thrust { segment, component }`), never by column index, because
-which column a parameter occupies depends on what *else* the orbit declares —
-adding an SRP AMRAT shifts the thrust columns by one. An index recorded
-against one orbit is wrong against the next, and the failure is silent: every
-number finite, every gate passed, one parameter's correlations attached to
-another. `ParamColumn::as_tag` / `from_tag` render and parse the canonical
-strings (`"A1"`, `"DT"`, `"AMRAT"`, `"thrust[0].x"`) that the file formats and
-the other language channels carry.
-
-A `Thrust` segment index is the **declared** segment, not the solved one — the
-same index space as `SolveFor::thrust` and the orbit's own correction
-covariances.
-
-### Absence is not zero
-
-`WideCross::is_empty` reports entry *count*, not values: an entry whose six
-numbers are all zero is a supplied zero correlation and makes it return
-`false`. Omitting the entry is the only way to say "absent". The distinction
-is load-bearing in both directions — the engine's definiteness gate engages on
-a supplied zero — so a producer never emits a zero block to stand in for a
-missing one, and `JointCovariance::non_grav_cross` is `Option`-typed for the
-same reason.
+The flat 6×6 state covariance read off a result — `PropagatedState::covariance`,
+`TaggedCovariance::matrix()` — is a derived read-only view of the joint's state
+block (`PackedJoint::state_block()`), never a second, independently settable
+home.
 
 ### Reading it, and handing it on
 
 ```rust,no_run
-use empyrean::{
-    Context, Epoch, ODConfig, ParamColumn, PropagationConfig, SolveForParams,
-};
+use empyrean::{Context, Epoch, ODConfig, PropagationConfig, SolveForParams};
 
 let ctx = Context::from_data_dir(None)?;
 let obs = ctx.read_ades("comet_67p.psv")?;
@@ -402,30 +374,24 @@ let fit = ctx.determine(&obs, None, &ODConfig {
     ..Default::default()
 })?.into_single()?;
 
-// The fitted orbit carries the fit's own off-diagonal blocks, in the two
-// homes above. No reconstruction: `fit.orbit` is already the input type.
-let border = fit.orbit.state.non_grav_cross;          // Option<[[f64; 3]; 6]>
-if let Some(wide) = &fit.orbit.wide_cross {
-    if let Some(col) = wide.state_cross(ParamColumn::Amrat) {
-        println!("cov(x, AMRAT) = {:e}", col[0]);
-    }
-    for (a, b, value) in wide.param_crosses() {
-        println!("cov({}, {}) = {value:e}", a.as_tag(), b.as_tag());
-    }
+// The fitted orbit carries the fit's own joint — the whole (6+P)-wide matrix.
+// No reconstruction: `fit.orbit` is already the input type.
+if let Some(joint) = &fit.orbit.covariance {
+    let block = joint.state_block();            // the derived 6×6 state view
+    println!("σ(x) = {:e}", block[0][0].sqrt());
+    println!("joint width = {}", joint.width);  // 6 + solved parameters
 }
 
 // Propagate it. The joint goes in with the orbit and comes back per epoch.
 let epochs = vec![Epoch::from_mjd_tdb(65000.0)];
 let leg1 = ctx.propagate(&[fit.orbit.clone()], &epochs, &PropagationConfig::default())?;
 let end = &leg1.states[0];
-println!("joint present at the end of leg 1: {}", !end.joint.is_empty());
-# let _ = border;
+println!("joint present at the end of leg 1: {}", end.joint.is_some());
 # Ok::<(), empyrean::Error>(())
 ```
 
-Chaining a second leg by hand is three field copies onto the next orbit —
-`state.covariance`, `state.non_grav_cross`, `wide_cross` — plus the parameter
-blocks the cross terms are *conditioned* on:
+Chaining a second leg by hand is one field copy onto the next orbit — the whole
+joint travels together, so there are no halves to reassemble:
 
 ```rust,no_run
 # use empyrean::{Context, CoordinateState, Epoch, PropagationConfig};
@@ -435,7 +401,7 @@ blocks the cross terms are *conditioned* on:
 # let leg1 = ctx.propagate(&[seed.clone()], &epochs, &PropagationConfig::default())?;
 let end = &leg1.states[0];
 
-let mut next = seed.clone();   // carries the parameter blocks unchanged
+let mut next = seed.clone();
 next.state = CoordinateState::cartesian(
     end.epoch,
     [
@@ -445,21 +411,18 @@ next.state = CoordinateState::cartesian(
     end.frame,
     end.origin,
 );
-next.state.covariance = end.covariance;
-next.state.non_grav_cross = end.joint.non_grav_cross;
-next.wide_cross = end.joint.wide_cross.clone();
+// The propagated joint is the whole matrix — copy it onto the next leg.
+next.covariance = end.joint.clone();
 
 let leg2 = ctx.propagate(&[next], &epochs, &PropagationConfig::default())?;
 # let _ = leg2;
 # Ok::<(), empyrean::Error>(())
 ```
 
-The parameter blocks come from the orbit that *started* the chain, not from
-the propagated row: propagation passes the non-grav 3×3, the DT variance and
-the AMRAT variance through unchanged rather than restating them on every
-output epoch. A border supplied without the parameter block it conditions is
-refused by the engine, not quietly ignored — a cross term with no diagonal
-block to sit against is half a matrix.
+Moving a covariance between representations, frames or origins goes through
+`transform_orbits`, whose Jacobian transports the whole joint; the bare-state
+`transform_coordinates` refuses a covariance-bearing input rather than drop it
+silently.
 
 `PropagationResult::joint_at(orbit_index, epoch_index)` reads the same cross
 terms alongside the tagged-covariance accessors, for callers working from
@@ -793,8 +756,9 @@ loudly by axis — never silently rebuilt against the wrong dynamics.
 # use empyrean::{Context, ForceModelTier, Frame, PropagationConfig, Epoch};
 # let ctx = Context::from_data_dir(None)?;
 # let orbits = empyrean::query_sbdb(&["Apophis"], None)?.orbits;
-// Build once; freeze the divisor at the engine default (0.0).
-let handle = ctx.built_system(ForceModelTier::Standard, Frame::EclipticJ2000, 0.0)?;
+// Build the force model once; the engine's encounter-floor angle is frozen
+// into the handle's key and read back from `describe()`.
+let handle = ctx.built_system(ForceModelTier::Standard, Frame::EclipticJ2000)?;
 
 let epochs = vec![Epoch::from_mjd_tdb(65020.0)];
 let result = handle.propagate(&ctx, &orbits, &epochs, &PropagationConfig::default())?;

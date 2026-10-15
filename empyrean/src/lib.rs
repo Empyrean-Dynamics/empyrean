@@ -146,7 +146,7 @@ pub use ephemeris::{
     SENSITIVITY_ROW_RA, SENSITIVITY_ROW_RANGE, SENSITIVITY_ROW_VDEC, SENSITIVITY_ROW_VRA,
     SENSITIVITY_ROW_VRANGE,
 };
-pub use error::{ENGINE_NOT_LOADED, Error, Result};
+pub use error::{ENGINE_NOT_LOADED, Error, PushError, Result};
 pub use impact::{BPlane, ImpactProbability};
 pub use io::{
     FitSummaryRow, OrbitBatch, read_orbits_csv, read_orbits_json, read_orbits_parquet,
@@ -155,7 +155,10 @@ pub use io::{
     write_fit_summary_parquet, write_orbits_csv, write_orbits_json, write_orbits_parquet,
     write_residuals_csv, write_residuals_json, write_residuals_parquet,
 };
-pub use joint::{JointCovariance, ParamColumn, ParamDisposition, WideCross};
+pub use joint::{
+    AssertedSource, AxisLayout, JointFunctional, JointProvenance, JointQuality, PackedJoint,
+    ParamDisposition,
+};
 // NAME COLLISION, resolved by module path. This root `MixtureComponent`
 // is the `split_gaussian` primitive at t₀ (weight / mean / covariance,
 // no basis tags). The AGM *read-back* component — the basis-tagged one
@@ -179,15 +182,15 @@ pub use od::{
 };
 pub use orbit::{Orbit, PhaseFunction};
 pub use planning::{
-    CandidateKind, CovarianceMetrics, ObservatoryConfig, PlanCandidate, PlanEphemerisPoint,
-    PlanResult, PlannedObservation, PlannedObservationKind, PlanningConfig, RadarMode,
-    RadarPlanSpec, RadarStation, TargetRadarProperties,
+    CandidateKind, CovarianceMetrics, LogDetWithheld, ObservatoryConfig, PlanCandidate,
+    PlanEphemerisPoint, PlanResult, PlannedObservation, PlannedObservationKind, PlanningConfig,
+    RadarMode, RadarPlanSpec, RadarStation, TargetRadarProperties,
 };
 pub use propagate::{
-    AdvancedIntegratorConfig, CaptureCriterion, CovarianceKind, CovarianceQuality, DenseOrigin,
-    DiagnosticsConfig, EphemerisOverlapPolicy, Event, EventConfig, ForceModelTier,
-    IntegratorChoice, OriginSwitchingConfig, PropagatedState, PropagationConfig, PropagationResult,
-    TaggedCovariance, TargetFunctional, UncertaintyMethod,
+    AdvancedIntegratorConfig, CaptureCriterion, CovarianceKind, DenseOrigin, DiagnosticsConfig,
+    EphemerisOverlapPolicy, Event, EventConfig, ForceModelTier, IntegratorChoice, OrbitOutcome,
+    OriginSwitchingConfig, PropagatedState, PropagationConfig, PropagationResult, TaggedCovariance,
+    UncertaintyMethod,
 };
 pub use query::{
     query_horizons, query_horizons_vectors, query_observations, query_radar, query_sbdb,

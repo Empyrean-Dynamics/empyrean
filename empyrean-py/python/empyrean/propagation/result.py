@@ -32,6 +32,7 @@ from empyrean.propagation.events import (
     ShadowExits,
 )
 from empyrean.propagation.mixtures import MixtureChains, MixtureComponent
+from empyrean.propagation.status import OrbitOutcome, OrbitStatuses
 from empyrean.propagation.tagged_covariance import (
     TaggedCovariance,
     TaggedCovariances,
@@ -103,6 +104,15 @@ class PropagationResult:
         engine cost. See
         :mod:`~empyrean.propagation.mixtures` for the four limits on what
         is retained.
+    status : OrbitStatuses
+        Per-input-orbit delivery table — one row per input orbit, in input
+        order, whether or not it delivered. A per-orbit failure no longer
+        ends the batch: the failing orbit is carried here as a ``FAILED``
+        row with its classified ``error_code`` and the engine's
+        ``error_message``, while every other orbit still delivers its
+        states. Read delivery from this table, never from ``len(states)``.
+        Use :attr:`all_delivered` for the batch verdict and
+        :meth:`rows_for` to select one orbit's states.
     """
 
     states: CartesianOrbits
@@ -110,6 +120,29 @@ class PropagationResult:
     sensitivity: StateSensitivities | None = None
     tagged_covariance: TaggedCovariances | None = None
     mixtures: MixtureChains = field(default_factory=MixtureChains.empty)
+    status: OrbitStatuses = field(default_factory=OrbitStatuses.empty)
+
+    @property
+    def all_delivered(self) -> bool:
+        """Whether every input orbit delivered (no ``FAILED`` status row)."""
+        return self.status.all_delivered
+
+    def rows_for(self, orbit_index: int) -> CartesianOrbits | None:
+        """The delivered states of input orbit ``orbit_index``.
+
+        Returns the orbit's ``[first_row, first_row + num_rows)`` block of
+        :attr:`states`, ``None`` if the orbit failed (it delivered no
+        states), or ``None`` if ``orbit_index`` is out of range. A delivered
+        orbit with zero rows returns an empty table, not ``None`` — delivery
+        is the outcome, never the row count.
+        """
+        if orbit_index < 0 or orbit_index >= len(self.status):
+            return None
+        if self.status.outcome[orbit_index].as_py() != OrbitOutcome.DELIVERED.value:
+            return None
+        first = self.status.first_row[orbit_index].as_py()
+        num = self.status.num_rows[orbit_index].as_py()
+        return self.states[first : first + num]
 
     def mixture_chains(self, orbit_index: int) -> list[list[MixtureComponent]]:
         """One orbit's retained mixture components, grouped by CA epoch.
@@ -165,13 +198,33 @@ class PropagationResult:
                 f"orbit_index {orbit_index} out of range (result holds {len(oids)} orbits)"
             )
         chain = self.tagged_covariance.select("orbit_id", oids[orbit_index])
+        # A joint-less orbit (no input covariance) carries aligned,
+        # zero-filled placeholder rows whose ``has_tagged`` is False and that
+        # hold no joint. Its series is refused by name rather than returned as
+        # an empty list — an empty series reads as "this orbit has no output
+        # epochs", a different and misleading claim. A tagged series is never
+        # fabricated from a joint-less orbit.
+        if len(chain) > 0 and not any(chain.has_tagged.to_pylist()):
+            raise ValueError(
+                f"orbit {orbit_index} ({oids[orbit_index]!r}) carried no input "
+                "covariance, so it has no tagged covariance series; propagate an "
+                "orbit carrying a covariance joint to populate it"
+            )
         return chain.to_series()
 
     def to_dir(self, path: str) -> None:
-        """Write a propagation result to a directory of Parquet files."""
+        """Write a propagation result to a directory of Parquet files.
+
+        The per-orbit delivery :attr:`status` table rides this Parquet
+        bundle (``status.parquet``) and is read back by :meth:`from_dir`. A
+        flat, state-only export — the CSV form of ``states`` alone — does
+        not carry it; persist through this directory (or JSON) to keep the
+        accounting of which orbits failed.
+        """
         os.makedirs(path, exist_ok=True)
 
         self.states.to_parquet(os.path.join(path, "states.parquet"))
+        self.status.to_parquet(os.path.join(path, "status.parquet"))
 
         for name, table in [
             ("summary", self.events.summary),
@@ -239,10 +292,18 @@ class PropagationResult:
             TaggedCovariances.from_parquet(tagged_path) if os.path.exists(tagged_path) else None
         )
 
+        status_path = os.path.join(path, "status.parquet")
+        status = (
+            OrbitStatuses.from_parquet(status_path)
+            if os.path.exists(status_path)
+            else OrbitStatuses.empty()
+        )
+
         return cls(
             states=states,
             events=events,
             sensitivity=sensitivity,
             tagged_covariance=tagged_covariance,
             mixtures=MixtureChains.from_dir(path),
+            status=status,
         )

@@ -601,3 +601,81 @@ fn every_not_yet_wrapped_entry_is_still_a_live_exception() {
         "empyrean-sys/tests/not_yet_wrapped.txt is stale:\n{report}"
     );
 }
+
+/// The members of a `#define <prefix><MEMBER> …` const family in the C
+/// header. Only `#define` lines count, so a doc comment that names
+/// `EMPYREAN_ORBIT_OUTCOME_DELIVERED` or the `{DELIVERED,FAILED}` shorthand
+/// is not mistaken for a definition.
+fn header_const_members(text: &str, prefix: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for line in text.lines() {
+        let Some(rest) = line.trim_start().strip_prefix("#define ") else {
+            continue;
+        };
+        let Some(suffix) = rest.trim_start().strip_prefix(prefix) else {
+            continue;
+        };
+        let (member, _) = split_ident(suffix);
+        if !member.is_empty() {
+            out.insert(member.to_string());
+        }
+    }
+    out
+}
+
+/// The members of a `pub const <prefix><MEMBER>: … ` const family in the
+/// generated sys bindings — the `pub const` guard likewise skips doc lines.
+fn binding_const_members(text: &str, prefix: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for line in text.lines() {
+        let Some(rest) = line.trim_start().strip_prefix("pub const ") else {
+            continue;
+        };
+        let Some(suffix) = rest.strip_prefix(prefix) else {
+            continue;
+        };
+        let (member, _) = split_ident(suffix);
+        if !member.is_empty() {
+            out.insert(member.to_string());
+        }
+    }
+    out
+}
+
+/// The per-orbit outcome const families — the delivery status
+/// (`EMPYREAN_ORBIT_OUTCOME_*`) and the two per-command failure
+/// classifications (`EMPYREAN_PROPAGATE_FAILURE_*`,
+/// `EMPYREAN_EPHEMERIS_FAILURE_*`) — must name the same members in the C
+/// header and the generated sys bindings. The outcome channel surfaces
+/// these codes up through the wrapper, Python (`OrbitStatuses.error_code` /
+/// `OrbitOutcome`) and the CLI (exit codes + the per-orbit status table), so
+/// a const dropped or renamed in the bindgen regen is a parity break the
+/// layers above would silently inherit. This pins the C ↔ sys-binding pair
+/// of that chain, both directions.
+#[test]
+fn the_outcome_const_families_match_between_header_and_bindings() {
+    let header = read(&sys_crate_dir().join("../include/empyrean.h"));
+    let bindings = read(&sys_crate_dir().join("src/bindings.rs"));
+    for prefix in [
+        "EMPYREAN_ORBIT_OUTCOME_",
+        "EMPYREAN_PROPAGATE_FAILURE_",
+        "EMPYREAN_EPHEMERIS_FAILURE_",
+    ] {
+        let header_members = header_const_members(&header, prefix);
+        let binding_members = binding_const_members(&bindings, prefix);
+        assert!(
+            !header_members.is_empty(),
+            "no `#define {prefix}*` constants found in the C header — the outcome \
+             channel's {prefix} family is missing from include/empyrean.h"
+        );
+        let header_only: Vec<&String> = header_members.difference(&binding_members).collect();
+        let binding_only: Vec<&String> = binding_members.difference(&header_members).collect();
+        assert!(
+            header_only.is_empty() && binding_only.is_empty(),
+            "the {prefix}* const family diverged between the C header and the generated \
+             sys bindings:\n  header only: {header_only:?}\n  bindings only: {binding_only:?}\n\
+             Regenerate src/bindings.rs from include/empyrean.h; a dropped or renamed const \
+             there desyncs the status/error_code surface at every layer above."
+        );
+    }
+}

@@ -13,12 +13,11 @@ from empyrean._convert import (
     _COORD_TYPE_MAP,
     AnyOrbits,
     coordinates_to_arrays,
-    extract_joint,
+    extract_joint_wire,
     extract_srp,
     int_to_frame,
-    joint_columns_from_result,
+    joint_from_result,
     naif_to_origin,
-    non_grav_border_only,
     validate_non_grav_marsden_only,
 )
 from empyrean.coordinates.coordinates import CartesianCoordinates
@@ -234,7 +233,7 @@ def _orbits_to_dict(orbits: AnyOrbits) -> dict[str, list[Any] | np.ndarray]:
     # NonGravParams is Marsden-only; reject a stray model='srp' / cr before
     # marshaling (SRP rides its own slot, extracted below).
     validate_non_grav_marsden_only(orbits)
-    has_srp, srp_amrat, srp_cr, srp_amrat_variance = extract_srp(orbits)
+    has_srp, srp_amrat, srp_cr = extract_srp(orbits)
     a1s = np.zeros(n, dtype=np.float64)
     a2s = np.zeros(n, dtype=np.float64)
     a3s = np.zeros(n, dtype=np.float64)
@@ -244,9 +243,6 @@ def _orbits_to_dict(orbits: AnyOrbits) -> dict[str, list[Any] | np.ndarray]:
     ng_ns = np.zeros(n, dtype=np.float64)
     ng_ks = np.zeros(n, dtype=np.float64)
     non_grav_dts = np.full(n, np.nan, dtype=np.float64)  # NaN = no thermal-lag delay
-    non_grav_dt_variances = np.full(n, np.nan, dtype=np.float64)  # NaN/<=0 = no DT prior
-    has_non_grav_cov = np.zeros(n, dtype=bool)
-    non_grav_cov = np.zeros((n, 3, 3), dtype=np.float64)
     if orbits.non_grav is not None:
         ng = orbits.non_grav
 
@@ -260,15 +256,6 @@ def _orbits_to_dict(orbits: AnyOrbits) -> dict[str, list[Any] | np.ndarray]:
         ng_alphas, ng_r0s = _col("alpha"), _col("r0")
         ng_ms, ng_ns, ng_ks = _col("m"), _col("n"), _col("k")
         non_grav_dts = np.asarray(ng.dt.to_numpy(zero_copy_only=False), dtype=np.float64)
-        # DT prior variance (opens the DT column in a StateAndNonGravAndDT
-        # solve). Mirror ng.dt exactly: nulls come back as NaN = no prior.
-        non_grav_dt_variances = np.asarray(
-            ng.dt_variance.to_numpy(zero_copy_only=False), dtype=np.float64
-        )
-        for i, c in enumerate(ng.covariance.to_pylist()):
-            if c is not None:
-                non_grav_cov[i] = np.asarray(c, dtype=np.float64).reshape(3, 3)
-                has_non_grav_cov[i] = True
 
     return {
         "orbit_ids": orbit_ids,
@@ -289,18 +276,14 @@ def _orbits_to_dict(orbits: AnyOrbits) -> dict[str, list[Any] | np.ndarray]:
         "ng_ns": ng_ns,
         "ng_ks": ng_ks,
         "non_grav_dts": non_grav_dts,
-        "non_grav_dt_variances": non_grav_dt_variances,
         "has_srp": has_srp,
         "srp_amrat": srp_amrat,
         "srp_cr": srp_cr,
-        "srp_amrat_variance": srp_amrat_variance,
-        "has_non_grav_cov": has_non_grav_cov,
-        "non_grav_cov": non_grav_cov,
-        # The joint's off-diagonal terms, when the seed orbit carries
-        # them — so a fitted orbit re-fed into evaluate / refine is
-        # conditioned on the joint its fit produced rather than on the
-        # diagonal blocks of it. No keys at all when it carries none.
-        **extract_joint(orbits),
+        # The seed orbit's packed joint, when it carries one — so a fitted
+        # orbit re-fed into evaluate / refine is conditioned on the joint
+        # its fit produced rather than on the state block alone. No key
+        # when it carries none.
+        "covariance": extract_joint_wire(orbits),
     }
 
 
@@ -461,13 +444,10 @@ def _build_cartesian_orbits_single(result: ResultDict, prefix: str = "") -> Cart
     frame = int_to_frame(int(result[f"{p}frame"]))
     origin = naif_to_origin(int(result[f"{p}origin"]))
 
-    cov_flat = result.get(f"{p}covariance")
-    if cov_flat is not None:
-        cov_matrix = np.asarray(cov_flat).reshape(1, 6, 6)
-        cov = CartesianCovariance.from_matrix(cov_matrix)
-    else:
-        cov = None
-
+    # The fitted covariance is the one packed joint (attached to the orbit
+    # below via `joint_from_result`); the coordinates carry no separate flat
+    # copy — the state 6×6 is the joint's derived leading block, read through
+    # `orbit.covariance`. `{p}covariance` is the joint wire, not a flat matrix.
     coord_kwargs: dict[str, KwargValue] = {
         "epoch": epoch,
         "x": x,
@@ -479,8 +459,6 @@ def _build_cartesian_orbits_single(result: ResultDict, prefix: str = "") -> Cart
         "frame": frame.value if hasattr(frame, "value") else frame,
         "origin": [origin],
     }
-    if cov is not None:
-        coord_kwargs["covariance"] = cov
 
     cart_coords = CartesianCoordinates.from_kwargs(
         validate=True, permit_nulls=False, **coord_kwargs
@@ -496,14 +474,13 @@ def _build_cartesian_orbits_single(result: ResultDict, prefix: str = "") -> Cart
         "coordinates": cart_coords,
     }
 
-    # The fit's joint — the off-diagonal blocks of the same matrix whose
-    # state block is the 6x6 above. Read before the non-grav block below
-    # because the border rides that sub-table, and a fit can produce a
-    # border with zero A coefficients (a solved Marsden block whose
-    # coefficients came out at zero is still a solved block).
-    border, wide = joint_columns_from_result(result, 1, prefix=p)
-    if wide is not None:
-        orbits_kwargs["wide_cross"] = wide
+    # The fit's packed joint — the single covariance home, carrying the
+    # whole (6+P)x(6+P) matrix whose leading block is the 6x6 above. The
+    # DT / AMRAT / non-grav priors all ride it, so a fitted orbit re-feeds
+    # into evaluate / refine conditioned on the joint its fit produced.
+    joint = joint_from_result(result, prefix=p)
+    if joint is not None:
+        orbits_kwargs["covariance"] = joint
 
     # Fitted **absolute** non-grav, so the returned orbit is re-feedable
     # into propagate / evaluate / refine / compute_b_planes without silently
@@ -523,10 +500,6 @@ def _build_cartesian_orbits_single(result: ResultDict, prefix: str = "") -> Cart
         is_inverse_square = alpha == 0.0 and r0 == 0.0 and m == 0.0 and n_exp == 0.0 and k == 0.0
         model = "inverse_square" if is_inverse_square else "marsden_sekanina"
         dt = result.get(f"{p}non_grav_dt")
-        # Fitted non-grav 3×3 covariance (row-major flat, 9), present only for
-        # StateAndNonGrav fits. Carried so the orbit re-feeds into a
-        # StateAndNonGrav refine without losing its prior.
-        ng_cov = result.get(f"{p}non_grav_cov")
         orbits_kwargs["non_grav"] = NonGravParams.from_kwargs(
             a1=[a1],
             a2=[result[f"{p}a2"]],
@@ -538,32 +511,19 @@ def _build_cartesian_orbits_single(result: ResultDict, prefix: str = "") -> Cart
             n=[n_exp],
             k=[k],
             dt=[dt],
-            covariance=[list(ng_cov) if ng_cov is not None else None],
-            # The other half of the matrix whose diagonal block is
-            # `covariance` beside it, in the fitted covariance's own
-            # basis and units.
-            non_grav_cross=border if border is not None else [None],
         )
-    elif border is not None:
-        # A border with no A coefficients to report: the Marsden block
-        # was solved and came out at zero, or the fit carried the block
-        # as a prior. The border still belongs on the orbit — dropping it
-        # would hand the next leg half a joint.
-        orbits_kwargs["non_grav"] = non_grav_border_only(border)
 
-    # Fitted / carried SRP slot — absolute AMRAT + fixed Cr, and the fitted
-    # AMRAT posterior variance when AMRAT was solved. Independent of the
-    # Marsden non-grav above (a State+AMRAT fit has no A1/A2/A3), so a solved
-    # AMRAT orbit re-feeds its SRP slot into propagate / refine.
+    # Fitted / carried SRP slot — absolute AMRAT + fixed Cr. Independent of
+    # the Marsden non-grav above (a State+AMRAT fit has no A1/A2/A3), so a
+    # solved AMRAT orbit re-feeds its SRP slot into propagate / refine; the
+    # AMRAT prior rides the packed joint.
     srp_amrat = result.get(f"{p}srp_amrat")
     if srp_amrat is not None:
         from empyrean.orbits.srp import SRPParams
 
-        srp_variance = result.get(f"{p}srp_amrat_variance")
         orbits_kwargs["srp"] = SRPParams.from_kwargs(
             amrat=[srp_amrat],
             cr=[result[f"{p}srp_cr"]],
-            amrat_variance=[srp_variance],
         )
 
     return CartesianOrbits.from_kwargs(validate=True, permit_nulls=False, **orbits_kwargs)

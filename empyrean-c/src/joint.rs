@@ -1,1275 +1,637 @@
-//! The joint solved-parameter covariance at the C ABI — identity-tagged
-//! cross terms in, posterior cross terms out.
+//! An orbit's full solved-parameter covariance as ONE self-describing
+//! packed joint at the C ABI — the single covariance home, input and
+//! output, at every width.
 //!
-//! # What crosses here, and what does not
+//! A fitted or propagated orbit's uncertainty is one \\((6+P) \times (6+P)\\)
+//! matrix over the state and every solved parameter (the Marsden
+//! non-gravitational coefficients, the non-grav time delay, the SRP
+//! area-to-mass ratio, and each thrust \\(\Delta v\\) segment). Rather than
+//! scatter that matrix across diagonal-block and cross-term carriers — where
+//! a caller who chained one leg into the next necessarily handed the engine a
+//! block-diagonal covariance, a physically unmotivated claim that the state
+//! and the parameters are independent — the whole joint travels as one
+//! [`EmpyreanPackedJoint`]: three axis bitsets, the packed lower triangle, and
+//! the tags that name what the joint describes.
 //!
-//! A fitted orbit's uncertainty is one \\((6+P) \times (6+P)\\) matrix over
-//! the state and every solved parameter. Until this module the C ABI could
-//! carry only its diagonal blocks — the \\(6 \times 6\\) state covariance,
-//! the Marsden \\(3 \times 3\\), a DT variance, an AMRAT variance, a
-//! per-segment thrust \\(3 \times 3\\) — so a caller who fitted an orbit and
-//! re-propagated it handed the engine a block-diagonal covariance and the
-//! engine could not tell. The correlations are not a refinement on top of
-//! the variances; they are what makes the joint the matrix the fit actually
-//! computed.
+//! The same struct is the input orbit's covariance and every result's
+//! covariance, with the same field names and the same ownership split
+//! (caller-owned on input, library-owned on a result), so leg chaining is
+//! uniform: whatever produced the state, its joint is read the same way and
+//! re-fed the same way.
 //!
-//! The joint is supplied in **four non-overlapping homes**, and one entry
-//! belongs to exactly one of them:
-//!
-//! | Block | Home |
-//! |---|---|
-//! | state ↔ state | [`CoordinateState::covariance`](crate::CoordinateState::covariance) |
-//! | \\(A_i \leftrightarrow A_j\\) | [`EmpyreanOrbit::non_grav_covariance`](crate::propagate::EmpyreanOrbit::non_grav_covariance) |
-//! | state ↔ \\(A_i\\) | [`CoordinateState::non_grav_cross`](crate::CoordinateState::non_grav_cross) |
-//! | \\(\Delta v_i \leftrightarrow \Delta v_j\\), same segment | `EmpyreanOrbit::correction_covariances[i]` |
-//! | everything else | [`EmpyreanStateParamCross`] / [`EmpyreanParamPairCross`] |
-//!
-//! "Everything else" is state↔DT, state↔AMRAT, state↔\\(\Delta v\\), and
-//! every mixed pair (DT↔\\(A_2\\), \\(A_1\\)↔AMRAT, AMRAT↔\\(\Delta v\\),
-//! segment \\(i\\)↔segment \\(j\\)). The engine refuses a term with two
-//! homes rather than merging or preferring one, so mirroring the partition
-//! in the ABI's *shape* is what makes the common mistake unrepresentable
-//! instead of merely refused.
-//!
-//! # Why the entries carry an identity and not a column index
-//!
-//! Which wide column a parameter occupies depends on which *other*
-//! parameters the orbit declares: adding an SRP AMRAT to an orbit shifts
-//! the thrust columns by one. A slot index recorded at one call site is
-//! therefore wrong at the next, and the failure is silent — every number
-//! finite, every gate passed, the fitted state↔AMRAT correlation attached
-//! to \\(A_1\\). [`EmpyreanParamColumn`] names the parameter itself, and
-//! the engine resolves the placement at assembly time.
-//!
-//! One consequence worth stating: because the tag is an identity, **the
-//! entry order of the cross arrays is not contract**. Callers may emit in
-//! any order.
-//!
-//! # A thrust `segment` is a DECLARED index, not a solved one
-//!
-//! `EmpyreanParamColumn::segment` indexes
-//! `EmpyreanOrbit::correction_covariances` — the segments the orbit
-//! **declares** — because that is the space the engine derives its
-//! thrust columns in when the orbit is re-fed. Tagging with the solved
-//! index instead would place a burn's cross terms on a different burn's
-//! column the moment any segment is considered or fixed, which after
-//! the tri-state is a routine case rather than an exotic one.
-//!
-//! Stated here explicitly because the engine enum this mirrors
-//! (`ParamColumn::Thrust`) documents its own `segment` as "which solved
-//! correction segment", which is stale: the estimator that populates
-//! these carriers tags them by declared index, and the layout resolves
-//! them by declared index. The C contract follows the code, not that
-//! doc string. Reported upstream.
-//!
-//! # Units
-//!
-//! The state-side rows of every cross column are in the coordinate's own
-//! element order, representation, frame **and angular unit** — the same
-//! basis as the \\(6 \times 6\\) they border. For a Cometary orbit that
-//! means the three angular rows are in DEGREES, matching
-//! [`CoordinateState::covariance`](crate::CoordinateState::covariance)
-//! exactly. [`push_orbit_with_joint`] converts the coordinate and its
-//! carrier in one step through the engine's unit-aware entry point, so
-//! there is no window in which a half-converted pair exists.
+//! [`c_to_orbit_uncertainty`] builds an engine
+//! [`OrbitUncertainty`](empyrean_core::propagation::OrbitUncertainty) from the
+//! wire through the facade, and [`orbit_uncertainty_to_c`] marshals one back
+//! out. The triangle is in the engine's radian basis on both sides, so a
+//! joint round-trips unchanged.
 
-use empyrean_core::coordinates::{AU, Coordinates, Degrees, ExtendedCovariance};
+use empyrean_core::coordinates::{AU, Cartesian, CoordinateRepresentation, Coordinates, Degrees};
 use empyrean_core::orbits::Orbits;
-use empyrean_core::propagation::{ParamColumn, WideCross};
+use empyrean_core::propagation::{Basis, OrbitUncertainty, Uncertainty};
+use empyrean_core::uncertainty::UncertaintyWireError;
 
 use crate::propagate::EmpyreanOrbit;
 
-// ── Parameter-column identity ─────────────────────────────────────
-// Mirrors `empyrean_core::propagation::ParamColumn` one-for-one.
+// ── Packed-joint input-refusal FFI codes ────────────────────────────
+//
+// Every boundary that turns a caller-supplied packed joint into an engine
+// `OrbitUncertainty` — a direct propagate / OD / ephemeris / impact push AND
+// the orbit file-write path (`empyrean_orbits_write_parquet` / `_write_csv`,
+// which convert C rows to engine orbits first) — refuses a malformed wire row
+// by the SAME per-variant code, never a single code with the detail only in
+// the message. The ten codes are the reserved block −40…−49, one per
+// `empyrean_core::uncertainty::UncertaintyWireError` variant.
 
-/// Marsden non-gravitational coefficient \\(A_{i+1}\\); `index` selects
-/// which of \\(A_1, A_2, A_3\\).
-pub const EMPYREAN_PARAM_COLUMN_MARSDEN: i32 = 0;
-/// The Marsden non-grav time delay \\(\Delta T\\).
-pub const EMPYREAN_PARAM_COLUMN_DT: i32 = 1;
-/// The SRP area-to-mass ratio.
-pub const EMPYREAN_PARAM_COLUMN_AMRAT: i32 = 2;
-/// One component of one thrust \\(\Delta v\\) correction segment;
-/// `segment` and `component` select which.
-pub const EMPYREAN_PARAM_COLUMN_THRUST: i32 = 3;
+/// Packed joint refused: the three axis bitsets break an `AxisLayout` invariant.
+pub const EMPYREAN_PUSH_LAYOUT_INVALID: i32 = -40;
+/// Packed joint refused: the triangle length disagrees with the declared width.
+pub const EMPYREAN_PUSH_TRIANGLE_LENGTH: i32 = -41;
+/// Packed joint refused: the declared width disagrees with the layout's width.
+pub const EMPYREAN_PUSH_WIDTH_MISMATCH: i32 = -42;
+/// Packed joint refused: an unrecognized `functional` wire discriminant.
+pub const EMPYREAN_PUSH_UNKNOWN_FUNCTIONAL: i32 = -43;
+/// Packed joint refused: an unrecognized `provenance` wire discriminant.
+pub const EMPYREAN_PUSH_UNKNOWN_PROVENANCE: i32 = -44;
+/// Packed joint refused: a retired / reserved wire discriminant in a validated column.
+pub const EMPYREAN_PUSH_RETIRED_DISCRIMINANT: i32 = -45;
+/// Packed joint refused: the covariance basis epoch and the row epoch disagree.
+pub const EMPYREAN_PUSH_EPOCH_MISMATCH: i32 = -46;
+/// Packed joint refused: the engine rejected the assembled joint (loud catch-all).
+pub const EMPYREAN_PUSH_ENGINE_REFUSED: i32 = -47;
+/// Packed joint refused: a live non-linear `kind` an input prior cannot transport.
+pub const EMPYREAN_PUSH_UNSUPPORTED_INPUT_KIND: i32 = -48;
+/// Packed joint refused: an unrecognized `asserted_source` companion discriminant.
+pub const EMPYREAN_PUSH_UNKNOWN_ASSERTED_SOURCE: i32 = -49;
 
-/// The identity of one solved-parameter column, independent of the wide
-/// slot it happens to occupy on any particular orbit.
-///
-/// The fields a given `kind` does not read must be **zero**. A non-zero
-/// value there is refused rather than ignored, so a caller who sets
-/// `segment` on a `DT` column learns immediately instead of silently
-/// getting a different column than they named.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub struct EmpyreanParamColumn {
-    /// One of the `EMPYREAN_PARAM_COLUMN_*` tags. Any other value is a
-    /// loud argument error.
-    pub kind: i32,
-    /// MARSDEN: 0, 1 or 2, selecting \\(A_1\\), \\(A_2\\) or \\(A_3\\).
-    /// Must be 0 for every other kind.
-    pub index: u32,
-    /// THRUST: index into `EmpyreanOrbit::correction_covariances`. Must
-    /// be 0 for every other kind.
-    pub segment: u32,
-    /// THRUST: 0, 1 or 2, selecting x, y or z of that segment's
-    /// \\(\Delta v\\). Must be 0 for every other kind.
-    pub component: u32,
+/// Map a [`UncertaintyWireError`] variant to its reserved FFI code (−40…−49).
+/// The match is exhaustive: a new engine variant is a compile error here
+/// rather than a silent fall-through to one code.
+pub(crate) fn uncertainty_wire_error_code(e: &UncertaintyWireError) -> i32 {
+    match e {
+        UncertaintyWireError::LayoutInvalid { .. } => EMPYREAN_PUSH_LAYOUT_INVALID,
+        UncertaintyWireError::TriangleLength { .. } => EMPYREAN_PUSH_TRIANGLE_LENGTH,
+        UncertaintyWireError::WidthMismatch { .. } => EMPYREAN_PUSH_WIDTH_MISMATCH,
+        UncertaintyWireError::UnknownFunctional { .. } => EMPYREAN_PUSH_UNKNOWN_FUNCTIONAL,
+        UncertaintyWireError::UnknownProvenance { .. } => EMPYREAN_PUSH_UNKNOWN_PROVENANCE,
+        UncertaintyWireError::RetiredDiscriminant { .. } => EMPYREAN_PUSH_RETIRED_DISCRIMINANT,
+        UncertaintyWireError::EpochMismatch { .. } => EMPYREAN_PUSH_EPOCH_MISMATCH,
+        UncertaintyWireError::EngineRefused { .. } => EMPYREAN_PUSH_ENGINE_REFUSED,
+        UncertaintyWireError::UnsupportedInputKind { .. } => EMPYREAN_PUSH_UNSUPPORTED_INPUT_KIND,
+        UncertaintyWireError::UnknownAssertedSource { .. } => EMPYREAN_PUSH_UNKNOWN_ASSERTED_SOURCE,
+    }
 }
 
-/// One state-to-parameter cross column: the 6-vector of covariances
-/// between the six state elements and one solved parameter.
-///
-/// Rows are in the coordinate's own element order, representation, frame
-/// and angular unit — the same basis AND THE SAME UNITS as the
-/// \\(6 \times 6\\) in `state.covariance` that this borders. Cartesian:
-/// \\((x, y, z, v_x, v_y, v_z)\\) in AU and AU/day. Cometary:
-/// \\((q, e, i, \Omega, \omega, t_p)\\) with the three angular rows in
-/// DEGREES. Supplying radians here and degrees there is a silent factor
-/// of \\(180/\pi\\) on those rows.
-///
-/// The engine rotates these with the state when the orbit is transformed.
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct EmpyreanStateParamCross {
-    /// Which parameter this column covaries the state with.
-    pub column: EmpyreanParamColumn,
-    /// \\(\mathrm{Cov}(\text{element } r, \text{parameter})\\), \\(r\\) in
-    /// \\(0..6\\).
-    pub values: [f64; 6],
+/// Wire discriminants for the tagged side columns of [`EmpyreanPackedJoint`]
+/// — `quality`, `functional` and `provenance`. These are the C ABI contract:
+/// documented in `include/empyrean.h` and read by C consumers of a result's
+/// packed joint to interpret its tags, not by this crate's own Rust code
+/// (which writes them straight from the engine's `wire_discriminant()`). The
+/// module-level `allow(dead_code)` marks the whole set as the C contract
+/// rather than tagging each constant; the values are pinned against the
+/// engine's `Quality` / `Functional` / `Provenance` encodings in
+/// `contract_tests::wire_discriminant_consts_are_stable`.
+pub(crate) mod wire_tags {
+    #![allow(dead_code)]
+
+    // ── EmpyreanPackedJoint.quality — engine `Quality::wire_discriminant` ──
+    /// All correlation-space eigenvalues positive; `cov_min_eig_corr` is NaN.
+    pub const EMPYREAN_JOINT_QUALITY_POSITIVE_DEFINITE: u8 = 0;
+    /// Exact zero variance on named axes; read `cov_rank` / `cov_null_axes`.
+    pub const EMPYREAN_JOINT_QUALITY_POSITIVE_SEMIDEFINITE: u8 = 1;
+    /// Minimum correlation-space eigenvalue below tolerance; `cov_min_eig_corr`
+    /// carries that (negative) eigenvalue.
+    pub const EMPYREAN_JOINT_QUALITY_INDEFINITE: u8 = 2;
+    /// Explicitly repaired to PSD; `cov_min_eig_corr` is the pre-repair minimum.
+    pub const EMPYREAN_JOINT_QUALITY_REPAIRED: u8 = 3;
+
+    // ── EmpyreanPackedJoint.functional — engine `Functional::wire_discriminant` ──
+    /// The second moment of the state axes.
+    pub const EMPYREAN_JOINT_FUNCTIONAL_STATE: u8 = 0;
+    /// Reception-epoch sky coordinates.
+    pub const EMPYREAN_JOINT_FUNCTIONAL_SKY: u8 = 1;
+    /// Delay / Doppler observables.
+    pub const EMPYREAN_JOINT_FUNCTIONAL_DELAY_DOPPLER: u8 = 2;
+
+    // ── EmpyreanPackedJoint.provenance — engine `Provenance::wire_discriminant` ──
+    /// Derived by this engine.
+    pub const EMPYREAN_JOINT_PROVENANCE_DERIVED: u8 = 0;
+    /// Asserted by an external source at ingestion.
+    pub const EMPYREAN_JOINT_PROVENANCE_ASSERTED: u8 = 1;
+
+    // ── EmpyreanPackedJoint.asserted_source — engine `AssertedSource::wire_discriminant` ──
+    //
+    // The external source that asserted the moment, meaningful ONLY when
+    // `provenance == EMPYREAN_JOINT_PROVENANCE_ASSERTED`. The two source values
+    // pin the engine's `AssertedSource` encoding (not core-re-exported, so
+    // pinned by their append-only value against villeneuve `packed_joint.rs`);
+    // a derived joint carries `_NONE`, the ABI's not-available sentinel chosen
+    // above every append-only engine discriminant so it never collides with a
+    // future source.
+    /// An orbit asserted from the JPL Small-Body Database.
+    pub const EMPYREAN_JOINT_ASSERTED_SOURCE_SBDB: u8 = 0;
+    /// An orbit asserted from another external tool / file.
+    pub const EMPYREAN_JOINT_ASSERTED_SOURCE_EXTERNAL_FILE: u8 = 1;
+    /// No asserted source — the value `asserted_source` carries on any joint
+    /// whose `provenance` is not `ASSERTED`.
+    pub const EMPYREAN_JOINT_ASSERTED_SOURCE_NONE: u8 = 255;
 }
 
-/// One parameter-to-parameter cross term.
+/// A C-ABI error carrying an optional specific return code.
 ///
-/// Symmetric: \\((a, b)\\) and \\((b, a)\\) are the same entry, and
-/// supplying both is a loud error rather than a merge or a
-/// last-one-wins.
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct EmpyreanParamPairCross {
-    /// One end of the pair.
-    pub a: EmpyreanParamColumn,
-    /// The other end. Must not name the same parameter as `a`.
-    pub b: EmpyreanParamColumn,
-    /// \\(\mathrm{Cov}(a, b)\\).
-    pub value: f64,
+/// `code: Some(c)` pins the code a boundary must return — a per-variant
+/// packed-joint refusal (−40…−49) reaches every push boundary this way, so a
+/// malformed wire row refused at a file writer returns the same code it would
+/// at a direct push. `code: None` is an ordinary error that takes the
+/// boundary's own default code (its message still names what failed). One
+/// mapping, shared by every push caller, its extern wrapper and both orbit
+/// writers.
+#[derive(Debug)]
+pub(crate) struct AbiError {
+    /// The specific code to return, or `None` to use the boundary default.
+    pub code: Option<i32>,
+    /// The human-readable message for `empyrean_last_error`.
+    pub message: String,
 }
 
-/// A joint cross-covariance the library HANDS BACK — the half of a
-/// covariance that is not a diagonal block.
+impl AbiError {
+    /// An error that pins a specific return code.
+    pub(crate) fn coded(code: i32, message: String) -> Self {
+        Self {
+            code: Some(code),
+            message,
+        }
+    }
+
+    /// Prepend a context prefix to the message, keeping the code.
+    pub(crate) fn prefixed(mut self, ctx: &str) -> Self {
+        self.message = format!("{ctx}: {}", self.message);
+        self
+    }
+}
+
+impl From<String> for AbiError {
+    fn from(message: String) -> Self {
+        Self {
+            code: None,
+            message,
+        }
+    }
+}
+
+impl std::fmt::Display for AbiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// An orbit's full uncertainty as ONE self-describing packed joint — the
+/// single covariance home at the C ABI, input and output, at every width.
 ///
-/// # Why this exists as output at all
+/// # The axis table
 ///
-/// A propagated or fitted state's uncertainty is one
-/// \\((6+P) \times (6+P)\\) matrix. Until this struct the C ABI reported
-/// only its diagonal blocks, so a caller chaining one leg into the next
-/// necessarily handed the engine a block-diagonal covariance — a
-/// physically unmotivated claim that the state and \\(A_2\\) are
-/// independent, when a single fit or a single propagation produced both.
-/// The engine's own propagated border is non-zero **even from a
-/// block-diagonal input**, because propagation itself generates the
-/// correlation: that is precisely why a second leg must not be handed a
-/// block-diagonal covariance.
+/// The three `layout_*` bitsets index the canonical parameter-axis table
+/// (bit → axis):
 ///
-/// # One shape, two producers
+/// | bits | axis |
+/// |---|---|
+/// | 0, 1, 2 | Marsden \\(A_1, A_2, A_3\\) |
+/// | 3 | non-grav time delay \\(\Delta T\\) (only alongside Marsden) |
+/// | 4 | SRP area-to-mass ratio |
+/// | 5 + 3·s + c | thrust segment `s`, \\(\Delta v\\) component `c` (x/y/z) |
 ///
-/// [`EmpyreanODResult::orbit`](crate::od::EmpyreanODResult::orbit) and
-/// every row of a propagation result carry this same struct, with the
-/// same field names and the same ownership. That is what makes leg
-/// chaining uniform: whatever produced the state, its joint is read the
-/// same way and re-fed the same way.
+/// `layout_present` are the axes with a column; `layout_considered` is a
+/// subset of `present`; `layout_marginalized` is disjoint from `present`.
+/// The joint width is `6 + popcount(layout_present)`.
 ///
-/// Each block is read off the object the engine already made coherent —
-/// the fitted orbit, or the propagated state row — never re-derived from
-/// a slot-tagged matrix. That matters: a slot-tagged covariance indexes
-/// the *solved* layout, while a re-fed orbit's layout is derived from
-/// what it *declares*, and the two disagree whenever the fit did not
-/// solve every axis the orbit declares. Copying columns between them
-/// would attach one parameter's correlations to another with every
-/// number finite and every gate passed.
+/// A thrust segment's covariance (a burn prior) is the joint's thrust-axis
+/// block(s); there is no separate thrust-covariance carrier.
 ///
-/// # Basis
+/// `tri` is the packed LOWER triangle of the `width × width` symmetric
+/// joint, row-major with `(i, j) → i·(i+1)/2 + j` for `j ≤ i`, of
+/// `width·(width+1)/2` doubles, in the coordinate's own element space and
+/// angular unit — the SAME units as the flat
+/// [`CoordinateState::covariance`](crate::CoordinateState::covariance), so
+/// the ABI carries one unit convention, not two. The leading
+/// \\(6 \times 6\\) is the state block: position / velocity rows are AU and
+/// AU/day, the angular state rows and columns are in **degrees** for the
+/// angular representations (unscaled for Cartesian), and the parameter axes
+/// (Marsden / DT / AMRAT / thrust) are always unscaled.
 ///
-/// The state-side rows are in the same basis **and the same units** as
-/// the \\(6 \times 6\\) sitting beside this struct — Cartesian AU and
-/// AU/day on a propagated state, and the fitted result's
-/// `covariance_representation` on an OD result.
+/// | representation | angular state rows/cols (in degrees) |
+/// |---|---|
+/// | Cartesian | none |
+/// | Keplerian | \\(i, \Omega, \omega, M\\) (indices 2, 3, 4, 5) |
+/// | Cometary | \\(i, \Omega, \omega\\) (indices 2, 3, 4) |
+/// | Spherical | lon, lat, \\(\dot{\text{lon}}, \dot{\text{lat}}\\) (1, 2, 4, 5) |
 ///
-/// # Re-feeding
+/// Each boundary converts between this degree basis and the engine's radian
+/// basis by the diagonal congruence \\(D \Sigma D^\top\\) (the scale on an
+/// angular row/column, identity elsewhere): the input builder scales
+/// degrees → radians before building the prior, and the output marshaler
+/// scales radians → degrees after reading the engine triangle. A
+/// degree → engine → degree round trip therefore returns the supplied joint
+/// within a scaling band — never bit-identical across the congruence.
 ///
-/// Assign across to the input orbit field by field — the result nests
-/// what the orbit flattens:
-///
-/// ```c
-/// orbit.state.has_non_grav_cross = st->orbit_cov.has_non_grav_cross;
-/// memcpy(orbit.state.non_grav_cross,
-///        st->orbit_cov.non_grav_cross, sizeof(double) * 18);
-/// orbit.state_param_cross        = st->orbit_cov.state_param_cross;
-/// orbit.n_state_param_cross      = st->orbit_cov.n_state_param_cross;
-/// orbit.param_pair_cross         = st->orbit_cov.param_pair_cross;
-/// orbit.n_param_pair_cross       = st->orbit_cov.n_param_pair_cross;
-///
-/// // ...and the diagonal blocks those crosses are conditioned on:
-/// orbit.has_non_grav_covariance  = res->non_grav.has_covariance;
-/// memcpy(orbit.non_grav_covariance,
-///        res->non_grav.covariance, sizeof(double) * 9);
-/// orbit.non_grav_dt_variance     = res->non_grav.dt_variance;
-/// orbit.has_srp                  = res->has_srp;
-/// orbit.srp_amrat_variance       = res->srp.amrat_variance;
-/// ```
+/// The tagged side columns name what the joint describes: `kind` is the
+/// derivation (the `EMPYREAN_COVARIANCE_KIND_*` tag); `quality` the
+/// definiteness (0 = positive-definite, 1 = positive-semidefinite with
+/// `cov_rank` / `cov_null_axes`, 2 = indefinite and 3 = repaired with
+/// `cov_min_eig_corr`); `functional` which second moment the axes describe
+/// (0 = state); `provenance` whether the engine derived the moment
+/// (0 = derived) or it was asserted at ingestion; `asserted_source` which
+/// external source asserted it — an `EMPYREAN_JOINT_ASSERTED_SOURCE_*` value,
+/// meaningful ONLY when `provenance == EMPYREAN_JOINT_PROVENANCE_ASSERTED` and
+/// otherwise the documented `_NONE` (255) value. A side value that does
+/// not apply is `NaN` (floating), 0 or the `_NONE` sentinel, the ABI's
+/// not-available convention.
+/// `kind` and `quality` are read on OUTPUT only — the engine re-derives them
+/// when it ingests a prior.
 ///
 /// # Ownership
 ///
-/// The two carrier arrays are **library-owned** and released with the
-/// parent result — the opposite of the identically-named fields on
-/// [`EmpyreanOrbit`], which are caller-owned and borrowed for the call.
-/// So the pointer assignments above are valid only while the result
-/// outlives the orbit; **copy them if it does not.**
+/// On a result the library owns `tri` and releases it with the parent
+/// result (via the result's `*_free`); on an input orbit the caller owns it
+/// and it is borrowed for the call — the same split as the other carrier
+/// arrays.
 #[repr(C)]
-pub struct EmpyreanOrbitCovariance {
-    /// 1 when [`non_grav_cross`](Self::non_grav_cross) carries the
-    /// state↔Marsden border; 0 when there is none.
-    pub has_non_grav_cross: u8,
-    /// \\(6 \times 3\\) state-to-\\((A_1, A_2, A_3)\\) cross covariance,
-    /// row-major, in the same basis and units as the \\(6 \times 6\\)
-    /// beside it. Zeroed when `has_non_grav_cross = 0`.
-    pub non_grav_cross: [[f64; 3]; 6],
-    /// State-to-parameter cross columns for every parameter that is not
-    /// Marsden. Null with a zero count when there are none.
-    /// **Library-owned** — see the struct docs.
-    pub state_param_cross: *mut EmpyreanStateParamCross,
-    /// Number of entries in
-    /// [`state_param_cross`](Self::state_param_cross).
-    pub n_state_param_cross: usize,
-    /// Parameter-to-parameter cross terms with no other home. Null with
-    /// a zero count when there are none. **Library-owned** — see the
-    /// struct docs.
-    pub param_pair_cross: *mut EmpyreanParamPairCross,
-    /// Number of entries in
-    /// [`param_pair_cross`](Self::param_pair_cross).
-    pub n_param_pair_cross: usize,
+pub struct EmpyreanPackedJoint {
+    /// Axes with a column in the joint, as a bitset over the axis table.
+    pub layout_present: u32,
+    /// Considered axes — a subset of `layout_present`.
+    pub layout_considered: u32,
+    /// Axes whose identity is present but whose column is absent; disjoint
+    /// from `layout_present`.
+    pub layout_marginalized: u32,
+    /// The joint width `N = 6 + popcount(layout_present)`.
+    pub width: u8,
+    /// The packed lower triangle, `width·(width+1)/2` doubles. See the
+    /// struct docs for the index convention.
+    pub tri: *const f64,
+    /// Number of doubles in [`tri`](Self::tri).
+    pub tri_len: usize,
+    /// The derivation tag — an `EMPYREAN_COVARIANCE_KIND_*` value.
+    pub kind: u8,
+    /// The definiteness tag — an `EMPYREAN_JOINT_QUALITY_*` value (0–3); see
+    /// the struct docs.
+    pub quality: u8,
+    /// The numerical rank; read only when `quality == 1`.
+    pub cov_rank: u8,
+    /// The null-axis bitset; read only when `quality == 1`.
+    pub cov_null_axes: u32,
+    /// The minimum correlation-space eigenvalue; read only when
+    /// `quality == 2` or `3`, else `NaN`.
+    pub cov_min_eig_corr: f64,
+    /// Which second moment the axes describe — an `EMPYREAN_JOINT_FUNCTIONAL_*`
+    /// value (0 = state).
+    pub functional: u8,
+    /// Whether the moment was derived or asserted — an
+    /// `EMPYREAN_JOINT_PROVENANCE_*` value (0 = derived).
+    pub provenance: u8,
+    /// Which external source asserted the moment — an
+    /// `EMPYREAN_JOINT_ASSERTED_SOURCE_*` value. Meaningful ONLY when
+    /// `provenance == EMPYREAN_JOINT_PROVENANCE_ASSERTED`; on any other joint
+    /// it carries the `EMPYREAN_JOINT_ASSERTED_SOURCE_NONE` (255) sentinel.
+    pub asserted_source: u8,
 }
 
-/// The absent joint — no border, no carrier, nothing to free.
-///
-/// Not `Default`, deliberately: this is a value with a meaning ("the
-/// producer had no cross terms"), and every construction site states it
-/// rather than inheriting it.
-pub(crate) fn empty_orbit_covariance() -> EmpyreanOrbitCovariance {
-    EmpyreanOrbitCovariance {
-        has_non_grav_cross: 0,
-        non_grav_cross: [[0.0; 3]; 6],
-        state_param_cross: std::ptr::null_mut(),
-        n_state_param_cross: 0,
-        param_pair_cross: std::ptr::null_mut(),
-        n_param_pair_cross: 0,
+/// The absent joint — width 0, no triangle, nothing to free.
+pub(crate) fn empty_packed_joint() -> EmpyreanPackedJoint {
+    EmpyreanPackedJoint {
+        layout_present: 0,
+        layout_considered: 0,
+        layout_marginalized: 0,
+        width: 0,
+        tri: std::ptr::null(),
+        tri_len: 0,
+        kind: crate::propagate::EMPYREAN_COVARIANCE_KIND_LINEAR,
+        quality: 0,
+        cov_rank: 0,
+        cov_null_axes: 0,
+        cov_min_eig_corr: f64::NAN,
+        functional: 0,
+        provenance: 0,
+        asserted_source: wire_tags::EMPYREAN_JOINT_ASSERTED_SOURCE_NONE,
     }
 }
 
-/// Marshal an engine border + carrier pair into the owned C shape, or
-/// **fail**.
+/// Apply the diagonal congruence \\(D \Sigma D^\top\\) to a packed lower
+/// triangle in place: entry \\((i, j)\\) is multiplied by \\(D_i D_j\\),
+/// where \\(D_k = \text{factor}\\) on an angular state row `k` (`k` in
+/// `angular`, all `< 6`) and \\(1\\) elsewhere — so position / velocity rows
+/// and every parameter axis are left untouched.
 ///
-/// The single producer for both output surfaces — the OD result and
-/// every propagated state row — so the two cannot drift in what they
-/// emit or in how it is owned.
-///
-/// # Allocation failure is a failure, not an absence
-///
-/// `Err` on a failed allocation, never a null-and-zero carrier. Absence
-/// and unavailability are different claims at this boundary: a caller
-/// reading `n_state_param_cross == 0` concludes *this fit produced no
-/// cross terms* and re-feeds a block-diagonal joint, which is exactly
-/// the physically unmotivated claim this whole surface exists to stop
-/// them making. Reporting a delivered result whose carrier silently
-/// vanished would be a hidden fallback in the feature built to remove
-/// them. The caller sees the failure code and the message names the
-/// allocation.
-pub(crate) fn joint_to_c(
-    ext: Option<&ExtendedCovariance>,
-    cross: Option<&WideCross>,
-    what: &str,
-) -> Result<EmpyreanOrbitCovariance, String> {
-    let (has_non_grav_cross, non_grav_cross) = border_to_c(ext);
-    let (state_param_cross, n_state_param_cross, param_pair_cross, n_param_pair_cross) = match cross
-    {
-        Some(wc) => crate::io::carrier_to_owned_arrays(wc).ok_or_else(|| {
-            format!(
-                "allocation failed for the {what} wide cross-covariance arrays \
-                 ({} state column(s), {} parameter pair(s))",
-                wc.state_crosses().count(),
-                wc.param_crosses().count()
-            )
-        })?,
-        None => (std::ptr::null_mut(), 0, std::ptr::null_mut(), 0),
-    };
-    Ok(EmpyreanOrbitCovariance {
-        has_non_grav_cross,
-        non_grav_cross,
-        state_param_cross,
-        n_state_param_cross,
-        param_pair_cross,
-        n_param_pair_cross,
-    })
+/// `factor` is \\(\pi/180\\) for degrees → radians (the input boundary) and
+/// \\(180/\pi\\) for the inverse (the output boundary). An angular row and
+/// its matching column are each multiplied once, so an entry pairing two
+/// angular elements carries the factor twice — the covariance analogue of
+/// the state vector's own per-angle conversion, matching the flat
+/// `CoordinateState.covariance` scaling. Indices beyond `tri.len()` are
+/// skipped: a malformed short triangle is refused downstream by the engine,
+/// by name, not silently here.
+fn scale_tri_angular(tri: &mut [f64], angular: &[usize], factor: f64) {
+    let packed = |i: usize, j: usize| i * (i + 1) / 2 + j; // j <= i
+    for &a in angular {
+        // Row a: entries (a, j) for j <= a.
+        for j in 0..=a {
+            let idx = packed(a, j);
+            if idx < tri.len() {
+                tri[idx] *= factor;
+            }
+        }
+        // Column a: entries (i, a) for i > a, to the triangle's extent.
+        let mut i = a + 1;
+        loop {
+            let idx = packed(i, a);
+            if idx >= tri.len() {
+                break;
+            }
+            tri[idx] *= factor;
+            i += 1;
+        }
+        // Diagonal (a, a): an angular variance, so \\(D_a D_a = \text{factor}^2\\).
+        // The row loop applied `factor` once and the column loop starts past
+        // it, so apply the second factor here — matching the flat path's dense
+        // `scale_angular_covariance` (which multiplies the whole row AND the
+        // whole column, hitting the diagonal twice). Without this the angular
+        // variance is off by `factor` and a re-fed joint disagrees with the
+        // flat state block it was derived from (the −1 refusal).
+        let d = packed(a, a);
+        if d < tri.len() {
+            tri[d] *= factor;
+        }
+    }
 }
 
-/// Release the owned carrier arrays hanging off one
-/// [`EmpyreanOrbitCovariance`] and leave it absent.
+/// The packed lower triangle of an [`OrbitUncertainty`], regardless of
+/// representation — the wire form read straight off the joint.
+fn orbit_uncertainty_tri(ou: &OrbitUncertainty<AU>) -> &[f64] {
+    use empyrean_core::propagation::OrbitUncertainty as OU;
+    match ou {
+        OU::Cartesian(u) => u.joint().tri(),
+        OU::Keplerian(u) => u.joint().tri(),
+        OU::Cometary(u) => u.joint().tri(),
+        OU::Spherical(u) => u.joint().tri(),
+    }
+}
+
+/// Marshal an engine [`OrbitUncertainty`] into the owned C packed-joint
+/// struct: the layout bitsets, the packed lower triangle (library-owned),
+/// and the tags read straight off the joint — nothing recomputed.
 ///
-/// Idempotent: a second call on the same struct is a no-op, because the
-/// pointers are nulled and the counts zeroed here.
+/// The returned `tri` is heap-allocated and must be released with
+/// [`free_packed_joint`].
+pub(crate) fn orbit_uncertainty_to_c(ou: &OrbitUncertainty<AU>) -> EmpyreanPackedJoint {
+    use empyrean_core::propagation::{Provenance, Quality};
+    let (layout_present, layout_considered, layout_marginalized) = ou.layout().bits();
+    // The provenance and its asserted-source companion are read off the same
+    // engine value: an asserted moment carries its source (written straight
+    // from the engine's `AssertedSource::wire_discriminant`), a derived moment
+    // carries the `_NONE` sentinel. Nothing is defaulted — the source rides the
+    // wire so a re-fed asserted joint round-trips rather than being refused.
+    let provenance = ou.provenance();
+    let asserted_source = match provenance {
+        Provenance::Asserted { source } => source.wire_discriminant(),
+        Provenance::Derived => wire_tags::EMPYREAN_JOINT_ASSERTED_SOURCE_NONE,
+    };
+    // The wire triangle, read off the engine joint (radian basis), copied
+    // into a library-owned heap buffer and scaled back to this ABI's degree
+    // basis on the angular state rows/columns of the representation (the
+    // inverse of the input builder's congruence). The length is carried in
+    // `tri_len` so the thin pointer can be reconstructed and freed in
+    // `free_packed_joint`.
+    let mut tri_vec: Vec<f64> = orbit_uncertainty_tri(ou).to_vec();
+    scale_tri_angular(
+        &mut tri_vec,
+        ou.representation().angular_element_indices(),
+        180.0 / std::f64::consts::PI,
+    );
+    let tri_boxed: Box<[f64]> = tri_vec.into_boxed_slice();
+    let tri_len = tri_boxed.len();
+    let tri = Box::into_raw(tri_boxed) as *const f64;
+    let (quality, cov_rank, cov_null_axes, cov_min_eig_corr) = match ou.quality() {
+        Quality::PositiveDefinite => (0u8, 0u8, 0u32, f64::NAN),
+        Quality::PositiveSemidefinite { rank, null_axes } => (1, rank, null_axes, f64::NAN),
+        Quality::Indefinite { min_eig_corr } => (2, 0, 0, min_eig_corr),
+        Quality::Repaired { min_eig_corr } => (3, 0, 0, min_eig_corr),
+    };
+    EmpyreanPackedJoint {
+        layout_present,
+        layout_considered,
+        layout_marginalized,
+        width: ou.width() as u8,
+        tri,
+        tri_len,
+        kind: crate::propagate::covariance_kind_to_u8(ou.kind()),
+        quality,
+        cov_rank,
+        cov_null_axes,
+        cov_min_eig_corr,
+        functional: ou.functional().wire_discriminant(),
+        provenance: provenance.wire_discriminant(),
+        asserted_source,
+    }
+}
+
+/// Map a resolved Cartesian [`Uncertainty`] into the owned C packed joint.
+///
+/// This is the `UncertaintyQuery → OrbitUncertainty → C` step of the output
+/// path: a lazy query resolved at the row's OWN delivered kind
+/// (`UncertaintyQuery::covariance`, which builds a Linear row linearly and a
+/// SecondOrder row at second order and never downgrades), or one entry of a
+/// Cartesian covariance series, is an owned `Uncertainty<Cartesian<AU>>`.
+/// Wrapping it as the representation-erased [`OrbitUncertainty`] lets the one
+/// marshaler serialize it — the resolved state covariance is published as the
+/// single packed joint, with its kind / quality / functional / provenance tags
+/// read straight off the value. The returned `tri` is heap-allocated and must
+/// be released with [`free_packed_joint`].
+pub(crate) fn cartesian_uncertainty_to_c(unc: Uncertainty<Cartesian<AU>>) -> EmpyreanPackedJoint {
+    orbit_uncertainty_to_c(&OrbitUncertainty::Cartesian(Box::new(unc)))
+}
+
+/// Release the library-owned triangle hanging off one
+/// [`EmpyreanPackedJoint`] and leave it absent. Idempotent.
 ///
 /// # Safety
 ///
-/// The arrays must be ones [`joint_to_c`] produced and not yet freed.
-pub(crate) unsafe fn free_orbit_covariance(cov: &mut EmpyreanOrbitCovariance) {
-    unsafe {
-        crate::io::free_owned_side_array(cov.state_param_cross, cov.n_state_param_cross);
-        crate::io::free_owned_side_array(cov.param_pair_cross, cov.n_param_pair_cross);
+/// `tri` must be a buffer [`orbit_uncertainty_to_c`] produced and not yet
+/// freed, of length `tri_len`.
+pub(crate) unsafe fn free_packed_joint(joint: &mut EmpyreanPackedJoint) {
+    if !joint.tri.is_null() && joint.tri_len > 0 {
+        let slice = unsafe { std::slice::from_raw_parts_mut(joint.tri as *mut f64, joint.tri_len) };
+        drop(unsafe { Box::from_raw(slice as *mut [f64]) });
     }
-    cov.state_param_cross = std::ptr::null_mut();
-    cov.n_state_param_cross = 0;
-    cov.param_pair_cross = std::ptr::null_mut();
-    cov.n_param_pair_cross = 0;
+    joint.tri = std::ptr::null();
+    joint.tri_len = 0;
 }
 
-/// Translate a C parameter-column tag into the engine's identity.
+/// Build an engine [`OrbitUncertainty`] from one caller-supplied
+/// [`EmpyreanPackedJoint`] — the INPUT dual of [`orbit_uncertainty_to_c`].
 ///
-/// `n_segments` is the orbit's declared `n_correction_covariances`, which
-/// is what bounds a THRUST segment index — the same count
-/// `wide_layout` derives its thrust block from.
+/// The construction goes through the engine facade (the distribution
+/// depends on `empyrean-core` only, so the representation markers and the
+/// `Derivation`/`Uncertainty` constructor the direct path needs are not
+/// nameable here): the facade validates the layout bitsets, retypes the
+/// packed triangle to the orbit's representation, and seeds a
+/// [`Derivation::Linear`] prior — an input prior carries no higher-order
+/// payload, and the engine re-derives the joint's `quality`/`kind`, so those
+/// wire columns are output-only.
 ///
-/// `what` names the array and entry the tag came from, so a refusal says
-/// which of possibly dozens of entries is malformed.
-///
-/// Refuses (all argument errors, never physics):
-/// - an unknown `kind` (E1);
-/// - a MARSDEN `index` outside \\(0..3\\), a THRUST `component` outside
-///   \\(0..3\\), or a THRUST `segment` at or beyond `n_segments` (E2);
-/// - a non-zero `index` / `segment` / `component` on a kind that does not
-///   read it (E3).
-fn param_column_to_engine(
-    c: &EmpyreanParamColumn,
-    n_segments: usize,
-    what: &str,
-) -> Result<ParamColumn, String> {
-    // E3 runs per-kind below rather than as one generic sweep, because
-    // "which fields does this kind read" is exactly what the match arms
-    // already say — a second, separate statement of it would be a copy
-    // that can drift.
-    let unused = |name: &str, value: u32, kind: &str| -> String {
-        format!(
-            "{what}: {name} = {value} is set on a {kind} column, which does not read it \
-             (it must be 0). A column that names one parameter and carries another's \
-             index is refused rather than silently resolved."
-        )
-    };
-    match c.kind {
-        EMPYREAN_PARAM_COLUMN_MARSDEN => {
-            if c.index >= 3 {
-                return Err(format!(
-                    "{what}: Marsden index = {} is out of range; it selects A1/A2/A3 and \
-                     must be 0, 1 or 2",
-                    c.index
-                ));
-            }
-            if c.segment != 0 {
-                return Err(unused("segment", c.segment, "Marsden"));
-            }
-            if c.component != 0 {
-                return Err(unused("component", c.component, "Marsden"));
-            }
-            Ok(ParamColumn::Marsden(c.index as usize))
-        }
-        EMPYREAN_PARAM_COLUMN_DT => {
-            if c.index != 0 {
-                return Err(unused("index", c.index, "DT"));
-            }
-            if c.segment != 0 {
-                return Err(unused("segment", c.segment, "DT"));
-            }
-            if c.component != 0 {
-                return Err(unused("component", c.component, "DT"));
-            }
-            Ok(ParamColumn::Dt)
-        }
-        EMPYREAN_PARAM_COLUMN_AMRAT => {
-            if c.index != 0 {
-                return Err(unused("index", c.index, "AMRAT"));
-            }
-            if c.segment != 0 {
-                return Err(unused("segment", c.segment, "AMRAT"));
-            }
-            if c.component != 0 {
-                return Err(unused("component", c.component, "AMRAT"));
-            }
-            Ok(ParamColumn::Amrat)
-        }
-        EMPYREAN_PARAM_COLUMN_THRUST => {
-            if c.index != 0 {
-                return Err(unused("index", c.index, "thrust"));
-            }
-            if c.component >= 3 {
-                return Err(format!(
-                    "{what}: thrust component = {} is out of range; it selects x/y/z and \
-                     must be 0, 1 or 2",
-                    c.component
-                ));
-            }
-            if (c.segment as usize) >= n_segments {
-                return Err(format!(
-                    "{what}: thrust segment = {} but the orbit declares {n_segments} \
-                     correction covariance(s); the segment index is an index into \
-                     correction_covariances",
-                    c.segment
-                ));
-            }
-            Ok(ParamColumn::Thrust {
-                segment: c.segment as usize,
-                component: c.component as usize,
-            })
-        }
-        other => Err(format!(
-            "{what}: unknown parameter-column kind {other}; the legal tags are \
-             {EMPYREAN_PARAM_COLUMN_MARSDEN} (Marsden), {EMPYREAN_PARAM_COLUMN_DT} (DT), \
-             {EMPYREAN_PARAM_COLUMN_AMRAT} (AMRAT) and \
-             {EMPYREAN_PARAM_COLUMN_THRUST} (thrust)"
-        )),
+/// The caller's triangle is in the C degree basis (angular state rows in
+/// degrees, matching the flat `CoordinateState.covariance`); it is scaled to
+/// the engine's radian basis here by [`scale_tri_angular`] (the exact inverse
+/// of [`orbit_uncertainty_to_c`]'s rad→deg scaling), so a degree → engine →
+/// degree round trip returns the supplied joint. A layout that violates the
+/// axis-table invariants, a triangle length that disagrees with the width, or
+/// a retired / unknown `functional` / `provenance` discriminant is refused by
+/// name rather than defaulted.
+pub(crate) fn c_to_orbit_uncertainty(
+    joint: &EmpyreanPackedJoint,
+    representation: CoordinateRepresentation,
+    basis: Basis,
+) -> Result<OrbitUncertainty<AU>, AbiError> {
+    // The triangle is borrowed read-only from the caller for the call. A
+    // null pointer here means a joint was requested with no data behind it,
+    // which is a loud argument error (not a wire refusal — the facade never
+    // sees a null, it takes a slice) so it carries no pinned code and takes
+    // the boundary's default.
+    if joint.tri.is_null() {
+        return Err(AbiError::from(
+            "packed joint: tri is null but a joint of non-zero width was supplied".to_string(),
+        ));
     }
-}
-
-/// Translate the engine's identity into a C parameter-column tag.
-///
-/// The inverse of [`param_column_to_engine`], used on the result path.
-/// Every field a kind does not read is written as 0, which is what the
-/// input side requires of a caller.
-pub(crate) fn param_column_from_engine(c: ParamColumn) -> EmpyreanParamColumn {
-    match c {
-        ParamColumn::Marsden(i) => EmpyreanParamColumn {
-            kind: EMPYREAN_PARAM_COLUMN_MARSDEN,
-            index: i as u32,
-            segment: 0,
-            component: 0,
-        },
-        ParamColumn::Dt => EmpyreanParamColumn {
-            kind: EMPYREAN_PARAM_COLUMN_DT,
-            index: 0,
-            segment: 0,
-            component: 0,
-        },
-        ParamColumn::Amrat => EmpyreanParamColumn {
-            kind: EMPYREAN_PARAM_COLUMN_AMRAT,
-            index: 0,
-            segment: 0,
-            component: 0,
-        },
-        ParamColumn::Thrust { segment, component } => EmpyreanParamColumn {
-            kind: EMPYREAN_PARAM_COLUMN_THRUST,
-            index: 0,
-            segment: segment as u32,
-            component: component as u32,
-        },
-    }
-}
-
-/// Build the wide cross-covariance carrier an [`EmpyreanOrbit`] supplies,
-/// or `None` when it supplies none.
-///
-/// Both side arrays follow the established `thrust_arcs` contract: a
-/// null pointer with a non-zero count is a loud argument error, and a
-/// non-null pointer with a zero count is absent and never read.
-///
-/// Duplicate entries are **refused** rather than resolved. The engine's
-/// setters are last-write-wins, which at an ABI boundary would turn "I
-/// supplied it twice by accident" into "the engine used whichever came
-/// later" — the two-numbers-for-one-entry failure the partition
-/// discipline exists to prevent. A pair is a duplicate of its own
-/// swapped form: \\((a, b)\\) and \\((b, a)\\) are one entry.
-///
-/// Partition violations (a Marsden term in the carrier, an intra-segment
-/// thrust pair, a self-pair) are **not** screened here. They are the
-/// engine's own refusals, raised with the orbit id and the assembled
-/// layout in hand, and a second copy of the rule at this boundary would
-/// have no mechanical link to the first.
-pub(crate) fn empyrean_orbit_wide_cross(
-    orbit: &EmpyreanOrbit,
-) -> Result<Option<WideCross>, String> {
-    crate::propagate::validate_side_array_ptr(
-        orbit.state_param_cross,
-        orbit.n_state_param_cross,
-        "state_param_cross",
-    )?;
-    crate::propagate::validate_side_array_ptr(
-        orbit.param_pair_cross,
-        orbit.n_param_pair_cross,
-        "param_pair_cross",
-    )?;
-
-    if orbit.n_state_param_cross == 0 && orbit.n_param_pair_cross == 0 {
-        return Ok(None);
-    }
-
-    let n_segments = orbit.n_correction_covariances;
-    let mut wide = WideCross::new();
-
-    if orbit.n_state_param_cross > 0 {
-        let entries = unsafe {
-            std::slice::from_raw_parts(orbit.state_param_cross, orbit.n_state_param_cross)
-        };
-        let mut seen: Vec<ParamColumn> = Vec::with_capacity(entries.len());
-        for (i, e) in entries.iter().enumerate() {
-            let column =
-                param_column_to_engine(&e.column, n_segments, &format!("state_param_cross[{i}]"))?;
-            if let Some(first) = seen.iter().position(|c| *c == column) {
-                return Err(format!(
-                    "state_param_cross[{i}]: parameter {column} is already supplied at \
-                     entry {first}. Entries are identified by their column tag, so a \
-                     repeat is two values for one term rather than an ordering — supply \
-                     it once."
-                ));
-            }
-            seen.push(column);
-            wide.set_state_cross(column, e.values);
-        }
-    }
-
-    if orbit.n_param_pair_cross > 0 {
-        let entries =
-            unsafe { std::slice::from_raw_parts(orbit.param_pair_cross, orbit.n_param_pair_cross) };
-        let mut seen: Vec<(ParamColumn, ParamColumn)> = Vec::with_capacity(entries.len());
-        for (i, e) in entries.iter().enumerate() {
-            let a = param_column_to_engine(&e.a, n_segments, &format!("param_pair_cross[{i}].a"))?;
-            let b = param_column_to_engine(&e.b, n_segments, &format!("param_pair_cross[{i}].b"))?;
-            // Canonicalize so the swapped form collides with the original:
-            // (a, b) and (b, a) name one term, and supplying both is the
-            // same two-values-for-one-entry error as a literal repeat.
-            let key = if a <= b { (a, b) } else { (b, a) };
-            if let Some(first) = seen.iter().position(|k| *k == key) {
-                return Err(format!(
-                    "param_pair_cross[{i}]: the pair ({a}, {b}) is already supplied at \
-                     entry {first} (in either order — the term is symmetric). Supply it once."
-                ));
-            }
-            seen.push(key);
-            wide.set_param_cross(a, b, e.value);
-        }
-    }
-
-    Ok(Some(wide))
-}
-
-/// Build the state↔Marsden border an [`EmpyreanOrbit`] supplies, or
-/// `None` when it supplies none.
-///
-/// The C layer supplies only the `cross` half and derives `params` from
-/// `non_grav_covariance`, which is the one place this ABI deliberately
-/// subsets the engine's surface. The engine compares the two copies
-/// exactly and raises `ExtendedCovarianceParamsMismatch` when they
-/// disagree; deriving the second copy rather than asking for it makes
-/// that failure **unreachable from C by construction** and removes a
-/// two-copies-that-can-disagree hazard at the boundary. Every program
-/// expressible in C is still a program the engine accepts.
-///
-/// The other guard stays reachable, deliberately: a border supplied with
-/// `has_non_grav_covariance = 0` passes through with a zero `params`
-/// block and the engine raises
-/// `ExtendedCovarianceWithoutNonGravCovariance` from its own guard. The
-/// shell does not re-implement that check.
-pub(crate) fn empyrean_orbit_extended_covariance(
-    orbit: &EmpyreanOrbit,
-) -> Option<ExtendedCovariance> {
-    let params = if orbit.has_non_grav_covariance != 0 {
-        orbit.non_grav_covariance
+    let tri_deg = unsafe { std::slice::from_raw_parts(joint.tri, joint.tri_len) };
+    // Scale the caller's degree-basis triangle into the engine's radian
+    // basis on the angular state rows/columns of this representation (the
+    // diagonal congruence D Σ Dᵀ), leaving position/velocity and the
+    // parameter axes unscaled. The inverse of the output marshaler, so a
+    // degree → engine → degree round trip returns the supplied joint.
+    let mut tri = tri_deg.to_vec();
+    scale_tri_angular(
+        &mut tri,
+        representation.angular_element_indices(),
+        std::f64::consts::PI / 180.0,
+    );
+    // The engine facade (core's `feature/uncertainty-from-wire`, landing on
+    // the branch the local `[patch]` points at) validates the layout
+    // bitsets, cross-checks `width` against BOTH the triangle length and the
+    // layout-implied width (two distinct refusals), retypes the packed
+    // triangle to the orbit's representation, refuses a retired `kind`
+    // discriminant (the third-order 2 and the reserved 6), an unknown /
+    // retired `functional` or `provenance` discriminant, and a basis / row
+    // epoch disagreement — each BY NAME through a `UncertaintyWireError`
+    // variant — and seeds a `Derivation::Linear` prior (an input prior
+    // carries no higher-order payload; the engine re-derives quality). This
+    // is the one unresolved import until that branch lands.
+    //
+    // `asserted_source` is the provenance companion: the joint carries its
+    // asserted source in the `asserted_source` field, so when the provenance
+    // discriminant is Asserted that byte is handed to the facade as
+    // `Some(source)` (the facade refuses the `_NONE` sentinel or an unknown
+    // source as `UnknownAssertedSource`, −49, by name); on any other provenance
+    // `None` is passed and the field is ignored. Nothing is defaulted, and a
+    // re-fed asserted (SBDB / external) joint round-trips rather than being
+    // refused. `row_epoch` is the basis epoch: an input prior's covariance is
+    // stated at the coordinate's own instant, so the facade's epoch check is
+    // satisfied by construction.
+    //
+    // The variant-named message is preserved AND the `UncertaintyWireError`
+    // variant is mapped to its own FFI return code (−40…−49) via
+    // `AbiError::coded`, so the refusal reaches every push boundary — direct
+    // call and file writer alike — as that code, never collapsed to one.
+    let asserted_source = if joint.provenance == wire_tags::EMPYREAN_JOINT_PROVENANCE_ASSERTED {
+        Some(joint.asserted_source)
     } else {
-        [[0.0_f64; 3]; 3]
+        None
     };
-    border_from_c(
-        orbit.state.has_non_grav_cross,
-        &orbit.state.non_grav_cross,
-        params,
+    empyrean_core::uncertainty::orbit_uncertainty_from_wire(
+        representation,
+        joint.layout_present,
+        joint.layout_considered,
+        joint.layout_marginalized,
+        joint.width as usize,
+        &tri,
+        basis,
+        joint.kind,
+        joint.functional,
+        joint.provenance,
+        asserted_source,
+        basis.epoch,
     )
+    .map_err(|e| {
+        AbiError::coded(
+            uncertainty_wire_error_code(&e),
+            format!("packed joint refused by the engine: {e}"),
+        )
+    })
 }
 
-/// Assemble an [`ExtendedCovariance`] from the C ABI's flat border pair
-/// and a parameter block, or `None` when no border is supplied.
-///
-/// Shared by the orbit-marshaling path and
-/// [`empyrean_transform_coordinates`](crate::transform::empyrean_transform_coordinates),
-/// which carries a border through a basis change and so needs the same
-/// presence rule from a bare `CoordinateState`.
-pub(crate) fn border_from_c(
-    has_border: u8,
-    cross: &[[f64; 3]; 6],
-    params: [[f64; 3]; 3],
-) -> Option<ExtendedCovariance> {
-    if has_border == 0 {
-        return None;
+/// Do two state-block covariances (both in the engine radian basis) agree to
+/// a generous relative tolerance? Used only to catch a caller who supplied a
+/// packed joint AND a flat state covariance that contradict each other — a
+/// disagreement GATE, not a published value, so the band is wide enough that
+/// the two independent deg→rad scaling paths never trip it on float noise.
+fn state_blocks_agree(a: &[[f64; 6]; 6], b: &[[f64; 6]; 6]) -> bool {
+    for i in 0..6 {
+        for j in 0..6 {
+            let (x, y) = (a[i][j], b[i][j]);
+            if (x - y).abs() > 1e-9 * (x.abs() + y.abs()) + 1e-18 {
+                return false;
+            }
+        }
     }
-    Some(ExtendedCovariance::new(*cross, params))
+    true
 }
 
-/// Read a coordinate's border back out into the C ABI's flat pair.
+/// Append one C-ABI orbit's coordinate to an `Orbits<AU>` batch with its
+/// uncertainty in one step.
 ///
-/// The inverse of [`empyrean_orbit_extended_covariance`]'s `cross` half.
-/// Only the cross is carried: the parameter block travels as the orbit's
-/// `non_grav_covariance`, so returning it here too would be the
-/// two-homes hazard the input side is shaped to prevent.
+/// The packed joint on [`EmpyreanOrbit::covariance`] is THE one authority for
+/// the orbit's covariance (the whole \\((6+P)\\)-wide matrix). `state_cov` is
+/// the flat state-6×6 view the convert tuple carries from
+/// `CoordinateState.covariance` — for the coordinate-conversion API, not a
+/// second home.
 ///
-/// Returns `(0, zeros)` when the coordinate carries no border, which is
-/// what a caller's `memset(0)` state already means.
-pub(crate) fn border_to_c(ext: Option<&ExtendedCovariance>) -> (u8, [[f64; 3]; 6]) {
-    match ext {
-        Some(e) => (1, e.cross),
-        None => (0, [[0.0_f64; 3]; 6]),
-    }
-}
-
-/// Re-seat a coordinate's extended covariance without disturbing
-/// anything else it carries.
+/// - Packed joint present (`width > 0`): it is built into an
+///   [`OrbitUncertainty`] in the coordinate's representation and basis and
+///   attached. If a flat `state_cov` was ALSO supplied, its state block must
+///   agree with the joint's (both radian-basis here) or the caller gave
+///   contradictory input — refused BY NAME rather than silently preferring
+///   one.
+/// - Packed joint absent: the flat `state_cov` (if any) is the orbit's only
+///   uncertainty and is attached as-is; otherwise the orbit carries none.
 ///
-/// `Coordinates` holds the border as the third field of every variant,
-/// so this is a rebuild rather than a mutation — the same shape scott
-/// uses when it writes a fitted border back onto an orbit.
-pub(crate) fn coordinates_with_extended(
-    coord: Coordinates<AU, Degrees>,
-    ext: Option<ExtendedCovariance>,
-) -> Coordinates<AU, Degrees> {
-    match coord {
-        Coordinates::Cartesian(c, cov, _) => Coordinates::Cartesian(c, cov, ext),
-        Coordinates::Keplerian(c, cov, _) => Coordinates::Keplerian(c, cov, ext),
-        Coordinates::Cometary(c, cov, _) => Coordinates::Cometary(c, cov, ext),
-        Coordinates::Spherical(c, cov, _) => Coordinates::Spherical(c, cov, ext),
-    }
-}
-
-/// Append one C-ABI orbit's coordinate to an `Orbits<AU>` batch **with**
-/// its full joint covariance — the \\(6 \times 6\\), the state↔Marsden
-/// border, and the wide carrier — converted from the caller's degrees to
-/// the engine's stored radian basis in one step.
-///
-/// This is the single attach point for all five marshaling helpers. It
-/// exists as one function rather than five inline blocks for the reason
-/// the units channel makes unavoidable: the coordinate and its carrier
-/// are one matrix and must convert together. Attaching a carrier after
-/// `into_radians` borders a radian-scaled \\(6 \times 6\\) with a
-/// degree-scaled carrier — for a Cometary orbit a factor of
-/// \\(180/\pi\\) on three of six rows of every carrier column: finite,
-/// plausible, accepted by the propagation gate, and wrong by 57×. There
-/// is no API here that accepts a half-converted pair.
-///
-/// The carrier's partition discipline is not validated here; that is the
-/// engine's `WideCross::validate`, run by the propagation gate with the
-/// orbit id and the assembled layout in hand.
+/// The coordinate itself is stored in the engine's radian basis.
 pub(crate) fn push_orbit_with_joint(
     orbits: &mut Orbits<AU>,
     orbit_id: String,
     coords: Coordinates<AU, Degrees>,
+    state_cov: Option<OrbitUncertainty<AU>>,
     orbit: &EmpyreanOrbit,
-) -> Result<(), String> {
-    let ext = empyrean_orbit_extended_covariance(orbit);
-    let cross = empyrean_orbit_wide_cross(orbit)?;
+) -> Result<(), AbiError> {
+    let uncertainty = if orbit.covariance.width > 0 {
+        let basis = Basis {
+            frame: coords.frame(),
+            origin: coords.origin(),
+            epoch: coords.time().mjd_tdb(),
+        };
+        let joint_ou = c_to_orbit_uncertainty(&orbit.covariance, coords.representation(), basis)?;
+        if let Some(flat) = state_cov.as_ref()
+            && !state_blocks_agree(&joint_ou.state_block(), &flat.state_block())
+        {
+            return Err(AbiError::from(
+                "orbit covariance: the packed joint and the flat state covariance disagree \
+                 on the state block"
+                    .to_string(),
+            ));
+        }
+        Some(joint_ou)
+    } else {
+        state_cov
+    };
     orbits
-        .push_angular(orbit_id, coordinates_with_extended(coords, ext), cross)
-        .map_err(|e| e.to_string())
-}
-
-/// The joint-covariance input surface: the identity tags, the four
-/// argument-error classes, the zero-init contract, and the units channel.
-///
-/// These pin the boundary's own behaviour. The engine's refusals
-/// (partition violations, definiteness, a cross for an undeclared
-/// parameter) are deliberately NOT re-implemented here and are not
-/// tested here either — they are tested where they live, and a second
-/// copy at this boundary would have no mechanical link to the first.
-#[cfg(test)]
-mod joint_input_tests {
-    use super::*;
-    use empyrean_core::coordinates::{CoordinateRepresentation, Degrees};
-
-    fn column(kind: i32) -> EmpyreanParamColumn {
-        EmpyreanParamColumn {
-            kind,
-            index: 0,
-            segment: 0,
-            component: 0,
-        }
-    }
-
-    fn marsden(i: u32) -> EmpyreanParamColumn {
-        EmpyreanParamColumn {
-            kind: EMPYREAN_PARAM_COLUMN_MARSDEN,
-            index: i,
-            segment: 0,
-            component: 0,
-        }
-    }
-
-    fn thrust(segment: u32, component: u32) -> EmpyreanParamColumn {
-        EmpyreanParamColumn {
-            kind: EMPYREAN_PARAM_COLUMN_THRUST,
-            index: 0,
-            segment,
-            component,
-        }
-    }
-
-    /// A zero-init orbit: the `memset(0)` a C caller gets for free.
-    fn zeroed_orbit() -> EmpyreanOrbit {
-        // SAFETY: `EmpyreanOrbit` is `#[repr(C)]` and every field is a
-        // scalar, an array of scalars, or a raw pointer, so the all-zero
-        // bit pattern is a valid value of the type. This is exactly the
-        // caller-side `memset(0)` whose meaning the test is pinning.
-        unsafe { std::mem::zeroed() }
-    }
-
-    /// Attach a carrier to a zero-init orbit, borrowing the caller's
-    /// backing storage exactly as the C ABI does.
-    fn with_carrier(
-        orbit: &mut EmpyreanOrbit,
-        state: &[EmpyreanStateParamCross],
-        pairs: &[EmpyreanParamPairCross],
-    ) {
-        orbit.state_param_cross = state.as_ptr();
-        orbit.n_state_param_cross = state.len();
-        orbit.param_pair_cross = pairs.as_ptr();
-        orbit.n_param_pair_cross = pairs.len();
-    }
-
-    // ── The zero-init contract ────────────────────────────────────
-
-    /// `memset(0)` means "no joint supplied", on both structs. This is
-    /// the audit as an executable assertion: every new field's zero
-    /// value is a presence switch reading absent or a null pointer, and
-    /// none has a non-zero engine default.
-    #[test]
-    fn a_zero_init_orbit_supplies_no_joint() {
-        let o = zeroed_orbit();
-        assert_eq!(o.state.has_non_grav_cross, 0, "border absent");
-        assert!(o.state_param_cross.is_null(), "carrier pointer null");
-        assert_eq!(o.n_state_param_cross, 0);
-        assert!(o.param_pair_cross.is_null());
-        assert_eq!(o.n_param_pair_cross, 0);
-
-        assert!(
-            empyrean_orbit_extended_covariance(&o).is_none(),
-            "a zero-init orbit must produce no ExtendedCovariance"
-        );
-        assert_eq!(
-            empyrean_orbit_wide_cross(&o).expect("a zero-init orbit is well-formed"),
-            None,
-            "a zero-init orbit must produce no carrier"
-        );
-    }
-
-    /// A non-null pointer with a zero count is absent and never read —
-    /// the `thrust_arcs` precedent. Pinned with a deliberately garbage
-    /// pointer so a read would fault rather than pass.
-    #[test]
-    fn a_non_null_pointer_with_zero_count_is_absent() {
-        let mut o = zeroed_orbit();
-        o.state_param_cross = std::ptr::dangling();
-        o.n_state_param_cross = 0;
-        o.param_pair_cross = std::ptr::dangling();
-        o.n_param_pair_cross = 0;
-        assert_eq!(
-            empyrean_orbit_wide_cross(&o).expect("absent, not read"),
-            None
-        );
-    }
-
-    /// The mirror rule: a non-zero count with a null pointer is a loud
-    /// argument error, not a silent empty read.
-    #[test]
-    fn a_null_pointer_with_a_non_zero_count_is_refused() {
-        for (field, set) in [("state_param_cross", 0), ("param_pair_cross", 1)] {
-            let mut o = zeroed_orbit();
-            if set == 0 {
-                o.n_state_param_cross = 2;
-            } else {
-                o.n_param_pair_cross = 2;
-            }
-            let err = empyrean_orbit_wide_cross(&o).expect_err("null + count is refused");
-            assert!(err.contains(field), "the error names the field: {err}");
-            assert!(err.contains('2'), "the error names the count: {err}");
-        }
-    }
-
-    // ── E1–E4: the four argument-error classes ────────────────────
-
-    /// E1 — an unknown `kind` is refused by value, and the message
-    /// lists the legal set rather than leaving the caller to guess.
-    #[test]
-    fn e1_an_unknown_column_kind_is_refused() {
-        for bad in [-1, 4, 99] {
-            let entries = [EmpyreanStateParamCross {
-                column: column(bad),
-                values: [1.0; 6],
-            }];
-            let mut o = zeroed_orbit();
-            with_carrier(&mut o, &entries, &[]);
-            let err = empyrean_orbit_wide_cross(&o).expect_err("unknown kind is refused");
-            assert!(
-                err.contains(&bad.to_string()),
-                "the error names the offending value: {err}"
-            );
-            assert!(
-                err.contains("state_param_cross[0]"),
-                "the error names the entry: {err}"
-            );
-            assert!(err.contains("Marsden") && err.contains("thrust"), "{err}");
-        }
-    }
-
-    /// E2 — an out-of-range Marsden index or thrust component.
-    #[test]
-    fn e2_an_out_of_range_index_or_component_is_refused() {
-        let entries = [EmpyreanStateParamCross {
-            column: marsden(3),
-            values: [1.0; 6],
-        }];
-        let mut o = zeroed_orbit();
-        with_carrier(&mut o, &entries, &[]);
-        let err = empyrean_orbit_wide_cross(&o).expect_err("A4 does not exist");
-        assert!(err.contains("A1/A2/A3"), "{err}");
-
-        let entries = [EmpyreanStateParamCross {
-            column: thrust(0, 3),
-            values: [1.0; 6],
-        }];
-        let mut o = zeroed_orbit();
-        o.n_correction_covariances = 1;
-        with_carrier(&mut o, &entries, &[]);
-        let err = empyrean_orbit_wide_cross(&o).expect_err("there is no fourth component");
-        assert!(err.contains("x/y/z"), "{err}");
-    }
-
-    /// E2 — a thrust segment beyond what the orbit declares. The bound
-    /// is `n_correction_covariances`, which is the space
-    /// `wide_layout` derives its thrust block in, and the message says
-    /// so rather than reporting a bare range.
-    #[test]
-    fn e2_a_thrust_segment_past_the_declared_count_is_refused() {
-        let entries = [EmpyreanStateParamCross {
-            column: thrust(2, 0),
-            values: [1.0; 6],
-        }];
-        let mut o = zeroed_orbit();
-        o.n_correction_covariances = 2; // segments 0 and 1 exist
-        with_carrier(&mut o, &entries, &[]);
-        let err = empyrean_orbit_wide_cross(&o).expect_err("segment 2 is not declared");
-        assert!(
-            err.contains("declares 2"),
-            "the error names the count: {err}"
-        );
-        assert!(err.contains("correction_covariances"), "{err}");
-
-        // And an orbit declaring NO segments admits no thrust tag at all,
-        // rather than admitting segment 0 by default.
-        let mut o = zeroed_orbit();
-        with_carrier(&mut o, &entries[..], &[]);
-        assert!(
-            empyrean_orbit_wide_cross(&o).is_err(),
-            "no declared segments means no legal thrust column"
-        );
-    }
-
-    /// E3 — a field the kind does not read must be zero. Refused rather
-    /// than ignored: a caller who sets `segment` on a DT column has
-    /// named one parameter and described another, and silently
-    /// resolving to the DT column would hand them a different number
-    /// than they asked for.
-    #[test]
-    fn e3_a_field_the_kind_does_not_read_must_be_zero() {
-        let cases: [(EmpyreanParamColumn, &str, &str); 4] = [
-            (
-                EmpyreanParamColumn {
-                    kind: EMPYREAN_PARAM_COLUMN_DT,
-                    index: 0,
-                    segment: 1,
-                    component: 0,
-                },
-                "segment",
-                "DT",
-            ),
-            (
-                EmpyreanParamColumn {
-                    kind: EMPYREAN_PARAM_COLUMN_AMRAT,
-                    index: 2,
-                    segment: 0,
-                    component: 0,
-                },
-                "index",
-                "AMRAT",
-            ),
-            (
-                EmpyreanParamColumn {
-                    kind: EMPYREAN_PARAM_COLUMN_MARSDEN,
-                    index: 1,
-                    segment: 0,
-                    component: 2,
-                },
-                "component",
-                "Marsden",
-            ),
-            (
-                EmpyreanParamColumn {
-                    kind: EMPYREAN_PARAM_COLUMN_THRUST,
-                    index: 1,
-                    segment: 0,
-                    component: 0,
-                },
-                "index",
-                "thrust",
-            ),
-        ];
-        for (col, field, kind) in cases {
-            let entries = [EmpyreanStateParamCross {
-                column: col,
-                values: [1.0; 6],
-            }];
-            let mut o = zeroed_orbit();
-            o.n_correction_covariances = 1;
-            with_carrier(&mut o, &entries, &[]);
-            let err = empyrean_orbit_wide_cross(&o)
-                .expect_err("a set field the kind does not read is refused");
-            assert!(
-                err.contains(field),
-                "the error names the field ({field}): {err}"
-            );
-            assert!(
-                err.contains(kind),
-                "the error names the kind ({kind}): {err}"
-            );
-            assert!(err.contains("must be 0"), "{err}");
-        }
-    }
-
-    /// E4 — a repeated state column. The engine's setter is
-    /// last-write-wins, which at an ABI boundary silently turns "I
-    /// supplied it twice by accident" into "the engine used whichever
-    /// came later".
-    #[test]
-    fn e4_a_repeated_state_column_is_refused() {
-        let entries = [
-            EmpyreanStateParamCross {
-                column: column(EMPYREAN_PARAM_COLUMN_DT),
-                values: [1.0; 6],
-            },
-            EmpyreanStateParamCross {
-                column: column(EMPYREAN_PARAM_COLUMN_AMRAT),
-                values: [2.0; 6],
-            },
-            EmpyreanStateParamCross {
-                column: column(EMPYREAN_PARAM_COLUMN_DT),
-                values: [9.0; 6],
-            },
-        ];
-        let mut o = zeroed_orbit();
-        with_carrier(&mut o, &entries, &[]);
-        let err = empyrean_orbit_wide_cross(&o).expect_err("a repeated column is refused");
-        assert!(
-            err.contains("state_param_cross[2]"),
-            "names the repeat: {err}"
-        );
-        assert!(err.contains("entry 0"), "names the original: {err}");
-    }
-
-    /// E4 — a repeated pair, including its SWAPPED form. This is the
-    /// half a naive duplicate check misses: `(DT, AMRAT)` and
-    /// `(AMRAT, DT)` are one symmetric term, so supplying both is two
-    /// values for one entry rather than an ordering choice.
-    #[test]
-    fn e4_a_pair_collides_with_its_own_swapped_form() {
-        let dt = column(EMPYREAN_PARAM_COLUMN_DT);
-        let amrat = column(EMPYREAN_PARAM_COLUMN_AMRAT);
-        let pairs = [
-            EmpyreanParamPairCross {
-                a: dt,
-                b: amrat,
-                value: 1.0,
-            },
-            EmpyreanParamPairCross {
-                a: amrat,
-                b: dt,
-                value: 7.0,
-            },
-        ];
-        let mut o = zeroed_orbit();
-        with_carrier(&mut o, &[], &pairs);
-        let err = empyrean_orbit_wide_cross(&o).expect_err("the swapped form is the same term");
-        assert!(err.contains("param_pair_cross[1]"), "{err}");
-        assert!(
-            err.contains("either order"),
-            "the error explains why: {err}"
-        );
-
-        // The honest case still passes: two DIFFERENT pairs sharing an
-        // endpoint are not duplicates.
-        let m0 = marsden(0);
-        let pairs = [
-            EmpyreanParamPairCross {
-                a: dt,
-                b: amrat,
-                value: 1.0,
-            },
-            EmpyreanParamPairCross {
-                a: dt,
-                b: m0,
-                value: 2.0,
-            },
-        ];
-        let mut o = zeroed_orbit();
-        with_carrier(&mut o, &[], &pairs);
-        let carrier = empyrean_orbit_wide_cross(&o)
-            .expect("distinct pairs sharing an endpoint are not duplicates")
-            .expect("a carrier was supplied");
-        assert_eq!(carrier.param_crosses().count(), 2);
-    }
-
-    // ── Identity round trip ───────────────────────────────────────
-
-    /// Every legal tag survives C → engine → C unchanged, and the
-    /// fields a kind does not read come back zero — which is what the
-    /// input side requires, so a result can be re-fed without editing.
-    #[test]
-    fn every_identity_tag_round_trips_through_the_engine_form() {
-        let mut cases = vec![
-            column(EMPYREAN_PARAM_COLUMN_DT),
-            column(EMPYREAN_PARAM_COLUMN_AMRAT),
-        ];
-        cases.extend((0..3).map(marsden));
-        for s in 0..3 {
-            cases.extend((0..3).map(|c| thrust(s, c)));
-        }
-        for c in cases {
-            let engine = param_column_to_engine(&c, 3, "round trip").expect("legal tag");
-            let back = param_column_from_engine(engine);
-            assert_eq!(back, c, "tag must survive the round trip unchanged");
-        }
-    }
-
-    // ── Ordering is not contract ──────────────────────────────────
-
-    /// Entry order does not matter: the same entries in a shuffled
-    /// order produce an identical carrier, because entries are keyed by
-    /// identity rather than by position. This is the property that
-    /// makes the whole surface immune to layout shifts.
-    #[test]
-    fn entry_order_is_not_contract() {
-        let dt = column(EMPYREAN_PARAM_COLUMN_DT);
-        let amrat = column(EMPYREAN_PARAM_COLUMN_AMRAT);
-        let forward = [
-            EmpyreanStateParamCross {
-                column: dt,
-                values: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-            },
-            EmpyreanStateParamCross {
-                column: amrat,
-                values: [7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
-            },
-        ];
-        let reversed = [forward[1], forward[0]];
-
-        let mut a = zeroed_orbit();
-        with_carrier(&mut a, &forward, &[]);
-        let mut b = zeroed_orbit();
-        with_carrier(&mut b, &reversed, &[]);
-
-        assert_eq!(
-            empyrean_orbit_wide_cross(&a).unwrap(),
-            empyrean_orbit_wide_cross(&b).unwrap(),
-            "a shuffled emission order must produce the identical carrier"
-        );
-    }
-
-    // ── The border ────────────────────────────────────────────────
-
-    /// The border's parameter block is DERIVED from
-    /// `non_grav_covariance` rather than asked for a second time, which
-    /// is what makes the engine's `ExtendedCovarianceParamsMismatch`
-    /// unreachable from C: there is no second copy to disagree.
-    #[test]
-    fn the_border_derives_its_parameter_block_from_the_orbit() {
-        let mut o = zeroed_orbit();
-        o.state.has_non_grav_cross = 1;
-        o.state.non_grav_cross = [[1.0, 2.0, 3.0]; 6];
-        o.has_non_grav_covariance = 1;
-        o.non_grav_covariance = [[9.0, 0.0, 0.0], [0.0, 8.0, 0.0], [0.0, 0.0, 7.0]];
-
-        let ext = empyrean_orbit_extended_covariance(&o).expect("a border was supplied");
-        assert_eq!(ext.cross, o.state.non_grav_cross);
-        assert_eq!(
-            ext.params, o.non_grav_covariance,
-            "params comes from the orbit's own 3x3, never from a second C-side copy"
-        );
-    }
-
-    /// A border supplied WITHOUT its parameter block is passed through
-    /// with a zero block rather than screened here, so the engine
-    /// raises its own `ExtendedCovarianceWithoutNonGravCovariance`. The
-    /// shell must not pre-empt an engine guard with a hand-maintained
-    /// copy of the same rule.
-    #[test]
-    fn a_border_without_a_parameter_block_reaches_the_engine_guard() {
-        let mut o = zeroed_orbit();
-        o.state.has_non_grav_cross = 1;
-        o.state.non_grav_cross = [[1.0, 2.0, 3.0]; 6];
-        o.has_non_grav_covariance = 0;
-
-        let ext = empyrean_orbit_extended_covariance(&o)
-            .expect("the border is carried through, not dropped and not refused here");
-        assert_eq!(
-            ext.params, [[0.0; 3]; 3],
-            "zero block, for the engine to catch"
-        );
-    }
-
-    // ── The units channel ─────────────────────────────────────────
-
-    /// The discriminating test for the attach point: a carrier supplied
-    /// in the coordinate's own angular unit must be scaled by the same
-    /// factor as the 6×6 it borders.
-    ///
-    /// A Cometary orbit's angular element rows are degrees on the ABI
-    /// and radians in the engine. Attaching the carrier AFTER the
-    /// conversion — which is what every marshal site did before this
-    /// change, and what `set_wide_cross` still does — leaves those rows
-    /// a factor of 180/π too large: finite, plausible, accepted by the
-    /// propagation gate, and wrong by 57×.
-    #[test]
-    fn the_carrier_converts_with_the_coordinate_it_borders() {
-        use empyrean_core::convert::coordinate_state_to_coordinates;
-
-        let mut o = zeroed_orbit();
-        o.state = crate::CoordinateState {
-            epoch_mjd_tdb: 59000.0,
-            // q, e, i, node, argperi, tp — the middle three are angles.
-            elements: [1.0, 0.2, 10.0, 20.0, 30.0, 59000.0],
-            covariance: [[0.0; 6]; 6],
-            has_covariance: 0,
-            representation: 2, // Cometary
-            frame: 0,
-            origin: 10,
-            has_non_grav_cross: 0,
-            non_grav_cross: [[0.0; 3]; 6],
-        };
-        // One unit in every state row, so the scaling of each row is
-        // readable directly off the stored carrier.
-        let entries = [EmpyreanStateParamCross {
-            column: column(EMPYREAN_PARAM_COLUMN_AMRAT),
-            values: [1.0; 6],
-        }];
-        with_carrier(&mut o, &entries, &[]);
-
-        let coords = coordinate_state_to_coordinates(&o.state.to_empyrean())
-            .expect("a well-formed Cometary state");
-        assert_eq!(coords.representation(), CoordinateRepresentation::Cometary);
-
-        let mut orbits: Orbits<AU> = Orbits::empty();
-        push_orbit_with_joint(&mut orbits, "c".to_string(), coords, &o)
-            .expect("the joint attaches");
-
-        let stored = orbits
-            .wide_cross(0)
-            .expect("the carrier reached the orbit")
-            .state_cross(ParamColumn::Amrat)
-            .copied()
-            .expect("the AMRAT column is present");
-
-        // Cometary's angular element indices are 2, 3, 4 (i, node,
-        // argperi). Those rows are scaled to radians; q, e and tp are
-        // not angles and are untouched.
-        let to_rad = std::f64::consts::PI / 180.0;
-        for (row, value) in stored.iter().enumerate() {
-            let expected = if (2..5).contains(&row) { to_rad } else { 1.0 };
-            assert!(
-                (value - expected).abs() < 1e-15,
-                "row {row}: expected {expected}, got {value} — the carrier must be \
-                 scaled exactly as the 6x6 beside it is"
-            );
-        }
-
-        // And the read-out is the same conversion in reverse, so a round
-        // trip returns what was supplied. A read-out that converted the
-        // coordinate and left the carrier alone would make the error
-        // visible only on round trips, and read as a marshaling bug.
-        let (_, back) = orbits
-            .coordinates_angular::<Degrees>(0)
-            .expect("row 0 exists");
-        let back = back
-            .expect("the carrier comes back")
-            .state_cross(ParamColumn::Amrat)
-            .copied()
-            .expect("the AMRAT column survives");
-        for (row, value) in back.iter().enumerate() {
-            assert!(
-                (value - 1.0).abs() < 1e-15,
-                "row {row}: the degree round trip must return the supplied value, got {value}"
-            );
-        }
-    }
-
-    /// A Cartesian orbit has no angular rows, so the same carrier
-    /// crosses unscaled. Paired with the Cometary case above, this is
-    /// what distinguishes "converted correctly" from "not converted at
-    /// all" — a broken attach point passes one of the two.
-    #[test]
-    fn a_cartesian_carrier_crosses_unscaled() {
-        use empyrean_core::convert::coordinate_state_to_coordinates;
-
-        let mut o = zeroed_orbit();
-        o.state = crate::CoordinateState {
-            epoch_mjd_tdb: 59000.0,
-            elements: [1.0, 0.1, 0.05, -0.005, 0.015, 0.001],
-            covariance: [[0.0; 6]; 6],
-            has_covariance: 0,
-            representation: 0, // Cartesian
-            frame: 0,
-            origin: 10,
-            has_non_grav_cross: 0,
-            non_grav_cross: [[0.0; 3]; 6],
-        };
-        let entries = [EmpyreanStateParamCross {
-            column: column(EMPYREAN_PARAM_COLUMN_DT),
-            values: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-        }];
-        with_carrier(&mut o, &entries, &[]);
-
-        let coords = coordinate_state_to_coordinates(&o.state.to_empyrean()).unwrap();
-        let mut orbits: Orbits<AU> = Orbits::empty();
-        push_orbit_with_joint(&mut orbits, "x".to_string(), coords, &o).unwrap();
-
-        let stored = orbits
-            .wide_cross(0)
-            .unwrap()
-            .state_cross(ParamColumn::Dt)
-            .copied()
-            .unwrap();
-        assert_eq!(
-            stored,
-            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-            "Cartesian has no angular rows, so nothing is scaled"
-        );
-    }
-
-    /// An all-zero carrier ENTRY is a supplied zero correlation, not an
-    /// absent one — the deliberate asymmetry with the border, where an
-    /// all-zero cross reads as absent. The two readings differ, and a
-    /// consumer should not have to discover that.
-    #[test]
-    fn an_all_zero_entry_is_supplied_rather_than_absent() {
-        let entries = [EmpyreanStateParamCross {
-            column: column(EMPYREAN_PARAM_COLUMN_DT),
-            values: [0.0; 6],
-        }];
-        let mut o = zeroed_orbit();
-        with_carrier(&mut o, &entries, &[]);
-        let carrier = empyrean_orbit_wide_cross(&o)
-            .expect("well-formed")
-            .expect("a carrier was supplied");
-        assert!(
-            !carrier.is_empty(),
-            "a supplied zero entry counts as supplied and engages the definiteness gate"
-        );
-        assert_eq!(carrier.state_cross(ParamColumn::Dt), Some(&[0.0; 6]));
-    }
+        .push(orbit_id, coords.into_radians())
+        .map_err(|e| e.to_string())?;
+    let i = orbits.len() - 1;
+    orbits.set_uncertainty(i, uncertainty);
+    Ok(())
 }

@@ -5,15 +5,18 @@ use empyrean_core::Origin;
 use empyrean_core::convert::{coordinate_state_to_coordinates, frame_to_int};
 use empyrean_core::coordinates::{AU, CartesianCoordinates, Frame};
 use empyrean_core::ephemeris::{
-    EphemerisConfig, EphemerisPropagationConfig, EphemerisResult, generate_ephemeris,
+    EphemerisConfig, EphemerisGenerationError, EphemerisPropagationConfig, EphemerisResult,
+    generate_ephemeris,
 };
 use empyrean_core::observers::Observer;
 use empyrean_core::orbits::Orbits;
+use empyrean_core::propagation::OrbitOutcome;
 use empyrean_core::time::Epoch;
 
 use crate::observers::EmpyreanObserver;
 use crate::propagate::{
-    EmpyreanOrbit, EmpyreanPropagationConfig, empyrean_orbit_photometric_params,
+    EMPYREAN_ORBIT_OUTCOME_DELIVERED, EMPYREAN_ORBIT_OUTCOME_FAILED, EmpyreanOrbit,
+    EmpyreanOrbitOutcome, EmpyreanPropagationConfig, empyrean_orbit_photometric_params,
     empyrean_orbit_srp_params, empyrean_orbit_thrust_params,
 };
 use crate::{EmpyreanContext, set_last_error};
@@ -208,10 +211,33 @@ pub struct EmpyreanObservationSensitivity {
     /// flattened (length `6 * n_params * n_params`). Null unless a
     /// second-order method (Jet2) ran.
     ///
+    /// The tensor is COMPOSED to the same input axis as `jacobian` — the
+    /// orbit-epoch state in `frame`/`origin` — so the pair is one
+    /// second-order expansion (villeneuve 1.25.0; earlier engines
+    /// published the LOCAL topocentric second derivative here, a
+    /// different input domain from the Jacobian beside it, and any
+    /// consumer that contracted the two together read the wrong
+    /// quantity). Populated on `SECOND_ORDER` rows of orbits declaring a
+    /// state covariance and no solved force-model parameters, where
+    /// `n_params == 6`; null on every other row.
+    ///
     /// Leading index is the observable, in the same order and the same
     /// units-per-input-unit as `jacobian` — index it with the same
     /// `EMPYREAN_SENSITIVITY_ROW_*` constants. Element `(row, i, j)` is
     /// `hessian[(row * n_params + i) * n_params + j]`.
+    ///
+    /// # Consumer note (fold builders)
+    ///
+    /// The per-row sky covariance delivered alongside this tensor under
+    /// a second-order method is the moment **about the published
+    /// nominal**: it already contains the mean-shift outer product
+    /// `δμ_a · δμ_b`, with `δμ_a = ½ tr(H_a Σ)` built from THIS tensor.
+    /// A consumer building its own bias-corrected update must not ALSO
+    /// subtract that shift from the innovation while using the delivered
+    /// matrix as its noise term — that double-counts the correction.
+    /// Either subtract the shift and build your own noise term from this
+    /// tensor, or take the delivered matrix as-is and leave the
+    /// innovation alone.
     pub hessian: *mut f64,
     /// Length of `hessian` (`6 * n_params²`), 0 when null.
     pub hessian_len: usize,
@@ -221,8 +247,93 @@ pub struct EmpyreanObservationSensitivity {
     pub origin: i32,
 }
 
+// ── Per-orbit ephemeris-generation outcome ───────────────────
+//
+// Ephemeris generation is batch, orbit-major, and carries the same per-orbit
+// delivery verdict as propagate: one orbit's generation failure no longer ends
+// the whole call. The outcome entries reuse the ONE `EmpyreanOrbitOutcome`
+// struct (`crate::propagate`); only the `error_code` namespace differs — an
+// ephemeris result's failed orbits carry `EMPYREAN_EPHEMERIS_FAILURE_*`
+// (classifying `EphemerisGenerationError`), not `EMPYREAN_PROPAGATE_FAILURE_*`.
+// `status`, `first_row`/`num_rows` (into the `entries` array) and the message
+// string mean the same thing.
+
+/// Per-orbit ephemeris-generation failure classification
+/// (`EmpyreanOrbitOutcome::error_code` on an ephemeris result), following the
+/// `EMPYREAN_OD_FAILURE_*` family idiom; the full engine text always rides the
+/// message. `NONE` on a delivered orbit.
+pub const EMPYREAN_EPHEMERIS_FAILURE_NONE: i32 = 0;
+/// The underlying propagation to an observer epoch failed (`Propagation`).
+pub const EMPYREAN_EPHEMERIS_FAILURE_PROPAGATION: i32 = 1;
+/// An SPK evaluation failed (`SPK`).
+pub const EMPYREAN_EPHEMERIS_FAILURE_SPK: i32 = 2;
+/// Stellar-aberration correction failed (`Aberration`).
+pub const EMPYREAN_EPHEMERIS_FAILURE_ABERRATION: i32 = 3;
+/// An observation-moment computation failed (`ObservationMoment`).
+pub const EMPYREAN_EPHEMERIS_FAILURE_OBSERVATION_MOMENT: i32 = 4;
+/// Light-time iteration failed for an observation (`ObservationLightTime`).
+pub const EMPYREAN_EPHEMERIS_FAILURE_LIGHT_TIME: i32 = 5;
+/// A sampled sky/radar member was non-finite (`SampledSkyMemberNonFinite`,
+/// `SampledRadarMemberNonFinite`).
+pub const EMPYREAN_EPHEMERIS_FAILURE_SAMPLED_MEMBER: i32 = 6;
+/// An ensemble member sub-generation failed (`EnsembleMemberFailed`).
+pub const EMPYREAN_EPHEMERIS_FAILURE_ENSEMBLE_MEMBER: i32 = 7;
+/// A sky/aberrated covariance could not be delivered at emission
+/// (`CovarianceLayoutOutOfTable`, `SampledCovarianceRejected`,
+/// `MarginalUnavailableAtEmission`, `SecondOrderSkyUnavailable`,
+/// `SecondOrderTensorsNotRetainedByCache`,
+/// `SecondOrderAberratedStateUnavailable`).
+pub const EMPYREAN_EPHEMERIS_FAILURE_COVARIANCE_UNAVAILABLE: i32 = 8;
+/// The requested uncertainty method / solved set has no sky delivery
+/// (`UnsupportedUncertaintyMethod`, `SampledSkySolvedSetUnsupported`).
+pub const EMPYREAN_EPHEMERIS_FAILURE_UNSUPPORTED_METHOD: i32 = 9;
+/// Any other carried per-orbit failure, including a variant added by a newer
+/// engine (`EphemerisGenerationError` is `#[non_exhaustive]`). The full cause
+/// is on the message; nothing is hidden.
+pub const EMPYREAN_EPHEMERIS_FAILURE_OTHER: i32 = 99;
+
+/// Classify a carried per-orbit [`EphemerisGenerationError`] into its
+/// `EMPYREAN_EPHEMERIS_FAILURE_*` code. `EphemerisGenerationError` is
+/// `#[non_exhaustive]`, so the `_OTHER` arm is required; the full text always
+/// rides the message, so a coarse code is never a silent drop.
+fn ephemeris_error_code(e: &EphemerisGenerationError) -> i32 {
+    use EphemerisGenerationError as E;
+    match e {
+        E::Propagation(_) => EMPYREAN_EPHEMERIS_FAILURE_PROPAGATION,
+        E::SPK(_) => EMPYREAN_EPHEMERIS_FAILURE_SPK,
+        E::Aberration(_) => EMPYREAN_EPHEMERIS_FAILURE_ABERRATION,
+        E::ObservationMoment(_) => EMPYREAN_EPHEMERIS_FAILURE_OBSERVATION_MOMENT,
+        E::ObservationLightTime { .. } => EMPYREAN_EPHEMERIS_FAILURE_LIGHT_TIME,
+        E::SampledSkyMemberNonFinite { .. } | E::SampledRadarMemberNonFinite { .. } => {
+            EMPYREAN_EPHEMERIS_FAILURE_SAMPLED_MEMBER
+        }
+        E::EnsembleMemberFailed { .. } => EMPYREAN_EPHEMERIS_FAILURE_ENSEMBLE_MEMBER,
+        E::CovarianceLayoutOutOfTable { .. }
+        | E::SampledCovarianceRejected { .. }
+        | E::MarginalUnavailableAtEmission { .. }
+        | E::SecondOrderSkyUnavailable { .. }
+        | E::SecondOrderTensorsNotRetainedByCache { .. }
+        | E::SecondOrderAberratedStateUnavailable { .. } => {
+            EMPYREAN_EPHEMERIS_FAILURE_COVARIANCE_UNAVAILABLE
+        }
+        E::UnsupportedUncertaintyMethod { .. } | E::SampledSkySolvedSetUnsupported { .. } => {
+            EMPYREAN_EPHEMERIS_FAILURE_UNSUPPORTED_METHOD
+        }
+        _ => EMPYREAN_EPHEMERIS_FAILURE_OTHER,
+    }
+}
+
 /// Result containing an array of ephemeris entries and, when an
 /// uncertainty method traced the STM, the observation-sensitivity chains.
+///
+/// `outcomes` is the per-INPUT-orbit delivery channel: `num_orbits` entries
+/// (the INPUT orbit count), one [`EmpyreanOrbitOutcome`] per input orbit in
+/// input order, with `error_code` drawn from the `EMPYREAN_EPHEMERIS_FAILURE_*`
+/// family. `num_entries` stays the delivered row count; a failed orbit
+/// contributes no entries, and `outcomes[k].first_row` / `num_rows` map each
+/// input orbit onto its block of `entries`. A batch in which every orbit failed
+/// returns successfully with `num_entries == 0` and every outcome `FAILED`;
+/// only a call-level input refusal is an error return.
 #[repr(C)]
 pub struct EmpyreanEphemerisResult {
     pub entries: *mut EmpyreanEphemerisEntry,
@@ -245,6 +356,15 @@ pub struct EmpyreanEphemerisResult {
     pub warnings: *mut *mut std::ffi::c_char,
     /// Number of warning strings. 0 when the run had nothing to report.
     pub num_warnings: usize,
+    /// The INPUT orbit count — the length of `outcomes`.
+    pub num_orbits: usize,
+    /// One [`EmpyreanOrbitOutcome`] per input orbit, in input order
+    /// (`num_orbits` entries). The per-orbit delivery channel: read delivery
+    /// from `outcomes[k].status`, map entries to input orbits with
+    /// `first_row` / `num_rows`, and read a failed orbit's cause from
+    /// `error_code` (an `EMPYREAN_EPHEMERIS_FAILURE_*` code) and
+    /// `error_message`. Owning; freed by `empyrean_ephemeris_result_free`.
+    pub outcomes: *mut EmpyreanOrbitOutcome,
 }
 
 /// Ephemeris-generation configuration.
@@ -266,14 +386,28 @@ pub struct EmpyreanEphemerisResult {
 ///
 /// # Generating for an SB441-N16 body
 ///
-/// `ephemeris_overlap_policy` matters more here than on `empyrean_propagate`.
-/// Under the default `EMPYREAN_EPHEMERIS_OVERLAP_POLICY_SUBSTITUTE_SPK` the engine
-/// skips integration for a target that coincides with one of its own
-/// perturbers — and ephemeris generation reads the dense trajectory that
-/// integration would have produced, so the call **fails** for any
-/// SB441-N16 body at Standard tier. Pass
-/// `EMPYREAN_EPHEMERIS_OVERLAP_POLICY_EXCLUDE_AND_INTEGRATE` (or exclude the body
-/// via `excluded_perturbers_naif`) to generate ephemerides for one.
+/// `ephemeris_overlap_policy` decides WHICH trajectory the rows come
+/// from when a target coincides with one of its own perturbers. Both
+/// settings produce rows, and the result's warnings channel says which
+/// answer you got — read it, because the two are not interchangeable.
+///
+/// Under the default `EMPYREAN_EPHEMERIS_OVERLAP_POLICY_SUBSTITUTE_SPK`
+/// the engine skips integration and serves the rows off the body's own
+/// SPK — the authoritative solution for that body, but **not** a
+/// propagation of the initial condition you supplied. Those rows carry
+/// **no sky covariance**, and if the input orbit declared one, the
+/// warning says it was dropped.
+///
+/// Under `EMPYREAN_EPHEMERIS_OVERLAP_POLICY_EXCLUDE_AND_INTEGRATE` the
+/// body is removed from its own force model and your initial condition
+/// is integrated, so the covariance is transported and the rows are
+/// differentiable — at the cost of a force model one perturber short,
+/// which its warning states. Naming the body in
+/// `excluded_perturbers_naif` is the other route to the same place.
+///
+/// Radar generation is the one product that still **fails** outright
+/// under the substituting policy: its Jacobian is composed on the STM,
+/// which an SPK substitution does not produce.
 #[repr(C)]
 pub struct EmpyreanEphemerisConfig {
     /// Inner propagation configuration applied to the trajectory that
@@ -333,8 +467,8 @@ pub unsafe extern "C" fn empyrean_generate_ephemeris(
         let orbits = match build_orbits_for_ephemeris(orbit_slice) {
             Ok(o) => o,
             Err(e) => {
-                set_last_error(&e);
-                return -1;
+                set_last_error(&e.message);
+                return e.code.unwrap_or(-1);
             }
         };
         let observers = match build_observers_from_c(observer_slice) {
@@ -380,15 +514,15 @@ pub unsafe extern "C" fn empyrean_generate_ephemeris(
 /// [`empyrean_builtsystem_generate_ephemeris`](crate::built_system::empyrean_builtsystem_generate_ephemeris).
 pub(crate) fn build_orbits_for_ephemeris(
     orbit_slice: &[EmpyreanOrbit],
-) -> Result<Orbits<AU>, String> {
+) -> Result<Orbits<AU>, crate::joint::AbiError> {
     let mut orbits: Orbits<AU> = Orbits::empty();
     for (i, orbit) in orbit_slice.iter().enumerate() {
         let state = orbit.state.to_empyrean();
-        let coords =
+        let (coords, state_cov) =
             coordinate_state_to_coordinates(&state).map_err(|e| format!("orbit {i}: {e}"))?;
         let id = format!("orbit_{i}");
-        crate::joint::push_orbit_with_joint(&mut orbits, id, coords, orbit)
-            .map_err(|e| format!("orbit {i}: {e}"))?;
+        crate::joint::push_orbit_with_joint(&mut orbits, id, coords, state_cov, orbit)
+            .map_err(|e| e.prefixed(&format!("orbit {i}")))?;
         // Routed through the shared helper rather than the inline copy
         // this path used to carry: that copy hardcoded `covariance:
         // None`, dropping the Marsden 3×3 the ABI has carried since
@@ -405,12 +539,12 @@ pub(crate) fn build_orbits_for_ephemeris(
         match empyrean_orbit_thrust_params(orbit) {
             Ok(Some(tp)) => orbits.set_thrust_params(i, Some(tp)),
             Ok(None) => {}
-            Err(e) => return Err(format!("orbit {i}: {e}")),
+            Err(e) => return Err(format!("orbit {i}: {e}").into()),
         }
         match empyrean_orbit_srp_params(orbit) {
             Ok(Some(srp)) => orbits.set_srp_params(i, Some(srp)),
             Ok(None) => {}
-            Err(e) => return Err(format!("orbit {i}: {e}")),
+            Err(e) => return Err(format!("orbit {i}: {e}").into()),
         }
     }
     Ok(orbits)
@@ -605,7 +739,7 @@ pub(crate) fn build_ephemeris_config_from_c(
         detect_ephemeris_overlap: full.detect_ephemeris_overlap,
         ephemeris_overlap_policy: full.ephemeris_overlap_policy,
         uncertainty_method: full.uncertainty_method,
-        compute_stm: full.compute_stm,
+        derivatives: full.derivatives,
         frame: full.frame,
         num_threads: full.num_threads,
         advanced: full.advanced,
@@ -636,6 +770,64 @@ pub(crate) fn marshal_ephemeris_result(
 ) -> i32 {
     let ephemeris = &eph_result.ephemeris;
     let n = ephemeris.iter().count();
+
+    // ── Per-INPUT-orbit delivery channel ──
+    // One EmpyreanOrbitOutcome per input orbit, in input order, reusing the
+    // propagate outcome struct (one struct, not a sibling). A failed orbit's
+    // code is drawn from EMPYREAN_EPHEMERIS_FAILURE_*. Built FIRST so an
+    // allocation failure here leaks nothing. Entry attribution uses the
+    // engine's per-orbit entry blocks (orbit_row_range) — the same index space
+    // as the `entries` array below — not a uniform grid guess.
+    let num_orbits = eph_result.outcomes().len();
+    let outcomes_ptr = if num_orbits > 0 {
+        let layout = std::alloc::Layout::array::<EmpyreanOrbitOutcome>(num_orbits)
+            .unwrap_or(std::alloc::Layout::new::<EmpyreanOrbitOutcome>());
+        let ptr = unsafe { std::alloc::alloc(layout) } as *mut EmpyreanOrbitOutcome;
+        if ptr.is_null() {
+            set_last_error("allocation failed for ephemeris outcomes array");
+            return -5;
+        }
+        for (k, outcome) in eph_result.outcomes().iter().enumerate() {
+            let rows = eph_result.orbit_row_range(k).unwrap_or(0..0);
+            let first_row = rows.start;
+            let num_rows = rows.len();
+            let (status, error_code, error_message) = match outcome {
+                OrbitOutcome::Delivered => (
+                    EMPYREAN_ORBIT_OUTCOME_DELIVERED,
+                    EMPYREAN_EPHEMERIS_FAILURE_NONE,
+                    std::ptr::null_mut(),
+                ),
+                OrbitOutcome::Failed(err) => {
+                    let msg = CString::new(err.to_string())
+                        .unwrap_or_else(|_| CString::new("ephemeris generation failed").unwrap());
+                    (
+                        EMPYREAN_ORBIT_OUTCOME_FAILED,
+                        ephemeris_error_code(err),
+                        msg.into_raw(),
+                    )
+                }
+                // `OrbitOutcome` is `#[non_exhaustive]`: a newer engine verdict
+                // is reported as a failure with the catch-all code.
+                _ => (
+                    EMPYREAN_ORBIT_OUTCOME_FAILED,
+                    EMPYREAN_EPHEMERIS_FAILURE_OTHER,
+                    CString::new("unknown orbit outcome").unwrap().into_raw(),
+                ),
+            };
+            unsafe {
+                ptr.add(k).write(EmpyreanOrbitOutcome {
+                    status,
+                    error_code,
+                    error_message,
+                    first_row,
+                    num_rows,
+                });
+            }
+        }
+        ptr
+    } else {
+        std::ptr::null_mut()
+    };
 
     // ── Generation warnings ──
     // Run-level (one list per call, not per row); Display-serialized so
@@ -681,7 +873,7 @@ pub(crate) fn marshal_ephemeris_result(
         // Cartesian state, and its covariance. Populate them; NaN-fill the
         // covariances when the input orbit carried none.
         let (has_covariance, covariance) = match cov {
-            Some(c) => (1u8, c.matrix),
+            Some(c) => (1u8, c.state_block()),
             None => (0u8, [[f64::NAN; 6]; 6]),
         };
         let aberrated_state = match aberrated {
@@ -690,7 +882,7 @@ pub(crate) fn marshal_ephemeris_result(
         };
         let (has_aberrated_covariance, aberrated_covariance) =
             match ephemeris.aberrated_covariance(i) {
-                Some(c) => (1u8, c.matrix),
+                Some(c) => (1u8, c.state_block()),
                 None => (0u8, [[f64::NAN; 6]; 6]),
             };
         // SphericalCoordinates: r, lon (= RA), lat (= Dec), vr, vlon, vlat.
@@ -771,25 +963,37 @@ pub(crate) fn marshal_ephemeris_result(
         let origin = chain.origin().naif_id();
         let epochs = chain.epochs();
         for (i, &epoch_mjd_tdb) in epochs.iter().enumerate() {
-            let (jac, n_params) = if let Some((jw, active_width)) = chain.jacobian_wide(i) {
-                // v1.20.0: jacobian_wide is width-tagged — the wide STM
-                // spans 7..=17 meaningful columns now (DT / AMRAT / thrust),
-                // no longer a fixed 9, and is STORED at the MAX_WIDE stride.
-                // Emit exactly the active_width columns so the buffer length
-                // stays 6 * n_params.
-                (
-                    flatten_2d_active(&jw.matrix, active_width),
-                    active_width as u8,
-                )
-            } else if let Some(j) = chain.jacobian(i) {
-                (flatten_2d(&j.matrix), 6u8)
-            } else {
-                (Vec::new(), 6u8)
+            let (jac, n_params) = match chain.jacobian_row(i) {
+                // villeneuve 1.26.0: one width-carrying row per epoch. A
+                // parameter-bearing row hands back its wide Jacobian — the
+                // active solved width, stored at the MAX_WIDE stride — through
+                // `wide()`; a state-only row has no wide tensor and its leading
+                // 6×6 is read through `state_block()`. Emit exactly the active
+                // columns so the buffer length stays 6 * n_params.
+                Some(row) => {
+                    if let Some((jw, active_width)) = row.wide() {
+                        (
+                            flatten_2d_active(&jw.matrix, active_width),
+                            active_width as u8,
+                        )
+                    } else {
+                        (flatten_2d(&row.state_block().matrix), 6u8)
+                    }
+                }
+                None => (Vec::new(), 6u8),
             };
-            let hess = if let Some(hw) = chain.hessian_wide(i) {
-                flatten_3d(&hw.tensor)
-            } else if let Some(h) = chain.hessian(i) {
-                flatten_3d(&h.tensor)
+            // villeneuve 1.26.0: the observation Hessian is a width-carrying
+            // row. This ABI publishes the state-only 6×6×6, read through the
+            // row's `state_block()` (the leading state corner of a
+            // parameter-bearing row, bit-identical to a narrow row), so the
+            // `6 * n_params²` length contract holds with n_params == 6.
+            // The engine stores the tensor packed lower-triangular (each slice
+            // is symmetric in (i, j) by Schwarz); `ObsHessian::to_full` mirrors
+            // the stored triangle back into the dense square this ABI
+            // publishes, so the flattened payload is byte-identical to what the
+            // dense storage produced.
+            let hess = if let Some(h) = chain.hessian_row(i) {
+                flatten_3d(&h.state_block().to_full())
             } else {
                 Vec::new()
             };
@@ -842,6 +1046,8 @@ pub(crate) fn marshal_ephemeris_result(
         (*result_out).num_sensitivity = num_sens;
         (*result_out).warnings = warn_ptr;
         (*result_out).num_warnings = num_warnings;
+        (*result_out).num_orbits = num_orbits;
+        (*result_out).outcomes = outcomes_ptr;
     }
 
     0
@@ -905,6 +1111,22 @@ pub unsafe extern "C" fn empyrean_ephemeris_result_free(result: *mut EmpyreanEph
             }
         }
 
+        // Per-orbit outcome array: each failed orbit owns its message string,
+        // freed before the array holding the entries.
+        let n_out = res.num_orbits;
+        if !res.outcomes.is_null() && n_out > 0 {
+            for i in 0..n_out {
+                let oc = unsafe { &*res.outcomes.add(i) };
+                if !oc.error_message.is_null() {
+                    drop(unsafe { CString::from_raw(oc.error_message) });
+                }
+            }
+            let layout = std::alloc::Layout::array::<EmpyreanOrbitOutcome>(n_out).unwrap();
+            unsafe {
+                std::alloc::dealloc(res.outcomes as *mut u8, layout);
+            }
+        }
+
         unsafe {
             (*result).entries = std::ptr::null_mut();
             (*result).num_entries = 0;
@@ -912,6 +1134,8 @@ pub unsafe extern "C" fn empyrean_ephemeris_result_free(result: *mut EmpyreanEph
             (*result).num_sensitivity = 0;
             (*result).warnings = std::ptr::null_mut();
             (*result).num_warnings = 0;
+            (*result).num_orbits = 0;
+            (*result).outcomes = std::ptr::null_mut();
         }
     }));
 }
@@ -1204,14 +1428,17 @@ mod ephemeris_config_conversion_tests {
             p.advanced.epsilon = 1e-11;
             p.advanced.dt_initial = f64::NAN;
             p.advanced.dt_min = 1e-6;
-            p.advanced.encounter_timescale_divisor = 500.0;
             p.advanced.max_steps = 12_345;
             p.advanced.max_dense_steps = 6_789;
         }
 
         let built = build_ephemeris_config_from_c(&cfg).expect("config converts");
         let p = &built.propagation;
-        assert!(p.compute_stm, "compute_stm must survive");
+        assert_eq!(
+            p.derivatives,
+            empyrean_core::propagation::DerivativeOrder::FirstOrder,
+            "compute_stm must survive as derivatives = FirstOrder"
+        );
         assert_eq!(
             p.num_threads.map(|n| n.get()),
             Some(3),
@@ -1223,10 +1450,6 @@ mod ephemeris_config_conversion_tests {
             p.advanced.dt_min,
             Some(1e-6),
             "advanced.dt_min must survive"
-        );
-        assert_eq!(
-            p.advanced.encounter_timescale_divisor, 500.0,
-            "the divisor is compared against a BuiltSystem's frozen key — it must survive"
         );
         assert_eq!(p.advanced.max_steps, 12_345);
         assert_eq!(p.advanced.max_dense_steps, 6_789);
@@ -1387,14 +1610,10 @@ mod ephemeris_config_end_to_end_tests {
             representation: 0, // Cartesian
             frame: 0,          // ICRF
             origin: 10,        // Sun
-            has_non_grav_cross: 0,
-            non_grav_cross: [[0.0; 3]; 6],
         };
         o.non_grav_dt = f64::NAN;
-        o.non_grav_dt_variance = f64::NAN;
         o.phot_system = -1;
         o.h_mag = f64::NAN;
-        o.srp_amrat_variance = f64::NAN;
         o
     }
 
@@ -1518,9 +1737,7 @@ mod ephemeris_config_end_to_end_tests {
                 .iter()
                 .map(|chain| {
                     (0..chain.epochs().len())
-                        .filter(|&i| {
-                            chain.jacobian(i).is_some() || chain.jacobian_wide(i).is_some()
-                        })
+                        .filter(|&i| chain.jacobian_row(i).is_some())
                         .count()
                 })
                 .sum::<usize>()
@@ -1766,5 +1983,196 @@ mod ephemeris_config_end_to_end_tests {
         }
 
         unsafe { empyrean_ephemeris_result_free(&mut out) };
+    }
+}
+
+/// The per-orbit delivery channel on `EmpyreanEphemerisResult`: a per-orbit
+/// generation failure is carried in `outcomes` rather than vanishing, the batch
+/// still succeeds, and `first_row` / `num_rows` map each input orbit onto its
+/// block of `entries`.
+#[cfg(test)]
+mod ephemeris_outcome_channel_tests {
+    use super::*;
+    use crate::propagate::EMPYREAN_UNCERTAINTY_FIRST;
+
+    fn try_context() -> Option<empyrean_core::Context> {
+        empyrean_core::Context::from_data_dir(None).ok()
+    }
+
+    fn last_err() -> String {
+        let p = crate::empyrean_last_error();
+        if p.is_null() {
+            return String::new();
+        }
+        unsafe { std::ffi::CStr::from_ptr(p) }
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// A valid heliocentric Cartesian orbit (delivers a row per observer).
+    fn delivered_orbit(px: f64) -> EmpyreanOrbit {
+        let mut o: EmpyreanOrbit = unsafe { std::mem::zeroed() };
+        o.state = crate::CoordinateState {
+            epoch_mjd_tdb: 59000.0,
+            elements: [px, 0.1, 0.05, -0.005, 0.015, 0.001],
+            covariance: [[0.0; 6]; 6],
+            has_covariance: 0,
+            representation: 0,
+            frame: 0,
+            origin: 10,
+        };
+        o.non_grav_dt = f64::NAN;
+        o.phot_system = -1;
+        o.h_mag = f64::NAN;
+        o
+    }
+
+    /// An orbit the engine refuses: a finite state whose epoch is far outside
+    /// the ephemeris span, so bringing it to the observer epoch fails on the
+    /// first perturber query — a carried per-orbit `Failed`, not a call-level
+    /// abort. Deterministic and offline.
+    fn refused_orbit() -> EmpyreanOrbit {
+        let mut o = delivered_orbit(1.0);
+        o.state.epoch_mjd_tdb = 400_000.0;
+        o
+    }
+
+    fn observer() -> EmpyreanObserver {
+        EmpyreanObserver {
+            obs_code: *b"500\0",
+            epoch_mjd_tdb: 59200.0,
+            x: 0.9,
+            y: -0.42,
+            z: -0.18,
+            vx: 0.0075,
+            vy: 0.0148,
+            vz: 0.0064,
+            observing_night: -1,
+            frame: 0,
+            origin: 0,
+        }
+    }
+
+    fn first_order_config() -> EmpyreanEphemerisConfig {
+        let mut cfg: EmpyreanEphemerisConfig = unsafe { std::mem::zeroed() };
+        cfg.propagation.force_model = 2;
+        cfg.propagation.frame = 0;
+        cfg.propagation.uncertainty_method.tag = EMPYREAN_UNCERTAINTY_FIRST;
+        cfg.propagation.advanced.dt_initial = f64::NAN;
+        cfg.propagation.advanced.dt_min = f64::NAN;
+        cfg
+    }
+
+    unsafe fn outcomes_slice(result: &EmpyreanEphemerisResult) -> &[EmpyreanOrbitOutcome] {
+        if result.outcomes.is_null() {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(result.outcomes, result.num_orbits) }
+        }
+    }
+
+    /// A three-orbit ephemeris batch whose MIDDLE orbit the engine refuses: the
+    /// failed orbit is carried in `outcomes`, the batch still succeeds, and
+    /// `first_row` / `num_rows` map the delivered rows to orbits 0 and 2.
+    #[test]
+    fn a_mixed_batch_carries_the_failed_orbit_and_maps_the_entries() {
+        let Some(ctx) = try_context() else {
+            eprintln!("skipping ephemeris outcome channel test: no data dir");
+            return;
+        };
+        let ctx_ptr: *const EmpyreanContext = &ctx;
+        let cfg = first_order_config();
+        let observers = [observer()];
+        let orbits = [delivered_orbit(1.0), refused_orbit(), delivered_orbit(1.2)];
+
+        let mut result: EmpyreanEphemerisResult = unsafe { std::mem::zeroed() };
+        let code = unsafe {
+            empyrean_generate_ephemeris(
+                ctx_ptr,
+                orbits.as_ptr(),
+                orbits.len(),
+                observers.as_ptr(),
+                observers.len(),
+                &cfg,
+                &mut result,
+            )
+        };
+        assert_eq!(
+            code,
+            0,
+            "a per-orbit failure must not fail the call: {}",
+            last_err()
+        );
+        assert_eq!(result.num_orbits, 3, "one outcome per INPUT orbit");
+
+        let outcomes = unsafe { outcomes_slice(&result) };
+        assert_eq!(outcomes[0].status, EMPYREAN_ORBIT_OUTCOME_DELIVERED);
+        assert_eq!(
+            outcomes[1].status, EMPYREAN_ORBIT_OUTCOME_FAILED,
+            "the out-of-span orbit is carried, not dropped"
+        );
+        assert_eq!(outcomes[2].status, EMPYREAN_ORBIT_OUTCOME_DELIVERED);
+
+        // The failed orbit names an ephemeris-family cause and carries no rows.
+        assert_ne!(outcomes[1].error_code, EMPYREAN_EPHEMERIS_FAILURE_NONE);
+        assert!(!outcomes[1].error_message.is_null());
+        assert_eq!(outcomes[1].num_rows, 0);
+
+        // The delivered entries map to orbits 0 and 2 exactly; the failed
+        // middle orbit occupies NO entries.
+        assert_eq!(outcomes[0].first_row, 0);
+        assert_eq!(
+            outcomes[2].first_row, outcomes[0].num_rows,
+            "orbit 2 begins immediately after orbit 0's entries"
+        );
+        assert_eq!(
+            result.num_entries,
+            outcomes[0].num_rows + outcomes[2].num_rows,
+            "num_entries is the DELIVERED rows only"
+        );
+
+        unsafe { empyrean_ephemeris_result_free(&mut result) };
+    }
+
+    /// Every orbit failing returns SUCCESS with zero entries and three FAILED.
+    #[test]
+    fn an_all_failed_ephemeris_batch_returns_the_accounting() {
+        let Some(ctx) = try_context() else {
+            eprintln!("skipping ephemeris outcome channel test: no data dir");
+            return;
+        };
+        let ctx_ptr: *const EmpyreanContext = &ctx;
+        let cfg = first_order_config();
+        let observers = [observer()];
+        let orbits = [refused_orbit(), refused_orbit(), refused_orbit()];
+
+        let mut result: EmpyreanEphemerisResult = unsafe { std::mem::zeroed() };
+        let code = unsafe {
+            empyrean_generate_ephemeris(
+                ctx_ptr,
+                orbits.as_ptr(),
+                orbits.len(),
+                observers.as_ptr(),
+                observers.len(),
+                &cfg,
+                &mut result,
+            )
+        };
+        assert_eq!(
+            code,
+            0,
+            "all-failed is the accounting, not an error: {}",
+            last_err()
+        );
+        assert_eq!(result.num_orbits, 3);
+        assert_eq!(result.num_entries, 0);
+        let outcomes = unsafe { outcomes_slice(&result) };
+        assert!(
+            outcomes
+                .iter()
+                .all(|o| o.status == EMPYREAN_ORBIT_OUTCOME_FAILED)
+        );
+
+        unsafe { empyrean_ephemeris_result_free(&mut result) };
     }
 }

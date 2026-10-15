@@ -3,9 +3,7 @@ use std::panic::AssertUnwindSafe;
 
 use empyrean_core::Origin;
 use empyrean_core::constants::KM_PER_AU;
-use empyrean_core::convert::{
-    coordinate_state_to_coordinates, frame_to_int, representation_to_int,
-};
+use empyrean_core::convert::{coordinate_state_to_coordinates, frame_to_int};
 use empyrean_core::nongrav::{
     GFunction, NonGravModel, NonGravParams, SRPForceParams, SteeringLaw, ThrustArc, ThrustParams,
 };
@@ -14,8 +12,8 @@ use empyrean_core::photometry::PhotometricParams;
 use empyrean_core::propagation::events::{CaptureCriterion, DynamicalEvent};
 use empyrean_core::propagation::{
     AdvancedIntegratorConfig, DenseOrigin, DiagnosticsConfig, EphemerisOverlapPolicy, EventConfig,
-    IntegratorChoice, OriginSwitchingConfig, PropagationConfig, PropagationResult,
-    UncertaintyMethod, propagate,
+    IntegratorChoice, OrbitOutcome, OriginSwitchingConfig, PropagationConfig, PropagationError,
+    PropagationResult, UncertaintyMethod, propagate,
 };
 use empyrean_core::time::Epoch;
 
@@ -207,10 +205,11 @@ pub struct EmpyreanThrustArc {
 /// arcs, and photometry.
 ///
 /// Thrust: when `n_thrust_arcs > 0`, [`thrust_arcs`](Self::thrust_arcs)
-/// (plus the optional [`dv_corrections`](Self::dv_corrections) /
-/// [`correction_covariances`](Self::correction_covariances) side arrays)
-/// build a [`ThrustParams`] for this orbit. All-zero `a1/a2/a3` and
-/// `n_thrust_arcs == 0` is a pure-gravity orbit.
+/// (plus the optional [`dv_corrections`](Self::dv_corrections) side array)
+/// build a [`ThrustParams`] for this orbit; the per-correction burn-prior
+/// covariance rides the orbit's packed [`covariance`](Self::covariance)
+/// joint (its thrust axes). All-zero `a1/a2/a3` and `n_thrust_arcs == 0` is
+/// a pure-gravity orbit.
 ///
 /// `a1/a2/a3` are the Marsden–Sekanina RTN coefficients (radial,
 /// transverse, normal) in AU/day². `ng_alpha … ng_k` parameterize the
@@ -273,18 +272,6 @@ pub struct EmpyreanOrbit {
     /// or negative) when SBDB's `model_pars[]` exposes a `DT` field —
     /// e.g. 67P (+45.7d), 46P/Wirtanen (−14.1d), 2I/Borisov (−65.1d).
     pub non_grav_dt: f64,
-    /// Prior variance on the non-grav time delay DT (days²). NaN or ≤0 = no
-    /// prior; a finite positive value opens + priors the DT column in a
-    /// StateAndNonGravAndDT fit.
-    pub non_grav_dt_variance: f64,
-    /// 1 when `non_grav_covariance` carries a non-grav prior covariance; 0
-    /// otherwise. Set by the OD output path (a fitted orbit) so it re-feeds
-    /// into a StateAndNonGrav refine without losing its non-grav prior;
-    /// leave 0 for hand-built / SBDB / propagate inputs.
-    pub has_non_grav_covariance: u8,
-    /// Non-grav 3×3 covariance for (A1, A2, A3), row-major. Only read when
-    /// `has_non_grav_covariance = 1`.
-    pub non_grav_covariance: [[f64; 3]; 3],
     /// Phase-function model. `EMPYREAN_PHASE_FUNCTION_NONE` disables
     /// magnitude computation; the other values map to villeneuve's
     /// `PhaseFunction` enum.
@@ -328,21 +315,6 @@ pub struct EmpyreanOrbit {
     pub dv_corrections: *const [f64; 3],
     /// Number of corrections in [`dv_corrections`](Self::dv_corrections).
     pub n_dv_corrections: usize,
-    /// Optional 3×3 covariance (AU/day)² per Δv correction, positional with
-    /// [`dv_corrections`](Self::dv_corrections). When non-empty its length
-    /// MUST equal `n_dv_corrections`; a non-empty covariance triggers the
-    /// wide-Jet burn-sensitivity propagation. The engine's higher-order
-    /// (third-order) propagation path does not implement thrust-correction
-    /// covariance and rejects that combination loudly upstream
-    /// (`Not implemented: … ThirdOrder with thrust-correction covariance …`,
-    /// surfaced as a propagation error) rather than silently dropping the
-    /// covariance.
-    ///
-    /// **Ownership:** caller-owned; borrowed read-only for the call.
-    pub correction_covariances: *const [[f64; 3]; 3],
-    /// Number of entries in
-    /// [`correction_covariances`](Self::correction_covariances).
-    pub n_correction_covariances: usize,
     /// 1 when this orbit carries a solar-radiation-pressure force slot
     /// (`srp_amrat` + `srp_cr`); 0 otherwise. SRP is **never** value-inferred
     /// — this explicit switch is the only trigger, so a zero-init orbit
@@ -360,74 +332,26 @@ pub struct EmpyreanOrbit {
     /// dynamics, so a fitted AMRAT absorbs Cr. Only read when `has_srp == 1`;
     /// must be finite and > 0.
     pub srp_cr: f64,
-    /// Prior variance on AMRAT ((m²/kg)²). NaN or ≤0 = no prior (the AMRAT
-    /// column stays closed; SRP is applied as a fixed force). A finite
-    /// positive value opens + priors the AMRAT column in a StateAndAMRAT /
-    /// StateAndNonGravAndAMRAT fit. Only read when `has_srp == 1`.
-    pub srp_amrat_variance: f64,
 
     // ── Joint solved-parameter covariance (input) ──────────────────
     //
-    // Everything below is ABSENT in a `memset(0)` orbit and changes
+    // ABSENT in a `memset(0)` orbit (`covariance.width == 0`) and changes
     // nothing about how such an orbit propagates.
-    //
-    // The joint is supplied in FOUR non-overlapping homes, and one
-    // covariance entry belongs to exactly one of them. The engine
-    // refuses a term with two homes rather than merging or preferring:
-    //
-    //   state x state    -> state.covariance          (6x6)
-    //   A_i x A_j        -> non_grav_covariance       (3x3)
-    //   state x A_i      -> state.non_grav_cross      (6x3, on the
-    //                       CoordinateState, beside the 6x6 it borders)
-    //   dv_i x dv_j, SAME segment
-    //                    -> correction_covariances[i] (3x3)
-    //   everything else  -> state_param_cross / param_pair_cross
-    //
-    // "Everything else" is state x DT, state x AMRAT, state x dv, and
-    // every mixed pair (DT x A2, A1 x AMRAT, AMRAT x dv, segment i x
-    // segment j).
-    //
-    // The state-to-Marsden 6x3 border is NOT here: it lives on `state`,
-    // the embedded `CoordinateState`, whose docs say why.
-    /// State-to-parameter cross columns for every solved parameter that
-    /// is **not** Marsden — state↔DT, state↔AMRAT, state↔Δv.
+    /// The orbit's full solved-parameter covariance as ONE packed joint —
+    /// the single covariance home at this ABI, carrying the state 6×6, the
+    /// Marsden / DT / AMRAT blocks, every thrust-segment block (a burn
+    /// prior), and all their cross terms. A `memset(0)` orbit has
+    /// `covariance.width == 0` and supplies none. See
+    /// [`EmpyreanPackedJoint`](crate::joint::EmpyreanPackedJoint) for the
+    /// axis table, the triangle layout and the basis.
     ///
-    /// Null / `n_state_param_cross == 0` ⇒ none. A null pointer with a
-    /// non-zero count is a loud argument error; a non-null pointer with
-    /// a zero count is absent and never read (the `thrust_arcs`
-    /// precedent).
-    ///
-    /// **Ownership:** caller-owned; borrowed read-only for the duration
-    /// of the call. The C ABI never frees it. Note the asymmetry with
-    /// the same arrays on
-    /// [`EmpyreanODResult`](crate::od::EmpyreanODResult), which are
-    /// library-owned: a caller re-feeding a result into a call must
-    /// **copy, not alias**.
-    ///
-    /// Entry order does not matter — entries are identified by their
-    /// `column` tag, never by position. Supplying the same parameter
-    /// twice is a loud error rather than a last-one-wins.
-    pub state_param_cross: *const crate::joint::EmpyreanStateParamCross,
-    /// Number of entries in
-    /// [`state_param_cross`](Self::state_param_cross).
-    pub n_state_param_cross: usize,
-    /// Parameter-to-parameter cross terms with no other home — DT↔\\(A_2\\),
-    /// \\(A_1\\)↔AMRAT, AMRAT↔Δv, segment \\(i\\)↔segment \\(j\\).
-    ///
-    /// Same ownership, absence and ordering rules as
-    /// [`state_param_cross`](Self::state_param_cross). The term is
-    /// symmetric, so supplying both \\((a, b)\\) and \\((b, a)\\) is the
-    /// same loud duplicate error as supplying one of them twice.
-    ///
-    /// Intra-segment Δv pairs do **not** belong here — segment `i`'s own
-    /// `correction_covariances[i]` already supplies its internal pairs,
-    /// and the engine refuses the duplicate home. Cross-segment pairs
-    /// have no other home and do belong here. That is the one place
-    /// where "which 3×3 does this go in" has a non-obvious answer.
-    pub param_pair_cross: *const crate::joint::EmpyreanParamPairCross,
-    /// Number of entries in
-    /// [`param_pair_cross`](Self::param_pair_cross).
-    pub n_param_pair_cross: usize,
+    /// **Ownership:** the `tri` pointer is caller-owned; borrowed read-only
+    /// for the duration of the call. The C ABI never frees it. Note the
+    /// asymmetry with the same struct on
+    /// [`EmpyreanODResult`](crate::od::EmpyreanODResult) and on result
+    /// rows, whose `tri` is library-owned: a caller re-feeding a result
+    /// into a call must **copy, not alias**.
+    pub covariance: crate::joint::EmpyreanPackedJoint,
 
     // ── Photometric parameter covariance ───────────────────────────
     //
@@ -537,10 +461,12 @@ pub const EMPYREAN_ORIGIN_SWITCHING_OFF: u8 = 2;
 /// published papers; `epsilon` is interpreted as the relative b₆
 /// truncation tolerance.
 ///
-/// Sentinel rule: `0.0` requests the upstream default for `epsilon` /
-/// `encounter_timescale_divisor`; `dt_initial` / `dt_min` use NaN to
-/// mean "auto-compute"; `0` requests the upstream defaults for
-/// `max_steps` and `max_dense_steps`.
+/// Sentinel rule: `0.0` requests the upstream default for `epsilon`;
+/// `dt_initial` / `dt_min` use NaN to mean "auto-compute"; `0` requests
+/// the upstream defaults for `max_steps` and `max_dense_steps`.
+///
+/// The encounter dynamical-timescale step floor is no longer a knob here:
+/// the engine derives it from `epsilon`, so there is nothing to set.
 #[repr(C)]
 pub struct EmpyreanAdvancedIntegratorConfig {
     /// Integrator backend (0 = GR15 default, 1 = DOP853). See
@@ -554,8 +480,6 @@ pub struct EmpyreanAdvancedIntegratorConfig {
     pub dt_initial: f64,
     /// Minimum allowed step size in days. NaN → auto.
     pub dt_min: f64,
-    /// Encounter dynamical-timescale step floor divisor. 0.0 → upstream default (1000.0).
-    pub encounter_timescale_divisor: f64,
     /// Maximum integration steps before aborting. 0 → upstream default (10_000_000).
     pub max_steps: usize,
     /// Memory cap on the per-step b-coefficient cache. 0 → upstream default (100_000).
@@ -874,11 +798,26 @@ pub struct EmpyreanPropagationConfig {
 ///
 /// The SPK is the authoritative solution for that body, so the returned
 /// states are exact *for the body itself* — but the caller's own initial
-/// condition is discarded, and nothing is integrated, so there is no
-/// dense trajectory, no STM, and no sensitivity chain. Ephemeris
-/// generation and the radar forward model both read the dense trajectory
-/// and therefore **fail** for an overlapped body under this policy; pass
-/// [`EMPYREAN_EPHEMERIS_OVERLAP_POLICY_EXCLUDE_AND_INTEGRATE`] there.
+/// condition is discarded, and nothing is integrated, so there is no STM
+/// and no sensitivity chain.
+///
+/// **Optical ephemeris generation succeeds** under this policy: it is
+/// served off the body's own SPK-backed trajectory — the best available
+/// solution for that body — and the substitution is reported on the
+/// result's warnings channel, naming the body and saying whether a
+/// declared covariance was dropped. Those rows carry **no sky
+/// covariance**: a covariance belongs to the caller's initial condition,
+/// and that is exactly what a substitution discards.
+///
+/// **Radar generation still fails** under this policy. Its Jacobian is a
+/// non-optional part of the radar contract and is composed on the STM,
+/// which a substituted trajectory does not have; the refusal names the
+/// body and both remedies.
+///
+/// Pass [`EMPYREAN_EPHEMERIS_OVERLAP_POLICY_EXCLUDE_AND_INTEGRATE`] when
+/// you need the caller's own initial condition propagated — a covariance
+/// transported to the observation epochs, a radar prediction, or
+/// anything differential.
 pub const EMPYREAN_EPHEMERIS_OVERLAP_POLICY_SUBSTITUTE_SPK: i32 = 0;
 /// Drop the overlapped perturber from the force model and integrate the
 /// caller's own initial conditions, reporting the overlap.
@@ -916,7 +855,9 @@ pub(crate) fn int_to_ephemeris_overlap_policy(v: i32) -> Result<EphemerisOverlap
 /// [`UncertaintyMethod::Auto`]'s CA windows.
 pub const EMPYREAN_COVARIANCE_KIND_LINEAR: u8 = 0;
 pub const EMPYREAN_COVARIANCE_KIND_SECOND_ORDER: u8 = 1;
-pub const EMPYREAN_COVARIANCE_KIND_THIRD_ORDER: u8 = 2;
+// Value 2 was `EMPYREAN_COVARIANCE_KIND_THIRD_ORDER`, retired with the engine
+// third-order path. The number is left UNASSIGNED (nothing renumbered); a
+// caller passing it is refused by name rather than folded onto a kind.
 pub const EMPYREAN_COVARIANCE_KIND_MIXTURE: u8 = 3;
 /// Monte Carlo sample covariance. The run's RNG seed is carried in the
 /// Monte-Carlo request config ([`EmpyreanUncertaintyMethod::mc_seed`]),
@@ -926,38 +867,27 @@ pub const EMPYREAN_COVARIANCE_KIND_MONTE_CARLO: u8 = 4;
 /// canonical 2N+1 sigma-point set. Deterministic and parameter-free —
 /// no per-row payload.
 pub const EMPYREAN_COVARIANCE_KIND_SIGMA_POINT: u8 = 5;
-
-// ── Covariance definiteness (TaggedCovariance.quality) ──────────────
-/// All eigenvalues positive within round-off; `quality_min_eig` is NaN.
-pub const EMPYREAN_COVARIANCE_QUALITY_POSITIVE_DEFINITE: u8 = 0;
-/// At least one meaningfully negative eigenvalue; `quality_min_eig` is
-/// that smallest (negative) eigenvalue.
-pub const EMPYREAN_COVARIANCE_QUALITY_INDEFINITE: u8 = 1;
-/// Explicitly repaired to positive semi-definite; `quality_min_eig` is
-/// the smallest eigenvalue *before* repair. Never emitted by the
-/// `_cartesian` accessor (which only classifies, never repairs).
-pub const EMPYREAN_COVARIANCE_QUALITY_REPAIRED: u8 = 2;
-/// The matrix is positive definite, **but** the Taylor expansion that
-/// produced it shows signs of having left its validity domain — the
-/// beyond-linear correction is large relative to the linear spread.
-/// `quality_kappa_state` carries the block-wise quadratic/linear ratio
-/// that triggered it; `quality_min_eig` is NaN (there is no negative
-/// eigenvalue — the matrix is definite).
+/// The engine produced a covariance kind this ABI has no tag for — a
+/// version-skew tripwire, not a kind.
 ///
-/// The moments are still the ones that were requested, but they must
-/// **not** be presented as an authoritative Gaussian: an unflagged
-/// second-order result through a deep close approach has been observed
-/// ~10³× wide of the Monte-Carlo truth. Surfaced as its own tag rather
-/// than folded into `POSITIVE_DEFINITE`, which would hide the
-/// degradation behind a clean bill of health.
-pub const EMPYREAN_COVARIANCE_QUALITY_EXPANSION_SUSPECT: u8 = 3;
-
-// ── Target functional (TaggedCovariance.target_functional) ──────────
-/// Generic Cartesian-state second moment.
-pub const EMPYREAN_TARGET_FUNCTIONAL_CARTESIAN_STATE: u8 = 0;
-/// Tied to the close-approach miss-distance functional — NOT a generic
-/// state σ. Never emitted by the `_cartesian` accessor.
-pub const EMPYREAN_TARGET_FUNCTIONAL_CLOSE_APPROACH_MISS_DISTANCE: u8 = 1;
+/// `CovarianceKind` is `#[non_exhaustive]` on the engine side, so a
+/// library built against a newer engine than the tags above describe can
+/// resolve a kind that has no number here. Rather than fold it onto
+/// `LINEAR` (or any other concrete tag), which would hand a consumer a
+/// covariance labelled with a construction that did not produce it, such
+/// a row is tagged with this value. It is **not** a covariance kind a
+/// caller can interpret: the matrix beside it is whatever the newer
+/// engine produced, and the only correct response is to stop and update
+/// the ABI. Both wrappers above this layer already do stop — the safe
+/// Rust wrapper's tag decode errors on any unrecognised value, and the
+/// Python decode table has no entry for one.
+///
+/// Numbered away from the concrete kinds on purpose: `6..` stays free
+/// for real kinds as the engine grows them, and `0xFF` is already the
+/// "not applicable" sentinel that
+/// [`EmpyreanEvent::resolved_kind`](EmpyreanEvent::resolved_kind) fills
+/// on non-regime events, which this must not be confused with.
+pub const EMPYREAN_COVARIANCE_KIND_UNKNOWN: u8 = 0xFE;
 
 // ── Tagged-covariance accessor return codes ─────────────────────────
 /// Success.
@@ -995,6 +925,21 @@ pub const EMPYREAN_TAGGED_COV_CHAIN_ORBIT_COUNT_MISMATCH: i32 = -10;
 /// exist). Refused at the seam: a covariance served under another
 /// epoch's label is invisible in the returned series.
 pub const EMPYREAN_TAGGED_COV_SAMPLE_ROW_EPOCH_MISMATCH: i32 = -11;
+/// The engine refused with a failure this ABI has no code for — a
+/// version-skew tripwire, not a diagnosis.
+///
+/// `CovarianceSeriesError` is `#[non_exhaustive]`, so an engine newer
+/// than the codes above can refuse for a reason none of them names.
+/// Reporting the nearest-looking specific code would send an operator to
+/// the wrong remedy — "widen the coverage window" for a failure that has
+/// nothing to do with coverage — so an unnamed refusal gets its own
+/// code. The call failed and produced nothing either way; what this adds
+/// is that the reason is unavailable at this ABI version, and the fix is
+/// to give it a code of its own. Numbered beside
+/// [`EMPYREAN_TAGGED_COV_PANIC`] because it is the same kind of
+/// boundary condition — something the ABI could not describe — rather
+/// than the next entry in the sequence of real, diagnosable failures.
+pub const EMPYREAN_TAGGED_COV_UNKNOWN: i32 = -98;
 /// A panic was caught at the boundary.
 pub const EMPYREAN_TAGGED_COV_PANIC: i32 = -99;
 
@@ -1023,37 +968,24 @@ pub struct EmpyreanPropagatedState {
     /// Defaults to `LINEAR` for non-Auto methods and for Auto epochs
     /// outside CA windows.
     pub resolved_kind: u8,
-    /// The propagated joint's cross terms — the state↔Marsden border and
-    /// the wide carrier at this epoch, in the Cartesian basis of the
-    /// \\(6 \times 6\\) above.
+    /// The resolved covariance at this output epoch as the single packed
+    /// joint — layout bitsets, the packed lower triangle (degree basis on
+    /// the angular state rows), and the kind / quality / functional /
+    /// provenance tags read straight off the engine value.
     ///
-    /// # This is what makes leg chaining possible
+    /// It is the state covariance resolved at THIS row's own delivered kind
+    /// (a Linear row linearly, a SecondOrder row at second order), never
+    /// re-derived at another order and never downgraded. The state↔parameter
+    /// border and the wide carrier are NOT on this inline joint; reach for
+    /// the opt-in covariance series
+    /// ([`empyrean_propagation_covariance_series_cartesian`]) when the
+    /// off-diagonal blocks are wanted.
     ///
-    /// [`covariance`](Self::covariance) is only the state block of the
-    /// propagated joint. Feeding leg 2 that block alone hands the engine
-    /// a block-diagonal covariance, and the engine cannot tell — while
-    /// the joint it actually computed has non-zero state↔parameter
-    /// columns **even when leg 1's input was block-diagonal**, because
-    /// propagation itself generates that correlation. A chained
-    /// propagation that drops this is not an approximation of the
-    /// single-leg answer; it is a different and tighter claim.
+    /// Absent (`width = 0`, `tri` null) when the orbit produced no tensors at
+    /// this epoch — not supplied, never asserted zero correlation.
     ///
-    /// Re-feed it onto an [`EmpyreanOrbit`] together with the parameter
-    /// blocks the crosses are conditioned on — the orbit's own
-    /// `non_grav_covariance`, `non_grav_dt_variance`,
-    /// `srp_amrat_variance` and `correction_covariances` — which
-    /// propagation carries through unchanged from the input orbit. See
-    /// [`EmpyreanOrbitCovariance`](crate::joint::EmpyreanOrbitCovariance)
-    /// for the field-by-field copy.
-    ///
-    /// Absent (`has_non_grav_cross = 0`, both pointers null) when the
-    /// orbit carried no solved-parameter block, when its layout is
-    /// Marsden-only (the whole border is then in `non_grav_cross` and
-    /// there is no carrier), or when a sigma-point run could not
-    /// reconstruct this row.
-    ///
-    /// **Library-owned**, freed with the parent result.
-    pub orbit_cov: crate::joint::EmpyreanOrbitCovariance,
+    /// **Library-owned** `tri`, freed with the parent result.
+    pub orbit_cov: crate::joint::EmpyreanPackedJoint,
 }
 
 /// A detected dynamical event from propagation.
@@ -1170,27 +1102,72 @@ pub struct EmpyreanEvent {
     pub ip_mc: f64,
 }
 
+/// Mixture component status — resolved: the sub-propagation reached its
+/// horizon cleanly.
+#[allow(dead_code)]
+pub const EMPYREAN_MIXTURE_COMPONENT_STATUS_RESOLVED: u8 = 0;
+/// Mixture component status — refused for curvature; carries the measured
+/// `rho` in [`EmpyreanMixtureComponent::rho`].
+#[allow(dead_code)]
+pub const EMPYREAN_MIXTURE_COMPONENT_STATUS_CURVATURE_REFUSED: u8 = 1;
+/// Mixture component status — still inside a zone at its horizon.
+#[allow(dead_code)]
+pub const EMPYREAN_MIXTURE_COMPONENT_STATUS_UNRESOLVED: u8 = 2;
+/// Mixture component status — the sub-propagation failed.
+#[allow(dead_code)]
+pub const EMPYREAN_MIXTURE_COMPONENT_STATUS_FAILED: u8 = 3;
+/// Mixture component status — refused because the sampled on-sky ensemble
+/// overflowed the flat-sky linearization bound; carries the measured
+/// angular `extent` in RADIANS in [`EmpyreanMixtureComponent::rho`] (the
+/// side-value slot). Appended (villeneuve 1.26.0); the discriminant is
+/// append-only, so this takes `4` even though the engine enum orders
+/// `SkyLinearizationRefused` before `Unresolved`.
+#[allow(dead_code)]
+pub const EMPYREAN_MIXTURE_COMPONENT_STATUS_SKY_LINEARIZATION_REFUSED: u8 = 4;
+
 /// One Gaussian sub-component of an AGM mixture decomposition.
 ///
 /// Mirrors
 /// [`empyrean_core::propagation::MixtureComponent`]. The mean carries
-/// the *propagated* sub-Gaussian centroid at the CA epoch (f64 from
-/// the Jet2 integrator); the covariance is the linearly-mapped
-/// \\(\Phi \, \Sigma_k \, \Phi^\top\\) over the same propagation
-/// segment. A consumer can evaluate
-/// \\(\sum_k w_k \\, \mathcal{N}(x \mid \mu_k, \Sigma_k)\\) directly
-/// at the CA epoch.
+/// the *propagated* sub-Gaussian centroid at the CA epoch (the leading
+/// six elements of the engine's N-wide shift); the covariance travels as
+/// ONE packed [`joint`](Self::joint) — the single covariance home — so a
+/// consumer can evaluate
+/// \\(\sum_k w_k \\, \mathcal{N}(x \mid \mu_k, \Sigma_k)\\) directly at
+/// the CA epoch after reading each joint's state block.
 ///
 /// Each component is basis-tagged: `frame` / `origin` give the
-/// reference frame and center body its `mean` and `covariance` are
-/// expressed in, so the mixture is self-describing rather than relying
-/// on positional alignment with the propagated states.
+/// reference frame and center body its `mean` and `joint` are expressed
+/// in, so the mixture is self-describing rather than relying on
+/// positional alignment with the propagated states.
 #[repr(C)]
 pub struct EmpyreanMixtureComponent {
     pub weight: f64,
     pub mean: [f64; 6],
-    pub covariance: [[f64; 6]; 6],
-    /// Reference frame `mean` / `covariance` are expressed in — the
+    /// The component covariance as ONE packed joint — the single
+    /// covariance home. Its tags (kind / quality / functional /
+    /// provenance) are read off the engine `Uncertainty` the facade
+    /// rebuilds, never literals; the provenance is the engine's own
+    /// `Derived`. **Library-owned** `tri`, freed with the result.
+    pub joint: crate::joint::EmpyreanPackedJoint,
+    /// Component status — the engine `ComponentStatus` wire form, one of
+    /// the `EMPYREAN_MIXTURE_COMPONENT_STATUS_*` values (`0` Resolved,
+    /// `1` CurvatureRefused, `2` Unresolved, `3` Failed,
+    /// `4` SkyLinearizationRefused).
+    pub status: u8,
+    /// The side value a refusal measured — the single slot the engine's
+    /// `component_status_wire` packs the refusal's one number into. Carried
+    /// (`!NaN`) only for the two refusal statuses, which measure DIFFERENT
+    /// quantities: for `EMPYREAN_MIXTURE_COMPONENT_STATUS_CURVATURE_REFUSED`
+    /// it is the dimensionless state-space curvature ρ; for
+    /// `EMPYREAN_MIXTURE_COMPONENT_STATUS_SKY_LINEARIZATION_REFUSED` it is the
+    /// on-sky angular extent in RADIANS that overflowed the flat-sky
+    /// linearization bound. `NaN` for every other status, never a zero that
+    /// would read as "measured, and flat". (The field name is historical —
+    /// ρ was the only side value when it was introduced — and kept for ABI
+    /// stability; read it against `status` to know which quantity it holds.)
+    pub rho: f64,
+    /// Reference frame `mean` / `joint` are expressed in — the
     /// integration frame of the run. Same integer encoding as
     /// `EmpyreanPropagatedState.frame` (0 = ICRF, 1 = ecliptic J2000,
     /// 2 = ITRF93).
@@ -1236,10 +1213,145 @@ pub struct EmpyreanMixtureChain {
     pub num_components_total: usize,
 }
 
+// ── Per-orbit delivery outcome ───────────────────────────────
+//
+// The engine's batch propagate is orbit-major and carries a per-orbit
+// delivery verdict: a single orbit's integration (or covariance) failure no
+// longer ends the whole call — the failing orbit's slot records the failure
+// with zero rows while every other orbit delivers its bits, and the call
+// still succeeds. Only a CALL-level refusal (an input the whole batch is
+// rejected on — a push-code refusal, empty times, an over-machine thread
+// budget) stays an error return. This surface makes that per-orbit verdict
+// visible so a failed orbit no longer silently vanishes from a shorter output.
+
+/// Input orbit `k` was propagated and occupies its row block
+/// (`outcomes[k].first_row .. first_row + num_rows`); that block may be
+/// legitimately empty (a marker stop before the first requested epoch).
+pub const EMPYREAN_ORBIT_OUTCOME_DELIVERED: i32 = 0;
+/// Input orbit `k` failed; `error_code` / `error_message` name the cause and
+/// `num_rows == 0`. Delivery is this status alone, never the row count.
+pub const EMPYREAN_ORBIT_OUTCOME_FAILED: i32 = 1;
+
+/// Per-orbit failure classification (`EmpyreanOrbitOutcome::error_code`),
+/// following the `EMPYREAN_OD_FAILURE_*` family idiom: a small positive code
+/// per failure axis a consumer acts on, with the full engine text always on
+/// `error_message`. `NONE` on a delivered orbit.
+pub const EMPYREAN_PROPAGATE_FAILURE_NONE: i32 = 0;
+/// Numerical integration failed for this orbit (`Integration`).
+pub const EMPYREAN_PROPAGATE_FAILURE_INTEGRATION: i32 = 1;
+/// Kepler back-propagation to \\(t-\Delta T\\) failed while DT is solved-for
+/// (`KeplerDTBackPropagation`).
+pub const EMPYREAN_PROPAGATE_FAILURE_KEPLER_DT_BACKPROP: i32 = 2;
+/// A frame/representation transform failed for this orbit (`Transform`,
+/// `CrossRepresentationUnsupported`).
+pub const EMPYREAN_PROPAGATE_FAILURE_TRANSFORM: i32 = 3;
+/// The input covariance was not usable (`StateCovarianceNotPositiveDefinite`,
+/// `StateCovarianceZeroVarianceAxis`, `ParameterBlockNotPositiveSemidefinite`,
+/// `ParameterCrossPartitionViolation`, `MarsdenCrossWithoutBlock`,
+/// `CrossParameterNotSolved`).
+pub const EMPYREAN_PROPAGATE_FAILURE_COVARIANCE_INPUT: i32 = 4;
+/// A sigma-point set could not be constructed / configured
+/// (`SigmaPointConstruction`, `SigmaPointConfigurationUnsupported`).
+pub const EMPYREAN_PROPAGATE_FAILURE_SIGMA_POINT: i32 = 5;
+/// A drawn sample left a parameter's valid domain
+/// (`SampledParameterOutOfDomain`).
+pub const EMPYREAN_PROPAGATE_FAILURE_SAMPLED_PARAMETER: i32 = 6;
+/// An ensemble member sub-propagation failed (`EnsembleMemberFailed`).
+pub const EMPYREAN_PROPAGATE_FAILURE_ENSEMBLE_MEMBER: i32 = 7;
+/// A delivered row's covariance was unpublishable at output assembly
+/// (`RowCovarianceUnpublishable`, `RowCovarianceWithoutProvenance`,
+/// `OutputAssembly`, `OutputAssemblyInvariant`).
+pub const EMPYREAN_PROPAGATE_FAILURE_OUTPUT_ASSEMBLY: i32 = 8;
+/// Any other carried per-orbit failure, including a variant added by a newer
+/// engine (`PropagationError` is `#[non_exhaustive]`). The full cause is on
+/// `error_message`; nothing is hidden.
+pub const EMPYREAN_PROPAGATE_FAILURE_OTHER: i32 = 99;
+
+/// Classify a carried per-orbit [`PropagationError`] into its
+/// `EMPYREAN_PROPAGATE_FAILURE_*` code. `PropagationError` is
+/// `#[non_exhaustive]`, so the `_OTHER` arm is required and catches a
+/// newer engine's variant; the full text always rides `error_message`,
+/// so a coarse code is never a silent drop.
+fn propagation_error_code(e: &PropagationError) -> i32 {
+    match e {
+        PropagationError::Integration { .. } => EMPYREAN_PROPAGATE_FAILURE_INTEGRATION,
+        PropagationError::KeplerDTBackPropagation { .. } => {
+            EMPYREAN_PROPAGATE_FAILURE_KEPLER_DT_BACKPROP
+        }
+        PropagationError::Transform { .. }
+        | PropagationError::CrossRepresentationUnsupported { .. } => {
+            EMPYREAN_PROPAGATE_FAILURE_TRANSFORM
+        }
+        PropagationError::StateCovarianceNotPositiveDefinite { .. }
+        | PropagationError::StateCovarianceZeroVarianceAxis { .. }
+        | PropagationError::ParameterBlockNotPositiveSemidefinite { .. }
+        | PropagationError::ParameterCrossPartitionViolation { .. }
+        | PropagationError::MarsdenCrossWithoutBlock { .. }
+        | PropagationError::CrossParameterNotSolved { .. } => {
+            EMPYREAN_PROPAGATE_FAILURE_COVARIANCE_INPUT
+        }
+        PropagationError::SigmaPointConstruction { .. }
+        | PropagationError::SigmaPointConfigurationUnsupported { .. } => {
+            EMPYREAN_PROPAGATE_FAILURE_SIGMA_POINT
+        }
+        PropagationError::SampledParameterOutOfDomain { .. } => {
+            EMPYREAN_PROPAGATE_FAILURE_SAMPLED_PARAMETER
+        }
+        PropagationError::EnsembleMemberFailed { .. } => EMPYREAN_PROPAGATE_FAILURE_ENSEMBLE_MEMBER,
+        PropagationError::RowCovarianceUnpublishable { .. }
+        | PropagationError::RowCovarianceWithoutProvenance { .. }
+        | PropagationError::OutputAssembly { .. }
+        | PropagationError::OutputAssemblyInvariant { .. } => {
+            EMPYREAN_PROPAGATE_FAILURE_OUTPUT_ASSEMBLY
+        }
+        _ => EMPYREAN_PROPAGATE_FAILURE_OTHER,
+    }
+}
+
+/// The delivery outcome of one INPUT orbit in a batch propagate, one entry per
+/// input orbit in `EmpyreanPropagationResult::outcomes`, positionally aligned
+/// with the input orbit batch.
+///
+/// `status` is the SOLE discriminator of delivery
+/// (`EMPYREAN_ORBIT_OUTCOME_{DELIVERED,FAILED}`) — never `num_rows`, which is
+/// zero for a delivered orbit whose marker stop fired before its first
+/// requested epoch. A delivered orbit's rows are
+/// `states[first_row .. first_row + num_rows]`; a failed orbit carries
+/// `num_rows == 0`, a classified `error_code` (`EMPYREAN_PROPAGATE_FAILURE_*`)
+/// and the engine's `error_message`. A delivered orbit carries
+/// `error_code == EMPYREAN_PROPAGATE_FAILURE_NONE` and a null `error_message`.
+#[repr(C)]
+pub struct EmpyreanOrbitOutcome {
+    /// `EMPYREAN_ORBIT_OUTCOME_DELIVERED` or `_FAILED`.
+    pub status: i32,
+    /// `EMPYREAN_PROPAGATE_FAILURE_*` classification of a failed orbit;
+    /// `EMPYREAN_PROPAGATE_FAILURE_NONE` when delivered.
+    pub error_code: i32,
+    /// Owning C string with the full engine failure text for a failed orbit;
+    /// null when delivered. Freed by `empyrean_propagation_result_free`.
+    pub error_message: *mut std::ffi::c_char,
+    /// Offset of this orbit's first delivered row in `states`. Meaningful for
+    /// a delivered orbit; `0` with `num_rows == 0` for a failed one.
+    pub first_row: usize,
+    /// Delivered row count for this orbit (`states[first_row ..
+    /// first_row + num_rows]`). Zero for a failed orbit, and legitimately zero
+    /// for a delivered orbit whose marker stop fired before its first epoch.
+    pub num_rows: usize,
+}
+
 /// Propagation result containing states, events, and object identifiers.
 ///
 /// `mixtures` is per-orbit (not per-state), so when populated its length
 /// is the input orbit count, not `num_states`.
+///
+/// `outcomes` is the per-INPUT-orbit delivery channel: `num_orbits` entries
+/// (the INPUT orbit count), one [`EmpyreanOrbitOutcome`] per input orbit in
+/// input order. `num_states` stays the DELIVERED row count; a failed orbit
+/// contributes no rows, and `outcomes[k].first_row` / `num_rows` map each
+/// input orbit onto its block of `states`. A batch in which every orbit failed
+/// returns successfully with `num_states == 0` and every outcome `FAILED` —
+/// the engine delivered the accounting; only a call-level input refusal is an
+/// error return.
 #[repr(C)]
 pub struct EmpyreanPropagationResult {
     pub states: *mut EmpyreanPropagatedState,
@@ -1271,6 +1383,15 @@ pub struct EmpyreanPropagationResult {
     /// freed by `empyrean_propagation_result_free`. Null when the
     /// propagation produced no retainable result.
     pub lazy_handle: *mut std::ffi::c_void,
+    /// The INPUT orbit count — the length of `outcomes`, and the number of
+    /// orbits the batch was given, whatever each delivered.
+    pub num_orbits: usize,
+    /// One [`EmpyreanOrbitOutcome`] per input orbit, in input order
+    /// (`num_orbits` entries). The per-orbit delivery channel: read delivery
+    /// from `outcomes[k].status`, and map rows to input orbits with
+    /// `first_row` / `num_rows`. Owning; freed by
+    /// `empyrean_propagation_result_free`.
+    pub outcomes: *mut EmpyreanOrbitOutcome,
 }
 
 // ── Helpers ─────────────────────────────────────────────────
@@ -1292,10 +1413,17 @@ pub(crate) fn covariance_kind_to_u8(k: empyrean_core::propagation::CovarianceKin
     match k {
         K::Linear => EMPYREAN_COVARIANCE_KIND_LINEAR,
         K::SecondOrder => EMPYREAN_COVARIANCE_KIND_SECOND_ORDER,
-        K::ThirdOrder => EMPYREAN_COVARIANCE_KIND_THIRD_ORDER,
         K::Mixture => EMPYREAN_COVARIANCE_KIND_MIXTURE,
         K::MonteCarlo { .. } => EMPYREAN_COVARIANCE_KIND_MONTE_CARLO,
         K::SigmaPoint => EMPYREAN_COVARIANCE_KIND_SIGMA_POINT,
+        // `CovarianceKind` is `#[non_exhaustive]`, so this arm is what a
+        // kind added by a newer engine lands in. It gets its own tag
+        // instead of a fallback onto `LINEAR`: a mislabelled covariance
+        // is undetectable downstream, whereas
+        // `EMPYREAN_COVARIANCE_KIND_UNKNOWN` is refused by every decoder
+        // above this layer. Delete this arm's reason for existing by
+        // giving the new kind a tag of its own — do not widen this one.
+        _ => EMPYREAN_COVARIANCE_KIND_UNKNOWN,
     }
 }
 
@@ -1355,9 +1483,6 @@ fn build_advanced_from_c(c: &EmpyreanAdvancedIntegratorConfig) -> AdvancedIntegr
     }
     if c.dt_min.is_finite() {
         a.dt_min = Some(c.dt_min);
-    }
-    if c.encounter_timescale_divisor > 0.0 {
-        a.encounter_timescale_divisor = c.encounter_timescale_divisor;
     }
     if c.max_steps > 0 {
         a.max_steps = c.max_steps;
@@ -1519,7 +1644,16 @@ pub(crate) fn build_propagation_config_from_c(
     }
 
     cfg.uncertainty_method = flat_to_uncertainty_method(&c.uncertainty_method)?.into();
-    cfg.compute_stm = c.compute_stm != 0;
+    // villeneuve 1.26.0: the engine's STM request is `derivatives:
+    // DerivativeOrder`, not a `compute_stm` flag. The C ABI keeps the boolean
+    // `compute_stm` knob; a set flag asks for first-order (Jet1) partials, a
+    // clear flag for none, leaving any higher order to the uncertainty method
+    // or an input covariance.
+    cfg.derivatives = if c.compute_stm != 0 {
+        empyrean_core::propagation::DerivativeOrder::FirstOrder
+    } else {
+        empyrean_core::propagation::DerivativeOrder::None
+    };
 
     cfg.frame = empyrean_core::convert::int_to_frame(c.frame).map_err(|e| e.to_string())?;
     cfg.events = build_event_config_from_c(&c.events)?;
@@ -1606,22 +1740,14 @@ pub(crate) fn refuse_detection_off_with_ca_driven_method(
 /// Yarkovsky); any non-zero value selects the explicit SBDB Marsden–Sekanina
 /// g(r). A non-finite `non_grav_dt` means "no thermal-lag delay".
 pub(crate) fn empyrean_orbit_non_grav_params(orbit: &EmpyreanOrbit) -> Option<NonGravParams> {
-    // Non-grav is present when the caller supplies Marsden *values* (non-zero
-    // A1/A2/A3 — the apply case) OR declares a fit prior on the block: a
-    // non-grav covariance (to solve A1/A2/A3 from a zero start) or a DT
-    // value/variance. Value-inferring presence from the coefficients alone
-    // would drop the covariance that a zero-seeded Marsden solve needs to open
-    // its column (villeneuve emits the Marsden Jacobian only when the
-    // covariance is declared) — the same "explicit switch, don't infer" rule
-    // `has_srp` uses.
-    let has_dt = orbit.non_grav_dt.is_finite()
-        || (orbit.non_grav_dt_variance.is_finite() && orbit.non_grav_dt_variance > 0.0);
-    if orbit.a1 == 0.0
-        && orbit.a2 == 0.0
-        && orbit.a3 == 0.0
-        && orbit.has_non_grav_covariance == 0
-        && !has_dt
-    {
+    // This builder carries the Marsden *values* and the g(r) model; the
+    // non-grav fit prior (the Marsden 3×3 and the DT variance) rides the
+    // orbit's packed joint now, attached separately via
+    // `push_orbit_with_joint`, so it is no longer a trigger here. Non-grav
+    // is present when the caller supplies Marsden values (non-zero A1/A2/A3 —
+    // the apply case) or a finite DT value.
+    let has_dt = orbit.non_grav_dt.is_finite();
+    if orbit.a1 == 0.0 && orbit.a2 == 0.0 && orbit.a3 == 0.0 && !has_dt {
         return None;
     }
     let g_func = if orbit.ng_alpha == 0.0
@@ -1645,24 +1771,13 @@ pub(crate) fn empyrean_orbit_non_grav_params(orbit: &EmpyreanOrbit) -> Option<No
         a2: orbit.a2,
         a3: orbit.a3,
         model: NonGravModel::MarsdenSekanina(g_func),
-        // Carry the non-grav prior covariance back in when present so a
-        // fitted orbit re-feeds into a StateAndNonGrav refine.
-        covariance: if orbit.has_non_grav_covariance != 0 {
-            Some(orbit.non_grav_covariance)
-        } else {
-            None
-        },
+        // DT is a fittable axis in v1.20.0; propagation input carries the DT
+        // value here, while its prior variance rides the packed joint's DT
+        // axis (attached via `push_orbit_with_joint`) rather than a scalar
+        // field, so a re-fed orbit opens + priors the DT column from the
+        // joint.
         dt: if orbit.non_grav_dt.is_finite() {
             Some(orbit.non_grav_dt)
-        } else {
-            None
-        },
-        // DT is a fittable axis in v1.20.0; propagation input carries the DT
-        // value (above); carry its prior variance too when supplied so a
-        // re-fed orbit opens + priors the DT column in a StateAndNonGravAndDT
-        // refine.
-        dt_variance: if orbit.non_grav_dt_variance.is_finite() && orbit.non_grav_dt_variance > 0.0 {
-            Some(orbit.non_grav_dt_variance)
         } else {
             None
         },
@@ -1678,39 +1793,24 @@ pub(crate) fn empyrean_orbit_non_grav_params(orbit: &EmpyreanOrbit) -> Option<No
 /// round-trip) so none of them silently drops the caller's SRP slot. SRP is
 /// an additive force slot — combinable with the Marsden A1/A2/A3 non-grav on
 /// the same orbit — and, unlike Marsden, is **never value-inferred**:
-/// `has_srp` is the sole trigger. `srp_amrat_variance` finite and > 0 seeds
-/// AMRAT as a fittable parameter (the trigger + Bayesian prior that opens the
-/// AMRAT column in a StateAndAMRAT / StateAndNonGravAndAMRAT fit); `0.0` (the
-/// memset zero-init default), NaN, or ∞ leaves the AMRAT column closed and
-/// applies SRP as a fixed force.
+/// `has_srp` is the sole trigger. The AMRAT prior variance that opens the
+/// AMRAT column in a StateAndAMRAT / StateAndNonGravAndAMRAT fit rides the
+/// orbit's packed joint now (its AMRAT axis), not a scalar field.
 ///
 /// Validates loudly rather than silently degrading:
 /// - SRP value fields set with `has_srp == 0` (a caller who forgot the
-///   switch — never a silent apply nor a silent drop), where a `0.0`
-///   `srp_amrat_variance` is the memset zero-init default and reads as
-///   absent, not as a set field,
-/// - a non-finite or non-positive `srp_amrat` or `srp_cr`,
-/// - a finite **negative** `srp_amrat_variance` (a caller error; `0.0`
-///   reads as "no prior", never as a loud error).
+///   switch — never a silent apply nor a silent drop),
+/// - a non-finite or non-positive `srp_amrat` or `srp_cr`.
 pub(crate) fn empyrean_orbit_srp_params(
     orbit: &EmpyreanOrbit,
 ) -> Result<Option<SRPForceParams>, String> {
     if orbit.has_srp == 0 {
         // Zero-init = absent. But value fields set without the switch is a
-        // caller mistake, not a silent drop: surface it loudly. A `0.0`
-        // `srp_amrat_variance` is the memset zero-init default, so it must
-        // read as absent (not "set") — otherwise every caller who memsets an
-        // EmpyreanOrbit with `has_srp == 0` has its propagation refused. Only
-        // a non-zero finite variance counts as a genuinely-set field here.
-        if orbit.srp_amrat != 0.0
-            || orbit.srp_cr != 0.0
-            || (orbit.srp_amrat_variance != 0.0 && orbit.srp_amrat_variance.is_finite())
-        {
-            return Err(
-                "has_srp = 0 but SRP fields (srp_amrat / srp_cr / srp_amrat_variance) are set — \
+        // caller mistake, not a silent drop: surface it loudly.
+        if orbit.srp_amrat != 0.0 || orbit.srp_cr != 0.0 {
+            return Err("has_srp = 0 but SRP fields (srp_amrat / srp_cr) are set — \
                  set has_srp = 1 to apply the SRP slot, or clear the fields"
-                    .to_string(),
-            );
+                .to_string());
         }
         return Ok(None);
     }
@@ -1727,31 +1827,13 @@ pub(crate) fn empyrean_orbit_srp_params(
             orbit.srp_cr
         ));
     }
-    // Finite & > 0 ⇒ AMRAT is fittable (prior variance). `0.0` (the memset
-    // zero-init default), NaN, or ∞ ⇒ no prior (fixed-force SRP) — the same
-    // reading the `has_srp == 0` guard above gives a zero-init variance, so a
-    // caller who memsets an orbit, sets `has_srp = 1` + `srp_amrat` +
-    // `srp_cr`, and leaves the variance untouched gets a fixed-force SRP
-    // rather than a refused fit. A finite *negative* variance is nonsense
-    // (never a zero-init artifact) and stays a loud error.
-    let amrat_variance = if orbit.srp_amrat_variance != 0.0 && orbit.srp_amrat_variance.is_finite()
-    {
-        if orbit.srp_amrat_variance < 0.0 {
-            return Err(format!(
-                "srp_amrat_variance must be > 0 when set (AMRAT prior variance, (m^2/kg)^2); \
-                 got {} — use NaN or 0.0 (the zero-init default) for no prior",
-                orbit.srp_amrat_variance
-            ));
-        }
-        Some(orbit.srp_amrat_variance)
-    } else {
-        None
-    };
-
+    // The AMRAT prior variance that makes AMRAT fittable rides the orbit's
+    // packed joint (its AMRAT axis), attached separately via
+    // `push_orbit_with_joint`; this builder carries the SRP force values
+    // only.
     Ok(Some(SRPForceParams {
         amrat: orbit.srp_amrat,
         cr: orbit.srp_cr,
-        amrat_variance,
     }))
 }
 
@@ -1783,11 +1865,11 @@ pub(crate) fn validate_side_array_ptr<T>(
 /// [`ThrustArc`]s (mapping [`isp_s`](EmpyreanThrustArc::isp_s) `NaN → None`,
 /// the [`steering_law`](EmpyreanThrustArc::steering_law) tag into a
 /// [`SteeringLaw`], and `central_body_naif_id` into an [`Origin`]), and
-/// carries the optional `dv_corrections` / `correction_covariances` side
-/// arrays through unchanged. Validates loudly:
+/// carries the optional `dv_corrections` side array through unchanged. The
+/// per-correction burn-prior covariance rides the orbit's packed joint (its
+/// thrust axes) now, not a C side array. Validates loudly:
 /// - any pointer/length mismatch (non-zero length with a null pointer),
-/// - `dv_corrections` / `correction_covariances` supplied with no arcs,
-/// - `correction_covariances` length not matching `dv_corrections`,
+/// - `dv_corrections` supplied with no arcs,
 /// - an unknown `steering_law` tag or an unknown `central_body_naif_id`.
 pub(crate) fn empyrean_orbit_thrust_params(
     orbit: &EmpyreanOrbit,
@@ -1798,33 +1880,14 @@ pub(crate) fn empyrean_orbit_thrust_params(
         orbit.n_dv_corrections,
         "dv_corrections",
     )?;
-    validate_side_array_ptr(
-        orbit.correction_covariances,
-        orbit.n_correction_covariances,
-        "correction_covariances",
-    )?;
 
     if orbit.n_thrust_arcs == 0 {
         // No arcs: corrections without an arc to attach them to are a loud
         // error, not a silent drop.
-        if orbit.n_dv_corrections != 0 || orbit.n_correction_covariances != 0 {
-            return Err(
-                "dv_corrections / correction_covariances supplied without any thrust_arcs"
-                    .to_string(),
-            );
+        if orbit.n_dv_corrections != 0 {
+            return Err("dv_corrections supplied without any thrust_arcs".to_string());
         }
         return Ok(None);
-    }
-
-    // villeneuve's ThrustParams contract: when correction_covariances is
-    // non-empty its length must match dv_corrections.
-    if orbit.n_correction_covariances != 0
-        && orbit.n_correction_covariances != orbit.n_dv_corrections
-    {
-        return Err(format!(
-            "correction_covariances length ({}) must match dv_corrections length ({})",
-            orbit.n_correction_covariances, orbit.n_dv_corrections
-        ));
     }
 
     let arc_slice = unsafe { std::slice::from_raw_parts(orbit.thrust_arcs, orbit.n_thrust_arcs) };
@@ -1870,19 +1933,12 @@ pub(crate) fn empyrean_orbit_thrust_params(
     } else {
         Vec::new()
     };
-    let correction_covariances = if orbit.n_correction_covariances > 0 {
-        unsafe {
-            std::slice::from_raw_parts(orbit.correction_covariances, orbit.n_correction_covariances)
-        }
-        .to_vec()
-    } else {
-        Vec::new()
-    };
-
     Ok(Some(ThrustParams {
         arcs,
         dv_corrections,
-        correction_covariances,
+        // The per-correction burn-prior covariance rides the orbit's packed
+        // joint (its thrust axes) now; this input path declares none here.
+        correction_covariances: Vec::new(),
     }))
 }
 
@@ -1933,7 +1989,7 @@ pub unsafe extern "C" fn empyrean_propagate(
                 Ok(t) => t,
                 Err(e) => {
                     e.report();
-                    return -1;
+                    return e.code.unwrap_or(-1);
                 }
             };
 
@@ -1978,13 +2034,7 @@ pub unsafe extern "C" fn empyrean_propagate(
             }
         };
 
-        marshal_propagation_result(
-            prop_result,
-            times.len(),
-            &input_orbit_ids,
-            &input_object_ids,
-            result_out,
-        )
+        marshal_propagation_result(prop_result, &input_orbit_ids, &input_object_ids, result_out)
     }));
 
     match result {
@@ -2037,11 +2087,22 @@ pub(crate) fn build_orbits_for_propagation(
             return Err(at(bad));
         }
         let state = orbit.state.to_empyrean();
-        let coords = coordinate_state_to_coordinates(&state).map_err(|e| at(e.to_string()))?;
+        let (coords, state_cov) =
+            coordinate_state_to_coordinates(&state).map_err(|e| at(e.to_string()))?;
         let obj = c_str_to_string(orbit.object_id).unwrap_or_default();
         input_orbit_ids.push(id.clone());
         input_object_ids.push(obj);
-        crate::joint::push_orbit_with_joint(&mut orbits, id, coords, orbit).map_err(&at)?;
+        // The 0.11.0 push carries the state covariance and refuses a
+        // malformed prior with a pinned code (−40…−50). Keep that code on
+        // the located error so the caller returns it verbatim, while still
+        // naming the row the failure belongs to.
+        crate::joint::push_orbit_with_joint(&mut orbits, id, coords, state_cov, orbit).map_err(
+            |crate::joint::AbiError { code, message }| {
+                let mut err = at(message);
+                err.code = code;
+                err
+            },
+        )?;
         if let Some(params) = empyrean_orbit_non_grav_params(orbit) {
             orbits.set_non_grav_params(i, Some(params));
         }
@@ -2066,11 +2127,17 @@ pub(crate) fn build_orbits_for_propagation(
 /// travels beside it as numbers instead of only inside the prose, so a
 /// caller reads the index off [`empyrean_error_location`](crate::empyrean_error_location)
 /// rather than parsing it back out of a string.
+#[derive(Debug)]
 pub(crate) struct BatchInputError {
     /// Which row failed.
     pub at: crate::ErrorLocation,
     /// The rendered message, index and id included.
     pub message: String,
+    /// The pinned C ABI code a packed-joint wire refusal (−40…−50) must
+    /// return, or `None` for the boundary's own default — so a located
+    /// marshaling failure carries both its row and, when the engine named
+    /// a cause, that cause's code.
+    pub code: Option<i32>,
 }
 
 impl BatchInputError {
@@ -2090,6 +2157,7 @@ impl BatchInputError {
         move |e: String| Self {
             at: at.clone(),
             message: format!("orbit {index} ({id}): {e}"),
+            code: None,
         }
     }
 
@@ -2150,15 +2218,6 @@ fn non_finite_state_field(state: &crate::CoordinateState) -> Option<String> {
             }
         }
     }
-    if state.has_non_grav_cross != 0 {
-        for (r, row) in state.non_grav_cross.iter().enumerate() {
-            for (c, v) in row.iter().enumerate() {
-                if !v.is_finite() {
-                    return Some(format!("non_grav_cross[{r}][{c}] is {v}"));
-                }
-            }
-        }
-    }
     None
 }
 
@@ -2193,7 +2252,7 @@ unsafe fn free_states_and_ids(
     if !states.is_null() {
         for k in 0..written {
             let st = unsafe { &mut *states.add(k) };
-            unsafe { crate::joint::free_orbit_covariance(&mut st.orbit_cov) };
+            unsafe { crate::joint::free_packed_joint(&mut st.orbit_cov) };
         }
         if n > 0 {
             unsafe { std::alloc::dealloc(states as *mut u8, states_layout) };
@@ -2224,7 +2283,6 @@ unsafe fn free_states_and_ids(
 /// `catch_unwind`, so it installs no panic guard of its own.
 pub(crate) fn marshal_propagation_result(
     prop_result: PropagationResult,
-    n_times: usize,
     input_orbit_ids: &[String],
     input_object_ids: &[String],
     result_out: *mut EmpyreanPropagationResult,
@@ -2260,42 +2318,99 @@ pub(crate) fn marshal_propagation_result(
         std::ptr::null_mut()
     };
 
+    // Map each delivered row to its (input orbit index, within-orbit epoch
+    // index) via the engine's per-orbit row counts — the authoritative,
+    // orbit-major block layout. The old uniform `i / n_times` guess assumes
+    // every orbit delivers exactly the request-grid length; once ONE orbit
+    // fails (zero rows) or a stop condition truncates it, that guess
+    // mis-attributes every later row, reading the sensitivity/covariance of
+    // the WRONG orbit. The prefix sum over `orbit_row_counts` is exact and is
+    // the same index space `outcomes[k].first_row` / `num_rows` publish.
+    let row_to_orbit: Vec<(usize, usize)> = {
+        let mut v = Vec::with_capacity(n);
+        for (orbit_idx, &count) in prop_result.orbit_row_counts.iter().enumerate() {
+            for within in 0..count {
+                v.push((orbit_idx, within));
+            }
+        }
+        v
+    };
+
     for (i, (orbit_id, coord, cov)) in prop_result.states.iter().enumerate() {
         let (covariance, has_covariance) = match cov {
-            Some(c) => (*c, 1u8),
+            Some(c) => (c, 1u8),
             None => ([[0.0; 6]; 6], 0u8),
         };
 
-        let orbit_idx = if n_times > 0 { i / n_times } else { 0 };
-        let time_idx = if n_times > 0 { i % n_times } else { 0 };
+        let (orbit_idx, time_idx) = row_to_orbit.get(i).copied().unwrap_or((0, 0));
         let chain = prop_result.sensitivity.get(orbit_idx);
-        let (stm, has_stm) = match chain.and_then(|c| c.stm(time_idx)) {
-            Some(m) => (m.matrix, 1u8),
+        // villeneuve 1.26.0: one width-carrying row per epoch. This ABI
+        // publishes the state-only 6×6 STM / 6×6×6 STT, read through the
+        // row's `state_block()` (the leading state corner of a
+        // parameter-bearing row, bit-identical to a narrow row).
+        let (stm, has_stm) = match chain.and_then(|c| c.stm_row(time_idx)) {
+            Some(row) => (row.state_block().matrix, 1u8),
             None => ([[0.0; 6]; 6], 0u8),
         };
-        let (stt, has_stt) = match chain.and_then(|c| c.stt(time_idx)) {
-            Some(t) => (t.tensor, 1u8),
+        // `StateTransitionTensor::to_full` mirrors the engine's packed
+        // lower-triangular STT back into the dense 6×6×6 square this ABI
+        // publishes; each slice is symmetric in (i, j), so the dense payload
+        // is byte-identical to the pre-packing one.
+        let (stt, has_stt) = match chain.and_then(|c| c.stt_row(time_idx)) {
+            Some(row) => (row.state_block().to_full(), 1u8),
             None => ([[[0.0; 6]; 6]; 6], 0u8),
         };
-        let resolved_kind = chain
-            .and_then(|c| c.resolved_kinds().get(time_idx).copied())
+        let resolved_covariance_kind =
+            chain.and_then(|c| c.resolved_kinds().get(time_idx).copied());
+        let resolved_kind = resolved_covariance_kind
             .map(covariance_kind_to_u8)
             .unwrap_or(EMPYREAN_COVARIANCE_KIND_LINEAR);
 
-        // Fallible: an allocation failure here is a failure of the
-        // call, never a silently absent carrier. Unwind the rows already
-        // written — each owns its carrier arrays — before returning.
-        let orbit_cov = match crate::joint::joint_to_c(
-            prop_result.states.extended_covariance(i),
-            prop_result.states.wide_cross(i),
-            "propagated state",
-        ) {
-            Ok(j) => j,
-            Err(e) => {
-                set_last_error(&e);
-                unsafe { free_states_and_ids(states_ptr, ids_ptr, i, n, states_layout) };
-                return -5;
-            }
+        // The resolved state covariance at this row, published as the one
+        // packed joint, dispatched on the row's OWN resolved kind so EVERY
+        // method delivers its covariance under its own tag — never a dropped
+        // field, never a downgrade:
+        //
+        // * Linear / SecondOrder / Mixture (and a chainless f64 row) read the
+        //   lazy chain query, which builds a Linear row linearly and a
+        //   SecondOrder row at second order and never downgrades. `None` is a
+        //   row that produced no tensors (legitimately absent → empty joint);
+        //   a query that exists but cannot be resolved at its kind (a missing
+        //   tensor) is refused BY NAME rather than read as an empty "no
+        //   covariance". The marshaler's allocation is fallible — a failure is
+        //   a failure of the call, so the rows already written (each owning
+        //   its carrier arrays) are unwound before returning.
+        // * MonteCarlo / SigmaPoint: the chain holds only tag-carrier
+        //   placeholders and refuses the sample moment BY NAME ("it lives on
+        //   the propagated states"). That sample second moment IS the
+        //   delivered row's own tagged uncertainty — written once at assembly
+        //   from this cloud, the single publication site that
+        //   `covariance_series_cartesian` also reads — so take it off the
+        //   state (`states.covariance(i)`, the same object the flat 6×6 above
+        //   came from) and marshal it as the engine tags it (kind ==
+        //   MonteCarlo/SigmaPoint, quality/functional/provenance off the
+        //   value). It is never re-derived from the draws here. A sampled row
+        //   below the rank floor (or whose cloud was short at this epoch)
+        //   publishes no second moment and is honestly absent (empty joint).
+        let orbit_cov = match resolved_covariance_kind {
+            Some(
+                empyrean_core::propagation::CovarianceKind::MonteCarlo { .. }
+                | empyrean_core::propagation::CovarianceKind::SigmaPoint,
+            ) => match prop_result.states.covariance(i) {
+                Some(unc) => crate::joint::cartesian_uncertainty_to_c(unc.clone()),
+                None => crate::joint::empty_packed_joint(),
+            },
+            _ => match prop_result.uncertainty(orbit_idx, time_idx) {
+                None => crate::joint::empty_packed_joint(),
+                Some(query) => match query.covariance() {
+                    Ok(unc) => crate::joint::cartesian_uncertainty_to_c(unc),
+                    Err(e) => {
+                        set_last_error(&e.to_string());
+                        unsafe { free_states_and_ids(states_ptr, ids_ptr, i, n, states_layout) };
+                        return -5;
+                    }
+                },
+            },
         };
 
         let out_state = EmpyreanPropagatedState {
@@ -2315,10 +2430,9 @@ pub(crate) fn marshal_propagation_result(
             stt,
             has_stt,
             resolved_kind,
-            // The propagated joint's crosses, at THIS row's index. Both
-            // engine accessors are parallel to `covariances`, so they
-            // share the row's provenance: a sampled 6×6 never sits
-            // beside the nominal linear run's border.
+            // The resolved state covariance at THIS row, as the one packed
+            // joint, sharing the row's provenance with the lazy query it was
+            // resolved from.
             orbit_cov,
         };
 
@@ -2331,6 +2445,67 @@ pub(crate) fn marshal_propagation_result(
             ids_ptr.add(i).write(c_id.into_raw());
         }
     }
+
+    // Materialize the per-INPUT-orbit delivery channel: one
+    // `EmpyreanOrbitOutcome` per input orbit, in input order. Status is read
+    // from the engine's `outcomes` (the sole delivery discriminator); the row
+    // block comes from `orbit_row_range` (the same prefix sum the row mapping
+    // above uses). A failed orbit carries a classified code and the engine's
+    // full failure text as an owned string. Done before the events / mixtures
+    // allocations so an allocation failure here unwinds only the already-
+    // written rows + ids.
+    let num_orbits = prop_result.outcomes.len();
+    let outcomes_ptr = if num_orbits > 0 {
+        let layout = std::alloc::Layout::array::<EmpyreanOrbitOutcome>(num_orbits)
+            .unwrap_or(std::alloc::Layout::new::<EmpyreanOrbitOutcome>());
+        let ptr = unsafe { std::alloc::alloc(layout) } as *mut EmpyreanOrbitOutcome;
+        if ptr.is_null() {
+            set_last_error("allocation failed for outcomes array");
+            unsafe { free_states_and_ids(states_ptr, ids_ptr, n, n, states_layout) };
+            return -5;
+        }
+        for (k, outcome) in prop_result.outcomes.iter().enumerate() {
+            let rows = prop_result.orbit_row_range(k).unwrap_or(0..0);
+            let first_row = rows.start;
+            let num_rows = rows.len();
+            let (status, error_code, error_message) = match outcome {
+                OrbitOutcome::Delivered => (
+                    EMPYREAN_ORBIT_OUTCOME_DELIVERED,
+                    EMPYREAN_PROPAGATE_FAILURE_NONE,
+                    std::ptr::null_mut(),
+                ),
+                OrbitOutcome::Failed(err) => {
+                    let msg = CString::new(err.to_string())
+                        .unwrap_or_else(|_| CString::new("propagation failed").unwrap());
+                    (
+                        EMPYREAN_ORBIT_OUTCOME_FAILED,
+                        propagation_error_code(err),
+                        msg.into_raw(),
+                    )
+                }
+                // `OrbitOutcome` is `#[non_exhaustive]`: a newer engine verdict
+                // is reported as a failure with the catch-all code rather than
+                // silently read as delivered.
+                _ => (
+                    EMPYREAN_ORBIT_OUTCOME_FAILED,
+                    EMPYREAN_PROPAGATE_FAILURE_OTHER,
+                    CString::new("unknown orbit outcome").unwrap().into_raw(),
+                ),
+            };
+            unsafe {
+                ptr.add(k).write(EmpyreanOrbitOutcome {
+                    status,
+                    error_code,
+                    error_message,
+                    first_row,
+                    num_rows,
+                });
+            }
+        }
+        ptr
+    } else {
+        std::ptr::null_mut()
+    };
 
     // Pre-flatten through `event_to_c`. Variants the v0.7.0
     // distribution channel intentionally gates off (HighSensitivity,
@@ -2450,15 +2625,44 @@ pub(crate) fn marshal_propagation_result(
                     offsets_p.add(k).write(running_offset);
                 }
                 for (j, comp) in comps.iter().enumerate() {
+                    // The component's covariance is rebuilt through the facade
+                    // (quality re-derived, functional State, derivation Linear,
+                    // provenance stamped `Derived` by core) and marshaled to the
+                    // one packed joint; every tag, provenance included, comes
+                    // off that returned `Uncertainty`, never a literal. The
+                    // facade's preconditions are satisfied by construction, so a
+                    // refusal is unreachable here; an unexpected engine refusal
+                    // is surfaced loudly (named, with the engine's variant text)
+                    // rather than swallowed.
+                    let unc = match empyrean_core::uncertainty::mixture_component_uncertainty(comp)
+                    {
+                        Ok(u) => u,
+                        Err(e) => {
+                            set_last_error(&format!(
+                                "mixture component (orbit {orbit_id}, ca epoch {k}, \
+                                 component {j}): {e}"
+                            ));
+                            unsafe {
+                                free_states_and_ids(states_ptr, ids_ptr, n, n, states_layout)
+                            };
+                            return -5;
+                        }
+                    };
+                    let joint = crate::joint::cartesian_uncertainty_to_c(unc);
+                    let (status, rho_opt) =
+                        empyrean_core::uncertainty::component_status_wire(comp.status);
+                    let m = comp.mean.as_slice();
                     unsafe {
                         comps_p
                             .add(running_offset + j)
                             .write(EmpyreanMixtureComponent {
                                 weight: comp.weight,
-                                mean: comp.mean,
-                                covariance: comp.covariance,
-                                frame: frame_to_int(comp.frame),
-                                origin: comp.origin.naif_id(),
+                                mean: [m[0], m[1], m[2], m[3], m[4], m[5]],
+                                joint,
+                                status,
+                                rho: rho_opt.unwrap_or(f64::NAN),
+                                frame: frame_to_int(comp.basis.frame),
+                                origin: comp.basis.origin.naif_id(),
                             });
                     }
                 }
@@ -2488,7 +2692,6 @@ pub(crate) fn marshal_propagation_result(
     // borrows have ended; freed by `empyrean_propagation_result_free`.
     let handle = Box::new(PropagationResultHandle {
         result: prop_result,
-        n_times,
     });
     let handle_ptr = Box::into_raw(handle) as *mut std::ffi::c_void;
 
@@ -2501,6 +2704,8 @@ pub(crate) fn marshal_propagation_result(
         (*result_out).mixtures = mixtures_ptr;
         (*result_out).num_mixtures = mixtures_count;
         (*result_out).lazy_handle = handle_ptr;
+        (*result_out).num_orbits = num_orbits;
+        (*result_out).outcomes = outcomes_ptr;
     }
 
     let _ = Origin::Earth; // reference Origin to suppress unused-import warnings
@@ -2538,7 +2743,7 @@ pub unsafe extern "C" fn empyrean_propagation_result_free(result: *mut EmpyreanP
             // released before the array holding the pointers to it.
             for i in 0..n {
                 let st = unsafe { &mut *res.states.add(i) };
-                unsafe { crate::joint::free_orbit_covariance(&mut st.orbit_cov) };
+                unsafe { crate::joint::free_packed_joint(&mut st.orbit_cov) };
             }
             let layout = std::alloc::Layout::array::<EmpyreanPropagatedState>(n).unwrap();
             unsafe {
@@ -2593,6 +2798,12 @@ pub unsafe extern "C" fn empyrean_propagation_result_free(result: *mut EmpyreanP
                 }
                 let total = mc.num_components_total;
                 if total > 0 && !mc.components.is_null() {
+                    // Each component's packed-joint triangle is library-owned;
+                    // release it before deallocating the components array.
+                    for c in 0..total {
+                        let comp = unsafe { &mut *mc.components.add(c) };
+                        unsafe { crate::joint::free_packed_joint(&mut comp.joint) };
+                    }
                     let l = std::alloc::Layout::array::<EmpyreanMixtureComponent>(total).unwrap();
                     unsafe {
                         std::alloc::dealloc(mc.components as *mut u8, l);
@@ -2602,6 +2813,22 @@ pub unsafe extern "C" fn empyrean_propagation_result_free(result: *mut EmpyreanP
             let layout = std::alloc::Layout::array::<EmpyreanMixtureChain>(n_mix).unwrap();
             unsafe {
                 std::alloc::dealloc(res.mixtures as *mut u8, layout);
+            }
+        }
+
+        // Release the per-orbit outcome array: each failed orbit owns its
+        // error-message string, freed before the array holding the entries.
+        let n_out = res.num_orbits;
+        if !res.outcomes.is_null() && n_out > 0 {
+            for i in 0..n_out {
+                let oc = unsafe { &*res.outcomes.add(i) };
+                if !oc.error_message.is_null() {
+                    drop(unsafe { CString::from_raw(oc.error_message) });
+                }
+            }
+            let layout = std::alloc::Layout::array::<EmpyreanOrbitOutcome>(n_out).unwrap();
+            unsafe {
+                std::alloc::dealloc(res.outcomes as *mut u8, layout);
             }
         }
 
@@ -2619,6 +2846,8 @@ pub unsafe extern "C" fn empyrean_propagation_result_free(result: *mut EmpyreanP
             (*result).mixtures = std::ptr::null_mut();
             (*result).num_mixtures = 0;
             (*result).lazy_handle = std::ptr::null_mut();
+            (*result).num_orbits = 0;
+            (*result).outcomes = std::ptr::null_mut();
         }
     }));
 }
@@ -2628,90 +2857,57 @@ pub unsafe extern "C" fn empyrean_propagation_result_free(result: *mut EmpyreanP
 // ─────────────────────────────────────────────────────────────────────
 
 /// Rich propagation result retained behind
-/// [`EmpyreanPropagationResult::lazy_handle`], plus the per-orbit epoch
-/// count needed to co-locate the nominal state by index. Boxed; freed by
-/// [`empyrean_propagation_result_free`].
+/// [`EmpyreanPropagationResult::lazy_handle`], so the on-demand
+/// tagged-covariance accessors can recompute the resolved-kind readback and
+/// co-locate each epoch's nominal state (by the engine's per-orbit row
+/// ranges). Boxed; freed by [`empyrean_propagation_result_free`].
 pub(crate) struct PropagationResultHandle {
     pub(crate) result: empyrean_core::propagation::PropagationResult,
-    pub(crate) n_times: usize,
 }
 
-/// Flattened, owned form of `empyrean_core::propagation::TaggedCovariance`
-/// (villeneuve's provenance-tagged covariance). Self-describing: the 6×6
-/// matrix together with the co-located nominal state, how the covariance
-/// was derived, its definiteness, its basis, the solved-for parameters,
-/// and the functional it describes — so a consumer can never read a
-/// second-order CA ellipsoid as a linear one.
+/// One entry of a resolved covariance series: a propagated nominal state and
+/// its uncertainty at one output epoch. The covariance is the single packed
+/// [`joint`](Self::joint) — which absorbs the matrix, the derivation `kind`,
+/// the definiteness `quality` (and its side values), the `functional`, and
+/// the solved `width`; the fields beside it are the per-entry quantities the
+/// joint cannot hold.
 ///
-/// NOTE on the `_cartesian` accessor's reachable range: that accessor
-/// classifies but never repairs (`quality` ∈ {POSITIVE_DEFINITE,
-/// INDEFINITE}), is always state-only (`solved_width == 6`,
-/// `target_functional == CARTESIAN_STATE`, `has_mean_shift_input == 0`),
-/// and resolves Monte-Carlo epochs to an error rather than a row. The
-/// constant fields are carried for the future element-space / off-grid /
-/// CA-window accessors that *do* vary them.
+/// NOTE on the `_cartesian` accessor's reachable range: it is state-only (the
+/// joint's `width == 6`, its functional is state) and resolves Monte-Carlo
+/// epochs to an error rather than a row.
 #[repr(C)]
 pub struct EmpyreanTaggedCovariance {
     /// Epoch of this covariance (TDB).
     pub epoch_mjd_tdb: f64,
-    /// Propagated nominal state [x, y, z, vx, vy, vz] (AU, AU/day),
-    /// co-located engine-side. The CORRECTED mean is
-    /// `state + (has_mean_shift_prop ? mean_shift_prop : 0)
-    ///        + (has_mean_shift_input ? mean_shift_input : 0)`.
+    /// Propagated nominal state [x, y, z, vx, vy, vz] (AU, AU/day). The
+    /// CORRECTED mean is
+    /// `state + (has_mean_shift_prop ? mean_shift_prop : 0)`.
     pub state: [f64; 6],
-    /// The 6×6 covariance (AU², AU²/day, AU²/day² blocks).
-    pub matrix: [[f64; 6]; 6],
-    /// `EMPYREAN_COVARIANCE_KIND_*`.
-    pub kind: u8,
-    /// RNG seed — valid iff `has_mc_seed == 1` (kind == MONTE_CARLO).
+    /// The covariance as the single packed joint — its covariance home.
+    /// Carries the derivation `kind`, the `quality` (+ its side values), the
+    /// `functional`, and the `width`. **Library-owned** `tri`, freed with
+    /// the series (or, for a single joint written by
+    /// [`empyrean_propagation_joint_at`], by
+    /// [`empyrean_orbit_covariance_free`]).
+    pub joint: crate::joint::EmpyreanPackedJoint,
+    /// RNG seed — valid iff `has_mc_seed == 1`, which implies
+    /// `joint.kind == EMPYREAN_COVARIANCE_KIND_MONTE_CARLO` but is **not**
+    /// implied by it: an entropy-seeded Monte-Carlo run is not reproducible
+    /// by construction, and such a row carries `has_mc_seed == 0`. Read the
+    /// flag, not the kind.
     pub mc_seed: u64,
     /// Disambiguates a real `mc_seed == 0` from "no seed". 0 on the
     /// `_cartesian` accessor (MC resolves to an error there).
     pub has_mc_seed: u8,
-    /// Second-order propagation mean shift δμ_prop (zero at t₀).
-    /// Zero-filled when `has_mean_shift_prop == 0`.
+    /// Second-order propagation mean shift δμ_prop (the leading-6 state part
+    /// of the N-wide shift; zero at t₀). Zero-filled when
+    /// `has_mean_shift_prop == 0` (every arm but the second-order one).
     pub mean_shift_prop: [f64; 6],
     pub has_mean_shift_prop: u8,
-    /// OD-estimator mean shift δμ₀ (nonzero at t₀). Zero-filled when
-    /// `has_mean_shift_input == 0` (always 0 on the `_cartesian` accessor).
-    pub mean_shift_input: [f64; 6],
-    pub has_mean_shift_input: u8,
-    /// `EMPYREAN_COVARIANCE_QUALITY_*`.
-    pub quality: u8,
-    /// `min_eig` for INDEFINITE / REPAIRED; `f64::NAN` for
-    /// POSITIVE_DEFINITE and EXPANSION_SUSPECT (both are definite, so
-    /// there is no negative eigenvalue to report). **Read-only
-    /// provenance** — `isnan`-guard before any arithmetic; never feed to
-    /// a clamp.
-    pub quality_min_eig: f64,
-    /// `EMPYREAN_REPRESENTATION_*` (always CARTESIAN=0 on this accessor).
-    pub representation: i32,
     /// Frame, same encoding as `EmpyreanPropagatedState.frame`.
     pub frame: i32,
     /// Origin NAIF id, same encoding as `EmpyreanPropagatedState.origin`.
     pub origin: i32,
-    /// [A1, A2, A3] non-grav solved flags (0/1). The returned 6×6 is the
-    /// MARGINALIZED state block of a possibly-wider fit.
-    pub non_grav: [u8; 3],
-    /// Thrust Δv segments solved for.
-    pub thrust_segments: u32,
-    /// `TaggedCovariance::solved_width()` (6 / 9 / 12 / …) — the scalar
-    /// IP consumers key on (6 on this accessor).
-    pub solved_width: u32,
-    /// `EMPYREAN_TARGET_FUNCTIONAL_*` (always CARTESIAN_STATE on this accessor).
-    pub target_functional: u8,
-    /// κ_state — the block-wise quadratic/linear ratio that classified
-    /// this covariance `EMPYREAN_COVARIANCE_QUALITY_EXPANSION_SUSPECT`.
-    /// `f64::NAN` for every other quality (the measure is only computed
-    /// where the expansion validity is in question), and `f64::INFINITY`
-    /// when a zero-spread block carried a nonzero second-order
-    /// correction. **Read-only provenance** — `isnan`-guard before any
-    /// arithmetic.
-    ///
-    /// Appended at the tail of the struct deliberately: growing a
-    /// `#[repr(C)]` result at the end is the only way to extend it
-    /// without moving an existing field's offset.
-    pub quality_kappa_state: f64,
 }
 
 /// Owned series of [`EmpyreanTaggedCovariance`], one entry per output
@@ -2722,103 +2918,68 @@ pub struct EmpyreanTaggedCovarianceSeries {
     pub num_entries: usize,
 }
 
-/// Flatten one villeneuve `TaggedCovariance` (+ its co-located nominal
-/// state) into the C struct. Errors loudly on a non-body basis origin
-/// (an observatory has no NAIF id) rather than letting `naif_id()` panic.
+/// Flatten one resolved covariance — an engine `Uncertainty` in the
+/// Cartesian basis, co-located with its nominal state — into one C series
+/// element. The covariance becomes the single packed joint (matrix / kind /
+/// quality / functional / width all absorbed into it); the per-entry fields
+/// the joint cannot hold (epoch, mean, the second-order mean shift, the
+/// Monte-Carlo seed, frame / origin) sit beside it. Errors loudly on a
+/// non-body basis origin (an observatory has no NAIF id) rather than letting
+/// `naif_id()` panic.
 fn flatten_tagged_covariance(
     epoch_mjd_tdb: f64,
     state: [f64; 6],
-    tc: &empyrean_core::propagation::TaggedCovariance,
+    unc: empyrean_core::propagation::Uncertainty<
+        empyrean_core::coordinates::Cartesian<empyrean_core::coordinates::AU>,
+    >,
 ) -> Result<EmpyreanTaggedCovariance, String> {
-    use empyrean_core::propagation::{CovarianceKind, CovarianceQuality, TargetFunctional};
+    use empyrean_core::propagation::CovarianceKind;
 
-    let (kind, mc_seed, has_mc_seed) = match tc.kind {
-        CovarianceKind::Linear => (EMPYREAN_COVARIANCE_KIND_LINEAR, 0u64, 0u8),
-        CovarianceKind::SecondOrder => (EMPYREAN_COVARIANCE_KIND_SECOND_ORDER, 0, 0),
-        CovarianceKind::ThirdOrder => (EMPYREAN_COVARIANCE_KIND_THIRD_ORDER, 0, 0),
-        CovarianceKind::Mixture => (EMPYREAN_COVARIANCE_KIND_MIXTURE, 0, 0),
-        CovarianceKind::MonteCarlo { seed } => (EMPYREAN_COVARIANCE_KIND_MONTE_CARLO, seed, 1),
-        CovarianceKind::SigmaPoint => (EMPYREAN_COVARIANCE_KIND_SIGMA_POINT, 0, 0),
+    // `has_mc_seed` carries presence: an entropy-seeded run (`seed: None`,
+    // not reproducible by construction) clears the flag rather than
+    // reporting seed 0, which is a real, reproducible seed.
+    let (mc_seed, has_mc_seed) = match unc.kind() {
+        CovarianceKind::MonteCarlo { seed: Some(s) } => (s, 1u8),
+        _ => (0u64, 0u8),
     };
 
-    // Every quality tag gets its own arm and its own payload slot. An
-    // `ExpansionSuspect` folded into `POSITIVE_DEFINITE` would hand the
-    // consumer a degraded covariance wearing a clean bill of health, and
-    // its κ has no meaning in the `min_eig` slot (the matrix is
-    // definite) — so it carries `quality_kappa_state` instead, with the
-    // unused slot NaN on both sides.
-    let (quality, quality_min_eig, quality_kappa_state) = match tc.quality {
-        CovarianceQuality::PositiveDefinite => (
-            EMPYREAN_COVARIANCE_QUALITY_POSITIVE_DEFINITE,
-            f64::NAN,
-            f64::NAN,
-        ),
-        CovarianceQuality::Indefinite { min_eig } => {
-            (EMPYREAN_COVARIANCE_QUALITY_INDEFINITE, min_eig, f64::NAN)
+    // The propagation mean shift δμ_prop is N-wide on the second-order arm;
+    // its state part is the leading 6. Absent on every other arm. (The old
+    // estimator shift δμ₀ `mean_shift_input` was removed engine-side and has
+    // no wire home — it is NOT fabricated as a zero row here.)
+    let (mean_shift_prop, has_mean_shift_prop) = match unc.mean_shift_prop() {
+        Some(s) => {
+            let mut a = [0.0; 6];
+            for (i, slot) in a.iter_mut().enumerate() {
+                *slot = s.get(i).copied().unwrap_or(0.0);
+            }
+            (a, 1u8)
         }
-        CovarianceQuality::Repaired { min_eig } => {
-            (EMPYREAN_COVARIANCE_QUALITY_REPAIRED, min_eig, f64::NAN)
-        }
-        CovarianceQuality::ExpansionSuspect { kappa_state } => (
-            EMPYREAN_COVARIANCE_QUALITY_EXPANSION_SUSPECT,
-            f64::NAN,
-            kappa_state,
-        ),
-    };
-
-    let (mean_shift_prop, has_mean_shift_prop) = match tc.mean_shift_prop {
-        Some(v) => (v, 1u8),
-        None => ([0.0; 6], 0u8),
-    };
-    let (mean_shift_input, has_mean_shift_input) = match tc.mean_shift_input {
-        Some(v) => (v, 1u8),
         None => ([0.0; 6], 0u8),
     };
 
     // Basis origin guard: `naif_id()` panics on an observatory origin.
-    if tc.basis.origin.is_observatory() {
+    let basis = unc.basis();
+    if basis.origin.is_observatory() {
         return Err("covariance basis origin is an observatory (no NAIF id)".to_string());
     }
-    let origin = tc.basis.origin.naif_id();
-    let frame = frame_to_int(tc.basis.frame);
-    let representation = representation_to_int(tc.basis.representation);
+    let origin = basis.origin.naif_id();
+    let frame = frame_to_int(basis.frame);
 
-    let non_grav = [
-        tc.param_list.non_grav[0] as u8,
-        tc.param_list.non_grav[1] as u8,
-        tc.param_list.non_grav[2] as u8,
-    ];
-    let thrust_segments = tc.param_list.thrust_segments as u32;
-    let solved_width = tc.solved_width() as u32;
-
-    let target_functional = match tc.target_functional {
-        TargetFunctional::CartesianState => EMPYREAN_TARGET_FUNCTIONAL_CARTESIAN_STATE,
-        TargetFunctional::CloseApproachMissDistance => {
-            EMPYREAN_TARGET_FUNCTIONAL_CLOSE_APPROACH_MISS_DISTANCE
-        }
-    };
+    // The covariance itself is the one packed joint. This CONSUMES `unc`, so
+    // every per-entry quantity above is read off it first.
+    let joint = crate::joint::cartesian_uncertainty_to_c(unc);
 
     Ok(EmpyreanTaggedCovariance {
         epoch_mjd_tdb,
         state,
-        matrix: tc.matrix,
-        kind,
+        joint,
         mc_seed,
         has_mc_seed,
         mean_shift_prop,
         has_mean_shift_prop,
-        mean_shift_input,
-        has_mean_shift_input,
-        quality,
-        quality_min_eig,
-        representation,
         frame,
         origin,
-        non_grav,
-        thrust_segments,
-        solved_width,
-        target_functional,
-        quality_kappa_state,
     })
 }
 
@@ -2841,6 +3002,12 @@ fn cov_series_err_code(e: &empyrean_core::propagation::CovarianceSeriesError) ->
         // coverage window when the pairing is what is wrong.
         E::ChainOrbitCountMismatch { .. } => EMPYREAN_TAGGED_COV_CHAIN_ORBIT_COUNT_MISMATCH,
         E::SampleRowEpochMismatch { .. } => EMPYREAN_TAGGED_COV_SAMPLE_ROW_EPOCH_MISMATCH,
+        // `CovarianceSeriesError` is `#[non_exhaustive]`: a refusal
+        // added by a newer engine lands here. It reports UNKNOWN rather
+        // than borrowing a sibling's code — the codes above are read as
+        // remedies, and the wrong remedy is worse than none. Give the
+        // new variant its own code instead of widening this arm.
+        _ => EMPYREAN_TAGGED_COV_UNKNOWN,
     }
 }
 
@@ -2853,7 +3020,21 @@ fn nominal_state_at(
     epoch_index: usize,
     expected_epoch_mjd_tdb: f64,
 ) -> Result<[f64; 6], i32> {
-    let flat_idx = orbit_index * handle.n_times + epoch_index;
+    // Map (orbit, within-orbit epoch) to a flat state row through the engine's
+    // per-orbit block layout (`orbit_row_range`) — the same prefix sum the
+    // marshal uses — NOT a uniform `orbit_index * n_times` grid. Once a failed
+    // or short orbit makes the delivered block non-uniform, the grid names the
+    // wrong flat row, so a covariance-bearing MIXED batch would co-locate
+    // another orbit's state with this orbit's series (today masked only by the
+    // epoch-match guard below, which then refuses with STATE_MISSING).
+    let rows = handle
+        .result
+        .orbit_row_range(orbit_index)
+        .ok_or(EMPYREAN_TAGGED_COV_STATE_MISSING)?;
+    if epoch_index >= rows.len() {
+        return Err(EMPYREAN_TAGGED_COV_STATE_MISSING);
+    }
+    let flat_idx = rows.start + epoch_index;
     let coord = handle
         .result
         .states
@@ -2882,43 +3063,24 @@ fn accessor_location(
     orbit_index: usize,
     epoch_index: usize,
 ) -> crate::ErrorLocation {
-    let Some(flat_idx) = accessor_row(
-        handle.result.states.len(),
-        handle.n_times,
-        orbit_index,
-        epoch_index,
-    ) else {
+    // Map (orbit, within-orbit epoch) to a flat row through the engine's
+    // per-orbit block layout (`orbit_row_range`), the same prefix sum the
+    // marshal uses — never a uniform `orbit_index * n_times` grid, which
+    // names the wrong row once a failed or short orbit makes the delivered
+    // blocks non-uniform. An out-of-range index has no row to name.
+    let Some(rows) = handle.result.orbit_row_range(orbit_index) else {
         return crate::ErrorLocation::at_orbit_index(orbit_index);
     };
+    if epoch_index >= rows.len() {
+        return crate::ErrorLocation::at_orbit_index(orbit_index);
+    }
+    let flat_idx = rows.start + epoch_index;
     // `nth` is a linear walk on this iterator; it runs only on a failure
     // path, so the cost is irrelevant and the clarity is worth more.
     match handle.result.states.iter().nth(flat_idx) {
         Some((id, coord, _)) => crate::ErrorLocation::at_orbit(orbit_index, id, coord.t.mjd_tdb()),
         None => crate::ErrorLocation::at_orbit_index(orbit_index),
     }
-}
-
-/// The flat row an `(orbit_index, epoch_index)` pair addresses, or
-/// `None` when either index is out of range.
-///
-/// Both are bounded, and that is the whole point. An out-of-range
-/// `epoch_index` still derives an **in-range** row whenever orbits
-/// follow it — with two epochs and three orbits, orbit 0 / epoch 5 lands
-/// on row 5, which belongs to orbit 2. Reporting orbit 0's index beside
-/// orbit 2's id and epoch is worse than reporting no id at all: it is a
-/// position that contradicts itself and points at an innocent row.
-///
-/// Split out from [`accessor_location`] so the arithmetic can be
-/// asserted without standing up an engine result.
-fn accessor_row(
-    n_states: usize,
-    n_times: usize,
-    orbit_index: usize,
-    epoch_index: usize,
-) -> Option<usize> {
-    let n_times = n_times.max(1);
-    let n_orbits = n_states / n_times;
-    (epoch_index < n_times && orbit_index < n_orbits).then(|| orbit_index * n_times + epoch_index)
 }
 
 /// Resolved-kind tagged covariance at every output epoch for one orbit,
@@ -2960,12 +3122,14 @@ pub unsafe extern "C" fn empyrean_propagation_covariance_series_cartesian(
         };
 
         let mut entries: Vec<EmpyreanTaggedCovariance> = Vec::with_capacity(series.len());
-        for (k, (epoch, tc)) in series.iter().enumerate() {
-            let state = match nominal_state_at(handle, orbit_index, k, *epoch) {
+        // Consume the series by value: `flatten_tagged_covariance` marshals
+        // the joint off an OWNED `Uncertainty`, so each entry moves in.
+        for (k, (epoch, unc)) in series.into_iter().enumerate() {
+            let state = match nominal_state_at(handle, orbit_index, k, epoch) {
                 Ok(s) => s,
                 Err(code) => return code,
             };
-            match flatten_tagged_covariance(*epoch, state, tc) {
+            match flatten_tagged_covariance(epoch, state, unc) {
                 Ok(e) => entries.push(e),
                 Err(msg) => {
                     set_last_error(&msg);
@@ -3009,44 +3173,34 @@ pub unsafe extern "C" fn empyrean_propagation_covariance_series_cartesian(
     }
 }
 
-/// The propagated joint's CROSS terms at a single `(orbit_index,
-/// epoch_index)` — the state↔Marsden border and the wide carrier that
-/// [`EmpyreanTaggedCovariance::matrix`] is the state block of.
+/// The full WIDE joint (the state block together with the state↔parameter
+/// border and carrier) at a single `(orbit_index, epoch_index)`, as one
+/// packed joint.
 ///
 /// # Why this is a separate call
 ///
-/// [`EmpyreanTaggedCovariance`] is a plain-old-data struct: a caller
-/// declares one on the stack, fills it through
-/// [`empyrean_propagation_covariance_at_cartesian`], and frees nothing.
-/// Putting the carrier on it would have made every such caller — code
-/// that is correct today and recompiles without a murmur — leak two
-/// allocations per call. Nothing would fail; memory would simply grow.
-/// So the joint is opt-in through this call instead, and the tagged
-/// covariance keeps its contract.
-///
-/// The same `(orbit_index, epoch_index)` addresses both surfaces, so a
-/// consumer walking a series
-/// ([`empyrean_propagation_covariance_series_cartesian`]) can ask for
-/// the joint of any entry without the series itself owning anything new.
+/// The inline `orbit_cov` on each [`EmpyreanPropagatedState`] is the
+/// STATE-ONLY resolved covariance; the wide off-diagonal blocks ride the
+/// covariance series instead. This accessor hands back the wide joint for a
+/// single epoch so a caller need not walk the whole series.
 ///
 /// # Absence is reported, never fabricated
 ///
-/// `has_non_grav_cross = 0` with null carrier pointers means the engine
-/// produced no cross terms at this row — not that they were zero. Every
-/// uncertainty method that reaches this accessor carries the payload
-/// when it has one, including the sampled paths, which recover the
-/// state↔parameter columns from the cloud. A row genuinely without a
-/// joint is one whose orbit declared no solved-parameter block.
+/// The wide joint lives on the covariance series, which is a SUBSEQUENCE of
+/// the output epochs (a sigma row the cloud was short at, or a withheld
+/// orbit, carries none). The requested epoch is matched in the series by
+/// value; an epoch the series does not carry is refused BY NAME, never
+/// returned as an empty joint.
 ///
 /// # Ownership
 ///
-/// On success `out` owns two heap arrays; release them with
+/// On success `out` owns the joint's heap triangle; release it with
 /// [`empyrean_orbit_covariance_free`]. On any non-zero return `out` is
 /// untouched and there is nothing to free.
 ///
 /// # Returns
 ///
-/// The same `EMPYREAN_TAGGED_COV_*` codes as the tagged-covariance
+/// The same `EMPYREAN_TAGGED_COV_*` codes as the covariance-series
 /// accessors, so a caller branches on one set.
 ///
 /// # Safety
@@ -3057,7 +3211,7 @@ pub unsafe extern "C" fn empyrean_propagation_joint_at(
     result: *const EmpyreanPropagationResult,
     orbit_index: usize,
     epoch_index: usize,
-    out: *mut crate::joint::EmpyreanOrbitCovariance,
+    out: *mut crate::joint::EmpyreanPackedJoint,
 ) -> i32 {
     let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
         if result.is_null() || out.is_null() {
@@ -3071,35 +3225,35 @@ pub unsafe extern "C" fn empyrean_propagation_joint_at(
         }
         let handle = unsafe { &*(res.lazy_handle as *const PropagationResultHandle) };
 
-        // The flat row index the two engine accessors are parallel to.
-        // Derived exactly as the marshal loop derives it in reverse, so
-        // the joint returned here always shares provenance with the
-        // covariance the sibling accessor returns for the same pair.
-        let n_times = handle.n_times;
-        let row = if n_times > 0 {
-            orbit_index * n_times + epoch_index
-        } else {
-            orbit_index
-        };
-        if epoch_index >= n_times.max(1) || row >= handle.result.states.len() {
-            set_last_error("orbit or epoch index out of range");
-            crate::set_error_location(accessor_location(handle, orbit_index, epoch_index));
-            return EMPYREAN_TAGGED_COV_EPOCH_INDEX_OUT_OF_RANGE;
-        }
-
-        let joint = match crate::joint::joint_to_c(
-            handle.result.states.extended_covariance(row),
-            handle.result.states.wide_cross(row),
-            "propagated joint",
-        ) {
-            Ok(j) => j,
-            Err(e) => {
-                set_last_error(&e);
-                return EMPYREAN_TAGGED_COV_UNCERTAINTY;
+        // The epoch this `(orbit, epoch_index)` names — this lookup is also
+        // the index-range check (`None` for an out-of-range pair).
+        let epoch = match handle.result.uncertainty(orbit_index, epoch_index) {
+            Some(q) => q.epoch_mjd_tdb(),
+            None => {
+                set_last_error("orbit or epoch index out of range");
+                crate::set_error_location(accessor_location(handle, orbit_index, epoch_index));
+                return EMPYREAN_TAGGED_COV_EPOCH_INDEX_OUT_OF_RANGE;
             }
         };
+
+        // The WIDE joint rides the covariance series, which is a SUBSEQUENCE
+        // of the chain epochs. Match the entry by EPOCH (both values are the
+        // same `f64` copied from `chain.epochs()`, so an exact compare is
+        // correct — the engine's own series walk matches the same way), not
+        // by position, and refuse an epoch absent from the series by name.
+        let series = match handle.result.covariance_series_cartesian(orbit_index) {
+            Ok(s) => s,
+            Err(e) => {
+                set_last_error(&e.to_string());
+                return cov_series_err_code(&e);
+            }
+        };
+        let Some((_, unc)) = series.into_iter().find(|(t, _)| *t == epoch) else {
+            set_last_error("the covariance series carries no entry at this epoch");
+            return EMPYREAN_TAGGED_COV_SAMPLE_COVARIANCE_MISSING;
+        };
         unsafe {
-            *out = joint;
+            *out = crate::joint::cartesian_uncertainty_to_c(unc);
         }
         EMPYREAN_TAGGED_COV_OK
     }));
@@ -3112,26 +3266,27 @@ pub unsafe extern "C" fn empyrean_propagation_joint_at(
     }
 }
 
-/// Release the arrays owned by an [`EmpyreanOrbitCovariance`](crate::joint::EmpyreanOrbitCovariance)
-/// written by [`empyrean_propagation_joint_at`].
+/// Release the heap triangle owned by an
+/// [`EmpyreanPackedJoint`](crate::joint::EmpyreanPackedJoint) written by
+/// [`empyrean_propagation_joint_at`].
 ///
-/// Idempotent — the pointers are nulled and the counts zeroed — and a
-/// null argument is a no-op. Do **not** call it on the `orbit_cov` of an
-/// OD result or a propagated state: those are owned by their parent and
+/// Idempotent — the pointer is nulled and the length zeroed — and a null
+/// argument is a no-op. Do **not** call it on the `orbit_cov` of an OD
+/// result or a propagated state: those are owned by their parent and
 /// released by the parent's own free function.
 ///
 /// # Safety
-/// `cov` must be null or a struct written by
+/// `cov` must be null or a joint written by
 /// [`empyrean_propagation_joint_at`] and not already freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn empyrean_orbit_covariance_free(
-    cov: *mut crate::joint::EmpyreanOrbitCovariance,
+    cov: *mut crate::joint::EmpyreanPackedJoint,
 ) {
     let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
         if cov.is_null() {
             return;
         }
-        unsafe { crate::joint::free_orbit_covariance(&mut *cov) };
+        unsafe { crate::joint::free_packed_joint(&mut *cov) };
     }));
 }
 
@@ -3184,7 +3339,7 @@ pub unsafe extern "C" fn empyrean_propagation_covariance_at_cartesian(
             Ok(s) => s,
             Err(code) => return code,
         };
-        match flatten_tagged_covariance(epoch, state, &tc) {
+        match flatten_tagged_covariance(epoch, state, tc) {
             Ok(flat) => {
                 unsafe { out.write(flat) };
                 EMPYREAN_TAGGED_COV_OK
@@ -3219,8 +3374,13 @@ pub unsafe extern "C" fn empyrean_tagged_covariance_series_free(
         }
         let s = unsafe { Box::from_raw(series) };
         if !s.entries.is_null() && s.num_entries > 0 {
-            // `EmpyreanTaggedCovariance` is POD (no Drop), so dealloc the
-            // backing array directly — matching the states-array pattern.
+            // Each entry now owns a heap `joint.tri` (the packed-joint
+            // triangle). Release every entry's joint before deallocating the
+            // backing array, or the triangles leak.
+            for i in 0..s.num_entries {
+                let entry = unsafe { &mut *s.entries.add(i) };
+                unsafe { crate::joint::free_packed_joint(&mut entry.joint) };
+            }
             let layout =
                 std::alloc::Layout::array::<EmpyreanTaggedCovariance>(s.num_entries).unwrap();
             unsafe {
@@ -3454,7 +3614,7 @@ fn event_to_c(
             effective_radius_au: data.effective_radius_au,
             effective_radius_km: data.effective_radius_km,
             sigma_distance_au: data.sigma_distance_au,
-            ip_linear: data.ip_linear,
+            ip_linear: data.ip_linear.unwrap_or(nan),
             ip_second_order: data.ip_second_order.unwrap_or(nan),
             nonlinearity: data.nonlinearity.unwrap_or(nan),
             ip_agm: data.ip_agm.unwrap_or(nan),
@@ -3760,100 +3920,19 @@ fn event_to_c(
 #[cfg(test)]
 mod tagged_covariance_tests {
     use super::*;
-    use empyrean_core::coordinates::{CoordinateRepresentation, Frame, Origin};
-    use empyrean_core::propagation::{
-        Basis, CovarianceKind, CovarianceQuality, SolvedParameters, TaggedCovariance,
-        TargetFunctional,
-    };
 
-    fn sample_tagged() -> TaggedCovariance {
-        TaggedCovariance {
-            matrix: [[0.0; 6]; 6],
-            kind: CovarianceKind::SecondOrder,
-            mean_shift_prop: Some([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
-            mean_shift_input: None,
-            quality: CovarianceQuality::PositiveDefinite,
-            basis: Basis {
-                representation: CoordinateRepresentation::Cartesian,
-                frame: Frame::EclipticJ2000,
-                origin: Origin::Sun,
-            },
-            param_list: SolvedParameters::state_only(),
-            target_functional: TargetFunctional::CartesianState,
-            // The engine grew a wide payload on this type. A state-only
-            // fixture carries none, and this delivery does not marshal
-            // it — see the report's TaggedCovariance item. Stated
-            // explicitly rather than via `..Default::default()` so the
-            // day it IS marshaled, this fixture is a compile-time
-            // reminder rather than a silently absent block.
-            extended: None,
-            wide_cross: None,
-        }
-    }
-
-    #[test]
-    fn flatten_maps_kind_quality_shifts_and_basis() {
-        let tc = sample_tagged();
-        let f = flatten_tagged_covariance(60000.0, [7.0; 6], &tc).unwrap();
-
-        assert_eq!(f.epoch_mjd_tdb, 60000.0);
-        assert_eq!(f.state, [7.0; 6]);
-        assert_eq!(f.kind, EMPYREAN_COVARIANCE_KIND_SECOND_ORDER);
-        assert_eq!(f.has_mc_seed, 0);
-
-        // Prop shift present, input shift absent.
-        assert_eq!(f.has_mean_shift_prop, 1);
-        assert_eq!(f.mean_shift_prop[0], 1.0);
-        assert_eq!(f.has_mean_shift_input, 0);
-        assert_eq!(f.mean_shift_input, [0.0; 6]);
-
-        // PositiveDefinite ⟹ NaN sentinel (dynamicist check 3).
-        assert_eq!(f.quality, EMPYREAN_COVARIANCE_QUALITY_POSITIVE_DEFINITE);
-        assert!(f.quality_min_eig.is_nan());
-
-        // Lossless basis round-trip (dynamicist check 4).
-        assert_eq!(f.frame, frame_to_int(Frame::EclipticJ2000));
-        assert_eq!(f.origin, Origin::Sun.naif_id());
-        assert_eq!(
-            f.representation,
-            representation_to_int(CoordinateRepresentation::Cartesian)
-        );
-
-        // State-only on this path.
-        assert_eq!(f.solved_width, 6);
-        assert_eq!(f.non_grav, [0, 0, 0]);
-        assert_eq!(
-            f.target_functional,
-            EMPYREAN_TARGET_FUNCTIONAL_CARTESIAN_STATE
-        );
-    }
-
-    #[test]
-    fn flatten_indefinite_carries_finite_negative_min_eig() {
-        let mut tc = sample_tagged();
-        tc.quality = CovarianceQuality::Indefinite { min_eig: -1.0e-9 };
-        let f = flatten_tagged_covariance(60000.0, [0.0; 6], &tc).unwrap();
-        assert_eq!(f.quality, EMPYREAN_COVARIANCE_QUALITY_INDEFINITE);
-        assert!(f.quality_min_eig.is_finite() && f.quality_min_eig < 0.0);
-    }
-
-    #[test]
-    fn flatten_monte_carlo_carries_seed_with_flag() {
-        let mut tc = sample_tagged();
-        tc.kind = CovarianceKind::MonteCarlo { seed: 42 };
-        let f = flatten_tagged_covariance(60000.0, [0.0; 6], &tc).unwrap();
-        assert_eq!(f.kind, EMPYREAN_COVARIANCE_KIND_MONTE_CARLO);
-        assert_eq!(f.has_mc_seed, 1);
-        assert_eq!(f.mc_seed, 42);
-    }
-
-    #[test]
-    fn flatten_rejects_observatory_origin_instead_of_panicking() {
-        let mut tc = sample_tagged();
-        tc.basis.origin = Origin::observatory("W84");
-        let r = flatten_tagged_covariance(60000.0, [0.0; 6], &tc);
-        assert!(r.is_err(), "observatory origin must error, not panic");
-    }
+    // The `flatten_*` and `flatten_rejects_observatory_origin` tests were
+    // deleted: they drove `flatten_tagged_covariance(&TaggedCovariance)` and
+    // asserted the flat `kind` / `quality` / `quality_min_eig` /
+    // `representation` / `solved_width` / `non_grav` / `target_functional` /
+    // `mean_shift_input` fields. `TaggedCovariance` /
+    // `CovarianceQuality` / `SolvedParameters` / `TargetFunctional` are
+    // removed from the engine surface, and the flatten now takes an engine
+    // `Uncertainty<Cartesian>` and folds kind/quality into the joint — so the
+    // old input type and those flat fields are ruling-removed. The live
+    // successor (flatten from an `Uncertainty`, kind/quality read off the
+    // joint, observatory-origin refusal) is covered by the pass-14 joint /
+    // transform contract tests.
 
     #[test]
     fn accessors_reject_null_pointers() {
@@ -3899,8 +3978,6 @@ mod thrust_input_tests {
                 representation: 0, // Cartesian
                 frame: 0,          // ICRF
                 origin: 10,        // Sun (NAIF)
-                has_non_grav_cross: 0,
-                non_grav_cross: [[0.0; 3]; 6],
             },
             orbit_id: std::ptr::null(),
             object_id: std::ptr::null(),
@@ -3913,9 +3990,6 @@ mod thrust_input_tests {
             ng_n: 0.0,
             ng_k: 0.0,
             non_grav_dt: f64::NAN,
-            non_grav_dt_variance: f64::NAN,
-            has_non_grav_covariance: 0,
-            non_grav_covariance: [[0.0; 3]; 3],
             phot_system: -1,
             h_mag: f64::NAN,
             slope1: 0.0,
@@ -3924,16 +3998,10 @@ mod thrust_input_tests {
             n_thrust_arcs: 0,
             dv_corrections: std::ptr::null(),
             n_dv_corrections: 0,
-            correction_covariances: std::ptr::null(),
-            n_correction_covariances: 0,
             has_srp: 0,
             srp_amrat: 0.0,
             srp_cr: 0.0,
-            srp_amrat_variance: f64::NAN,
-            state_param_cross: std::ptr::null(),
-            n_state_param_cross: 0,
-            param_pair_cross: std::ptr::null(),
-            n_param_pair_cross: 0,
+            covariance: crate::joint::empty_packed_joint(),
             has_phot_covariance: 0,
             phot_covariance: [[0.0; 3]; 3],
         }
@@ -4042,25 +4110,11 @@ mod thrust_input_tests {
         assert!(err.contains("without any thrust_arcs"), "err was: {err}");
     }
 
-    #[test]
-    fn correction_covariance_length_mismatch_errors() {
-        let arcs = [rtn_arc()];
-        let dvs = [[0.0, 0.0, 0.0]];
-        let eye = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-        let covs = [eye, eye]; // 2 covariances vs 1 correction
-        let mut orbit = base_orbit();
-        orbit.thrust_arcs = arcs.as_ptr();
-        orbit.n_thrust_arcs = 1;
-        orbit.dv_corrections = dvs.as_ptr();
-        orbit.n_dv_corrections = 1;
-        orbit.correction_covariances = covs.as_ptr();
-        orbit.n_correction_covariances = 2;
-        let err = empyrean_orbit_thrust_params(&orbit).unwrap_err();
-        assert!(
-            err.contains("must match dv_corrections length"),
-            "err was: {err}"
-        );
-    }
+    // DELETED `correction_covariance_length_mismatch_errors`: the per-correction
+    // burn-prior covariance folded into the orbit's packed joint (its thrust
+    // axes) — `empyrean_orbit_thrust_params` no longer reads or length-checks
+    // `orbit.correction_covariances`, so the length-mismatch contract is
+    // ruling-removed.
 
     #[test]
     fn unknown_steering_law_tag_errors() {
@@ -4191,12 +4245,6 @@ mod thrust_input_tests {
         // Thrusting run — one ConstantRTN arc + a Δv correction with covariance.
         let arcs = [rtn_arc()];
         let dvs = [[0.0f64, 0.0, 0.0]];
-        let eye_small = [
-            [1.0e-20, 0.0, 0.0],
-            [0.0, 1.0e-20, 0.0],
-            [0.0, 0.0, 1.0e-20],
-        ];
-        let covs = [eye_small];
         let mut thrusting = base_orbit();
         thrusting.state.covariance = cov;
         thrusting.state.has_covariance = 1;
@@ -4204,10 +4252,11 @@ mod thrust_input_tests {
         thrusting.n_thrust_arcs = 1;
         thrusting.dv_corrections = dvs.as_ptr();
         thrusting.n_dv_corrections = 1;
-        thrusting.correction_covariances = covs.as_ptr();
-        thrusting.n_correction_covariances = 1;
+        // The per-correction burn-prior covariance rides the orbit's packed
+        // joint now (not a C side array); the arc + Δv correction alone
+        // engage the wide-Jet burn-sensitivity path this test exercises.
         let pos_thrust = final_position(thrusting);
-        // `arcs` / `dvs` / `covs` outlive the borrow above — dropped here.
+        // `arcs` / `dvs` outlive the borrow above — dropped here.
 
         // The thrust arc must have moved the final position.
         let dr = ((pos_thrust[0] - pos_ballistic[0]).powi(2)
@@ -4237,8 +4286,6 @@ mod srp_input_tests {
                 representation: 0,
                 frame: 0,
                 origin: 10,
-                has_non_grav_cross: 0,
-                non_grav_cross: [[0.0; 3]; 6],
             },
             orbit_id: std::ptr::null(),
             object_id: std::ptr::null(),
@@ -4251,9 +4298,6 @@ mod srp_input_tests {
             ng_n: 0.0,
             ng_k: 0.0,
             non_grav_dt: f64::NAN,
-            non_grav_dt_variance: f64::NAN,
-            has_non_grav_covariance: 0,
-            non_grav_covariance: [[0.0; 3]; 3],
             phot_system: -1,
             h_mag: f64::NAN,
             slope1: 0.0,
@@ -4262,16 +4306,10 @@ mod srp_input_tests {
             n_thrust_arcs: 0,
             dv_corrections: std::ptr::null(),
             n_dv_corrections: 0,
-            correction_covariances: std::ptr::null(),
-            n_correction_covariances: 0,
             has_srp: 0,
             srp_amrat: 0.0,
             srp_cr: 0.0,
-            srp_amrat_variance: f64::NAN,
-            state_param_cross: std::ptr::null(),
-            n_state_param_cross: 0,
-            param_pair_cross: std::ptr::null(),
-            n_param_pair_cross: 0,
+            covariance: crate::joint::empty_packed_joint(),
             has_phot_covariance: 0,
             phot_covariance: [[0.0; 3]; 3],
         }
@@ -4288,23 +4326,16 @@ mod srp_input_tests {
         o.has_srp = 1;
         o.srp_amrat = 3.0e-3;
         o.srp_cr = 1.2;
-        // NaN variance ⇒ SRP applied as a fixed force, AMRAT column closed.
+        // The AMRAT prior/variance rides the joint now, so the builder is
+        // value-only: it marshals amrat/cr through.
         let srp = empyrean_orbit_srp_params(&o).unwrap().unwrap();
         assert_eq!(srp.amrat, 3.0e-3);
         assert_eq!(srp.cr, 1.2);
-        assert!(srp.amrat_variance.is_none());
     }
 
-    #[test]
-    fn fittable_srp_opens_amrat_column() {
-        let mut o = base_orbit();
-        o.has_srp = 1;
-        o.srp_amrat = 3.0e-3;
-        o.srp_cr = 1.0;
-        o.srp_amrat_variance = 1.0e-8;
-        let srp = empyrean_orbit_srp_params(&o).unwrap().unwrap();
-        assert_eq!(srp.amrat_variance, Some(1.0e-8));
-    }
+    // DELETED `fittable_srp_opens_amrat_column`: the AMRAT prior variance that
+    // opens the column rides the orbit's packed joint (its AMRAT axis) now, not
+    // `SRPForceParams.amrat_variance` — a ruling-removed scalar surface.
 
     #[test]
     fn fields_without_enable_are_loud() {
@@ -4333,47 +4364,34 @@ mod srp_input_tests {
         assert!(empyrean_orbit_srp_params(&o).is_err());
     }
 
-    #[test]
-    fn negative_finite_variance_is_loud() {
-        let mut o = base_orbit();
-        o.has_srp = 1;
-        o.srp_amrat = 3.0e-3;
-        o.srp_cr = 1.0;
-        o.srp_amrat_variance = -1.0e-8; // finite negative is nonsense, not "no prior"
-        assert!(empyrean_orbit_srp_params(&o).is_err());
-    }
+    // DELETED `negative_finite_variance_is_loud`: the SRP builder no longer
+    // reads `srp_amrat_variance` (the AMRAT prior rides the joint), so the
+    // negative-variance validation is a ruling-removed scalar surface.
 
-    /// A memset(0) `EmpyreanOrbit` carries `has_srp = 0` and a `0.0`
-    /// `srp_amrat_variance` (C's zero-init default is 0.0, not NaN). The
-    /// zero-init variance must read as "absent", not as a value-field-set-
-    /// without-the-switch error — otherwise every C caller that memsets the
-    /// struct has its propagation refused (the validation C channel was
-    /// measured dead-on-arrival from exactly this). Regression for the SRP
-    /// zero-init guard.
+    /// A memset(0) `EmpyreanOrbit` carries `has_srp = 0`. With no SRP enabled
+    /// and zero amrat/cr, the slot reads as absent — a C caller that memsets
+    /// the struct must not have its propagation refused.
     #[test]
     fn zero_init_srp_fields_are_absent() {
         let mut o = base_orbit();
         o.has_srp = 0;
         o.srp_amrat = 0.0;
         o.srp_cr = 0.0;
-        o.srp_amrat_variance = 0.0; // the memset value, not NaN
         assert!(empyrean_orbit_srp_params(&o).unwrap().is_none());
     }
 
-    /// `has_srp = 1` with a zero-init (`0.0`) variance applies SRP as a fixed
-    /// force (no AMRAT prior), identical to NaN — a memset caller who sets
-    /// only `has_srp` + `srp_amrat` + `srp_cr` must not have the fit refused.
+    /// `has_srp = 1` with only `srp_amrat` + `srp_cr` set applies SRP as a
+    /// fixed force — the AMRAT prior, when fit, rides the joint, so the
+    /// value-only builder marshals the force values without refusal.
     #[test]
-    fn zero_init_variance_with_srp_is_fixed_force() {
+    fn srp_enabled_marshals_force_values() {
         let mut o = base_orbit();
         o.has_srp = 1;
         o.srp_amrat = 3.0e-3;
         o.srp_cr = 1.2;
-        o.srp_amrat_variance = 0.0; // zero-init ⇒ no prior, not a loud error
         let srp = empyrean_orbit_srp_params(&o).unwrap().unwrap();
         assert_eq!(srp.amrat, 3.0e-3);
         assert_eq!(srp.cr, 1.2);
-        assert!(srp.amrat_variance.is_none());
     }
 }
 
@@ -4394,8 +4412,6 @@ mod non_grav_input_tests {
                 representation: 0,
                 frame: 0,
                 origin: 10,
-                has_non_grav_cross: 0,
-                non_grav_cross: [[0.0; 3]; 6],
             },
             orbit_id: std::ptr::null(),
             object_id: std::ptr::null(),
@@ -4408,9 +4424,6 @@ mod non_grav_input_tests {
             ng_n: 0.0,
             ng_k: 0.0,
             non_grav_dt: f64::NAN,
-            non_grav_dt_variance: f64::NAN,
-            has_non_grav_covariance: 0,
-            non_grav_covariance: [[0.0; 3]; 3],
             phot_system: -1,
             h_mag: f64::NAN,
             slope1: 0.0,
@@ -4419,16 +4432,10 @@ mod non_grav_input_tests {
             n_thrust_arcs: 0,
             dv_corrections: std::ptr::null(),
             n_dv_corrections: 0,
-            correction_covariances: std::ptr::null(),
-            n_correction_covariances: 0,
             has_srp: 0,
             srp_amrat: 0.0,
             srp_cr: 0.0,
-            srp_amrat_variance: f64::NAN,
-            state_param_cross: std::ptr::null(),
-            n_state_param_cross: 0,
-            param_pair_cross: std::ptr::null(),
-            n_param_pair_cross: 0,
+            covariance: crate::joint::empty_packed_joint(),
             has_phot_covariance: 0,
             phot_covariance: [[0.0; 3]; 3],
         }
@@ -4440,22 +4447,11 @@ mod non_grav_input_tests {
         assert!(empyrean_orbit_non_grav_params(&base_orbit()).is_none());
     }
 
-    #[test]
-    fn zero_coeffs_with_covariance_opens_marsden() {
-        // A Marsden solve seeded from A1=A2=A3=0 declares its column via the
-        // covariance prior — the presence gate must NOT drop it (villeneuve
-        // opens the Marsden Jacobian only when the covariance is declared).
-        let mut o = base_orbit();
-        o.has_non_grav_covariance = 1;
-        let mut c = [[0.0; 3]; 3];
-        for (i, row) in c.iter_mut().enumerate() {
-            row[i] = 1.0e-24;
-        }
-        o.non_grav_covariance = c;
-        let ng = empyrean_orbit_non_grav_params(&o).expect("covariance opens the Marsden column");
-        assert_eq!(ng.a1, 0.0);
-        assert_eq!(ng.covariance, Some(c));
-    }
+    // DELETED `zero_coeffs_with_covariance_opens_marsden`: the non-grav prior
+    // covariance rides the orbit's packed joint (its Marsden axes) now, not
+    // `EmpyreanOrbit.non_grav_covariance` / `NonGravParams.covariance`; the
+    // presence gate is value-based (A1/A2/A3 or DT) and the joint's layout
+    // opens the Marsden column — a ruling-removed scalar surface.
 
     #[test]
     fn zero_coeffs_with_dt_is_present() {
@@ -4557,35 +4553,14 @@ mod overlap_policy_tests {
     }
 }
 
-/// The `EMPYREAN_COVARIANCE_QUALITY_*` and `EMPYREAN_TAGGED_COV_*`
-/// surfaces that grew when the engine added an expansion-validity tag and
-/// two row-addressing integrity errors.
+/// The `EMPYREAN_TAGGED_COV_*` series-accessor error codes — the two
+/// row-addressing integrity errors the engine added alongside the rest —
+/// must stay distinct and negative. (The joint's own `quality` /
+/// `functional` / `provenance` discriminants are pinned against the engine
+/// in `contract_tests::wire_discriminant_consts_are_stable`.)
 #[cfg(test)]
 mod covariance_quality_tag_tests {
     use super::*;
-
-    /// The new tag must not collide with the three that shipped, and must
-    /// be distinct from them — folding it into POSITIVE_DEFINITE would
-    /// hand consumers a degraded covariance wearing a clean bill of
-    /// health.
-    #[test]
-    fn the_quality_tags_are_distinct() {
-        let tags = [
-            EMPYREAN_COVARIANCE_QUALITY_POSITIVE_DEFINITE,
-            EMPYREAN_COVARIANCE_QUALITY_INDEFINITE,
-            EMPYREAN_COVARIANCE_QUALITY_REPAIRED,
-            EMPYREAN_COVARIANCE_QUALITY_EXPANSION_SUSPECT,
-        ];
-        for (i, a) in tags.iter().enumerate() {
-            for b in &tags[i + 1..] {
-                assert_ne!(a, b, "quality tags must be distinct");
-            }
-        }
-        assert_eq!(
-            EMPYREAN_COVARIANCE_QUALITY_EXPANSION_SUSPECT, 3,
-            "appended after the three shipped tags"
-        );
-    }
 
     /// The two new series errors get their own codes rather than sharing
     /// STATE_MISSING: "the row is not there" and "the row belongs to a
@@ -4702,47 +4677,61 @@ mod propagated_joint_tests {
         cfg
     }
 
-    /// A comet-like orbit with a Marsden block AND an AMRAT prior, so
-    /// the wide layout is wider than 9 and BOTH halves of the joint are
-    /// exercised: the Marsden border rides `state.non_grav_cross`, the
-    /// state↔AMRAT column rides the carrier.
+    /// A comet-like orbit with a Marsden block AND an AMRAT prior, so the
+    /// wide layout is wider than 9: A1/A2/A3 (axis bits 0–2) plus AMRAT
+    /// (axis bit 4) sit alongside the state in ONE width-10 packed joint.
+    /// The Marsden coefficients and the SRP slot carry their values; the
+    /// solved-parameter PRIOR rides `o.covariance` (its layout opens the
+    /// columns). Cartesian, so the joint needs no angular scaling.
     fn wide_orbit() -> EmpyreanOrbit {
         // SAFETY: as above — this is the caller-side `memset(0)`.
         let mut o: EmpyreanOrbit = unsafe { std::mem::zeroed() };
         o.state = crate::CoordinateState {
             epoch_mjd_tdb: 59000.0,
             elements: [1.0, 0.1, 0.05, -0.005, 0.015, 0.001],
-            covariance: {
-                let mut c = [[0.0f64; 6]; 6];
-                for (i, row) in c.iter_mut().enumerate() {
-                    row[i] = 1.0e-10 * (i as f64 + 1.0);
-                }
-                c
-            },
-            has_covariance: 1,
+            // The state covariance is the joint's leading 6×6; the flat
+            // field stays absent so the packed joint is the sole authority
+            // (no agreement cross-check to satisfy).
+            covariance: [[0.0; 6]; 6],
+            has_covariance: 0,
             representation: 0, // Cartesian
             frame: 0,
             origin: 10,
-            has_non_grav_cross: 0,
-            non_grav_cross: [[0.0; 3]; 6],
         };
         o.a1 = 1.0e-10;
         o.a2 = 1.0e-11;
         o.a3 = 0.0;
         o.non_grav_dt = f64::NAN;
-        o.non_grav_dt_variance = f64::NAN;
-        o.has_non_grav_covariance = 1;
-        o.non_grav_covariance = [
-            [1.0e-22, 0.0, 0.0],
-            [0.0, 1.0e-24, 0.0],
-            [0.0, 0.0, 1.0e-26],
-        ];
         o.phot_system = -1;
         o.h_mag = f64::NAN;
         o.has_srp = 1;
         o.srp_amrat = 0.01;
         o.srp_cr = 1.0;
-        o.srp_amrat_variance = 1.0e-6;
+        // The solved-parameter prior as ONE packed joint: width 10 (6 state +
+        // A1/A2/A3 + AMRAT), diagonal, Linear/State/Derived. The triangle is
+        // leaked so it outlives the fixture for the test process.
+        let width = 10usize;
+        let mut tri = vec![0.0f64; width * (width + 1) / 2];
+        for i in 0..width {
+            tri[i * (i + 1) / 2 + i] = 1.0e-20;
+        }
+        let tri: &'static [f64] = Box::leak(tri.into_boxed_slice());
+        o.covariance = crate::joint::EmpyreanPackedJoint {
+            layout_present: 0b1_0111, // A1,A2,A3 (bits 0–2) + AMRAT (bit 4)
+            layout_considered: 0,
+            layout_marginalized: 0,
+            width: width as u8,
+            tri: tri.as_ptr(),
+            tri_len: tri.len(),
+            kind: 0, // Linear
+            quality: 0,
+            cov_rank: 0,
+            cov_null_axes: 0,
+            cov_min_eig_corr: f64::NAN,
+            functional: 0, // State
+            provenance: 0, // Derived
+            asserted_source: crate::joint::wire_tags::EMPYREAN_JOINT_ASSERTED_SOURCE_NONE,
+        };
         o
     }
 
@@ -4785,67 +4774,76 @@ mod propagated_joint_tests {
         let last = unsafe { &*leg1.states.add(leg1_times.len() - 1) };
         assert_eq!(last.has_covariance, 1, "leg 1 must deliver a 6x6");
 
-        // The joint reached the caller. A layout wider than 9 puts the
-        // AMRAT column in the carrier and the Marsden block in the
-        // border, so both halves must be present.
+        // The inline per-state `orbit_cov` is the state-only marginal (width
+        // 6); the full (6+P)-wide joint is the opt-in covariance series, read
+        // by epoch through `empyrean_propagation_joint_at`. A wide orbit
+        // (state + Marsden + AMRAT) propagates to a joint wider than the state
+        // 6×6, the propagated correlation living in that one triangle.
         assert_eq!(
-            last.orbit_cov.has_non_grav_cross, 1,
-            "the propagated state-Marsden border must reach the caller — it is \
-             non-zero even from a block-diagonal input, because propagation \
-             generates the correlation"
+            last.orbit_cov.width, 6,
+            "the inline per-state joint is the state marginal; the wide joint rides the series"
+        );
+        let mut wide = crate::joint::empty_packed_joint();
+        let rc =
+            unsafe { empyrean_propagation_joint_at(&leg1, 0, leg1_times.len() - 1, &mut wide) };
+        assert_eq!(
+            rc,
+            0,
+            "the wide propagated joint is available via the series: {}",
+            last_err()
         );
         assert!(
-            last.orbit_cov.n_state_param_cross > 0,
-            "the state-AMRAT column has no home but the carrier, and this orbit \
-             declares an AMRAT prior"
-        );
-        let entries = unsafe {
-            std::slice::from_raw_parts(
-                last.orbit_cov.state_param_cross,
-                last.orbit_cov.n_state_param_cross,
-            )
-        };
-        assert!(
-            entries
-                .iter()
-                .any(|e| e.column.kind == crate::joint::EMPYREAN_PARAM_COLUMN_AMRAT),
-            "the carrier must tag its AMRAT column by identity"
+            wide.width > 6,
+            "the wide propagated joint must carry the solved-parameter axes (width {})",
+            wide.width
         );
         assert!(
-            entries
-                .iter()
-                .all(|e| e.values.iter().all(|v| v.is_finite())),
-            "every propagated cross value must be finite"
+            !wide.tri.is_null() && wide.tri_len > 0,
+            "the wide propagated joint must carry a triangle"
         );
+        {
+            let tri = unsafe { std::slice::from_raw_parts(wide.tri, wide.tri_len) };
+            assert!(
+                tri.iter().all(|v| v.is_finite()),
+                "every propagated joint entry must be finite"
+            );
+        }
 
-        // ── Re-feed: leg 2's input IS leg 1's output ──
+        // ── Re-feed: leg 2's input IS leg 1's output joint ──
         //
-        // Field copies only. Nothing here inverts a slot map or consults
-        // a layout — that is the whole point of identity tagging.
+        // The whole (6+P)-wide joint rides one field now. Its triangle is
+        // library-owned by `leg1` (freed at the end of the test, after leg 2),
+        // so the re-fed orbit borrows it for leg 2's duration — a field copy of
+        // the packed joint, no slot-map inversion.
         let mut refed = wide_orbit();
         refed.state.epoch_mjd_tdb = last.epoch_mjd_tdb;
         refed.state.elements = [last.x, last.y, last.z, last.vx, last.vy, last.vz];
         refed.state.covariance = last.covariance;
         refed.state.has_covariance = last.has_covariance;
-        refed.state.has_non_grav_cross = last.orbit_cov.has_non_grav_cross;
-        refed.state.non_grav_cross = last.orbit_cov.non_grav_cross;
-        refed.state_param_cross = last.orbit_cov.state_param_cross;
-        refed.n_state_param_cross = last.orbit_cov.n_state_param_cross;
-        refed.param_pair_cross = last.orbit_cov.param_pair_cross;
-        refed.n_param_pair_cross = last.orbit_cov.n_param_pair_cross;
+        let src = &wide;
+        refed.covariance = crate::joint::EmpyreanPackedJoint {
+            layout_present: src.layout_present,
+            layout_considered: src.layout_considered,
+            layout_marginalized: src.layout_marginalized,
+            width: src.width,
+            tri: src.tri,
+            tri_len: src.tri_len,
+            kind: src.kind,
+            quality: src.quality,
+            cov_rank: src.cov_rank,
+            cov_null_axes: src.cov_null_axes,
+            cov_min_eig_corr: src.cov_min_eig_corr,
+            functional: src.functional,
+            provenance: src.provenance,
+            asserted_source: src.asserted_source,
+        };
 
         // The same orbit, re-fed with the state block ONLY — the chain a
-        // caller was forced into before this release. Rebuilt rather
-        // than copied, since `EmpyreanOrbit` is deliberately not `Clone`
-        // (its side arrays are borrowed pointers).
+        // caller was forced into before this release. No wide joint, so leg 2
+        // sees only the state 6×6 carried on the flat state.
         let mut block_diagonal = wide_orbit();
         block_diagonal.state = refed.state;
-        block_diagonal.state.has_non_grav_cross = 0;
-        block_diagonal.state.non_grav_cross = [[0.0; 3]; 6];
-        block_diagonal.state_param_cross = std::ptr::null();
-        block_diagonal.n_state_param_cross = 0;
-        block_diagonal.param_pair_cross = std::ptr::null();
-        block_diagonal.n_param_pair_cross = 0;
+        block_diagonal.covariance = crate::joint::empty_packed_joint();
 
         // ── Leg 2, both ways ──
         let leg2_times = [last.epoch_mjd_tdb, last.epoch_mjd_tdb + 50.0];
@@ -4891,6 +4889,7 @@ mod propagated_joint_tests {
              reached the engine, which is the defect this surface exists to remove"
         );
 
+        unsafe { empyrean_orbit_covariance_free(&mut wide) };
         unsafe { empyrean_propagation_result_free(&mut leg1) };
     }
 
@@ -4911,12 +4910,12 @@ mod propagated_joint_tests {
         o.a1 = 0.0;
         o.a2 = 0.0;
         o.a3 = 0.0;
-        o.has_non_grav_covariance = 0;
-        o.non_grav_covariance = [[0.0; 3]; 3];
         o.has_srp = 0;
         o.srp_amrat = 0.0;
         o.srp_cr = 0.0;
-        o.srp_amrat_variance = f64::NAN;
+        // No solved-parameter prior: a gravity-only orbit carries no joint
+        // (the Marsden / AMRAT priors that rode the joint are simply absent).
+        o.covariance = crate::joint::empty_packed_joint();
 
         let orbits = [o];
         let times = [59000.0f64, 59010.0];
@@ -4937,16 +4936,13 @@ mod propagated_joint_tests {
         for i in 0..result.num_states {
             let st = unsafe { &*result.states.add(i) };
             assert_eq!(
-                st.orbit_cov.has_non_grav_cross, 0,
-                "row {i}: no solved-parameter block means no border"
+                st.orbit_cov.width, 0,
+                "row {i}: no solved-parameter block means an absent joint, \
+                 not a block of zeros"
             );
             assert!(
-                st.orbit_cov.state_param_cross.is_null() && st.orbit_cov.n_state_param_cross == 0,
-                "row {i}: absent, never an array of zeros"
-            );
-            assert!(
-                st.orbit_cov.param_pair_cross.is_null() && st.orbit_cov.n_param_pair_cross == 0,
-                "row {i}: same for the pair array"
+                st.orbit_cov.tri.is_null() && st.orbit_cov.tri_len == 0,
+                "row {i}: absent joint carries no triangle"
             );
         }
 
@@ -4987,12 +4983,8 @@ mod mixture_flattening_tests {
             representation: crate::od::EMPYREAN_REPRESENTATION_CARTESIAN,
             frame: 1,
             origin: 10,
-            has_non_grav_cross: 0,
-            non_grav_cross: [[0.0; 3]; 6],
         };
         orbit.non_grav_dt = f64::NAN;
-        orbit.non_grav_dt_variance = f64::NAN;
-        orbit.srp_amrat_variance = f64::NAN;
         orbit
     }
 
@@ -5475,57 +5467,229 @@ mod detection_refusal_tests {
 /// `accessor_location` must never hand back a position that contradicts
 /// itself.
 ///
-/// The retained-result accessors are addressed by `(orbit_index,
-/// epoch_index)` and reach this resolver on the out-of-range path with
-/// an `epoch_index` already known to be bad. Deriving a flat row from a
-/// bad epoch index lands on a *different orbit's* row whenever orbits
-/// follow it, so the index reported and the id reported would name two
-/// different orbits.
+/// The per-orbit delivery channel on `EmpyreanPropagationResult`: a per-orbit
+/// propagation failure is carried in `outcomes` (no longer vanishing from a
+/// shorter output), the batch still succeeds, and `first_row` / `num_rows` map
+/// each input orbit onto its block of delivered rows.
 #[cfg(test)]
-mod accessor_row_tests {
-    use super::accessor_row;
+mod outcome_channel_tests {
+    use super::*;
 
-    /// Three orbits × two epochs. Orbit 0, epoch 5 derives row 5 — a
-    /// real row, belonging to orbit 2. It must resolve to no row, so the
-    /// caller is told the index it passed and nothing borrowed.
-    #[test]
-    fn an_out_of_range_epoch_resolves_to_no_row() {
-        assert_eq!(
-            accessor_row(6, 2, 0, 5),
-            None,
-            "epoch 5 of a two-epoch grid must not borrow orbit 2's row"
-        );
+    fn try_context() -> Option<EmpyreanContext> {
+        empyrean_core::Context::from_data_dir(None).ok()
     }
 
-    /// An out-of-range orbit index is bounded the same way.
-    #[test]
-    fn an_out_of_range_orbit_resolves_to_no_row() {
-        assert_eq!(accessor_row(6, 2, 9, 0), None);
-        assert_eq!(accessor_row(6, 2, 3, 0), None, "one past the last orbit");
+    fn last_err() -> String {
+        let p = crate::empyrean_last_error();
+        if p.is_null() {
+            return String::new();
+        }
+        unsafe { std::ffi::CStr::from_ptr(p) }
+            .to_string_lossy()
+            .into_owned()
     }
 
-    /// The positive control, and the reason the two above mean
-    /// something: every in-range pair still resolves, orbit-major. A
-    /// resolver that always returned `None` would pass both tests above
-    /// and fail this one.
-    #[test]
-    fn every_in_range_pair_resolves_orbit_major() {
-        for orbit in 0..3 {
-            for epoch in 0..2 {
-                assert_eq!(
-                    accessor_row(6, 2, orbit, epoch),
-                    Some(orbit * 2 + epoch),
-                    "({orbit}, {epoch})"
-                );
-            }
+    /// A valid heliocentric Cartesian orbit (AU, AU/day), SSB-ish; delivers a
+    /// row at every requested epoch.
+    fn delivered_orbit(px: f64) -> EmpyreanOrbit {
+        EmpyreanOrbit {
+            state: crate::CoordinateState {
+                epoch_mjd_tdb: 59000.0,
+                elements: [px, 0.1, 0.05, -0.005, 0.015, 0.001],
+                covariance: [[0.0; 6]; 6],
+                has_covariance: 0,
+                representation: 0,
+                frame: 0,
+                origin: 10,
+            },
+            orbit_id: std::ptr::null(),
+            object_id: std::ptr::null(),
+            a1: 0.0,
+            a2: 0.0,
+            a3: 0.0,
+            ng_alpha: 0.0,
+            ng_r0: 0.0,
+            ng_m: 0.0,
+            ng_n: 0.0,
+            ng_k: 0.0,
+            non_grav_dt: f64::NAN,
+            phot_system: -1,
+            h_mag: f64::NAN,
+            slope1: 0.0,
+            slope2: 0.0,
+            thrust_arcs: std::ptr::null(),
+            n_thrust_arcs: 0,
+            dv_corrections: std::ptr::null(),
+            n_dv_corrections: 0,
+            has_srp: 0,
+            srp_amrat: 0.0,
+            srp_cr: 0.0,
+            covariance: crate::joint::empty_packed_joint(),
+            has_phot_covariance: 0,
+            phot_covariance: [[0.0; 3]; 3],
         }
     }
 
-    /// A zero `n_times` is the degenerate grid the accessors guard with
-    /// `max(1)`; it must not divide by zero.
+    /// An orbit the engine refuses to integrate: a finite Cartesian state (so
+    /// it passes input validation) whose epoch is far outside the ephemeris
+    /// span, so the perturber lookup fails on the first integration step. It
+    /// fails BY NAME inside the per-orbit compute closure — a carried
+    /// `OrbitOutcome::Failed`, not a call-level abort — while the in-span orbits
+    /// deliver. Deterministic and offline (no network; the span, not a missing
+    /// kernel, is the refusal).
+    fn refused_orbit() -> EmpyreanOrbit {
+        let mut o = delivered_orbit(1.0);
+        // ~year 2956: outside de440 (…2650) and de440s (…2150) alike.
+        o.state.epoch_mjd_tdb = 400_000.0;
+        o
+    }
+
+    fn first_order_cfg() -> EmpyreanPropagationConfig {
+        let mut cfg: EmpyreanPropagationConfig = unsafe { std::mem::zeroed() };
+        cfg.force_model = 2; // Standard
+        cfg.uncertainty_method.tag = EMPYREAN_UNCERTAINTY_FIRST;
+        cfg.advanced.dt_initial = f64::NAN;
+        cfg.advanced.dt_min = f64::NAN;
+        cfg
+    }
+
+    unsafe fn outcomes_slice(result: &EmpyreanPropagationResult) -> &[EmpyreanOrbitOutcome] {
+        if result.outcomes.is_null() {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(result.outcomes, result.num_orbits) }
+        }
+    }
+
+    /// A three-orbit batch whose MIDDLE orbit the engine refuses: the failed
+    /// orbit is carried in `outcomes` rather than vanishing, the batch still
+    /// returns success, and `first_row` / `num_rows` map the delivered rows to
+    /// orbits 0 and 2 exactly.
     #[test]
-    fn a_zero_epoch_count_is_treated_as_one() {
-        assert_eq!(accessor_row(3, 0, 1, 0), Some(1));
-        assert_eq!(accessor_row(3, 0, 1, 1), None);
+    fn a_mixed_batch_carries_the_failed_orbit_and_maps_the_delivered_rows() {
+        let ctx = match try_context() {
+            Some(c) => c,
+            None => {
+                eprintln!("skipping outcome channel test: no ephemeris data dir");
+                return;
+            }
+        };
+        let ctx_ptr: *const EmpyreanContext = &ctx;
+        let cfg = first_order_cfg();
+        let times = [59000.0f64, 59005.0, 59012.0];
+        let orbits = [delivered_orbit(1.0), refused_orbit(), delivered_orbit(1.2)];
+
+        let mut result: EmpyreanPropagationResult = unsafe { std::mem::zeroed() };
+        let code = unsafe {
+            empyrean_propagate(
+                ctx_ptr,
+                orbits.as_ptr(),
+                orbits.len(),
+                times.as_ptr(),
+                times.len(),
+                &cfg,
+                &mut result,
+            )
+        };
+        // A per-orbit failure is NOT a call-level error.
+        assert_eq!(code, 0, "mixed batch must still succeed: {}", last_err());
+        assert_eq!(result.num_orbits, 3, "one outcome per INPUT orbit");
+
+        let outcomes = unsafe { outcomes_slice(&result) };
+        assert_eq!(
+            outcomes[0].status, EMPYREAN_ORBIT_OUTCOME_DELIVERED,
+            "orbit 0 delivers"
+        );
+        assert_eq!(
+            outcomes[1].status, EMPYREAN_ORBIT_OUTCOME_FAILED,
+            "orbit 1 (near-Sun) is refused by the engine, not dropped"
+        );
+        assert_eq!(
+            outcomes[2].status, EMPYREAN_ORBIT_OUTCOME_DELIVERED,
+            "orbit 2 delivers"
+        );
+
+        // The failed orbit names its cause and carries no rows.
+        assert_ne!(
+            outcomes[1].error_code, EMPYREAN_PROPAGATE_FAILURE_NONE,
+            "a failed orbit carries a classified code"
+        );
+        assert!(
+            !outcomes[1].error_message.is_null(),
+            "a failed orbit carries the engine's message"
+        );
+        assert_eq!(outcomes[1].num_rows, 0, "a failed orbit delivers no rows");
+
+        // The delivered rows map to orbits 0 and 2 exactly: each delivered
+        // orbit's block is contiguous and sums to num_states.
+        assert_eq!(outcomes[0].first_row, 0, "orbit 0 opens the row block");
+        assert_eq!(
+            outcomes[0].num_rows, 3,
+            "orbit 0 delivers one row per epoch"
+        );
+        assert_eq!(
+            outcomes[2].first_row, outcomes[0].num_rows,
+            "orbit 2 begins immediately after orbit 0's rows — the failed \
+             middle orbit occupies NO rows"
+        );
+        assert_eq!(
+            outcomes[2].num_rows, 3,
+            "orbit 2 delivers one row per epoch"
+        );
+        assert_eq!(
+            result.num_states,
+            outcomes[0].num_rows + outcomes[2].num_rows,
+            "num_states is the DELIVERED rows only (the two surviving orbits)"
+        );
+
+        unsafe { empyrean_propagation_result_free(&mut result) };
+    }
+
+    /// A batch where EVERY orbit fails returns SUCCESS with zero delivered rows
+    /// and every outcome FAILED — the engine delivered the accounting, so it is
+    /// not an error return.
+    #[test]
+    fn an_all_failed_batch_returns_the_accounting_not_an_error() {
+        let ctx = match try_context() {
+            Some(c) => c,
+            None => {
+                eprintln!("skipping outcome channel test: no ephemeris data dir");
+                return;
+            }
+        };
+        let ctx_ptr: *const EmpyreanContext = &ctx;
+        let cfg = first_order_cfg();
+        let times = [59000.0f64, 59005.0, 59012.0];
+        let orbits = [refused_orbit(), refused_orbit(), refused_orbit()];
+
+        let mut result: EmpyreanPropagationResult = unsafe { std::mem::zeroed() };
+        let code = unsafe {
+            empyrean_propagate(
+                ctx_ptr,
+                orbits.as_ptr(),
+                orbits.len(),
+                times.as_ptr(),
+                times.len(),
+                &cfg,
+                &mut result,
+            )
+        };
+        assert_eq!(
+            code,
+            0,
+            "an all-failed batch is the engine's accounting, not an error: {}",
+            last_err()
+        );
+        assert_eq!(result.num_orbits, 3, "every input orbit has an outcome");
+        assert_eq!(result.num_states, 0, "no orbit delivered a row");
+        let outcomes = unsafe { outcomes_slice(&result) };
+        assert!(
+            outcomes
+                .iter()
+                .all(|o| o.status == EMPYREAN_ORBIT_OUTCOME_FAILED),
+            "every orbit failed"
+        );
+
+        unsafe { empyrean_propagation_result_free(&mut result) };
     }
 }

@@ -8,6 +8,8 @@
 #![allow(clippy::field_reassign_with_default)]
 
 mod built_system;
+#[cfg(test)]
+mod contract_tests;
 mod ephemeris;
 mod impact;
 mod io;
@@ -95,49 +97,12 @@ const _: () = {
 /// `Copy` is a Rust-side convenience only (the batched transform writes
 /// whole rows into a caller-owned array); the C layout is unaffected.
 ///
-/// # The border sits here, beside the 6×6 it borders
-///
-/// [`non_grav_cross`](Self::non_grav_cross) is the \\(6 \times 3\\) half
-/// of one `ExtendedCovariance`, whose other half is the state
-/// [`covariance`](Self::covariance). Putting it one level up on
-/// `EmpyreanOrbit` would split a single matrix across two structs, and
-/// `empyrean_transform_coordinates` takes a `CoordinateState` *without*
-/// its orbit — so the two halves could be transformed apart. Here they
-/// travel together, and the transform rotates the pair.
-///
-/// The orbit's wide **carrier** stays on `EmpyreanOrbit`, mirroring the
-/// engine's own split: a carrier's thrust tags are an orbit-level
-/// concept a coordinate has no business knowing.
-///
-/// One consequence a caller should know: `empyrean_transform_coordinates`
-/// transforms a coordinate and its border, **not a whole joint**. An
-/// orbit's carrier is not in scope at that signature, so an orbit-level
-/// joint cannot be re-expressed in another basis through the C ABI in
-/// this release. Transform the orbit before attaching its carrier, or
-/// supply the joint in the basis you want it consumed in.
-///
-/// # Non-finite values are refused, by the row they belong to
-///
-/// A propagation batch is checked row by row before anything is
-/// integrated, and a NaN or infinite value in a **declared** field
-/// fails the call with invalid-argument, naming that orbit's index and
-/// `orbit_id` (readable through
-/// [`empyrean_error_location`]). A NaN
-/// element otherwise integrates into a NaN trajectory and surfaces from
-/// deep inside the engine with no index in the message.
-///
-/// Checked always: [`epoch_mjd_tdb`](Self::epoch_mjd_tdb) and all six
-/// [`elements`](Self::elements). Checked only when the row declares
-/// them: [`covariance`](Self::covariance) (when `has_covariance` is
-/// non-zero) and [`non_grav_cross`](Self::non_grav_cross) (when
-/// `has_non_grav_cross` is non-zero) — an undeclared block is
-/// uninitialized memory as far as this ABI is concerned, and reading it
-/// would reject rows the engine never looks at.
-///
-/// **Deliberately not checked**, because NaN is their documented
-/// "absent" sentinel rather than a mistake: `EmpyreanOrbit`'s
-/// `non_grav_dt`, `non_grav_dt_variance`, `srp_amrat_variance`, and the
-/// photometry slots.
+/// Carries only the state: epoch, elements and the bare \\(6 \times 6\\)
+/// state covariance. An orbit's solved-parameter cross terms (the border,
+/// the non-grav / thrust blocks) ride the orbit's one packed joint
+/// (`EmpyreanPackedJoint`), not this
+/// struct — so `empyrean_transform_coordinates`, which takes a bare
+/// `CoordinateState`, rotates the state covariance alone, never a joint.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CoordinateState {
@@ -148,29 +113,6 @@ pub struct CoordinateState {
     pub representation: i32,
     pub frame: i32,
     pub origin: i32,
-    /// 1 when [`non_grav_cross`](Self::non_grav_cross) carries the
-    /// state↔Marsden border; 0 otherwise. A zero-init state carries no
-    /// border and behaves exactly as it did before this field existed.
-    pub has_non_grav_cross: u8,
-    /// \\(6 \times 3\\) state-to-\\((A_1, A_2, A_3)\\) cross covariance,
-    /// row-major, in the same basis **and the same units** as
-    /// [`covariance`](Self::covariance) — angular rows in degrees for
-    /// Cometary / Keplerian / Spherical.
-    ///
-    /// Only read when `has_non_grav_cross = 1`, and requires the orbit
-    /// to declare `has_non_grav_covariance = 1`: the border and the
-    /// \\(3 \times 3\\) it borders are two halves of one matrix, and the
-    /// engine refuses a border without its parameter block rather than
-    /// substituting a zero one.
-    ///
-    /// A zero-filled border is read as *no border supplied* — the engine
-    /// filters an all-zero cross as absent, because a file row tagged
-    /// with a 9-wide covariance gets one attached whether or not it ever
-    /// had cross terms. Note the deliberate asymmetry with the wide
-    /// carrier, where a supplied all-zero entry counts as *a supplied
-    /// zero correlation* and does engage the joint definiteness gate. If
-    /// you mean "absent" in the carrier, omit the entry.
-    pub non_grav_cross: [[f64; 3]; 6],
 }
 
 impl CoordinateState {
@@ -195,11 +137,9 @@ impl CoordinateState {
 
     /// Build a C-ABI state from an [`empyrean_core::convert::CoordinateState`].
     ///
-    /// Leaves the border absent — the core type does not carry one. A
-    /// caller marshaling a coordinate that HAS a border sets the two
-    /// fields afterwards from the `Coordinates`' own
-    /// `extended_covariance()`; this constructor is for the paths where
-    /// there is nothing to carry.
+    /// A field-by-field copy: both types carry only the state (epoch,
+    /// elements, the bare \\(6 \times 6\\)). Solved-parameter cross terms
+    /// ride the orbit's packed joint, never this struct.
     pub fn from_empyrean(s: &empyrean_core::convert::CoordinateState) -> Self {
         Self {
             epoch_mjd_tdb: s.epoch_mjd_tdb,
@@ -209,8 +149,6 @@ impl CoordinateState {
             representation: s.representation,
             frame: s.frame,
             origin: s.origin,
-            has_non_grav_cross: 0,
-            non_grav_cross: [[0.0; 3]; 6],
         }
     }
 }

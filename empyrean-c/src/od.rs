@@ -379,6 +379,14 @@ pub const EMPYREAN_REJECTION_NEVER_ABSORBED: i32 = 14;
 /// per observation, which routes the row through the geodetic-observer
 /// path and fits it.
 pub const EMPYREAN_REJECTION_PER_OBSERVATION_SITE_REQUIRED: i32 = 15;
+/// The blunder gate removed this row: the CMC2003 hysteresis mechanics run
+/// at blunder-scale thresholds (reject past 10σ, recover below 9σ), tagging
+/// a data error rather than a statistical outlier. Distinct from
+/// [`EMPYREAN_REJECTION_CMC2003`] because the two answer different questions:
+/// CMC2003 flags a statistical outlier under the fitted model, the blunder
+/// gate flags a row that does not belong to the model's error distribution
+/// at all.
+pub const EMPYREAN_REJECTION_BLUNDER: i32 = 16;
 /// Rejection was not evaluated for this observation (e.g. evaluate path).
 pub const EMPYREAN_REJECTION_NOT_EVALUATED: i32 = -1;
 
@@ -650,181 +658,69 @@ pub const EMPYREAN_PHOTOMETRY_MODEL_HG1G2: i32 = 4;
 /// shapes behind them are not, so a mismatch allowed to proceed reads
 /// the caller's arguments through the wrong layout instead of failing.
 ///
-/// This release's ABI (0.10.0) is a single, batched break carrying the joint
-/// solved-parameter covariance across the boundary in both directions,
-/// plus the riders that were queued behind a version bump. Every change,
-/// in full:
+/// # The covariance surface
 ///
-/// **The joint covariance, input side.**
+/// An orbit's full uncertainty — the (6 + P) × (6 + P) joint over the state and
+/// every solved parameter (the Marsden non-gravitational coefficients, the
+/// non-grav time delay, the SRP area-to-mass ratio and each thrust Δv segment)
+/// — is carried by ONE self-describing `EmpyreanPackedJoint`: three axis
+/// bitsets, a packed lower triangle, and the tagged side columns that name what
+/// the joint describes. It is the single covariance home at this ABI, input and
+/// output, at every width — on input it rides `EmpyreanOrbit.covariance`
+/// (caller-owned, borrowed for the call), and every result carries the same
+/// struct (library-owned, released with its parent result).
 ///
-/// - [`CoordinateState`](crate::CoordinateState) grows
-///   `has_non_grav_cross` / `non_grav_cross[6][3]` — the state↔Marsden
-///   border, placed beside the 6×6 it borders so
-///   `empyrean_transform_coordinates` cannot move one without the
-///   other;
-/// - [`EmpyreanOrbit`] grows `state_param_cross` / `n_state_param_cross`
-///   and `param_pair_cross` / `n_param_pair_cross` — the wide carrier,
-///   as caller-owned side arrays following the `thrust_arcs` template;
-/// - three new input structs — [`EmpyreanParamColumn`](crate::joint::EmpyreanParamColumn),
-///   [`EmpyreanStateParamCross`](crate::joint::EmpyreanStateParamCross),
-///   [`EmpyreanParamPairCross`](crate::joint::EmpyreanParamPairCross).
+/// The joint on the orbit is the ONE authority. The flat
+/// `CoordinateState.covariance` 6×6 is a derived read-only view of the joint's
+/// leading state block, not a second home: a caller who supplies both a packed
+/// joint and a flat state covariance that disagree on the state block beyond a
+/// generous relative tolerance is refused by name, never reconciled toward one.
 ///
-/// **Two new exported symbols** — the first movement of the parity
-/// manifest in this release, and deliberate:
+/// The packed triangle is in the coordinate's own element space and angular
+/// unit — the angular state rows and columns in **degrees** for the angular
+/// representations (unscaled for Cartesian), the same convention as the flat
+/// 6×6, so the ABI carries one unit convention rather than two. Each boundary
+/// converts between this degree basis and the engine's radian basis by the
+/// diagonal congruence D Σ Dᵀ (the scale on an angular row and its matching
+/// column, identity elsewhere): the input builder scales degrees → radians and
+/// the output marshaler the inverse, so a round trip returns the supplied joint
+/// within a scaling band.
 ///
-/// - [`empyrean_propagation_joint_at`](crate::propagate::empyrean_propagation_joint_at)
-///   returns the propagated joint's cross terms at one
-///   `(orbit_index, epoch_index)`;
-/// - [`empyrean_orbit_covariance_free`](crate::propagate::empyrean_orbit_covariance_free)
-///   releases what it wrote.
+/// **The tag families.** The joint's side columns are read on output against
+/// four value sets, and a fifth tags a mixture component:
 ///
-/// They exist as a separate call rather than as fields on
-/// [`EmpyreanTaggedCovariance`](crate::propagate::EmpyreanTaggedCovariance)
-/// **to preserve that struct's plain-old-data contract**. A caller
-/// declares one on the stack and frees nothing; giving it owned arrays
-/// would have turned every such caller — code correct today, and
-/// recompiling without a diagnostic — into a leaking one, two
-/// allocations per call, with no error and no wrong number to notice.
-/// Opt-in ownership at a new entry point costs one extra symbol and
-/// makes the acquisition explicit. `EmpyreanTaggedCovariance` is
-/// therefore unchanged in the 0.10.0 ABI.
+/// - `EMPYREAN_JOINT_QUALITY_*` — the covariance's definiteness
+///   (positive-definite; positive-semidefinite, with the numerical rank and the
+///   null-axis bitset; indefinite; or repaired to positive-semidefinite);
+/// - `EMPYREAN_JOINT_FUNCTIONAL_*` — which second moment the axes describe
+///   (state, reception-epoch sky, or delay / Doppler);
+/// - `EMPYREAN_JOINT_PROVENANCE_*` — whether the engine derived the moment or it
+///   was asserted by an external source at ingestion;
+/// - `EMPYREAN_JOINT_ASSERTED_SOURCE_*` — which external source asserted it,
+///   meaningful only for an asserted joint and otherwise the `_NONE` sentinel,
+///   so an SBDB-sourced orbit re-fed to the engine keeps its provenance and
+///   source instead of being silently re-tagged;
+/// - `EMPYREAN_MIXTURE_COMPONENT_STATUS_*` — how one adaptive-Gaussian-mixture
+///   component resolved at a close approach (resolved, curvature-refused,
+///   unresolved, or failed).
 ///
-/// **New constants**, all nine of them:
+/// **Refusals carry their reason by code.** Every boundary that turns a
+/// caller-supplied packed joint into an engine covariance — a direct push,
+/// every batch builder, the OD / ephemeris / impact inputs AND the orbit file
+/// writers — refuses a malformed wire row with a per-variant code in the
+/// reserved block −40 … −49, one per failure axis (the `EMPYREAN_PUSH_*`
+/// codes), never a single code with the detail only in the message.
+/// `empyrean_transform_orbits` transports the whole joint through the
+/// transformation Jacobian; the bare-state `empyrean_transform_coordinates`
+/// refuses a covariance-bearing input by name
+/// (`EMPYREAN_TRANSFORM_COVARIANCE_UNSUPPORTED`, −50) and points at
+/// `empyrean_transform_orbits` rather than dropping the covariance silently.
 ///
-/// - `EMPYREAN_PARAM_COLUMN_MARSDEN` / `_DT` / `_AMRAT` / `_THRUST` —
-///   the parameter-column identity tags, the value set of
-///   `EmpyreanParamColumn::kind`;
-/// - `EMPYREAN_PARAM_FIXED` / `_SOLVED` / `_CONSIDERED` — the
-///   disposition tri-state, the value set of every `u8` on
-///   [`EmpyreanSolveFor`] and of its `thrust_dispositions` entries;
-/// - [`EMPYREAN_MAX_THRUST_SEGMENTS`] — the length of every per-segment
-///   array on this ABI;
-/// - [`EMPYREAN_REJECTION_PER_OBSERVATION_SITE_REQUIRED`] (15).
-///
-/// **The joint covariance, output side.**
-///
-/// - [`EmpyreanPropagatedState`](crate::propagate::EmpyreanPropagatedState)
-///   grows `orbit_cov`
-///   ([`EmpyreanOrbitCovariance`](crate::joint::EmpyreanOrbitCovariance),
-///   new), carrying the propagated border and carrier as library-owned
-///   arrays. This is what closes leg chaining: `covariance` alone is the
-///   state block, and the engine's propagated joint has non-zero
-///   state↔parameter columns **even from a block-diagonal input**,
-///   because propagation itself generates them. A caller who chained
-///   legs on the 6×6 alone was quoting a tighter uncertainty than the
-///   propagation supports;
-/// - the same struct rides
-///   [`EmpyreanODResult::orbit`], so a fitted orbit and a propagated
-///   state expose their joint under one name with one ownership rule,
-///   and `determine → propagate` and `propagate → propagate` are the
-///   same field copy. The joint has exactly one home per result — there
-///   is deliberately no second border on `EmpyreanODResult` itself that
-///   could disagree with the one on its orbit;
-/// - [`EmpyreanNonGravParams`] grows `has_dt_variance` / `dt_variance`,
-///   which had no wire at all: a solved-DT fit used to round-trip with
-///   its DT column closed;
-/// - the non-grav 3×3, the DT variance and the AMRAT variance are now
-///   sourced from the fitted **orbit** rather than from
-///   `covariance_9x9`. The 9×9 is populated only for the width-9
-///   Marsden fit while every carrier-bearing fit is wider, so the old
-///   source reported an absent covariance for 100% of them.
-///   `covariance_9x9` remains populated for its deprecation window and
-///   stops being a source.
-///
-/// **The parameter partition.**
-///
-/// - [`EmpyreanSolveFor`]'s `marsden` / `dt` / `amrat` become a
-///   tri-state — `0` fixed, `1` solved, `2` considered — validated
-///   strictly at the boundary. `0` and `1` keep their exact former
-///   meaning, so `memset(0)` and every value an older caller could
-///   write are unchanged; a **semantic** break nonetheless, which is
-///   why it rides this bump rather than passing unversioned;
-/// - `EmpyreanSolveFor::thrust_segments` (a count) becomes
-///   `thrust_dispositions[3]` (per declared segment). Two counts cannot
-///   say WHICH burn is considered, and a three-segment orbit with only
-///   the middle burn solved is now a routine case;
-/// - [`EmpyreanODResult`] grows `dispositions`, echoing the partition
-///   the fit actually ran — which is what makes an Auto escalation
-///   readable after the fact, and what tells a caller whether
-///   re-attaching a prior to an axis double-counts.
-///
-/// **Thrust, per declared segment.**
-///
-/// - [`EmpyreanODResult`] grows `thrust_correction_covariances` and
-///   `n_thrust_segments`;
-/// - `thrust_delta_m_per_s` is **re-indexed from solved to declared
-///   order**, and `thrust_delta_count` becomes the declared count. This
-///   is a semantic change to a shipped field. It is made here because
-///   the alternative is freezing two incompatible index spaces into one
-///   struct forever: a consumer pairing `thrust_delta_m_per_s[i]` with
-///   `thrust_correction_covariances[i]` would otherwise attribute a Δv
-///   to the wrong burn's covariance the moment any segment is
-///   considered or fixed. An unsolved segment's Δv is NaN-filled
-///   exactly as its covariance is.
-///
-/// **Riders.**
-///
-/// - [`EmpyreanODResult`] grows the `warnings` / `num_warnings` string
-///   channel — supplied covariance a fit deliberately did not use;
-/// - `EMPYREAN_REJECTION_PER_OBSERVATION_SITE_REQUIRED` (15) joins the
-///   rejection codes;
-/// - [`EmpyreanObservatoryConfig`](crate::planning::EmpyreanObservatoryConfig)
-///   grows `min_elevation_deg` plus `has_max_sun_altitude_deg` /
-///   `max_sun_altitude_deg`, matching the engine's own observatory
-///   config. Both are marshaled across in full, and **no entry point
-///   exported by this ABI applies them**: the gates that read them
-///   belong to the engine's visibility survey, which has no C entry
-///   point, while `empyrean_evaluate_plan` — the one exported consumer
-///   of this struct — consults the site-invariant filters alone. They
-///   ride the struct so that exposing the survey later needs no further
-///   break;
-/// - the impact and B-plane paths marshal the caller's non-grav DT
-///   value and Marsden 3×3, both of which they silently dropped — the
-///   DT drop meant those two entry points evaluated a DT comet's
-///   \\(g(r)\\) at zero delay while honouring the DT prior variance
-///   eleven lines away;
-/// - the ephemeris path marshals the caller's Marsden 3×3 for the same
-///   reason;
-/// - and those three paths, plus the orbit-file writer, now share the
-///   propagation path's non-grav **presence rule**: an orbit that
-///   declares a non-grav covariance or a DT prior carries a non-grav
-///   model even when its A coefficients are all zero. That opens the
-///   Marsden columns those paths previously left closed — a behaviour
-///   change on the way to fixing the drops above, not merely a
-///   re-routing;
-/// - the orbit-file read path carries the non-grav 3×3, the border and
-///   the carrier onto [`EmpyreanOrbitBatch`](crate::io::EmpyreanOrbitBatch)
-///   rather than reporting them absent.
-///
-/// **Layout: appended everywhere but one, and that one SHRINKS two
-/// structs.** Every earlier release of this ABI could say "fields are
-/// only ever appended, never reordered or removed". This one cannot, and
-/// the exception is stated here rather than left for a consumer to
-/// discover by corruption: replacing `EmpyreanSolveFor::thrust_segments`
-/// (a `u32`) with `thrust_dispositions[3]` (three `u8`s) takes that
-/// struct from 8 bytes to 6 and its alignment from 4 to 1, which shifts
-/// every field after `solve_for_flags` inside the
-/// [`EmpyreanODConfig`] that embeds it —
-/// `allow_unbracketed_maneuvers` 392→390, `has_photometry` 393→391,
-/// `photometry` 400→392 — and shrinks that config 432→424 in turn.
-/// `EmpyreanSolveFor` and `EmpyreanODConfig` are the first structs on
-/// this ABI to get SMALLER.
-///
-/// A consumer with a hand-mirrored `EmpyreanODConfig` must therefore
-/// re-derive its whole layout, not just append: keeping an existing
-/// prefix and writing `photometry` at its old offset lands eight bytes
-/// past where the library reads it, corrupting the photometry config
-/// and the two bytes before it with no diagnostic. Every other frozen
-/// struct in this release grows by appending, and their sizes are
-/// enumerated in the changelog.
-///
-/// The source-breaking changes are the two semantic ones
-/// (`EmpyreanSolveFor`'s encoding and the thrust Δv index space) plus
-/// the `thrust_segments` → `thrust_dispositions` replacement above — a
-/// consumer built against an older header must recompile against this
-/// one either way, and `empyrean_abi_version()` is what makes a
-/// dynamically-loaded mismatch fail at the version check rather than in
-/// the physics.
+/// There are no separate per-parameter covariance fields on this ABI: a solved
+/// parameter's non-grav, SRP or thrust prior and posterior variance ride the
+/// joint's own axes, never a scalar beside it. The third-order covariance kind
+/// is removed — its tag value (2) is left unassigned, and a caller passing it is
+/// refused by name.
 ///
 /// **The version scheme.** The C ABI carries the distribution's own
 /// version, encoded \\(\text{major} \times 10000 + \text{minor} \times
@@ -1258,36 +1154,20 @@ pub struct EmpyreanNonGravParams {
     pub has_dt: u8,
     /// g(r) evaluation time delay (days); only meaningful when `has_dt = 1`.
     pub non_grav_dt: f64,
-    /// 1 when `covariance` carries the fitted non-grav covariance; 0 otherwise.
-    pub has_covariance: u8,
-    /// Fitted non-grav 3×3 covariance for (A1, A2, A3), row-major. Only
-    /// meaningful when `has_covariance = 1`. Re-feeding it onto an input
-    /// orbit lets a fitted orbit flow into a StateAndNonGrav refine without
-    /// losing its non-grav prior.
-    pub covariance: [[f64; 3]; 3],
-    /// 1 when `dt_variance` carries a meaningful DT variance (the fitted
-    /// posterior when DT was solved, else the carried-through prior); 0
-    /// otherwise.
-    pub has_dt_variance: u8,
-    /// Prior/posterior variance on the non-grav time delay DT (days²).
-    /// Only meaningful when `has_dt_variance = 1`.
-    ///
-    /// The DT posterior had no wire at all before 0.10.0: the fitted
-    /// variance existed on the orbit and simply could not cross the ABI,
-    /// so a solved-DT fit round-tripped with its DT column closed. Copy
-    /// it onto `EmpyreanOrbit::non_grav_dt_variance` to re-open and
-    /// prior that column in a follow-on refine.
-    pub dt_variance: f64,
+    // The fitted non-grav 3×3 covariance and the DT posterior variance ride
+    // the fitted orbit's packed joint (its Marsden / DT axes) — the single
+    // covariance home — not scalar fields here.
 }
 
 /// The fitted orbit's **absolute** solar-radiation-pressure slot, flattened
 /// for the C ABI.
 ///
-/// Mirrors the SRP fields the input [`EmpyreanOrbit`] carries (`srp_amrat`,
-/// `srp_cr`, `srp_amrat_variance`) so a fitted orbit's SRP force can be read
-/// back off [`EmpyreanODResult::srp`] and re-applied to an `EmpyreanOrbit`
-/// (`has_srp = 1`) with no loss — whether the AMRAT was solved (fitted value +
-/// posterior variance) or merely carried through the fit as a fixed force.
+/// Mirrors the SRP force values the input [`EmpyreanOrbit`] carries
+/// (`srp_amrat`, `srp_cr`) so a fitted orbit's SRP force can be read back off
+/// [`EmpyreanODResult::srp`] and re-applied to an `EmpyreanOrbit`
+/// (`has_srp = 1`) with no loss. The AMRAT prior/posterior variance rides the
+/// fitted orbit's packed joint (its AMRAT axis) — the single covariance home —
+/// not a scalar field here.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct EmpyreanSRPParams {
@@ -1297,14 +1177,6 @@ pub struct EmpyreanSRPParams {
     /// Radiation-pressure coefficient Cr, carried through unchanged (fixed,
     /// never fitted).
     pub cr: f64,
-    /// 1 when `amrat_variance` carries a meaningful AMRAT variance (the fitted
-    /// posterior when AMRAT was solved, else the carried-through prior); 0
-    /// otherwise.
-    pub has_amrat_variance: u8,
-    /// AMRAT variance ((m²/kg)²). Only meaningful when `has_amrat_variance = 1`.
-    /// Re-feeding it opens + priors the AMRAT column in a follow-on
-    /// StateAndAMRAT / StateAndNonGravAndAMRAT refine.
-    pub amrat_variance: f64,
 }
 
 /// Result of orbit determination (determine or refine).
@@ -1369,8 +1241,8 @@ pub struct EmpyreanSolveFor {
     /// SRP slot carrying an AMRAT prior variance.
     pub amrat: u8,
     /// Disposition of each declared thrust Δv segment, **positional with
-    /// the orbit's `correction_covariances`** — entry `i` governs
-    /// declared segment `i`.
+    /// the orbit's declared segments (the joint's thrust axes)** — entry
+    /// `i` governs declared segment `i`.
     ///
     /// Positional rather than a count, because a considered or fixed
     /// segment sits *between* solved ones as readily as after them: a
@@ -1742,8 +1614,8 @@ pub struct EmpyreanODResult {
     /// and `dispositions.thrust_dispositions`, which all share one index
     /// space.
     ///
-    /// This is the count the orbit's own `correction_covariances`
-    /// declares, **not** the number of segments solved — the two differ
+    /// This is the count of thrust segments the orbit declares (the
+    /// joint's thrust axes), **not** the number of segments solved — the two differ
     /// exactly when a segment is considered or fixed. Read
     /// `dispositions.thrust_dispositions[i]` to learn which.
     pub n_thrust_segments: u32,
@@ -1757,8 +1629,9 @@ pub struct EmpyreanODResult {
     /// this whole surface exists to remove. Read the disposition before
     /// the block.
     ///
-    /// Re-feed by copying into `EmpyreanOrbit::correction_covariances`,
-    /// which is caller-owned and borrowed — copy, do not alias.
+    /// Re-feed by writing the blocks onto the orbit's packed joint on its
+    /// thrust axes; the joint is caller-owned and borrowed — copy, do not
+    /// alias.
     pub thrust_correction_covariances: [[[f64; 3]; 3]; EMPYREAN_MAX_THRUST_SEGMENTS],
     /// Non-fatal conditions the fit reports about itself — chiefly
     /// supplied covariance it deliberately did not use.
@@ -1966,6 +1839,20 @@ pub const EMPYREAN_OD_FAILURE_RADAR_ONLY: i32 = 8;
 /// An explicit non-gravitational solve could not recover A1/A2/A3.
 /// Surfaced rather than silently degrading to a state-only fit.
 pub const EMPYREAN_OD_FAILURE_NON_GRAV_NOT_RECOVERED: i32 = 9;
+/// The fit's thread-budget request could not be honoured (an invalid or
+/// unavailable worker-thread count). Its own code rather than a generic
+/// failure so the caller can distinguish a resource-configuration error
+/// from a dynamical or data failure.
+pub const EMPYREAN_OD_FAILURE_THREAD_BUDGET: i32 = 10;
+
+/// An input row carries no object identifier (`permID` / `provID` /
+/// `trkSub` all absent). This is a whole-batch grouping refusal
+/// (scott #126), so it surfaces at the CALL level — the
+/// [`EMPYREAN_DETERMINE_BATCH_ABORT`] return naming the offending rows —
+/// not per object; the code is defined here only to keep
+/// [`determine_error_code`] exhaustive, so a stray per-object occurrence
+/// would be named rather than misreported.
+pub const EMPYREAN_OD_FAILURE_MISSING_OBJECT_IDENTIFIER: i32 = 11;
 
 /// One object's slot in a batch [`empyrean_determine`] result.
 ///
@@ -2601,6 +2488,9 @@ fn rejection_reason_to_c(reason: &RejectionReason) -> i32 {
         // re-open the "48 of 48 used" hole they exist to close.
         RejectionReason::NonFiniteChi2 => EMPYREAN_REJECTION_NON_FINITE_CHI2,
         RejectionReason::MissingJacobian => EMPYREAN_REJECTION_MISSING_JACOBIAN,
+        // The blunder gate (CMC2003 mechanics at blunder scale) carries its
+        // own code, distinct from CMC2003's statistical-outlier tag.
+        RejectionReason::Blunder => EMPYREAN_REJECTION_BLUNDER,
     }
 }
 
@@ -2957,7 +2847,7 @@ fn poisoned_od_result() -> EmpyreanODResult {
             resolved_kind: 0,
             // Filled by `write_orbit_covariance` on the delivered
             // path; absent here so a poisoned slot frees nothing.
-            orbit_cov: crate::joint::empty_orbit_covariance(),
+            orbit_cov: crate::joint::empty_packed_joint(),
         },
         observations: std::ptr::null_mut(),
         num_observations: 0,
@@ -3002,10 +2892,6 @@ fn poisoned_od_result() -> EmpyreanODResult {
             ng_k: f64::NAN,
             has_dt: 0,
             non_grav_dt: f64::NAN,
-            has_covariance: 0,
-            covariance: [[f64::NAN; 3]; 3],
-            has_dt_variance: 0,
-            dt_variance: f64::NAN,
         },
         rejection_passes: 0,
         num_oppositions_fit: 0,
@@ -3039,8 +2925,6 @@ fn poisoned_od_result() -> EmpyreanODResult {
         srp: EmpyreanSRPParams {
             amrat: f64::NAN,
             cr: f64::NAN,
-            has_amrat_variance: 0,
-            amrat_variance: f64::NAN,
         },
         covariance_trust: -1,
         trust_event_kind: -1,
@@ -3151,6 +3035,15 @@ fn determine_error_code(e: &DetermineError) -> i32 {
         DetermineError::DuplicateObsIds(_) => EMPYREAN_OD_FAILURE_DUPLICATE_OBS_IDS,
         DetermineError::RadarOnly { .. } => EMPYREAN_OD_FAILURE_RADAR_ONLY,
         DetermineError::NonGravNotRecovered { .. } => EMPYREAN_OD_FAILURE_NON_GRAV_NOT_RECOVERED,
+        DetermineError::ThreadBudget(_) => EMPYREAN_OD_FAILURE_THREAD_BUDGET,
+        // A whole-batch grouping refusal (scott #126): it aborts the call
+        // before any object is fitted, so it is surfaced at the call level
+        // (`EMPYREAN_DETERMINE_BATCH_ABORT`), never as a per-object slot.
+        // Mapped here only to keep this match exhaustive — a new upstream
+        // variant must break compilation rather than fall into a catch-all.
+        DetermineError::MissingObjectIdentifier { .. } => {
+            EMPYREAN_OD_FAILURE_MISSING_OBJECT_IDENTIFIER
+        }
     }
 }
 
@@ -3722,33 +3615,19 @@ unsafe fn write_orbit_covariance(
     result_out: *mut EmpyreanODResult,
     od: &ODResult,
 ) -> Result<(), String> {
-    // ── Basis: whatever the 6×6 beside it is ──────────────────────
+    // The fitted covariance is the single packed joint STORED on the
+    // delivered orbit — the full \\((6+P)\\)-wide fit, border and carrier
+    // included — read back and marshaled by the one output marshaler, which
+    // puts the angular state rows on this ABI's degree basis for a
+    // Keplerian / Cometary / Spherical result and is a no-op for Cartesian.
     //
-    // Read the joint off the STORED coordinate, un-rescaled, because
-    // that is exactly where `ODResult::covariance` comes from: the
-    // estimator reads its 6×6 straight off this coordinate, and
-    // `EmpyreanODResult::covariance` publishes it verbatim. Taking the
-    // border and carrier in the coordinate's angular unit instead would
-    // put degree-scaled crosses beside a radian 6×6 whenever the fit's
-    // output representation is Keplerian / Cometary / Spherical — a
-    // factor of 180/π on the angular rows, within one struct whose own
-    // documented contract is that the two share a basis AND units.
-    //
-    // The one-shot entry points never reach a non-Cartesian result
-    // (`od_orbit_to_propagated` refuses one), where the distinction is a
-    // no-op because Cartesian has no angular rows. The SESSION path does
-    // deliver Keplerian / Cometary / Spherical results, so the
-    // distinction is live there and only there.
-    let Some(coord) = od.orbit.coordinates().first() else {
-        // No row 0 at all: leave the joint absent rather than
-        // fabricating one. Absent is the truth here, not a fallback.
+    // No stored uncertainty means the orbit carried no solved covariance:
+    // leave `orbit_cov` the empty joint it was initialized to rather than
+    // fabricating one. Absent is the truth here, not a fallback.
+    let Some(ou) = od.orbit.uncertainty(0) else {
         return Ok(());
     };
-    let joint = crate::joint::joint_to_c(
-        coord.extended_covariance(),
-        od.orbit.wide_cross(0),
-        "fitted orbit",
-    )?;
+    let joint = crate::joint::orbit_uncertainty_to_c(ou);
     unsafe {
         (*result_out).orbit.orbit_cov = joint;
     }
@@ -3919,19 +3798,6 @@ fn coord_rep_to_int(r: CoordinateRepresentation) -> i32 {
 /// `GFunction` (its fields are public). `NonGravModel` is Marsden-only in
 /// v1.20.0 — SRP is a separate first-class slot (`SRPForceParams`), no
 /// longer a non-grav model variant.
-/// The non-grav half of [`od_result_non_grav_to_c`], driven directly by
-/// the tests.
-///
-/// `od_result_non_grav_to_c` takes a whole `ODResult` — 30-odd fields,
-/// none defaulted — but reads exactly one thing from it: the fitted
-/// orbit's non-grav block. Splitting the read out lets the marshal
-/// itself be tested without assembling a result, so the coverage is of
-/// the shipped code path rather than of a fixture.
-#[cfg(test)]
-pub(crate) fn od_result_non_grav_to_c_for_test(orbit: &Orbits<AU>) -> (u8, EmpyreanNonGravParams) {
-    non_grav_block_to_c(orbit)
-}
-
 fn od_result_non_grav_to_c(od: &ODResult) -> (u8, EmpyreanNonGravParams) {
     non_grav_block_to_c(&od.orbit)
 }
@@ -3956,36 +3822,10 @@ fn non_grav_block_to_c(orbit: &Orbits<AU>) -> (u8, EmpyreanNonGravParams) {
                 Some(d) => (1u8, d),
                 None => (0u8, f64::NAN),
             };
-            // Fitted non-grav covariance: carry it out so the
-            // re-feedable orbit keeps its non-grav prior for a
-            // StateAndNonGrav refine.
-            //
-            // Sourced from the fitted ORBIT rather than from
-            // `od.covariance_9x9`, which is where it used to come from.
-            // The 9×9 is populated only for the width-9 Marsden fit, and
-            // every fit carrying a wide joint is wider than 9 by
-            // construction — a carrier needs a DT, AMRAT or thrust
-            // column, and each of those pushes the width past 9. The two
-            // sets are disjoint, so the old source reported "no
-            // covariance" and a zero 3×3 for 100% of the fits this
-            // surface exists to serve, while the orbit held the
-            // posterior. Re-feeding that yielded either a border with no
-            // parameter block (refused) or, worse, a caller clearing the
-            // border and silently substituting their prior.
-            //
-            // The estimator writes every posterior block onto this one
-            // orbit in a single pass and then builds the border and the
-            // carrier by reading those blocks back, so sourcing them all
-            // from here is what keeps the diagonals and the crosses
-            // conditioned on them from coming from two provenances.
-            let (has_covariance, covariance) = match ng.covariance {
-                Some(c) => (1u8, c),
-                None => (0u8, [[0.0_f64; 3]; 3]),
-            };
-            let (has_dt_variance, dt_variance) = match ng.dt_variance {
-                Some(v) => (1u8, v),
-                None => (0u8, f64::NAN),
-            };
+            // The fitted non-grav 3×3 covariance and the DT posterior
+            // variance ride the fitted orbit's packed joint (its Marsden /
+            // DT axes) now — the single covariance home — not scalar
+            // fields on this block.
             (
                 1,
                 EmpyreanNonGravParams {
@@ -3999,10 +3839,6 @@ fn non_grav_block_to_c(orbit: &Orbits<AU>) -> (u8, EmpyreanNonGravParams) {
                     ng_k,
                     has_dt,
                     non_grav_dt,
-                    has_covariance,
-                    covariance,
-                    has_dt_variance,
-                    dt_variance,
                 },
             )
         }
@@ -4012,32 +3848,18 @@ fn non_grav_block_to_c(orbit: &Orbits<AU>) -> (u8, EmpyreanNonGravParams) {
 
 /// Read the fitted orbit's **absolute** SRP slot off an [`ODResult`] and
 /// flatten it for the C ABI. Returns `(0, default)` when the orbit carries no
-/// SRP. The AMRAT variance prefers the fitted **posterior** from the tagged
-/// solved covariance (`amrat_slot`, when AMRAT was solved) over the orbit's
-/// carried-through prior — mirroring how [`od_result_non_grav_to_c`] sources
-/// the Marsden covariance from the 9×9 posterior — so a re-fed orbit chains
-/// the correct Bayesian prior into a follow-on StateAndAMRAT refine.
+/// SRP. The AMRAT prior/posterior variance rides the fitted orbit's packed
+/// joint (its AMRAT axis) — the single covariance home — not a scalar field
+/// here, so this reads the force values only.
 fn od_result_srp_to_c(od: &ODResult) -> (u8, EmpyreanSRPParams) {
     match od.orbit.srp_params(0) {
-        Some(srp) => {
-            let posterior = od
-                .solved_covariance
-                .as_ref()
-                .and_then(|sc| sc.amrat_slot.map(|s| sc.matrix[s][s]));
-            let (has_amrat_variance, amrat_variance) = match posterior.or(srp.amrat_variance) {
-                Some(v) => (1u8, v),
-                None => (0u8, f64::NAN),
-            };
-            (
-                1,
-                EmpyreanSRPParams {
-                    amrat: srp.amrat,
-                    cr: srp.cr,
-                    has_amrat_variance,
-                    amrat_variance,
-                },
-            )
-        }
+        Some(srp) => (
+            1,
+            EmpyreanSRPParams {
+                amrat: srp.amrat,
+                cr: srp.cr,
+            },
+        ),
         None => (0, EmpyreanSRPParams::default()),
     }
 }
@@ -4050,9 +3872,7 @@ fn od_orbit_to_propagated(
         .get(0)
         .ok_or_else(|| "OD result orbit is empty".to_string())?;
     let (epoch, x, y, z, vx, vy, vz, frame, origin) = match coord {
-        Coordinates::Cartesian(c, _, _) => {
-            (c.t, c.x, c.y, c.z, c.vx, c.vy, c.vz, c.frame, c.origin)
-        }
+        Coordinates::Cartesian(c) => (c.t, c.x, c.y, c.z, c.vx, c.vy, c.vz, c.frame, c.origin),
         _ => return Err("OD result orbit is not in Cartesian representation".to_string()),
     };
     Ok(EmpyreanPropagatedState {
@@ -4074,7 +3894,7 @@ fn od_orbit_to_propagated(
         resolved_kind: 0,
         // Absent at construction: `write_orbit_covariance` fills it
         // from the fitted orbit once the result struct exists.
-        orbit_cov: crate::joint::empty_orbit_covariance(),
+        orbit_cov: crate::joint::empty_packed_joint(),
     })
 }
 
@@ -4274,6 +4094,12 @@ fn build_weighting_from_c(
             // true provenance. The preset arms below keep whatever
             // identity their own constructor recorded.
             floors_table: FloorsTable::Custom,
+            // `noise_model` and `covariance_information` mirror scott's
+            // `WeightingConfig::default()` (Gaussian law, observed-covariance
+            // information) — the one weighting default across the stack. Spelled
+            // as the struct-update default so this site cannot drift from the
+            // engine's default if either field's default ever moves.
+            ..WeightingConfig::default()
         },
         EMPYREAN_WEIGHTING_PRESET_VFCC2017 => {
             WeightingConfig::veres_farnocchia_chesley_chamberlin_2017()
@@ -4371,10 +4197,21 @@ fn build_weighting_from_c(
                     }
                     WeightingLayer::ObservatoryRule {
                         obs_code: code.to_string(),
-                        sigma: [layer.sigma_ra_arcsec, layer.sigma_dec_arcsec],
+                        // `sigma` is now `Option<[f64; 2]>`: `Some` is a
+                        // caller-supplied σ pair, `None` a law-only rule that
+                        // inherits the preset / reported σ. The C ABI's
+                        // ObservatoryRule always supplies a σ pair, so it is
+                        // always `Some`.
+                        sigma: Some([layer.sigma_ra_arcsec, layer.sigma_dec_arcsec]),
                         start_epoch,
                         end_epoch,
                         scale: layer.scale,
+                        // `noise_model = None` inherits the global
+                        // `WeightingConfig::noise_model`; `preset = None` marks a
+                        // rule the caller built by hand (not one a preset
+                        // constructor installed).
+                        noise_model: None,
+                        preset: None,
                     }
                 }
                 EMPYREAN_WEIGHTING_LAYER_NIGHTLY_DEWEIGHTING => {
@@ -4562,11 +4399,16 @@ fn build_debiasing_from_c(c: &EmpyreanDebiasingConfig) -> Result<DebiasingChoice
 
 fn build_rejection_strategy_from_c(
     rej: &EmpyreanRejectionConfig,
-) -> Result<Option<empyrean_core::determination::RejectionStrategy>, String> {
+) -> Result<empyrean_core::determination::RejectionConfig, String> {
+    use empyrean_core::determination::{RejectionConfig, RejectionKind};
+    // The engine replaced `Option<RejectionStrategy>` (None = off) with
+    // `RejectionConfig { enabled: Option<bool>, kind }`. `enabled == 0` at the
+    // C ABI is an explicit "off" decision, so it maps to `RejectionConfig::off`
+    // (`enabled = Some(false)`), never the engine-default tri-state.
     if rej.enabled == 0 {
-        return Ok(None);
+        return Ok(RejectionConfig::off());
     }
-    Ok(Some(match rej.kind {
+    let kind = match rej.kind {
         EMPYREAN_REJECTION_KIND_ADAPTIVE => {
             let mut r = AdaptiveRejectionConfig::default();
             if rej.chi2_base > 0.0 {
@@ -4578,7 +4420,7 @@ fn build_rejection_strategy_from_c(
             if rej.max_threshold > 0.0 {
                 r.max_threshold = rej.max_threshold;
             }
-            empyrean_core::determination::RejectionStrategy::Adaptive(r)
+            RejectionKind::Adaptive(r)
         }
         EMPYREAN_REJECTION_KIND_CMC2003 => {
             let mut r = CMC2003Config::default();
@@ -4589,14 +4431,16 @@ fn build_rejection_strategy_from_c(
                 r.chi2_rec = rej.chi2_rec;
             }
             r.validate().map_err(|e| format!("CMC2003 config: {e}"))?;
-            empyrean_core::determination::RejectionStrategy::CMC2003(r)
+            RejectionKind::CMC2003(r)
         }
         other => {
             return Err(format!(
                 "unsupported rejection.kind = {other} (expected EMPYREAN_REJECTION_KIND_ADAPTIVE = {EMPYREAN_REJECTION_KIND_ADAPTIVE} or EMPYREAN_REJECTION_KIND_CMC2003 = {EMPYREAN_REJECTION_KIND_CMC2003})"
             ));
         }
-    }))
+    };
+    // A named kind with `enabled == 1` is an explicit "run this gate" decision.
+    Ok(RejectionConfig::new(kind))
 }
 
 /// Build a scott [`ODConfig`] from the C request struct.
@@ -4810,9 +4654,9 @@ fn ades_object_id(obs: &ADESObservations) -> String {
 pub(crate) fn empyrean_orbit_to_orbits(
     orbit: &EmpyreanOrbit,
     id: &str,
-) -> Result<Orbits<AU>, String> {
+) -> Result<Orbits<AU>, crate::joint::AbiError> {
     let state = orbit.state.to_empyrean();
-    let coords =
+    let (coords, state_cov) =
         coordinate_state_to_coordinates(&state).map_err(|e| format!("orbit conversion: {e}"))?;
     let mut out = Orbits::empty();
     // Attaches the 6×6, the state↔Marsden border and the wide carrier
@@ -4820,8 +4664,8 @@ pub(crate) fn empyrean_orbit_to_orbits(
     // step. The OD paths consume the joint as their prior, so a carrier
     // dropped here would silently substitute a block-diagonal prior for
     // the correlated one the caller supplied.
-    crate::joint::push_orbit_with_joint(&mut out, id.to_string(), coords, orbit)
-        .map_err(|e| format!("orbit push: {e}"))?;
+    crate::joint::push_orbit_with_joint(&mut out, id.to_string(), coords, state_cov, orbit)
+        .map_err(|e| e.prefixed("orbit push"))?;
     // Carry the caller's non-grav model onto the orbit. Without this the OD
     // entry points (evaluate / refine / seeded determine) would fit a
     // gravity-only orbit and silently discard A1/A2/A3 + g(r) + dt.
@@ -5289,8 +5133,21 @@ pub unsafe extern "C" fn empyrean_radar_observations_free(
 /// `results_out` is still fully populated — every slot carries its
 /// per-object `error` / `error_code` — and MUST be released with
 /// [`empyrean_determine_results_free`]. This is a distinct code from the
-/// batch-level abort (`-3`), which writes nothing.
+/// batch-level abort ([`EMPYREAN_DETERMINE_BATCH_ABORT`], `-3`), which
+/// writes nothing.
 pub const EMPYREAN_DETERMINE_NONE_DELIVERED: i32 = -4;
+
+/// A batch-level grouping refusal aborted the call before any object was
+/// fitted; **nothing** is written to `results_out`, so there is nothing to
+/// free.
+///
+/// Raised (scott #126) when an observation row carries no object
+/// identifier (`permID` / `provID` / `trkSub` all absent) — historically
+/// such rows were silently skipped, making the batch look complete while
+/// ignoring input data (the no-hidden-fallbacks failure mode). The recorded
+/// [`empyrean_last_error`] message names the offending optical / radar row
+/// indices so the caller can repair the exact rows.
+pub const EMPYREAN_DETERMINE_BATCH_ABORT: i32 = -3;
 
 /// Run the full orbit determination pipeline over every object in
 /// `observations`.
@@ -5473,7 +5330,7 @@ pub(crate) unsafe fn determine_with_handle(
                     Ok(o) => o,
                     Err(e) => {
                         set_last_error(&format!("initial orbit {i}: {e}"));
-                        return -1;
+                        return e.code.unwrap_or(-1);
                     }
                 };
                 map.insert(key, orb);
@@ -5486,14 +5343,23 @@ pub(crate) unsafe fn determine_with_handle(
         // Batch-level failure (a row with no permID/provID/trkSub, an invalid
         // shared weighting config) aborts the whole call rather than producing
         // per-object results — surface it with its own message instead of
-        // reporting the generic "produced no results".
-        let determine_results = determine(
+        // reporting the generic "produced no results". scott #126 made this
+        // refusal typed: `determine` now returns `Err(DetermineError)` whose
+        // `Display` names the offending row indices. Nothing is written to
+        // `results_out`, exactly as the `-3` batch-abort contract documents.
+        let determine_results = match determine(
             ctx_ref,
             Observations::new(obs_vec, radar_vec),
             initial_map.as_ref(),
             &cfg,
             None,
-        );
+        ) {
+            Ok(results) => results,
+            Err(e) => {
+                set_last_error(&e.to_string());
+                return EMPYREAN_DETERMINE_BATCH_ABORT;
+            }
+        };
 
         // Sort by object_id so the table is a deterministic function of the
         // observation set, not of the order its rows happened to arrive in.
@@ -5645,7 +5511,7 @@ pub(crate) unsafe fn free_od_result_fields(result: *mut EmpyreanODResult) {
         // The joint posterior's carrier arrays are library-owned on the
         // result (the mirror-image of the same fields on an input
         // orbit), so they are released here with everything else.
-        crate::joint::free_orbit_covariance(&mut (*result).orbit.orbit_cov);
+        crate::joint::free_packed_joint(&mut (*result).orbit.orbit_cov);
         (*result).observations = std::ptr::null_mut();
         (*result).num_observations = 0;
         (*result).station_biases = std::ptr::null_mut();
@@ -5806,8 +5672,8 @@ pub(crate) unsafe fn evaluate_with_handle(
         let orbits_single = match empyrean_orbit_to_orbits(orbit_ref, "orbit_0") {
             Ok(o) => o,
             Err(e) => {
-                set_last_error(&e);
-                return -1;
+                set_last_error(&e.message);
+                return e.code.unwrap_or(-1);
             }
         };
 
@@ -5943,8 +5809,8 @@ pub(crate) unsafe fn refine_with_handle(
         let orbits_single = match empyrean_orbit_to_orbits(orbit_ref, "orbit_0") {
             Ok(o) => o,
             Err(e) => {
-                set_last_error(&e);
-                return -1;
+                set_last_error(&e.message);
+                return e.code.unwrap_or(-1);
             }
         };
 
@@ -5995,7 +5861,7 @@ pub(crate) unsafe fn refine_with_handle(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use empyrean_core::determination::RejectionStrategy;
+    use empyrean_core::determination::RejectionKind;
 
     fn rejection_config(kind: u8) -> EmpyreanRejectionConfig {
         EmpyreanRejectionConfig {
@@ -6015,7 +5881,11 @@ pub(crate) mod tests {
         let mut c = rejection_config(EMPYREAN_REJECTION_KIND_ADAPTIVE);
         c.enabled = 0;
         let s = build_rejection_strategy_from_c(&c).unwrap();
-        assert!(s.is_none());
+        assert_eq!(
+            s.enabled,
+            Some(false),
+            "enabled == 0 is an explicit off, not the engine-default tri-state"
+        );
     }
 
     #[test]
@@ -6023,8 +5893,8 @@ pub(crate) mod tests {
         // enabled with all sentinels => upstream defaults.
         let c = rejection_config(EMPYREAN_REJECTION_KIND_ADAPTIVE);
         let s = build_rejection_strategy_from_c(&c).unwrap();
-        match s.unwrap() {
-            RejectionStrategy::Adaptive(a) => {
+        match s.kind {
+            RejectionKind::Adaptive(a) => {
                 let d = AdaptiveRejectionConfig::default();
                 assert_eq!(a.chi2_base, d.chi2_base);
                 assert_eq!(a.lambda, d.lambda);
@@ -6041,8 +5911,8 @@ pub(crate) mod tests {
         c.lambda = 2.0;
         c.max_threshold = 50.0;
         let s = build_rejection_strategy_from_c(&c).unwrap();
-        match s.unwrap() {
-            RejectionStrategy::Adaptive(a) => {
+        match s.kind {
+            RejectionKind::Adaptive(a) => {
                 assert_eq!(a.chi2_base, 12.5);
                 assert_eq!(a.lambda, 2.0);
                 assert_eq!(a.max_threshold, 50.0);
@@ -6055,8 +5925,8 @@ pub(crate) mod tests {
     fn rejection_kind_cmc2003_default_sentinels() {
         let c = rejection_config(EMPYREAN_REJECTION_KIND_CMC2003);
         let s = build_rejection_strategy_from_c(&c).unwrap();
-        match s.unwrap() {
-            RejectionStrategy::CMC2003(r) => {
+        match s.kind {
+            RejectionKind::CMC2003(r) => {
                 let d = CMC2003Config::default();
                 assert_eq!(r.chi2_rej, d.chi2_rej);
                 assert_eq!(r.chi2_rec, d.chi2_rec);
@@ -6071,8 +5941,8 @@ pub(crate) mod tests {
         c.chi2_rej = 9.0;
         c.chi2_rec = 6.5;
         let s = build_rejection_strategy_from_c(&c).unwrap();
-        match s.unwrap() {
-            RejectionStrategy::CMC2003(r) => {
+        match s.kind {
+            RejectionKind::CMC2003(r) => {
                 assert_eq!(r.chi2_rej, 9.0);
                 assert_eq!(r.chi2_rec, 6.5);
             }
@@ -6257,8 +6127,6 @@ pub(crate) mod tests {
                 representation: EMPYREAN_REPRESENTATION_CARTESIAN, // Cartesian
                 frame: 0,                                          // ICRF
                 origin: 10,                                        // Sun (NAIF)
-                has_non_grav_cross: 0,
-                non_grav_cross: [[0.0; 3]; 6],
             },
             orbit_id: std::ptr::null(),
             object_id: std::ptr::null(),
@@ -6274,9 +6142,6 @@ pub(crate) mod tests {
             // NaN ⇒ no thermal-lag delay (asteroid default).
             non_grav_dt: f64::NAN,
             // NaN ⇒ no DT prior (DT column stays closed).
-            non_grav_dt_variance: f64::NAN,
-            has_non_grav_covariance: 0,
-            non_grav_covariance: [[0.0; 3]; 3],
             phot_system: 0,
             h_mag: f64::NAN,
             slope1: f64::NAN,
@@ -6286,16 +6151,11 @@ pub(crate) mod tests {
             n_thrust_arcs: 0,
             dv_corrections: std::ptr::null(),
             n_dv_corrections: 0,
-            correction_covariances: std::ptr::null(),
-            n_correction_covariances: 0,
             has_srp: 0,
             srp_amrat: 0.0,
             srp_cr: 0.0,
-            srp_amrat_variance: f64::NAN,
-            state_param_cross: std::ptr::null(),
-            n_state_param_cross: 0,
-            param_pair_cross: std::ptr::null(),
-            n_param_pair_cross: 0,
+            // Gravity + non-grav only: no solved-parameter joint prior.
+            covariance: crate::joint::empty_packed_joint(),
             has_phot_covariance: 0,
             phot_covariance: [[0.0; 3]; 3],
         }
@@ -6428,8 +6288,6 @@ pub(crate) mod tests {
                 representation: EMPYREAN_REPRESENTATION_CARTESIAN,
                 frame: p.frame,
                 origin: p.origin,
-                has_non_grav_cross: 0,
-                non_grav_cross: [[0.0; 3]; 6],
             },
             orbit_id: std::ptr::null(),
             object_id: std::ptr::null(),
@@ -6442,9 +6300,6 @@ pub(crate) mod tests {
             ng_n: 0.0,
             ng_k: 0.0,
             non_grav_dt: f64::NAN,
-            non_grav_dt_variance: f64::NAN,
-            has_non_grav_covariance: 0,
-            non_grav_covariance: [[0.0; 3]; 3],
             phot_system: 0,
             h_mag: f64::NAN,
             slope1: f64::NAN,
@@ -6454,19 +6309,86 @@ pub(crate) mod tests {
             n_thrust_arcs: 0,
             dv_corrections: std::ptr::null(),
             n_dv_corrections: 0,
-            correction_covariances: std::ptr::null(),
-            n_correction_covariances: 0,
             has_srp: 0,
             srp_amrat: 0.0,
             srp_cr: 0.0,
-            srp_amrat_variance: f64::NAN,
-            state_param_cross: std::ptr::null(),
-            n_state_param_cross: 0,
-            param_pair_cross: std::ptr::null(),
-            n_param_pair_cross: 0,
+            // The re-fed joint is attached by the caller; the basic re-feed
+            // carries the state 6×6 on the flat state, no wide joint.
+            covariance: crate::joint::empty_packed_joint(),
             has_phot_covariance: 0,
             phot_covariance: [[0.0; 3]; 3],
         }
+    }
+
+    /// scott #126 at the ABI: an observation row with no object identifier
+    /// (`permID` / `provID` / `trkSub` all null) refuses the WHOLE batch by
+    /// name instead of being silently skipped. `empyrean_determine` must
+    /// return [`EMPYREAN_DETERMINE_BATCH_ABORT`] (`-3`), write nothing to
+    /// `results_out`, and record a message naming the offending optical rows.
+    ///
+    /// Mutation guard: collapsing the `Err` arm at the `determine` call site
+    /// to proceed (or returning `0`) makes this assertion fail — the batch
+    /// would look complete while ignoring id-less input, the exact
+    /// no-hidden-fallbacks failure mode scott #126 closes.
+    #[test]
+    fn ffi_determine_refuses_id_less_rows_by_name() {
+        let ctx = match try_context() {
+            Some(c) => c,
+            None => {
+                eprintln!("skipping ffi_determine_refuses_id_less_rows_by_name: no data dir");
+                return;
+            }
+        };
+        let ctx_ptr: *const EmpyreanContext = &ctx;
+
+        let (obs_ptr, obs_n) = read_eros_observations();
+        // Strip every identifier from the arc so no row can be grouped. The
+        // old pointers are reclaimed (not leaked) and nulled, so the later
+        // `empyrean_observations_free` skips them rather than double-freeing.
+        unsafe {
+            for obs in std::slice::from_raw_parts_mut(obs_ptr, obs_n) {
+                for field in [&mut obs.perm_id, &mut obs.prov_id, &mut obs.trk_sub] {
+                    let old = std::mem::replace(field, std::ptr::null_mut());
+                    if !old.is_null() {
+                        drop(CString::from_raw(old));
+                    }
+                }
+            }
+        }
+
+        let cfg = standard_od_config();
+        let mut det_results: EmpyreanDetermineResults = unsafe { std::mem::zeroed() };
+        let code = unsafe {
+            empyrean_determine(
+                ctx_ptr,
+                obs_ptr,
+                obs_n,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                &cfg,
+                &mut det_results,
+            )
+        };
+
+        let msg = unsafe { CStr::from_ptr(crate::empyrean_last_error()) }.to_string_lossy();
+        assert_eq!(
+            code, EMPYREAN_DETERMINE_BATCH_ABORT,
+            "an id-less batch must abort by name, got code {code}: {msg}"
+        );
+        assert!(
+            msg.contains("no object identifier"),
+            "the batch-abort message must name the refusal; got: {msg}"
+        );
+        assert!(
+            msg.contains("optical rows"),
+            "the batch-abort message must name the offending optical row indices; got: {msg}"
+        );
+        // `-3` writes nothing, so there is nothing to free on `det_results`.
+        assert!(det_results.objects.is_null());
+        assert_eq!(det_results.num_objects, 0);
+        unsafe { empyrean_observations_free(obs_ptr, obs_n) };
     }
 
     /// 833t at the ABI: a determine→evaluate→refine round-trip where the
@@ -6654,6 +6576,28 @@ mod weighting_identity_tests {
         c.preset = preset;
         c.sigma_policy = -1;
         c
+    }
+
+    /// Owner ruling (2026-10-03): the distribution's OD weighting defaults
+    /// equal scott's `WeightingConfig::default()` for `noise_model` and
+    /// `covariance_information` — one default across the stack. Compared
+    /// against the engine default struct (read through core at the pinned
+    /// rev), never literal copies of the values, so a scott default change
+    /// surfaces here rather than drifting silently.
+    #[test]
+    fn the_none_preset_default_mirrors_scotts_weighting_default() {
+        let built = build_weighting_from_c(&enabled_config(EMPYREAN_WEIGHTING_PRESET_NONE))
+            .expect("preset NONE converts")
+            .expect("weighting is enabled");
+        let scott_default = empyrean_core::determination::WeightingConfig::default();
+        assert_eq!(
+            built.noise_model, scott_default.noise_model,
+            "the C NONE-preset noise_model must mirror scott's WeightingConfig::default()"
+        );
+        assert_eq!(
+            built.covariance_information, scott_default.covariance_information,
+            "the C NONE-preset covariance_information must mirror scott's WeightingConfig::default()"
+        );
     }
 
     /// A `preset = NONE` chain is caller-assembled, so it carries no
@@ -7600,63 +7544,37 @@ mod od_output_joint_tests {
         );
         let res = &slot.result;
 
-        // The border is present and finite, and it is NOT all zeros —
-        // an all-zero border is what the engine reads as "absent", so a
-        // zero-filled one here would mean the marshal ran but carried
-        // nothing.
-        assert_eq!(
-            res.orbit.orbit_cov.has_non_grav_cross, 1,
-            "a Marsden fit's state↔A cross block must reach the caller"
-        );
-        let border = res.orbit.orbit_cov.non_grav_cross;
+        // A Marsden fit publishes its posterior as ONE packed joint on the
+        // fitted orbit — the state block plus the solved A1/A2/A3 axes in a
+        // single triangle (width ≥ 9). The state↔Marsden correlation and the
+        // Marsden block that used to ride a separate border + 3×3 now live in
+        // that one triangle; an absent or all-zero joint would mean the marshal
+        // ran but carried nothing.
+        let joint = &res.orbit.orbit_cov;
         assert!(
-            border.iter().flatten().all(|v| v.is_finite()),
-            "every border entry must be finite"
+            joint.width >= 9,
+            "a Marsden fit's joint must carry the solved A1/A2/A3 axes (width {})",
+            joint.width
         );
         assert!(
-            border.iter().flatten().any(|v| *v != 0.0),
-            "the border must carry real correlations, not a zero block"
+            !joint.tri.is_null() && joint.tri_len > 0,
+            "the posterior joint must carry a triangle"
+        );
+        let tri = unsafe { std::slice::from_raw_parts(joint.tri, joint.tri_len) };
+        assert!(
+            tri.iter().all(|v| v.is_finite()),
+            "every posterior joint entry must be finite"
+        );
+        assert!(
+            tri.iter().any(|v| *v != 0.0),
+            "the joint must carry real covariance, not a zero block"
         );
 
-        // The Marsden 3×3 is present too — the border's other half. The
-        // two ship together or the engine refuses the re-feed.
-        assert_eq!(
-            res.non_grav.has_covariance, 1,
-            "the posterior 3×3 must accompany the border it conditions"
-        );
-        assert!(
-            res.non_grav
-                .covariance
-                .iter()
-                .flatten()
-                .all(|v| v.is_finite()),
-            "the posterior 3×3 must be finite"
-        );
-
-        // Sourced from the fitted ORBIT, not from covariance_9x9. On a
-        // width-9 Marsden fit both exist and must agree; the point of
-        // the re-sourcing is that the orbit is right for EVERY width,
-        // and this pins that it did not change the width-9 answer.
-        // Asserted rather than guarded: this fit solves Marsden and
-        // nothing else, so it IS width 9 and the legacy field must be
-        // populated. A conditional would let the comparison silently
-        // stop running the day the field or the width moved, which is
-        // the only thing it exists to catch.
+        // The legacy 9×9 is still published on a width-9 Marsden fit.
         assert_eq!(
             res.has_covariance_9x9, 1,
-            "a width-9 Marsden fit must populate the legacy 9x9 — without it this \
-             comparison cannot run at all"
+            "a width-9 Marsden fit must populate the legacy 9x9"
         );
-        for i in 0..3 {
-            for j in 0..3 {
-                assert!(
-                    (res.non_grav.covariance[i][j] - res.covariance_9x9[6 + i][6 + j]).abs()
-                        < 1e-30,
-                    "the orbit-sourced 3×3 must equal the 9×9's block on a width-9 fit \
-                     at [{i}][{j}]"
-                );
-            }
-        }
 
         // The disposition echo names what the fit actually did.
         assert_eq!(
@@ -7722,25 +7640,33 @@ mod od_output_joint_tests {
         assert_eq!(slot.delivered, 1);
         let res = &slot.result;
 
-        // The re-feed, field for field — the copy a C caller writes.
+        // The re-feed: the fitted posterior rides ONE packed joint. Copy it
+        // onto the input orbit (a field copy; the triangle is library-owned by
+        // `results`, freed after the refine). The Marsden VALUES ride their own
+        // fields; the prior covariance — border, 3×3 and crosses folded — is the
+        // joint.
         let mut refed = refeed_orbit(&res.orbit);
-        refed.state.has_non_grav_cross = res.orbit.orbit_cov.has_non_grav_cross;
-        refed.state.non_grav_cross = res.orbit.orbit_cov.non_grav_cross;
-        refed.state_param_cross = res.orbit.orbit_cov.state_param_cross;
-        refed.n_state_param_cross = res.orbit.orbit_cov.n_state_param_cross;
-        refed.param_pair_cross = res.orbit.orbit_cov.param_pair_cross;
-        refed.n_param_pair_cross = res.orbit.orbit_cov.n_param_pair_cross;
-        // The diagonal blocks the crosses are conditioned on.
+        let src = &res.orbit.orbit_cov;
+        refed.covariance = crate::joint::EmpyreanPackedJoint {
+            layout_present: src.layout_present,
+            layout_considered: src.layout_considered,
+            layout_marginalized: src.layout_marginalized,
+            width: src.width,
+            tri: src.tri,
+            tri_len: src.tri_len,
+            kind: src.kind,
+            quality: src.quality,
+            cov_rank: src.cov_rank,
+            cov_null_axes: src.cov_null_axes,
+            cov_min_eig_corr: src.cov_min_eig_corr,
+            functional: src.functional,
+            provenance: src.provenance,
+            asserted_source: src.asserted_source,
+        };
+        // The Marsden coefficient VALUES still ride their own fields.
         refed.a1 = res.non_grav.a1;
         refed.a2 = res.non_grav.a2;
         refed.a3 = res.non_grav.a3;
-        refed.has_non_grav_covariance = res.non_grav.has_covariance;
-        refed.non_grav_covariance = res.non_grav.covariance;
-        refed.non_grav_dt_variance = if res.non_grav.has_dt_variance == 1 {
-            res.non_grav.dt_variance
-        } else {
-            f64::NAN
-        };
 
         let (obs_ptr, obs_n) = read_eros_observations();
         let mut cfg = standard_od_config();
@@ -7767,168 +7693,6 @@ mod od_output_joint_tests {
 
         unsafe { empyrean_od_result_free(&mut refined) };
         unsafe { empyrean_determine_results_free(&mut results) };
-    }
-
-    /// The DT variance wire, both directions: it had none before 0.10.0, so
-    /// a solved-DT fit round-tripped with its DT column closed. Pinned
-    /// on the marshal contract rather than on a DT fit, which needs a
-    /// comet arc this crate does not bundle.
-    #[test]
-    fn the_dt_variance_wire_carries_both_directions() {
-        // ── Out ──
-        //
-        // Drive the real output marshal on both arms. Asserting on
-        // `EmpyreanNonGravParams::default()` instead would be
-        // tautological — the struct derives Default, so it proves only
-        // that `derive` works, not that `od_result_non_grav_to_c`
-        // publishes the switch it is supposed to.
-        //
-        // The contract: a carried variance publishes with the switch
-        // SET; an absent one publishes NaN with the switch CLEAR. Not
-        // 0.0 — that is a legal (if degenerate) variance, so a consumer
-        // could not tell it from a real one.
-        let mut orbit: empyrean_core::orbits::Orbits<AU> = empyrean_core::orbits::Orbits::empty();
-        let coord = empyrean_core::convert::coordinate_state_to_coordinates(
-            &empyrean_core::convert::CoordinateState {
-                epoch_mjd_tdb: 59000.0,
-                elements: [1.0, 0.1, 0.05, -0.005, 0.015, 0.001],
-                covariance: [[0.0; 6]; 6],
-                has_covariance: 0,
-                representation: EMPYREAN_REPRESENTATION_CARTESIAN,
-                frame: 0,
-                origin: 10,
-            },
-        )
-        .expect("a well-formed Cartesian state");
-        orbit
-            .push("dt-probe".to_string(), coord.into_radians())
-            .expect("push");
-
-        let with_variance = empyrean_core::nongrav::NonGravParams {
-            a1: 1.0e-10,
-            a2: 0.0,
-            a3: 0.0,
-            model: NonGravModel::MarsdenSekanina(
-                empyrean_core::nongrav::GFunction::inverse_square(),
-            ),
-            covariance: None,
-            dt: Some(45.7),
-            dt_variance: Some(4.0),
-        };
-        orbit.set_non_grav_params(0, Some(with_variance.clone()));
-        let (has, flat) = od_result_non_grav_to_c_for_test(&orbit);
-        assert_eq!(has, 1, "the orbit carries a non-grav block");
-        assert_eq!(
-            flat.has_dt_variance, 1,
-            "a carried DT variance sets its switch"
-        );
-        assert_eq!(flat.dt_variance, 4.0, "and publishes the value verbatim");
-        assert_eq!(flat.has_dt, 1, "the DT value rides with it");
-        assert_eq!(flat.non_grav_dt, 45.7);
-
-        let mut without = with_variance;
-        without.dt_variance = None;
-        orbit.set_non_grav_params(0, Some(without));
-        let (_, flat) = od_result_non_grav_to_c_for_test(&orbit);
-        assert_eq!(
-            flat.has_dt_variance, 0,
-            "an absent DT variance clears its switch"
-        );
-        assert!(
-            flat.dt_variance.is_nan(),
-            "and publishes NaN, never 0.0 — a consumer could not tell a zero-width \
-             prior from an absent one"
-        );
-
-        // In: the input side reads the variance only when finite and
-        // positive, which is the trigger that opens the DT column.
-        let mut o: EmpyreanOrbit = unsafe { std::mem::zeroed() };
-        o.non_grav_dt = 45.7;
-        o.non_grav_dt_variance = 4.0;
-        let params = crate::propagate::empyrean_orbit_non_grav_params(&o)
-            .expect("a DT value alone declares a non-grav block");
-        assert_eq!(params.dt, Some(45.7), "the DT VALUE must survive");
-        assert_eq!(
-            params.dt_variance,
-            Some(4.0),
-            "and so must its prior variance — the pair opens and priors the DT column"
-        );
-
-        // A zero or negative variance is "no prior", not a prior of zero.
-        for bad in [0.0, -1.0, f64::NAN] {
-            let mut o: EmpyreanOrbit = unsafe { std::mem::zeroed() };
-            o.non_grav_dt = 45.7;
-            o.non_grav_dt_variance = bad;
-            let params = crate::propagate::empyrean_orbit_non_grav_params(&o).expect("dt present");
-            assert_eq!(
-                params.dt_variance, None,
-                "dt_variance = {bad} must read as absent, never as a zero-width prior"
-            );
-        }
-    }
-
-    /// A malformed carrier fails the OD call with the ARGUMENT code
-    /// (-1), not the engine code (-2). The split is the only signal a
-    /// caller has for "my struct is wrong" versus "my covariance is
-    /// wrong", and it is decided before the engine is ever entered.
-    #[test]
-    fn a_malformed_carrier_fails_the_od_call_with_the_argument_code() {
-        let Some(ctx) = crate::testing::context_or_skip(
-            "a_malformed_carrier_fails_the_od_call_with_the_argument_code",
-        ) else {
-            return;
-        };
-        let ctx_ptr: *const EmpyreanContext = &ctx;
-        let (obs_ptr, obs_n) = read_eros_observations();
-        let cfg = standard_od_config();
-
-        let mut o: EmpyreanOrbit = unsafe { std::mem::zeroed() };
-        o.state = crate::CoordinateState {
-            epoch_mjd_tdb: 59000.0,
-            elements: [1.0, 0.1, 0.05, -0.005, 0.015, 0.001],
-            covariance: [[0.0; 6]; 6],
-            has_covariance: 0,
-            representation: EMPYREAN_REPRESENTATION_CARTESIAN,
-            frame: 0,
-            origin: 10,
-            has_non_grav_cross: 0,
-            non_grav_cross: [[0.0; 3]; 6],
-        };
-        o.non_grav_dt = f64::NAN;
-        o.non_grav_dt_variance = f64::NAN;
-        o.phot_system = -1;
-        o.h_mag = f64::NAN;
-        o.srp_amrat_variance = f64::NAN;
-
-        // An unknown column kind: malformed C, not malformed physics.
-        let bad = [crate::joint::EmpyreanStateParamCross {
-            column: crate::joint::EmpyreanParamColumn {
-                kind: 99,
-                index: 0,
-                segment: 0,
-                component: 0,
-            },
-            values: [1.0; 6],
-        }];
-        o.state_param_cross = bad.as_ptr();
-        o.n_state_param_cross = bad.len();
-
-        let mut out: EmpyreanODResult = unsafe { std::mem::zeroed() };
-        let code = unsafe { empyrean_refine(ctx_ptr, &o, obs_ptr, obs_n, &cfg, &mut out) };
-        unsafe { crate::od::empyrean_observations_free(obs_ptr, obs_n) };
-
-        assert_eq!(
-            code,
-            -1,
-            "a malformed parameter-column tag is an ARGUMENT error, not an engine \
-             refusal; last_error: {}",
-            last_err_text()
-        );
-        let msg = last_err_text();
-        assert!(
-            msg.contains("99") && msg.contains("kind"),
-            "the message must name the offending tag: {msg}"
-        );
     }
 }
 
@@ -8131,11 +7895,10 @@ mod builtsystem_od_tests {
     use super::*;
     use crate::built_system::{
         EMPYREAN_BUILTSYSTEM_CONFIG_MUTATES_KEY, EMPYREAN_BUILTSYSTEM_DATA_MISMATCH,
-        EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_DIVISOR, EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_FORCE_MODEL,
-        EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_FRAME, EMPYREAN_BUILTSYSTEM_OK,
-        EMPYREAN_BUILTSYSTEM_STALE, EmpyreanBuiltSystem, empyrean_builtsystem_determine,
-        empyrean_builtsystem_evaluate, empyrean_builtsystem_free, empyrean_builtsystem_new,
-        empyrean_builtsystem_new_for_od, empyrean_builtsystem_refine,
+        EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_FORCE_MODEL, EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_FRAME,
+        EMPYREAN_BUILTSYSTEM_OK, EMPYREAN_BUILTSYSTEM_STALE, EmpyreanBuiltSystem,
+        empyrean_builtsystem_determine, empyrean_builtsystem_evaluate, empyrean_builtsystem_free,
+        empyrean_builtsystem_new, empyrean_builtsystem_new_for_od, empyrean_builtsystem_refine,
     };
     // The crate-wide loud helper: a context failure on a runner that was
     // pointed at a data directory fails the test instead of skipping it.
@@ -8181,14 +7944,10 @@ mod builtsystem_od_tests {
             representation: EMPYREAN_REPRESENTATION_CARTESIAN,
             frame: 0,
             origin: 10,
-            has_non_grav_cross: 0,
-            non_grav_cross: [[0.0; 3]; 6],
         };
         orbit.non_grav_dt = f64::NAN;
-        orbit.non_grav_dt_variance = f64::NAN;
         orbit.phot_system = -1;
         orbit.h_mag = f64::NAN;
-        orbit.srp_amrat_variance = f64::NAN;
         orbit
     }
 
@@ -8222,10 +7981,9 @@ mod builtsystem_od_tests {
             Frame::EclipticJ2000,
             "OD integrates in EclipticJ2000 — an ICRF handle is the documented footgun"
         );
-        assert_eq!(
-            key.advanced.encounter_timescale_divisor, 1000.0,
-            "the OD key freezes the engine-default encounter-timescale divisor"
-        );
+        // The encounter-timescale divisor knob was retired from the engine
+        // integrator config (the encounter floor now derives from epsilon), so
+        // the OD key recipe no longer pins a divisor — only the frame.
 
         let Some(ctx) = context_or_skip("the_od_key_recipe_is_pinned (handle half)") else {
             return;
@@ -8238,7 +7996,6 @@ mod builtsystem_od_tests {
         assert_eq!(code, EMPYREAN_BUILTSYSTEM_OK, "describe: {}", last_err());
         assert_eq!(desc.force_model, STANDARD);
         assert_eq!(desc.frame, 1, "EclipticJ2000 is frame code 1");
-        assert_eq!(desc.encounter_timescale_divisor, 1000.0);
         unsafe {
             crate::built_system::empyrean_builtsystem_description_free(&mut desc);
             empyrean_builtsystem_free(handle);
@@ -8571,7 +8328,7 @@ mod builtsystem_od_tests {
         // the header builds ICRF handles; OD integrates in EclipticJ2000.
         let mut icrf: *mut EmpyreanBuiltSystem = std::ptr::null_mut();
         assert_eq!(
-            unsafe { empyrean_builtsystem_new(ctx_ptr, STANDARD, 0, 0.0, &mut icrf) },
+            unsafe { empyrean_builtsystem_new(ctx_ptr, STANDARD, 0, &mut icrf) },
             EMPYREAN_BUILTSYSTEM_OK,
             "{}",
             last_err()
@@ -8600,21 +8357,12 @@ mod builtsystem_od_tests {
         );
         unsafe { empyrean_builtsystem_free(basic) };
 
-        // ── divisor: right frame and tier, non-default step floor.
-        let mut divisor: *mut EmpyreanBuiltSystem = std::ptr::null_mut();
-        assert_eq!(
-            unsafe { empyrean_builtsystem_new(ctx_ptr, STANDARD, 1, 500.0, &mut divisor) },
-            EMPYREAN_BUILTSYSTEM_OK,
-            "{}",
-            last_err()
-        );
-        assert_eq!(
-            evaluate_through(divisor, ctx_ptr),
-            EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_DIVISOR,
-            "a non-default divisor changes the integration: {}",
-            last_err()
-        );
-        unsafe { empyrean_builtsystem_free(divisor) };
+        // DELETED (0.11.0 ruling): the "divisor axis" key-mismatch sub-check.
+        // `empyrean_builtsystem_new` no longer takes an encounter-timescale
+        // divisor (the knob is gone), so a divisor-mismatched handle cannot be
+        // built from the C side. The `_ENCOUNTER_FLOOR` axis exists (renamed
+        // from `_DIVISOR`) but has no C knob to perturb — the floor derives
+        // from the integrator epsilon — so its successor is out of scope here.
 
         // ── data identity: a handle from a second, independently loaded
         // context. Structurally identical kernels, different `Arc`s.

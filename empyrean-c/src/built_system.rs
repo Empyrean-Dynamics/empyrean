@@ -78,9 +78,11 @@ pub const EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_FRAME: i32 = -21;
 /// Identity guard (b): the per-call config's force-model tier diverges from
 /// the handle's frozen tier.
 pub const EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_FORCE_MODEL: i32 = -22;
-/// Identity guard (b): the per-call config's encounter-timescale divisor
-/// diverges from the handle's frozen divisor.
-pub const EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_DIVISOR: i32 = -23;
+/// Identity guard (b): the per-call config's encounter floor angle
+/// diverges from the handle's frozen floor (the engine derives the floor
+/// from the integrator tolerance, so a different tolerance is a different
+/// integration).
+pub const EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_ENCOUNTER_FLOOR: i32 = -23;
 /// Identity guard (c): the context's ephemeris data was mutated (a kernel
 /// load) after the handle was built. The handle refuses to serve results
 /// assembled from since-replaced kernels — rebuild it.
@@ -189,8 +191,10 @@ pub struct EmpyreanSystemDescription {
     pub force_model: i32,
     /// Integration/output frame: 0=ICRF, 1=EclipticJ2000, 2=ITRF93.
     pub frame: i32,
-    /// The frozen encounter-timescale divisor.
-    pub encounter_timescale_divisor: f64,
+    /// The frozen encounter floor angle (radians of turning per step), the
+    /// value the engine derives from the integrator tolerance. Describe-only;
+    /// it is no longer a construction knob.
+    pub encounter_floor_angle: f64,
     /// 1 if the post-Newtonian (EIH) GR correction is enabled, else 0.
     pub relativistic: u8,
     /// 1 if the N16 asteroid perturbers are included, else 0.
@@ -214,14 +218,14 @@ pub struct EmpyreanSystemDescription {
 // ────────────────────────────────────────────────────────────────────
 
 /// Assemble a reusable force-model handle for `(force_model, frame)` from
-/// `ctx`, freezing `encounter_timescale_divisor` into its key.
+/// `ctx`.
 ///
 /// - `force_model`: tier code (0=Approximate, 1=Basic, 2=Standard).
 /// - `frame`: output/integration frame code (0=ICRF, 1=EclipticJ2000, 2=ITRF93).
-/// - `encounter_timescale_divisor`: pass `0.0` to freeze the engine default;
-///   any positive value freezes that divisor into the key *before* it is
-///   used to validate calls.
 /// - `out`: receives the heap-allocated handle on success.
+///
+/// The encounter floor angle is no longer a construction argument: the engine
+/// derives it from the integrator tolerance and freezes it into the key.
 ///
 /// The handle snapshots `ctx`'s kernel manifest at construction so
 /// [`empyrean_builtsystem_describe`] is self-contained. After you load any
@@ -237,7 +241,6 @@ pub unsafe extern "C" fn empyrean_builtsystem_new(
     ctx: *const EmpyreanContext,
     force_model: i32,
     frame: i32,
-    encounter_timescale_divisor: f64,
     out: *mut *mut EmpyreanBuiltSystem,
 ) -> i32 {
     let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -274,21 +277,16 @@ pub unsafe extern "C" fn empyrean_builtsystem_new(
             }
         };
 
-        let mut system = match ctx_ref.built_system(fm.into(), fr) {
+        let system = match ctx_ref.built_system(fm.into(), fr) {
             Ok(s) => s,
             Err(e) => {
                 set_last_error(&e.to_string());
                 return EMPYREAN_BUILTSYSTEM_INVALID_ARGUMENT;
             }
         };
-        // Sentinel: 0.0 keeps the engine default that `built_system` already
-        // froze; any positive value freezes that divisor into the key before
-        // it is used to validate calls. A non-positive non-zero value is not
-        // a valid divisor and likewise falls back to the frozen default,
-        // matching the per-call config sentinel convention.
-        if encounter_timescale_divisor > 0.0 {
-            system = system.with_encounter_timescale_divisor(encounter_timescale_divisor);
-        }
+        // The encounter floor angle is no longer a construction knob: the
+        // engine freezes the value it derives from the integrator tolerance
+        // into the key, so there is nothing to override here.
 
         let handle = Box::new(EmpyreanBuiltSystem {
             system: Arc::new(system),
@@ -340,15 +338,7 @@ pub unsafe extern "C" fn empyrean_builtsystem_new_for_od(
     out: *mut *mut EmpyreanBuiltSystem,
 ) -> i32 {
     let key = od_key_config();
-    unsafe {
-        empyrean_builtsystem_new(
-            ctx,
-            force_model,
-            frame_to_int(key.propagation.frame),
-            key.propagation.advanced.encounter_timescale_divisor,
-            out,
-        )
-    }
+    unsafe { empyrean_builtsystem_new(ctx, force_model, frame_to_int(key.propagation.frame), out) }
 }
 
 /// Free a handle previously returned by [`empyrean_builtsystem_new`].
@@ -423,7 +413,7 @@ pub unsafe extern "C" fn empyrean_builtsystem_propagate(
                 Ok(t) => t,
                 Err(e) => {
                     e.report();
-                    return EMPYREAN_BUILTSYSTEM_INVALID_ARGUMENT;
+                    return e.code.unwrap_or(EMPYREAN_BUILTSYSTEM_INVALID_ARGUMENT);
                 }
             };
         let cfg = match build_propagation_config_from_c(config_ref) {
@@ -467,13 +457,7 @@ pub unsafe extern "C" fn empyrean_builtsystem_propagate(
             }
         };
 
-        marshal_propagation_result(
-            prop_result,
-            times.len(),
-            &input_orbit_ids,
-            &input_object_ids,
-            result_out,
-        )
+        marshal_propagation_result(prop_result, &input_orbit_ids, &input_object_ids, result_out)
     }));
     match r {
         Ok(c) => c,
@@ -493,7 +477,7 @@ pub unsafe extern "C" fn empyrean_builtsystem_propagate(
 /// [`empyrean_builtsystem_propagate`] before dispatch; on pass the result is
 /// bit-identical to the one-shot. Note the C-ABI ephemeris config carries no
 /// divisor knob, so a handle frozen at a non-default divisor is rejected here
-/// with [`EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_DIVISOR`] rather than served under
+/// with [`EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_ENCOUNTER_FLOOR`] rather than served under
 /// the wrong dynamics — build the handle with the default divisor for
 /// ephemeris reuse.
 ///
@@ -539,8 +523,8 @@ pub unsafe extern "C" fn empyrean_builtsystem_generate_ephemeris(
         let orbits = match build_orbits_for_ephemeris(orbit_slice) {
             Ok(o) => o,
             Err(e) => {
-                set_last_error(&e);
-                return EMPYREAN_BUILTSYSTEM_INVALID_ARGUMENT;
+                set_last_error(&e.message);
+                return e.code.unwrap_or(EMPYREAN_BUILTSYSTEM_INVALID_ARGUMENT);
             }
         };
         let observers = match build_observers_from_c(observer_slice) {
@@ -948,7 +932,7 @@ pub unsafe extern "C" fn empyrean_builtsystem_describe(
             *out = EmpyreanSystemDescription {
                 force_model,
                 frame,
-                encounter_timescale_divisor: desc.encounter_timescale_divisor,
+                encounter_floor_angle: desc.encounter_floor_angle,
                 relativistic: desc.relativistic as u8,
                 asteroids: desc.asteroids as u8,
                 has_bpc: desc.has_bpc as u8,
@@ -1023,9 +1007,9 @@ fn map_prop_error_to_code(e: &PropagationError, batch: Option<&ErrorBatch<'_>>) 
             set_last_error(&format!("BuiltSystem key mismatch: {e}"));
             EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_FORCE_MODEL
         }
-        PropagationError::KeyMismatch(SystemKeyMismatch::Divisor { .. }) => {
+        PropagationError::KeyMismatch(SystemKeyMismatch::EncounterFloor { .. }) => {
             set_last_error(&format!("BuiltSystem key mismatch: {e}"));
-            EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_DIVISOR
+            EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_ENCOUNTER_FLOOR
         }
         PropagationError::StaleEphemerisData { .. } => {
             set_last_error(&format!("BuiltSystem is stale: {e}"));
@@ -1068,13 +1052,6 @@ fn propagation_error_orbit_id(e: &PropagationError) -> Option<&str> {
         | PropagationError::KeplerDTBackPropagation { orbit_id, .. }
         | PropagationError::Transform { orbit_id, .. }
         | PropagationError::InvalidDTConfiguration { orbit_id, .. }
-        | PropagationError::ExtendedCovarianceWithoutState { orbit_id, .. }
-        | PropagationError::ExtendedCovarianceWithoutNonGravCovariance { orbit_id, .. }
-        | PropagationError::ExtendedCovarianceNotPositiveSemidefinite { orbit_id, .. }
-        | PropagationError::WideCrossPartitionViolation { orbit_id, .. }
-        | PropagationError::WideCrossParameterNotSolved { orbit_id, .. }
-        | PropagationError::WideCrossRepresentationUnsupported { orbit_id, .. }
-        | PropagationError::ExtendedCovarianceParamsMismatch { orbit_id, .. }
         | PropagationError::OutputAssembly { orbit_id, .. }
         | PropagationError::DuplicateOrbitId { orbit_id, .. }
         | PropagationError::SigmaPointConstruction { orbit_id, .. }
@@ -1217,7 +1194,7 @@ mod tests {
             EMPYREAN_BUILTSYSTEM_DATA_MISMATCH,
             EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_FRAME,
             EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_FORCE_MODEL,
-            EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_DIVISOR,
+            EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_ENCOUNTER_FLOOR,
             EMPYREAN_BUILTSYSTEM_STALE,
         ];
         let mut sorted = codes.to_vec();
@@ -1257,8 +1234,6 @@ mod tests {
                 representation: 0, // Cartesian
                 frame: 0,          // ICRF
                 origin: 10,        // Sun (NAIF)
-                has_non_grav_cross: 0,
-                non_grav_cross: [[0.0; 3]; 6],
             },
             orbit_id: std::ptr::null(),
             object_id: std::ptr::null(),
@@ -1271,9 +1246,6 @@ mod tests {
             ng_n: 0.0,
             ng_k: 0.0,
             non_grav_dt: f64::NAN,
-            non_grav_dt_variance: f64::NAN,
-            has_non_grav_covariance: 0,
-            non_grav_covariance: [[0.0; 3]; 3],
             phot_system: -1,
             h_mag: f64::NAN,
             slope1: 0.0,
@@ -1282,16 +1254,10 @@ mod tests {
             n_thrust_arcs: 0,
             dv_corrections: std::ptr::null(),
             n_dv_corrections: 0,
-            correction_covariances: std::ptr::null(),
-            n_correction_covariances: 0,
             has_srp: 0,
             srp_amrat: 0.0,
             srp_cr: 0.0,
-            srp_amrat_variance: f64::NAN,
-            state_param_cross: std::ptr::null(),
-            n_state_param_cross: 0,
-            param_pair_cross: std::ptr::null(),
-            n_param_pair_cross: 0,
+            covariance: crate::joint::empty_packed_joint(),
             has_phot_covariance: 0,
             phot_covariance: [[0.0; 3]; 3],
         }
@@ -1343,7 +1309,7 @@ mod tests {
 
         // Through the handle.
         let mut handle: *mut EmpyreanBuiltSystem = std::ptr::null_mut();
-        let hc = unsafe { empyrean_builtsystem_new(ctx_ptr, 2, 0, 0.0, &mut handle) };
+        let hc = unsafe { empyrean_builtsystem_new(ctx_ptr, 2, 0, &mut handle) };
         assert_eq!(
             hc,
             EMPYREAN_BUILTSYSTEM_OK,
@@ -1409,7 +1375,7 @@ mod tests {
         let ctx_ptr: *const EmpyreanContext = &ctx;
 
         let mut handle: *mut EmpyreanBuiltSystem = std::ptr::null_mut();
-        let hc = unsafe { empyrean_builtsystem_new(ctx_ptr, 2, 0, 0.0, &mut handle) };
+        let hc = unsafe { empyrean_builtsystem_new(ctx_ptr, 2, 0, &mut handle) };
         assert_eq!(
             hc,
             EMPYREAN_BUILTSYSTEM_OK,
@@ -1428,10 +1394,10 @@ mod tests {
 
         assert_eq!(desc.force_model, 2, "Standard tier");
         assert_eq!(desc.frame, 0, "ICRF");
-        assert_eq!(
-            desc.encounter_timescale_divisor, 1000.0,
-            "engine default divisor"
-        );
+        // (0.11.0 ruling) the encounter-timescale DIVISOR knob is gone; the
+        // describe field is now `encounter_floor_angle`, a different quantity,
+        // so the old `== 1000.0` divisor assertion is dropped rather than
+        // reinterpreted.
         assert_eq!(desc.relativistic, 1, "Standard tier includes GR");
         assert_eq!(desc.asteroids, 1, "Standard tier includes N16 asteroids");
         assert_eq!(desc.has_bpc, 1, "Standard tier loads a BPC");
@@ -1546,7 +1512,7 @@ mod tests {
 
         // Through the handle.
         let mut handle: *mut EmpyreanBuiltSystem = std::ptr::null_mut();
-        let hc = unsafe { empyrean_builtsystem_new(ctx_ptr, 2, 0, 0.0, &mut handle) };
+        let hc = unsafe { empyrean_builtsystem_new(ctx_ptr, 2, 0, &mut handle) };
         assert_eq!(
             hc,
             EMPYREAN_BUILTSYSTEM_OK,
@@ -1606,7 +1572,7 @@ mod tests {
         let ctx_ptr: *const EmpyreanContext = &ctx;
 
         let mut handle: *mut EmpyreanBuiltSystem = std::ptr::null_mut();
-        let hc = unsafe { empyrean_builtsystem_new(ctx_ptr, 2, 0, 0.0, &mut handle) };
+        let hc = unsafe { empyrean_builtsystem_new(ctx_ptr, 2, 0, &mut handle) };
         assert_eq!(
             hc,
             EMPYREAN_BUILTSYSTEM_OK,
@@ -1663,29 +1629,13 @@ mod tests {
             last_err()
         );
 
-        // Divisor axis: frozen at the engine default (built with 0.0), call
-        // requests a non-default encounter-timescale divisor.
-        let mut cfg_dv = standard_first_config();
-        cfg_dv.advanced.encounter_timescale_divisor = 500.0;
-        let mut out_dv: EmpyreanPropagationResult = unsafe { std::mem::zeroed() };
-        let rc_dv = unsafe {
-            empyrean_builtsystem_propagate(
-                handle,
-                ctx_ptr,
-                orbits.as_ptr(),
-                1,
-                times.as_ptr(),
-                times.len(),
-                &cfg_dv,
-                &mut out_dv,
-            )
-        };
-        assert_eq!(
-            rc_dv,
-            EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_DIVISOR,
-            "divisor mismatch must fire by axis: {}",
-            last_err()
-        );
+        // DELETED (0.11.0 ruling): the "divisor axis" key-mismatch sub-check.
+        // The encounter-timescale DIVISOR knob is gone from the C advanced
+        // config, so a divisor mismatch can no longer be triggered from the C
+        // side. The `_ENCOUNTER_FLOOR` axis exists (renamed from `_DIVISOR`)
+        // but has no C-config knob to perturb — the floor derives from the
+        // integrator epsilon — so its key-mismatch successor is out of this
+        // test's scope.
 
         unsafe { empyrean_builtsystem_free(handle) };
     }
@@ -1713,7 +1663,7 @@ mod tests {
         let b_ptr: *const EmpyreanContext = &ctx_b;
 
         let mut handle: *mut EmpyreanBuiltSystem = std::ptr::null_mut();
-        let hc = unsafe { empyrean_builtsystem_new(a_ptr, 2, 0, 0.0, &mut handle) };
+        let hc = unsafe { empyrean_builtsystem_new(a_ptr, 2, 0, &mut handle) };
         assert_eq!(
             hc,
             EMPYREAN_BUILTSYSTEM_OK,

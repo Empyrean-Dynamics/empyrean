@@ -22,14 +22,16 @@ use std::ffi::{CStr, CString, c_char};
 use std::panic::AssertUnwindSafe;
 
 use empyrean_core::planning::{
-    CandidateInfo, CandidateKind, CovarianceMetrics, ObservatoryConfig, PlanResult,
-    PlannedObservation, PlanningConfig, RadarMode, RadarPlanSpec, Station, TargetRadarProperties,
-    evaluate_plan_single,
+    CandidateInfo, CandidateKind, CovarianceMetrics, EngineUncertaintyMethod, LogDetWithheld,
+    ObservatoryConfig, PlanResult, PlannedObservation, PlanningConfig, RadarMode, RadarPlanSpec,
+    Station, TargetRadarProperties, evaluate_plan_single,
 };
 use empyrean_core::time::Epoch;
 
 use crate::od::empyrean_orbit_to_orbits;
-use crate::propagate::{EmpyreanOrbit, int_to_force_model};
+use crate::propagate::{
+    EMPYREAN_COVARIANCE_KIND_UNKNOWN, EmpyreanOrbit, covariance_kind_to_u8, int_to_force_model,
+};
 use crate::{EmpyreanContext, set_last_error};
 
 // ── Input structs ───────────────────────────────────────────────────
@@ -198,6 +200,27 @@ pub struct EmpyreanPlanningConfig {
 
 // ── Output structs ──────────────────────────────────────────────────
 
+/// [`EmpyreanCovarianceMetrics::log_det`] is delivered — the finite
+/// \\(\ln\det\Sigma\\). [`EmpyreanCovarianceMetrics::log_det_withheld`]
+/// carries this when `log_det` is a real number, never withheld.
+pub const EMPYREAN_LOG_DET_WITHHELD_NONE: u8 = 0;
+/// `log_det` is `NaN` because the metric was reported past a closed-form
+/// second-order moment transport, where no epoch-invariant determinant
+/// identity holds. The epoch-invariant
+/// [`EmpyreanPlanResult::log_det_gain`] stays finite.
+pub const EMPYREAN_LOG_DET_WITHHELD_SECOND_ORDER_MOMENT: u8 = 1;
+/// `log_det` is `NaN` because the metric was reported past a sampled
+/// transport whose products are flown-member sample moments; the sampled
+/// transport kind rides beside it in
+/// [`EmpyreanCovarianceMetrics::log_det_withheld_method`], an
+/// `EMPYREAN_COVARIANCE_KIND_*` value (`SIGMA_POINT` or `MONTE_CARLO`).
+pub const EMPYREAN_LOG_DET_WITHHELD_SAMPLED_MOMENT: u8 = 2;
+/// `log_det` is `NaN` because the metric was reported past a
+/// Gaussian-mixture moment transport. Not produced by this planning seam
+/// (it runs the single-linearization fold), but named so the withholding
+/// vocabulary is complete across the distribution's uncertainty methods.
+pub const EMPYREAN_LOG_DET_WITHHELD_MIXTURE_MOMENT: u8 = 3;
+
 /// Covariance summary metrics (prior, posterior, or per-candidate cumulative).
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -210,8 +233,32 @@ pub struct EmpyreanCovarianceMetrics {
     pub semi_major_km: f64,
     /// Semi-minor axis of the 1σ position ellipsoid (km).
     pub semi_minor_km: f64,
-    /// ln(det(Σ)) — D-optimality criterion.
+    /// ln(det(Σ)) — the absolute D-optimality criterion over the 6×6
+    /// state block. A finite, delivered value at the prior epoch and at a
+    /// report epoch reached under the single-linearization (`Linear`)
+    /// transport — which is the only transport this planning seam runs,
+    /// so on every result `empyrean_evaluate_plan` returns today this is
+    /// finite. `NaN` **only** when
+    /// [`log_det_withheld`](Self::log_det_withheld) names a nonlinear
+    /// transport that made the absolute determinant ill-posed — never a
+    /// NaN without a reason, and never a zero that would read as a
+    /// unit-determinant. The two fields are complementary: exactly one of
+    /// `log_det` (finite) / `log_det_withheld` (a non-`NONE` reason)
+    /// carries the state.
     pub log_det: f64,
+    /// Why [`log_det`](Self::log_det) is `NaN`, when it is — an
+    /// `EMPYREAN_LOG_DET_WITHHELD_*` code. `EMPYREAN_LOG_DET_WITHHELD_NONE`
+    /// (0) whenever `log_det` is delivered (finite); otherwise the
+    /// nonlinear transport that withheld it, named rather than left as a
+    /// bare NaN.
+    pub log_det_withheld: u8,
+    /// The sampled transport kind when
+    /// [`log_det_withheld`](Self::log_det_withheld) is
+    /// `EMPYREAN_LOG_DET_WITHHELD_SAMPLED_MOMENT` — an
+    /// `EMPYREAN_COVARIANCE_KIND_*` value (`SIGMA_POINT` or
+    /// `MONTE_CARLO`). `EMPYREAN_COVARIANCE_KIND_UNKNOWN` for every other
+    /// `log_det_withheld` code, where no sampled method applies.
+    pub log_det_withheld_method: u8,
 }
 
 /// One predicted sky-plane point of the plan's optical ephemeris: the
@@ -319,6 +366,17 @@ pub struct EmpyreanPlanResult {
     pub prior: EmpyreanCovarianceMetrics,
     /// Posterior (all candidates folded) covariance metrics.
     pub posterior: EmpyreanCovarianceMetrics,
+    /// Epoch-invariant prior→posterior change in the absolute 6×6
+    /// state-block ln-determinant, in nats:
+    /// \\(\ln\det\Sigma_{\mathrm{post}} - \ln\det\Sigma_{\mathrm{prior}}\\)
+    /// formed once at the prior's epoch, where both are well-posed.
+    /// Negative when the planned observations shrink the covariance
+    /// volume; \\(\exp(\text{gain}/6)\\) is the whole-plan 1σ-volume
+    /// ratio. Always finite — it is reached at the prior epoch, before
+    /// any transport, so it stays available even when
+    /// [`prior`](Self::prior) / [`posterior`](Self::posterior) carry a
+    /// withheld (`NaN`) `log_det` past a nonlinear transport.
+    pub log_det_gain: f64,
     /// Per-candidate analysis array (owned).
     pub candidates: *mut EmpyreanPlanCandidate,
     /// Number of entries in `candidates`.
@@ -468,9 +526,36 @@ fn build_planning_config(c: &EmpyreanPlanningConfig) -> Result<PlanningConfig, S
         });
     }
 
+    // Five fields the villeneuve 1.26.0 / scott 1.19.0 pin added to the
+    // engine `PlanningConfig` (`max_light_time_iterations`,
+    // `excluded_perturbers`, `origin_switching`, `output_epoch`,
+    // `transport_cache`). This ABI exposes no knob for any of them yet — the
+    // same deferral as `uncertainty_method` / `weighting` below — so each
+    // is pinned to the engine's own documented planning default, read
+    // field-by-field from `PlanningConfig::default()`
+    // rather than by a `..Default::default()` struct-update, so a field the
+    // engine grows next is a compile break here (at the marshal boundary)
+    // rather than a silently defaulted plan. Four of the five preserve the
+    // behaviour of a seam that never surfaced them —
+    // `max_light_time_iterations = 3`, no perturber exclusions, villeneuve's
+    // library origin-switching, and no transport cache. The fifth,
+    // `output_epoch = LastObservation`, is NOT behaviour-preserving relative
+    // to the prior (IOD) epoch: it transports the plan's prior and posterior
+    // metrics to the last planned observation, so the covariance-bearing
+    // fields (and the per-candidate `cumulative`) are reported at that epoch,
+    // not at the input orbit's. Under the `Linear` transport the engine
+    // delivers the transported state-block `log_det` there; `log_det_gain`
+    // stays the epoch-invariant prior→posterior difference, formed once at
+    // the prior epoch.
+    let engine_defaults = PlanningConfig::default();
     Ok(PlanningConfig {
         force_model,
         epsilon: c.epsilon,
+        max_light_time_iterations: engine_defaults.max_light_time_iterations,
+        excluded_perturbers: engine_defaults.excluded_perturbers,
+        origin_switching: engine_defaults.origin_switching,
+        output_epoch: engine_defaults.output_epoch,
+        transport_cache: engine_defaults.transport_cache,
         observatories,
         num_threads: if c.num_threads < 0 {
             None
@@ -478,16 +563,60 @@ fn build_planning_config(c: &EmpyreanPlanningConfig) -> Result<PlanningConfig, S
             Some(c.num_threads as usize)
         },
         encounter: None,
+        // Both are pinned to the behaviour this seam has always had,
+        // not left to `Default`: the engine's default for either field
+        // may move, and this ABI exposes no knob for a caller to move
+        // it back. `FirstOrder` is the single-linearization Gaussian
+        // fold every previous release of `empyrean_evaluate_plan`
+        // computed; `None` is the raw per-candidate σ it has always
+        // consumed unmodified. Exposing the two as C-ABI knobs — with
+        // the uncertainty-method flat struct the propagation entry
+        // points already carry, and a weighting config the OD seam
+        // would share — is bd empyrean-848gm.10.
+        uncertainty_method: EngineUncertaintyMethod::FirstOrder,
+        weighting: None,
     })
 }
 
 fn metrics_to_c(m: &CovarianceMetrics) -> EmpyreanCovarianceMetrics {
+    // `CovarianceMetrics` carries the absolute `log_det` under the
+    // `Linear` transport (and at the prior epoch) and withholds it under a
+    // nonlinear one, naming the transport on `log_det_withheld` rather
+    // than leaving a bare `None` — exactly one of the two is `Some`. The
+    // reason tag is authoritative: when it is present the value is `NaN`
+    // and the tag says why; when it is absent the value is delivered. So
+    // a `NaN` on this struct never arrives without a non-`NONE`
+    // `log_det_withheld` beside it to explain it.
+    let (log_det, withheld, withheld_method) = match m.log_det_withheld {
+        None => (
+            m.log_det.unwrap_or(f64::NAN),
+            EMPYREAN_LOG_DET_WITHHELD_NONE,
+            EMPYREAN_COVARIANCE_KIND_UNKNOWN,
+        ),
+        Some(LogDetWithheld::SecondOrderMoment) => (
+            f64::NAN,
+            EMPYREAN_LOG_DET_WITHHELD_SECOND_ORDER_MOMENT,
+            EMPYREAN_COVARIANCE_KIND_UNKNOWN,
+        ),
+        Some(LogDetWithheld::SampledMoment { method }) => (
+            f64::NAN,
+            EMPYREAN_LOG_DET_WITHHELD_SAMPLED_MOMENT,
+            covariance_kind_to_u8(method),
+        ),
+        Some(LogDetWithheld::MixtureMoment) => (
+            f64::NAN,
+            EMPYREAN_LOG_DET_WITHHELD_MIXTURE_MOMENT,
+            EMPYREAN_COVARIANCE_KIND_UNKNOWN,
+        ),
+    };
     EmpyreanCovarianceMetrics {
         position_sigma_km: m.position_sigma_km,
         velocity_sigma_m_s: m.velocity_sigma_m_s,
         semi_major_km: m.semi_major_km,
         semi_minor_km: m.semi_minor_km,
-        log_det: m.log_det,
+        log_det,
+        log_det_withheld: withheld,
+        log_det_withheld_method: withheld_method,
     }
 }
 
@@ -586,6 +715,7 @@ fn plan_result_to_c(plan: &PlanResult, out: *mut EmpyreanPlanResult) {
         (*out).orbit_id = owned_cstr(&plan.orbit_id);
         (*out).prior = metrics_to_c(&plan.prior);
         (*out).posterior = metrics_to_c(&plan.posterior);
+        (*out).log_det_gain = plan.log_det_gain;
         (*out).candidates = cand_ptr;
         (*out).num_candidates = num_candidates;
         (*out).active_width = plan.active_width;
@@ -649,8 +779,8 @@ pub unsafe extern "C" fn empyrean_evaluate_plan(
         let orbits = match empyrean_orbit_to_orbits(orbit_ref, &id) {
             Ok(o) => o,
             Err(e) => {
-                set_last_error(&e);
-                return -1;
+                set_last_error(&e.message);
+                return e.code.unwrap_or(-1);
             }
         };
 
@@ -874,5 +1004,97 @@ mod observatory_gate_tests {
         assert_eq!(o.max_apparent_mag, 24.5);
         assert_eq!(o.min_elongation_deg, 70.0);
         assert_eq!(o.sigma_arcsec, [0.3, 0.4]);
+    }
+}
+
+/// The log-det delivered/withheld contract at the C boundary: a finite
+/// value with the `_NONE` reason when delivered, a `NaN` paired with a
+/// named reason under a nonlinear transport — never a `NaN` without a
+/// reason beside it.
+#[cfg(test)]
+mod log_det_withheld_tests {
+    use super::*;
+    use crate::propagate::EMPYREAN_COVARIANCE_KIND_SIGMA_POINT;
+    use empyrean_core::propagation::CovarianceKind;
+
+    fn metrics(log_det: Option<f64>, withheld: Option<LogDetWithheld>) -> CovarianceMetrics {
+        CovarianceMetrics {
+            position_sigma_km: 1.0,
+            velocity_sigma_m_s: 2.0,
+            semi_major_km: 3.0,
+            semi_minor_km: 4.0,
+            log_det,
+            log_det_withheld: withheld,
+        }
+    }
+
+    /// The withheld codes are frozen ABI wire values, pinned here against
+    /// the core `LogDetWithheld` variants they encode. A renumber is an
+    /// ABI break, caught here rather than silently reinterpreted downstream.
+    #[test]
+    fn withheld_codes_are_the_pinned_wire_values() {
+        assert_eq!(EMPYREAN_LOG_DET_WITHHELD_NONE, 0);
+        assert_eq!(EMPYREAN_LOG_DET_WITHHELD_SECOND_ORDER_MOMENT, 1);
+        assert_eq!(EMPYREAN_LOG_DET_WITHHELD_SAMPLED_MOMENT, 2);
+        assert_eq!(EMPYREAN_LOG_DET_WITHHELD_MIXTURE_MOMENT, 3);
+    }
+
+    /// A delivered log_det carries the finite value and the `_NONE`
+    /// reason, with no sampled method — the delivered half of the pair.
+    #[test]
+    fn a_delivered_log_det_carries_the_value_and_no_reason() {
+        let c = metrics_to_c(&metrics(Some(-221.5), None));
+        assert_eq!(c.log_det, -221.5);
+        assert_eq!(c.log_det_withheld, EMPYREAN_LOG_DET_WITHHELD_NONE);
+        assert_eq!(c.log_det_withheld_method, EMPYREAN_COVARIANCE_KIND_UNKNOWN);
+    }
+
+    /// A SecondOrder (and a Mixture) transport withholds log_det as `NaN`
+    /// AND names itself — assert the pair. Mapping either reason to
+    /// `_NONE` (the mutation) fails the reason assertion here.
+    #[test]
+    fn a_second_order_plan_withholds_log_det_with_its_reason() {
+        let second = metrics_to_c(&metrics(None, Some(LogDetWithheld::SecondOrderMoment)));
+        assert!(second.log_det.is_nan(), "a withheld log_det is NaN");
+        assert_eq!(
+            second.log_det_withheld, EMPYREAN_LOG_DET_WITHHELD_SECOND_ORDER_MOMENT,
+            "the NaN must carry the SecondOrder reason, never _NONE"
+        );
+        assert_eq!(
+            second.log_det_withheld_method,
+            EMPYREAN_COVARIANCE_KIND_UNKNOWN
+        );
+
+        let mixture = metrics_to_c(&metrics(None, Some(LogDetWithheld::MixtureMoment)));
+        assert!(mixture.log_det.is_nan());
+        assert_eq!(
+            mixture.log_det_withheld,
+            EMPYREAN_LOG_DET_WITHHELD_MIXTURE_MOMENT
+        );
+        assert_eq!(
+            mixture.log_det_withheld_method,
+            EMPYREAN_COVARIANCE_KIND_UNKNOWN
+        );
+    }
+
+    /// A sampled transport withholds log_det and carries the sampled kind
+    /// beside the reason, in the covariance-kind vocabulary.
+    #[test]
+    fn a_sampled_moment_carries_its_transport_kind() {
+        let sampled = metrics_to_c(&metrics(
+            None,
+            Some(LogDetWithheld::SampledMoment {
+                method: CovarianceKind::SigmaPoint,
+            }),
+        ));
+        assert!(sampled.log_det.is_nan());
+        assert_eq!(
+            sampled.log_det_withheld,
+            EMPYREAN_LOG_DET_WITHHELD_SAMPLED_MOMENT
+        );
+        assert_eq!(
+            sampled.log_det_withheld_method,
+            EMPYREAN_COVARIANCE_KIND_SIGMA_POINT
+        );
     }
 }

@@ -432,14 +432,15 @@ zero-initialized config selects `EMPYREAN_SOLVE_FOR_STATE_ONLY` (`0`).
   Press, 2004, ch. 6).
 
 DT, AMRAT, and thrust are **refine-path** solves: the input orbit must
-carry a prior — its variance — that opens the parameter. DT reads
-`non_grav_dt` + `non_grav_dt_variance`; AMRAT reads the SRP slot
-(`has_srp` + `srp_amrat` + `srp_cr` + `srp_amrat_variance`); the Marsden
-block reads `has_non_grav_covariance` + `non_grav_covariance`; thrust
-segments read the Δv-correction covariance carried alongside the orbit's
-thrust arcs. Requesting an axis whose prior is absent is a **loud
-error** — a non-zero return with a message on `empyrean_last_error()` —
-never a silently zeroed or defaulted column.
+carry a prior — its variance — that opens the parameter, and every prior
+rides the orbit's packed covariance joint (`EmpyreanOrbit.covariance`) on
+the axis it opens: the Marsden block (axes 0–2), the DT axis (3), the
+AMRAT axis (4) and the thrust Δv axes (5+). The force **values** stay on
+the orbit (`non_grav_dt`, the SRP slot `has_srp` + `srp_amrat` +
+`srp_cr`); the prior **variances** that open each axis live on the joint,
+not in scalar fields beside them. Requesting an axis whose prior is absent
+is a **loud error** — a non-zero return with a message on
+`empyrean_last_error()` — never a silently zeroed or defaulted column.
 
 ### Tagged solved covariance
 
@@ -479,203 +480,85 @@ Alongside it, `EmpyreanODResult` reports what the fit *did*:
 
 ### The joint covariance across the boundary
 
-A fit over the state and *P* parameters produces one (6+*P*)×(6+*P*) matrix.
-Through ABI 3 this boundary reported only its **diagonal** blocks, so a caller
-chaining one leg into the next necessarily handed the engine a block-diagonal
-covariance — a physically unmotivated claim that the state and A2 are
-independent when one fit produced both. Worse, the engine's *propagated*
-border is non-zero **even from a block-diagonal input**, because propagation
-itself generates the correlation. A chained propagation built on the 6×6 alone
-is not an approximation of the single-leg answer; it is a tighter claim.
+A fit over the state and *P* parameters produces one (6+*P*)×(6+*P*) matrix —
+the 6×6 state block plus one row and column per solved parameter (the Marsden
+A1/A2/A3 coefficients, the outgassing time delay DT, the SRP area-to-mass
+AMRAT, each thrust Δv component). The whole matrix travels as ONE
+`EmpyreanPackedJoint`: the single covariance home at this ABI, input and
+output, at every width.
 
-The 0.10.0 ABI carries the off-diagonal blocks in both directions.
+Carrying only the diagonal blocks is not a conservative simplification. A
+block-diagonal covariance asserts that the data which produced the state and
+the data which produced A2 were independent, when one fit produced both.
+Worse, the *propagated* joint has non-zero state↔parameter columns **even from
+a block-diagonal input**, because propagation itself generates the correlation
+— so a second leg handed only the 6×6 reports a *tighter* uncertainty than the
+first leg supports.
 
-**Input side** — caller-owned, borrowed for the call, following the
-`thrust_arcs` template:
+**One struct.** `EmpyreanPackedJoint` stores the matrix as its packed lower
+triangle `tri` (`width·(width+1)/2` doubles, the leading 6×6 being the state
+block), three axis bitsets naming which parameter axes have a column
+(`layout_present`), which are carried by consider analysis
+(`layout_considered`) and which are present-but-marginalized
+(`layout_marginalized`), the `width`, and the tagged side columns that name
+what the matrix describes: `kind` (how it was derived), `quality`
+(definiteness, with `cov_rank` / `cov_null_axes` / `cov_min_eig_corr`),
+`functional` (which second moment), `provenance` (derived or asserted) and
+`asserted_source` (which external source asserted it, meaningful only for an
+asserted joint and otherwise the `_NONE` sentinel). The layout names the
+parameter each column belongs to, so a column's meaning does not depend on how
+many *other* parameters the orbit declares.
 
-- `CoordinateState` gains `has_non_grav_cross` / `non_grav_cross[6][3]`, the
-  state↔Marsden border. It sits on the coordinate, beside the 6×6 it borders,
-  so `empyrean_transform_coordinates` cannot move one without the other.
-- `EmpyreanOrbit` gains `state_param_cross` / `n_state_param_cross` and
-  `param_pair_cross` / `n_param_pair_cross` — the wide carrier, as side
-  arrays.
-- Three new input structs: `EmpyreanParamColumn` (the identity of one
-  parameter column — `kind` from the `EMPYREAN_PARAM_COLUMN_*` tags plus
-  `index` / `segment` / `component`; the fields a given `kind` does not read
-  must be **zero**, and a non-zero value there is refused rather than
-  ignored), `EmpyreanStateParamCross` (one column and its 6 values), and
-  `EmpyreanParamPairCross` (two columns and one value; symmetric, so
-  supplying both `(a, b)` and `(b, a)` is a loud error rather than a merge).
+**One authority.** On input the joint rides `EmpyreanOrbit.covariance`,
+caller-owned and borrowed for the call; every result carries the same struct,
+library-owned and released with its parent result (via the result's `*_free`).
+The orbit's joint is THE authority. The flat `CoordinateState.covariance` 6×6
+is a derived read-only view of the joint's leading state block, not a second
+home: if a caller supplies both a packed joint and a flat state covariance that
+disagree on the state block beyond a generous relative tolerance, the push is
+refused by name rather than silently preferring one.
 
-Cross terms name the **parameter**, never a column index — which column a
-parameter occupies depends on what else the orbit declares, so an index
-recorded against one orbit is wrong against the next, and the failure is
-silent.
+**One unit convention.** The triangle is in the coordinate's own element space
+and angular unit — the angular state rows and columns in **degrees** for the
+angular representations (unscaled for Cartesian), the same convention as the
+flat 6×6. Each boundary converts between this degree basis and the engine's
+radian basis by the diagonal congruence D Σ Dᵀ (the scale on an angular row
+and its matching column, identity elsewhere), so a degree → engine → degree
+round trip returns the supplied joint within a scaling band.
 
-**Output side** — library-owned, released with the parent result:
+**Refusals carry their reason.** Every boundary that turns a caller-supplied
+packed joint into an engine covariance — a direct push, every batch builder,
+the OD / ephemeris / impact inputs, AND the orbit file writers — refuses a
+malformed wire row by a per-variant code in the reserved block −40 … −49 (the
+`EMPYREAN_PUSH_*` codes), one per failure axis, never a single code with the
+detail only in the message. A solved parameter's non-grav, SRP or thrust prior
+and posterior variance ride the joint's own axes; there are no separate
+per-parameter covariance fields on the orbit.
 
-- `EmpyreanOrbitCovariance` is the shape the library hands back, reached as
-  `EmpyreanPropagatedState::orbit_cov`. Every propagated row carries one, and
-  so does a fitted result — `EmpyreanODResult::orbit` is itself an
-  `EmpyreanPropagatedState`, so `res.orbit.orbit_cov` and `st.orbit_cov` are
-  the same field read the same way, which makes `determine → propagate` and
-  `propagate → propagate` the same copy. The joint has exactly one home per
-  result: there is deliberately no second border on `EmpyreanODResult` itself
-  that could disagree with the one on its orbit.
-- `empyrean_propagation_joint_at(result, orbit_index, epoch_index, out)`
-  returns the propagated joint at one row; `empyrean_orbit_covariance_free`
-  releases what it wrote. These are the two new exported symbols the
-  joint itself adds; with the four
-  [OD handle entry points](#reusable-force-model-handle--guard-codes)
-  they are the 0.10.0 break's own symbol movement — the retired
-  counter's additions (strict-offline construction, provisioning, the
-  missing-file list, the fit-summary writers, the single-state
-  transform, the batch free) reach consumers for the first time here
-  as well (see [The 0.10.0 ABI](#the-0100-abi)).
+**Moving it between bases.** `empyrean_transform_orbits` transports the whole
+joint through the transformation Jacobian. The bare-state
+`empyrean_transform_coordinates` refuses a covariance-bearing input by name
+(`EMPYREAN_TRANSFORM_COVARIANCE_UNSUPPORTED`, −50) and points at
+`empyrean_transform_orbits` rather than dropping the covariance silently.
 
-They are a separate call rather than fields on `EmpyreanTaggedCovariance` to
-preserve that struct's plain-old-data contract: a caller declares one on the
-stack and frees nothing, so giving it owned arrays would have turned code that
-is correct today — recompiling without a diagnostic — into a leaking caller,
-two allocations per call, with no error and no wrong number to notice.
-`EmpyreanTaggedCovariance` is unchanged in the 0.10.0 ABI.
+**Re-feeding** a propagated or fitted joint onto the next orbit is one struct
+copy: the whole matrix travels together, so there are no halves to reassemble.
+The library owns a result's `tri`; because an input orbit's `tri` is
+caller-owned and borrowed, copy the triangle into caller-owned storage before
+the result is freed if the orbit must outlive the result it came from.
 
-Re-feeding is a field-by-field assignment, because the result *nests* what the
-orbit *flattens*:
-
-```c
-orbit.state.has_non_grav_cross = st->orbit_cov.has_non_grav_cross;
-memcpy(orbit.state.non_grav_cross,
-       st->orbit_cov.non_grav_cross, sizeof(double) * 18);
-orbit.state_param_cross   = st->orbit_cov.state_param_cross;
-orbit.n_state_param_cross = st->orbit_cov.n_state_param_cross;
-orbit.param_pair_cross    = st->orbit_cov.param_pair_cross;
-orbit.n_param_pair_cross  = st->orbit_cov.n_param_pair_cross;
-
-/* ...and the diagonal blocks those crosses are conditioned on, which
-   propagation passes through unchanged from the input orbit: */
-orbit.has_non_grav_covariance = res->non_grav.has_covariance;
-memcpy(orbit.non_grav_covariance,
-       res->non_grav.covariance, sizeof(double) * 9);
-orbit.non_grav_dt_variance = res->non_grav.dt_variance;
-orbit.has_srp              = res->has_srp;
-orbit.srp_amrat_variance   = res->srp.amrat_variance;
-```
-
-Note the ownership inversion in those pointer assignments: the arrays on
-`EmpyreanOrbitCovariance` are **library-owned**, the identically-named fields
-on `EmpyreanOrbit` are **caller-owned**. The assignment is valid only while
-the result outlives the orbit — **copy them if it does not.** A border
-supplied without the parameter block it conditions is refused by name, not
-ignored.
-
-An absent cross and a supplied zero cross are different claims: absence is a
-null pointer with a zero count (and `has_non_grav_cross = 0`), never a zeroed
-block. The engine's definiteness gate engages on a supplied zero.
-
-`EmpyreanOrbitCovariance` is absent on a propagated row when the orbit carried
-no solved-parameter block, when its layout is Marsden-only (the whole border
-is then in `non_grav_cross` and there is no carrier), or when a sigma-point
-run could not reconstruct that row.
-
-### The 0.10.0 ABI
+### The ABI version handshake
 
 A consumer should confirm at load that the runtime library agrees, by
 checking `empyrean_abi_version()` against the `EMPYREAN_ABI_VERSION` it
 compiled with. The contract is **equality**, not an ordering or a
 compatible range: the number carries the distribution release, so any
 difference at all means a different release — rebuild against that
-release's header, or repoint at the matching engine. A difference is no
-longer evidence that a frozen struct moved, and matching numbers are
-what license the layouts below.
-
-The ABI is versioned by the distribution release that ships it. Before
-0.10.0 it was an independent counter, now retired, whose last published
-value is 2 (v0.9.0, which grew several result structs). A value of 3 was
-prepared — it made `empyrean_determine` and `empyrean_transform_coordinates`
-batched — but no library reporting it was ever published; those changes
-reach consumers for the first time in this release.
-0.10.0's ABI is one batched break carrying the joint covariance across
-the boundary, plus the riders queued behind a break:
-
-- **The joint**, input and output, as described above — plus
-  `EmpyreanNonGravParams` gaining `has_dt_variance` / `dt_variance`, which had
-  no wire at all, so a solved-DT fit used to round-trip with its DT column
-  closed.
-- **The parameter partition.** `EmpyreanSolveFor`'s `marsden` / `dt` /
-  `amrat` become the disposition tri-state, validated strictly at the
-  boundary; `0` and `1` keep their exact former meaning, so `memset(0)` and
-  every value an older caller could write are unchanged — a *semantic* break
-  nonetheless, which is why it rides this bump rather than passing
-  unversioned. `thrust_segments` (a count) becomes `thrust_dispositions[3]`.
-  `EmpyreanODResult` gains `dispositions`.
-- **Thrust, per declared segment.** `EmpyreanODResult` gains
-  `thrust_correction_covariances` and `n_thrust_segments`, and
-  `thrust_delta_m_per_s` is **re-indexed from solved to declared order** with
-  `thrust_delta_count` becoming the declared count. This is a semantic change
-  to a shipped field, made here because the alternative is freezing two
-  incompatible index spaces into one struct forever: a consumer pairing
-  `thrust_delta_m_per_s[i]` with `thrust_correction_covariances[i]` would
-  otherwise attribute a Δv to the wrong burn's covariance the moment any
-  segment is considered or fixed.
-- **Nine new constants:** `EMPYREAN_PARAM_COLUMN_MARSDEN` / `_DT` / `_AMRAT` /
-  `_THRUST`, `EMPYREAN_PARAM_FIXED` / `_SOLVED` / `_CONSIDERED`,
-  `EMPYREAN_MAX_THRUST_SEGMENTS`, and
-  `EMPYREAN_REJECTION_PER_OBSERVATION_SITE_REQUIRED` (15).
-- **The solver's stopping verdict.** `EmpyreanODResult` gains ten
-  tail fields — `termination`, `gn_step_qnorm`, `mu_final`,
-  `accepted_steps`, `final_solve_iterations` and the five `stall_*` —
-  described under [How the solver stopped](#how-the-solver-stopped),
-  with ten new `EMPYREAN_SOLVER_STOP_*` constants.
-- **Photometric parameter uncertainty gets a slot.** `EmpyreanOrbit`
-  gains `has_phot_covariance` + `phot_covariance[3][3]` over
-  (H, slope1, slope2), appended at the tail. Three engine-side
-  producers had been computing that 3×3 — the post-OD photometry fit,
-  the SBDB `phys_par` ingest, the orbit-file readers — and all three
-  died at this boundary, so `mag_sigma` was always the state
-  contribution alone. **`mag_sigma` will increase** for every orbit
-  that now carries an H uncertainty, SBDB-queried orbits included.
-- **Riders.** `EmpyreanODResult` gains `warnings` / `num_warnings`.
-  `EmpyreanObservatoryConfig` gains `min_elevation_deg` plus
-  `has_max_sun_altitude_deg` / `max_sun_altitude_deg`. The impact, B-plane and
-  ephemeris paths now marshal the caller's non-grav DT value and Marsden 3×3,
-  which they had been dropping — the DT drop meant those entry points
-  evaluated a DT comet's g(r) at zero delay while honouring the DT prior
-  variance eleven lines away. Those three paths and the orbit-file writer also
-  adopt the propagation path's non-grav **presence rule**: an orbit that
-  declares a non-grav covariance or a DT prior carries a non-grav model even
-  when its A coefficients are all zero, which opens Marsden columns those
-  paths previously left closed. The orbit-file **read** path now carries the
-  non-grav 3×3, the border and the carrier onto `EmpyreanOrbitBatch` rather
-  than reporting them absent.
-
-**Layout: appended everywhere but one, and that one SHRINKS two structs.** Every
-earlier version of this ABI could say "fields are only ever appended, never
-reordered or removed". The 0.10.0 ABI cannot. Replacing
-`EmpyreanSolveFor::thrust_segments` (a `uint32_t`) with
-`thrust_dispositions[3]` (three `uint8_t`s) takes that struct from 8 bytes to
-6 and its alignment from 4 to 1, which shifts every field after
-`solve_for_flags` inside the `EmpyreanODConfig` that embeds it —
-`allow_unbracketed_maneuvers` 392→390, `has_photometry` 393→391, `photometry`
-400→392 — and shrinks that config 432→424 in turn. `EmpyreanSolveFor` and
-`EmpyreanODConfig` are the first structs on this ABI to get smaller.
-
-A consumer with a hand-mirrored `EmpyreanODConfig` must therefore re-derive
-its whole layout, not merely append: keeping an existing prefix and writing
-`photometry` at its old offset lands eight bytes past where the library reads
-it, corrupting the photometry config and the two bytes before it with no
-diagnostic. Every other frozen struct grows by appending —
-`CoordinateState` 360→512, `EmpyreanOrbit` 648→832→912,
-`EmpyreanPropagatedState` 2392→2576, `EmpyreanNonGravParams` 160→176,
-`EmpyreanObservatoryConfig` 40→64, `EmpyreanODResult` 7688→8128→8192
-(carrying `EmpyreanODObjectResult` 7720→8160→8224 with it).
-
-The source-breaking changes are the two semantic ones (`EmpyreanSolveFor`'s
-encoding and the thrust Δv index space) plus the `thrust_segments` →
-`thrust_dispositions` replacement. A consumer built against an older header
-must recompile against this one either way, and `empyrean_abi_version()` is
-what makes a dynamically-loaded mismatch fail at the version check rather than
-in the physics.
+release's header, or repoint at the matching engine. Matching numbers are
+what license every frozen struct layout the header declares. `dlsym`
+resolves on symbol name alone, and the names are stable across releases
+while the shapes behind them are not, so a mismatch allowed to proceed
+reads the caller's arguments through the wrong layout instead of failing.
 
 `ephemeris_overlap_policy` decides what happens when a propagated body is
 also carried by a loaded SPK: `EMPYREAN_EPHEMERIS_OVERLAP_POLICY_SUBSTITUTE_SPK`
@@ -853,20 +736,23 @@ size_t n_obs = 0, n_radar = 0;
 if (empyrean_read_ades(ades_xml, &obs, &n_obs, &radar, &n_radar) != 0)
     return 1;  /* empyrean_last_error() carries the message */
 
-/* Prior orbit (e.g. a previous determine result) carrying the priors
-   that open the extra axes: a Marsden A1/A2/A3 covariance and a DT
-   variance. Zero-init, then set the fields we mean. */
+/* Prior orbit (e.g. a previous determine result) carrying, on its packed
+   covariance joint, the priors that open the extra axes. Zero-init, then
+   set the fields we mean. */
 struct EmpyreanOrbit prior;
 memset(&prior, 0, sizeof prior);
 /* ... fill prior.state (epoch, elements, 6x6 covariance) ... */
 prior.non_grav_dt = 45.7;            /* days; e.g. a 67P-like delay    */
-prior.non_grav_dt_variance = 25.0;   /* days^2 prior — opens DT        */
-prior.has_non_grav_covariance = 1;   /* opens the Marsden block        */
-/* ... fill prior.non_grav_covariance[3][3] ... */
 prior.has_srp = 1;                   /* SRP slot ...                   */
 prior.srp_amrat = 3.0e-3;            /* ... m^2/kg                     */
 prior.srp_cr = 1.0;
-prior.srp_amrat_variance = 1.0e-8;   /* (m^2/kg)^2 prior — opens AMRAT */
+/* The priors that OPEN each axis ride the packed covariance joint, not
+   scalar fields beside it: build prior.covariance (an EmpyreanPackedJoint)
+   with the Marsden block (axes 0-2), the DT axis (3) and the AMRAT axis (4)
+   present in layout_present and their prior variances on the packed
+   triangle — see "The joint covariance across the boundary" above. A fitted
+   orbit from a previous determine already carries this joint; re-feed that
+   rather than rebuilding it by hand. */
 
 /* Config: solve state + Marsden + DT explicitly, plus post-OD H/G.
    Name the dispositions — memset(0) leaves every axis FIXED, and the
@@ -939,9 +825,8 @@ frees an `empyrean_refine` result.
 ## Reusable force-model handle & guard codes
 
 `empyrean_builtsystem_new` assembles a reusable force-model handle for a
-`(force_model, frame)` pair, freezing `encounter_timescale_divisor` into
-its key, so a caller running many propagations pays the assembly cost
-once. `empyrean_builtsystem_propagate`,
+`(force_model, frame)` pair, so a caller running many propagations pays
+the assembly cost once. `empyrean_builtsystem_propagate`,
 `empyrean_builtsystem_generate_ephemeris`,
 `empyrean_builtsystem_determine`, `empyrean_builtsystem_evaluate` and
 `empyrean_builtsystem_refine` parallel their one-shot

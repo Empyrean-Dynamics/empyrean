@@ -142,8 +142,10 @@ blocks alongside the 6×6 state block.
    empyrean.TaggedCovariance
    empyrean.TaggedCovariances
    empyrean.CovarianceKind
-   empyrean.CovarianceQuality
-   empyrean.TargetFunctional
+   empyrean.JointQuality
+   empyrean.JointFunctional
+   empyrean.JointProvenance
+   empyrean.AssertedSource
    empyrean.GaussianMixture
 ```
 

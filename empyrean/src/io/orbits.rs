@@ -105,7 +105,7 @@ fn batch_to_ffi(
     Ok((ffi_orbits, id_ptrs, obj_ptrs, id_cstrings, obj_cstrings))
 }
 
-fn ffi_batch_to_owned(batch: &empyrean_sys::EmpyreanOrbitBatch) -> Result<OrbitBatch> {
+pub(crate) fn ffi_batch_to_owned(batch: &empyrean_sys::EmpyreanOrbitBatch) -> Result<OrbitBatch> {
     let n = batch.num_orbits;
     let mut orbits = Vec::with_capacity(n);
     let mut orbit_ids = Vec::with_capacity(n);
@@ -189,14 +189,6 @@ fn ffi_orbit_to_owned(o: &empyrean_sys::EmpyreanOrbit) -> Result<Orbit> {
         } else {
             None
         },
-        non_grav_dt_variance: if o.non_grav_dt_variance.is_finite() && o.non_grav_dt_variance > 0.0
-        {
-            Some(o.non_grav_dt_variance)
-        } else {
-            None
-        },
-        // Non-grav covariance is an OD-output concept; orbit reads don't carry it.
-        ng_covariance: None,
         phot_system,
         h_mag: o.h_mag,
         slope1: o.slope1,
@@ -208,23 +200,12 @@ fn ffi_orbit_to_owned(o: &empyrean_sys::EmpyreanOrbit) -> Result<Orbit> {
         // doesn't carry it, so orbit reads never reconstruct it.
         thrust: None,
         // SRP slot carried through from the C EmpyreanOrbit when present.
-        srp: crate::orbit::SrpParams::from_ffi(
-            o.srp_amrat,
-            o.srp_cr,
-            o.has_srp,
-            o.srp_amrat_variance,
-        ),
-        // The batch a read produces owns these arrays, so the carrier is
-        // read back here rather than borrowed — the wrapper's `Orbit`
-        // outlives the batch it came from.
-        wide_cross: unsafe {
-            crate::WideCross::from_ffi_arrays(
-                o.state_param_cross,
-                o.n_state_param_cross,
-                o.param_pair_cross,
-                o.n_param_pair_cross,
-            )
-        }?,
+        srp: crate::orbit::SrpParams::from_ffi(o.srp_amrat, o.srp_cr, o.has_srp),
+        // The orbit's covariance as one packed joint. The batch a read
+        // produces owns the triangle, so it is copied into an owned Vec here —
+        // the wrapper's `Orbit` outlives the batch it came from. A width-0
+        // joint reads back as `None`.
+        covariance: unsafe { crate::PackedJoint::from_ffi(&o.covariance) }?,
     })
 }
 
@@ -313,4 +294,91 @@ pub fn write_orbits_csv(path: impl AsRef<Path>, batch: &OrbitBatch) -> Result<()
     write_orbits_via(path.as_ref(), batch, |p, b| unsafe {
         empyrean_sys::empyrean_orbits_write_csv(p, b)
     })
+}
+
+#[cfg(test)]
+mod push_code_tests {
+    use crate::{
+        AxisLayout, CovarianceKind, Frame, JointFunctional, JointProvenance, JointQuality, Orbit,
+        Origin, PackedJoint, PushError,
+    };
+
+    /// A malformed packed joint — `width = 6` but a triangle too short for it
+    /// (6 needs 21 doubles) — so the engine's ingestion refuses it with the
+    /// triangle-length wire code. Constructible through the safe API because
+    /// `width` and `tri` are independent fields.
+    fn orbit_with_short_triangle() -> Orbit {
+        let joint = PackedJoint {
+            // State-only (width = 6 + popcount(0) = 6); the layout implies a
+            // 21-double triangle, so a 3-double triangle is a length mismatch.
+            layout: AxisLayout {
+                present: 0,
+                considered: 0,
+                marginalized: 0,
+            },
+            width: 6,
+            tri: vec![1.0e-8; 3], // far short of 6·7/2 = 21
+            kind: CovarianceKind::Linear,
+            quality: JointQuality::PositiveDefinite,
+            functional: JointFunctional::State,
+            provenance: JointProvenance::Derived,
+            asserted_source: None,
+        };
+        Orbit::new(crate::CoordinateState::cartesian(
+            crate::Epoch::from_mjd_tdb(59000.0),
+            [1.0, 0.1, 0.05, -0.005, 0.015, 0.001],
+            Frame::EclipticJ2000,
+            Origin::Sun,
+        ))
+        .with_orbit_id("bad")
+        .with_covariance(joint)
+    }
+
+    fn tmp_path(ext: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("empyrean_push_{nanos}_{ext}.{ext}"))
+    }
+
+    /// A packed-joint wire refusal reaches every push boundary as the SAME
+    /// typed variant: writing the malformed orbit to parquet and to CSV both
+    /// fail with the same [`PushError`]. The engine validates the joint on
+    /// ingestion before either format serializes, so the two channels agree —
+    /// the refusal is never collapsed to one generic code at one boundary and
+    /// a different one at another.
+    #[test]
+    fn the_same_push_variant_reaches_both_the_parquet_and_csv_writers() {
+        let batch = super::OrbitBatch::new(
+            vec![orbit_with_short_triangle()],
+            vec!["bad".into()],
+            vec![None],
+        )
+        .expect("batch");
+
+        let pq = tmp_path("parquet");
+        let csv = tmp_path("csv");
+        let parquet_err = super::write_orbits_parquet(&pq, &batch)
+            .expect_err("a short triangle must be refused on parquet write");
+        let csv_err = super::write_orbits_csv(&csv, &batch)
+            .expect_err("a short triangle must be refused on csv write");
+        let _ = std::fs::remove_file(&pq);
+        let _ = std::fs::remove_file(&csv);
+
+        let pv = parquet_err.push_error();
+        let cv = csv_err.push_error();
+        assert!(
+            matches!(
+                pv,
+                Some(PushError::TriangleLength | PushError::WidthMismatch)
+            ),
+            "parquet refusal must be a packed-joint wire code, got {pv:?} ({})",
+            parquet_err.message
+        );
+        assert_eq!(
+            pv, cv,
+            "the same malformed joint must yield the same variant at both writers"
+        );
+    }
 }

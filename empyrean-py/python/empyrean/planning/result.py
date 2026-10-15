@@ -79,6 +79,29 @@ class RadarStation(str, Enum):
     be described, and rejected if you try to schedule it."""
 
 
+class LogDetWithheld(str, Enum):
+    """Why a :attr:`PlanMetrics.log_det` is NaN — the nonlinear transport
+    that made the absolute determinant ill-posed, named rather than left
+    as a bare NaN.
+
+    Member names mirror ``empyrean_core::planning::LogDetWithheld`` (plus
+    :attr:`NONE` for the delivered case). :attr:`PlanMetrics.log_det` is a
+    real number exactly when this is :attr:`NONE`; the two are
+    complementary.
+    """
+
+    NONE = "none"
+    """``log_det`` is delivered — a finite number, nothing withheld."""
+    SECOND_ORDER_MOMENT = "second_order_moment"
+    """Withheld past a closed-form second-order moment transport."""
+    SAMPLED_MOMENT = "sampled_moment"
+    """Withheld past a sampled (SigmaPoint / MonteCarlo) transport; the
+    sampled kind is on :attr:`PlanMetrics.log_det_withheld_method`."""
+    MIXTURE_MOMENT = "mixture_moment"
+    """Withheld past a Gaussian-mixture moment transport. Not produced by
+    this planning surface, but named so the vocabulary is complete."""
+
+
 # Keyed by both the enum member and its bare wire string so a raw string
 # works everywhere an enum does.
 _KIND_TO_INT: dict[PlannedObservationKind | str, int] = {
@@ -114,6 +137,15 @@ _INT_TO_KIND: dict[int, str] = {0: "optical", 1: "radar"}
 # -1 is the engine's "not a radar candidate" sentinel and maps to None,
 # never to a mode.
 _INT_TO_RADAR_MODE: dict[int, str] = {0: "delay", 1: "doppler", 2: "both"}
+
+# Why log_det was withheld, by wire code. An unrecognized code is refused
+# rather than coerced to "delivered", so a NaN never arrives unexplained.
+_INT_TO_LOG_DET_WITHHELD: dict[int, str] = {
+    0: "none",
+    1: "second_order_moment",
+    2: "sampled_moment",
+    3: "mixture_moment",
+}
 
 # ── Campaign-stage labels ────────────────────────────────────
 #
@@ -714,15 +746,33 @@ class PlanMetrics(qv.Table):
     """Semi-minor axis of the 1σ position ellipsoid (km)."""
     log_det = qv.Float64Column()
     """:math:`\\ln \\det \\Sigma` over the 6×6 state covariance — the
-    D-optimality criterion.
+    absolute D-optimality criterion.
 
-    **In AU and AU·day⁻¹**, unlike the four columns above, which are
-    rescaled to km and m/s. A log-determinant is dimensional, so the
-    absolute value depends on that choice: the same covariance expressed
-    in km and m/s gives a value larger by :math:`6\\ln(\\mathrm{km/AU}) +
-    6\\ln(\\mathrm{(m/s)/(AU/day)}) \\approx 199.13`. Differences between
-    two ``log_det`` values on this surface are unit-invariant and can be
-    compared directly."""
+    A real number when delivered (at the prior epoch and under the
+    single-linearization transport, which is the only transport the
+    planner runs — so finite on every plan this package returns today).
+    **NaN only when** :attr:`log_det_withheld` names a nonlinear transport
+    that made the absolute determinant ill-posed — never a NaN without a
+    reason, which is why the companion :class:`LogDetWithheld` column rides
+    beside it. The epoch-invariant :attr:`PlanResult.log_det_gain` stays
+    available regardless.
+
+    **In AU and AU·day⁻¹** when present, unlike the four columns above,
+    which are rescaled to km and m/s. A log-determinant is dimensional, so
+    the absolute value depends on that choice: the same covariance
+    expressed in km and m/s gives a value larger by
+    :math:`6\\ln(\\mathrm{km/AU}) + 6\\ln(\\mathrm{(m/s)/(AU/day)}) \\approx
+    199.13`. Differences between two ``log_det`` values on this surface are
+    unit-invariant and can be compared directly."""
+    log_det_withheld = qv.LargeStringColumn()
+    """Why :attr:`log_det` is NaN, when it is — a :class:`LogDetWithheld`
+    value. ``"none"`` whenever ``log_det`` is delivered (finite); the two
+    are complementary."""
+    log_det_withheld_method = qv.LargeStringColumn(nullable=True)
+    """The sampled transport kind (a
+    :class:`~empyrean.CovarianceKind` value — ``"sigma_point"`` or
+    ``"monte_carlo"``) when :attr:`log_det_withheld` is ``"sampled_moment"``.
+    Null for every other case, where no sampled method applies."""
 
     # ── Selection helpers ─────────────────────────────────
 
@@ -986,3 +1036,11 @@ class PlanResult:
     active_width: int
     """Width of the solve-for set. Always 6 (state-only) on this entry
     point; see the Notes on :func:`empyrean.evaluate_plan`."""
+    log_det_gain: float
+    """Epoch-invariant prior→posterior change in the absolute 6×6
+    state-block :math:`\\ln \\det \\Sigma` (nats), formed once at the
+    prior epoch: negative when the planned observations shrink the
+    covariance volume, and :math:`\\exp(\\mathrm{gain}/6)` is the
+    whole-plan 1σ-volume ratio. Always finite — reached before any
+    transport, so it stays available even when :attr:`PlanMetrics.log_det`
+    is withheld (NaN) past a nonlinear transport."""

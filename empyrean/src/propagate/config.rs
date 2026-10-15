@@ -79,6 +79,14 @@ pub enum UncertaintyMethod {
     /// [`FirstOrder`](Self::FirstOrder) — that is expected, not a bug.
     /// Construct with [`gaussian_mixture()`](Self::gaussian_mixture) for
     /// the engine defaults. Reference: DeMars-Bishop-Jah (JGCD 2013).
+    ///
+    /// **Propagation only.** Ephemeris generation refuses this method,
+    /// naming it and the seam, rather than composing a first-order sky
+    /// covariance under a mixture's name: components are born during
+    /// propagation and retained on-grid only, so no per-observation sky
+    /// projection exists yet. The on-grid moment-matched mixture
+    /// covariance is available from the propagation result's covariance
+    /// series.
     Mixture {
         /// Nonlinearity threshold above which the splitter fires
         /// (default: 1.0).
@@ -267,8 +275,6 @@ pub struct AdvancedIntegratorConfig {
     pub dt_initial: Option<f64>,
     /// Minimum allowed step size in days. `None` = auto.
     pub dt_min: Option<f64>,
-    /// Encounter dynamical-timescale step floor divisor.
-    pub encounter_timescale_divisor: f64,
     /// Maximum integration steps before aborting.
     pub max_steps: usize,
     /// Memory cap on the per-step b-coefficient cache.
@@ -289,7 +295,6 @@ impl Default for AdvancedIntegratorConfig {
             epsilon: 1e-9,
             dt_initial: None,
             dt_min: None,
-            encounter_timescale_divisor: 1000.0,
             max_steps: 10_000_000,
             max_dense_steps: 100_000,
             cache_integrator_steps: false,
@@ -482,10 +487,18 @@ pub enum EphemerisOverlapPolicy {
     /// the caller's initial condition is **discarded** (two inputs within
     /// the detection threshold produce identical output, which makes the
     /// path useless for anything differential — an OD step, a covariance
-    /// sweep), and **no trajectory is produced**, so there is no dense
-    /// trajectory, no STM, and no sensitivity chain. Ephemeris and radar
-    /// generation both read those, and therefore fail outright for an
-    /// overlapped body under this policy.
+    /// sweep), and nothing is integrated, so there is no STM and no
+    /// sensitivity chain.
+    ///
+    /// Optical ephemeris generation **succeeds** here, served off the
+    /// body's own SPK-backed trajectory, and reports the substitution on
+    /// the result's warnings channel — naming the body and saying
+    /// whether a declared covariance was dropped. Those rows carry no
+    /// sky covariance, because a covariance describes the initial
+    /// condition this policy discards.
+    ///
+    /// Radar generation still fails outright: its Jacobian is composed
+    /// on the STM a substitution never produces.
     #[default]
     SubstituteSpk,
     /// Integrate normally, with the matched perturber removed from the
@@ -730,7 +743,6 @@ impl PropagationConfig {
                 epsilon: self.advanced.epsilon,
                 dt_initial: self.advanced.dt_initial.unwrap_or(f64::NAN),
                 dt_min: self.advanced.dt_min.unwrap_or(f64::NAN),
-                encounter_timescale_divisor: self.advanced.encounter_timescale_divisor,
                 max_steps: self.advanced.max_steps,
                 max_dense_steps: self.advanced.max_dense_steps,
                 cache_integrator_steps: u8::from(self.advanced.cache_integrator_steps),

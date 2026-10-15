@@ -116,6 +116,96 @@ pub struct DetermineArgs {
     pub format: OutputFormat,
 }
 
+/// Non-grav time delay ΔT axis — bit 3 of the packed-joint axis table
+/// (only alongside the Marsden axes, bits 0–2).
+const DT_AXIS_BIT: u32 = 3;
+/// SRP area-to-mass-ratio axis — bit 4 of the packed-joint axis table.
+const AMRAT_AXIS_BIT: u32 = 4;
+
+/// Append parameter axes to a packed joint as diagonal prior variances
+/// (zero cross terms), preserving everything the seed already carries.
+///
+/// This is how the refine opens a parameter column now that the per-param
+/// `amrat_variance` / `dt_variance` fields are gone: the variance on a
+/// parameter's own diagonal is the prior that opens its column. Append-only
+/// — each new axis bit must exceed every bit already present, because the
+/// packed columns are ordered by ascending axis bit. That holds for the
+/// CLI's axes: the ΔT (bit 3) and AMRAT (bit 4) axes always follow the
+/// Marsden axes (bits 0–2) a seed may carry, so a new column lands at the
+/// end of the triangle. A bit already present, or one that would not
+/// append after the seed's highest bit, is refused by name rather than
+/// misplaced.
+// Packed-triangle index arithmetic with mirrored (i, j)/(j, i) assignment;
+// the explicit indices carry the symmetry an iterator form would obscure —
+// the same shape as the wrapper's `PackedJoint::state_block`.
+#[allow(clippy::needless_range_loop)]
+fn append_prior_axes(
+    base: &empyrean::PackedJoint,
+    new_axes: &[(u32, f64)],
+) -> Result<empyrean::PackedJoint> {
+    use empyrean::{AxisLayout, PackedJoint};
+
+    let mut axes = new_axes.to_vec();
+    axes.sort_by_key(|&(bit, _)| bit);
+    let max_present = (0..32u32)
+        .rev()
+        .find(|b| base.layout.present & (1 << b) != 0);
+    for &(bit, _) in &axes {
+        if base.layout.present & (1 << bit) != 0 {
+            anyhow::bail!("parameter axis bit {bit} is already present on the seed joint");
+        }
+        if let Some(m) = max_present
+            && bit <= m
+        {
+            anyhow::bail!(
+                "parameter axis bit {bit} would not append after the seed's highest present \
+                 bit {m} (packed columns are ordered by ascending axis bit)"
+            );
+        }
+    }
+
+    let old_w = base.width as usize;
+    let new_w = old_w + axes.len();
+    // Expand the seed's packed lower triangle to a dense symmetric matrix,
+    // then set the new parameter diagonals and re-pack.
+    let mut full = vec![vec![0.0f64; new_w]; new_w];
+    for i in 0..old_w {
+        for j in 0..=i {
+            let idx = i * (i + 1) / 2 + j;
+            let v = base.tri.get(idx).copied().unwrap_or(0.0);
+            full[i][j] = v;
+            full[j][i] = v;
+        }
+    }
+    for (k, &(_, var)) in axes.iter().enumerate() {
+        full[old_w + k][old_w + k] = var;
+    }
+    let mut tri = Vec::with_capacity(new_w * (new_w + 1) / 2);
+    for i in 0..new_w {
+        for j in 0..=i {
+            tri.push(full[i][j]);
+        }
+    }
+    let mut present = base.layout.present;
+    for &(bit, _) in &axes {
+        present |= 1 << bit;
+    }
+    Ok(PackedJoint {
+        layout: AxisLayout {
+            present,
+            considered: base.layout.considered,
+            marginalized: base.layout.marginalized,
+        },
+        width: new_w as u8,
+        tri,
+        kind: base.kind,
+        quality: base.quality,
+        functional: base.functional,
+        provenance: base.provenance,
+        asserted_source: base.asserted_source,
+    })
+}
+
 /// The `(marsden, dt, amrat)` fit axes a coarse [`SolveForArg`] expands to.
 /// Shared by [`build_solve_for`] and the refine-path priming so the wide
 /// solve and the priors that open its columns never drift apart.
@@ -333,7 +423,15 @@ fn run_refine_path(
 
         // Prime: attach the requested priors to the seed orbit. The prior
         // variance is the trigger that opens each wide column in the refine.
+        // Under 0.11.0 a parameter's prior variance rides the seed orbit's
+        // packed joint (the AMRAT axis = bit 4, the non-grav ΔT axis = bit 3)
+        // — the removed `amrat_variance` / `dt_variance` fields had no home.
+        // The parameter VALUE still rides `with_srp` / `with_non_grav_dt`;
+        // only its prior variance moved onto the joint. Collect the requested
+        // axes and append them once, in ascending bit order, to whatever the
+        // seed already carries (state-only, or state + Marsden).
         let mut primed = seed.orbit.clone();
+        let mut prior_axes: Vec<(u32, f64)> = Vec::new();
         if amrat_axis {
             // Present by construction — validate_prior_flags required both.
             let amrat = args
@@ -342,9 +440,8 @@ fn run_refine_path(
             let amrat_variance = args
                 .amrat_variance
                 .expect("validate_prior_flags requires --amrat-variance for an AMRAT solve");
-            primed = primed
-                .with_srp(amrat, args.cr.unwrap_or(1.0))
-                .with_srp_amrat_variance(Some(amrat_variance));
+            primed = primed.with_srp(amrat, args.cr.unwrap_or(1.0));
+            prior_axes.push((AMRAT_AXIS_BIT, amrat_variance));
         }
         if dt_axis {
             let dt_variance = args
@@ -355,7 +452,16 @@ fn run_refine_path(
             if let Some(dt) = args.dt {
                 primed = primed.with_non_grav_dt(Some(dt));
             }
-            primed = primed.with_non_grav_dt_variance(Some(dt_variance));
+            prior_axes.push((DT_AXIS_BIT, dt_variance));
+        }
+        if !prior_axes.is_empty() {
+            let base = primed.covariance.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "seed orbit for {object_id} carries no covariance to prior the requested \
+                     parameter axis onto"
+                )
+            })?;
+            primed = primed.with_covariance(append_prior_axes(&base, &prior_axes)?);
         }
 
         let object_obs = observations_for_object(observations, &object_id)?;
@@ -569,16 +675,28 @@ fn batch_residual_rows(results: &DetermineResults) -> Vec<empyrean::ObservationR
         .collect()
 }
 
-/// The process exit code for a finished batch: success only when every
-/// object delivered.
-pub fn exit_code_for(results: &DetermineResults) -> i32 {
-    if results.delivered_count() == results.len() && !results.is_empty() {
-        EXIT_ALL_DELIVERED
-    } else if results.delivered_count() == 0 {
+/// The process exit code for any finished batch, from its delivery count.
+///
+/// The one place the `0` / `3` / `4` convention lives: `0` only when every
+/// input item delivered, `4` when the batch ran but none did (an empty
+/// batch delivered nothing either), `3` for a partial. Shared verbatim by
+/// `determine`, `propagate` and `ephemeris` — one helper, no per-command
+/// sibling — so the three commands cannot drift apart on what a partial
+/// run's exit code is.
+pub fn batch_exit_code(delivered: usize, total: usize) -> i32 {
+    if delivered == 0 {
         EXIT_NONE_DELIVERED
+    } else if delivered == total {
+        EXIT_ALL_DELIVERED
     } else {
         EXIT_PARTIAL
     }
+}
+
+/// The process exit code for a finished batch: success only when every
+/// object delivered.
+pub fn exit_code_for(results: &DetermineResults) -> i32 {
+    batch_exit_code(results.delivered_count(), results.len())
 }
 
 pub fn run(data: &DataOptions, args: DetermineArgs) -> Result<()> {

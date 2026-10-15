@@ -8,9 +8,9 @@ use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use empyrean::{OrbitBatch, PropagationConfig, PropagationResult};
+use empyrean::PropagationConfig;
 
-use crate::commands::propagate::{parse_format, parse_uncertainty_method};
+use crate::commands::propagate::{parse_format, parse_uncertainty_method, propagated_to_batch};
 use crate::daemon::protocol::{self, Request, Response};
 use crate::io::orbit_input;
 use crate::io::output::{self, OutputFormat};
@@ -336,62 +336,11 @@ fn handle_determine(
     ))
 }
 
-fn propagated_to_batch(input: &OrbitBatch, result: &PropagationResult) -> OrbitBatch {
-    use empyrean::{CoordinateState, Orbit};
-    let n_in = input.len();
-    let n_times = if n_in > 0 {
-        result.states.len() / n_in
-    } else {
-        1
-    };
-    let mut orbits = Vec::with_capacity(result.states.len());
-    let mut orbit_ids = Vec::with_capacity(result.states.len());
-    let mut object_ids = Vec::with_capacity(result.states.len());
-    for (i, state) in result.states.iter().enumerate() {
-        let orbit_idx = if n_times > 0 { i / n_times } else { 0 };
-        let id = input
-            .orbit_ids
-            .get(orbit_idx)
-            .cloned()
-            .unwrap_or_else(|| format!("orbit_{orbit_idx}"));
-        let obj = input.object_ids.get(orbit_idx).cloned().flatten();
-        let mut cs = CoordinateState::cartesian(
-            state.epoch,
-            [
-                state.position[0],
-                state.position[1],
-                state.position[2],
-                state.velocity[0],
-                state.velocity[1],
-                state.velocity[2],
-            ],
-            state.frame,
-            state.origin,
-        );
-        if let Some(c) = state.covariance {
-            cs = cs.with_covariance(c);
-        }
-        // Carry the input orbit's non-grav + photometry forward; only
-        // the state is replaced with the parsed `cs`. Functional
-        // update syntax (`..template`) so future additions to
-        // `Orbit` don't break this site.
-        let orbit = match input.orbits.get(orbit_idx).cloned() {
-            Some(template) => Orbit {
-                state: cs,
-                ..template
-            },
-            None => Orbit::new(cs),
-        };
-        orbits.push(orbit);
-        orbit_ids.push(id);
-        object_ids.push(obj);
-    }
-    OrbitBatch {
-        orbits,
-        orbit_ids,
-        object_ids,
-    }
-}
+// `propagated_to_batch` lives in `commands::propagate` and is shared by both
+// the in-process command and this daemon path — one row-attribution helper
+// (through `rows_for`), so the two channels cannot drift apart. The former
+// daemon twin used a uniform `i / n_times` grid and mis-mapped rows once an
+// orbit failed; it is gone.
 
 #[cfg(test)]
 mod tests {

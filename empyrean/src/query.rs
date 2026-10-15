@@ -105,16 +105,6 @@ fn ffi_batch_to_owned(batch: &empyrean_sys::EmpyreanOrbitBatch) -> Result<OrbitB
             } else {
                 None
             },
-            non_grav_dt_variance: if ffi_orbit.non_grav_dt_variance.is_finite()
-                && ffi_orbit.non_grav_dt_variance > 0.0
-            {
-                Some(ffi_orbit.non_grav_dt_variance)
-            } else {
-                None
-            },
-            // Non-grav covariance is an OD-output concept; SBDB/query orbits
-            // don't carry it.
-            ng_covariance: None,
             phot_system,
             h_mag: ffi_orbit.h_mag,
             slope1: ffi_orbit.slope1,
@@ -134,11 +124,12 @@ fn ffi_batch_to_owned(batch: &empyrean_sys::EmpyreanOrbitBatch) -> Result<OrbitB
                 ffi_orbit.srp_amrat,
                 ffi_orbit.srp_cr,
                 ffi_orbit.has_srp,
-                ffi_orbit.srp_amrat_variance,
             ),
-            // SBDB publishes a state and, at most, a Marsden block — no
-            // cross terms of any kind. Absent, not dropped.
-            wide_cross: None,
+            // The orbit's covariance as one packed joint, read back from the
+            // library-owned batch (copied into an owned Vec). SBDB publishes a
+            // state and, at most, a Marsden block — a width-0 joint reads back
+            // as `None`.
+            covariance: unsafe { crate::PackedJoint::from_ffi(&ffi_orbit.covariance) }?,
         });
         let id_ptr = unsafe { *batch.orbit_ids.add(i) };
         let id = if id_ptr.is_null() {
@@ -206,6 +197,8 @@ pub fn query_horizons(
         num_sensitivity: 0,
         warnings: std::ptr::null_mut(),
         num_warnings: 0,
+        num_orbits: 0,
+        outcomes: std::ptr::null_mut(),
     };
     let code = unsafe {
         empyrean_sys::empyrean_query_horizons(

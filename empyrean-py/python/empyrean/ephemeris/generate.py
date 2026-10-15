@@ -10,8 +10,7 @@ from empyrean._convert import (
     _COORD_TYPE_MAP,
     AnyOrbits,
     coordinates_to_arrays,
-    extract_joint,
-    extract_non_grav_covariance,
+    extract_joint_wire,
     extract_photometry,
     extract_srp,
     validate_non_grav_marsden_only,
@@ -96,22 +95,46 @@ def generate_ephemeris(
         if ``config`` is given.
     uncertainty_method : UncertaintyMethod | SigmaPoint | MonteCarlo | GaussianMixture | str
         Optional quick override for ``config.propagation.uncertainty_method``.
-        Only the analytic methods are supported for ephemeris:
-        ``FIRST_ORDER``, ``SECOND_ORDER``, ``AUTO``, and
-        ``GAUSSIAN_MIXTURE`` (``SECOND_ORDER`` additionally populates
-        observation Hessians on the resulting
-        :class:`~empyrean.types.ObservationSensitivity`;
-        ``GAUSSIAN_MIXTURE`` is an adaptive-Gaussian-mixture method that is
-        likewise analytic on this path). The sky-plane covariance is a
-        first-order STM projection (``J·Φ·Σ·Φᵀ·Jᵀ``) that does not consume
-        a sampled ensemble, so the sampling methods ``SIGMA_POINT`` and
-        ``MONTE_CARLO`` are **rejected with a** :class:`ValueError`
-        rather than silently downgraded to first order. For a sampled
-        state covariance use
-        :func:`~empyrean.propagate` with ``SIGMA_POINT``; for Monte-Carlo
-        impact probability use
-        :func:`~empyrean.compute_impact_probabilities`. Ignored if
-        ``config`` is given.
+        Honored here: ``FIRST_ORDER``, ``SECOND_ORDER`` and ``AUTO``
+        (``SECOND_ORDER`` additionally populates observation Hessians on
+        the resulting :class:`~empyrean.types.ObservationSensitivity`),
+        and the two sampling methods, which fly the member set through
+        the generation pipeline (light time and all) and deliver the
+        ensemble's sky moments as the row covariance:
+
+        * ``SIGMA_POINT`` — the canonical 2N+1 unscented set, which is
+          parameter-free; pass ``SigmaPoint()`` and leave ``n_sigma`` /
+          ``samples_per_plane`` at their defaults (``1.0`` / ``8``). Any
+          other value is refused by the engine.
+        * ``MONTE_CARLO`` — ``n_samples`` draws with the run's ``seed``
+          (same seed, same rows bit for bit); fewer than 8 draws is
+          refused by the engine, because the sky moment of a smaller
+          ensemble is rank-deficient.
+
+        Refusals come from the engine as :class:`RuntimeError` naming
+        the method and the seam, never as a silent downgrade to a
+        first-order sky covariance wearing the requested method's name.
+        A prior wide enough that the sampled members disperse beyond the
+        engine's sky chart is refused the same way. A non-Cartesian
+        primary — a Cometary, Keplerian or Spherical record, such as one
+        queried from SBDB — is NOT refused: the engine samples it in its
+        own representation and delivers the ensemble's sky moments. When
+        that cloud disperses so far that the sampled sky covariance is not
+        positive-definite, the covariance is withheld for the affected
+        rows and the reason rides the result's ``warnings``, while the
+        ephemeris rows themselves are still delivered. The sampled members
+        fly the state (and the Marsden non-grav) space, so a solved
+        non-grav ΔT or SRP-AMRAT prior variance on the joint is the one
+        sampled prior still refused by name — no sampled member carries
+        that axis. ``GAUSSIAN_MIXTURE`` is DELIVERED on this path: the
+        mixture generation seams fly the mixture through the generation
+        pipeline and deliver its per-observation sky moment as the row
+        covariance (away from a close approach it reduces to the linear
+        ``Φ·Σ·Φᵀ`` mapping). The per-component breakdown stays a
+        :func:`~empyrean.propagate` surface — the ephemeris row carries
+        the moment-matched sky covariance alone.
+
+        Ignored if ``config`` is given.
 
     Returns
     -------
@@ -212,9 +235,8 @@ def generate_ephemeris(
     # NonGravParams is Marsden-only; reject a stray model='srp' / cr before
     # marshaling (SRP rides its own slot, extracted below).
     validate_non_grav_marsden_only(orbits)
-    has_srp, srp_amrat, srp_cr, srp_amrat_variance = extract_srp(orbits)
+    has_srp, srp_amrat, srp_cr = extract_srp(orbits)
     non_grav_dts: np.ndarray | None = None
-    non_grav_dt_variances: np.ndarray | None = None
     if orbits.non_grav is not None:
         ng = orbits.non_grav
         a1s = np.asarray(ng.a1.to_numpy(zero_copy_only=False), dtype=np.float64)
@@ -228,12 +250,6 @@ def generate_ephemeris(
         dt_col = np.asarray(ng.dt.to_numpy(zero_copy_only=False), dtype=np.float64)
         if np.isfinite(dt_col).any():
             non_grav_dts = dt_col
-        # DT prior variance — opens the DT column in a StateAndNonGravAndDT
-        # solve. Gated like non_grav_dts (finite positive) so the no-prior
-        # case skips the FFI marshal.
-        dtv_col = np.asarray(ng.dt_variance.to_numpy(zero_copy_only=False), dtype=np.float64)
-        if (np.isfinite(dtv_col) & (dtv_col > 0.0)).any():
-            non_grav_dt_variances = dtv_col
     else:
         a1s = np.zeros(n, dtype=np.float64)
         a2s = np.zeros(n, dtype=np.float64)
@@ -253,13 +269,10 @@ def generate_ephemeris(
     has_phot_cov: np.ndarray | None = has_phot_cov_arr if has_phot_cov_arr.any() else None
     phot_cov: np.ndarray | None = phot_cov_arr if has_phot_cov_arr.any() else None
 
-    # Fitted non-grav covariance — passed through only when a row carries one
-    # (mirrors the OD output path) so a StateAndNonGrav-fitted orbit re-fed
-    # into ephemeris generation keeps its prior. Gated like non_grav_dts so
-    # the common no-cov case skips the FFI marshal.
-    has_ng_cov_arr, ng_cov_arr = extract_non_grav_covariance(orbits)
-    has_non_grav_cov: np.ndarray | None = has_ng_cov_arr if has_ng_cov_arr.any() else None
-    non_grav_cov: np.ndarray | None = ng_cov_arr if has_ng_cov_arr.any() else None
+    # The orbit's packed joint — the single covariance home. Passed through
+    # only when a row carries one, so a StateAndNonGrav-fitted orbit re-fed
+    # into ephemeris generation keeps its full joint.
+    joint_wire = extract_joint_wire(orbits)
 
     # ── Extract observer arrays ──────────────────────────────
     obs_codes = observers.obs_code.to_pylist()
@@ -347,22 +360,18 @@ def generate_ephemeris(
         epsilon,
         uncertainty_method=um_int,
         non_grav_dts=non_grav_dts,
-        non_grav_dt_variances=non_grav_dt_variances,
         has_srp=has_srp,
         srp_amrat=srp_amrat,
         srp_cr=srp_cr,
-        srp_amrat_variance=srp_amrat_variance,
-        has_non_grav_cov=has_non_grav_cov,
-        non_grav_cov=non_grav_cov,
         phot_slope2=phot_slope2,
         has_phot_cov=has_phot_cov,
         phot_cov=phot_cov,
-        # The joint's off-diagonal terms. An ephemeris of a fitted orbit
-        # is computed against the covariance the fit produced, not
-        # against its diagonal blocks — the sky-plane covariance
-        # reported per row inherits whatever the state covariance was
-        # conditioned on. No keys at all when no orbit carries any.
-        **extract_joint(orbits),
+        # The orbit's packed joint. An ephemeris of a fitted orbit is
+        # computed against the covariance the fit produced, not against its
+        # state block alone — the sky-plane covariance reported per row
+        # inherits whatever the joint was conditioned on. No key when no
+        # orbit carries one.
+        covariance=joint_wire,
         gm_threshold=gm_threshold,
         gm_max_depth=gm_max_depth,
         gm_components_per_split=gm_components_per_split,
@@ -533,8 +542,15 @@ def generate_ephemeris(
             hessian=result["sensitivity_hessian"],
         )
 
+    # Per-input-orbit delivery status (same channel as `propagate`): one row
+    # per input orbit, whether or not it delivered.
+    from empyrean.propagation.status import build_orbit_statuses
+
+    status = build_orbit_statuses(result["outcomes"])
+
     return EphemerisResult(
         ephemeris=ephemeris,
         sensitivity=sensitivity,
         warnings=list(result["warnings"]),
+        status=status,
     )

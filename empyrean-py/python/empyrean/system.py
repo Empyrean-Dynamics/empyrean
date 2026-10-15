@@ -3,7 +3,7 @@
 A :class:`BuiltSystem` assembles the force model — the perturber set,
 spherical-harmonic gravity, the post-Newtonian relativistic correction,
 and the integration frame — **once** for a frozen
-``{force_model, frame, encounter_timescale_divisor}`` key, then reuses it
+``{force_model, frame}`` key, then reuses it
 across every :meth:`~BuiltSystem.propagate` /
 :meth:`~BuiltSystem.generate_ephemeris` call. For workloads dominated by
 many short forward models (fit / predict / screen loops) the per-call
@@ -18,7 +18,7 @@ Identity guard
 Every forward-model call validates, before it runs, that the handle's
 frozen key matches the call's configuration and that the source data has
 not changed since the handle was built. Any mismatch — frame, force
-model, divisor, source-data identity, or staleness — raises a loud,
+model, encounter-floor angle, source-data identity, or staleness — raises a loud,
 distinct exception. The handle **never** silently rebuilds and never
 serves wrong physics. **Rebuild the handle after any**
 :func:`empyrean.initialize` / data (re)load.
@@ -138,8 +138,8 @@ class SystemDescription:
     """The frozen force-model tier."""
     frame: Frame
     """The frozen integration/output frame."""
-    encounter_timescale_divisor: float
-    """The frozen encounter-timescale divisor."""
+    encounter_floor_angle: float
+    """The frozen encounter-floor angle (radians)."""
     relativistic: bool
     """Whether the post-Newtonian (EIH) relativistic correction is enabled."""
     asteroids: bool
@@ -168,7 +168,7 @@ class SystemDescription:
         return cls(
             force_model=_INT_TO_FORCE_MODEL[int(raw["force_model"])],
             frame=int_to_frame(int(raw["frame"])),
-            encounter_timescale_divisor=float(raw["encounter_timescale_divisor"]),
+            encounter_floor_angle=float(raw["encounter_floor_angle"]),
             relativistic=bool(raw["relativistic"]),
             asteroids=bool(raw["asteroids"]),
             has_bpc=bool(raw["has_bpc"]),
@@ -218,16 +218,17 @@ class BuiltSystem:
         Frame to freeze. Default :attr:`Frame.ECLIPTICJ2000`. For
         :meth:`generate_ephemeris` the frame must be
         :attr:`Frame.ECLIPTICJ2000` (the ephemeris integration frame).
-    encounter_timescale_divisor : float, optional
-        Encounter-timescale divisor to freeze into the key. ``None``
-        (default) freezes the engine default.
+
+    Notes
+    -----
+    The encounter-floor angle is resolved by the engine and read back onto
+    :attr:`encounter_floor_angle`; it is not a caller-set knob.
     """
 
     def __init__(
         self,
         force_model: ForceModelTier | str | int = ForceModelTier.STANDARD,
         frame: Frame | str | int = Frame.ECLIPTICJ2000,
-        encounter_timescale_divisor: float | None = None,
     ) -> None:
         from empyrean._empyrean_rs import BuiltSystem as _RsBuiltSystem
 
@@ -235,11 +236,10 @@ class BuiltSystem:
         self._frame: Frame = _resolve_frame(frame)
         fm_int = _FORCE_MODEL_TO_INT[self._force_model]
         frame_int = frame_to_int(self._frame)
-        divisor = 0.0 if encounter_timescale_divisor is None else float(encounter_timescale_divisor)
-        self._rs: Any = _RsBuiltSystem(fm_int, frame_int, divisor)
-        # The engine resolves the 0.0 sentinel to its default; read it back
-        # so the recorded key reflects the actual frozen divisor.
-        self._encounter_timescale_divisor: float = float(self._rs.encounter_timescale_divisor)
+        self._rs: Any = _RsBuiltSystem(fm_int, frame_int)
+        # The engine picks the encounter-floor angle; read it back so the
+        # recorded key reflects the actual frozen value.
+        self._encounter_floor_angle: float = float(self._rs.encounter_floor_angle)
 
     @classmethod
     def _adopt(cls, rs: Any) -> BuiltSystem:
@@ -253,7 +253,7 @@ class BuiltSystem:
         self._rs = rs
         self._force_model = _INT_TO_FORCE_MODEL[int(rs.force_model)]
         self._frame = int_to_frame(int(rs.frame))
-        self._encounter_timescale_divisor = float(rs.encounter_timescale_divisor)
+        self._encounter_floor_angle = float(rs.encounter_floor_angle)
         return self
 
     # ── Frozen key (read-only) ────────────────────────────────
@@ -269,9 +269,9 @@ class BuiltSystem:
         return self._frame
 
     @property
-    def encounter_timescale_divisor(self) -> float:
-        """The frozen encounter-timescale divisor (engine default resolved)."""
-        return self._encounter_timescale_divisor
+    def encounter_floor_angle(self) -> float:
+        """The frozen encounter-floor angle in radians (engine-resolved)."""
+        return self._encounter_floor_angle
 
     # ── Forward models ────────────────────────────────────────
 
@@ -334,9 +334,9 @@ class BuiltSystem:
         Identical to :func:`empyrean.generate_ephemeris` but reuses the
         pre-built force model. The ephemeris pipeline integrates in
         EclipticJ2000, so this handle must be frozen at
-        :attr:`Frame.ECLIPTICJ2000` (the default) and the engine-default
-        divisor; a handle frozen otherwise is rejected loudly by the
-        identity guard rather than served under the wrong dynamics.
+        :attr:`Frame.ECLIPTICJ2000` (the default); a handle frozen
+        otherwise is rejected loudly by the identity guard rather than
+        served under the wrong dynamics.
 
         Parameters
         ----------
@@ -363,9 +363,9 @@ class BuiltSystem:
     # The three verbs mirror the module-level :func:`empyrean.determine` /
     # :func:`empyrean.evaluate` / :func:`empyrean.refine` argument for
     # argument. Build the handle with :func:`od_system` — a fit picks its
-    # own integration frame (EclipticJ2000) and encounter-timescale
-    # divisor, and a handle frozen at, say, ``frame="icrf"`` is refused
-    # here rather than served under dynamics the fit did not ask for.
+    # own integration frame (EclipticJ2000) and encounter-floor angle,
+    # and a handle frozen at, say, ``frame="icrf"`` is refused here
+    # rather than served under dynamics the fit did not ask for.
     #
     # The guard refuses; it does not degrade. A caller who named this
     # surface asked to reuse a *specific* frozen force model, so fitting
@@ -454,24 +454,23 @@ class BuiltSystem:
         return (
             f"BuiltSystem(force_model={self._force_model.value!r}, "
             f"frame={self._frame.value!r}, "
-            f"encounter_timescale_divisor={self._encounter_timescale_divisor})"
+            f"encounter_floor_angle={self._encounter_floor_angle})"
         )
 
 
 def build_system(
     force_model: ForceModelTier | str | int = ForceModelTier.STANDARD,
     frame: Frame | str | int = Frame.ECLIPTICJ2000,
-    encounter_timescale_divisor: float | None = None,
 ) -> BuiltSystem:
     """Assemble a reusable :class:`BuiltSystem` force-model handle.
 
-    Builds the force model once for ``(force_model, frame)`` and freezes
-    ``encounter_timescale_divisor`` into its key, then reuse the returned
-    handle across many :meth:`~BuiltSystem.propagate` /
+    Builds the force model once for ``(force_model, frame)``, then reuse
+    the returned handle across many :meth:`~BuiltSystem.propagate` /
     :meth:`~BuiltSystem.generate_ephemeris` calls. **Rebuild the handle
     after any** :func:`empyrean.initialize` / data (re)load — a stale
     handle is rejected loudly by every forward-model call, never silently
-    reused.
+    reused. The encounter-floor angle is resolved by the engine and read
+    back onto :attr:`~BuiltSystem.encounter_floor_angle`.
 
     Parameters
     ----------
@@ -479,9 +478,6 @@ def build_system(
         Force-model tier to freeze. Default :attr:`ForceModelTier.STANDARD`.
     frame : Frame | str | int
         Frame to freeze. Default :attr:`Frame.ECLIPTICJ2000`.
-    encounter_timescale_divisor : float, optional
-        Encounter-timescale divisor to freeze. ``None`` (default) freezes
-        the engine default.
 
     Returns
     -------
@@ -496,7 +492,6 @@ def build_system(
     return BuiltSystem(
         force_model=force_model,
         frame=frame,
-        encounter_timescale_divisor=encounter_timescale_divisor,
     )
 
 
@@ -504,10 +499,10 @@ def od_system(force_model: ForceModelTier | str | int = ForceModelTier.STANDARD)
     """Assemble a :class:`BuiltSystem` keyed for the orbit-determination
     entry points.
 
-    :func:`build_system` asks for a frame and an encounter-timescale
-    divisor. An OD fit picks both itself — :class:`~empyrean.ODConfig`
-    exposes no knob for either — so naming them at the call site is an
-    invitation to name them wrong, and the wrong frame is the likely
+    :func:`build_system` asks for a frame. An OD fit picks it itself —
+    :class:`~empyrean.ODConfig` exposes no knob for it — so naming it at
+    the call site is an
+    invitation to name it wrong, and the wrong frame is the likely
     mistake: OD integrates in :attr:`Frame.ECLIPTICJ2000`, while
     propagation examples routinely freeze ``"icrf"``. This function
     freezes the recipe a fit actually runs under, so the handle it returns

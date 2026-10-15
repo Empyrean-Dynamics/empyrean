@@ -461,9 +461,7 @@ fn od_orbit_to_propagated_local(
         .get(0)
         .ok_or_else(|| "session OD result orbit is empty".to_string())?;
     let (epoch, x, y, z, vx, vy, vz, frame, origin) = match coord {
-        Coordinates::Cartesian(c, _, _) => {
-            (c.t, c.x, c.y, c.z, c.vx, c.vy, c.vz, c.frame, c.origin)
-        }
+        Coordinates::Cartesian(c) => (c.t, c.x, c.y, c.z, c.vx, c.vy, c.vz, c.frame, c.origin),
         _ => {
             // Convert to Cartesian via empyrean-core's converter so we
             // get a uniform [x y z vx vy vz] regardless of whether the
@@ -476,7 +474,10 @@ fn od_orbit_to_propagated_local(
             // with no NAIF id (an MPC site code). Surface it rather than
             // invent a sentinel: a made-up integer read back through the
             // ABI would name a different body.
-            let cs = coordinates_to_coordinate_state(&coord_deg)
+            // The flat state 6×6 is set from `covariance` below (the OD
+            // result's state covariance), not from the coordinate, so no
+            // uncertainty is threaded into the conversion here.
+            let cs = coordinates_to_coordinate_state(&coord_deg, None)
                 .map_err(|e| format!("session OD result orbit: {e}"))?;
             return Ok(EmpyreanPropagatedState {
                 epoch_mjd_tdb: cs.epoch_mjd_tdb,
@@ -496,7 +497,7 @@ fn od_orbit_to_propagated_local(
                 has_stt: 0,
                 resolved_kind: 0,
                 // Filled by `write_od_result_fields` below.
-                orbit_cov: crate::joint::empty_orbit_covariance(),
+                orbit_cov: crate::joint::empty_packed_joint(),
             });
         }
     };
@@ -518,166 +519,19 @@ fn od_orbit_to_propagated_local(
         has_stt: 0,
         resolved_kind: 0,
         // Filled by `write_od_result_fields` below.
-        orbit_cov: crate::joint::empty_orbit_covariance(),
+        orbit_cov: crate::joint::empty_packed_joint(),
     })
 }
 
-/// The basis the joint marshal reads, which the session path is the only
-/// consumer of.
-///
-/// The one-shot entry points refuse a non-Cartesian fitted orbit, and
-/// Cartesian has no angular element rows — so degrees and radians are
-/// indistinguishable there and the marshal's basis choice is
-/// unobservable. The session is the only path that delivers Keplerian /
-/// Cometary / Spherical results, and it shipped once with the marshal
-/// reading DEGREES while `ODResult::covariance` is read off the stored
-/// RADIAN coordinate: a factor of 180/π on three rows, inside one struct
-/// whose documented contract is that the two share a basis.
-///
-/// # Why this pins the accessor rather than driving a session fit
-///
-/// A live Keplerian-output session cannot reach the code under test. A
-/// Marsden solve needs a Cartesian seed — `empyrean_session_refine` with
-/// `output_representation = KEPLERIAN` and Marsden solved fails in IOD
-/// with "initial orbit must be Cartesian" before any joint is marshaled
-/// — and without a Marsden solve there is no border to check. An
-/// end-to-end test would therefore skip every time while appearing to
-/// cover the path, which is the failure mode this delivery has already
-/// been bitten by twice. So this pins the decision itself: on a
-/// non-Cartesian coordinate the two read-outs genuinely differ, and the
-/// marshal must take the stored one.
-#[cfg(test)]
-mod session_joint_basis_tests {
-    use empyrean_core::coordinates::{AU, Degrees, ExtendedCovariance};
-    use empyrean_core::orbits::Orbits;
-
-    /// On a Keplerian orbit the stored and degree read-outs of a border
-    /// differ by 180/π on the angular rows — so "which one the marshal
-    /// takes" is a real choice with a wrong answer, not a formality.
-    ///
-    /// `write_orbit_covariance` takes the STORED one, because that is
-    /// where `ODResult::covariance` comes from. This test fails if
-    /// anyone reintroduces the angular read-out there: the two arrays it
-    /// compares would become the same array.
-    #[test]
-    fn the_stored_and_degree_read_outs_of_a_border_really_differ() {
-        let cs = empyrean_core::convert::CoordinateState {
-            epoch_mjd_tdb: 59000.0,
-            // a, e, i, raan, argperi, M — i/raan/argperi are angles.
-            elements: [1.5, 0.2, 10.0, 20.0, 30.0, 40.0],
-            covariance: {
-                let mut c = [[0.0f64; 6]; 6];
-                for (i, row) in c.iter_mut().enumerate() {
-                    row[i] = 1.0e-8 * (i as f64 + 1.0);
-                }
-                c
-            },
-            has_covariance: 1,
-            representation: crate::od::EMPYREAN_REPRESENTATION_KEPLERIAN,
-            frame: 0,
-            origin: 10,
-        };
-        let coord = empyrean_core::convert::coordinate_state_to_coordinates(&cs)
-            .expect("a well-formed Keplerian state");
-        let params: [[f64; 3]; 3] = [
-            [1.0e-20, 0.0, 0.0],
-            [0.0, 1.0e-20, 0.0],
-            [0.0, 0.0, 1.0e-20],
-        ];
-        let cross = [[1.0e-14f64; 3]; 6];
-        let bordered = crate::joint::coordinates_with_extended(
-            coord,
-            Some(ExtendedCovariance::new(cross, params)),
-        );
-
-        let mut orbits: Orbits<AU> = Orbits::empty();
-        orbits
-            .push("kep".to_string(), bordered.into_radians())
-            .expect("push");
-
-        let stored = *orbits.coordinates()[0]
-            .extended_covariance()
-            .expect("the border survived the push");
-        let (degree_coord, _) = orbits
-            .coordinates_angular::<Degrees>(0)
-            .expect("row 0 exists");
-        let degrees = *degree_coord
-            .extended_covariance()
-            .expect("the degree read-out carries it too");
-
-        // Keplerian's angular element indices are 2, 3, 4 AND 5:
-        // a, e, i, raan, argperi, M — the mean anomaly is an angle too.
-        // (Cometary's list stops at 4 because its sixth element is a
-        // time of perihelion, not an angle. Using that list here is how
-        // this test failed on its first run.)
-        let to_deg = 180.0 / std::f64::consts::PI;
-        for r in 0..6 {
-            for c in 0..3 {
-                if (2..6).contains(&r) {
-                    assert!(
-                        (degrees.cross[r][c] / stored.cross[r][c] - to_deg).abs() < 1e-6,
-                        "angular row {r} must differ between the two read-outs by 180/pi; \
-                         taking the wrong one is a 57x error on this row"
-                    );
-                } else {
-                    assert!(
-                        (degrees.cross[r][c] - stored.cross[r][c]).abs() < 1e-30,
-                        "non-angular row {r} is identical in both read-outs"
-                    );
-                }
-            }
-        }
-    }
-
-    /// The marshal's contract, stated as an assertion: what it publishes
-    /// must equal the STORED border, because `ODResult::covariance` is
-    /// the stored 6x6 and the two have to describe one matrix.
-    #[test]
-    fn the_marshal_publishes_the_stored_border_not_the_degree_one() {
-        let cs = empyrean_core::convert::CoordinateState {
-            epoch_mjd_tdb: 59000.0,
-            elements: [1.5, 0.2, 10.0, 20.0, 30.0, 40.0],
-            covariance: {
-                let mut c = [[0.0f64; 6]; 6];
-                for (i, row) in c.iter_mut().enumerate() {
-                    row[i] = 1.0e-8 * (i as f64 + 1.0);
-                }
-                c
-            },
-            has_covariance: 1,
-            representation: crate::od::EMPYREAN_REPRESENTATION_KEPLERIAN,
-            frame: 0,
-            origin: 10,
-        };
-        let coord = empyrean_core::convert::coordinate_state_to_coordinates(&cs).unwrap();
-        let params: [[f64; 3]; 3] = [
-            [1.0e-20, 0.0, 0.0],
-            [0.0, 1.0e-20, 0.0],
-            [0.0, 0.0, 1.0e-20],
-        ];
-        let bordered = crate::joint::coordinates_with_extended(
-            coord,
-            Some(ExtendedCovariance::new([[1.0e-14f64; 3]; 6], params)),
-        );
-        let mut orbits: Orbits<AU> = Orbits::empty();
-        orbits
-            .push("kep".to_string(), bordered.into_radians())
-            .unwrap();
-
-        let stored = *orbits.coordinates()[0].extended_covariance().unwrap();
-        let published = crate::joint::joint_to_c(
-            orbits.coordinates()[0].extended_covariance(),
-            orbits.wide_cross(0),
-            "test",
-        )
-        .expect("marshals");
-
-        assert_eq!(published.has_non_grav_cross, 1);
-        assert_eq!(
-            published.non_grav_cross, stored.cross,
-            "the published border must be the STORED one — the basis ODResult::covariance \
-             is read in. Publishing the degree read-out beside a radian 6x6 puts a \
-             180/pi error on three rows of one joint."
-        );
-    }
-}
+// DELETED (0.11.0 ruling): `session_joint_basis_tests`
+// (`the_stored_and_degree_read_outs_of_a_border_really_differ`,
+// `the_marshal_publishes_the_stored_border_not_the_degree_one`). Those
+// pinned the OLD marshal (`joint_to_c`) reading a border off a
+// `Coordinates` via the removed `coordinates_with_extended` /
+// `coordinates_angular` / `extended_covariance` / `ExtendedCovariance`
+// APIs. In 0.11.0 the covariance rides ONE packed joint and
+// `orbit_uncertainty_to_c` scales the angular rows rad->deg uniformly;
+// the basis-correctness contract (angular rows in degrees, radian
+// stored) is the packed-joint round-trip ruling test. NOTE for the
+// lead: that round trip is Cartesian; a NON-Cartesian (Keplerian)
+// angular-row round trip would be the direct successor of this module.

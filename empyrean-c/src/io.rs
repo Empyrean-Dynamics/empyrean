@@ -1260,7 +1260,7 @@ fn residuals_to_rows(observations: &[EmpyreanObservationResult]) -> Vec<Residual
         .map(|o| ResidualRow {
             object_id: cstr_or_empty(o.object_id),
             obs_id: cstr_or_empty(o.obs_id),
-            // Fixed 3-byte + NUL field, not a pointer.
+            // Fixed 4-byte NUL-padded field, not a pointer.
             obs_code: String::from_utf8_lossy(&o.obs_code)
                 .trim_end_matches('\0')
                 .to_string(),
@@ -2711,6 +2711,17 @@ fn _suppress_unused() {
 mod residual_writer_tests {
     use super::*;
     use crate::od::EmpyreanObservationResult;
+
+    /// The 4-byte obs-code field is read back in full: a 4-character code
+    /// (no terminator) returns all four characters; a shorter code is read
+    /// up to its NUL. This is the read side of the query / ephemeris-entry
+    /// carrier. (Narrowing the reader to a 3-byte prefix reddens this.)
+    #[test]
+    fn obs_code_bytes_to_string_reads_the_full_four_byte_field() {
+        assert_eq!(obs_code_bytes_to_string(b"W68a"), "W68a");
+        assert_eq!(obs_code_bytes_to_string(b"703\0"), "703");
+        assert_eq!(obs_code_bytes_to_string(b"W68\0"), "W68");
+    }
 
     /// Every field the residual surface carries, by wire name. This list
     /// is the contract: it is written out here independently of

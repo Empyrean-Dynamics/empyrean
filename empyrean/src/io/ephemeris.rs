@@ -24,8 +24,17 @@ fn ephemeris_to_ffi_array(
             keep.push(id_c);
             let mut obs_code = [0u8; 4];
             let bytes = e.obs_code.as_bytes();
-            let n = bytes.len().min(3);
-            obs_code[..n].copy_from_slice(&bytes[..n]);
+            // Full 4-byte width, left-aligned and NUL-padded; a code longer
+            // than the field is refused by name rather than clipped to a
+            // prefix that names a different observatory.
+            if bytes.len() > 4 {
+                return Err(Error::invalid_input(format!(
+                    "observatory code \"{}\" is longer than the 4-byte MPC code \
+                     field; truncating it would name a different observatory",
+                    e.obs_code
+                )));
+            }
+            obs_code[..bytes.len()].copy_from_slice(bytes);
             Ok(empyrean_sys::EmpyreanEphemerisEntry {
                 orbit_id: id_ptr,
                 epoch_mjd_tdb: e.epoch.mjd_tdb()?,

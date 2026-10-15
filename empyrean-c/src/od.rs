@@ -35,8 +35,10 @@ use crate::{EmpyreanContext, set_last_error};
 /// String fields are nullable (`null` pointer = absent). Float fields
 /// use NaN as the absent sentinel. The `n_stars` integer uses `-1` as
 /// the absent sentinel (since `u32::MAX` is a valid count). The
-/// `obs_code` is fixed-size 4-byte null-padded to keep the common case
-/// allocation-free.
+/// `obs_code` is a fixed-size 4-byte field, left-aligned and NUL-padded,
+/// to keep the common case allocation-free. A 4-character code fills all
+/// four bytes; a code longer than four bytes is refused by name at the
+/// FFI boundary, never truncated.
 ///
 /// Mirrors scott's `OpticalObservation` field-for-field — every named
 /// PSV column round-trips losslessly except for ADES extension fields
@@ -58,7 +60,9 @@ pub struct EmpyreanObservation {
     pub trk_id: *mut c_char,
 
     // ── Observer ──────────────────────────────────────────
-    /// MPC observatory code, null-padded to 4 bytes.
+    /// MPC observatory code: left-aligned and NUL-padded in a 4-byte
+    /// field. A 4-character code fills all four bytes (no terminator); a
+    /// code longer than four bytes is refused by name, never truncated.
     pub obs_code: [u8; 4],
     /// Observation mode (CCD, CMOS, etc.) (nullable).
     pub mode: *mut c_char,
@@ -263,11 +267,14 @@ pub struct EmpyreanRadarObservation {
 
     // ── Bistatic geometry ─────────────────────────────────
     /// MPC station code of the **transmitting** antenna (ADES `trx`),
-    /// null-padded to 4 bytes.
+    /// left-aligned and NUL-padded in a 4-byte field. A 4-character code
+    /// fills all four bytes; a longer code is refused by name, never
+    /// truncated.
     pub trx: [u8; 4],
     /// MPC station code of the **receiving** antenna (ADES `rcv`),
-    /// null-padded to 4 bytes. Equal to `trx` for a monostatic
-    /// observation; differs for a bistatic one.
+    /// left-aligned and NUL-padded in a 4-byte field (same width/refusal
+    /// contract as `trx`). Equal to `trx` for a monostatic observation;
+    /// differs for a bistatic one.
     pub rcv: [u8; 4],
 
     // ── Core measurement ──────────────────────────────────
@@ -1059,7 +1066,9 @@ pub struct EmpyreanObservationResult {
     /// `empyrean_refine`), where the caller supplied the one orbit and
     /// no grouping key exists. Owned by the parent array.
     pub object_id: *mut c_char,
-    /// MPC observatory code (3-byte + NUL).
+    /// MPC observatory code: left-aligned and NUL-padded in a 4-byte
+    /// field. A 4-character code fills all four bytes (no terminator); a
+    /// shorter code is NUL-padded. Read up to the first NUL.
     pub obs_code: [u8; 4],
     /// Star catalog used for astrometric reduction (ADES `astCat`).
     /// Heap-allocated; null when ADES did not carry one. Freed with the array.
@@ -2747,9 +2756,13 @@ pub(crate) fn c_observations_to_optical(
             .map_err(|e| format!("invalid UTF-8 in obs_time: {e}"))?
             .to_string();
 
-        let stn = std::str::from_utf8(&obs.obs_code[..3])
-            .unwrap_or("   ")
-            .trim_end_matches('\0')
+        // Decode the full 4-byte field up to the first NUL (a 4-character
+        // code fills all four bytes and carries no terminator). Reading a
+        // fixed 3-byte prefix would clip a 4-character MPC code to a
+        // different observatory.
+        let nul = obs.obs_code.iter().position(|&b| b == 0).unwrap_or(4);
+        let stn = std::str::from_utf8(&obs.obs_code[..nul])
+            .unwrap_or("")
             .trim_end()
             .to_string();
 
@@ -2817,14 +2830,17 @@ fn c_radar_to_scott(slice: &[EmpyreanRadarObservation]) -> Result<Vec<RadarObser
             .map_err(|e| format!("invalid UTF-8 in radar obs_time: {e}"))?
             .to_string();
 
-        let trx = std::str::from_utf8(&r.trx[..3])
-            .unwrap_or("   ")
-            .trim_end_matches('\0')
+        // Decode the full 4-byte station fields up to the first NUL (a
+        // 4-character code fills all four bytes and carries no terminator);
+        // a fixed 3-byte prefix would clip to a different station.
+        let trx_nul = r.trx.iter().position(|&b| b == 0).unwrap_or(4);
+        let trx = std::str::from_utf8(&r.trx[..trx_nul])
+            .unwrap_or("")
             .trim_end()
             .to_string();
-        let rcv = std::str::from_utf8(&r.rcv[..3])
-            .unwrap_or("   ")
-            .trim_end_matches('\0')
+        let rcv_nul = r.rcv.iter().position(|&b| b == 0).unwrap_or(4);
+        let rcv = std::str::from_utf8(&r.rcv[..rcv_nul])
+            .unwrap_or("")
             .trim_end()
             .to_string();
 
@@ -2884,12 +2900,14 @@ fn c_radar_to_scott(slice: &[EmpyreanRadarObservation]) -> Result<Vec<RadarObser
 /// [`empyrean_query_radar`](crate::query::empyrean_query_radar) (JPL
 /// `sb_radar` live radar) so both emit byte-identical layouts.
 pub(crate) fn scott_radar_to_c(r: &RadarObservation) -> EmpyreanRadarObservation {
+    // Fill the full 4-byte station fields, NUL-padded (the engine's station
+    // codes are 3 bytes today, but the field admits four).
     let mut trx = [0u8; 4];
-    for (j, b) in r.trx.as_bytes().iter().take(3).enumerate() {
+    for (j, b) in r.trx.as_bytes().iter().take(4).enumerate() {
         trx[j] = *b;
     }
     let mut rcv = [0u8; 4];
-    for (j, b) in r.rcv.as_bytes().iter().take(3).enumerate() {
+    for (j, b) in r.rcv.as_bytes().iter().take(4).enumerate() {
         rcv[j] = *b;
     }
 
@@ -3043,10 +3061,11 @@ pub(crate) fn observation_results_to_c(
         return (std::ptr::null_mut(), 0);
     }
     for (i, obs) in observations.iter().enumerate() {
-        // 3-byte obs code + NUL.
+        // Full 4-byte obs code, NUL-padded (engine codes are 3 bytes today,
+        // but the field admits four — never clip to a 3-byte prefix).
         let mut code = [0u8; 4];
         let bytes = obs.obs_code.as_bytes();
-        let take = bytes.len().min(3);
+        let take = bytes.len().min(4);
         code[..take].copy_from_slice(&bytes[..take]);
 
         // residual.values is arcseconds: [Δα·cosδ, Δδ].
@@ -5570,12 +5589,14 @@ pub unsafe extern "C" fn empyrean_read_ades(
             }
 
             for (i, obs) in observations.optical.iter().enumerate() {
+                // Full 4-byte obs code, NUL-padded (engine codes are 3 bytes
+                // today, but the field admits four — never clip to a 3-byte
+                // prefix).
                 let mut obs_code = [0u8; 4];
                 let stn_bytes = obs.stn.as_bytes();
-                for (j, b) in stn_bytes.iter().take(3).enumerate() {
+                for (j, b) in stn_bytes.iter().take(4).enumerate() {
                     obs_code[j] = *b;
                 }
-                obs_code[3] = 0;
 
                 let entry = EmpyreanObservation {
                     perm_id: opt_cstr(obs.perm_id.as_ref()),
@@ -7213,6 +7234,65 @@ pub(crate) mod tests {
                     drop(unsafe { CString::from_raw(p) });
                 }
             }
+        }
+    }
+
+    /// A 4-character observatory code survives the optical observation-input
+    /// decode byte-for-byte: the engine-facing `stn` carries all four
+    /// characters, never a clipped 3-byte prefix. A shorter code is read up
+    /// to its NUL. (Restoring the old `obs_code[..3]` decode reddens the
+    /// 4-character case; the engine then names the full code itself.)
+    #[test]
+    fn four_char_obs_code_round_trips_through_optical_decode() {
+        use std::ffi::CString;
+        let t1 = CString::new("2026-01-01T00:00:00Z").unwrap().into_raw();
+        let t2 = CString::new("2026-01-01T00:00:00Z").unwrap().into_raw();
+        let mut four: EmpyreanObservation = unsafe { std::mem::zeroed() };
+        four.obs_code = *b"W68a";
+        four.obs_time = t1;
+        let mut three: EmpyreanObservation = unsafe { std::mem::zeroed() };
+        three.obs_code = *b"703\0";
+        three.obs_time = t2;
+
+        let decoded = c_observations_to_optical(&[four, three]).expect("decode");
+        assert_eq!(
+            decoded[0].stn, "W68a",
+            "4-character code must survive the FFI field, not be clipped"
+        );
+        assert_eq!(decoded[1].stn, "703", "shorter code read up to its NUL");
+
+        unsafe {
+            drop(CString::from_raw(t1));
+            drop(CString::from_raw(t2));
+        }
+    }
+
+    /// A 4-character station code survives the radar observation decode in
+    /// both `trx` and `rcv`, read up to the NUL. (Restoring the old `[..3]`
+    /// decode reddens the 4-character case.)
+    #[test]
+    fn four_char_station_code_round_trips_through_radar_decode() {
+        use std::ffi::CString;
+        let t = CString::new("2021-03-11T08:20:00Z").unwrap().into_raw();
+        let mut r: EmpyreanRadarObservation = unsafe { std::mem::zeroed() };
+        r.trx = *b"W68a";
+        r.rcv = *b"703\0";
+        r.obs_time = t;
+        r.kind = EMPYREAN_RADAR_KIND_DELAY;
+        r.delay_seconds = 120.5;
+        r.rms_delay_microseconds = 0.25;
+        r.doppler_hz = f64::NAN;
+        r.rms_doppler_hz = f64::NAN;
+
+        let decoded = c_radar_to_scott(&[r]).expect("radar decode");
+        assert_eq!(
+            decoded[0].trx, "W68a",
+            "4-character trx must not be clipped"
+        );
+        assert_eq!(decoded[0].rcv, "703", "shorter rcv read up to its NUL");
+
+        unsafe {
+            drop(CString::from_raw(t));
         }
     }
 

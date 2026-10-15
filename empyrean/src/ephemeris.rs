@@ -604,15 +604,16 @@ pub(crate) fn observers_to_ffi(
         .map(|o| {
             let mut code_bytes = [0u8; 4];
             let src = o.obs_code.as_bytes();
-            // The engine's observatory registry keys 3-byte MPC codes. A
-            // longer code must not be truncated: its 3-byte prefix would
-            // silently resolve to a DIFFERENT observatory (wrong
-            // topocentric geometry, no diagnostic).
-            if src.len() > 3 {
+            // The observatory code rides into the fixed 4-byte FFI field,
+            // left-aligned and NUL-padded; a 4-character code fills all four
+            // bytes. A code longer than the field is refused by name rather
+            // than truncated — a clipped code silently resolves to a
+            // DIFFERENT observatory (wrong topocentric geometry, no
+            // diagnostic).
+            if src.len() > 4 {
                 return Err(Error::invalid_input(format!(
-                    "observatory code \"{}\" is longer than 3 bytes; \
-                     4-character MPC codes are not yet supported by the \
-                     engine's observatory registry",
+                    "observatory code \"{}\" is longer than the 4-byte MPC code \
+                     field; truncating it would name a different observatory",
                     o.obs_code
                 )));
             }
@@ -763,44 +764,60 @@ mod tests {
         assert_eq!(rows, [0, 1, 2, 3, 4, 5]);
     }
 
-    /// A 4-character observatory code must be a loud error at the FFI
-    /// boundary: clipped to 3 bytes it would silently alias a different
-    /// observatory.
-    #[test]
-    fn four_char_obs_code_is_rejected() {
-        let observer = Observer {
-            obs_code: "W68a".to_string(),
+    fn observer_with_code(code: &str) -> Observer {
+        Observer {
+            obs_code: code.to_string(),
             epoch: crate::Epoch::from_mjd_tdb(61000.0),
             position: [1.0, 0.0, 0.0],
             velocity: [0.0, 0.01, 0.0],
             observing_night: -1,
             frame: crate::Frame::ICRF,
             origin: crate::Origin::SSB,
-        };
-        let err = observers_to_ffi(&[observer])
-            .expect_err("4-character observatory code must not marshal");
-        let msg = err.to_string();
-        assert!(msg.contains("W68a"), "error names the code: {msg}");
-        assert!(
-            msg.contains("longer than 3 bytes"),
-            "error states the contract: {msg}"
+        }
+    }
+
+    /// A 4-character observatory code round-trips through the ephemeris
+    /// observer carrier: it fills all four bytes of the FFI field (no
+    /// terminator) and reads back byte-for-byte. (Restoring the old
+    /// `min(3)` / reject-over-3 marshal reddens this: the code would be
+    /// clipped to or rejected at three characters.)
+    #[test]
+    fn four_char_obs_code_round_trips() {
+        let ffi =
+            observers_to_ffi(&[observer_with_code("W68a")]).expect("4-character code marshals");
+        assert_eq!(&ffi[0].obs_code, b"W68a");
+        assert_eq!(
+            crate::observers::obs_code_from_bytes(&ffi[0].obs_code),
+            "W68a",
+            "the 4-byte field reads back the full code"
         );
     }
 
-    /// 3-character (and shorter) codes still marshal, NUL-padded.
+    /// A shorter code (the classic 3-byte MPC code) still marshals,
+    /// NUL-padded, and reads back without the padding.
     #[test]
     fn three_char_obs_code_marshals() {
-        let observer = Observer {
-            obs_code: "W68".to_string(),
-            epoch: crate::Epoch::from_mjd_tdb(61000.0),
-            position: [1.0, 0.0, 0.0],
-            velocity: [0.0, 0.01, 0.0],
-            observing_night: -1,
-            frame: crate::Frame::ICRF,
-            origin: crate::Origin::SSB,
-        };
-        let ffi = observers_to_ffi(&[observer]).expect("3-character code marshals");
+        let ffi = observers_to_ffi(&[observer_with_code("W68")]).expect("3-byte code marshals");
         assert_eq!(&ffi[0].obs_code, b"W68\0");
+        assert_eq!(
+            crate::observers::obs_code_from_bytes(&ffi[0].obs_code),
+            "W68"
+        );
+    }
+
+    /// A 5-character code does not fit the 4-byte field, so it is refused
+    /// by name rather than truncated. (Truncating to four bytes instead of
+    /// refusing reddens this.)
+    #[test]
+    fn five_char_obs_code_is_refused_by_name() {
+        let err = observers_to_ffi(&[observer_with_code("W68ab")])
+            .expect_err("5-character observatory code must not marshal");
+        let msg = err.to_string();
+        assert!(msg.contains("W68ab"), "error names the code: {msg}");
+        assert!(
+            msg.contains("4-byte"),
+            "error states the field width: {msg}"
+        );
     }
 }
 
@@ -1203,4 +1220,144 @@ mod outcome_channel_tests {
             "num_entries is delivered rows only"
         );
     }
+<<<<<<< ours
+
+    /// The doc's promise, pinned at the safe wrapper: within an orbit
+    /// block the sensitivity rows arrive in **observer-input order**, so
+    /// row `k` pairs position-for-position with observer `k` (same code,
+    /// same epoch) and with `entries[k]` (same epoch). Interleaving two
+    /// observatory labels and repeating one `(code, epoch)` exposure is
+    /// the arc the engine's per-`(orbit, obs_code)` BTreeMap scrambles —
+    /// iterating the chains hands back every `500` row, then every `I41`
+    /// row, an order that disagrees with the observer-input entries at the
+    /// interleaved positions. The code is only a label and the chain key
+    /// here; the geometry rides the explicit observer state, so reusing one
+    /// state under two labels is exactly that interleaved arc. The repeated
+    /// exposure is the case no `(code, epoch)` key can disambiguate, so the
+    /// positional contract is the only thing that can carry it.
+    ///
+    /// Mutation: drop the `sort_by_key` in the C flatten and this goes red,
+    /// the rows coming back grouped by code and disagreeing with the
+    /// request at the first interleaved position.
+    #[test]
+    fn sensitivity_rows_follow_observer_input_order() {
+        let Some(ctx) = try_context() else {
+            eprintln!("skipping sensitivity_rows_follow_observer_input_order: no data dir");
+            return;
+        };
+        let observer_coded = |code: &str, epoch_mjd_tdb: f64| Observer {
+            obs_code: code.to_string(),
+            epoch: Epoch::from_mjd_tdb(epoch_mjd_tdb),
+            ..observer()
+        };
+
+        // Request order: 500, I41, 500 (the duplicate of row 0), I41, 500.
+        // "500" sorts before "I41", so the BTreeMap places every 500 row
+        // ahead of every I41 row — an order that disagrees here at 1 and 3.
+        let (e0, e1, e2) = (59200.0, 59210.0, 59220.0);
+        let observers = [
+            observer_coded("500", e0),
+            observer_coded("I41", e1),
+            observer_coded("500", e0),
+            observer_coded("I41", e1),
+            observer_coded("500", e2),
+        ];
+
+        let cfg = EphemerisConfig {
+            propagation: PropagationConfig {
+                compute_stm: true,
+                ..PropagationConfig::default()
+            },
+            ..EphemerisConfig::default()
+        };
+        let orbit = delivered("x", 1.0);
+        let result = ctx
+            .generate_ephemeris(std::slice::from_ref(&orbit), &observers, &cfg)
+            .expect("ephemeris generates");
+
+        assert_eq!(
+            result.entries.len(),
+            observers.len(),
+            "one entry per observer, the duplicate exposure included"
+        );
+        assert_eq!(
+            result.sensitivity.len(),
+            result.entries.len(),
+            "every entry carries a sensitivity row on this fixture, so the two \
+             arrays are the same length and pair up position for position"
+        );
+
+        for (k, (obs, row)) in observers.iter().zip(&result.sensitivity).enumerate() {
+            assert_eq!(
+                row.obs_code, obs.obs_code,
+                "row {k}: sensitivity code {} != request code {} — the rows are \
+                 not in observer-input order",
+                row.obs_code, obs.obs_code
+            );
+            let obs_epoch = obs.epoch.mjd_tdb().expect("observer epoch is TDB");
+            assert_eq!(
+                row.epoch_mjd_tdb.to_bits(),
+                obs_epoch.to_bits(),
+                "row {k}: sensitivity epoch {} != request epoch {obs_epoch}",
+                row.epoch_mjd_tdb,
+            );
+            let entry_epoch = result.entries[k]
+                .epoch
+                .mjd_tdb()
+                .expect("entry epoch is TDB");
+            assert_eq!(
+                row.epoch_mjd_tdb.to_bits(),
+                entry_epoch.to_bits(),
+                "row {k}: sensitivity epoch disagrees with entry epoch {entry_epoch}"
+            );
+            assert!(
+                !row.jacobian.is_empty(),
+                "row {k}: compute_stm was set, so the row carries a Jacobian"
+            );
+        }
+    }
+
+    /// A four-character observatory code round-trips from the engine through
+    /// the ephemeris output row unaltered. The code is only a label here (the
+    /// geometry rides the explicit observer state), so the engine builds an
+    /// `ObservatoryCode` of all four characters and the C marshal copies its
+    /// full four-byte NUL-padded form into the row's fixed field, which the
+    /// wrapper reads back whole. `W68a` must NOT alias its three-character
+    /// prefix `W68`, a different, real observatory — the aliasing a registry
+    /// with no four-character entry cannot otherwise expose.
+    ///
+    /// Mutation: truncate the engine→C marshal to three bytes at the ephemeris
+    /// `obs_code` seam (restore the old `o.code[0..3]` copy) and this goes red,
+    /// the row reading back `W68`.
+    #[test]
+    fn four_char_obs_code_round_trips_from_the_engine() {
+        let Some(ctx) = try_context() else {
+            eprintln!("skipping four_char_obs_code_round_trips_from_the_engine: no data dir");
+            return;
+        };
+        let observers = [Observer {
+            obs_code: "W68a".to_string(),
+            ..observer()
+        }];
+        let orbit = delivered("x", 1.0);
+        let result = ctx
+            .generate_ephemeris(
+                std::slice::from_ref(&orbit),
+                &observers,
+                &EphemerisConfig::default(),
+            )
+            .expect("ephemeris generates for a four-character observatory code");
+        assert_eq!(result.entries.len(), 1, "one observer delivers one row");
+        assert_eq!(
+            result.entries[0].obs_code, "W68a",
+            "the four-character code reads back whole from the engine, not \
+             clipped to its three-character prefix"
+        );
+        assert_ne!(
+            result.entries[0].obs_code, "W68",
+            "the code must not collapse onto its three-character prefix"
+        );
+    }
+=======
+>>>>>>> theirs
 }

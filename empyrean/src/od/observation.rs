@@ -437,14 +437,15 @@ impl Observations {
             keep_strings.push(time_c);
             let mut obs_code = [0u8; 4];
             let bytes = obs.obs_code.as_bytes();
-            // Same contract as the ephemeris observer path: truncating a
-            // 4-character MPC code to its 3-byte prefix silently aliases a
-            // different observatory, so over-length codes are an error.
-            if bytes.len() > 3 {
+            // Same contract as the ephemeris observer path: the code rides
+            // into the fixed 4-byte field, left-aligned and NUL-padded, and
+            // a 4-character code fills all four bytes. A code longer than the
+            // field is refused by name rather than truncated — a clipped code
+            // silently aliases a different observatory.
+            if bytes.len() > 4 {
                 return Err(Error::invalid_input(format!(
-                    "observatory code \"{}\" is longer than 3 bytes; \
-                     4-character MPC codes are not yet supported by the \
-                     engine's observatory registry",
+                    "observatory code \"{}\" is longer than the 4-byte MPC code \
+                     field; truncating it would name a different observatory",
                     obs.obs_code
                 )));
             }
@@ -536,14 +537,23 @@ impl Observations {
                 None => Ok(std::ptr::null_mut()),
             }
         }
-        // Pack a station code String into a 4-byte null-padded array
-        // (mirrors how `from_array` packs `obs_code`).
-        fn station_bytes(code: &str) -> [u8; 4] {
-            let mut buf = [0u8; 4];
+        // Pack a station code String into the fixed 4-byte field,
+        // left-aligned and NUL-padded (mirrors how `from_array` packs
+        // `obs_code`). A 4-character code fills all four bytes; a code
+        // longer than the field is refused by name rather than truncated —
+        // a clipped code names a different station.
+        fn station_bytes(code: &str, field: &str) -> Result<[u8; 4]> {
             let bytes = code.as_bytes();
-            let n = bytes.len().min(3);
-            buf[..n].copy_from_slice(&bytes[..n]);
-            buf
+            if bytes.len() > 4 {
+                return Err(Error::invalid_input(format!(
+                    "radar {field} station code \"{code}\" is longer than the \
+                     4-byte MPC code field; truncating it would name a \
+                     different station"
+                )));
+            }
+            let mut buf = [0u8; 4];
+            buf[..bytes.len()].copy_from_slice(bytes);
+            Ok(buf)
         }
         for obs in radar {
             let perm_ptr = opt_str_ptr(&obs.perm_id, "perm_id", &mut keep_strings)?;
@@ -589,8 +599,8 @@ impl Observations {
                 perm_id: perm_ptr,
                 prov_id: prov_ptr,
                 trk_sub: trk_sub_ptr,
-                trx: station_bytes(&obs.trx),
-                rcv: station_bytes(&obs.rcv),
+                trx: station_bytes(&obs.trx, "trx")?,
+                rcv: station_bytes(&obs.rcv, "rcv")?,
                 obs_time: time_ptr,
                 kind,
                 delay_seconds,
@@ -735,25 +745,44 @@ impl Drop for Observations {
 mod tests {
     use super::*;
 
-    /// A 4-character observatory code must be a loud error at the FFI
-    /// boundary: clipped to 3 bytes it would silently alias a different
-    /// observatory.
+    /// A 4-character observatory code round-trips through the OD
+    /// observation-input carrier: it marshals into the 4-byte FFI field and
+    /// reads back byte-for-byte via `observations()`. (Restoring the old
+    /// `min(3)` / reject-over-3 marshal reddens this.)
     #[test]
-    fn four_char_obs_code_is_rejected() {
+    fn four_char_obs_code_round_trips() {
         let obs = Observation {
             obs_code: "W68a".to_string(),
             obs_time: "2026-01-01T00:00:00Z".to_string(),
             ..Observation::default()
         };
+        let marshalled = Observations::from_array(&[obs]).expect("4-character code marshals");
+        let back: Vec<Observation> = marshalled.iter().collect();
+        assert_eq!(
+            back[0].obs_code, "W68a",
+            "the 4-byte field reads back the full code"
+        );
+    }
+
+    /// A 5-character code does not fit the 4-byte field, so it is refused
+    /// by name rather than truncated. (Truncating to four bytes instead of
+    /// refusing reddens this.)
+    #[test]
+    fn five_char_obs_code_is_refused_by_name() {
+        let obs = Observation {
+            obs_code: "W68ab".to_string(),
+            obs_time: "2026-01-01T00:00:00Z".to_string(),
+            ..Observation::default()
+        };
         let err = match Observations::from_array(&[obs]) {
-            Ok(_) => panic!("4-character observatory code must not marshal"),
+            Ok(_) => panic!("5-character observatory code must not marshal"),
             Err(e) => e,
         };
         let msg = err.to_string();
-        assert!(msg.contains("W68a"), "error names the code: {msg}");
+        assert!(msg.contains("W68ab"), "error names the code: {msg}");
         assert!(
-            msg.contains("longer than 3 bytes"),
-            "error states the contract: {msg}"
+            msg.contains("4-byte"),
+            "error states the field width: {msg}"
         );
     }
 

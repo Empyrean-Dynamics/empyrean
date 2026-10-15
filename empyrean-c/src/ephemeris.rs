@@ -8,7 +8,7 @@ use empyrean_core::ephemeris::{
     EphemerisConfig, EphemerisGenerationError, EphemerisPropagationConfig, EphemerisResult,
     generate_ephemeris,
 };
-use empyrean_core::observers::Observer;
+use empyrean_core::observers::{ObservatoryCode, Observer};
 use empyrean_core::orbits::Orbits;
 use empyrean_core::propagation::OrbitOutcome;
 use empyrean_core::time::Epoch;
@@ -139,7 +139,9 @@ pub struct EmpyreanEphemerisEntry {
     /// Total apparent sky-plane rate of motion (degrees/day). NaN if
     /// unavailable.
     pub sky_rate_deg_day: f64,
-    /// Observer code, null-terminated (4 bytes).
+    /// MPC observatory code: left-aligned and NUL-padded in a 4-byte
+    /// field. A 4-character code fills all four bytes (no terminator); a
+    /// shorter code is NUL-padded. Read up to the first NUL.
     pub obs_code: [u8; 4],
     /// 1 when `covariance` / `aberrated_state` / `aberrated_covariance`
     /// below are populated — i.e. the input orbit carried a state
@@ -211,7 +213,9 @@ pub struct EmpyreanObservationSensitivity {
     pub orbit_id: *mut std::ffi::c_char,
     /// Object identifier (owning C string) or null when absent.
     pub object_id: *mut std::ffi::c_char,
-    /// MPC observatory code, null-terminated (4 bytes).
+    /// MPC observatory code: left-aligned and NUL-padded in a 4-byte
+    /// field. A 4-character code fills all four bytes (no terminator); a
+    /// shorter code is NUL-padded. Read up to the first NUL.
     pub obs_code: [u8; 4],
     /// Observation epoch (MJD TDB).
     pub epoch_mjd_tdb: f64,
@@ -611,22 +615,20 @@ pub(crate) fn build_observers_from_c(
                 obs.frame, obs.origin
             ));
         }
-        // The engine's observatory registry keys 3-byte MPC codes. A
-        // 4th byte must not be dropped: the 3-byte prefix would silently
-        // resolve to a DIFFERENT observatory (wrong topocentric geometry,
-        // no diagnostic).
-        if obs.obs_code[3] != 0 {
-            return Err(format!(
-                "observer {i}: observatory code {:?} uses all 4 bytes; \
-                 4-character MPC codes are not yet supported by the \
-                 engine's observatory registry",
-                String::from_utf8_lossy(&obs.obs_code)
-            ));
-        }
-        let mut code = [b' '; 3];
-        for (c, &b) in code.iter_mut().zip(obs.obs_code.iter()) {
-            *c = if b == 0 { b' ' } else { b };
-        }
+        // The 4-byte field is read in full (never clipped to a shorter
+        // prefix, which would name a DIFFERENT observatory). The engine
+        // identifies an observer by an ObservatoryCode of one to four
+        // characters, so the whole NUL-padded field is parsed as that code: a
+        // four-character code names its own observer rather than being refused
+        // or truncated to three bytes.
+        let nul = obs.obs_code.iter().position(|&b| b == 0).unwrap_or(4);
+        let code_str = std::str::from_utf8(&obs.obs_code[..nul]).map_err(|_| {
+            format!(
+                "observer {i}: observatory code bytes {:?} are not valid UTF-8",
+                &obs.obs_code[..nul]
+            )
+        })?;
+        let code: ObservatoryCode = code_str.parse().map_err(|e| format!("observer {i}: {e}"))?;
         let epoch = Epoch::from_mjd_tdb(obs.epoch_mjd_tdb);
         let state = CartesianCoordinates::new(
             epoch,
@@ -973,15 +975,11 @@ pub(crate) fn marshal_ephemeris_result(
             lunar_elongation_deg: ephemeris.lunar_elongation(i).unwrap_or(f64::NAN),
             position_angle_deg: ephemeris.position_angle(i).unwrap_or(f64::NAN),
             sky_rate_deg_day: ephemeris.sky_rate(i).unwrap_or(f64::NAN),
-            obs_code: {
-                let mut c = [0u8; 4];
-                if let Some(o) = obs_opt {
-                    c[0] = o.code[0];
-                    c[1] = o.code[1];
-                    c[2] = o.code[2];
-                }
-                c[3] = 0;
-                c
+            obs_code: match obs_opt {
+                // ObservatoryCode's padded form is the 4-byte NUL-padded
+                // buffer the FFI field carries; copy it across whole.
+                Some(o) => o.code.to_padded_bytes(),
+                None => [0u8; 4],
             },
             has_covariance,
             covariance,
@@ -1003,21 +1001,22 @@ pub(crate) fn marshal_ephemeris_result(
     // non-grav, 9-param) Jacobian/Hessian when present, else the 6-param.
     let mut sens_rows: Vec<EmpyreanObservationSensitivity> = Vec::new();
     for chain in &eph_result.sensitivity {
-        // Engine observatory codes are 3 bytes today (the 4th C-field
-        // byte is the NUL terminator). If the engine ever emits a longer
-        // code, surface it instead of clipping to a prefix that names a
-        // different observatory — the same contract the input paths
-        // enforce.
-        if chain.obs_code().len() > 3 {
+        // The obs code rides into the fixed 4-byte field, left-aligned and
+        // NUL-padded. Engine codes are 3 bytes today, but a code longer than
+        // the field is surfaced by name rather than clipped to a prefix that
+        // names a different observatory — the same contract the other
+        // marshal sites enforce.
+        if chain.obs_code().len() > 4 {
             set_last_error(&format!(
-                "sensitivity chain observatory code \"{}\" is longer than \
-                 3 bytes; 4-character MPC codes are not yet supported",
+                "sensitivity chain observatory code \"{}\" is longer than the \
+                 4-byte MPC code field; truncating it would name a different \
+                 observatory",
                 chain.obs_code()
             ));
             return -1;
         }
         let mut obs_code = [0u8; 4];
-        for (k, b) in chain.obs_code().bytes().take(3).enumerate() {
+        for (k, b) in chain.obs_code().bytes().take(4).enumerate() {
             obs_code[k] = b;
         }
         let frame = frame_to_int(chain.frame());
@@ -1318,24 +1317,26 @@ mod tests {
         build_observers_from_c(&[obs]).expect("a zeroed basis must convert");
     }
 
-    /// A 4-byte observatory code must be a loud error at the C boundary:
-    /// clipped to its 3-byte prefix it would silently alias a different
-    /// observatory.
+    /// A code that fills all four bytes names its own engine observer: the
+    /// engine's key is an `ObservatoryCode` of up to four characters, so the
+    /// full field converts and the engine observer carries all four characters
+    /// rather than the code being refused or clipped to a three-character
+    /// prefix for a different observatory. (Restoring the old `[..3]` decode or
+    /// the over-three refusal reddens this — the code would alias `W68` or be
+    /// rejected.)
     #[test]
-    fn four_byte_obs_code_is_rejected() {
-        let err = build_observers_from_c(&[observer_with_code(*b"W68a")])
-            .expect_err("4-byte observatory code must not convert");
-        assert!(err.contains("W68a"), "error names the code: {err}");
-        assert!(err.contains("4 bytes"), "error states the contract: {err}");
+    fn four_byte_obs_code_converts() {
+        let observers =
+            build_observers_from_c(&[observer_with_code(*b"W68a")]).expect("4-byte code");
+        assert_eq!(observers[0].code.as_str(), "W68a");
     }
 
-    /// NUL-terminated 3-byte codes convert, space-padded to the engine's
-    /// 3-byte registry key.
+    /// NUL-terminated 3-character codes convert, carrying the trimmed code.
     #[test]
     fn three_byte_obs_code_converts() {
         let observers =
             build_observers_from_c(&[observer_with_code(*b"W68\0")]).expect("3-byte code");
-        assert_eq!(observers[0].code, *b"W68");
+        assert_eq!(observers[0].code.as_str(), "W68");
     }
 }
 

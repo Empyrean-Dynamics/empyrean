@@ -170,6 +170,17 @@ pub unsafe extern "C" fn empyrean_query_horizons(
                 return -1;
             }
         };
+        // The record's `obs_code` is marshalled into a fixed 4-byte field.
+        // A longer code is refused by name rather than clipped: a truncated
+        // code names a DIFFERENT observatory (wrong topocentric geometry,
+        // no diagnostic).
+        if obs_code_str.len() > 4 {
+            set_last_error(&format!(
+                "obs_code \"{obs_code_str}\" is longer than the 4-byte MPC code \
+                 field; truncating it would query a different observatory"
+            ));
+            return -1;
+        }
         let cache_path = if cache_dir.is_null() {
             None
         } else {
@@ -224,7 +235,10 @@ pub unsafe extern "C" fn empyrean_query_horizons(
                 .into_raw();
             let mut obs_code_bytes = [0u8; 4];
             let bytes = rec.obs_code.as_bytes();
-            let m = bytes.len().min(3);
+            // Full 4-byte width (obs_code_str, which every record echoes, was
+            // refused above if longer); a 4-character code fills all four
+            // bytes, shorter codes are NUL-padded.
+            let m = bytes.len().min(4);
             obs_code_bytes[..m].copy_from_slice(&bytes[..m]);
             let entry = EmpyreanEphemerisEntry {
                 orbit_id,
@@ -449,6 +463,22 @@ pub unsafe extern "C" fn empyrean_query_observations(
         if n == 0 {
             return 0;
         }
+        // Refuse any over-length station code before building the array, so
+        // a 4-byte-field overflow fails by name rather than being clipped to
+        // a prefix that names a different station, and no partially-built
+        // array needs unwinding.
+        for rec in &records {
+            if let Some(stn) = rec.get("stn").and_then(|x| x.as_str())
+                && stn.len() > 4
+            {
+                set_last_error(&format!(
+                    "MPC observation station code \"{stn}\" is longer than the \
+                     4-byte MPC code field; truncating it would name a different \
+                     station"
+                ));
+                return -1;
+            }
+        }
         let layout = std::alloc::Layout::array::<EmpyreanObservation>(n).unwrap();
         let ptr = unsafe { std::alloc::alloc(layout) } as *mut EmpyreanObservation;
         if ptr.is_null() {
@@ -496,7 +526,11 @@ fn mpc_record_to_empyrean_observation(rec: &serde_json::Value) -> EmpyreanObserv
     let mut obs_code = [0u8; 4];
     if let Some(stn) = rec.get("stn").and_then(|x| x.as_str()) {
         let bytes = stn.as_bytes();
-        let m = bytes.len().min(3);
+        // Full 4-byte width: a 4-character station code fills all four
+        // bytes, shorter codes are NUL-padded. Over-length codes are
+        // refused up front by the caller (see `empyrean_query_observations`)
+        // so this copy never truncates a code it was handed.
+        let m = bytes.len().min(4);
         obs_code[..m].copy_from_slice(&bytes[..m]);
     }
 
@@ -700,6 +734,26 @@ mod tests {
     // Marshaling-level error paths only — no network. The C entry
     // point must reject bad pointers / encodings before any HTTP
     // request is attempted.
+
+    /// A 4-character MPC station code survives the ADES_DF JSON → C
+    /// observation marshal in all four bytes; a shorter code is NUL-padded.
+    /// (Restoring the old `min(3)` pack reddens the 4-character case; the
+    /// engine then names the full code itself downstream.)
+    #[test]
+    fn mpc_record_four_char_station_code_round_trips() {
+        let four = mpc_record_to_empyrean_observation(&serde_json::json!({ "stn": "W68a" }));
+        assert_eq!(
+            &four.obs_code, b"W68a",
+            "4-character stn must fill all four bytes, not be clipped"
+        );
+        let three = mpc_record_to_empyrean_observation(&serde_json::json!({ "stn": "703" }));
+        assert_eq!(&three.obs_code, b"703\0", "shorter stn is NUL-padded");
+        // The marshal always allocates an obs_time C string; reclaim it.
+        unsafe {
+            drop(CString::from_raw(four.obs_time));
+            drop(CString::from_raw(three.obs_time));
+        }
+    }
 
     #[test]
     fn horizons_vectors_null_command_is_rejected() {

@@ -15,7 +15,9 @@ use crate::{EmpyreanContext, set_last_error};
 /// consumer reading a row never has to infer which basis produced it.
 #[repr(C)]
 pub struct EmpyreanObserver {
-    /// MPC 3-character code, null-terminated (4 bytes).
+    /// MPC observatory code: left-aligned and NUL-padded in a 4-byte
+    /// field. A 4-character code fills all four bytes (no terminator); a
+    /// shorter code is NUL-padded. Read up to the first NUL.
     pub obs_code: [u8; 4],
     /// Epoch as MJD TDB.
     pub epoch_mjd_tdb: f64,
@@ -207,12 +209,10 @@ pub unsafe extern "C" fn empyrean_get_observers(
         };
 
         for (i, obs) in observers.iter().enumerate() {
-            // Observer.code is [u8; 3]; pad to 4 with null terminator.
-            let mut obs_code = [0u8; 4];
-            obs_code[0] = obs.code[0];
-            obs_code[1] = obs.code[1];
-            obs_code[2] = obs.code[2];
-            obs_code[3] = 0;
+            // Observer.code is an ObservatoryCode of one to four characters;
+            // its padded form is the 4-byte NUL-padded buffer this FFI field
+            // holds, copied across without re-padding or clipping a prefix.
+            let obs_code = obs.code.to_padded_bytes();
 
             let observing_night = obs.observing_night.map(|n| n as i32).unwrap_or(-1);
 
@@ -248,7 +248,7 @@ pub unsafe extern "C" fn empyrean_get_observers(
                         set_last_error(&format!(
                             "observer {} came back on an origin with no NAIF id \
                              (an MPC site code), which cannot be marshaled",
-                            String::from_utf8_lossy(&obs.code)
+                            obs.code.as_str()
                         ));
                         // The array is raw-allocated and partially
                         // written; release it rather than leak, then fail.

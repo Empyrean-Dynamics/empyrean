@@ -77,8 +77,17 @@ fn residuals_to_ffi_array(
         .map(|r| {
             let mut code = [0u8; 4];
             let bytes = r.obs_code.as_bytes();
-            let take = bytes.len().min(3);
-            code[..take].copy_from_slice(&bytes[..take]);
+            // Full 4-byte width, left-aligned and NUL-padded; a code longer
+            // than the field is refused by name rather than clipped to a
+            // prefix that names a different observatory.
+            if bytes.len() > 4 {
+                return Err(Error::invalid_input(format!(
+                    "observatory code \"{}\" is longer than the 4-byte MPC code \
+                     field; truncating it would name a different observatory",
+                    r.obs_code
+                )));
+            }
+            code[..bytes.len()].copy_from_slice(bytes);
             Ok(empyrean_sys::EmpyreanObservationResult {
                 obs_id: opt_str_ptr(&r.obs_id, keep_strings),
                 // The grouping key travels with the row, so a residual

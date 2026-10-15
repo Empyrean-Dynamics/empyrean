@@ -1541,7 +1541,7 @@ impl Default for EmpyreanPropagationResult {
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
 pub struct EmpyreanObserver {
-    #[doc = " MPC 3-character code, null-terminated (4 bytes)."]
+    #[doc = " MPC observatory code: left-aligned and NUL-padded in a 4-byte\n field. A 4-character code fills all four bytes (no terminator); a\n shorter code is NUL-padded. Read up to the first NUL."]
     pub obs_code: [u8; 4usize],
     #[doc = " Epoch as MJD TDB."]
     pub epoch_mjd_tdb: f64,
@@ -1665,7 +1665,7 @@ pub struct EmpyreanEphemerisEntry {
     pub position_angle_deg: f64,
     #[doc = " Total apparent sky-plane rate of motion (degrees/day). NaN if\n unavailable."]
     pub sky_rate_deg_day: f64,
-    #[doc = " Observer code, null-terminated (4 bytes)."]
+    #[doc = " MPC observatory code: left-aligned and NUL-padded in a 4-byte\n field. A 4-character code fills all four bytes (no terminator); a\n shorter code is NUL-padded. Read up to the first NUL."]
     pub obs_code: [u8; 4usize],
     #[doc = " 1 when `covariance` / `aberrated_state` / `aberrated_covariance`\n below are populated — i.e. the input orbit carried a state\n covariance and the STM/uncertainty path ran; 0 otherwise."]
     pub has_covariance: u8,
@@ -1769,7 +1769,7 @@ pub struct EmpyreanObservationSensitivity {
     pub orbit_id: *mut ::std::os::raw::c_char,
     #[doc = " Object identifier (owning C string) or null when absent."]
     pub object_id: *mut ::std::os::raw::c_char,
-    #[doc = " MPC observatory code, null-terminated (4 bytes)."]
+    #[doc = " MPC observatory code: left-aligned and NUL-padded in a 4-byte\n field. A 4-character code fills all four bytes (no terminator); a\n shorter code is NUL-padded. Read up to the first NUL."]
     pub obs_code: [u8; 4usize],
     #[doc = " Observation epoch (MJD TDB)."]
     pub epoch_mjd_tdb: f64,
@@ -1875,7 +1875,7 @@ impl Default for EmpyreanEphemerisResult {
         }
     }
 }
-#[doc = " A single optical observation for orbit determination — full ADES schema.\n\n String fields are nullable (`null` pointer = absent). Float fields\n use NaN as the absent sentinel. The `n_stars` integer uses `-1` as\n the absent sentinel (since `u32::MAX` is a valid count). The\n `obs_code` is fixed-size 4-byte null-padded to keep the common case\n allocation-free.\n\n Mirrors scott's `OpticalObservation` field-for-field — every named\n PSV column round-trips losslessly except for ADES extension fields\n not yet in the upstream schema."]
+#[doc = " A single optical observation for orbit determination — full ADES schema.\n\n String fields are nullable (`null` pointer = absent). Float fields\n use NaN as the absent sentinel. The `n_stars` integer uses `-1` as\n the absent sentinel (since `u32::MAX` is a valid count). The\n `obs_code` is a fixed-size 4-byte field, left-aligned and NUL-padded,\n to keep the common case allocation-free. A 4-character code fills all\n four bytes; a code longer than four bytes is refused by name at the\n FFI boundary, never truncated.\n\n Mirrors scott's `OpticalObservation` field-for-field — every named\n PSV column round-trips losslessly except for ADES extension fields\n not yet in the upstream schema."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct EmpyreanObservation {
@@ -1891,7 +1891,7 @@ pub struct EmpyreanObservation {
     pub obs_sub_id: *mut ::std::os::raw::c_char,
     #[doc = " Track identifier (`trkID`, nullable)."]
     pub trk_id: *mut ::std::os::raw::c_char,
-    #[doc = " MPC observatory code, null-padded to 4 bytes."]
+    #[doc = " MPC observatory code: left-aligned and NUL-padded in a 4-byte\n field. A 4-character code fills all four bytes (no terminator); a\n code longer than four bytes is refused by name, never truncated."]
     pub obs_code: [u8; 4usize],
     #[doc = " Observation mode (CCD, CMOS, etc.) (nullable)."]
     pub mode: *mut ::std::os::raw::c_char,
@@ -2036,9 +2036,9 @@ pub struct EmpyreanRadarObservation {
     pub prov_id: *mut ::std::os::raw::c_char,
     #[doc = " Observer-assigned tracklet identifier (nullable)."]
     pub trk_sub: *mut ::std::os::raw::c_char,
-    #[doc = " MPC station code of the **transmitting** antenna (ADES `trx`),\n null-padded to 4 bytes."]
+    #[doc = " MPC station code of the **transmitting** antenna (ADES `trx`),\n left-aligned and NUL-padded in a 4-byte field. A 4-character code\n fills all four bytes; a longer code is refused by name, never\n truncated."]
     pub trx: [u8; 4usize],
-    #[doc = " MPC station code of the **receiving** antenna (ADES `rcv`),\n null-padded to 4 bytes. Equal to `trx` for a monostatic\n observation; differs for a bistatic one."]
+    #[doc = " MPC station code of the **receiving** antenna (ADES `rcv`),\n left-aligned and NUL-padded in a 4-byte field (same width/refusal\n contract as `trx`). Equal to `trx` for a monostatic observation;\n differs for a bistatic one."]
     pub rcv: [u8; 4usize],
     #[doc = " Observation epoch as an ISO 8601 UTC string. For radar this is the\n **receive** epoch (the time the returned signal is recorded).\n Required, non-null."]
     pub obs_time: *mut ::std::os::raw::c_char,
@@ -2636,7 +2636,7 @@ pub struct EmpyreanObservationResult {
     pub obs_id: *mut ::std::os::raw::c_char,
     #[doc = " ADES object identifier (permID / provID / trkSub) of the object\n this row was fitted against. Populated by\n [`empyrean_determine`], which groups by object — so a caller may\n concatenate every object's rows into one flat table and still\n know which fit each row belongs to.\n\n Null on the single-object paths (`empyrean_evaluate`,\n `empyrean_refine`), where the caller supplied the one orbit and\n no grouping key exists. Owned by the parent array."]
     pub object_id: *mut ::std::os::raw::c_char,
-    #[doc = " MPC observatory code (3-byte + NUL)."]
+    #[doc = " MPC observatory code: left-aligned and NUL-padded in a 4-byte\n field. A 4-character code fills all four bytes (no terminator); a\n shorter code is NUL-padded. Read up to the first NUL."]
     pub obs_code: [u8; 4usize],
     #[doc = " Star catalog used for astrometric reduction (ADES `astCat`).\n Heap-allocated; null when ADES did not carry one. Freed with the array."]
     pub ast_cat: *mut ::std::os::raw::c_char,

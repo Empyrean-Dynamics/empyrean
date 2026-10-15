@@ -4596,6 +4596,7 @@ fn rejection_reason_str(r: empyrean::RejectionReason) -> &'static str {
         R::Adaptive => "adaptive",
         R::UnsupportedObservatory => "unsupported_observatory",
         R::CMC2003 => "cmc2003",
+        R::Blunder => "blunder",
         R::RadarObservationsUnsupported => "radar_observations_unsupported",
         R::OccultationObservationsUnsupported => "occultation_observations_unsupported",
         R::OutsideArc => "outside_arc",
@@ -5259,6 +5260,7 @@ fn determine_failure_kind_str(kind: empyrean::DetermineFailureKind) -> String {
     match kind {
         K::ObservationConversion => "observation_conversion".to_string(),
         K::ObserverConstruction => "observer_construction".to_string(),
+        K::UnknownObservatoryCode => "unknown_observatory_code".to_string(),
         K::UnsupportedCoordinateSystem => "unsupported_coordinate_system".to_string(),
         K::EarthOrientationCoverage => "earth_orientation_coverage".to_string(),
         K::IOD => "iod".to_string(),
@@ -5984,6 +5986,9 @@ fn build_od_config_from_dict(d: &Bound<'_, PyDict>) -> PyResult<empyrean::ODConf
                             start_epoch_mjd_tdb: start,
                             end_epoch_mjd_tdb: end,
                             scale,
+                            // Per-station noise model is a follow-up on the
+                            // Python surface; inherit the global law.
+                            noise_model: None,
                         }
                     }
                     "nightly_deweighting" => {
@@ -6306,7 +6311,11 @@ fn build_od_config_from_dict(d: &Bound<'_, PyDict>) -> PyResult<empyrean::ODConf
     // ── Rejection ─────────────────────────────────────────────────
     if let Some(rej) = get_dict(d, "rejection")? {
         if let Some(v) = get_bool(&rej, "enabled")? {
-            cfg.rejection.enabled = v;
+            // The wrapper's `enabled` is a tri-state (`Option<bool>`); the
+            // Python surface exposes the boolean, so an explicit value maps
+            // to `Some`. (Selecting the engine-default `None`, and the
+            // noise-model surface, are a follow-up.)
+            cfg.rejection.enabled = Some(v);
         }
         if let Some(s) = get_str(&rej, "kind")? {
             cfg.rejection.kind = match s.to_ascii_lowercase().as_str() {
@@ -7722,6 +7731,17 @@ fn pydict_to_residuals(dict: &Bound<'_, PyDict>) -> PyResult<Vec<empyrean::Obser
             influence_information_loss: f(&infl_loss, i),
             along_cross_covariance_arcsec2: f(&at_ct_cov, i),
             radar,
+            // The Python residual table does not yet carry the observation
+            // noise-model columns (a follow-up), so a round-trip through it
+            // reconstructs them as absent rather than fabricating values.
+            noise_model: empyrean::DeliveredNoiseModel::Known(empyrean::NoiseModel::Gaussian),
+            robust_weight: f64::NAN,
+            sigma_ra_used_arcsec: f64::NAN,
+            sigma_dec_used_arcsec: f64::NAN,
+            sigma_eff_ra_arcsec: f64::NAN,
+            sigma_eff_dec_arcsec: f64::NAN,
+            sigma_source: empyrean::SigmaSource::NotWeighted,
+            sigma_scale_applied: f64::NAN,
         });
     }
     Ok(out)

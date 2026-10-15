@@ -139,6 +139,14 @@ fn base_residual() -> ObservationResidual {
         influence_information_loss: f64::NAN,
         along_cross_covariance_arcsec2: f64::NAN,
         radar: None,
+        noise_model: empyrean::DeliveredNoiseModel::Known(empyrean::NoiseModel::Gaussian),
+        robust_weight: 1.0,
+        sigma_ra_used_arcsec: f64::NAN,
+        sigma_dec_used_arcsec: f64::NAN,
+        sigma_eff_ra_arcsec: f64::NAN,
+        sigma_eff_dec_arcsec: f64::NAN,
+        sigma_source: empyrean::SigmaSource::NotWeighted,
+        sigma_scale_applied: 1.0,
     }
 }
 

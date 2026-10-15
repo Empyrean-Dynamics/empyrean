@@ -356,7 +356,11 @@ class AcceptabilityReport:
     occultation stub rows that were never candidates for outlier
     pruning, so its ratio is a different (smaller) number."""
     selection_fraction_value: float
-    """Fraction of observations retained (n_selected / n_obs)."""
+    """Fraction of the **submitted** optical observations retained. The
+    denominator is the optical rows the caller submitted (after the mode
+    partition), so a row dropped at observer construction — an unresolvable
+    site, an unsupported mode — counts as not selected, just like an
+    outlier the fit pruned."""
     selection_fraction_threshold: float
     """Minimum retained fraction the gate required."""
 

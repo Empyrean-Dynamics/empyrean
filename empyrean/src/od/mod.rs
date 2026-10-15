@@ -68,14 +68,17 @@ pub use nuisance::StationRaDecConfig;
 pub use observation::{Observation, Observations, RadarMeasurement, RadarObservation};
 pub use rejection::{RejectionConfig, RejectionKind};
 pub use result::{
-    AcceptabilityReport, BandStat, CovarianceRepresentation, CovarianceTrust, DetermineEntry,
-    DetermineFailure, DetermineFailureKind, DetermineResult, DetermineResults, EvaluateResult,
-    GateRecord, MAX_THRUST_SEGMENTS, ObservationResidual, OriginPolicy, OutputEpoch,
-    PhotometryModel, PhotometryResult, RadarResidual, RadarResidualKind, RejectionReason,
-    ResidualSummary, SolveFor, SolveForParams, SolvedCovariance, SolverStop, StallDelivery,
-    StationBias, TrustGateEvent,
+    AcceptabilityReport, BandStat, CovarianceRepresentation, CovarianceTrust, DeliveredNoiseModel,
+    DeliveredRejectionKind, DetermineEntry, DetermineFailure, DetermineFailureKind,
+    DetermineResult, DetermineResults, EvaluateResult, GateRecord, MAX_THRUST_SEGMENTS, ODError,
+    ObservationResidual, OriginPolicy, OutputEpoch, PhotometryModel, PhotometryResult,
+    RadarResidual, RadarResidualKind, RejectionReason, ResidualSummary, SigmaSource, SolveFor,
+    SolveForParams, SolvedCovariance, SolverStop, StallDelivery, StationBias, TrustGateEvent,
 };
-pub use weighting::{SigmaPolicy, WeightingConfig, WeightingLayer, WeightingPreset};
+pub use weighting::{
+    CovarianceInformation, NoiseModel, SigmaPolicy, WeightingConfig, WeightingLayer,
+    WeightingPreset,
+};
 
 use std::ffi::CString;
 
@@ -479,6 +482,8 @@ fn ffi_determine_results_to_rust(
                 object_id: object_id.clone(),
                 message: ffi_string(slot.error),
                 kind: DetermineFailureKind::from_code(slot.error_code),
+                od_error: (slot.od_error_code != empyrean_sys::EMPYREAN_OD_ERROR_NONE as i32)
+                    .then(|| ODError::from_code(slot.od_error_code)),
             })
         };
         entries.push(DetermineEntry { object_id, outcome });
@@ -597,6 +602,8 @@ fn ffi_od_result_to_rust(
         covariance_9x9: (result.has_covariance_9x9 != 0).then_some(result.covariance_9x9),
         non_grav_delta: (result.has_non_grav_delta != 0).then_some(result.non_grav_delta),
         rejection_passes: result.rejection_passes,
+        rejection_kind: result::rejection_kind_from_ffi(result.rejection_kind),
+        rejection_enabled: result.rejection_enabled != 0,
         num_oppositions_fit: result.num_oppositions_fit,
         force_model_used,
         // Reconstruct the solved axes: an Explicit fit's exact set is

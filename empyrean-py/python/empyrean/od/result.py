@@ -1329,11 +1329,17 @@ class DetermineFailure:
     kind: str
     """Classified cause, as a stable snake_case name — ``"iod"``,
     ``"od"``, ``"radar_only"``, ``"observer_construction"``,
-    ``"earth_orientation_coverage"``, ``"observation_conversion"``,
-    ``"unsupported_coordinate_system"``, ``"duplicate_obs_ids"``,
-    ``"non_grav_not_recovered"``, or ``"unknown_<code>"`` for a cause
-    this build of the bindings does not name. Branch on this rather than
-    on :attr:`message`."""
+    ``"unknown_observatory_code"``, ``"earth_orientation_coverage"``,
+    ``"observation_conversion"``, ``"unsupported_coordinate_system"``,
+    ``"duplicate_obs_ids"``, ``"non_grav_not_recovered"``, or
+    ``"unknown_<code>"`` for a cause this build of the bindings does not
+    name. Branch on this rather than on :attr:`message`.
+
+    ``"unknown_observatory_code"`` is a hard refusal, never a deselect: an
+    observation naming a site in no loaded registry and matching no station
+    table fails the object by name (the code and its observation index are
+    in :attr:`message`), rather than being silently skipped or placed at a
+    fallback geometry."""
 
 
 @dataclass

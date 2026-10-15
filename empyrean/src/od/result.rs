@@ -29,6 +29,11 @@ pub enum RejectionReason {
     UnsupportedObservatory,
     /// Rejected by Carpino–Milani–Chesley (2003) χ²-with-hysteresis scheme.
     CMC2003,
+    /// Rejected by the blunder gate — the CMC2003 hysteresis mechanics at
+    /// blunder scale (χ² 100 / 81, a 10σ test). A data error, not a
+    /// statistical outlier: distinct from [`CMC2003`](Self::CMC2003), which
+    /// is the same mechanics at 3σ outlier scale.
+    Blunder,
     /// Skipped because the observation mode is `RAD` (radar). The
     /// optical-only fitter cannot fold radar range / Doppler measurements.
     RadarObservationsUnsupported,
@@ -71,8 +76,138 @@ impl RejectionReason {
             9 => RejectionReason::OutsideArc,
             10 => RejectionReason::NonFiniteChi2,
             11 => RejectionReason::MissingJacobian,
+            16 => RejectionReason::Blunder,
             _ => RejectionReason::NotEvaluated,
         }
+    }
+}
+
+/// Which branch of the weighting pipeline supplied a delivered row's base
+/// σ. Not recoverable from the σ itself: a floor destroys the value it
+/// replaced, so the branch is recorded where it is taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SigmaSource {
+    /// The record's own reported σ (ADES `rmsRA` / `rmsDec`), used
+    /// verbatim. Also every delivered radar row.
+    Reported,
+    /// A station rule a preset constructor installed from a published
+    /// floors table (VFCC2017 / NEODyS).
+    Preset,
+    /// A caller-written [`WeightingLayer::ObservatoryRule`](super::weighting::WeightingLayer::ObservatoryRule)
+    /// carrying no preset stamp.
+    Layer,
+    /// [`WeightingConfig::default_sigma_arcsec`](super::weighting::WeightingConfig::default_sigma_arcsec)
+    /// — no record or rule supplied a σ, or the floor fallback applied it.
+    Default,
+    /// The row carries no weighted σ at all (its σ columns are NaN): a
+    /// skipped stub, an IOD output, or a span-grouped row never evaluated.
+    NotWeighted,
+    /// The engine reported a σ-provenance this build does not model (a
+    /// variant added upstream after these bindings were generated).
+    /// Distinct from [`NotWeighted`](Self::NotWeighted): a row weighted by
+    /// an unknown branch was still weighted, never reported as unweighted.
+    Unknown,
+}
+
+impl SigmaSource {
+    fn from_int(v: u8) -> Self {
+        match v as u32 {
+            empyrean_sys::EMPYREAN_SIGMA_SOURCE_REPORTED => SigmaSource::Reported,
+            empyrean_sys::EMPYREAN_SIGMA_SOURCE_PRESET => SigmaSource::Preset,
+            empyrean_sys::EMPYREAN_SIGMA_SOURCE_LAYER => SigmaSource::Layer,
+            empyrean_sys::EMPYREAN_SIGMA_SOURCE_DEFAULT => SigmaSource::Default,
+            empyrean_sys::EMPYREAN_SIGMA_SOURCE_NOT_WEIGHTED => SigmaSource::NotWeighted,
+            // Every unrecognised code (including EMPYREAN_SIGMA_SOURCE_UNKNOWN)
+            // decodes to Unknown — never silently to NotWeighted.
+            _ => SigmaSource::Unknown,
+        }
+    }
+}
+
+/// The error **law** a delivered row was fitted under.
+///
+/// A delivered-value type, distinct from the config-input
+/// [`NoiseModel`](super::weighting::NoiseModel): the wrapper and
+/// `libempyrean` are separately versioned and loaded at run time, so a
+/// newer library can mint a law tag this build does not know. Such a tag
+/// surfaces as [`Unknown`](Self::Unknown) carrying the raw wire value —
+/// never silently as a valid law — mirroring
+/// [`DetermineFailureKind::Unknown`] and [`SigmaSource::Unknown`]. The
+/// config input enum stays constructible only with valid laws.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DeliveredNoiseModel {
+    /// A law this build knows.
+    Known(super::weighting::NoiseModel),
+    /// A law tag the loaded library minted that this wrapper does not
+    /// model — the raw wire value, kept verbatim. Its appearance means the
+    /// library is newer than the wrapper.
+    Unknown(u8),
+}
+
+impl DeliveredNoiseModel {
+    /// Pack into the C-ABI tagged value, round-tripping an
+    /// [`Unknown`](Self::Unknown) tag verbatim (with `nu = NaN`).
+    pub(crate) fn to_ffi(self) -> empyrean_sys::EmpyreanNoiseModel {
+        match self {
+            DeliveredNoiseModel::Known(nm) => nm.to_ffi(),
+            DeliveredNoiseModel::Unknown(tag) => {
+                empyrean_sys::EmpyreanNoiseModel { tag, nu: f64::NAN }
+            }
+        }
+    }
+}
+
+/// The outlier-rejection gate a fit was configured with, as delivered.
+///
+/// A delivered-value type, distinct from the config-input
+/// [`RejectionKind`](super::rejection::RejectionKind), for the same
+/// separately-versioned reason as [`DeliveredNoiseModel`]: an unknown gate
+/// tag surfaces as [`Unknown`](Self::Unknown) with the raw value, never as
+/// a valid gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveredRejectionKind {
+    /// A gate this build knows.
+    Known(super::rejection::RejectionKind),
+    /// A gate tag the loaded library minted that this wrapper does not
+    /// model — the raw wire value, kept verbatim.
+    Unknown(u8),
+}
+
+/// Decode the per-row noise-model tag + ν the engine delivered. An
+/// unrecognised tag is kept as [`DeliveredNoiseModel::Unknown`], never
+/// decoded to a valid law (the library may be newer than the wrapper).
+fn noise_model_from_ffi(tag: u8, nu: f64) -> DeliveredNoiseModel {
+    use super::weighting::NoiseModel;
+    match tag as u32 {
+        empyrean_sys::EMPYREAN_NOISE_MODEL_GAUSSIAN => {
+            DeliveredNoiseModel::Known(NoiseModel::Gaussian)
+        }
+        empyrean_sys::EMPYREAN_NOISE_MODEL_STUDENT_T => {
+            DeliveredNoiseModel::Known(NoiseModel::StudentT { nu })
+        }
+        empyrean_sys::EMPYREAN_NOISE_MODEL_NIGHT_SCALE => {
+            DeliveredNoiseModel::Known(NoiseModel::NightScale { nu })
+        }
+        _ => DeliveredNoiseModel::Unknown(tag),
+    }
+}
+
+/// Decode the configured outlier-rejection gate tag the engine delivered.
+/// An unrecognised tag is kept as [`DeliveredRejectionKind::Unknown`],
+/// never decoded to a valid gate.
+pub(super) fn rejection_kind_from_ffi(v: u8) -> DeliveredRejectionKind {
+    use super::rejection::RejectionKind;
+    match v as u32 {
+        empyrean_sys::EMPYREAN_REJECTION_KIND_ADAPTIVE => {
+            DeliveredRejectionKind::Known(RejectionKind::Adaptive)
+        }
+        empyrean_sys::EMPYREAN_REJECTION_KIND_CMC2003 => {
+            DeliveredRejectionKind::Known(RejectionKind::CMC2003)
+        }
+        empyrean_sys::EMPYREAN_REJECTION_KIND_BLUNDER => {
+            DeliveredRejectionKind::Known(RejectionKind::Blunder)
+        }
+        _ => DeliveredRejectionKind::Unknown(v),
     }
 }
 
@@ -159,6 +294,43 @@ pub struct ObservationResidual {
     /// observations; on radar rows the optical RA/Dec residual fields
     /// are NaN.
     pub radar: Option<RadarResidual>,
+    /// The error **law** this row was fitted under — the global
+    /// [`WeightingConfig::noise_model`](super::weighting::WeightingConfig::noise_model)
+    /// or the per-station override a rule set for it.
+    /// [`DeliveredNoiseModel::Known(NoiseModel::Gaussian)`](DeliveredNoiseModel)
+    /// on a default fit and on every radar row;
+    /// [`DeliveredNoiseModel::Unknown`] if the loaded library is newer than
+    /// this wrapper.
+    pub noise_model: DeliveredNoiseModel,
+    /// The law's per-row **robust weight** \\(w = \nu/(\nu+\delta^2) \in
+    /// (0,1]\\) — its down-weighting of this row alone. Exactly `1.0` under
+    /// the Gaussian law; smaller for a large residual under a heavy-tailed
+    /// law. The quantity the summary [`n_eff`](ResidualSummary::n_eff) is
+    /// defined over.
+    pub robust_weight: f64,
+    /// The RA·cos(Dec) **1σ the fit actually weighted this row with**
+    /// (arcsec), every weighting layer folded in. NaN on skipped stubs and
+    /// radar rows.
+    pub sigma_ra_used_arcsec: f64,
+    /// The Dec **1σ the fit actually weighted this row with** (arcsec); see
+    /// [`sigma_ra_used_arcsec`](Self::sigma_ra_used_arcsec).
+    pub sigma_dec_used_arcsec: f64,
+    /// The RA·cos(Dec) **effective 1σ** \\(\sigma_\text{eff} =
+    /// \sigma_\text{used}/\sqrt{w}\\) (arcsec): the fitted σ inflated by the
+    /// law's down-weighting [`robust_weight`](Self::robust_weight). Equals
+    /// [`sigma_ra_used_arcsec`](Self::sigma_ra_used_arcsec) under the
+    /// Gaussian law, and is `≥` it in general.
+    pub sigma_eff_ra_arcsec: f64,
+    /// The Dec effective 1σ (arcsec); see
+    /// [`sigma_eff_ra_arcsec`](Self::sigma_eff_ra_arcsec).
+    pub sigma_eff_dec_arcsec: f64,
+    /// Which branch of the weighting pipeline supplied this row's base σ.
+    pub sigma_source: SigmaSource,
+    /// The single factor by which this row's base σ was inflated to reach
+    /// [`sigma_ra_used_arcsec`](Self::sigma_ra_used_arcsec) — the product of
+    /// the observatory-rule scale and the nightly-batch factor. `1.0` when
+    /// no layer scaled the row. Excludes the floor.
+    pub sigma_scale_applied: f64,
 }
 
 /// Which radar observable a [`RadarResidual`] refers to.
@@ -254,6 +426,14 @@ impl ObservationResidual {
                 probability: r.radar_probability,
                 variance: r.radar_variance.is_finite().then_some(r.radar_variance),
             }),
+            noise_model: noise_model_from_ffi(r.noise_model, r.noise_model_nu),
+            robust_weight: r.robust_weight,
+            sigma_ra_used_arcsec: r.sigma_ra_used_arcsec,
+            sigma_dec_used_arcsec: r.sigma_dec_used_arcsec,
+            sigma_eff_ra_arcsec: r.sigma_eff_ra_arcsec,
+            sigma_eff_dec_arcsec: r.sigma_eff_dec_arcsec,
+            sigma_source: SigmaSource::from_int(r.sigma_source),
+            sigma_scale_applied: r.sigma_scale_applied,
         }
     }
 }
@@ -268,6 +448,20 @@ pub struct ResidualSummary {
     pub num_selected: usize,
     /// Observations rejected.
     pub num_rejected: usize,
+    /// **Effective** number of selected observations
+    /// \\(n_\text{eff} = (\sum_i w_i)^2 / \sum_i w_i^2\\), with \\(w_i\\) the
+    /// per-row [`robust_weight`](ObservationResidual::robust_weight). Equals
+    /// [`num_selected`](Self::num_selected) under the Gaussian law; smaller
+    /// under a heavy-tailed law. `0.0` when nothing was selected.
+    pub n_eff: f64,
+    /// Law-aware calibration reference: the median of the nominal 2-DOF
+    /// Mahalanobis distance \\(d^2 = r^\top W r\\) the configured law
+    /// predicts. \\(2\ln 2 \approx 1.386\\) under the Gaussian law.
+    pub expected_median_d2: f64,
+    /// Law-aware calibration reference: the fraction of rows the configured
+    /// law predicts beyond the 3σ ellipse (\\(d^2 > 9\\)).
+    /// \\(e^{-4.5} \approx 0.011\\) under the Gaussian law.
+    pub expected_tail: f64,
     /// χ² of selected observations.
     pub chi2: f64,
     /// Effective degrees of freedom.
@@ -307,6 +501,9 @@ impl ResidualSummary {
             num_obs: s.num_obs,
             num_selected: s.num_selected,
             num_rejected: s.num_rejected,
+            n_eff: s.n_eff,
+            expected_median_d2: s.expected_median_d2,
+            expected_tail: s.expected_tail,
             chi2: s.chi2,
             dof: s.dof,
             reduced_chi2: s.reduced_chi2,
@@ -664,7 +861,11 @@ pub struct AcceptabilityReport {
     /// occultation stub rows that were never candidates for outlier
     /// pruning, so its ratio is a different (smaller) number.
     pub selection_fraction_ok: bool,
-    /// Fraction of observations retained (n_selected / n_obs).
+    /// Fraction of the SUBMITTED optical observations retained. The
+    /// denominator is the optical rows the caller submitted (after the mode
+    /// partition), so a row dropped at observer construction — an
+    /// unresolvable site, an unsupported mode — counts as not selected,
+    /// just like an outlier the fit pruned.
     pub selection_fraction_value: f64,
     /// Minimum retained fraction the gate required.
     pub selection_fraction_threshold: f64,
@@ -1417,6 +1618,17 @@ pub struct DetermineResult {
     pub non_grav_delta: Option<[f64; 3]>,
     /// Number of rejection-refit passes performed.
     pub rejection_passes: u32,
+    /// The outlier-rejection gate this fit was configured with — named
+    /// whether or not it ran (read it beside
+    /// [`rejection_enabled`](Self::rejection_enabled)).
+    /// [`DeliveredRejectionKind::Unknown`] if the loaded library is newer
+    /// than this wrapper.
+    pub rejection_kind: DeliveredRejectionKind,
+    /// Whether outlier rejection actually ran this fit — the engine's
+    /// resolution of the [`RejectionConfig::enabled`](super::rejection::RejectionConfig::enabled)
+    /// tri-state. When `false`, [`rejection_kind`](Self::rejection_kind)
+    /// names a gate that never ran.
+    pub rejection_enabled: bool,
     /// Number of oppositions fit.
     pub num_oppositions_fit: u32,
     /// Force model tier actually used.
@@ -1605,6 +1817,233 @@ pub struct EvaluateResult {
     pub summary: ResidualSummary,
 }
 
+/// The specific differential-correction error behind a
+/// [`DetermineFailureKind::OD`] failure.
+///
+/// One variant per engine `ODError`, names identical to the engine's, so a
+/// caller can branch on the exact cause instead of matching the message
+/// string. Codes only: variant payloads the engine carries (a count, a
+/// threshold, an observatory code) are not reproduced here — read
+/// [`DetermineFailure::message`] for them. A code newer than this build
+/// decodes to [`Unknown`](Self::Unknown) keeping the raw value, never a
+/// valid-looking variant (the wrapper and `libempyrean` are separately
+/// versioned).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ODError {
+    /// Initial orbit is not in Cartesian representation.
+    NotCartesian,
+    /// Initial orbit carries no covariance, required for Jet propagation.
+    NoCovarianceOnOrbit,
+    /// The requested uncertainty method has no honest implementation on
+    /// this entry point; refused, not silently downgraded.
+    UnsupportedUncertaintyMethod,
+    /// The orbit collection did not contain exactly one orbit.
+    NotSingleOrbit,
+    /// Ephemeris generation failed during the fit.
+    EphemerisGeneration,
+    /// The normal matrix is singular — no state correction can be solved.
+    SingularNormalMatrix,
+    /// No observations carried valid Jacobians / STMs to fit against.
+    NoValidObservations,
+    /// A batch orbit's map key matched no observation group.
+    NoObservationsForOrbit,
+    /// The solve did not reach a deliverable iterate.
+    NotConverged,
+    /// Every rung of a retry ladder failed.
+    RetryLadderExhausted,
+    /// Consecutive non-finite trial costs with no underlying domain error.
+    NonFiniteTrialCosts,
+    /// A full evaluation at the initial point was non-finite or negative.
+    NonFiniteEvaluation,
+    /// Nearest-perihelion output epoch requested for a non-heliocentric fit.
+    PerihelionEpochRequiresHeliocentric,
+    /// Nearest-perihelion resolution produced a non-finite time (near-parabolic).
+    PerihelionEpochNonFinite,
+    /// The solver reported a contract violation (a bug in the problem mapping).
+    SolverContractViolation,
+    /// A user-settable solver knob holds an invalid value.
+    InvalidSolverConfig,
+    /// A solver knob was set that names a code path this engine no longer has.
+    RetiredSolverKnob,
+    /// The Bayesian prior could not be built from the orbit's covariance.
+    PriorConstruction,
+    /// A thrust Δv solve was requested but the orbit declares no burn arcs.
+    ThrustParamsMissing,
+    /// A thrust request reaches past the orbit's declared correction covariances.
+    ThrustPriorMismatch,
+    /// An axis is considered but the fit runs without an orbit prior.
+    ConsiderPriorUnavailable,
+    /// A solved thrust segment's burn window lies off the propagation path.
+    ManeuverNotBracketed,
+    /// A DT (thermal-lag) solve was requested but the orbit carries no DT value.
+    NonGravDTMissing,
+    /// A DT solve was requested but its variance is absent.
+    DTPriorMissing,
+    /// A solved covariance carried a width the representation transform does
+    /// not support (a version skew).
+    UnsupportedSolvedWidth,
+    /// An AMRAT solve was requested but the orbit carries no SRP force.
+    SRPParamsMissing,
+    /// An AMRAT solve was requested but its variance is absent.
+    AMRATPriorMissing,
+    /// A converged AMRAT solve delivered a non-physical area-to-mass ratio.
+    AMRATNotPhysical,
+    /// Multi-opposition arc truncation was needed but disabled.
+    ArcTruncationDisabled,
+    /// An observation's reported σ is non-finite or non-positive.
+    InvalidObservationUncertainty,
+    /// Observation conversion failed (time parsing, malformed record).
+    ObservationConversion,
+    /// Observer construction failed (unknown obs code, epoch out of range).
+    ObserverConstruction,
+    /// The loaded Earth-orientation (BPC) coverage does not span the observations.
+    EarthOrientationCoverageIncomplete,
+    /// IOD returned a physically pathological orbit.
+    PathologicalIOD,
+    /// Propagation asked for a body position outside the loaded SPK coverage.
+    PropagationOutOfCoverage,
+    /// The requested output representation is unsupported for a fitted orbit.
+    UnsupportedOutputRepresentation,
+    /// Transforming the fit into the requested representation failed (degenerate).
+    DegenerateRepresentation,
+    /// The explicitly requested post-OD photometric fit failed.
+    PhotometricFit,
+    /// A non-Gaussian noise model was configured with outlier rejection left
+    /// at the engine default — refused rather than a trimmed-t fit by accident.
+    NoiseModelRejectionUnset,
+    /// A fit was configured with the night-scale law, refused by name in v1.
+    NightScaleNotYetValidated,
+    /// A non-Gaussian noise model was combined with a fit feature its v1 IRLS
+    /// engine does not yet wire.
+    NoiseModelCompositionUnsupported,
+    /// The Student-t observed information is not positive definite, so it has
+    /// no honest covariance.
+    ObservedInformationNotPositiveDefinite,
+    /// The IRLS outer loop reached its cap without the weights and step settling.
+    NoiseModelIrlsNotConverged,
+    /// An observation named an observatory code in no loaded registry and
+    /// matching no station table — refused by name, never silently skipped
+    /// or placed at a fallback site. The offending code and its observation
+    /// index are in [`DetermineFailure::message`].
+    UnknownObservatoryCode,
+    /// A weighting configuration was refused at construction: a σ or scale
+    /// is non-finite, zero or negative. The offending layer, field and
+    /// value are in [`DetermineFailure::message`].
+    InvalidWeightingConfig,
+    /// An observation's assembled 2×2 weight matrix was non-finite — a
+    /// weighting defect refused before the solve's factorization.
+    NonFiniteWeightMatrix,
+    /// An observation's assembled 2×2 weight matrix was finite but not
+    /// positive-definite, so it has no Cholesky factor.
+    WeightMatrixNotPositiveDefinite,
+    /// A code this build does not model — the raw wire value, kept verbatim.
+    /// Its appearance means the loaded library is newer than the wrapper.
+    Unknown(i32),
+}
+
+impl ODError {
+    pub(super) fn from_code(code: i32) -> Self {
+        match code as u32 {
+            empyrean_sys::EMPYREAN_OD_ERROR_NOT_CARTESIAN => ODError::NotCartesian,
+            empyrean_sys::EMPYREAN_OD_ERROR_NO_COVARIANCE_ON_ORBIT => ODError::NoCovarianceOnOrbit,
+            empyrean_sys::EMPYREAN_OD_ERROR_UNSUPPORTED_UNCERTAINTY_METHOD => {
+                ODError::UnsupportedUncertaintyMethod
+            }
+            empyrean_sys::EMPYREAN_OD_ERROR_NOT_SINGLE_ORBIT => ODError::NotSingleOrbit,
+            empyrean_sys::EMPYREAN_OD_ERROR_EPHEMERIS_GENERATION => ODError::EphemerisGeneration,
+            empyrean_sys::EMPYREAN_OD_ERROR_SINGULAR_NORMAL_MATRIX => ODError::SingularNormalMatrix,
+            empyrean_sys::EMPYREAN_OD_ERROR_NO_VALID_OBSERVATIONS => ODError::NoValidObservations,
+            empyrean_sys::EMPYREAN_OD_ERROR_NO_OBSERVATIONS_FOR_ORBIT => {
+                ODError::NoObservationsForOrbit
+            }
+            empyrean_sys::EMPYREAN_OD_ERROR_NOT_CONVERGED => ODError::NotConverged,
+            empyrean_sys::EMPYREAN_OD_ERROR_RETRY_LADDER_EXHAUSTED => ODError::RetryLadderExhausted,
+            empyrean_sys::EMPYREAN_OD_ERROR_NON_FINITE_TRIAL_COSTS => ODError::NonFiniteTrialCosts,
+            empyrean_sys::EMPYREAN_OD_ERROR_NON_FINITE_EVALUATION => ODError::NonFiniteEvaluation,
+            empyrean_sys::EMPYREAN_OD_ERROR_PERIHELION_EPOCH_REQUIRES_HELIOCENTRIC => {
+                ODError::PerihelionEpochRequiresHeliocentric
+            }
+            empyrean_sys::EMPYREAN_OD_ERROR_PERIHELION_EPOCH_NON_FINITE => {
+                ODError::PerihelionEpochNonFinite
+            }
+            empyrean_sys::EMPYREAN_OD_ERROR_SOLVER_CONTRACT_VIOLATION => {
+                ODError::SolverContractViolation
+            }
+            empyrean_sys::EMPYREAN_OD_ERROR_INVALID_SOLVER_CONFIG => ODError::InvalidSolverConfig,
+            empyrean_sys::EMPYREAN_OD_ERROR_RETIRED_SOLVER_KNOB => ODError::RetiredSolverKnob,
+            empyrean_sys::EMPYREAN_OD_ERROR_PRIOR_CONSTRUCTION => ODError::PriorConstruction,
+            empyrean_sys::EMPYREAN_OD_ERROR_THRUST_PARAMS_MISSING => ODError::ThrustParamsMissing,
+            empyrean_sys::EMPYREAN_OD_ERROR_THRUST_PRIOR_MISMATCH => ODError::ThrustPriorMismatch,
+            empyrean_sys::EMPYREAN_OD_ERROR_CONSIDER_PRIOR_UNAVAILABLE => {
+                ODError::ConsiderPriorUnavailable
+            }
+            empyrean_sys::EMPYREAN_OD_ERROR_MANEUVER_NOT_BRACKETED => ODError::ManeuverNotBracketed,
+            empyrean_sys::EMPYREAN_OD_ERROR_NON_GRAV_DT_MISSING => ODError::NonGravDTMissing,
+            empyrean_sys::EMPYREAN_OD_ERROR_DT_PRIOR_MISSING => ODError::DTPriorMissing,
+            empyrean_sys::EMPYREAN_OD_ERROR_UNSUPPORTED_SOLVED_WIDTH => {
+                ODError::UnsupportedSolvedWidth
+            }
+            empyrean_sys::EMPYREAN_OD_ERROR_SRP_PARAMS_MISSING => ODError::SRPParamsMissing,
+            empyrean_sys::EMPYREAN_OD_ERROR_AMRAT_PRIOR_MISSING => ODError::AMRATPriorMissing,
+            empyrean_sys::EMPYREAN_OD_ERROR_AMRAT_NOT_PHYSICAL => ODError::AMRATNotPhysical,
+            empyrean_sys::EMPYREAN_OD_ERROR_ARC_TRUNCATION_DISABLED => {
+                ODError::ArcTruncationDisabled
+            }
+            empyrean_sys::EMPYREAN_OD_ERROR_INVALID_OBSERVATION_UNCERTAINTY => {
+                ODError::InvalidObservationUncertainty
+            }
+            empyrean_sys::EMPYREAN_OD_ERROR_OBSERVATION_CONVERSION => {
+                ODError::ObservationConversion
+            }
+            empyrean_sys::EMPYREAN_OD_ERROR_OBSERVER_CONSTRUCTION => ODError::ObserverConstruction,
+            empyrean_sys::EMPYREAN_OD_ERROR_EARTH_ORIENTATION_COVERAGE_INCOMPLETE => {
+                ODError::EarthOrientationCoverageIncomplete
+            }
+            empyrean_sys::EMPYREAN_OD_ERROR_PATHOLOGICAL_IOD => ODError::PathologicalIOD,
+            empyrean_sys::EMPYREAN_OD_ERROR_PROPAGATION_OUT_OF_COVERAGE => {
+                ODError::PropagationOutOfCoverage
+            }
+            empyrean_sys::EMPYREAN_OD_ERROR_UNSUPPORTED_OUTPUT_REPRESENTATION => {
+                ODError::UnsupportedOutputRepresentation
+            }
+            empyrean_sys::EMPYREAN_OD_ERROR_DEGENERATE_REPRESENTATION => {
+                ODError::DegenerateRepresentation
+            }
+            empyrean_sys::EMPYREAN_OD_ERROR_PHOTOMETRIC_FIT => ODError::PhotometricFit,
+            empyrean_sys::EMPYREAN_OD_ERROR_NOISE_MODEL_REJECTION_UNSET => {
+                ODError::NoiseModelRejectionUnset
+            }
+            empyrean_sys::EMPYREAN_OD_ERROR_NIGHT_SCALE_NOT_YET_VALIDATED => {
+                ODError::NightScaleNotYetValidated
+            }
+            empyrean_sys::EMPYREAN_OD_ERROR_NOISE_MODEL_COMPOSITION_UNSUPPORTED => {
+                ODError::NoiseModelCompositionUnsupported
+            }
+            empyrean_sys::EMPYREAN_OD_ERROR_OBSERVED_INFORMATION_NOT_POSITIVE_DEFINITE => {
+                ODError::ObservedInformationNotPositiveDefinite
+            }
+            empyrean_sys::EMPYREAN_OD_ERROR_NOISE_MODEL_IRLS_NOT_CONVERGED => {
+                ODError::NoiseModelIrlsNotConverged
+            }
+            empyrean_sys::EMPYREAN_OD_ERROR_UNKNOWN_OBSERVATORY_CODE => {
+                ODError::UnknownObservatoryCode
+            }
+            empyrean_sys::EMPYREAN_OD_ERROR_INVALID_WEIGHTING_CONFIG => {
+                ODError::InvalidWeightingConfig
+            }
+            empyrean_sys::EMPYREAN_OD_ERROR_NON_FINITE_WEIGHT_MATRIX => {
+                ODError::NonFiniteWeightMatrix
+            }
+            empyrean_sys::EMPYREAN_OD_ERROR_WEIGHT_MATRIX_NOT_POSITIVE_DEFINITE => {
+                ODError::WeightMatrixNotPositiveDefinite
+            }
+            // Every unrecognised code (including NONE) → Unknown(raw),
+            // never a valid-looking variant.
+            _ => ODError::Unknown(code),
+        }
+    }
+}
+
 /// Why one object's fit failed inside a batch
 /// [`Context::determine`](crate::Context::determine).
 ///
@@ -1636,6 +2075,13 @@ pub enum DetermineFailureKind {
     /// An explicit non-gravitational solve could not recover A1/A2/A3.
     /// Reported rather than silently degrading to a state-only fit.
     NonGravNotRecovered,
+    /// An observation named an observatory code in no loaded registry and
+    /// matching no station table. Split from
+    /// [`ObserverConstruction`](Self::ObserverConstruction) — the one
+    /// observer failure a caller fixes by registering the code. A hard
+    /// refusal, never a deselect; the code and its observation index are in
+    /// [`DetermineFailure::message`].
+    UnknownObservatoryCode,
     /// A failure code this build of the wrapper does not know. Carries
     /// the raw code so a newer engine's cause is never flattened away.
     Unknown(i32),
@@ -1657,6 +2103,9 @@ impl DetermineFailureKind {
             empyrean_sys::EMPYREAN_OD_FAILURE_DUPLICATE_OBS_IDS => Self::DuplicateObsIds,
             empyrean_sys::EMPYREAN_OD_FAILURE_RADAR_ONLY => Self::RadarOnly,
             empyrean_sys::EMPYREAN_OD_FAILURE_NON_GRAV_NOT_RECOVERED => Self::NonGravNotRecovered,
+            empyrean_sys::EMPYREAN_OD_FAILURE_UNKNOWN_OBSERVATORY_CODE => {
+                Self::UnknownObservatoryCode
+            }
             other => Self::Unknown(other),
         }
     }
@@ -1671,6 +2120,13 @@ pub struct DetermineFailure {
     pub message: String,
     /// Classified cause.
     pub kind: DetermineFailureKind,
+    /// The specific differential-correction error, when
+    /// [`kind`](Self::kind) is [`DetermineFailureKind::OD`] and the engine
+    /// produced a typed [`ODError`]. `None` for every other kind, and for
+    /// an OD-bucket failure raised distribution-side (its detail is in
+    /// [`message`](Self::message)). A code newer than this build decodes to
+    /// [`ODError::Unknown`], never a valid-looking variant.
+    pub od_error: Option<ODError>,
 }
 
 impl std::fmt::Display for DetermineFailure {
@@ -1890,6 +2346,9 @@ mod batch_tests {
             num_obs: 42,
             num_selected: 40,
             num_rejected: 2,
+            n_eff: 40.0,
+            expected_median_d2: 1.3863,
+            expected_tail: 0.0111,
             chi2: 38.0,
             dof: 34,
             reduced_chi2: 1.12,
@@ -1962,6 +2421,10 @@ mod batch_tests {
             covariance_9x9: None,
             non_grav_delta: None,
             rejection_passes: 1,
+            rejection_kind: DeliveredRejectionKind::Known(
+                crate::od::rejection::RejectionKind::Adaptive,
+            ),
+            rejection_enabled: true,
             num_oppositions_fit: 3,
             force_model_used: ForceModelTier::Standard,
             solve_for_used: SolveForParams::StateOnly,
@@ -2003,6 +2466,7 @@ mod batch_tests {
                 object_id: object_id.to_string(),
                 message: "no viable IOD seed".to_string(),
                 kind,
+                od_error: None,
             }),
         }
     }
@@ -2248,5 +2712,307 @@ mod batch_tests {
             optical_reduced_chi2: 1.1,
         };
         assert_eq!(stall.step_sigmas(), 2.0e-2);
+    }
+}
+
+#[cfg(test)]
+mod noise_model_decode_tests {
+    use super::*;
+    use crate::od::rejection::RejectionKind;
+    use crate::od::weighting::NoiseModel;
+
+    #[test]
+    fn blunder_reason_arrives_as_code_16() {
+        assert_eq!(empyrean_sys::EMPYREAN_REJECTION_BLUNDER, 16);
+        assert_eq!(RejectionReason::from_int(16), RejectionReason::Blunder);
+    }
+
+    #[test]
+    fn sigma_source_tags_decode() {
+        assert_eq!(
+            SigmaSource::from_int(empyrean_sys::EMPYREAN_SIGMA_SOURCE_REPORTED as u8),
+            SigmaSource::Reported
+        );
+        assert_eq!(
+            SigmaSource::from_int(empyrean_sys::EMPYREAN_SIGMA_SOURCE_PRESET as u8),
+            SigmaSource::Preset
+        );
+        assert_eq!(
+            SigmaSource::from_int(empyrean_sys::EMPYREAN_SIGMA_SOURCE_LAYER as u8),
+            SigmaSource::Layer
+        );
+        assert_eq!(
+            SigmaSource::from_int(empyrean_sys::EMPYREAN_SIGMA_SOURCE_DEFAULT as u8),
+            SigmaSource::Default
+        );
+        assert_eq!(
+            SigmaSource::from_int(empyrean_sys::EMPYREAN_SIGMA_SOURCE_NOT_WEIGHTED as u8),
+            SigmaSource::NotWeighted
+        );
+    }
+
+    #[test]
+    fn per_row_noise_model_decodes() {
+        assert_eq!(
+            noise_model_from_ffi(empyrean_sys::EMPYREAN_NOISE_MODEL_GAUSSIAN as u8, f64::NAN),
+            DeliveredNoiseModel::Known(NoiseModel::Gaussian)
+        );
+        assert_eq!(
+            noise_model_from_ffi(empyrean_sys::EMPYREAN_NOISE_MODEL_STUDENT_T as u8, 4.0),
+            DeliveredNoiseModel::Known(NoiseModel::StudentT { nu: 4.0 })
+        );
+        assert_eq!(
+            noise_model_from_ffi(empyrean_sys::EMPYREAN_NOISE_MODEL_NIGHT_SCALE as u8, 6.0),
+            DeliveredNoiseModel::Known(NoiseModel::NightScale { nu: 6.0 })
+        );
+    }
+
+    #[test]
+    fn an_unknown_law_tag_keeps_its_raw_value_and_is_not_gaussian() {
+        // A library newer than this wrapper mints a fourth law tag: it must
+        // surface as itself, never silently as Gaussian.
+        let decoded = noise_model_from_ffi(99, 4.0);
+        assert_eq!(decoded, DeliveredNoiseModel::Unknown(99));
+        assert_ne!(decoded, DeliveredNoiseModel::Known(NoiseModel::Gaussian));
+    }
+
+    #[test]
+    fn rejection_kind_tags_decode() {
+        assert_eq!(
+            rejection_kind_from_ffi(empyrean_sys::EMPYREAN_REJECTION_KIND_ADAPTIVE as u8),
+            DeliveredRejectionKind::Known(RejectionKind::Adaptive)
+        );
+        assert_eq!(
+            rejection_kind_from_ffi(empyrean_sys::EMPYREAN_REJECTION_KIND_CMC2003 as u8),
+            DeliveredRejectionKind::Known(RejectionKind::CMC2003)
+        );
+        assert_eq!(
+            rejection_kind_from_ffi(empyrean_sys::EMPYREAN_REJECTION_KIND_BLUNDER as u8),
+            DeliveredRejectionKind::Known(RejectionKind::Blunder)
+        );
+    }
+
+    #[test]
+    fn an_unknown_gate_tag_keeps_its_raw_value_and_is_not_adaptive() {
+        let decoded = rejection_kind_from_ffi(99);
+        assert_eq!(decoded, DeliveredRejectionKind::Unknown(99));
+        assert_ne!(
+            decoded,
+            DeliveredRejectionKind::Known(RejectionKind::Adaptive)
+        );
+    }
+}
+
+#[cfg(test)]
+mod od_error_tests {
+    use super::ODError;
+
+    /// Every EMPYREAN_OD_ERROR_* code round-trips to the same-named wrapper
+    /// variant, all 43 map to distinct variants, and none collides with
+    /// the NONE sentinel.
+    #[test]
+    fn od_error_codes_round_trip_to_named_variants() {
+        let table: [(i32, ODError); 43] = [
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_NOT_CARTESIAN as i32,
+                ODError::NotCartesian,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_NO_COVARIANCE_ON_ORBIT as i32,
+                ODError::NoCovarianceOnOrbit,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_UNSUPPORTED_UNCERTAINTY_METHOD as i32,
+                ODError::UnsupportedUncertaintyMethod,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_NOT_SINGLE_ORBIT as i32,
+                ODError::NotSingleOrbit,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_EPHEMERIS_GENERATION as i32,
+                ODError::EphemerisGeneration,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_SINGULAR_NORMAL_MATRIX as i32,
+                ODError::SingularNormalMatrix,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_NO_VALID_OBSERVATIONS as i32,
+                ODError::NoValidObservations,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_NO_OBSERVATIONS_FOR_ORBIT as i32,
+                ODError::NoObservationsForOrbit,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_NOT_CONVERGED as i32,
+                ODError::NotConverged,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_RETRY_LADDER_EXHAUSTED as i32,
+                ODError::RetryLadderExhausted,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_NON_FINITE_TRIAL_COSTS as i32,
+                ODError::NonFiniteTrialCosts,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_NON_FINITE_EVALUATION as i32,
+                ODError::NonFiniteEvaluation,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_PERIHELION_EPOCH_REQUIRES_HELIOCENTRIC as i32,
+                ODError::PerihelionEpochRequiresHeliocentric,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_PERIHELION_EPOCH_NON_FINITE as i32,
+                ODError::PerihelionEpochNonFinite,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_SOLVER_CONTRACT_VIOLATION as i32,
+                ODError::SolverContractViolation,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_INVALID_SOLVER_CONFIG as i32,
+                ODError::InvalidSolverConfig,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_RETIRED_SOLVER_KNOB as i32,
+                ODError::RetiredSolverKnob,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_PRIOR_CONSTRUCTION as i32,
+                ODError::PriorConstruction,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_THRUST_PARAMS_MISSING as i32,
+                ODError::ThrustParamsMissing,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_THRUST_PRIOR_MISMATCH as i32,
+                ODError::ThrustPriorMismatch,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_CONSIDER_PRIOR_UNAVAILABLE as i32,
+                ODError::ConsiderPriorUnavailable,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_MANEUVER_NOT_BRACKETED as i32,
+                ODError::ManeuverNotBracketed,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_NON_GRAV_DT_MISSING as i32,
+                ODError::NonGravDTMissing,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_DT_PRIOR_MISSING as i32,
+                ODError::DTPriorMissing,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_UNSUPPORTED_SOLVED_WIDTH as i32,
+                ODError::UnsupportedSolvedWidth,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_SRP_PARAMS_MISSING as i32,
+                ODError::SRPParamsMissing,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_AMRAT_PRIOR_MISSING as i32,
+                ODError::AMRATPriorMissing,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_AMRAT_NOT_PHYSICAL as i32,
+                ODError::AMRATNotPhysical,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_ARC_TRUNCATION_DISABLED as i32,
+                ODError::ArcTruncationDisabled,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_INVALID_OBSERVATION_UNCERTAINTY as i32,
+                ODError::InvalidObservationUncertainty,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_OBSERVATION_CONVERSION as i32,
+                ODError::ObservationConversion,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_OBSERVER_CONSTRUCTION as i32,
+                ODError::ObserverConstruction,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_EARTH_ORIENTATION_COVERAGE_INCOMPLETE as i32,
+                ODError::EarthOrientationCoverageIncomplete,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_PATHOLOGICAL_IOD as i32,
+                ODError::PathologicalIOD,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_PROPAGATION_OUT_OF_COVERAGE as i32,
+                ODError::PropagationOutOfCoverage,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_UNSUPPORTED_OUTPUT_REPRESENTATION as i32,
+                ODError::UnsupportedOutputRepresentation,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_DEGENERATE_REPRESENTATION as i32,
+                ODError::DegenerateRepresentation,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_PHOTOMETRIC_FIT as i32,
+                ODError::PhotometricFit,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_NOISE_MODEL_REJECTION_UNSET as i32,
+                ODError::NoiseModelRejectionUnset,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_NIGHT_SCALE_NOT_YET_VALIDATED as i32,
+                ODError::NightScaleNotYetValidated,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_NOISE_MODEL_COMPOSITION_UNSUPPORTED as i32,
+                ODError::NoiseModelCompositionUnsupported,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_OBSERVED_INFORMATION_NOT_POSITIVE_DEFINITE as i32,
+                ODError::ObservedInformationNotPositiveDefinite,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_NOISE_MODEL_IRLS_NOT_CONVERGED as i32,
+                ODError::NoiseModelIrlsNotConverged,
+            ),
+        ];
+        let mut seen_codes = std::collections::BTreeSet::new();
+        let mut seen_variants = std::collections::BTreeSet::new();
+        for (code, variant) in table {
+            assert_eq!(
+                ODError::from_code(code),
+                variant,
+                "code {code} must decode to its variant"
+            );
+            assert_ne!(
+                code,
+                empyrean_sys::EMPYREAN_OD_ERROR_NONE as i32,
+                "no variant code is NONE"
+            );
+            assert!(seen_codes.insert(code), "code {code} is not distinct");
+            assert!(
+                seen_variants.insert(format!("{variant:?}")),
+                "variant {variant:?} is not distinct"
+            );
+        }
+        assert_eq!(seen_codes.len(), 43);
+    }
+
+    /// A code this build does not know decodes to Unknown(raw), never a
+    /// valid-looking variant.
+    #[test]
+    fn an_unknown_od_error_code_keeps_its_raw_value() {
+        assert_eq!(ODError::from_code(9999), ODError::Unknown(9999));
+        assert_ne!(ODError::from_code(9999), ODError::NotCartesian);
     }
 }

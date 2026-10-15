@@ -52,6 +52,7 @@ fn residuals_to_ffi_array(
             R::Adaptive => 4,
             R::UnsupportedObservatory => 5,
             R::CMC2003 => 6,
+            R::Blunder => 16,
             R::RadarObservationsUnsupported => 7,
             R::OccultationObservationsUnsupported => 8,
             R::OutsideArc => 9,
@@ -59,6 +60,17 @@ fn residuals_to_ffi_array(
             R::MissingJacobian => 11,
             R::NotEvaluated => -1,
         }
+    };
+    let sigma_source_to_int = |s: crate::od::SigmaSource| -> u8 {
+        use crate::od::SigmaSource as S;
+        (match s {
+            S::Reported => empyrean_sys::EMPYREAN_SIGMA_SOURCE_REPORTED,
+            S::Preset => empyrean_sys::EMPYREAN_SIGMA_SOURCE_PRESET,
+            S::Layer => empyrean_sys::EMPYREAN_SIGMA_SOURCE_LAYER,
+            S::Default => empyrean_sys::EMPYREAN_SIGMA_SOURCE_DEFAULT,
+            S::NotWeighted => empyrean_sys::EMPYREAN_SIGMA_SOURCE_NOT_WEIGHTED,
+            S::Unknown => empyrean_sys::EMPYREAN_SIGMA_SOURCE_UNKNOWN,
+        }) as u8
     };
     residuals
         .iter()
@@ -115,6 +127,15 @@ fn residuals_to_ffi_array(
                     }
                     _ => empyrean_sys::EMPYREAN_RADAR_KIND_DELAY as u8,
                 },
+                noise_model: r.noise_model.to_ffi().tag,
+                noise_model_nu: r.noise_model.to_ffi().nu,
+                robust_weight: r.robust_weight,
+                sigma_ra_used_arcsec: r.sigma_ra_used_arcsec,
+                sigma_dec_used_arcsec: r.sigma_dec_used_arcsec,
+                sigma_eff_ra_arcsec: r.sigma_eff_ra_arcsec,
+                sigma_eff_dec_arcsec: r.sigma_eff_dec_arcsec,
+                sigma_source: sigma_source_to_int(r.sigma_source),
+                sigma_scale_applied: r.sigma_scale_applied,
             })
         })
         .collect()

@@ -22,6 +22,7 @@ empyrean_default_data_dir
 empyrean_determine
 empyrean_determine_results_free
 empyrean_download_data
+empyrean_earth_orientation_kernel_coverage
 empyrean_eigenvector_max_6x6
 empyrean_ephemeris_result_free
 empyrean_ephemeris_write_csv

@@ -386,6 +386,8 @@ impl ODConfig {
                 weighting_layers.as_ptr()
             },
             num_additional_layers: weighting_layers.len(),
+            noise_model: self.weighting.noise_model.to_ffi(),
+            covariance_information: self.weighting.covariance_information.to_ffi(),
         };
         // Materialize debiasing config (CString for the optional path).
         let bias_dat_path = self
@@ -476,10 +478,18 @@ impl ODConfig {
             },
             use_span_grouping: u8::from(self.use_span_grouping),
             rejection: empyrean_sys::EmpyreanRejectionConfig {
-                enabled: u8::from(self.rejection.enabled),
+                // Tri-state via the ABI's DEFAULT/ON/OFF convention:
+                // engine default (None) is the zero-initialized value, never
+                // a spelling of off.
+                enabled: match self.rejection.enabled {
+                    None => empyrean_sys::EMPYREAN_REJECTION_ENABLED_DEFAULT as u8,
+                    Some(true) => empyrean_sys::EMPYREAN_REJECTION_ENABLED_ON as u8,
+                    Some(false) => empyrean_sys::EMPYREAN_REJECTION_ENABLED_OFF as u8,
+                },
                 kind: match self.rejection.kind {
                     RejectionKind::Adaptive => empyrean_sys::EMPYREAN_REJECTION_KIND_ADAPTIVE as u8,
                     RejectionKind::CMC2003 => empyrean_sys::EMPYREAN_REJECTION_KIND_CMC2003 as u8,
+                    RejectionKind::Blunder => empyrean_sys::EMPYREAN_REJECTION_KIND_BLUNDER as u8,
                 },
                 chi2_base: self.rejection.chi2_base,
                 lambda: self.rejection.lambda,
@@ -540,5 +550,71 @@ mod uncertainty_method_tests {
         };
         let (ffi, _keep) = cfg.to_ffi_with().expect("config marshals");
         assert_eq!(ffi.uncertainty_method.tag, 1);
+    }
+}
+
+#[cfg(test)]
+mod noise_model_config_tests {
+    use super::*;
+    use crate::od::weighting::{CovarianceInformation, NoiseModel};
+
+    #[test]
+    fn rejection_enabled_tristate_maps_to_the_ffi_sentinels() {
+        let cases = [
+            (None, empyrean_sys::EMPYREAN_REJECTION_ENABLED_DEFAULT as u8),
+            (
+                Some(true),
+                empyrean_sys::EMPYREAN_REJECTION_ENABLED_ON as u8,
+            ),
+            (
+                Some(false),
+                empyrean_sys::EMPYREAN_REJECTION_ENABLED_OFF as u8,
+            ),
+        ];
+        for (enabled, want) in cases {
+            let mut cfg = ODConfig::default();
+            cfg.rejection.enabled = enabled;
+            let (ffi, _keep) = cfg.to_ffi_with().unwrap();
+            assert_eq!(ffi.rejection.enabled, want, "enabled {enabled:?}");
+        }
+    }
+
+    #[test]
+    fn rejection_kind_blunder_crosses_the_ffi() {
+        let mut cfg = ODConfig::default();
+        cfg.rejection.kind = RejectionKind::Blunder;
+        let (ffi, _keep) = cfg.to_ffi_with().unwrap();
+        assert_eq!(
+            ffi.rejection.kind as u32,
+            empyrean_sys::EMPYREAN_REJECTION_KIND_BLUNDER
+        );
+    }
+
+    #[test]
+    fn global_noise_model_and_covariance_information_cross_the_ffi() {
+        let mut cfg = ODConfig::default();
+        cfg.weighting.noise_model = NoiseModel::StudentT { nu: 4.0 };
+        cfg.weighting.covariance_information = CovarianceInformation::Expected;
+        let (ffi, _keep) = cfg.to_ffi_with().unwrap();
+        assert_eq!(
+            ffi.weighting.noise_model.tag as u32,
+            empyrean_sys::EMPYREAN_NOISE_MODEL_STUDENT_T
+        );
+        assert_eq!(ffi.weighting.noise_model.nu, 4.0);
+        assert_eq!(
+            ffi.weighting.covariance_information as u32,
+            empyrean_sys::EMPYREAN_COVARIANCE_INFORMATION_EXPECTED
+        );
+    }
+
+    #[test]
+    fn the_default_config_carries_the_gaussian_law() {
+        let cfg = ODConfig::default();
+        assert_eq!(cfg.weighting.noise_model, NoiseModel::Gaussian);
+        let (ffi, _keep) = cfg.to_ffi_with().unwrap();
+        assert_eq!(
+            ffi.weighting.noise_model.tag as u32,
+            empyrean_sys::EMPYREAN_NOISE_MODEL_GAUSSIAN
+        );
     }
 }

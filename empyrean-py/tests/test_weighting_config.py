@@ -731,3 +731,51 @@ def test_session_constructor_rejects_invalid_layer(case, raw, message, fittable_
     )
     with pytest.raises(RuntimeError, match=message):
         Session(fittable_f51_observations, config=cfg)
+
+
+# ── (f) an unresolvable observatory code is refused by name ──────────
+#
+# scott v1.19.0 splits an unresolvable observatory code out of the
+# generic observer-construction failure. A ground station in no loaded
+# registry is refused BY NAME — never silently skipped, never placed at
+# a fallback geometry — and that refusal crosses the C ABI as the typed
+# ``unknown_observatory_code`` failure kind, carrying the code and its
+# observation index in the message.
+
+
+def test_unknown_observatory_code_refuses_the_fit_by_name(probe_orbit):
+    """Every ground ``stn`` relabelled to a code the registry does not
+    know (``ZZZ``) makes ``determine`` refuse the object by name instead
+    of fitting it against a default geometry.
+
+    Mutation: map the engine's ``UnknownObservatoryCode`` onto the
+    generic observer-construction code and ``kind`` reads
+    ``observer_construction`` — this goes red.
+    """
+    epochs = [61001.1 + 30.0 * i / 14 for i in range(15)]
+    observers = Observers.from_code("F51", Epochs.from_mjd(epochs, scale="tdb"))
+    eph = generate_ephemeris(probe_orbit, observers, force_model=ForceModelTier.APPROXIMATE)
+    ra = eph.ephemeris.coordinates.lon.to_numpy(zero_copy_only=False)
+    dec = eph.ephemeris.coordinates.lat.to_numpy(zero_copy_only=False)
+    n = len(ra)
+    # Real F51 astrometry, every ground station relabelled to ZZZ.
+    relabelled = ADESObservations.from_kwargs(
+        stn=["ZZZ"] * n,
+        obs_time=[_mjd_to_iso(e) for e in epochs],
+        ra=ra.tolist(),
+        dec=(dec + 1.0 / 3600.0).tolist(),
+        rms_ra=[None] * n,
+        rms_dec=[None] * n,
+        trk_sub=["probe"] * n,
+    )
+
+    results = determine(relabelled, config=ODConfig(force_model=ForceModelTier.APPROXIMATE))
+
+    # The object is accounted for as a failure, never a silent drop and
+    # never a fit against a fallback site.
+    assert "probe" in results.failures
+    failure = results.failures["probe"]
+    assert failure.kind == "unknown_observatory_code"
+    # The message names the offending code and its observation index.
+    assert "ZZZ" in failure.message
+    assert "observation" in failure.message

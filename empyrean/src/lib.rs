@@ -170,15 +170,16 @@ pub use math::{MixtureComponent, eigenvector_max_6x6, split_gaussian};
 pub use observers::Observer;
 pub use od::{
     AcceptabilityReport, AcceptabilityThresholds, AutoEscalationPolicy, BandStat,
-    CovarianceRepresentation, CovarianceTrust, DebiasingConfig, DebiasingResolution,
-    DetermineEntry, DetermineFailure, DetermineFailureKind, DetermineResult, DetermineResults,
-    EvaluateResult, GateRecord, IODConfig, MAX_THRUST_SEGMENTS, ODConfig, Observation,
+    CovarianceInformation, CovarianceRepresentation, CovarianceTrust, DebiasingConfig,
+    DebiasingResolution, DeliveredNoiseModel, DeliveredRejectionKind, DetermineEntry,
+    DetermineFailure, DetermineFailureKind, DetermineResult, DetermineResults, EvaluateResult,
+    GateRecord, IODConfig, MAX_THRUST_SEGMENTS, NoiseModel, ODConfig, ODError, Observation,
     ObservationResidual, Observations, OriginPolicy, OutputEpoch, PhotometryConfig,
     PhotometryModel, PhotometryResult, RadarMeasurement, RadarObservation, RadarResidual,
     RadarResidualKind, RejectionConfig, RejectionKind, RejectionReason, ResidualSummary,
-    SigmaPolicy, SolveFor, SolveForParams, SolvedCovariance, SolverStop, StallDelivery,
-    StationBias, StationRaDecConfig, TrustGateEvent, WeightingConfig, WeightingLayer,
-    WeightingPreset,
+    SigmaPolicy, SigmaSource, SolveFor, SolveForParams, SolvedCovariance, SolverStop,
+    StallDelivery, StationBias, StationRaDecConfig, TrustGateEvent, WeightingConfig,
+    WeightingLayer, WeightingPreset,
 };
 pub use orbit::{Orbit, PhaseFunction};
 pub use planning::{

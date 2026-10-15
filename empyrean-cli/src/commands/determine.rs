@@ -481,6 +481,9 @@ fn run_refine_path(
                     object_id: object_id.clone(),
                     message: format!("wide refine failed: {}", e.message),
                     kind: DetermineFailureKind::OD,
+                    // The wrapper's refine surfaces its error on the scalar
+                    // channel (message only), not the per-object OD code.
+                    od_error: None,
                 });
         entries.push(DetermineEntry { object_id, outcome });
     }
@@ -985,6 +988,7 @@ mod tests {
                     object_id: id.to_string(),
                     message: "no viable IOD seed".to_string(),
                     kind: DetermineFailureKind::IOD,
+                    od_error: None,
                 }),
             }
         }
@@ -1020,6 +1024,7 @@ mod tests {
                 object_id: "K25A00B".to_string(),
                 message: "no viable IOD seed".to_string(),
                 kind: DetermineFailureKind::IOD,
+                od_error: None,
             }),
         }];
         let results = DetermineResults::from_entries(entries, Vec::new());

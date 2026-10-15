@@ -60,7 +60,7 @@ class ObservationResults(qv.Table):
     dec_residual = qv.Float64Column()
     """Dec residual O−C (arcsec)."""
     chi2 = qv.Float64Column()
-    """Mahalanobis χ². NaN if combined covariance unavailable."""
+    """Mahalanobis χ². NaN if the effective measurement covariance unavailable."""
     dof = qv.Int32Column()
     """Degrees of freedom (number of non-NaN residual dimensions)."""
     probability = qv.Float64Column()
@@ -70,11 +70,14 @@ class ObservationResults(qv.Table):
 
     # ── Residual covariance ───────────────────────────────
     residual_cov_ra = qv.Float64Column(nullable=True)
-    """Combined obs+predicted RA·cos(Dec) variance (arcsec²)."""
+    """Effective measurement covariance Σ = W⁻¹ for RA·cos(Dec) (arcsec²) — the
+    Σ for which the Mahalanobis χ² = rᵀ Σ⁻¹ r is exact."""
     residual_cov_dec = qv.Float64Column(nullable=True)
-    """Combined obs+predicted Dec variance (arcsec²)."""
+    """Effective measurement covariance Σ = W⁻¹ for Dec (arcsec²) — the Σ for
+    which the Mahalanobis χ² = rᵀ Σ⁻¹ r is exact."""
     residual_cov_corr = qv.Float64Column(nullable=True)
-    """RA-Dec correlation coefficient (dimensionless, [-1, 1])."""
+    """Correlation coefficient of the effective measurement covariance Σ = W⁻¹
+    (dimensionless, [-1, 1])."""
 
     # ── Rejection ─────────────────────────────────────────
     rejection_reason = qv.LargeStringColumn()
@@ -193,7 +196,9 @@ class ResidualSummary:
     fields are NaN when no along/cross-track decomposition was
     computed (no sky-motion rates available).
 
-    All angular quantities in **arcseconds**.
+    All angular quantities in **arcseconds**, except the ``weighted_rms_*``
+    fields, which are **dimensionless** (each residual normalized by its own
+    σ before the RMS).
     """
 
     num_obs: int
@@ -208,10 +213,10 @@ class ResidualSummary:
     """Combined RA·cos(δ) + Dec residual RMS. Matches the find_orb /
     OrbFit ``rms`` reporting convention — a single number directly
     comparable across tools."""
-    weighted_rms_ra_arcsec: float
-    weighted_rms_dec_arcsec: float
-    weighted_rms_combined_arcsec: float
-    """Combined weighted RA·cos(δ) + Dec residual RMS."""
+    weighted_rms_ra: float
+    weighted_rms_dec: float
+    weighted_rms_combined: float
+    """Combined RA·cos(δ) + Dec σ-normalized residual RMS (dimensionless)."""
     mean_ra_arcsec: float
     mean_dec_arcsec: float
     std_ra_arcsec: float

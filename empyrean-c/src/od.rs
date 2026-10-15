@@ -1087,11 +1087,14 @@ pub struct EmpyreanObservationResult {
     pub probability: f64,
     /// Whether this observation was used in the fit (1 = yes, 0 = no).
     pub selected: u8,
-    /// Combined obs+predicted RA covariance (arcsec²). NaN if absent.
+    /// Effective measurement covariance Σ = W⁻¹ for RA·cos(Dec) (arcsec²) — the
+    /// Σ for which the Mahalanobis χ² = rᵀ Σ⁻¹ r is exact. NaN if absent.
     pub residual_cov_ra: f64,
-    /// Combined obs+predicted Dec covariance (arcsec²). NaN if absent.
+    /// Effective measurement covariance Σ = W⁻¹ for Dec (arcsec²) — the Σ for
+    /// which the Mahalanobis χ² = rᵀ Σ⁻¹ r is exact. NaN if absent.
     pub residual_cov_dec: f64,
-    /// Off-diagonal correlation coefficient (dimensionless, [-1, 1]). NaN if absent.
+    /// Correlation coefficient of the effective measurement covariance Σ = W⁻¹
+    /// (dimensionless, [-1, 1]). NaN if absent.
     pub residual_cov_corr: f64,
     /// Reason this observation was kept / rejected. One of the
     /// `EMPYREAN_REJECTION_*` codes; `EMPYREAN_REJECTION_NOT_EVALUATED`
@@ -1240,11 +1243,12 @@ pub struct EmpyreanResidualSummary {
     /// find_orb / OrbFit `rms` reporting convention — a single
     /// number directly comparable across tools.
     pub rms_combined_arcsec: f64,
-    /// RMS weighted by the per-observation σ (matches scott's `weighted_rms`).
-    pub weighted_rms_ra_arcsec: f64,
-    pub weighted_rms_dec_arcsec: f64,
-    /// Combined weighted RA·cosδ + Dec residual RMS (arcsec).
-    pub weighted_rms_combined_arcsec: f64,
+    /// RMS of the residuals each normalized by their own σ — dimensionless,
+    /// not arcsec (matches scott's `weighted_rms`).
+    pub weighted_rms_ra: f64,
+    pub weighted_rms_dec: f64,
+    /// Combined RA·cosδ + Dec σ-normalized residual RMS (dimensionless).
+    pub weighted_rms_combined: f64,
     pub mean_ra_arcsec: f64,
     pub mean_dec_arcsec: f64,
     pub std_ra_arcsec: f64,
@@ -3247,9 +3251,9 @@ pub(crate) fn summary_to_c(summary: &ObservationResidualSummary) -> EmpyreanResi
         rms_ra_arcsec: summary.rms_ra,
         rms_dec_arcsec: summary.rms_dec,
         rms_combined_arcsec: summary.rms_combined,
-        weighted_rms_ra_arcsec: summary.weighted_rms_ra,
-        weighted_rms_dec_arcsec: summary.weighted_rms_dec,
-        weighted_rms_combined_arcsec: summary.weighted_rms_combined,
+        weighted_rms_ra: summary.weighted_rms_ra,
+        weighted_rms_dec: summary.weighted_rms_dec,
+        weighted_rms_combined: summary.weighted_rms_combined,
         mean_ra_arcsec: summary.mean_ra,
         mean_dec_arcsec: summary.mean_dec,
         std_ra_arcsec: summary.std_ra,
@@ -3425,9 +3429,9 @@ fn poisoned_od_result() -> EmpyreanODResult {
             rms_ra_arcsec: f64::NAN,
             rms_dec_arcsec: f64::NAN,
             rms_combined_arcsec: f64::NAN,
-            weighted_rms_ra_arcsec: f64::NAN,
-            weighted_rms_dec_arcsec: f64::NAN,
-            weighted_rms_combined_arcsec: f64::NAN,
+            weighted_rms_ra: f64::NAN,
+            weighted_rms_dec: f64::NAN,
+            weighted_rms_combined: f64::NAN,
             mean_ra_arcsec: f64::NAN,
             mean_dec_arcsec: f64::NAN,
             std_ra_arcsec: f64::NAN,

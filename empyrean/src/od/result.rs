@@ -240,7 +240,8 @@ pub struct ObservationResidual {
     pub ra_residual_arcsec: f64,
     /// Dec residual (arcseconds).
     pub dec_residual_arcsec: f64,
-    /// Mahalanobis χ² for this observation. NaN if combined covariance unavailable.
+    /// Mahalanobis χ² for this observation. NaN if the effective measurement
+    /// covariance is unavailable.
     pub chi2: f64,
     /// Degrees of freedom (number of non-NaN residual dimensions).
     pub dof: u32,
@@ -248,11 +249,14 @@ pub struct ObservationResidual {
     pub probability: f64,
     /// Was this observation used in the fit?
     pub selected: bool,
-    /// Combined obs+predicted covariance for RA·cos(Dec) (arcsec²). NaN if absent.
+    /// Effective measurement covariance Σ = W⁻¹ for RA·cos(Dec) (arcsec²) — the
+    /// Σ for which the Mahalanobis χ² = rᵀ Σ⁻¹ r is exact. NaN if absent.
     pub residual_cov_ra: f64,
-    /// Combined obs+predicted covariance for Dec (arcsec²). NaN if absent.
+    /// Effective measurement covariance Σ = W⁻¹ for Dec (arcsec²) — the Σ for
+    /// which the Mahalanobis χ² = rᵀ Σ⁻¹ r is exact. NaN if absent.
     pub residual_cov_dec: f64,
-    /// RA-Dec correlation coefficient (dimensionless, [-1, 1]). NaN if absent.
+    /// Correlation coefficient of the effective measurement covariance Σ = W⁻¹
+    /// (dimensionless, [-1, 1]). NaN if absent.
     pub residual_cov_corr: f64,
     /// Why this observation was kept / rejected.
     pub rejection_reason: RejectionReason,
@@ -475,12 +479,14 @@ pub struct ResidualSummary {
     /// Combined RA·cos(Dec) + Dec residual RMS (arcsec). Single-number
     /// figure matching the find_orb / OrbFit `rms` reporting convention.
     pub rms_combined_arcsec: f64,
-    /// Per-observation σ-weighted RA RMS (arcsec).
-    pub weighted_rms_ra_arcsec: f64,
-    /// Per-observation σ-weighted Dec RMS (arcsec).
-    pub weighted_rms_dec_arcsec: f64,
-    /// Combined weighted RA·cos(Dec) + Dec residual RMS (arcsec).
-    pub weighted_rms_combined_arcsec: f64,
+    /// RA RMS over the residuals each normalized by their own σ
+    /// (dimensionless, not arcsec).
+    pub weighted_rms_ra: f64,
+    /// Dec RMS over the residuals each normalized by their own σ
+    /// (dimensionless, not arcsec).
+    pub weighted_rms_dec: f64,
+    /// Combined RA·cos(Dec) + Dec σ-normalized residual RMS (dimensionless).
+    pub weighted_rms_combined: f64,
     /// Mean RA·cos(Dec) residual (arcsec).
     pub mean_ra_arcsec: f64,
     /// Mean Dec residual (arcsec).
@@ -510,9 +516,9 @@ impl ResidualSummary {
             rms_ra_arcsec: s.rms_ra_arcsec,
             rms_dec_arcsec: s.rms_dec_arcsec,
             rms_combined_arcsec: s.rms_combined_arcsec,
-            weighted_rms_ra_arcsec: s.weighted_rms_ra_arcsec,
-            weighted_rms_dec_arcsec: s.weighted_rms_dec_arcsec,
-            weighted_rms_combined_arcsec: s.weighted_rms_combined_arcsec,
+            weighted_rms_ra: s.weighted_rms_ra,
+            weighted_rms_dec: s.weighted_rms_dec,
+            weighted_rms_combined: s.weighted_rms_combined,
             mean_ra_arcsec: s.mean_ra_arcsec,
             mean_dec_arcsec: s.mean_dec_arcsec,
             std_ra_arcsec: s.std_ra_arcsec,
@@ -2355,9 +2361,9 @@ mod batch_tests {
             rms_ra_arcsec: 0.31,
             rms_dec_arcsec: 0.28,
             rms_combined_arcsec: 0.30,
-            weighted_rms_ra_arcsec: 0.9,
-            weighted_rms_dec_arcsec: 0.8,
-            weighted_rms_combined_arcsec: 0.85,
+            weighted_rms_ra: 0.9,
+            weighted_rms_dec: 0.8,
+            weighted_rms_combined: 0.85,
             mean_ra_arcsec: 0.01,
             mean_dec_arcsec: -0.02,
             std_ra_arcsec: 0.31,

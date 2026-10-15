@@ -4831,17 +4831,14 @@ fn add_summary_to_dict(
     dict.set_item(format!("{prefix}rms_ra"), summary.rms_ra_arcsec)?;
     dict.set_item(format!("{prefix}rms_dec"), summary.rms_dec_arcsec)?;
     dict.set_item(format!("{prefix}rms_combined"), summary.rms_combined_arcsec)?;
-    dict.set_item(
-        format!("{prefix}weighted_rms_ra"),
-        summary.weighted_rms_ra_arcsec,
-    )?;
+    dict.set_item(format!("{prefix}weighted_rms_ra"), summary.weighted_rms_ra)?;
     dict.set_item(
         format!("{prefix}weighted_rms_dec"),
-        summary.weighted_rms_dec_arcsec,
+        summary.weighted_rms_dec,
     )?;
     dict.set_item(
         format!("{prefix}weighted_rms_combined"),
-        summary.weighted_rms_combined_arcsec,
+        summary.weighted_rms_combined,
     )?;
     dict.set_item(format!("{prefix}mean_ra"), summary.mean_ra_arcsec)?;
     dict.set_item(format!("{prefix}mean_dec"), summary.mean_dec_arcsec)?;

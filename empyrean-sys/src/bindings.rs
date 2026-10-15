@@ -2694,11 +2694,11 @@ pub struct EmpyreanObservationResult {
     pub probability: f64,
     #[doc = " Whether this observation was used in the fit (1 = yes, 0 = no)."]
     pub selected: u8,
-    #[doc = " Combined obs+predicted RA covariance (arcsec²). NaN if absent."]
+    #[doc = " Effective measurement covariance Σ = W⁻¹ for RA·cos(Dec) (arcsec²) — the\n Σ for which the Mahalanobis χ² = rᵀ Σ⁻¹ r is exact. NaN if absent."]
     pub residual_cov_ra: f64,
-    #[doc = " Combined obs+predicted Dec covariance (arcsec²). NaN if absent."]
+    #[doc = " Effective measurement covariance Σ = W⁻¹ for Dec (arcsec²) — the Σ for\n which the Mahalanobis χ² = rᵀ Σ⁻¹ r is exact. NaN if absent."]
     pub residual_cov_dec: f64,
-    #[doc = " Off-diagonal correlation coefficient (dimensionless, [-1, 1]). NaN if absent."]
+    #[doc = " Correlation coefficient of the effective measurement covariance Σ = W⁻¹\n (dimensionless, [-1, 1]). NaN if absent."]
     pub residual_cov_corr: f64,
     #[doc = " Reason this observation was kept / rejected. One of the\n `EMPYREAN_REJECTION_*` codes; `EMPYREAN_REJECTION_NOT_EVALUATED`\n when the call did not run rejection (e.g. `empyrean_evaluate`)."]
     pub rejection_reason: i32,
@@ -2896,11 +2896,11 @@ pub struct EmpyreanResidualSummary {
     pub rms_dec_arcsec: f64,
     #[doc = " Combined RA·cosδ + Dec residual RMS (arcsec). Matches the\n find_orb / OrbFit `rms` reporting convention — a single\n number directly comparable across tools."]
     pub rms_combined_arcsec: f64,
-    #[doc = " RMS weighted by the per-observation σ (matches scott's `weighted_rms`)."]
-    pub weighted_rms_ra_arcsec: f64,
-    pub weighted_rms_dec_arcsec: f64,
-    #[doc = " Combined weighted RA·cosδ + Dec residual RMS (arcsec)."]
-    pub weighted_rms_combined_arcsec: f64,
+    #[doc = " RMS of the residuals each normalized by their own σ — dimensionless,\n not arcsec (matches scott's `weighted_rms`)."]
+    pub weighted_rms_ra: f64,
+    pub weighted_rms_dec: f64,
+    #[doc = " Combined RA·cosδ + Dec σ-normalized residual RMS (dimensionless)."]
+    pub weighted_rms_combined: f64,
     pub mean_ra_arcsec: f64,
     pub mean_dec_arcsec: f64,
     pub std_ra_arcsec: f64,
@@ -2940,12 +2940,12 @@ const _: () = {
         [::std::mem::offset_of!(EmpyreanResidualSummary, rms_dec_arcsec) - 80usize];
     ["Offset of field: EmpyreanResidualSummary::rms_combined_arcsec"]
         [::std::mem::offset_of!(EmpyreanResidualSummary, rms_combined_arcsec) - 88usize];
-    ["Offset of field: EmpyreanResidualSummary::weighted_rms_ra_arcsec"]
-        [::std::mem::offset_of!(EmpyreanResidualSummary, weighted_rms_ra_arcsec) - 96usize];
-    ["Offset of field: EmpyreanResidualSummary::weighted_rms_dec_arcsec"]
-        [::std::mem::offset_of!(EmpyreanResidualSummary, weighted_rms_dec_arcsec) - 104usize];
-    ["Offset of field: EmpyreanResidualSummary::weighted_rms_combined_arcsec"]
-        [::std::mem::offset_of!(EmpyreanResidualSummary, weighted_rms_combined_arcsec) - 112usize];
+    ["Offset of field: EmpyreanResidualSummary::weighted_rms_ra"]
+        [::std::mem::offset_of!(EmpyreanResidualSummary, weighted_rms_ra) - 96usize];
+    ["Offset of field: EmpyreanResidualSummary::weighted_rms_dec"]
+        [::std::mem::offset_of!(EmpyreanResidualSummary, weighted_rms_dec) - 104usize];
+    ["Offset of field: EmpyreanResidualSummary::weighted_rms_combined"]
+        [::std::mem::offset_of!(EmpyreanResidualSummary, weighted_rms_combined) - 112usize];
     ["Offset of field: EmpyreanResidualSummary::mean_ra_arcsec"]
         [::std::mem::offset_of!(EmpyreanResidualSummary, mean_ra_arcsec) - 120usize];
     ["Offset of field: EmpyreanResidualSummary::mean_dec_arcsec"]

@@ -28,7 +28,10 @@ use crate::io::{orbit_input, output, status};
 /// inventing a knob whose output has nowhere to go is not.
 ///
 /// Adding it is a two-part change: an output channel for the sensitivity
-/// rows (writer + `--out-dir` file) *and* the flag, landed together.
+/// rows (writer + `--out-dir` file) *and* the flag, landed together. That
+/// writer would serialize `EphemerisResult::sensitivity` as it arrives —
+/// in observer-input order, row for row with the `entries` this command
+/// already writes.
 ///
 /// # Known gap: SB441-N16 bodies
 ///

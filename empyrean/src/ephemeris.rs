@@ -549,10 +549,16 @@ impl Context {
     /// Generate predicted ephemeris for orbits as seen by observers.
     ///
     /// Returns `num_orbits * num_observers` entries, orbit-major; within
-    /// each orbit, entries (and [`ObservationSensitivity`] rows) follow
-    /// the **observer-input order**. Each observer carries its own epoch,
-    /// so there is no separate epoch axis — positional pairing against
-    /// the input observers is safe within an orbit block.
+    /// each orbit, entries and [`ObservationSensitivity`] rows follow the
+    /// **observer-input order**, so the two pair up position for position.
+    /// Each observer carries its own epoch, so there is no separate epoch
+    /// axis — positional pairing against the input observers is safe within
+    /// an orbit block. A row whose sensitivity chain the engine could not
+    /// build is omitted, so [`sensitivity`](EphemerisResult::sensitivity)
+    /// can be shorter than [`entries`](EphemerisResult::entries); realign
+    /// that case on each row's
+    /// [`obs_code`](ObservationSensitivity::obs_code) and
+    /// [`epoch_mjd_tdb`](ObservationSensitivity::epoch_mjd_tdb).
     pub fn generate_ephemeris(
         &self,
         orbits: &[Orbit],
@@ -1220,7 +1226,6 @@ mod outcome_channel_tests {
             "num_entries is delivered rows only"
         );
     }
-<<<<<<< ours
 
     /// The doc's promise, pinned at the safe wrapper: within an orbit
     /// block the sensitivity rows arrive in **observer-input order**, so
@@ -1358,6 +1363,4 @@ mod outcome_channel_tests {
             "the code must not collapse onto its three-character prefix"
         );
     }
-=======
->>>>>>> theirs
 }

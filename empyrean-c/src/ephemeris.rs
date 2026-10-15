@@ -192,7 +192,9 @@ pub struct EmpyreanEphemerisEntry {
 /// One observation-sensitivity row — the partial derivatives of the
 /// sky-plane observable w.r.t. the input state, for a single
 /// `(orbit, observer, epoch)`. One row per observation epoch within each
-/// `(orbit_id, obs_code)` chain. Owning struct: free
+/// `(orbit_id, obs_code)` chain; the array of these rows is delivered in
+/// observer-input order (see the `sensitivity` field on
+/// `EmpyreanEphemerisResult`). Owning struct: free
 /// the whole result with [`empyrean_ephemeris_result_free`].
 ///
 /// The Jacobian composes d(obs)/d(state at t_obs) * Phi(t_obs, t0) and
@@ -371,8 +373,12 @@ fn ephemeris_error_code(e: &EphemerisGenerationError) -> i32 {
 pub struct EmpyreanEphemerisResult {
     pub entries: *mut EmpyreanEphemerisEntry,
     pub num_entries: usize,
-    /// Per-`(orbit, observer, epoch)` sensitivity rows. Null / 0 when no
-    /// STM was traced (e.g. an f64-only path).
+    /// Per-`(orbit, observer, epoch)` sensitivity rows, in **observer-input
+    /// order**: within each orbit block, row `k` pairs positionally with
+    /// `entries[k]`, the same pairing the entry array carries. A row the
+    /// engine skipped shortens this array (`num_sensitivity < num_entries`);
+    /// realign that case on the rows' `(obs_code, epoch_mjd_tdb)`. Null / 0
+    /// when no STM was traced (e.g. an f64-only path).
     pub sensitivity: *mut EmpyreanObservationSensitivity,
     pub num_sensitivity: usize,
     /// Non-fatal generation warnings: conditions the generator handled
@@ -999,7 +1005,21 @@ pub(crate) fn marshal_ephemeris_result(
     // ── Observation sensitivity chains ──
     // One row per (orbit, observer, epoch). Prefer the wide (state +
     // non-grav, 9-param) Jacobian/Hessian when present, else the 6-param.
-    let mut sens_rows: Vec<EmpyreanObservationSensitivity> = Vec::new();
+    //
+    // The engine groups rows into one chain per (orbit_id, obs_code)
+    // through a BTreeMap, so iterating the chains yields rows in code
+    // order — not the observer-input order the flat `entries` array uses.
+    // Each row carries its `input_index` (its position in that flat
+    // array), so we tag every row with it, concatenate across chains, then
+    // stable-sort by `input_index` to re-interleave the rows into
+    // observer-input order. Only positions change; the row contents are
+    // bit-identical to the unsorted concatenation. A row the engine skipped
+    // (num_sensitivity < num_entries) never joins the vector, so the
+    // delivered rows stay in input order with the gaps closed up.
+    // `input_index` is not published on the ABI — positional order is the
+    // contract, and a caller realigning the skipped case keys on
+    // (obs_code, epoch).
+    let mut sens_rows: Vec<(usize, EmpyreanObservationSensitivity)> = Vec::new();
     for chain in &eph_result.sensitivity {
         // The obs code rides into the fixed 4-byte field, left-aligned and
         // NUL-padded. Engine codes are 3 bytes today, but a code longer than
@@ -1064,23 +1084,37 @@ pub(crate) fn marshal_ephemeris_result(
                 .and_then(|s| CString::new(s).ok())
                 .map(CString::into_raw)
                 .unwrap_or(std::ptr::null_mut());
-            sens_rows.push(EmpyreanObservationSensitivity {
-                orbit_id: CString::new(chain.orbit_id())
-                    .unwrap_or_else(|_| CString::new("?").unwrap())
-                    .into_raw(),
-                object_id,
-                obs_code,
-                epoch_mjd_tdb,
-                n_params,
-                jacobian,
-                jacobian_len,
-                hessian,
-                hessian_len,
-                frame,
-                origin,
-            });
+            // The observer-input position of this row in the flat `entries`
+            // array. `input_index(i)` is `Some` for every in-range epoch a
+            // chain holds; the `usize::MAX` fallback parks a would-be `None`
+            // at the tail without disturbing the real rows' order.
+            let input_index = chain.input_index(i).unwrap_or(usize::MAX);
+            sens_rows.push((
+                input_index,
+                EmpyreanObservationSensitivity {
+                    orbit_id: CString::new(chain.orbit_id())
+                        .unwrap_or_else(|_| CString::new("?").unwrap())
+                        .into_raw(),
+                    object_id,
+                    obs_code,
+                    epoch_mjd_tdb,
+                    n_params,
+                    jacobian,
+                    jacobian_len,
+                    hessian,
+                    hessian_len,
+                    frame,
+                    origin,
+                },
+            ));
         }
     }
+    // Re-interleave the concatenated chains into observer-input order, the
+    // order the flat `entries` array already uses. `sort_by_key` is stable,
+    // so were two rows ever to share an index their chain order would be
+    // preserved. Dropping this line is the mutation the ordering tests
+    // catch: the rows fall back to the BTreeMap's code-grouped order.
+    sens_rows.sort_by_key(|&(input_index, _)| input_index);
     let (sens_ptr, num_sens) = if sens_rows.is_empty() {
         (std::ptr::null_mut(), 0)
     } else {
@@ -1091,7 +1125,7 @@ pub(crate) fn marshal_ephemeris_result(
             set_last_error("allocation failed for sensitivity array");
             return -5;
         }
-        for (k, row) in sens_rows.into_iter().enumerate() {
+        for (k, (_, row)) in sens_rows.into_iter().enumerate() {
             unsafe {
                 ptr.add(k).write(row);
             }
@@ -2045,6 +2079,104 @@ mod ephemeris_config_end_to_end_tests {
                 "row {i}: no STM was traced, so the Jacobian must be null"
             );
             assert_eq!(row.jacobian_len, 0, "row {i}: a null Jacobian has length 0");
+        }
+
+        unsafe { empyrean_ephemeris_result_free(&mut out) };
+    }
+
+    /// Observer `code` at `epoch`, sharing the fixture's explicit state.
+    /// The code is only a label and the sensitivity-chain key; the
+    /// topocentric geometry comes from the state, so reusing one state
+    /// under two codes is exactly the interleaved arc this test needs.
+    fn observer_coded(code: [u8; 4], epoch_mjd_tdb: f64) -> EmpyreanObserver {
+        EmpyreanObserver {
+            obs_code: code,
+            epoch_mjd_tdb,
+            ..observer()
+        }
+    }
+
+    /// The reorder fix, asserted at the ABI boundary. Interleaving two
+    /// observatories — and repeating one `(code, epoch)` exposure — is the
+    /// arc the engine's per-`(orbit, obs_code)` BTreeMap scrambles:
+    /// iterating the chains hands back every `500` row, then every `I41`
+    /// row, an order that disagrees with the observer-input `entries`.
+    /// The flatten stable-sorts the rows back into input order; this pins
+    /// that each delivered sensitivity row pairs position-for-position with
+    /// the entry beside it (same code, same epoch), the duplicate exposure
+    /// included — which a `(code, epoch)` key alone cannot disambiguate.
+    ///
+    /// Mutation: delete the `sort_by_key` in the flatten and this goes
+    /// red, the rows coming back grouped by code and disagreeing with the
+    /// entries at the first interleaved position.
+    #[test]
+    fn sensitivity_rows_follow_observer_input_order_through_the_abi() {
+        let Some(ctx) =
+            context_or_skip("sensitivity_rows_follow_observer_input_order_through_the_abi")
+        else {
+            return;
+        };
+        let mut cfg = config(&[]);
+        cfg.propagation.compute_stm = 1;
+
+        // Request order: 500, I41, 500 (same epoch as row 0 — the
+        // duplicate), I41, 500. "500" sorts before "I41", so the BTreeMap
+        // places every 500 row ahead of every I41 row, an order that
+        // disagrees with this request at positions 1 and 3.
+        let e0 = OBS_EPOCH;
+        let e1 = OBS_EPOCH + 10.0;
+        let e2 = OBS_EPOCH + 20.0;
+        let observers = [
+            observer_coded(*b"500\0", e0),
+            observer_coded(*b"I41\0", e1),
+            observer_coded(*b"500\0", e0),
+            observer_coded(*b"I41\0", e1),
+            observer_coded(*b"500\0", e2),
+        ];
+
+        let mut out = generate_through_the_abi(&ctx, &orbit(), &cfg, &observers);
+        assert_eq!(
+            out.num_entries,
+            observers.len(),
+            "one entry per observer, the duplicate exposure included"
+        );
+        assert_eq!(
+            out.num_sensitivity, out.num_entries,
+            "every entry carries a sensitivity row on this fixture, so the two \
+             arrays are the same length and pair up position for position"
+        );
+
+        // Each sensitivity row pairs positionally with the entry beside
+        // it — same code, same epoch. Grouped-by-code order fails this at
+        // the first interleaved position.
+        for k in 0..out.num_entries {
+            let entry = unsafe { &*out.entries.add(k) };
+            let row = unsafe { &*out.sensitivity.add(k) };
+            assert_eq!(
+                row.obs_code, entry.obs_code,
+                "row {k}: sensitivity obs_code {:?} != entry obs_code {:?} — the \
+                 sensitivity rows are not in observer-input order",
+                row.obs_code, entry.obs_code
+            );
+            assert_eq!(
+                row.epoch_mjd_tdb.to_bits(),
+                entry.epoch_mjd_tdb.to_bits(),
+                "row {k}: sensitivity epoch {} != entry epoch {}",
+                row.epoch_mjd_tdb,
+                entry.epoch_mjd_tdb
+            );
+        }
+
+        // And the whole sequence matches the request's own (code, epoch)
+        // list — the pairing a caller makes against its observer array.
+        for (k, obs) in observers.iter().enumerate() {
+            let row = unsafe { &*out.sensitivity.add(k) };
+            assert_eq!(row.obs_code, obs.obs_code, "row {k}: code vs request");
+            assert_eq!(
+                row.epoch_mjd_tdb.to_bits(),
+                obs.epoch_mjd_tdb.to_bits(),
+                "row {k}: epoch vs request"
+            );
         }
 
         unsafe { empyrean_ephemeris_result_free(&mut out) };

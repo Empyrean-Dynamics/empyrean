@@ -128,12 +128,14 @@ from empyrean.orbits.thrust import (
     ThrustParams,
     VelocityTangent,
 )
-from empyrean.planning.plan import evaluate_plan
+from empyrean.planning.plan import compute_visibility, evaluate_plan
 from empyrean.planning.result import (
     STAGE_POSTERIOR,
     STAGE_PRIOR,
     LogDetWithheld,
+    Nights,
     ObservatoryConfig,
+    ObservatorySummary,
     PlanCandidates,
     PlanEphemeris,
     PlanMetrics,
@@ -143,6 +145,10 @@ from empyrean.planning.result import (
     PlanResult,
     RadarMode,
     RadarStation,
+    VisibilityAnchors,
+    VisibilityPoints,
+    VisibilityResult,
+    VisibilityWindows,
 )
 from empyrean.propagation.config import (
     AdvancedIntegratorConfig,

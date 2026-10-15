@@ -4603,6 +4603,39 @@ fn build_orbit_from_dict<'py>(orbit_dict: &Bound<'py, PyDict>) -> PyResult<empyr
             srp = Some((amrat, cr));
         }
     }
+    // Photometry (optional): the (phase function, H, slope1, slope2) quad
+    // plus its optional 3×3, decoded through the same shared `phot_at` /
+    // `covariance_3x3_at` helpers the batch orbits-table reader uses — so
+    // this seam and that one cannot drift. Only row 0 is read (this entry
+    // point takes a single orbit). A `None` tag or a non-finite H is "no
+    // photometry"; an unrecognized tag is a typed error, never a silent
+    // downgrade. Without this the evaluate / refine / visibility seams fed
+    // the engine a photometry-less orbit, so apparent magnitude came back
+    // NaN and the magnitude gate could never pass.
+    let phot_system: Option<String> = match orbit_dict.get_item("phot_system")? {
+        Some(obj) => {
+            let col: Vec<Option<String>> = obj.extract()?;
+            col.into_iter().next().flatten()
+        }
+        None => None,
+    };
+    let has_phot_cov_arr: Option<PyReadonlyArray1<bool>> = orbit_dict
+        .get_item("has_phot_covariance")?
+        .map(|o| o.extract())
+        .transpose()?;
+    let phot_cov_arr: Option<PyReadonlyArray3<f64>> = orbit_dict
+        .get_item("phot_covariance")?
+        .map(|o| o.extract())
+        .transpose()?;
+    let has_phot_cov_owned = has_phot_cov_arr.as_ref().map(|a| a.as_array().to_owned());
+    let phot_cov_owned = phot_cov_arr.as_ref().map(|a| a.as_array().to_owned());
+    let photometry = phot_at(
+        phot_system.as_deref(),
+        arr1("phot_h")?.map_or(f64::NAN, |v| v[0]),
+        arr1("phot_slope1")?.map_or(0.0, |v| v[0]),
+        arr1("phot_slope2")?.map_or(0.0, |v| v[0]),
+        covariance_3x3_at(has_phot_cov_owned.as_ref(), phot_cov_owned.as_ref(), 0),
+    )?;
     Ok(assemble_orbit(
         None,
         None,
@@ -4612,7 +4645,7 @@ fn build_orbit_from_dict<'py>(orbit_dict: &Bound<'py, PyDict>) -> PyResult<empyr
         a3,
         g_function,
         non_grav_dt,
-        None,
+        photometry,
         None,
         srp,
         joint_in.joint_at(0),
@@ -5421,6 +5454,44 @@ fn build_planning_config_from_dict(d: &Bound<'_, PyDict>) -> PyResult<empyrean::
                     })?
                     .extract()
             };
+            // The four twilight thresholds are all-or-nothing (the engine
+            // validates them as a strictly-descending group): present together
+            // → a `TwilightThresholds`, any absent → `None` (engine defaults).
+            let twilight_keys = [
+                "sunset_sun_altitude_deg",
+                "civil_twilight_sun_altitude_deg",
+                "nautical_twilight_sun_altitude_deg",
+                "astronomical_twilight_sun_altitude_deg",
+            ];
+            let twilight_present = twilight_keys
+                .iter()
+                .map(|k| Ok(e.get_item(k)?.is_some()))
+                .collect::<PyResult<Vec<_>>>()?;
+            let twilight_thresholds = if twilight_present.iter().all(|p| *p) {
+                Some(empyrean::TwilightThresholds {
+                    sunset_sun_altitude_deg: get_f64("sunset_sun_altitude_deg")?,
+                    civil_twilight_sun_altitude_deg: get_f64("civil_twilight_sun_altitude_deg")?,
+                    nautical_twilight_sun_altitude_deg: get_f64(
+                        "nautical_twilight_sun_altitude_deg",
+                    )?,
+                    astronomical_twilight_sun_altitude_deg: get_f64(
+                        "astronomical_twilight_sun_altitude_deg",
+                    )?,
+                })
+            } else if twilight_present.iter().any(|p| *p) {
+                return Err(PyValueError::new_err(format!(
+                    "observatories[{i}]: the twilight thresholds are all-or-nothing \
+                     (the engine validates them as a strictly-descending group); supply all \
+                     four of {twilight_keys:?} or none"
+                )));
+            } else {
+                None
+            };
+            let explicit_anchor_utc = e
+                .get_item("explicit_anchor_utc_mjd_tdb")?
+                .map(|v| v.extract::<f64>())
+                .transpose()?
+                .map(empyrean::Epoch::from_mjd_tdb);
             observatories.push(empyrean::ObservatoryConfig {
                 obs_code,
                 sigma_arcsec: [get_f64("sigma_ra_arcsec")?, get_f64("sigma_dec_arcsec")?],
@@ -5439,6 +5510,8 @@ fn build_planning_config_from_dict(d: &Bound<'_, PyDict>) -> PyResult<empyrean::
                     .get_item("max_sun_altitude_deg")?
                     .map(|v| v.extract::<f64>())
                     .transpose()?,
+                twilight_thresholds,
+                explicit_anchor_utc,
             });
         }
         cfg.observatories = observatories;
@@ -5829,6 +5902,358 @@ fn _evaluate_plan<'py>(
     dict.set_item("ephemeris_dec_deg", eph_dec.into_pyarray(py))?;
 
     Ok(dict)
+}
+
+// ══════════════════════════════════════════════════════════
+//  _compute_visibility
+// ══════════════════════════════════════════════════════════
+
+fn anchor_policy_name(p: &empyrean::AnchorPolicy) -> &'static str {
+    match p {
+        empyrean::AnchorPolicy::NearestObservableToMidnight => "nearest_observable_to_midnight",
+        empyrean::AnchorPolicy::Midnight => "midnight",
+        empyrean::AnchorPolicy::Transit => "transit",
+        empyrean::AnchorPolicy::ExplicitUtc(_) => "explicit_utc",
+    }
+}
+
+fn gate_name(g: Option<empyrean::Gate>) -> Option<&'static str> {
+    g.map(|g| match g {
+        empyrean::Gate::Elongation => "elongation",
+        empyrean::Gate::Magnitude => "magnitude",
+        empyrean::Gate::Elevation => "elevation",
+        empyrean::Gate::Darkness => "darkness",
+        empyrean::Gate::EndOfNight => "end_of_night",
+    })
+}
+
+/// Survey one orbit's observability and return a flat wire dict of parallel
+/// columns for the `points`, `windows`, `nights` and `anchors` quivr tables,
+/// plus per-observatory metadata. `start` / `end` are MJD TDB. Night intervals
+/// ride the `windows` columns with a non-negative `window_night_index` (`-1`
+/// marks a whole-survey window); anchors reference their night by
+/// `(obs_code, night_index)`. The anchor sky covariance rides as the same
+/// packed-joint wire the ephemeris rows use (`anchor_joints`), one per anchor
+/// or `None`.
+#[pyfunction]
+#[pyo3(signature = (orbit_dict, config_dict, start, end, step_days, orbit_id = None))]
+#[allow(clippy::too_many_arguments)]
+fn _compute_visibility<'py>(
+    py: Python<'py>,
+    orbit_dict: &Bound<'py, PyDict>,
+    config_dict: &Bound<'py, PyDict>,
+    start: f64,
+    end: f64,
+    step_days: f64,
+    orbit_id: Option<&str>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let ctx = get_context()?;
+    let orbit = build_orbit_from_dict(orbit_dict)?;
+    let cfg = build_planning_config_from_dict(config_dict)?;
+
+    let result = py
+        .detach(|| {
+            ctx.compute_visibility(
+                &orbit,
+                orbit_id,
+                empyrean::Epoch::from_mjd_tdb(start),
+                empyrean::Epoch::from_mjd_tdb(end),
+                step_days,
+                &cfg,
+            )
+        })
+        .map_err(err_to_pyerr)?;
+
+    let ep = |e: empyrean::Epoch| -> f64 { e.mjd_tdb().unwrap_or(f64::NAN) };
+    let opt_ep = |e: Option<empyrean::Epoch>| -> f64 { e.map(ep).unwrap_or(f64::NAN) };
+
+    // Points.
+    let mut p_obs: Vec<String> = Vec::new();
+    let mut p_epoch: Vec<f64> = Vec::new();
+    let mut p_solar_elong: Vec<f64> = Vec::new();
+    let mut p_elevation: Vec<f64> = Vec::new();
+    let mut p_sun_alt: Vec<f64> = Vec::new();
+    let mut p_observable: Vec<bool> = Vec::new();
+    let mut p_elong_ok: Vec<bool> = Vec::new();
+    let mut p_mag: Vec<f64> = Vec::new();
+    let mut p_mag_ok: Vec<bool> = Vec::new();
+    let mut p_elev_ok: Vec<bool> = Vec::new();
+    let mut p_dark_ok: Vec<bool> = Vec::new();
+    let mut p_moon_alt: Vec<f64> = Vec::new();
+    let mut p_moon_az: Vec<f64> = Vec::new();
+    let mut p_moon_illum: Vec<f64> = Vec::new();
+    let mut p_lunar_elong: Vec<f64> = Vec::new();
+
+    // Windows (whole-survey, night_index = -1; night intervals, night_index >= 0).
+    let mut w_obs: Vec<String> = Vec::new();
+    let mut w_night: Vec<i64> = Vec::new();
+    let mut w_start: Vec<f64> = Vec::new();
+    let mut w_end: Vec<f64> = Vec::new();
+    let mut w_peak_elong: Vec<f64> = Vec::new();
+    let mut w_brightest_mag: Vec<f64> = Vec::new();
+    let mut w_hours: Vec<f64> = Vec::new();
+    let mut w_max_alt: Vec<f64> = Vec::new();
+    let mut w_max_alt_epoch: Vec<f64> = Vec::new();
+    let mut w_closing_gate: Vec<Option<&'static str>> = Vec::new();
+
+    // Nights.
+    let mut n_obs: Vec<String> = Vec::new();
+    let mut n_index: Vec<i64> = Vec::new();
+    let mut n_year: Vec<i64> = Vec::new();
+    let mut n_month: Vec<u32> = Vec::new();
+    let mut n_day: Vec<u32> = Vec::new();
+    let mut n_noon_start: Vec<f64> = Vec::new();
+    let mut n_noon_end: Vec<f64> = Vec::new();
+    let mut n_sunset: Vec<f64> = Vec::new();
+    let mut n_civil_dusk: Vec<f64> = Vec::new();
+    let mut n_nautical_dusk: Vec<f64> = Vec::new();
+    let mut n_astro_dusk: Vec<f64> = Vec::new();
+    let mut n_midnight: Vec<f64> = Vec::new();
+    let mut n_astro_dawn: Vec<f64> = Vec::new();
+    let mut n_nautical_dawn: Vec<f64> = Vec::new();
+    let mut n_civil_dawn: Vec<f64> = Vec::new();
+    let mut n_sunrise: Vec<f64> = Vec::new();
+    let mut n_note: Vec<Option<String>> = Vec::new();
+
+    // Anchors (circumstances flattened; the sky covariance as a packed joint).
+    let mut a_obs: Vec<String> = Vec::new();
+    let mut a_night: Vec<i64> = Vec::new();
+    let mut a_policy: Vec<&'static str> = Vec::new();
+    let mut a_epoch: Vec<f64> = Vec::new();
+    let mut a_observable: Vec<bool> = Vec::new();
+    let mut a_altitude: Vec<f64> = Vec::new();
+    let mut a_azimuth: Vec<f64> = Vec::new();
+    let mut a_sun_alt: Vec<f64> = Vec::new();
+    let mut a_solar_elong: Vec<f64> = Vec::new();
+    let mut a_phase: Vec<f64> = Vec::new();
+    let mut a_lunar_elong: Vec<f64> = Vec::new();
+    let mut a_moon_alt: Vec<f64> = Vec::new();
+    let mut a_moon_illum: Vec<f64> = Vec::new();
+    let mut a_mag: Vec<f64> = Vec::new();
+    let mut a_sigma_mag: Vec<f64> = Vec::new();
+    let mut a_sky_rate: Vec<f64> = Vec::new();
+    let mut a_position_angle: Vec<f64> = Vec::new();
+    let mut a_hour_angle: Vec<f64> = Vec::new();
+    let mut a_cov_kind: Vec<i64> = Vec::new();
+    let a_joints = pyo3::types::PyList::empty(py);
+
+    // Per-observatory metadata (survey-wide resolved method / Earth orientation
+    // replicated per observatory for a per-observatory view).
+    let mut m_obs: Vec<String> = Vec::new();
+    let mut m_note: Vec<Option<String>> = Vec::new();
+    let mut m_resolved_method: Vec<i64> = Vec::new();
+    let mut m_eo_has: Vec<bool> = Vec::new();
+    let mut m_eo_bpc: Vec<u64> = Vec::new();
+    let mut m_eo_analytic: Vec<u64> = Vec::new();
+
+    let resolved_code = covariance_kind_code(result.resolved_method);
+    let (eo_has, eo_bpc, eo_analytic) = match result.earth_orientation {
+        Some(s) => (true, s.bpc_epochs as u64, s.analytic_iau_2006_epochs as u64),
+        None => (false, 0, 0),
+    };
+
+    for ov in &result.observatory_visibility {
+        m_obs.push(ov.obs_code.clone());
+        m_note.push(ov.note.clone());
+        m_resolved_method.push(resolved_code);
+        m_eo_has.push(eo_has);
+        m_eo_bpc.push(eo_bpc);
+        m_eo_analytic.push(eo_analytic);
+
+        for p in &ov.points {
+            p_obs.push(ov.obs_code.clone());
+            p_epoch.push(ep(p.epoch));
+            p_solar_elong.push(p.solar_elongation_deg);
+            p_elevation.push(nan_to_value(p.elevation_deg));
+            p_sun_alt.push(nan_to_value(p.sun_altitude_deg));
+            p_observable.push(p.observable);
+            p_elong_ok.push(p.elongation_ok);
+            p_mag.push(nan_to_value(p.mag));
+            p_mag_ok.push(p.magnitude_ok);
+            p_elev_ok.push(p.elevation_ok);
+            p_dark_ok.push(p.darkness_ok);
+            p_moon_alt.push(nan_to_value(p.moon_altitude_deg));
+            p_moon_az.push(nan_to_value(p.moon_azimuth_deg));
+            p_moon_illum.push(nan_to_value(p.moon_illuminated_fraction));
+            p_lunar_elong.push(p.lunar_elongation_deg);
+        }
+
+        let mut push_window = |obs: &str, night: i64, w: &empyrean::VisibilityWindow| {
+            w_obs.push(obs.to_string());
+            w_night.push(night);
+            w_start.push(ep(w.start_epoch));
+            w_end.push(ep(w.end_epoch));
+            w_peak_elong.push(w.peak_elongation_deg);
+            w_brightest_mag.push(nan_to_value(w.brightest_mag));
+            w_hours.push(w.hours_observable);
+            w_max_alt.push(nan_to_value(w.max_altitude_deg));
+            w_max_alt_epoch.push(opt_ep(w.max_altitude_epoch));
+            w_closing_gate.push(gate_name(w.closing_gate));
+        };
+        for w in &ov.windows {
+            push_window(&ov.obs_code, -1, w);
+        }
+
+        for (ni, night) in ov.nights.iter().enumerate() {
+            let ni = ni as i64;
+            n_obs.push(ov.obs_code.clone());
+            n_index.push(ni);
+            n_year.push(night.local_date.0);
+            n_month.push(night.local_date.1);
+            n_day.push(night.local_date.2);
+            n_noon_start.push(ep(night.noon_start));
+            n_noon_end.push(ep(night.noon_end));
+            n_sunset.push(opt_ep(night.sunset));
+            n_civil_dusk.push(opt_ep(night.civil_dusk));
+            n_nautical_dusk.push(opt_ep(night.nautical_dusk));
+            n_astro_dusk.push(opt_ep(night.astronomical_dusk));
+            n_midnight.push(opt_ep(night.local_solar_midnight));
+            n_astro_dawn.push(opt_ep(night.astronomical_dawn));
+            n_nautical_dawn.push(opt_ep(night.nautical_dawn));
+            n_civil_dawn.push(opt_ep(night.civil_dawn));
+            n_sunrise.push(opt_ep(night.sunrise));
+            n_note.push(night.note.clone());
+            for w in &night.intervals {
+                push_window(&ov.obs_code, ni, w);
+            }
+            for a in &night.anchors {
+                a_obs.push(ov.obs_code.clone());
+                a_night.push(ni);
+                a_policy.push(anchor_policy_name(&a.policy));
+                a_epoch.push(opt_ep(a.epoch));
+                a_observable.push(a.observable);
+                match &a.circumstances {
+                    Some(c) => {
+                        a_altitude.push(c.altitude_deg);
+                        a_azimuth.push(c.azimuth_deg);
+                        a_sun_alt.push(c.sun_altitude_deg);
+                        a_solar_elong.push(c.solar_elongation_deg);
+                        a_phase.push(c.phase_angle_deg);
+                        a_lunar_elong.push(c.lunar_elongation_deg);
+                        a_moon_alt.push(nan_to_value(c.moon_altitude_deg));
+                        a_moon_illum.push(nan_to_value(c.moon_illuminated_fraction));
+                        a_mag.push(nan_to_value(c.mag));
+                        a_sigma_mag.push(nan_to_value(c.sigma_mag));
+                        a_sky_rate.push(nan_to_value(c.sky_rate));
+                        a_position_angle.push(nan_to_value(c.position_angle_deg));
+                        a_hour_angle.push(nan_to_value(c.hour_angle));
+                        a_cov_kind.push(
+                            c.sky_covariance_kind
+                                .map(covariance_kind_code)
+                                .unwrap_or(-1),
+                        );
+                        match &c.sky_covariance {
+                            Some(j) => a_joints.append(packed_joint_to_pydict(py, j)?)?,
+                            None => a_joints.append(py.None())?,
+                        }
+                    }
+                    None => {
+                        for col in [
+                            &mut a_altitude,
+                            &mut a_azimuth,
+                            &mut a_sun_alt,
+                            &mut a_solar_elong,
+                            &mut a_phase,
+                            &mut a_lunar_elong,
+                            &mut a_moon_alt,
+                            &mut a_moon_illum,
+                            &mut a_mag,
+                            &mut a_sigma_mag,
+                            &mut a_sky_rate,
+                            &mut a_position_angle,
+                            &mut a_hour_angle,
+                        ] {
+                            col.push(f64::NAN);
+                        }
+                        a_cov_kind.push(-1);
+                        a_joints.append(py.None())?;
+                    }
+                }
+            }
+        }
+    }
+
+    let out = PyDict::new(py);
+    // The resolved orbit id the engine keyed the survey under — the scalar
+    // every row of this single-orbit result is tagged with on the Python side.
+    out.set_item("orbit_id", result.orbit_id.clone())?;
+    // points
+    out.set_item("point_obs_code", p_obs)?;
+    out.set_item("point_epoch", p_epoch)?;
+    out.set_item("point_solar_elongation_deg", p_solar_elong)?;
+    out.set_item("point_elevation_deg", p_elevation)?;
+    out.set_item("point_sun_altitude_deg", p_sun_alt)?;
+    out.set_item("point_observable", p_observable)?;
+    out.set_item("point_elongation_ok", p_elong_ok)?;
+    out.set_item("point_mag", p_mag)?;
+    out.set_item("point_magnitude_ok", p_mag_ok)?;
+    out.set_item("point_elevation_ok", p_elev_ok)?;
+    out.set_item("point_darkness_ok", p_dark_ok)?;
+    out.set_item("point_moon_altitude_deg", p_moon_alt)?;
+    out.set_item("point_moon_azimuth_deg", p_moon_az)?;
+    out.set_item("point_moon_illuminated_fraction", p_moon_illum)?;
+    out.set_item("point_lunar_elongation_deg", p_lunar_elong)?;
+    // windows
+    out.set_item("window_obs_code", w_obs)?;
+    out.set_item("window_night_index", w_night)?;
+    out.set_item("window_start_epoch", w_start)?;
+    out.set_item("window_end_epoch", w_end)?;
+    out.set_item("window_peak_elongation_deg", w_peak_elong)?;
+    out.set_item("window_brightest_mag", w_brightest_mag)?;
+    out.set_item("window_hours_observable", w_hours)?;
+    out.set_item("window_max_altitude_deg", w_max_alt)?;
+    out.set_item("window_max_altitude_epoch", w_max_alt_epoch)?;
+    out.set_item("window_closing_gate", w_closing_gate)?;
+    // nights
+    out.set_item("night_obs_code", n_obs)?;
+    out.set_item("night_index", n_index)?;
+    out.set_item("night_year", n_year)?;
+    out.set_item("night_month", n_month)?;
+    out.set_item("night_day", n_day)?;
+    out.set_item("night_noon_start", n_noon_start)?;
+    out.set_item("night_noon_end", n_noon_end)?;
+    out.set_item("night_sunset", n_sunset)?;
+    out.set_item("night_civil_dusk", n_civil_dusk)?;
+    out.set_item("night_nautical_dusk", n_nautical_dusk)?;
+    out.set_item("night_astronomical_dusk", n_astro_dusk)?;
+    out.set_item("night_local_solar_midnight", n_midnight)?;
+    out.set_item("night_astronomical_dawn", n_astro_dawn)?;
+    out.set_item("night_nautical_dawn", n_nautical_dawn)?;
+    out.set_item("night_civil_dawn", n_civil_dawn)?;
+    out.set_item("night_sunrise", n_sunrise)?;
+    out.set_item("night_note", n_note)?;
+    // anchors
+    out.set_item("anchor_obs_code", a_obs)?;
+    out.set_item("anchor_night_index", a_night)?;
+    out.set_item("anchor_policy", a_policy)?;
+    out.set_item("anchor_epoch", a_epoch)?;
+    out.set_item("anchor_observable", a_observable)?;
+    out.set_item("anchor_altitude_deg", a_altitude)?;
+    out.set_item("anchor_azimuth_deg", a_azimuth)?;
+    out.set_item("anchor_sun_altitude_deg", a_sun_alt)?;
+    out.set_item("anchor_solar_elongation_deg", a_solar_elong)?;
+    out.set_item("anchor_phase_angle_deg", a_phase)?;
+    out.set_item("anchor_lunar_elongation_deg", a_lunar_elong)?;
+    out.set_item("anchor_moon_altitude_deg", a_moon_alt)?;
+    out.set_item("anchor_moon_illuminated_fraction", a_moon_illum)?;
+    out.set_item("anchor_mag", a_mag)?;
+    out.set_item("anchor_sigma_mag", a_sigma_mag)?;
+    out.set_item("anchor_sky_rate", a_sky_rate)?;
+    out.set_item("anchor_position_angle_deg", a_position_angle)?;
+    out.set_item("anchor_hour_angle_deg", a_hour_angle)?;
+    out.set_item("anchor_sky_covariance_kind", a_cov_kind)?;
+    out.set_item("anchor_joints", a_joints)?;
+    // per-observatory metadata
+    out.set_item("obs_code", m_obs)?;
+    out.set_item("obs_note", m_note)?;
+    out.set_item("obs_resolved_method", m_resolved_method)?;
+    out.set_item("obs_earth_orientation_present", m_eo_has)?;
+    out.set_item("obs_earth_orientation_bpc_epochs", m_eo_bpc)?;
+    out.set_item(
+        "obs_earth_orientation_analytic_iau_2006_epochs",
+        m_eo_analytic,
+    )?;
+    Ok(out)
 }
 
 // ══════════════════════════════════════════════════════════
@@ -8635,6 +9060,7 @@ fn _empyrean_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_evaluate_single, m)?)?;
     m.add_function(wrap_pyfunction!(_refine_single, m)?)?;
     m.add_function(wrap_pyfunction!(_evaluate_plan, m)?)?;
+    m.add_function(wrap_pyfunction!(_compute_visibility, m)?)?;
     m.add_function(wrap_pyfunction!(_convert_epochs, m)?)?;
     m.add_function(wrap_pyfunction!(_iso_to_mjd, m)?)?;
     m.add_function(wrap_pyfunction!(_mjd_to_iso, m)?)?;

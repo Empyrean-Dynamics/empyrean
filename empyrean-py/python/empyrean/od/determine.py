@@ -12,6 +12,7 @@ import quivr as qv
 from empyrean._convert import (
     _COORD_TYPE_MAP,
     AnyOrbits,
+    _photometry_wire,
     coordinates_to_arrays,
     extract_joint_wire,
     extract_srp,
@@ -257,7 +258,7 @@ def _orbits_to_dict(orbits: AnyOrbits) -> dict[str, list[Any] | np.ndarray]:
         ng_ms, ng_ns, ng_ks = _col("m"), _col("n"), _col("k")
         non_grav_dts = np.asarray(ng.dt.to_numpy(zero_copy_only=False), dtype=np.float64)
 
-    return {
+    out: dict[str, Any] = {
         "orbit_ids": orbit_ids,
         "object_ids": object_ids,
         "epochs": epochs_arr,
@@ -285,6 +286,14 @@ def _orbits_to_dict(orbits: AnyOrbits) -> dict[str, list[Any] | np.ndarray]:
         # when it carries none.
         "covariance": extract_joint_wire(orbits),
     }
+    # Photometry — the (phase function, H, slope1, slope2) quad plus its
+    # optional 3x3, the same keys the batch orbits-table dict emits (one
+    # `_photometry_wire`, not a second copy). This direction dropped them
+    # entirely, so evaluate / refine / visibility fed the engine a
+    # photometry-less orbit: apparent magnitude was always NaN and the
+    # magnitude gate could never pass.
+    out.update(_photometry_wire(orbits))
+    return out
 
 
 def _nullable_float(values: np.ndarray) -> pa.Array | np.ndarray:

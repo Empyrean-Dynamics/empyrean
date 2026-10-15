@@ -27,7 +27,7 @@ import pyarrow.compute as pc
 import quivr as qv
 
 from empyrean.coordinates.epoch import Epochs
-from empyrean.orbits.joint import CovarianceKind
+from empyrean.orbits.joint import CovarianceKind, PackedJoints
 from empyrean.propagation.config import (
     ForceModelTier,
     UncertaintyMethod,
@@ -581,6 +581,23 @@ class ObservatoryConfig:
     zero would quietly plan a campaign in daylight. The other conventions
     are civil (−6°) and nautical (−12°); above +90° disables the gate."""
 
+    sunset_sun_altitude_deg: float | None = None
+    """Sunset/sunrise Sun altitude (degrees) for the :func:`~empyrean.compute_visibility`
+    night product. One of the four all-or-nothing twilight thresholds —
+    supply all four or none (``None`` takes the engine's default −0.833°).
+    Only the night product reads these; plan evaluation does not."""
+    civil_twilight_sun_altitude_deg: float | None = None
+    """Civil-twilight Sun altitude (degrees); default −6°. See
+    :attr:`sunset_sun_altitude_deg`."""
+    nautical_twilight_sun_altitude_deg: float | None = None
+    """Nautical-twilight Sun altitude (degrees); default −12°."""
+    astronomical_twilight_sun_altitude_deg: float | None = None
+    """Astronomical-twilight Sun altitude (degrees); default −18°."""
+    explicit_anchor_utc_mjd_tdb: float | None = None
+    """A caller-supplied epoch (MJD, TDB) for the ``explicit_utc`` night
+    anchor, or ``None`` for the three site-derived anchors only. Every night
+    whose noon-to-noon span contains it also carries an anchor there."""
+
     def _to_wire_dict(self) -> dict[str, WireValue]:
         """Serialize to the dict shape the binding consumes.
 
@@ -590,6 +607,9 @@ class ObservatoryConfig:
         A ``None`` visibility limit is **omitted** rather than sent as
         null: an absent key is exactly how the binding spells "use the
         engine's default", while a null would fail extraction as a float.
+        The four twilight thresholds are all-or-nothing (the engine
+        validates them as a strictly-descending group), so a partial set is
+        refused here with a message rather than silently half-applied.
         """
         wire: dict[str, WireValue] = {
             "obs_code": self.obs_code,
@@ -602,6 +622,24 @@ class ObservatoryConfig:
             wire["min_elevation_deg"] = float(self.min_elevation_deg)
         if self.max_sun_altitude_deg is not None:
             wire["max_sun_altitude_deg"] = float(self.max_sun_altitude_deg)
+        twilight = {
+            "sunset_sun_altitude_deg": self.sunset_sun_altitude_deg,
+            "civil_twilight_sun_altitude_deg": self.civil_twilight_sun_altitude_deg,
+            "nautical_twilight_sun_altitude_deg": self.nautical_twilight_sun_altitude_deg,
+            "astronomical_twilight_sun_altitude_deg": self.astronomical_twilight_sun_altitude_deg,
+        }
+        set_count = sum(v is not None for v in twilight.values())
+        if set_count not in (0, 4):
+            raise ValueError(
+                "the four twilight thresholds are all-or-nothing (the engine "
+                "validates them as a strictly-descending group); supply all "
+                f"four of {list(twilight)} or none"
+            )
+        if set_count == 4:
+            for key, value in twilight.items():
+                wire[key] = float(value)  # type: ignore[arg-type]
+        if self.explicit_anchor_utc_mjd_tdb is not None:
+            wire["explicit_anchor_utc_mjd_tdb"] = float(self.explicit_anchor_utc_mjd_tdb)
         return wire
 
 
@@ -653,28 +691,15 @@ class PlanningConfig:
     unlike :attr:`observatories` / :attr:`num_threads` above."""
 
     def __post_init__(self) -> None:
-        self._reject_unread_knobs()
+        # Normalize force_model at construction (always needed, both entry
+        # points read it). The observatories / num_threads refusal is NOT
+        # applied here: :func:`compute_visibility` reads the observatories,
+        # so a config carrying them is valid to construct. The refusal is
+        # specific to :func:`evaluate_plan`, which applies it through
+        # :meth:`_reject_unread_knobs` on the config it is handed.
+        self._normalize_force_model()
 
-    def _reject_unread_knobs(self) -> None:
-        """Raise ``ValueError`` for any field :func:`evaluate_plan` never
-        reads.
-
-        A knob that accepts a value and silently does nothing is the
-        failure mode this package refuses everywhere else (see
-        :meth:`WeightingLayer.__post_init__`). Neither field below
-        reaches the planner, so setting one is refused rather than
-        quietly dropped somewhere across three layers.
-
-        Called twice on purpose. :meth:`__post_init__` catches the
-        common case at construction, and :func:`evaluate_plan` calls it
-        again on the config it was handed — this dataclass is mutable by
-        design, so ``cfg.num_threads = 4`` after construction would
-        otherwise skip the construction-time check and surface as the
-        Rust wrapper's ``RuntimeError`` backstop instead of the
-        ``ValueError`` this class documents. Delete the matching arm —
-        and the field's doc caveat — if a release ever wires one of them
-        through.
-        """
+    def _normalize_force_model(self) -> None:
         try:
             self.force_model = ForceModelTier(_enum_value(self.force_model))
         except ValueError:
@@ -683,6 +708,21 @@ class PlanningConfig:
                 f"PlanningConfig: force_model must be one of {accepted} (or the "
                 f"matching ForceModelTier member), got {self.force_model!r}."
             ) from None
+
+    def _reject_unread_knobs(self) -> None:
+        """Raise ``ValueError`` for any field :func:`evaluate_plan` never
+        reads.
+
+        A knob that accepts a value and silently does nothing is the
+        failure mode this package refuses everywhere else (see
+        :meth:`WeightingLayer.__post_init__`). Neither field below
+        reaches the plan-evaluation seam, so setting one is refused there
+        rather than quietly dropped. **These fields ARE read by
+        :func:`compute_visibility`** — the observatories carry its gates and
+        twilight thresholds — so this refusal is scoped to evaluate_plan's
+        own call, not to construction.
+        """
+        self._normalize_force_model()
         if self.observatories:
             raise ValueError(
                 f"PlanningConfig.observatories is not consulted by "
@@ -1071,3 +1111,157 @@ class PlanResult:
     reported as the kind it ran, never as ``AUTO``. It is the box the
     search is sized to, so a sampled transport's withheld
     :attr:`PlanMetrics.log_det` reads under this same kind."""
+
+
+# ── Visibility night product (compute_visibility) ────────────────────
+
+
+class VisibilityPoints(qv.Table):
+    """Per-epoch observability — one row per orbit × observatory × grid
+    epoch. Mirrors ``empyrean::VisibilityPoint`` field for field.
+
+    :attr:`observable` is the conjunction of **all four** gates
+    (:attr:`elongation_ok`, :attr:`magnitude_ok`, :attr:`elevation_ok`,
+    :attr:`darkness_ok`), not elongation alone — this is the site-aware
+    verdict the plan-evaluation :attr:`PlanCandidates.observable` cannot
+    give (that seam reads no elevation or darkness). A not-applicable
+    magnitude (:attr:`mag` null) sets :attr:`magnitude_ok` ``False``, never
+    a vacuous pass. Elevation / sun altitude / Moon columns are null for a
+    horizonless observer (the gate passes vacuously there)."""
+
+    orbit_id = qv.LargeStringColumn()
+    obs_code = qv.LargeStringColumn()
+    epoch_mjd_tdb = qv.Float64Column()
+    solar_elongation_deg = qv.Float64Column()
+    elevation_deg = qv.Float64Column(nullable=True)
+    sun_altitude_deg = qv.Float64Column(nullable=True)
+    observable = qv.BooleanColumn()
+    elongation_ok = qv.BooleanColumn()
+    mag = qv.Float64Column(nullable=True)
+    magnitude_ok = qv.BooleanColumn()
+    elevation_ok = qv.BooleanColumn()
+    darkness_ok = qv.BooleanColumn()
+    moon_altitude_deg = qv.Float64Column(nullable=True)
+    moon_azimuth_deg = qv.Float64Column(nullable=True)
+    moon_illuminated_fraction = qv.Float64Column(nullable=True)
+    lunar_elongation_deg = qv.Float64Column()
+
+
+class VisibilityWindows(qv.Table):
+    """Contiguous observable windows. Mirrors ``empyrean::VisibilityWindow``.
+
+    A row with :attr:`night_index` ``-1`` is a whole-survey window; a
+    non-negative index is that night's interval (boundaries bisection-refined
+    to one second), joining to :class:`Nights` on ``(orbit_id, obs_code,
+    night_index)``. :attr:`closing_gate` is ``"elongation"`` / ``"magnitude"``
+    / ``"elevation"`` / ``"darkness"`` / ``"end_of_night"`` or null."""
+
+    orbit_id = qv.LargeStringColumn()
+    obs_code = qv.LargeStringColumn()
+    night_index = qv.Int64Column()
+    start_epoch_mjd_tdb = qv.Float64Column()
+    end_epoch_mjd_tdb = qv.Float64Column()
+    peak_elongation_deg = qv.Float64Column()
+    brightest_mag = qv.Float64Column(nullable=True)
+    hours_observable = qv.Float64Column()
+    max_altitude_deg = qv.Float64Column(nullable=True)
+    max_altitude_epoch_mjd_tdb = qv.Float64Column(nullable=True)
+    closing_gate = qv.LargeStringColumn(nullable=True)
+
+
+class Nights(qv.Table):
+    """The structure of one local night at one observatory — one row per
+    orbit × observatory × local night. Mirrors ``empyrean::Night``.
+
+    The two solar-noon epochs always carry a value; the nine twilight /
+    midnight epochs are null for a polar case or a surveyed span that did not
+    reach the crossing (with the reason in :attr:`note`). The night's
+    observable intervals are the :class:`VisibilityWindows` rows sharing its
+    ``(orbit_id, obs_code, night_index)``; its anchors are the
+    :class:`VisibilityAnchors` rows."""
+
+    orbit_id = qv.LargeStringColumn()
+    obs_code = qv.LargeStringColumn()
+    night_index = qv.Int64Column()
+    local_date_year = qv.Int64Column()
+    local_date_month = qv.Int64Column()
+    local_date_day = qv.Int64Column()
+    noon_start_mjd_tdb = qv.Float64Column()
+    noon_end_mjd_tdb = qv.Float64Column()
+    sunset_mjd_tdb = qv.Float64Column(nullable=True)
+    civil_dusk_mjd_tdb = qv.Float64Column(nullable=True)
+    nautical_dusk_mjd_tdb = qv.Float64Column(nullable=True)
+    astronomical_dusk_mjd_tdb = qv.Float64Column(nullable=True)
+    local_solar_midnight_mjd_tdb = qv.Float64Column(nullable=True)
+    astronomical_dawn_mjd_tdb = qv.Float64Column(nullable=True)
+    nautical_dawn_mjd_tdb = qv.Float64Column(nullable=True)
+    civil_dawn_mjd_tdb = qv.Float64Column(nullable=True)
+    sunrise_mjd_tdb = qv.Float64Column(nullable=True)
+    note = qv.LargeStringColumn(nullable=True)
+
+
+class VisibilityAnchors(qv.Table):
+    """Night anchors — one row per (night, policy). Mirrors ``empyrean::Anchor``
+    with its :class:`~empyrean.AnchorCircumstances` flattened.
+
+    :attr:`policy` is ``"nearest_observable_to_midnight"`` / ``"midnight"`` /
+    ``"transit"`` / ``"explicit_utc"``. An anchor with no epoch this night
+    carries a null :attr:`epoch_mjd_tdb` and null circumstances. The sky
+    covariance rides as :attr:`joint`, the same
+    :class:`~empyrean.orbits.joint.PackedJoints` packed-lower-triangle column
+    the ephemeris rows carry (null when the orbit has no covariance)."""
+
+    orbit_id = qv.LargeStringColumn()
+    obs_code = qv.LargeStringColumn()
+    night_index = qv.Int64Column()
+    policy = qv.LargeStringColumn()
+    epoch_mjd_tdb = qv.Float64Column(nullable=True)
+    observable = qv.BooleanColumn()
+    altitude_deg = qv.Float64Column(nullable=True)
+    azimuth_deg = qv.Float64Column(nullable=True)
+    sun_altitude_deg = qv.Float64Column(nullable=True)
+    solar_elongation_deg = qv.Float64Column(nullable=True)
+    phase_angle_deg = qv.Float64Column(nullable=True)
+    lunar_elongation_deg = qv.Float64Column(nullable=True)
+    moon_altitude_deg = qv.Float64Column(nullable=True)
+    moon_illuminated_fraction = qv.Float64Column(nullable=True)
+    mag = qv.Float64Column(nullable=True)
+    sigma_mag = qv.Float64Column(nullable=True)
+    sky_rate = qv.Float64Column(nullable=True)
+    position_angle_deg = qv.Float64Column(nullable=True)
+    hour_angle_deg = qv.Float64Column(nullable=True)
+    sky_covariance_kind = qv.LargeStringColumn(nullable=True)
+    joint = PackedJoints.as_column(nullable=True)
+
+
+class ObservatorySummary(qv.Table):
+    """Per-observatory survey provenance — one row per orbit × observatory.
+
+    :attr:`note` says why :class:`Nights` is empty when it is for a
+    structural reason (a horizonless or space-based observer). The resolved
+    covariance method and the Earth-orientation summary are survey-wide (per
+    orbit) and replicated onto each observatory for a per-observatory view."""
+
+    orbit_id = qv.LargeStringColumn()
+    obs_code = qv.LargeStringColumn()
+    note = qv.LargeStringColumn(nullable=True)
+    resolved_method = qv.LargeStringColumn()
+    earth_orientation_present = qv.BooleanColumn()
+    earth_orientation_bpc_epochs = qv.Int64Column()
+    earth_orientation_analytic_iau_2006_epochs = qv.Int64Column()
+
+
+@dataclass
+class VisibilityResult:
+    """The result of :func:`empyrean.compute_visibility` — four quivr tables
+    plus the per-observatory survey provenance.
+
+    The tables join on ``orbit_id`` / ``obs_code`` (and ``night_index`` for
+    the night's windows and anchors), so one object's survey from one site is
+    a set of filters away."""
+
+    points: VisibilityPoints
+    windows: VisibilityWindows
+    nights: Nights
+    anchors: VisibilityAnchors
+    observatories: ObservatorySummary

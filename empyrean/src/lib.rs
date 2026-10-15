@@ -184,9 +184,11 @@ pub use od::{
 };
 pub use orbit::{Orbit, PhaseFunction};
 pub use planning::{
-    CandidateKind, CovarianceMetrics, LogDetWithheld, ObservatoryConfig, PlanCandidate,
-    PlanEphemerisPoint, PlanResult, PlannedObservation, PlannedObservationKind, PlanningConfig,
-    RadarMode, RadarPlanSpec, RadarStation, TargetRadarProperties,
+    Anchor, AnchorCircumstances, AnchorPolicy, CandidateKind, CovarianceMetrics,
+    EarthOrientationSummary, Gate, LogDetWithheld, Night, ObservatoryConfig, ObservatoryVisibility,
+    PlanCandidate, PlanEphemerisPoint, PlanResult, PlannedObservation, PlannedObservationKind,
+    PlanningConfig, RadarMode, RadarPlanSpec, RadarStation, TargetRadarProperties,
+    TwilightThresholds, VisibilityPoint, VisibilityResult, VisibilityWindow,
 };
 pub use propagate::{
     AdvancedIntegratorConfig, CaptureCriterion, CovarianceKind, DenseOrigin, DiagnosticsConfig,

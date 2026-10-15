@@ -5525,6 +5525,17 @@ pub(crate) fn empyrean_orbit_to_orbits(
     if let Some(srp) = crate::propagate::empyrean_orbit_srp_params(orbit)? {
         out.set_srp_params(0, Some(srp));
     }
+    // Carry the caller's photometry (phase function + H / slopes + optional
+    // 3×3) onto the orbit through the same `empyrean_orbit_photometric_params`
+    // chokepoint the propagate / ephemeris / file paths use. Without it the
+    // planning (compute_visibility / evaluate_plan) and OD single-orbit paths
+    // fed the engine a photometry-less orbit, so apparent magnitude came back
+    // NaN on every visibility point and the magnitude gate could never pass.
+    if let Some(ph) = crate::propagate::empyrean_orbit_photometric_params(orbit)
+        .map_err(|e| format!("orbit photometry: {e}"))?
+    {
+        out.set_photometric_params(0, Some(ph));
+    }
     Ok(out)
 }
 

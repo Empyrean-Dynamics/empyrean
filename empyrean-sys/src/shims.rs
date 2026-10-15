@@ -1321,6 +1321,43 @@ pub unsafe fn empyrean_evaluate_plan(
 pub unsafe fn empyrean_plan_result_free(result: *mut EmpyreanPlanResult) {
     unsafe { lib().empyrean_plan_result_free(result) }
 }
+/** Survey the observability of one or more orbits over a time window from a
+set of observatories: the per-epoch gates, the observable windows, and the
+local-night product (twilight epochs, local solar midnight, observable
+intervals, and the Moon-aware anchor circumstances).
+
+`orbits` is an array of `n_orbits` orbits, `start` / `end` are MJD TDB and
+`step_days` the survey grid step. On success populates `*out`
+(caller-allocated) with one result per input orbit, in input order; free with
+[`empyrean_visibility_result_free`].
+
+Returns 0 on success (per-orbit failures ride each result's `error_code` /
+`error_message`), -1 for a null/invalid argument, -3 if the survey setup
+fails, -99 on an internal panic. The error message is retrievable via
+`empyrean_last_error()`.*/
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn empyrean_compute_visibility(
+    ctx: *const EmpyreanContext,
+    orbits: *const EmpyreanOrbit,
+    n_orbits: usize,
+    start: f64,
+    end: f64,
+    step_days: f64,
+    config: *const EmpyreanPlanningConfig,
+    out: *mut EmpyreanVisibilityBatch,
+) -> i32 {
+    unsafe {
+        lib().empyrean_compute_visibility(ctx, orbits, n_orbits, start, end, step_days, config, out)
+    }
+}
+/** Free the heap allocations inside a visibility batch populated by
+[`empyrean_compute_visibility`]. Does not free the caller-allocated
+`EmpyreanVisibilityBatch` struct itself.*/
+#[inline]
+pub unsafe fn empyrean_visibility_result_free(result: *mut EmpyreanVisibilityBatch) {
+    unsafe { lib().empyrean_visibility_result_free(result) }
+}
 /** Propagate orbits to the requested target times.
 
 Returns 0 on success, negative error code on failure.

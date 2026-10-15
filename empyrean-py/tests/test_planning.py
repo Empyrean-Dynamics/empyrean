@@ -256,24 +256,31 @@ def test_planning_config_default_lowering_is_a_no_op():
     assert wire["num_threads"] == -1, f"num_threads=0 must lower to -1, got {wire['num_threads']}"
 
 
-def test_config_knobs_the_planner_never_reads_are_refused_at_construction():
+def test_config_knobs_evaluate_plan_never_reads_are_refused_at_its_call():
     """``observatories`` and ``num_threads`` ride the shared planning
-    config but are unread on this entry point.
+    config but are unread by ``evaluate_plan``.
 
-    Accepting either silently would be a dead knob carried across three
-    layers, so both are rejected with a message naming the field and the
+    Since ``compute_visibility`` **does** read the observatories (they
+    carry its gates and twilight thresholds), a config carrying them is
+    valid to CONSTRUCT — the refusal is specific to ``evaluate_plan`` and
+    fires at its call, with a message naming the field and the
     alternative. Delete the matching arm in
-    ``PlanningConfig._reject_unread_knobs`` — and the field's doc caveat
-    — if a release ever wires one of them through.
+    ``PlanningConfig._reject_unread_knobs`` if a release ever wires one of
+    them through evaluate_plan too.
     """
+    orbit = _plan_orbit()
+    planned = [PlannedObservation.optical(_EPOCH_MJD_TDB + 10.0, "F51", (0.2, 0.2))]
+
+    # Construction no longer refuses observatories — compute_visibility reads them.
+    cfg = PlanningConfig(observatories=[_observatory()])
     with pytest.raises(ValueError) as exc:
-        PlanningConfig(observatories=[_observatory()])
+        evaluate_plan(orbit, planned, cfg)
     message = str(exc.value)
     assert "observatories" in message, message
     assert "PlannedObservation" in message, f"the refusal must name the alternative: {message}"
 
     with pytest.raises(ValueError, match="num_threads"):
-        PlanningConfig(num_threads=4)
+        evaluate_plan(orbit, planned, PlanningConfig(num_threads=4))
 
 
 def test_unread_config_knobs_set_after_construction_are_still_refused_as_valueerror():
@@ -368,6 +375,13 @@ def test_observatory_config_lowering_covers_every_dataclass_field():
             min_elongation_deg=45.0,
             min_elevation_deg=30.0,
             max_sun_altitude_deg=-12.0,
+            # The night-product fields (0.11.0) must reach the wire too. The
+            # four thresholds are all-or-nothing and must strictly descend.
+            sunset_sun_altitude_deg=-0.833,
+            civil_twilight_sun_altitude_deg=-6.0,
+            nautical_twilight_sun_altitude_deg=-12.0,
+            astronomical_twilight_sun_altitude_deg=-18.0,
+            explicit_anchor_utc_mjd_tdb=61000.5,
         )._to_wire_dict()
     )
     missing = declared - lowered

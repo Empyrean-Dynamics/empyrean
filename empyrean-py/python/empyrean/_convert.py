@@ -804,6 +804,45 @@ def orbit_batch_dict_to_orbits(result: dict[str, Any]) -> AnyOrbits:
     return orbits_cls.from_kwargs(validate=True, permit_nulls=False, **orbits_kwargs)
 
 
+# The documented spelling of PhotometricParams.model (lowercase), so an
+# Orbits -> dict -> Orbits round trip returns the caller's own tag rather
+# than rewriting its case.
+_MODEL_INT_TO_TAG = {0: "hg", 1: "hg1g2", 2: "hg12"}
+
+
+def _photometry_wire(orbits: AnyOrbits) -> dict[str, Any]:
+    """The photometry fragment of the orbit wire, shared by every
+    Python -> Rust orbit marshaler.
+
+    Both the batch orbits-table dict and the determine / evaluate /
+    visibility orbit dict carry an orbit's ``(phase function, H, slope1,
+    slope2)`` quad plus its optional 3x3 under these keys. Emitting them
+    from one place keeps the two seams from drifting: the visibility /
+    evaluate dict dropped them entirely, so the engine saw a
+    photometry-less orbit, apparent magnitude came back NaN, and the
+    magnitude gate could never pass.
+
+    A model tag with no absolute magnitude is not photometry — the phase
+    function alone predicts nothing — so such a row carries a null tag
+    rather than a tag beside a fabricated H.
+    """
+    phot_h, phot_slope1, phot_slope2, phot_model, has_phot_cov, phot_cov = extract_photometry(
+        orbits
+    )
+    phot_system = [
+        _MODEL_INT_TO_TAG.get(int(m)) if np.isfinite(h) else None
+        for m, h in zip(phot_model, phot_h, strict=True)
+    ]
+    return {
+        "phot_system": phot_system,
+        "phot_h": phot_h,
+        "phot_slope1": phot_slope1,
+        "phot_slope2": phot_slope2,
+        "has_phot_covariance": has_phot_cov,
+        "phot_covariance": phot_cov,
+    }
+
+
 def orbits_to_orbit_batch_dict(orbits: AnyOrbits) -> dict[str, Any]:
     """Convert a quivr Orbits table (Cartesian / Keplerian / Cometary
     / Spherical) into the OrbitBatch dict shape consumed by the Rust
@@ -876,25 +915,12 @@ def orbits_to_orbit_batch_dict(orbits: AnyOrbits) -> dict[str, Any]:
     # prior rides the packed joint.
     has_srp, srp_amrat, srp_cr = extract_srp(orbits)
 
-    # Photometry. The reverse direction (orbit_batch_dict_to_orbits) has
-    # always read these keys back; this direction emitted none of them, so
-    # an orbit batch written through the Python I/O surface lost its H/G
-    # entirely — including the H uncertainty the engine's parquet / CSV
-    # formats do carry.
-    phot_h, phot_slope1, phot_slope2, phot_model, has_phot_cov, phot_cov = extract_photometry(
-        orbits
-    )
-    # The documented spelling of PhotometricParams.model (lowercase), so
-    # an Orbits -> dict -> Orbits round trip returns the caller's own
-    # tag rather than rewriting its case.
-    _MODEL_INT_TO_TAG = {0: "hg", 1: "hg1g2", 2: "hg12"}
-    # A model tag with no absolute magnitude is not photometry: the
-    # phase function alone predicts nothing. Emit no tag for such a row
-    # so the file carries NULL, rather than a tag beside a fabricated H.
-    phot_system = [
-        _MODEL_INT_TO_TAG.get(int(m)) if np.isfinite(h) else None
-        for m, h in zip(phot_model, phot_h, strict=True)
-    ]
+    # Photometry — the (phase function, H, slope1, slope2) quad plus its
+    # optional 3x3, shared verbatim with the determine / evaluate /
+    # visibility orbit dict via `_photometry_wire` so the two seams cannot
+    # drift. The reverse direction (orbit_batch_dict_to_orbits) has always
+    # read these keys back.
+    phot_wire = _photometry_wire(orbits)
 
     object_ids = [s if s else "" for s in orbits.object_id.to_pylist()]
     out: dict[str, Any] = {
@@ -917,12 +943,7 @@ def orbits_to_orbit_batch_dict(orbits: AnyOrbits) -> dict[str, Any]:
         "has_srp": has_srp,
         "srp_amrat": srp_amrat,
         "srp_cr": srp_cr,
-        "phot_system": phot_system,
-        "phot_h": phot_h,
-        "phot_slope1": phot_slope1,
-        "phot_slope2": phot_slope2,
-        "has_phot_covariance": has_phot_cov,
-        "phot_covariance": phot_cov,
+        **phot_wire,
     }
     # The one packed joint per orbit — the covariance authority. No key at
     # all when no orbit carried a joint.

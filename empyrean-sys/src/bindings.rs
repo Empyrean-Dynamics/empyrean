@@ -52,7 +52,12 @@
 //       (EmpyreanPackedJoint::quality / functional / provenance, 0.11.0),
 //   EMPYREAN_MIXTURE_COMPONENT_STATUS_*   (EmpyreanMixtureComponent::status),
 //   EMPYREAN_REJECTION_*                  (rejection_reason, an int32_t — the
-//       whole family except the negative NOT_EVALUATED sentinel shipped u32).
+//       whole family except the negative NOT_EVALUATED sentinel shipped u32),
+//   EMPYREAN_GATE_* / EMPYREAN_ANCHOR_POLICY_* (0.11.0 — the u8
+//       EmpyreanVisibilityWindow::closing_gate / EmpyreanAnchor::policy tags),
+//   EMPYREAN_PLANNING_ERROR_* (0.11.0 — the i32
+//       EmpyreanVisibilityResult::error_code, kept u32 like EMPYREAN_OD_ERROR_*;
+//       the wrapper casts at the comparison).
 //
 // 0.11.0 removed the four-homes covariance surface: EMPYREAN_PARAM_COLUMN_*
 // (the retired EmpyreanParamColumn::kind tags), EMPYREAN_COVARIANCE_QUALITY_*
@@ -292,6 +297,39 @@ pub const EMPYREAN_LOG_DET_WITHHELD_NONE: u32 = 0;
 pub const EMPYREAN_LOG_DET_WITHHELD_SECOND_ORDER_MOMENT: u32 = 1;
 pub const EMPYREAN_LOG_DET_WITHHELD_SAMPLED_MOMENT: u32 = 2;
 pub const EMPYREAN_LOG_DET_WITHHELD_MIXTURE_MOMENT: u32 = 3;
+pub const EMPYREAN_GATE_NONE: u32 = 0;
+pub const EMPYREAN_GATE_ELONGATION: u32 = 1;
+pub const EMPYREAN_GATE_MAGNITUDE: u32 = 2;
+pub const EMPYREAN_GATE_ELEVATION: u32 = 3;
+pub const EMPYREAN_GATE_DARKNESS: u32 = 4;
+pub const EMPYREAN_GATE_END_OF_NIGHT: u32 = 5;
+pub const EMPYREAN_ANCHOR_POLICY_NEAREST_OBSERVABLE_TO_MIDNIGHT: u32 = 0;
+pub const EMPYREAN_ANCHOR_POLICY_MIDNIGHT: u32 = 1;
+pub const EMPYREAN_ANCHOR_POLICY_TRANSIT: u32 = 2;
+pub const EMPYREAN_ANCHOR_POLICY_EXPLICIT_UTC: u32 = 3;
+pub const EMPYREAN_PLANNING_ERROR_NONE: u32 = 0;
+pub const EMPYREAN_PLANNING_ERROR_INVALID_TIME_WINDOW: u32 = 1;
+pub const EMPYREAN_PLANNING_ERROR_OBSERVER_CONSTRUCTION: u32 = 2;
+pub const EMPYREAN_PLANNING_ERROR_INVALID_STATION_CODE: u32 = 3;
+pub const EMPYREAN_PLANNING_ERROR_EPHEMERIS_GENERATION: u32 = 4;
+pub const EMPYREAN_PLANNING_ERROR_ORBIT_PROPAGATION_FAILED: u32 = 5;
+pub const EMPYREAN_PLANNING_ERROR_ORBIT_EPHEMERIS_FAILED: u32 = 6;
+pub const EMPYREAN_PLANNING_ERROR_CANDIDATE_COVARIANCE_WITHHELD: u32 = 7;
+pub const EMPYREAN_PLANNING_ERROR_THREAD_BUDGET: u32 = 8;
+pub const EMPYREAN_PLANNING_ERROR_NO_OBSERVATORIES: u32 = 9;
+pub const EMPYREAN_PLANNING_ERROR_UNSUPPORTED_UNCERTAINTY_METHOD: u32 = 10;
+pub const EMPYREAN_PLANNING_ERROR_EARTH_ORIENTATION_UNAVAILABLE: u32 = 11;
+pub const EMPYREAN_PLANNING_ERROR_EARTH_ORIENTATION_EVALUATION: u32 = 12;
+pub const EMPYREAN_PLANNING_ERROR_BODY_STATE_UNAVAILABLE: u32 = 13;
+pub const EMPYREAN_PLANNING_ERROR_DEGENERATE_SITE_GEOMETRY: u32 = 14;
+pub const EMPYREAN_PLANNING_ERROR_VISIBILITY_GRID_MISMATCH: u32 = 15;
+pub const EMPYREAN_PLANNING_ERROR_MISSING_OBSERVABILITY_DIAGNOSTIC: u32 = 16;
+pub const EMPYREAN_PLANNING_ERROR_ASTROMETRY_FRAME_NOT_ICRF: u32 = 17;
+pub const EMPYREAN_PLANNING_ERROR_SPK_SUBSTITUTED_BODY: u32 = 18;
+pub const EMPYREAN_PLANNING_ERROR_NON_FINITE_PRIOR_COVARIANCE: u32 = 19;
+pub const EMPYREAN_PLANNING_ERROR_INVALID_OBSERVATORY_CONFIG: u32 = 20;
+pub const EMPYREAN_PLANNING_ERROR_NIGHT_TIME_CONVERSION: u32 = 21;
+pub const EMPYREAN_PLANNING_ERROR_OTHER: u32 = 99;
 pub const EMPYREAN_PHASE_FUNCTION_NONE: i32 = -1;
 pub const EMPYREAN_PHASE_FUNCTION_HG: u32 = 0;
 pub const EMPYREAN_PHASE_FUNCTION_HG1G2: u32 = 1;
@@ -4414,11 +4452,25 @@ pub struct EmpyreanObservatoryConfig {
     pub has_max_sun_altitude_deg: u8,
     #[doc = " Solar altitude at or below which the site counts as dark, in\n degrees. Only read when\n [`has_max_sun_altitude_deg`](Self::has_max_sun_altitude_deg) is 1.\n\n Built from the same site zenith as `min_elevation_deg`, against\n the **geometric** topocentric direction to the Sun — no\n light-time, aberration or refraction correction, each of which is\n a few tens of arcseconds at most against a threshold that\n operates on degrees.\n\n The standard conventions are civil (\\\\(-6°\\\\)), nautical\n (\\\\(-12°\\\\)) and astronomical (\\\\(-18°\\\\), the engine default,\n where the sky background has fallen to its dark-time floor).\n Because refraction is ignored, `0.0` means the Sun's *centre* on\n the geometric horizon, about \\\\(0.83°\\\\) later than visible\n sunset. A value above \\\\(+90°\\\\) disables the darkness gate.\n\n **No exported entry point applies it**, on the same terms as\n [`min_elevation_deg`](Self::min_elevation_deg): the value reaches\n the engine's observatory config, and the darkness gate that reads\n it belongs to the unexported visibility survey. See the\n struct-level docs."]
     pub max_sun_altitude_deg: f64,
+    #[doc = " 1 when the four twilight thresholds below carry caller values; 0 to\n take the engine's defaults (−0.833° / −6° / −12° / −18°).\n\n A single switch gates all four because they are validated as a\n **group** — the engine refuses a set that does not strictly descend\n (sunset > civil > nautical > astronomical). A zero-init struct\n (`memset(0)`) would read `0, 0, 0, 0`, which is not strictly\n descending and would be refused, so — exactly as\n [`has_max_sun_altitude_deg`](Self::has_max_sun_altitude_deg) guards\n the darkness gate against a literal `0.0` — this switch lets a\n zero-init struct resolve to the engine's own defaults rather than to\n an invalid all-zero set. These thresholds structure the [night\n product](empyrean_compute_visibility) only; per-epoch darkness still\n gates on [`max_sun_altitude_deg`](Self::max_sun_altitude_deg)."]
+    pub has_twilight_thresholds: u8,
+    #[doc = " Sun altitude (degrees) that opens/closes the observable night on the\n refraction-corrected visible horizon (sunset/sunrise). Default\n `-0.833` — the Sun's upper limb on the apparent horizon. Read only\n when [`has_twilight_thresholds`](Self::has_twilight_thresholds) is 1."]
+    pub sunset_sun_altitude_deg: f64,
+    #[doc = " Sun altitude (degrees) for civil twilight. Default `-6.0`. Read only\n when [`has_twilight_thresholds`](Self::has_twilight_thresholds) is 1."]
+    pub civil_twilight_sun_altitude_deg: f64,
+    #[doc = " Sun altitude (degrees) for nautical twilight. Default `-12.0`. Read\n only when [`has_twilight_thresholds`](Self::has_twilight_thresholds)\n is 1."]
+    pub nautical_twilight_sun_altitude_deg: f64,
+    #[doc = " Sun altitude (degrees) for astronomical twilight. Default `-18.0` —\n the same convention as the darkness gate's default, but an\n independent night-structure threshold. Read only when\n [`has_twilight_thresholds`](Self::has_twilight_thresholds) is 1."]
+    pub astronomical_twilight_sun_altitude_deg: f64,
+    #[doc = " 1 when [`explicit_anchor_utc_mjd_tdb`](Self::explicit_anchor_utc_mjd_tdb)\n carries a caller-supplied anchor epoch; 0 for the three site-derived\n anchors only."]
+    pub has_explicit_anchor_utc: u8,
+    #[doc = " Caller-supplied epoch (MJD, TDB) for the\n `EMPYREAN_ANCHOR_POLICY_EXPLICIT_UTC` anchor: every night whose\n noon-to-noon span contains it also carries an explicit anchor there,\n with the circumstances read off the ephemeris row. Read only when\n [`has_explicit_anchor_utc`](Self::has_explicit_anchor_utc) is 1."]
+    pub explicit_anchor_utc_mjd_tdb: f64,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of EmpyreanObservatoryConfig"]
-        [::std::mem::size_of::<EmpyreanObservatoryConfig>() - 64usize];
+        [::std::mem::size_of::<EmpyreanObservatoryConfig>() - 120usize];
     ["Alignment of EmpyreanObservatoryConfig"]
         [::std::mem::align_of::<EmpyreanObservatoryConfig>() - 8usize];
     ["Offset of field: EmpyreanObservatoryConfig::obs_code"]
@@ -4437,6 +4489,27 @@ const _: () = {
         [::std::mem::offset_of!(EmpyreanObservatoryConfig, has_max_sun_altitude_deg) - 48usize];
     ["Offset of field: EmpyreanObservatoryConfig::max_sun_altitude_deg"]
         [::std::mem::offset_of!(EmpyreanObservatoryConfig, max_sun_altitude_deg) - 56usize];
+    ["Offset of field: EmpyreanObservatoryConfig::has_twilight_thresholds"]
+        [::std::mem::offset_of!(EmpyreanObservatoryConfig, has_twilight_thresholds) - 64usize];
+    ["Offset of field: EmpyreanObservatoryConfig::sunset_sun_altitude_deg"]
+        [::std::mem::offset_of!(EmpyreanObservatoryConfig, sunset_sun_altitude_deg) - 72usize];
+    ["Offset of field: EmpyreanObservatoryConfig::civil_twilight_sun_altitude_deg"][::std::mem::offset_of!(
+        EmpyreanObservatoryConfig,
+        civil_twilight_sun_altitude_deg
+    ) - 80usize];
+    ["Offset of field: EmpyreanObservatoryConfig::nautical_twilight_sun_altitude_deg"][::std::mem::offset_of!(
+        EmpyreanObservatoryConfig,
+        nautical_twilight_sun_altitude_deg
+    ) - 88usize];
+    ["Offset of field: EmpyreanObservatoryConfig::astronomical_twilight_sun_altitude_deg"][::std::mem::offset_of!(
+        EmpyreanObservatoryConfig,
+        astronomical_twilight_sun_altitude_deg
+    )
+        - 96usize];
+    ["Offset of field: EmpyreanObservatoryConfig::has_explicit_anchor_utc"]
+        [::std::mem::offset_of!(EmpyreanObservatoryConfig, has_explicit_anchor_utc) - 104usize];
+    ["Offset of field: EmpyreanObservatoryConfig::explicit_anchor_utc_mjd_tdb"]
+        [::std::mem::offset_of!(EmpyreanObservatoryConfig, explicit_anchor_utc_mjd_tdb) - 112usize];
 };
 impl Default for EmpyreanObservatoryConfig {
     fn default() -> Self {
@@ -4706,6 +4779,588 @@ const _: () = {
         [::std::mem::offset_of!(EmpyreanPlanResult, resolved_method) - 152usize];
 };
 impl Default for EmpyreanPlanResult {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[doc = " One epoch's observability from one observatory — mirrors\n `scott::planning::VisibilityPoint` field for field. The four `*_ok`\n flags are the individual gates and [`observable`](Self::observable) is\n their conjunction, so a caller sees WHICH condition closed a window."]
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct EmpyreanVisibilityPoint {
+    #[doc = " Epoch — MJD, TDB."]
+    pub epoch_mjd_tdb: f64,
+    #[doc = " Solar elongation (degrees)."]
+    pub solar_elongation_deg: f64,
+    #[doc = " 1 when [`elevation_deg`](Self::elevation_deg) is a measured value; 0\n for an observer with no local horizon (geocentric `500`, a registered\n spacecraft), where the elevation gate passes vacuously."]
+    pub has_elevation_deg: u8,
+    #[doc = " Target elevation above the site's local horizon (degrees, geodetic\n zenith, refraction ignored). Meaningful only when\n [`has_elevation_deg`](Self::has_elevation_deg) is 1."]
+    pub elevation_deg: f64,
+    #[doc = " 1 when [`sun_altitude_deg`](Self::sun_altitude_deg) is a measured\n value; 0 for a horizonless observer, where the darkness gate passes\n vacuously."]
+    pub has_sun_altitude_deg: u8,
+    #[doc = " Altitude of the Sun's geometric centre above the site's local horizon\n (degrees). Meaningful only when\n [`has_sun_altitude_deg`](Self::has_sun_altitude_deg) is 1."]
+    pub sun_altitude_deg: f64,
+    #[doc = " 1 when all four gates pass."]
+    pub observable: u8,
+    #[doc = " 1 when the solar-elongation gate passes."]
+    pub elongation_ok: u8,
+    #[doc = " 1 when [`mag`](Self::mag) carries a predicted apparent magnitude; 0\n when the orbit has no photometry — the magnitude gate is then NOT\n applicable (and [`magnitude_ok`](Self::magnitude_ok) is 0, never a\n vacuous pass)."]
+    pub has_mag: u8,
+    #[doc = " Predicted apparent magnitude. Meaningful only when\n [`has_mag`](Self::has_mag) is 1."]
+    pub mag: f64,
+    #[doc = " 1 when the target is brighter than the limit AND a magnitude is known.\n A not-applicable magnitude does NOT pass vacuously."]
+    pub magnitude_ok: u8,
+    #[doc = " 1 when the target is at/above the minimum elevation, or the observer\n has no local horizon."]
+    pub elevation_ok: u8,
+    #[doc = " 1 when the Sun is at/below the darkness threshold, or the observer has\n no local horizon."]
+    pub darkness_ok: u8,
+    #[doc = " 1 when the Moon altitude is measured; 0 for a horizonless observer."]
+    pub has_moon_altitude_deg: u8,
+    #[doc = " Moon altitude above the site's local horizon (degrees, villeneuve's\n geocentric vertical). Meaningful only when\n [`has_moon_altitude_deg`](Self::has_moon_altitude_deg) is 1."]
+    pub moon_altitude_deg: f64,
+    #[doc = " 1 when the Moon azimuth is measured; 0 for a horizonless observer."]
+    pub has_moon_azimuth_deg: u8,
+    #[doc = " Moon azimuth (degrees, East of North). Meaningful only when\n [`has_moon_azimuth_deg`](Self::has_moon_azimuth_deg) is 1."]
+    pub moon_azimuth_deg: f64,
+    #[doc = " 1 when the Moon illuminated fraction is available; 0 only in the\n degenerate observer-at-Moon case."]
+    pub has_moon_illuminated_fraction: u8,
+    #[doc = " Sunlit fraction of the Moon's disc, \\\\(k = \\tfrac{1}{2}(1+\\cos\\alpha)\\\\)\n from its phase angle. Meaningful only when\n [`has_moon_illuminated_fraction`](Self::has_moon_illuminated_fraction)\n is 1."]
+    pub moon_illuminated_fraction: f64,
+    #[doc = " Target–observer–Moon angle (degrees), independent of any horizon."]
+    pub lunar_elongation_deg: f64,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of EmpyreanVisibilityPoint"]
+        [::std::mem::size_of::<EmpyreanVisibilityPoint>() - 120usize];
+    ["Alignment of EmpyreanVisibilityPoint"]
+        [::std::mem::align_of::<EmpyreanVisibilityPoint>() - 8usize];
+    ["Offset of field: EmpyreanVisibilityPoint::epoch_mjd_tdb"]
+        [::std::mem::offset_of!(EmpyreanVisibilityPoint, epoch_mjd_tdb) - 0usize];
+    ["Offset of field: EmpyreanVisibilityPoint::solar_elongation_deg"]
+        [::std::mem::offset_of!(EmpyreanVisibilityPoint, solar_elongation_deg) - 8usize];
+    ["Offset of field: EmpyreanVisibilityPoint::has_elevation_deg"]
+        [::std::mem::offset_of!(EmpyreanVisibilityPoint, has_elevation_deg) - 16usize];
+    ["Offset of field: EmpyreanVisibilityPoint::elevation_deg"]
+        [::std::mem::offset_of!(EmpyreanVisibilityPoint, elevation_deg) - 24usize];
+    ["Offset of field: EmpyreanVisibilityPoint::has_sun_altitude_deg"]
+        [::std::mem::offset_of!(EmpyreanVisibilityPoint, has_sun_altitude_deg) - 32usize];
+    ["Offset of field: EmpyreanVisibilityPoint::sun_altitude_deg"]
+        [::std::mem::offset_of!(EmpyreanVisibilityPoint, sun_altitude_deg) - 40usize];
+    ["Offset of field: EmpyreanVisibilityPoint::observable"]
+        [::std::mem::offset_of!(EmpyreanVisibilityPoint, observable) - 48usize];
+    ["Offset of field: EmpyreanVisibilityPoint::elongation_ok"]
+        [::std::mem::offset_of!(EmpyreanVisibilityPoint, elongation_ok) - 49usize];
+    ["Offset of field: EmpyreanVisibilityPoint::has_mag"]
+        [::std::mem::offset_of!(EmpyreanVisibilityPoint, has_mag) - 50usize];
+    ["Offset of field: EmpyreanVisibilityPoint::mag"]
+        [::std::mem::offset_of!(EmpyreanVisibilityPoint, mag) - 56usize];
+    ["Offset of field: EmpyreanVisibilityPoint::magnitude_ok"]
+        [::std::mem::offset_of!(EmpyreanVisibilityPoint, magnitude_ok) - 64usize];
+    ["Offset of field: EmpyreanVisibilityPoint::elevation_ok"]
+        [::std::mem::offset_of!(EmpyreanVisibilityPoint, elevation_ok) - 65usize];
+    ["Offset of field: EmpyreanVisibilityPoint::darkness_ok"]
+        [::std::mem::offset_of!(EmpyreanVisibilityPoint, darkness_ok) - 66usize];
+    ["Offset of field: EmpyreanVisibilityPoint::has_moon_altitude_deg"]
+        [::std::mem::offset_of!(EmpyreanVisibilityPoint, has_moon_altitude_deg) - 67usize];
+    ["Offset of field: EmpyreanVisibilityPoint::moon_altitude_deg"]
+        [::std::mem::offset_of!(EmpyreanVisibilityPoint, moon_altitude_deg) - 72usize];
+    ["Offset of field: EmpyreanVisibilityPoint::has_moon_azimuth_deg"]
+        [::std::mem::offset_of!(EmpyreanVisibilityPoint, has_moon_azimuth_deg) - 80usize];
+    ["Offset of field: EmpyreanVisibilityPoint::moon_azimuth_deg"]
+        [::std::mem::offset_of!(EmpyreanVisibilityPoint, moon_azimuth_deg) - 88usize];
+    ["Offset of field: EmpyreanVisibilityPoint::has_moon_illuminated_fraction"]
+        [::std::mem::offset_of!(EmpyreanVisibilityPoint, has_moon_illuminated_fraction) - 96usize];
+    ["Offset of field: EmpyreanVisibilityPoint::moon_illuminated_fraction"]
+        [::std::mem::offset_of!(EmpyreanVisibilityPoint, moon_illuminated_fraction) - 104usize];
+    ["Offset of field: EmpyreanVisibilityPoint::lunar_elongation_deg"]
+        [::std::mem::offset_of!(EmpyreanVisibilityPoint, lunar_elongation_deg) - 112usize];
+};
+#[doc = " A contiguous window of observability — mirrors\n `scott::planning::VisibilityWindow`. Used both for the whole-survey\n windows and for a [`EmpyreanNight`]'s intervals (whose boundaries are\n bisection-refined to one second)."]
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct EmpyreanVisibilityWindow {
+    #[doc = " Window start — MJD, TDB."]
+    pub start_epoch_mjd_tdb: f64,
+    #[doc = " Window end — MJD, TDB."]
+    pub end_epoch_mjd_tdb: f64,
+    #[doc = " Peak solar elongation during the window (degrees)."]
+    pub peak_elongation_deg: f64,
+    #[doc = " 1 when [`brightest_mag`](Self::brightest_mag) is set."]
+    pub has_brightest_mag: u8,
+    #[doc = " Brightest predicted magnitude during the window. Meaningful only when\n [`has_brightest_mag`](Self::has_brightest_mag) is 1."]
+    pub brightest_mag: f64,
+    #[doc = " Length of the window in hours (`end − start`)."]
+    pub hours_observable: f64,
+    #[doc = " 1 when [`max_altitude_deg`](Self::max_altitude_deg) is set (absent for\n a horizonless observer's whole-survey window)."]
+    pub has_max_altitude_deg: u8,
+    #[doc = " Maximum target altitude in the window (degrees, geodetic vertical)."]
+    pub max_altitude_deg: f64,
+    #[doc = " 1 when [`max_altitude_epoch_mjd_tdb`](Self::max_altitude_epoch_mjd_tdb)\n is set."]
+    pub has_max_altitude_epoch: u8,
+    #[doc = " Epoch of the maximum altitude — MJD, TDB."]
+    pub max_altitude_epoch_mjd_tdb: f64,
+    #[doc = " The gate that closed the window — an `EMPYREAN_GATE_*` value\n (`EMPYREAN_GATE_NONE` when the engine reported none)."]
+    pub closing_gate: u8,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of EmpyreanVisibilityWindow"]
+        [::std::mem::size_of::<EmpyreanVisibilityWindow>() - 88usize];
+    ["Alignment of EmpyreanVisibilityWindow"]
+        [::std::mem::align_of::<EmpyreanVisibilityWindow>() - 8usize];
+    ["Offset of field: EmpyreanVisibilityWindow::start_epoch_mjd_tdb"]
+        [::std::mem::offset_of!(EmpyreanVisibilityWindow, start_epoch_mjd_tdb) - 0usize];
+    ["Offset of field: EmpyreanVisibilityWindow::end_epoch_mjd_tdb"]
+        [::std::mem::offset_of!(EmpyreanVisibilityWindow, end_epoch_mjd_tdb) - 8usize];
+    ["Offset of field: EmpyreanVisibilityWindow::peak_elongation_deg"]
+        [::std::mem::offset_of!(EmpyreanVisibilityWindow, peak_elongation_deg) - 16usize];
+    ["Offset of field: EmpyreanVisibilityWindow::has_brightest_mag"]
+        [::std::mem::offset_of!(EmpyreanVisibilityWindow, has_brightest_mag) - 24usize];
+    ["Offset of field: EmpyreanVisibilityWindow::brightest_mag"]
+        [::std::mem::offset_of!(EmpyreanVisibilityWindow, brightest_mag) - 32usize];
+    ["Offset of field: EmpyreanVisibilityWindow::hours_observable"]
+        [::std::mem::offset_of!(EmpyreanVisibilityWindow, hours_observable) - 40usize];
+    ["Offset of field: EmpyreanVisibilityWindow::has_max_altitude_deg"]
+        [::std::mem::offset_of!(EmpyreanVisibilityWindow, has_max_altitude_deg) - 48usize];
+    ["Offset of field: EmpyreanVisibilityWindow::max_altitude_deg"]
+        [::std::mem::offset_of!(EmpyreanVisibilityWindow, max_altitude_deg) - 56usize];
+    ["Offset of field: EmpyreanVisibilityWindow::has_max_altitude_epoch"]
+        [::std::mem::offset_of!(EmpyreanVisibilityWindow, has_max_altitude_epoch) - 64usize];
+    ["Offset of field: EmpyreanVisibilityWindow::max_altitude_epoch_mjd_tdb"]
+        [::std::mem::offset_of!(EmpyreanVisibilityWindow, max_altitude_epoch_mjd_tdb) - 72usize];
+    ["Offset of field: EmpyreanVisibilityWindow::closing_gate"]
+        [::std::mem::offset_of!(EmpyreanVisibilityWindow, closing_gate) - 80usize];
+};
+#[doc = " The circumstances at a night anchor epoch — mirrors\n `scott::planning::AnchorCircumstances`. Read off the single ephemeris row\n generated at the anchor epoch (never interpolated). The target and Moon\n altitudes are villeneuve's geocentric vertical; the Sun altitude is\n scott's geodetic value (consistent with the darkness gate)."]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct EmpyreanAnchorCircumstances {
+    #[doc = " Target altitude above the horizon (degrees, geocentric vertical)."]
+    pub altitude_deg: f64,
+    #[doc = " Target azimuth (degrees, East of North, geocentric vertical)."]
+    pub azimuth_deg: f64,
+    #[doc = " Sun altitude at the site (degrees, geodetic vertical)."]
+    pub sun_altitude_deg: f64,
+    #[doc = " Solar elongation (degrees)."]
+    pub solar_elongation_deg: f64,
+    #[doc = " Solar phase angle (degrees)."]
+    pub phase_angle_deg: f64,
+    #[doc = " Target–observer–Moon angle (degrees)."]
+    pub lunar_elongation_deg: f64,
+    #[doc = " 1 when the Moon altitude is set; 0 for a horizonless observer."]
+    pub has_moon_altitude_deg: u8,
+    #[doc = " Moon altitude above the horizon (degrees, geocentric vertical)."]
+    pub moon_altitude_deg: f64,
+    #[doc = " 1 when the Moon illuminated fraction is set."]
+    pub has_moon_illuminated_fraction: u8,
+    #[doc = " Moon illuminated fraction (dimensionless, [0, 1])."]
+    pub moon_illuminated_fraction: f64,
+    #[doc = " 1 when [`mag`](Self::mag) is set (0 when the orbit has no photometry)."]
+    pub has_mag: u8,
+    #[doc = " Predicted apparent magnitude."]
+    pub mag: f64,
+    #[doc = " 1 when [`sigma_mag`](Self::sigma_mag) is set."]
+    pub has_sigma_mag: u8,
+    #[doc = " 1σ magnitude uncertainty."]
+    pub sigma_mag: f64,
+    #[doc = " 1 when [`sky_rate`](Self::sky_rate) is set."]
+    pub has_sky_rate: u8,
+    #[doc = " Total on-sky angular rate (degrees/day)."]
+    pub sky_rate: f64,
+    #[doc = " 1 when [`position_angle_deg`](Self::position_angle_deg) is set."]
+    pub has_position_angle_deg: u8,
+    #[doc = " Position angle of motion (degrees, East of North)."]
+    pub position_angle_deg: f64,
+    #[doc = " 1 when [`hour_angle`](Self::hour_angle) is set; 0 for a horizonless\n observer."]
+    pub has_hour_angle: u8,
+    #[doc = " Hour angle (degrees)."]
+    pub hour_angle: f64,
+    #[doc = " 1 when [`sky_covariance`](Self::sky_covariance) carries the row's sky\n covariance; 0 when the orbit carries no covariance."]
+    pub has_sky_covariance: u8,
+    #[doc = " Derivation tag of the sky covariance — an `EMPYREAN_COVARIANCE_KIND_*`\n value; `EMPYREAN_COVARIANCE_KIND_UNKNOWN` when absent."]
+    pub sky_covariance_kind: u8,
+    #[doc = " The row's sky covariance under the requested uncertainty method, as\n ONE self-describing packed joint — the same `EmpyreanPackedJoint`\n struct and lower-triangle packing the propagation / ephemeris rows\n carry. The absent joint (`width == 0`, null `tri`) when\n [`has_sky_covariance`](Self::has_sky_covariance) is 0. Freed by\n [`empyrean_visibility_result_free`]."]
+    pub sky_covariance: EmpyreanPackedJoint,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of EmpyreanAnchorCircumstances"]
+        [::std::mem::size_of::<EmpyreanAnchorCircumstances>() - 224usize];
+    ["Alignment of EmpyreanAnchorCircumstances"]
+        [::std::mem::align_of::<EmpyreanAnchorCircumstances>() - 8usize];
+    ["Offset of field: EmpyreanAnchorCircumstances::altitude_deg"]
+        [::std::mem::offset_of!(EmpyreanAnchorCircumstances, altitude_deg) - 0usize];
+    ["Offset of field: EmpyreanAnchorCircumstances::azimuth_deg"]
+        [::std::mem::offset_of!(EmpyreanAnchorCircumstances, azimuth_deg) - 8usize];
+    ["Offset of field: EmpyreanAnchorCircumstances::sun_altitude_deg"]
+        [::std::mem::offset_of!(EmpyreanAnchorCircumstances, sun_altitude_deg) - 16usize];
+    ["Offset of field: EmpyreanAnchorCircumstances::solar_elongation_deg"]
+        [::std::mem::offset_of!(EmpyreanAnchorCircumstances, solar_elongation_deg) - 24usize];
+    ["Offset of field: EmpyreanAnchorCircumstances::phase_angle_deg"]
+        [::std::mem::offset_of!(EmpyreanAnchorCircumstances, phase_angle_deg) - 32usize];
+    ["Offset of field: EmpyreanAnchorCircumstances::lunar_elongation_deg"]
+        [::std::mem::offset_of!(EmpyreanAnchorCircumstances, lunar_elongation_deg) - 40usize];
+    ["Offset of field: EmpyreanAnchorCircumstances::has_moon_altitude_deg"]
+        [::std::mem::offset_of!(EmpyreanAnchorCircumstances, has_moon_altitude_deg) - 48usize];
+    ["Offset of field: EmpyreanAnchorCircumstances::moon_altitude_deg"]
+        [::std::mem::offset_of!(EmpyreanAnchorCircumstances, moon_altitude_deg) - 56usize];
+    ["Offset of field: EmpyreanAnchorCircumstances::has_moon_illuminated_fraction"][::std::mem::offset_of!(
+        EmpyreanAnchorCircumstances,
+        has_moon_illuminated_fraction
+    ) - 64usize];
+    ["Offset of field: EmpyreanAnchorCircumstances::moon_illuminated_fraction"]
+        [::std::mem::offset_of!(EmpyreanAnchorCircumstances, moon_illuminated_fraction) - 72usize];
+    ["Offset of field: EmpyreanAnchorCircumstances::has_mag"]
+        [::std::mem::offset_of!(EmpyreanAnchorCircumstances, has_mag) - 80usize];
+    ["Offset of field: EmpyreanAnchorCircumstances::mag"]
+        [::std::mem::offset_of!(EmpyreanAnchorCircumstances, mag) - 88usize];
+    ["Offset of field: EmpyreanAnchorCircumstances::has_sigma_mag"]
+        [::std::mem::offset_of!(EmpyreanAnchorCircumstances, has_sigma_mag) - 96usize];
+    ["Offset of field: EmpyreanAnchorCircumstances::sigma_mag"]
+        [::std::mem::offset_of!(EmpyreanAnchorCircumstances, sigma_mag) - 104usize];
+    ["Offset of field: EmpyreanAnchorCircumstances::has_sky_rate"]
+        [::std::mem::offset_of!(EmpyreanAnchorCircumstances, has_sky_rate) - 112usize];
+    ["Offset of field: EmpyreanAnchorCircumstances::sky_rate"]
+        [::std::mem::offset_of!(EmpyreanAnchorCircumstances, sky_rate) - 120usize];
+    ["Offset of field: EmpyreanAnchorCircumstances::has_position_angle_deg"]
+        [::std::mem::offset_of!(EmpyreanAnchorCircumstances, has_position_angle_deg) - 128usize];
+    ["Offset of field: EmpyreanAnchorCircumstances::position_angle_deg"]
+        [::std::mem::offset_of!(EmpyreanAnchorCircumstances, position_angle_deg) - 136usize];
+    ["Offset of field: EmpyreanAnchorCircumstances::has_hour_angle"]
+        [::std::mem::offset_of!(EmpyreanAnchorCircumstances, has_hour_angle) - 144usize];
+    ["Offset of field: EmpyreanAnchorCircumstances::hour_angle"]
+        [::std::mem::offset_of!(EmpyreanAnchorCircumstances, hour_angle) - 152usize];
+    ["Offset of field: EmpyreanAnchorCircumstances::has_sky_covariance"]
+        [::std::mem::offset_of!(EmpyreanAnchorCircumstances, has_sky_covariance) - 160usize];
+    ["Offset of field: EmpyreanAnchorCircumstances::sky_covariance_kind"]
+        [::std::mem::offset_of!(EmpyreanAnchorCircumstances, sky_covariance_kind) - 161usize];
+    ["Offset of field: EmpyreanAnchorCircumstances::sky_covariance"]
+        [::std::mem::offset_of!(EmpyreanAnchorCircumstances, sky_covariance) - 168usize];
+};
+impl Default for EmpyreanAnchorCircumstances {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[doc = " A night anchor: the epoch chosen under one policy and the circumstances\n there — mirrors `scott::planning::Anchor`."]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct EmpyreanAnchor {
+    #[doc = " The policy that chose the epoch — an `EMPYREAN_ANCHOR_POLICY_*` value."]
+    pub policy: u8,
+    #[doc = " 1 when [`epoch_mjd_tdb`](Self::epoch_mjd_tdb) is set (0 when the policy\n has no epoch this night, e.g. nearest-observable with no observable\n interval)."]
+    pub has_epoch: u8,
+    #[doc = " The chosen epoch — MJD, TDB. Meaningful only when\n [`has_epoch`](Self::has_epoch) is 1."]
+    pub epoch_mjd_tdb: f64,
+    #[doc = " 1 when the target passes all four gates at the anchor epoch; 0 when\n there is no epoch."]
+    pub observable: u8,
+    #[doc = " 1 when [`circumstances`](Self::circumstances) is populated (0 when\n there is no epoch)."]
+    pub has_circumstances: u8,
+    #[doc = " The circumstances at the anchor epoch. Meaningful only when\n [`has_circumstances`](Self::has_circumstances) is 1; its\n `sky_covariance` packed joint is freed by\n [`empyrean_visibility_result_free`]."]
+    pub circumstances: EmpyreanAnchorCircumstances,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of EmpyreanAnchor"][::std::mem::size_of::<EmpyreanAnchor>() - 248usize];
+    ["Alignment of EmpyreanAnchor"][::std::mem::align_of::<EmpyreanAnchor>() - 8usize];
+    ["Offset of field: EmpyreanAnchor::policy"]
+        [::std::mem::offset_of!(EmpyreanAnchor, policy) - 0usize];
+    ["Offset of field: EmpyreanAnchor::has_epoch"]
+        [::std::mem::offset_of!(EmpyreanAnchor, has_epoch) - 1usize];
+    ["Offset of field: EmpyreanAnchor::epoch_mjd_tdb"]
+        [::std::mem::offset_of!(EmpyreanAnchor, epoch_mjd_tdb) - 8usize];
+    ["Offset of field: EmpyreanAnchor::observable"]
+        [::std::mem::offset_of!(EmpyreanAnchor, observable) - 16usize];
+    ["Offset of field: EmpyreanAnchor::has_circumstances"]
+        [::std::mem::offset_of!(EmpyreanAnchor, has_circumstances) - 17usize];
+    ["Offset of field: EmpyreanAnchor::circumstances"]
+        [::std::mem::offset_of!(EmpyreanAnchor, circumstances) - 24usize];
+};
+impl Default for EmpyreanAnchor {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[doc = " The structure of one local night at one observatory — mirrors\n `scott::planning::Night`. The two solar-noon epochs always carry a value;\n the nine twilight / midnight epochs are `has_*` + value (a `None` crossing\n is a polar case, or a surveyed span that did not reach it, with the reason\n in [`note`](Self::note))."]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct EmpyreanNight {
+    #[doc = " Local civil date year."]
+    pub local_date_year: i64,
+    #[doc = " Local civil date month (1–12)."]
+    pub local_date_month: u32,
+    #[doc = " Local civil date day (1–31)."]
+    pub local_date_day: u32,
+    #[doc = " Local solar noon that opens the night — MJD, TDB."]
+    pub noon_start_mjd_tdb: f64,
+    #[doc = " Local solar noon that closes the night — MJD, TDB."]
+    pub noon_end_mjd_tdb: f64,
+    #[doc = " 1 when the evening sunset crossing was found."]
+    pub has_sunset: u8,
+    #[doc = " Evening crossing of the sunset threshold — MJD, TDB."]
+    pub sunset_mjd_tdb: f64,
+    #[doc = " 1 when the evening civil-twilight crossing was found."]
+    pub has_civil_dusk: u8,
+    #[doc = " Evening civil-twilight crossing — MJD, TDB."]
+    pub civil_dusk_mjd_tdb: f64,
+    #[doc = " 1 when the evening nautical-twilight crossing was found."]
+    pub has_nautical_dusk: u8,
+    #[doc = " Evening nautical-twilight crossing — MJD, TDB."]
+    pub nautical_dusk_mjd_tdb: f64,
+    #[doc = " 1 when the evening astronomical-twilight crossing was found."]
+    pub has_astronomical_dusk: u8,
+    #[doc = " Evening astronomical-twilight crossing — MJD, TDB."]
+    pub astronomical_dusk_mjd_tdb: f64,
+    #[doc = " 1 when the local solar midnight was found."]
+    pub has_local_solar_midnight: u8,
+    #[doc = " Local solar midnight (Sun-altitude minimum) — MJD, TDB."]
+    pub local_solar_midnight_mjd_tdb: f64,
+    #[doc = " 1 when the morning astronomical-twilight crossing was found."]
+    pub has_astronomical_dawn: u8,
+    #[doc = " Morning astronomical-twilight crossing — MJD, TDB."]
+    pub astronomical_dawn_mjd_tdb: f64,
+    #[doc = " 1 when the morning nautical-twilight crossing was found."]
+    pub has_nautical_dawn: u8,
+    #[doc = " Morning nautical-twilight crossing — MJD, TDB."]
+    pub nautical_dawn_mjd_tdb: f64,
+    #[doc = " 1 when the morning civil-twilight crossing was found."]
+    pub has_civil_dawn: u8,
+    #[doc = " Morning civil-twilight crossing — MJD, TDB."]
+    pub civil_dawn_mjd_tdb: f64,
+    #[doc = " 1 when the morning sunrise crossing was found."]
+    pub has_sunrise: u8,
+    #[doc = " Morning sunrise crossing — MJD, TDB."]
+    pub sunrise_mjd_tdb: f64,
+    #[doc = " Observable intervals within the night (boundaries refined to one\n second). Owned array; freed by [`empyrean_visibility_result_free`]."]
+    pub intervals: *mut EmpyreanVisibilityWindow,
+    #[doc = " Number of entries in [`intervals`](Self::intervals)."]
+    pub num_intervals: usize,
+    #[doc = " Anchors under each policy. Owned array; freed by\n [`empyrean_visibility_result_free`]."]
+    pub anchors: *mut EmpyreanAnchor,
+    #[doc = " Number of entries in [`anchors`](Self::anchors)."]
+    pub num_anchors: usize,
+    #[doc = " Edge annotations (which thresholds are absent and why). Owned,\n null-terminated UTF-8, or null when every threshold was found. Freed\n by [`empyrean_visibility_result_free`]."]
+    pub note: *mut ::std::os::raw::c_char,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of EmpyreanNight"][::std::mem::size_of::<EmpyreanNight>() - 216usize];
+    ["Alignment of EmpyreanNight"][::std::mem::align_of::<EmpyreanNight>() - 8usize];
+    ["Offset of field: EmpyreanNight::local_date_year"]
+        [::std::mem::offset_of!(EmpyreanNight, local_date_year) - 0usize];
+    ["Offset of field: EmpyreanNight::local_date_month"]
+        [::std::mem::offset_of!(EmpyreanNight, local_date_month) - 8usize];
+    ["Offset of field: EmpyreanNight::local_date_day"]
+        [::std::mem::offset_of!(EmpyreanNight, local_date_day) - 12usize];
+    ["Offset of field: EmpyreanNight::noon_start_mjd_tdb"]
+        [::std::mem::offset_of!(EmpyreanNight, noon_start_mjd_tdb) - 16usize];
+    ["Offset of field: EmpyreanNight::noon_end_mjd_tdb"]
+        [::std::mem::offset_of!(EmpyreanNight, noon_end_mjd_tdb) - 24usize];
+    ["Offset of field: EmpyreanNight::has_sunset"]
+        [::std::mem::offset_of!(EmpyreanNight, has_sunset) - 32usize];
+    ["Offset of field: EmpyreanNight::sunset_mjd_tdb"]
+        [::std::mem::offset_of!(EmpyreanNight, sunset_mjd_tdb) - 40usize];
+    ["Offset of field: EmpyreanNight::has_civil_dusk"]
+        [::std::mem::offset_of!(EmpyreanNight, has_civil_dusk) - 48usize];
+    ["Offset of field: EmpyreanNight::civil_dusk_mjd_tdb"]
+        [::std::mem::offset_of!(EmpyreanNight, civil_dusk_mjd_tdb) - 56usize];
+    ["Offset of field: EmpyreanNight::has_nautical_dusk"]
+        [::std::mem::offset_of!(EmpyreanNight, has_nautical_dusk) - 64usize];
+    ["Offset of field: EmpyreanNight::nautical_dusk_mjd_tdb"]
+        [::std::mem::offset_of!(EmpyreanNight, nautical_dusk_mjd_tdb) - 72usize];
+    ["Offset of field: EmpyreanNight::has_astronomical_dusk"]
+        [::std::mem::offset_of!(EmpyreanNight, has_astronomical_dusk) - 80usize];
+    ["Offset of field: EmpyreanNight::astronomical_dusk_mjd_tdb"]
+        [::std::mem::offset_of!(EmpyreanNight, astronomical_dusk_mjd_tdb) - 88usize];
+    ["Offset of field: EmpyreanNight::has_local_solar_midnight"]
+        [::std::mem::offset_of!(EmpyreanNight, has_local_solar_midnight) - 96usize];
+    ["Offset of field: EmpyreanNight::local_solar_midnight_mjd_tdb"]
+        [::std::mem::offset_of!(EmpyreanNight, local_solar_midnight_mjd_tdb) - 104usize];
+    ["Offset of field: EmpyreanNight::has_astronomical_dawn"]
+        [::std::mem::offset_of!(EmpyreanNight, has_astronomical_dawn) - 112usize];
+    ["Offset of field: EmpyreanNight::astronomical_dawn_mjd_tdb"]
+        [::std::mem::offset_of!(EmpyreanNight, astronomical_dawn_mjd_tdb) - 120usize];
+    ["Offset of field: EmpyreanNight::has_nautical_dawn"]
+        [::std::mem::offset_of!(EmpyreanNight, has_nautical_dawn) - 128usize];
+    ["Offset of field: EmpyreanNight::nautical_dawn_mjd_tdb"]
+        [::std::mem::offset_of!(EmpyreanNight, nautical_dawn_mjd_tdb) - 136usize];
+    ["Offset of field: EmpyreanNight::has_civil_dawn"]
+        [::std::mem::offset_of!(EmpyreanNight, has_civil_dawn) - 144usize];
+    ["Offset of field: EmpyreanNight::civil_dawn_mjd_tdb"]
+        [::std::mem::offset_of!(EmpyreanNight, civil_dawn_mjd_tdb) - 152usize];
+    ["Offset of field: EmpyreanNight::has_sunrise"]
+        [::std::mem::offset_of!(EmpyreanNight, has_sunrise) - 160usize];
+    ["Offset of field: EmpyreanNight::sunrise_mjd_tdb"]
+        [::std::mem::offset_of!(EmpyreanNight, sunrise_mjd_tdb) - 168usize];
+    ["Offset of field: EmpyreanNight::intervals"]
+        [::std::mem::offset_of!(EmpyreanNight, intervals) - 176usize];
+    ["Offset of field: EmpyreanNight::num_intervals"]
+        [::std::mem::offset_of!(EmpyreanNight, num_intervals) - 184usize];
+    ["Offset of field: EmpyreanNight::anchors"]
+        [::std::mem::offset_of!(EmpyreanNight, anchors) - 192usize];
+    ["Offset of field: EmpyreanNight::num_anchors"]
+        [::std::mem::offset_of!(EmpyreanNight, num_anchors) - 200usize];
+    ["Offset of field: EmpyreanNight::note"]
+        [::std::mem::offset_of!(EmpyreanNight, note) - 208usize];
+};
+impl Default for EmpyreanNight {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[doc = " Per-observatory visibility data — mirrors\n `scott::planning::ObservatoryVisibility`."]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct EmpyreanObservatoryVisibility {
+    #[doc = " Observatory code (owned; freed by [`empyrean_visibility_result_free`])."]
+    pub obs_code: *mut ::std::os::raw::c_char,
+    #[doc = " Per-epoch observability detail. Owned; freed on release."]
+    pub points: *mut EmpyreanVisibilityPoint,
+    #[doc = " Number of entries in [`points`](Self::points)."]
+    pub num_points: usize,
+    #[doc = " Contiguous observable windows across the whole surveyed span. Owned."]
+    pub windows: *mut EmpyreanVisibilityWindow,
+    #[doc = " Number of entries in [`windows`](Self::windows)."]
+    pub num_windows: usize,
+    #[doc = " One night per local night the surveyed span overlaps. EMPTY for an\n observer with no local horizon, with the reason in\n [`note`](Self::note). Owned."]
+    pub nights: *mut EmpyreanNight,
+    #[doc = " Number of entries in [`nights`](Self::nights)."]
+    pub num_nights: usize,
+    #[doc = " Why [`nights`](Self::nights) is empty, when it is for a structural\n reason (a horizonless or space-based observer). Owned, null-terminated\n UTF-8, or null on a ground site whose nights were built normally."]
+    pub note: *mut ::std::os::raw::c_char,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of EmpyreanObservatoryVisibility"]
+        [::std::mem::size_of::<EmpyreanObservatoryVisibility>() - 64usize];
+    ["Alignment of EmpyreanObservatoryVisibility"]
+        [::std::mem::align_of::<EmpyreanObservatoryVisibility>() - 8usize];
+    ["Offset of field: EmpyreanObservatoryVisibility::obs_code"]
+        [::std::mem::offset_of!(EmpyreanObservatoryVisibility, obs_code) - 0usize];
+    ["Offset of field: EmpyreanObservatoryVisibility::points"]
+        [::std::mem::offset_of!(EmpyreanObservatoryVisibility, points) - 8usize];
+    ["Offset of field: EmpyreanObservatoryVisibility::num_points"]
+        [::std::mem::offset_of!(EmpyreanObservatoryVisibility, num_points) - 16usize];
+    ["Offset of field: EmpyreanObservatoryVisibility::windows"]
+        [::std::mem::offset_of!(EmpyreanObservatoryVisibility, windows) - 24usize];
+    ["Offset of field: EmpyreanObservatoryVisibility::num_windows"]
+        [::std::mem::offset_of!(EmpyreanObservatoryVisibility, num_windows) - 32usize];
+    ["Offset of field: EmpyreanObservatoryVisibility::nights"]
+        [::std::mem::offset_of!(EmpyreanObservatoryVisibility, nights) - 40usize];
+    ["Offset of field: EmpyreanObservatoryVisibility::num_nights"]
+        [::std::mem::offset_of!(EmpyreanObservatoryVisibility, num_nights) - 48usize];
+    ["Offset of field: EmpyreanObservatoryVisibility::note"]
+        [::std::mem::offset_of!(EmpyreanObservatoryVisibility, note) - 56usize];
+};
+impl Default for EmpyreanObservatoryVisibility {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[doc = " One orbit's visibility survey outcome — mirrors\n `scott::planning::VisibilityResult`, plus the per-orbit delivery channel\n (the engine returns each orbit's survey as its own `Result`).\n\n The survey-wide provenance — the resolved covariance method and the\n Earth-orientation summary — is carried here (as in the engine), where it\n belongs to the whole survey rather than to one observatory."]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct EmpyreanVisibilityResult {
+    #[doc = " Orbit identifier (owned; freed by [`empyrean_visibility_result_free`])."]
+    pub orbit_id: *mut ::std::os::raw::c_char,
+    #[doc = " 1 when this orbit's survey was delivered; 0 when it failed (see\n [`error_code`](Self::error_code) / [`error_message`](Self::error_message))."]
+    pub delivered: u8,
+    #[doc = " `EMPYREAN_PLANNING_ERROR_*` code — `_NONE` (0) when delivered."]
+    pub error_code: i32,
+    #[doc = " The engine's typed failure message when not delivered; null when\n delivered. Owned; freed on release."]
+    pub error_message: *mut ::std::os::raw::c_char,
+    #[doc = " The covariance method every sky search box was produced under — an\n `EMPYREAN_COVARIANCE_KIND_*` value (never `Auto`). Meaningful only when\n delivered."]
+    pub resolved_method: u8,
+    #[doc = " 1 when the Earth-orientation summary is present (an observer with a\n local horizon consulted the Earth orientation); 0 when no observer in\n the survey had a local horizon."]
+    pub has_earth_orientation: u8,
+    #[doc = " Survey epochs resolved from the Earth-orientation kernels."]
+    pub earth_orientation_bpc_epochs: usize,
+    #[doc = " Survey epochs served by the analytic IAU 2006 model (below the\n 1962-02-01 mandate floor) — NON-ZERO means degraded site geometry."]
+    pub earth_orientation_analytic_iau_2006_epochs: usize,
+    #[doc = " Per-observatory visibility. Owned array; freed on release. Null/0 when\n not delivered."]
+    pub observatories: *mut EmpyreanObservatoryVisibility,
+    #[doc = " Number of entries in [`observatories`](Self::observatories)."]
+    pub num_observatories: usize,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of EmpyreanVisibilityResult"]
+        [::std::mem::size_of::<EmpyreanVisibilityResult>() - 64usize];
+    ["Alignment of EmpyreanVisibilityResult"]
+        [::std::mem::align_of::<EmpyreanVisibilityResult>() - 8usize];
+    ["Offset of field: EmpyreanVisibilityResult::orbit_id"]
+        [::std::mem::offset_of!(EmpyreanVisibilityResult, orbit_id) - 0usize];
+    ["Offset of field: EmpyreanVisibilityResult::delivered"]
+        [::std::mem::offset_of!(EmpyreanVisibilityResult, delivered) - 8usize];
+    ["Offset of field: EmpyreanVisibilityResult::error_code"]
+        [::std::mem::offset_of!(EmpyreanVisibilityResult, error_code) - 12usize];
+    ["Offset of field: EmpyreanVisibilityResult::error_message"]
+        [::std::mem::offset_of!(EmpyreanVisibilityResult, error_message) - 16usize];
+    ["Offset of field: EmpyreanVisibilityResult::resolved_method"]
+        [::std::mem::offset_of!(EmpyreanVisibilityResult, resolved_method) - 24usize];
+    ["Offset of field: EmpyreanVisibilityResult::has_earth_orientation"]
+        [::std::mem::offset_of!(EmpyreanVisibilityResult, has_earth_orientation) - 25usize];
+    ["Offset of field: EmpyreanVisibilityResult::earth_orientation_bpc_epochs"]
+        [::std::mem::offset_of!(EmpyreanVisibilityResult, earth_orientation_bpc_epochs) - 32usize];
+    ["Offset of field: EmpyreanVisibilityResult::earth_orientation_analytic_iau_2006_epochs"][::std::mem::offset_of!(
+        EmpyreanVisibilityResult,
+        earth_orientation_analytic_iau_2006_epochs
+    )
+        - 40usize];
+    ["Offset of field: EmpyreanVisibilityResult::observatories"]
+        [::std::mem::offset_of!(EmpyreanVisibilityResult, observatories) - 48usize];
+    ["Offset of field: EmpyreanVisibilityResult::num_observatories"]
+        [::std::mem::offset_of!(EmpyreanVisibilityResult, num_observatories) - 56usize];
+};
+impl Default for EmpyreanVisibilityResult {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[doc = " The batch result of [`empyrean_compute_visibility`]: one\n [`EmpyreanVisibilityResult`] per input orbit, in input order. The caller\n allocates this holder; [`results`](Self::results) is heap-allocated here\n and the whole tree is released with [`empyrean_visibility_result_free`]."]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct EmpyreanVisibilityBatch {
+    #[doc = " One result per input orbit, in input order (so a result can be joined\n back to the orbit that produced it positionally). Owned."]
+    pub results: *mut EmpyreanVisibilityResult,
+    #[doc = " Number of entries in [`results`](Self::results)."]
+    pub num_results: usize,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of EmpyreanVisibilityBatch"][::std::mem::size_of::<EmpyreanVisibilityBatch>() - 16usize];
+    ["Alignment of EmpyreanVisibilityBatch"]
+        [::std::mem::align_of::<EmpyreanVisibilityBatch>() - 8usize];
+    ["Offset of field: EmpyreanVisibilityBatch::results"]
+        [::std::mem::offset_of!(EmpyreanVisibilityBatch, results) - 0usize];
+    ["Offset of field: EmpyreanVisibilityBatch::num_results"]
+        [::std::mem::offset_of!(EmpyreanVisibilityBatch, num_results) - 8usize];
+};
+impl Default for EmpyreanVisibilityBatch {
     fn default() -> Self {
         let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
         unsafe {
@@ -5211,6 +5866,17 @@ pub struct EmpyreanLib {
         result_out: *mut EmpyreanPlanResult,
     ) -> i32,
     pub empyrean_plan_result_free: unsafe extern "C" fn(result: *mut EmpyreanPlanResult),
+    pub empyrean_compute_visibility: unsafe extern "C" fn(
+        ctx: *const EmpyreanContext,
+        orbits: *const EmpyreanOrbit,
+        n_orbits: usize,
+        start: f64,
+        end: f64,
+        step_days: f64,
+        config: *const EmpyreanPlanningConfig,
+        out: *mut EmpyreanVisibilityBatch,
+    ) -> i32,
+    pub empyrean_visibility_result_free: unsafe extern "C" fn(result: *mut EmpyreanVisibilityBatch),
     pub empyrean_propagate: unsafe extern "C" fn(
         ctx: *const EmpyreanContext,
         orbits_ptr: *const EmpyreanOrbit,
@@ -5557,6 +6223,12 @@ impl EmpyreanLib {
         let empyrean_plan_result_free = __library
             .get(b"empyrean_plan_result_free\0")
             .map(|sym| *sym)?;
+        let empyrean_compute_visibility = __library
+            .get(b"empyrean_compute_visibility\0")
+            .map(|sym| *sym)?;
+        let empyrean_visibility_result_free = __library
+            .get(b"empyrean_visibility_result_free\0")
+            .map(|sym| *sym)?;
         let empyrean_propagate = __library.get(b"empyrean_propagate\0").map(|sym| *sym)?;
         let empyrean_propagation_result_free = __library
             .get(b"empyrean_propagation_result_free\0")
@@ -5705,6 +6377,8 @@ impl EmpyreanLib {
             empyrean_refine,
             empyrean_evaluate_plan,
             empyrean_plan_result_free,
+            empyrean_compute_visibility,
+            empyrean_visibility_result_free,
             empyrean_propagate,
             empyrean_propagation_result_free,
             empyrean_propagation_covariance_series_cartesian,
@@ -6422,6 +7096,26 @@ impl EmpyreanLib {
     #[doc = " Free the heap allocations inside a plan result populated by\n [`empyrean_evaluate_plan`]. Does not free the caller-allocated struct."]
     pub unsafe fn empyrean_plan_result_free(&self, result: *mut EmpyreanPlanResult) {
         (self.empyrean_plan_result_free)(result)
+    }
+    #[doc = " Survey the observability of one or more orbits over a time window from a\n set of observatories: the per-epoch gates, the observable windows, and\n the local-night product (twilight epochs, local solar midnight, observable\n intervals, and the anchors with their Moon-aware circumstances).\n\n `orbits` is an array of `n_orbits` orbits (each carrying its own id; a null\n or empty id becomes `\"orbit_{i}\"`). `start` / `end` are MJD TDB and\n `step_days` the survey grid step. `config.observatories` carries the\n per-site gates and the night-product twilight thresholds. On success\n populates `*out` (caller-allocated) with one result per input orbit, in\n input order; free with [`empyrean_visibility_result_free`].\n\n Returns 0 on success (per-orbit failures ride each result's `error_code`\n / `error_message`, NOT the call status), -1 for a null/invalid argument,\n -3 if the survey setup fails, -99 on an internal panic. The error message\n is retrievable via `empyrean_last_error()`."]
+    pub unsafe fn empyrean_compute_visibility(
+        &self,
+        ctx: *const EmpyreanContext,
+        orbits: *const EmpyreanOrbit,
+        n_orbits: usize,
+        start: f64,
+        end: f64,
+        step_days: f64,
+        config: *const EmpyreanPlanningConfig,
+        out: *mut EmpyreanVisibilityBatch,
+    ) -> i32 {
+        (self.empyrean_compute_visibility)(
+            ctx, orbits, n_orbits, start, end, step_days, config, out,
+        )
+    }
+    #[doc = " Free the heap allocations inside a visibility batch populated by\n [`empyrean_compute_visibility`]. Does not free the caller-allocated\n `EmpyreanVisibilityBatch` struct itself."]
+    pub unsafe fn empyrean_visibility_result_free(&self, result: *mut EmpyreanVisibilityBatch) {
+        (self.empyrean_visibility_result_free)(result)
     }
     #[doc = " Propagate orbits to the requested target times.\n\n Returns 0 on success, negative error code on failure.\n On success, `result_out` is populated with the propagated states.\n The caller must free the result with `empyrean_propagation_result_free()`.\n\n States are flat in orbit-major order; within each orbit, rows are in\n **ascending epoch order, always** (engine guarantee since villeneuve\n v1.18.0), regardless of request order. Positional pairing against an\n ascending, duplicate-free request grid is exact; for any other\n request shape, join on `epoch_mjd_tdb`."]
     pub unsafe fn empyrean_propagate(

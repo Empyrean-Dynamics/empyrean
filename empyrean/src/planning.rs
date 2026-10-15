@@ -332,6 +332,38 @@ pub struct ObservatoryConfig {
     /// other conventions are civil (−6°) and nautical (−12°); above
     /// +90° disables the gate.
     pub max_sun_altitude_deg: Option<f64>,
+    /// The four twilight thresholds that structure the [night
+    /// product](Context::compute_visibility), or `None` for the engine's
+    /// defaults (−0.833° / −6° / −12° / −18°).
+    ///
+    /// All-or-nothing: the engine validates the four as a group (they must
+    /// strictly descend), so they are set together or not at all. `None`
+    /// takes the engine defaults, and is the only choice that affects
+    /// [`Context::evaluate_plan`] in no way (that seam reads none of them).
+    pub twilight_thresholds: Option<TwilightThresholds>,
+    /// A caller-supplied UTC epoch for the
+    /// [`AnchorPolicy::ExplicitUtc`] anchor, or `None` for the three
+    /// site-derived anchors only. Every night whose noon-to-noon span
+    /// contains it also carries an explicit anchor there.
+    pub explicit_anchor_utc: Option<Epoch>,
+}
+
+/// The four Sun-altitude thresholds the [night
+/// product](Context::compute_visibility) reports crossings of, in degrees.
+/// Must strictly descend (sunset > civil > nautical > astronomical) or the
+/// survey refuses the observatory by name; the field names mirror the
+/// engine's `ObservatoryConfig` one for one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TwilightThresholds {
+    /// Sunset/sunrise on the refraction-corrected visible horizon
+    /// (default −0.833°).
+    pub sunset_sun_altitude_deg: f64,
+    /// Civil twilight (default −6°).
+    pub civil_twilight_sun_altitude_deg: f64,
+    /// Nautical twilight (default −12°).
+    pub nautical_twilight_sun_altitude_deg: f64,
+    /// Astronomical twilight (default −18°).
+    pub astronomical_twilight_sun_altitude_deg: f64,
 }
 
 /// Configuration for [`Context::evaluate_plan`].
@@ -1034,17 +1066,8 @@ impl Context {
             .observatories
             .iter()
             .zip(keep.obs_codes.iter())
-            .map(|(o, code)| empyrean_sys::EmpyreanObservatoryConfig {
-                obs_code: code.as_ptr(),
-                sigma_ra_arcsec: o.sigma_arcsec[0],
-                sigma_dec_arcsec: o.sigma_arcsec[1],
-                max_apparent_mag: o.max_apparent_mag,
-                min_elongation_deg: o.min_elongation_deg,
-                min_elevation_deg: o.min_elevation_deg,
-                has_max_sun_altitude_deg: u8::from(o.max_sun_altitude_deg.is_some()),
-                max_sun_altitude_deg: o.max_sun_altitude_deg.unwrap_or(0.0),
-            })
-            .collect();
+            .map(|(o, code)| observatory_to_ffi(o, code))
+            .collect::<Result<Vec<_>>>()?;
 
         let ffi_config = empyrean_sys::EmpyreanPlanningConfig {
             force_model: config.force_model as i32,
@@ -1092,6 +1115,167 @@ impl Context {
         drop(keep);
         copied
     }
+
+    /// Survey this orbit's observability over a time window from a set of
+    /// observatories: the per-epoch gates, the observable windows, and the
+    /// local-night product.
+    ///
+    /// For each observatory in [`PlanningConfig::observatories`] the survey
+    /// steps the orbit across `[start, end]` on a `step_days` grid and reports
+    /// an [`ObservatoryVisibility`]: the per-epoch [`VisibilityPoint`]s (each
+    /// with the four gate flags and the Moon's altitude, azimuth and
+    /// illuminated fraction), the contiguous observable [`VisibilityWindow`]s,
+    /// and — for a ground site — the [`Night`] product: the twilight epochs,
+    /// the local solar midnight, the per-night observable intervals, and the
+    /// [`Anchor`]s (a chosen epoch and its [`AnchorCircumstances`] under each
+    /// [`AnchorPolicy`]).
+    ///
+    /// The observatory's gates and the night-product twilight thresholds come
+    /// from each [`ObservatoryConfig`] — unlike [`Context::evaluate_plan`],
+    /// which reads neither the elevation/darkness gates nor the thresholds,
+    /// this survey reads them all.
+    ///
+    /// `orbit` is surveyed as one object (the single-object form, like
+    /// [`evaluate_plan`](Self::evaluate_plan); the batch C ABI underneath is
+    /// called with one orbit). `orbit_id` labels the result; `None` uses the
+    /// orbit's own [`Orbit::orbit_id`], or a positional label.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] when the time window or step is invalid, when no
+    /// observatory is configured, when an observatory's twilight thresholds do
+    /// not strictly descend, when a station code is unresolvable, or when the
+    /// survey propagation fails. A [`PlanningConfig::observatories`] entry whose
+    /// twilight thresholds are invalid is refused by that observatory's code.
+    pub fn compute_visibility(
+        &self,
+        orbit: &Orbit,
+        orbit_id: Option<&str>,
+        start: Epoch,
+        end: Epoch,
+        step_days: f64,
+        config: &PlanningConfig,
+    ) -> Result<VisibilityResult> {
+        // No Cartesian/SSB pre-check: unlike `evaluate_plan`, a visibility
+        // survey folds no covariance prior — it propagates the orbit and reads
+        // ephemeris circumstances, which the engine handles in any frame or
+        // origin. The engine validates the orbit and surfaces its own error.
+        if config.observatories.is_empty() {
+            return Err(Error::invalid_input(
+                "compute_visibility needs at least one observatory in PlanningConfig::observatories",
+            ));
+        }
+
+        let (ffi_orbit, _orbit_keep) = orbit.to_ffi_with_keep()?;
+        let mut obs_codes: Vec<CString> = Vec::with_capacity(config.observatories.len());
+        for o in &config.observatories {
+            obs_codes.push(cstring_for(&o.obs_code, "observatory code")?);
+        }
+        let orbit_id_cstr = match resolve_orbit_id(orbit_id, orbit.orbit_id.as_deref()) {
+            Some(id) => Some(cstring_for(id, "orbit_id")?),
+            None => None,
+        };
+        // The batch C ABI keys each orbit by its own id, carried on the orbit.
+        let mut ffi_orbit = ffi_orbit;
+        ffi_orbit.orbit_id = orbit_id_cstr
+            .as_ref()
+            .map_or(std::ptr::null(), |c| c.as_ptr());
+
+        let ffi_observatories: Vec<empyrean_sys::EmpyreanObservatoryConfig> = config
+            .observatories
+            .iter()
+            .zip(obs_codes.iter())
+            .map(|(o, code)| observatory_to_ffi(o, code))
+            .collect::<Result<Vec<_>>>()?;
+
+        let ffi_config = empyrean_sys::EmpyreanPlanningConfig {
+            force_model: config.force_model as i32,
+            epsilon: config.epsilon,
+            observatories: ffi_observatories.as_ptr(),
+            num_observatories: ffi_observatories.len(),
+            num_threads: match config.num_threads {
+                None => -1,
+                Some(n) => i32::try_from(n).map_err(|_| {
+                    Error::invalid_input(format!("num_threads {n} exceeds the C ABI's i32 range"))
+                })?,
+            },
+            uncertainty_method: config.uncertainty_method.to_ffi(),
+        };
+
+        let start_mjd = start.mjd_tdb()?;
+        let end_mjd = end.mjd_tdb()?;
+
+        let mut batch = empyrean_sys::EmpyreanVisibilityBatch::default();
+        let code = unsafe {
+            empyrean_sys::empyrean_compute_visibility(
+                self.as_raw(),
+                &ffi_orbit,
+                1,
+                start_mjd,
+                end_mjd,
+                step_days,
+                &ffi_config,
+                &mut batch,
+            )
+        };
+        if code != 0 {
+            return Err(Error::capture(code));
+        }
+
+        // Copy out of the C batch BEFORE releasing it — the copy is fallible
+        // (an unknown enum tag from a newer engine, or a per-orbit refusal),
+        // so it runs to completion and the result's interiors are freed
+        // regardless of whether it was delivered or refused.
+        let copied = visibility_result_from_batch(&batch);
+        unsafe { empyrean_sys::empyrean_visibility_result_free(&mut batch) };
+        drop(obs_codes);
+        drop(orbit_id_cstr);
+        copied
+    }
+}
+
+/// Marshal one wrapper [`ObservatoryConfig`] into the C struct. The explicit
+/// anchor epoch conversion is fallible, so the whole thing returns a
+/// [`Result`]; the twilight thresholds ride behind the single
+/// `has_twilight_thresholds` flag (all-or-nothing, as the engine validates
+/// them).
+fn observatory_to_ffi(
+    o: &ObservatoryConfig,
+    code: &CString,
+) -> Result<empyrean_sys::EmpyreanObservatoryConfig> {
+    let (has_twilight_thresholds, t) = match o.twilight_thresholds {
+        Some(t) => (1u8, t),
+        None => (
+            0u8,
+            TwilightThresholds {
+                sunset_sun_altitude_deg: 0.0,
+                civil_twilight_sun_altitude_deg: 0.0,
+                nautical_twilight_sun_altitude_deg: 0.0,
+                astronomical_twilight_sun_altitude_deg: 0.0,
+            },
+        ),
+    };
+    let (has_explicit_anchor_utc, explicit_anchor_utc_mjd_tdb) = match o.explicit_anchor_utc {
+        Some(e) => (1u8, e.mjd_tdb()?),
+        None => (0u8, 0.0),
+    };
+    Ok(empyrean_sys::EmpyreanObservatoryConfig {
+        obs_code: code.as_ptr(),
+        sigma_ra_arcsec: o.sigma_arcsec[0],
+        sigma_dec_arcsec: o.sigma_arcsec[1],
+        max_apparent_mag: o.max_apparent_mag,
+        min_elongation_deg: o.min_elongation_deg,
+        min_elevation_deg: o.min_elevation_deg,
+        has_max_sun_altitude_deg: u8::from(o.max_sun_altitude_deg.is_some()),
+        max_sun_altitude_deg: o.max_sun_altitude_deg.unwrap_or(0.0),
+        has_twilight_thresholds,
+        sunset_sun_altitude_deg: t.sunset_sun_altitude_deg,
+        civil_twilight_sun_altitude_deg: t.civil_twilight_sun_altitude_deg,
+        nautical_twilight_sun_altitude_deg: t.nautical_twilight_sun_altitude_deg,
+        astronomical_twilight_sun_altitude_deg: t.astronomical_twilight_sun_altitude_deg,
+        has_explicit_anchor_utc,
+        explicit_anchor_utc_mjd_tdb,
+    })
 }
 
 fn planned_to_ffi(
@@ -1312,9 +1496,601 @@ fn candidate_from_ffi(c: &empyrean_sys::EmpyreanPlanCandidate) -> Result<PlanCan
     })
 }
 
+// ── Visibility output types (mirror empyrean_core::planning) ─────────
+
+/// Which of the four gates (or the end of the night) closed a
+/// [`VisibilityWindow`]. Mirrors `empyrean_core::planning::Gate`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gate {
+    /// Solar elongation fell below the configured minimum.
+    Elongation,
+    /// Apparent magnitude rose above the configured limit.
+    Magnitude,
+    /// Target altitude fell below the configured minimum elevation.
+    Elevation,
+    /// The Sun rose above the configured darkness threshold (dawn).
+    Darkness,
+    /// No gate closed it — the window ran to the end of its night (or span).
+    EndOfNight,
+}
+
+impl Gate {
+    fn from_ffi(code: u8) -> Result<Option<Self>> {
+        Ok(match code as u32 {
+            empyrean_sys::EMPYREAN_GATE_NONE => None,
+            empyrean_sys::EMPYREAN_GATE_ELONGATION => Some(Gate::Elongation),
+            empyrean_sys::EMPYREAN_GATE_MAGNITUDE => Some(Gate::Magnitude),
+            empyrean_sys::EMPYREAN_GATE_ELEVATION => Some(Gate::Elevation),
+            empyrean_sys::EMPYREAN_GATE_DARKNESS => Some(Gate::Darkness),
+            empyrean_sys::EMPYREAN_GATE_END_OF_NIGHT => Some(Gate::EndOfNight),
+            other => {
+                return Err(Error::invalid_input(format!(
+                    "unknown closing-gate code {other} from the engine"
+                )));
+            }
+        })
+    }
+}
+
+/// How a night's anchor epoch was chosen. Mirrors
+/// `empyrean_core::planning::AnchorPolicy`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AnchorPolicy {
+    /// The observable epoch nearest the local solar midnight.
+    NearestObservableToMidnight,
+    /// The local solar midnight itself, observable or not.
+    Midnight,
+    /// The target's transit — its maximum altitude while the site is dark.
+    Transit,
+    /// A caller-supplied UTC epoch (the carried epoch is the request).
+    ExplicitUtc(Epoch),
+}
+
+/// How many survey epochs each Earth-orientation realization answered.
+/// Mirrors `empyrean_core::planning::EarthOrientationSummary`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EarthOrientationSummary {
+    /// Epochs resolved from the Earth-orientation kernels (measured EOP).
+    pub bpc_epochs: usize,
+    /// Epochs served by the analytic IAU 2006 model, below the 1962-02-01
+    /// mandate floor — **non-zero means degraded site geometry** (UT1 ≈ TT,
+    /// up to ~15 km of site position by 1960).
+    pub analytic_iau_2006_epochs: usize,
+}
+
+/// The circumstances at a night anchor epoch, read off the ephemeris row
+/// there. Mirrors `empyrean_core::planning::AnchorCircumstances`.
+#[derive(Debug, Clone)]
+pub struct AnchorCircumstances {
+    /// Target altitude above the horizon (degrees, geocentric vertical).
+    pub altitude_deg: f64,
+    /// Target azimuth (degrees, East of North, geocentric vertical).
+    pub azimuth_deg: f64,
+    /// Sun altitude at the site (degrees, geodetic vertical).
+    pub sun_altitude_deg: f64,
+    /// Solar elongation (degrees).
+    pub solar_elongation_deg: f64,
+    /// Solar phase angle (degrees).
+    pub phase_angle_deg: f64,
+    /// Target–observer–Moon angle (degrees).
+    pub lunar_elongation_deg: f64,
+    /// Moon altitude (degrees, geocentric vertical); `None` for a horizonless
+    /// observer.
+    pub moon_altitude_deg: Option<f64>,
+    /// Moon illuminated fraction ([0, 1]).
+    pub moon_illuminated_fraction: Option<f64>,
+    /// Predicted apparent magnitude; `None` when the orbit has no photometry.
+    pub mag: Option<f64>,
+    /// 1σ magnitude uncertainty.
+    pub sigma_mag: Option<f64>,
+    /// Total on-sky angular rate (degrees/day).
+    pub sky_rate: Option<f64>,
+    /// Position angle of motion (degrees, East of North).
+    pub position_angle_deg: Option<f64>,
+    /// Hour angle (degrees); `None` for a horizonless observer.
+    pub hour_angle: Option<f64>,
+    /// The derivation tag of [`sky_covariance`](Self::sky_covariance), when
+    /// present — the covariance method the row carries.
+    pub sky_covariance_kind: Option<crate::CovarianceKind>,
+    /// The row's sky covariance as one packed joint (lower-triangular, the
+    /// same [`PackedJoint`](crate::PackedJoint) the ephemeris rows carry);
+    /// `None` when the orbit carries no covariance.
+    pub sky_covariance: Option<crate::PackedJoint>,
+}
+
+/// A night anchor. Mirrors `empyrean_core::planning::Anchor`.
+#[derive(Debug, Clone)]
+pub struct Anchor {
+    /// The policy that chose [`epoch`](Self::epoch).
+    pub policy: AnchorPolicy,
+    /// The chosen epoch, or `None` when the policy has no epoch this night.
+    pub epoch: Option<Epoch>,
+    /// Whether the target passes all four gates at the anchor epoch.
+    pub observable: bool,
+    /// The circumstances at the anchor epoch; `None` when there is no epoch.
+    pub circumstances: Option<AnchorCircumstances>,
+}
+
+/// A contiguous window of observability. Mirrors
+/// `empyrean_core::planning::VisibilityWindow`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VisibilityWindow {
+    /// Window start.
+    pub start_epoch: Epoch,
+    /// Window end.
+    pub end_epoch: Epoch,
+    /// Peak solar elongation during the window (degrees).
+    pub peak_elongation_deg: f64,
+    /// Brightest predicted magnitude during the window.
+    pub brightest_mag: Option<f64>,
+    /// Length of the window in hours.
+    pub hours_observable: f64,
+    /// Maximum target altitude in the window (degrees, geodetic vertical).
+    pub max_altitude_deg: Option<f64>,
+    /// Epoch of [`max_altitude_deg`](Self::max_altitude_deg).
+    pub max_altitude_epoch: Option<Epoch>,
+    /// The gate that closed the window, or `None` when the engine reported
+    /// none.
+    pub closing_gate: Option<Gate>,
+}
+
+/// The structure of one local night at one observatory. Mirrors
+/// `empyrean_core::planning::Night`.
+#[derive(Debug, Clone)]
+pub struct Night {
+    /// The site's local civil date `(year, month, day)`.
+    pub local_date: (i64, u32, u32),
+    /// Local solar noon that opens the night.
+    pub noon_start: Epoch,
+    /// Local solar noon that closes the night.
+    pub noon_end: Epoch,
+    /// Evening sunset crossing.
+    pub sunset: Option<Epoch>,
+    /// Evening civil-twilight crossing.
+    pub civil_dusk: Option<Epoch>,
+    /// Evening nautical-twilight crossing.
+    pub nautical_dusk: Option<Epoch>,
+    /// Evening astronomical-twilight crossing.
+    pub astronomical_dusk: Option<Epoch>,
+    /// Local solar midnight (Sun-altitude minimum).
+    pub local_solar_midnight: Option<Epoch>,
+    /// Morning astronomical-twilight crossing.
+    pub astronomical_dawn: Option<Epoch>,
+    /// Morning nautical-twilight crossing.
+    pub nautical_dawn: Option<Epoch>,
+    /// Morning civil-twilight crossing.
+    pub civil_dawn: Option<Epoch>,
+    /// Morning sunrise crossing.
+    pub sunrise: Option<Epoch>,
+    /// Observable intervals within the night (boundaries refined to one
+    /// second).
+    pub intervals: Vec<VisibilityWindow>,
+    /// Anchors under each policy.
+    pub anchors: Vec<Anchor>,
+    /// Edge annotations (which thresholds are absent and why); `None` when
+    /// every threshold was found.
+    pub note: Option<String>,
+}
+
+/// A single epoch's visibility from one observatory. Mirrors
+/// `empyrean_core::planning::VisibilityPoint`. The four `*_ok` flags are the
+/// individual gates and [`observable`](Self::observable) is their
+/// conjunction.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VisibilityPoint {
+    /// Epoch.
+    pub epoch: Epoch,
+    /// Solar elongation (degrees).
+    pub solar_elongation_deg: f64,
+    /// Target elevation above the local horizon (degrees, geodetic zenith,
+    /// refraction ignored); `None` for a horizonless observer.
+    pub elevation_deg: Option<f64>,
+    /// Sun altitude (degrees); `None` for a horizonless observer.
+    pub sun_altitude_deg: Option<f64>,
+    /// Whether all four gates pass.
+    pub observable: bool,
+    /// Solar-elongation gate.
+    pub elongation_ok: bool,
+    /// Predicted apparent magnitude; `None` when the orbit has no photometry
+    /// — the magnitude gate is then not applicable.
+    pub mag: Option<f64>,
+    /// Magnitude gate (`false`, never a vacuous pass, when `mag` is `None`).
+    pub magnitude_ok: bool,
+    /// Elevation gate (vacuously true for a horizonless observer).
+    pub elevation_ok: bool,
+    /// Darkness gate (vacuously true for a horizonless observer).
+    pub darkness_ok: bool,
+    /// Moon altitude above the local horizon (degrees, geocentric vertical);
+    /// `None` for a horizonless observer.
+    pub moon_altitude_deg: Option<f64>,
+    /// Moon azimuth (degrees, East of North); `None` for a horizonless
+    /// observer.
+    pub moon_azimuth_deg: Option<f64>,
+    /// Moon illuminated fraction ([0, 1]).
+    pub moon_illuminated_fraction: Option<f64>,
+    /// Target–observer–Moon angle (degrees).
+    pub lunar_elongation_deg: f64,
+}
+
+/// Per-observatory visibility data. Mirrors
+/// `empyrean_core::planning::ObservatoryVisibility`.
+#[derive(Debug, Clone)]
+pub struct ObservatoryVisibility {
+    /// Observatory code.
+    pub obs_code: String,
+    /// Per-epoch observability detail.
+    pub points: Vec<VisibilityPoint>,
+    /// Contiguous observable windows across the whole surveyed span.
+    pub windows: Vec<VisibilityWindow>,
+    /// One night per local night the surveyed span overlaps; empty for a
+    /// horizonless observer (with the reason in [`note`](Self::note)).
+    pub nights: Vec<Night>,
+    /// Why [`nights`](Self::nights) is empty, when it is for a structural
+    /// reason; `None` on a ground site whose nights were built normally.
+    pub note: Option<String>,
+}
+
+/// One orbit's visibility survey. Mirrors
+/// `empyrean_core::planning::VisibilityResult`.
+#[derive(Debug, Clone)]
+pub struct VisibilityResult {
+    /// Orbit identifier.
+    pub orbit_id: String,
+    /// Per-observatory visibility detail.
+    pub observatory_visibility: Vec<ObservatoryVisibility>,
+    /// Which Earth-orientation realization(s) placed the site zenith, or
+    /// `None` when no observatory in the survey had a local horizon.
+    pub earth_orientation: Option<EarthOrientationSummary>,
+    /// The covariance method every sky search box was produced under (never
+    /// `Auto`).
+    pub resolved_method: crate::CovarianceKind,
+}
+
+/// `Some(v)` when the flag is set, else `None`.
+fn opt_f64(has: u8, v: f64) -> Option<f64> {
+    (has != 0).then_some(v)
+}
+
+/// An optional epoch from a `has_*` flag + MJD TDB value.
+fn opt_epoch(has: u8, mjd_tdb: f64) -> Option<Epoch> {
+    (has != 0).then(|| Epoch::from_mjd_tdb(mjd_tdb))
+}
+
+/// `Some(String)` for a non-null C string, `None` for null.
+fn opt_string(p: *mut std::os::raw::c_char) -> Option<String> {
+    if p.is_null() {
+        None
+    } else {
+        Some(unsafe { CStr::from_ptr(p).to_string_lossy().into_owned() })
+    }
+}
+
+fn point_from_ffi(p: &empyrean_sys::EmpyreanVisibilityPoint) -> VisibilityPoint {
+    VisibilityPoint {
+        epoch: Epoch::from_mjd_tdb(p.epoch_mjd_tdb),
+        solar_elongation_deg: p.solar_elongation_deg,
+        elevation_deg: opt_f64(p.has_elevation_deg, p.elevation_deg),
+        sun_altitude_deg: opt_f64(p.has_sun_altitude_deg, p.sun_altitude_deg),
+        observable: p.observable != 0,
+        elongation_ok: p.elongation_ok != 0,
+        mag: opt_f64(p.has_mag, p.mag),
+        magnitude_ok: p.magnitude_ok != 0,
+        elevation_ok: p.elevation_ok != 0,
+        darkness_ok: p.darkness_ok != 0,
+        moon_altitude_deg: opt_f64(p.has_moon_altitude_deg, p.moon_altitude_deg),
+        moon_azimuth_deg: opt_f64(p.has_moon_azimuth_deg, p.moon_azimuth_deg),
+        moon_illuminated_fraction: opt_f64(
+            p.has_moon_illuminated_fraction,
+            p.moon_illuminated_fraction,
+        ),
+        lunar_elongation_deg: p.lunar_elongation_deg,
+    }
+}
+
+fn window_from_ffi(w: &empyrean_sys::EmpyreanVisibilityWindow) -> Result<VisibilityWindow> {
+    Ok(VisibilityWindow {
+        start_epoch: Epoch::from_mjd_tdb(w.start_epoch_mjd_tdb),
+        end_epoch: Epoch::from_mjd_tdb(w.end_epoch_mjd_tdb),
+        peak_elongation_deg: w.peak_elongation_deg,
+        brightest_mag: opt_f64(w.has_brightest_mag, w.brightest_mag),
+        hours_observable: w.hours_observable,
+        max_altitude_deg: opt_f64(w.has_max_altitude_deg, w.max_altitude_deg),
+        max_altitude_epoch: opt_epoch(w.has_max_altitude_epoch, w.max_altitude_epoch_mjd_tdb),
+        closing_gate: Gate::from_ffi(w.closing_gate)?,
+    })
+}
+
+fn circ_from_ffi(c: &empyrean_sys::EmpyreanAnchorCircumstances) -> Result<AnchorCircumstances> {
+    let sky_covariance = unsafe { crate::PackedJoint::from_ffi(&c.sky_covariance) }?;
+    let sky_covariance_kind = if c.has_sky_covariance != 0 {
+        Some(crate::CovarianceKind::from_u8(c.sky_covariance_kind)?)
+    } else {
+        None
+    };
+    Ok(AnchorCircumstances {
+        altitude_deg: c.altitude_deg,
+        azimuth_deg: c.azimuth_deg,
+        sun_altitude_deg: c.sun_altitude_deg,
+        solar_elongation_deg: c.solar_elongation_deg,
+        phase_angle_deg: c.phase_angle_deg,
+        lunar_elongation_deg: c.lunar_elongation_deg,
+        moon_altitude_deg: opt_f64(c.has_moon_altitude_deg, c.moon_altitude_deg),
+        moon_illuminated_fraction: opt_f64(
+            c.has_moon_illuminated_fraction,
+            c.moon_illuminated_fraction,
+        ),
+        mag: opt_f64(c.has_mag, c.mag),
+        sigma_mag: opt_f64(c.has_sigma_mag, c.sigma_mag),
+        sky_rate: opt_f64(c.has_sky_rate, c.sky_rate),
+        position_angle_deg: opt_f64(c.has_position_angle_deg, c.position_angle_deg),
+        hour_angle: opt_f64(c.has_hour_angle, c.hour_angle),
+        sky_covariance_kind,
+        sky_covariance,
+    })
+}
+
+fn anchor_from_ffi(a: &empyrean_sys::EmpyreanAnchor) -> Result<Anchor> {
+    let epoch = opt_epoch(a.has_epoch, a.epoch_mjd_tdb);
+    let policy = match a.policy as u32 {
+        empyrean_sys::EMPYREAN_ANCHOR_POLICY_NEAREST_OBSERVABLE_TO_MIDNIGHT => {
+            AnchorPolicy::NearestObservableToMidnight
+        }
+        empyrean_sys::EMPYREAN_ANCHOR_POLICY_MIDNIGHT => AnchorPolicy::Midnight,
+        empyrean_sys::EMPYREAN_ANCHOR_POLICY_TRANSIT => AnchorPolicy::Transit,
+        // The ExplicitUtc request epoch is the anchor's own epoch.
+        empyrean_sys::EMPYREAN_ANCHOR_POLICY_EXPLICIT_UTC => {
+            AnchorPolicy::ExplicitUtc(Epoch::from_mjd_tdb(a.epoch_mjd_tdb))
+        }
+        other => {
+            return Err(Error::invalid_input(format!(
+                "unknown anchor-policy code {other} from the engine"
+            )));
+        }
+    };
+    let circumstances = if a.has_circumstances != 0 {
+        Some(circ_from_ffi(&a.circumstances)?)
+    } else {
+        None
+    };
+    Ok(Anchor {
+        policy,
+        epoch,
+        observable: a.observable != 0,
+        circumstances,
+    })
+}
+
+fn night_from_ffi(n: &empyrean_sys::EmpyreanNight) -> Result<Night> {
+    let intervals = ffi_slice(n.intervals, n.num_intervals)
+        .iter()
+        .map(window_from_ffi)
+        .collect::<Result<Vec<_>>>()?;
+    let anchors = ffi_slice(n.anchors, n.num_anchors)
+        .iter()
+        .map(anchor_from_ffi)
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Night {
+        local_date: (n.local_date_year, n.local_date_month, n.local_date_day),
+        noon_start: Epoch::from_mjd_tdb(n.noon_start_mjd_tdb),
+        noon_end: Epoch::from_mjd_tdb(n.noon_end_mjd_tdb),
+        sunset: opt_epoch(n.has_sunset, n.sunset_mjd_tdb),
+        civil_dusk: opt_epoch(n.has_civil_dusk, n.civil_dusk_mjd_tdb),
+        nautical_dusk: opt_epoch(n.has_nautical_dusk, n.nautical_dusk_mjd_tdb),
+        astronomical_dusk: opt_epoch(n.has_astronomical_dusk, n.astronomical_dusk_mjd_tdb),
+        local_solar_midnight: opt_epoch(n.has_local_solar_midnight, n.local_solar_midnight_mjd_tdb),
+        astronomical_dawn: opt_epoch(n.has_astronomical_dawn, n.astronomical_dawn_mjd_tdb),
+        nautical_dawn: opt_epoch(n.has_nautical_dawn, n.nautical_dawn_mjd_tdb),
+        civil_dawn: opt_epoch(n.has_civil_dawn, n.civil_dawn_mjd_tdb),
+        sunrise: opt_epoch(n.has_sunrise, n.sunrise_mjd_tdb),
+        intervals,
+        anchors,
+        note: opt_string(n.note),
+    })
+}
+
+fn obs_vis_from_ffi(
+    ov: &empyrean_sys::EmpyreanObservatoryVisibility,
+) -> Result<ObservatoryVisibility> {
+    let points = ffi_slice(ov.points, ov.num_points)
+        .iter()
+        .map(point_from_ffi)
+        .collect();
+    let windows = ffi_slice(ov.windows, ov.num_windows)
+        .iter()
+        .map(window_from_ffi)
+        .collect::<Result<Vec<_>>>()?;
+    let nights = ffi_slice(ov.nights, ov.num_nights)
+        .iter()
+        .map(night_from_ffi)
+        .collect::<Result<Vec<_>>>()?;
+    Ok(ObservatoryVisibility {
+        obs_code: opt_string(ov.obs_code).unwrap_or_default(),
+        points,
+        windows,
+        nights,
+        note: opt_string(ov.note),
+    })
+}
+
+/// Borrow a C array as a slice, treating a null pointer / zero length as
+/// empty.
+fn ffi_slice<'a, T>(ptr: *const T, len: usize) -> &'a [T] {
+    if ptr.is_null() || len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(ptr, len) }
+    }
+}
+
+/// Decode the single-orbit survey out of the batch the C ABI returns. A
+/// per-orbit refusal (the engine's own `PlanningError`) becomes an [`Error`]
+/// carrying the engine's typed message, the planning error code, and the
+/// orbit id.
+fn visibility_result_from_batch(
+    batch: &empyrean_sys::EmpyreanVisibilityBatch,
+) -> Result<VisibilityResult> {
+    let results = ffi_slice(
+        batch.results as *const empyrean_sys::EmpyreanVisibilityResult,
+        batch.num_results,
+    );
+    let r = results.first().ok_or_else(|| {
+        Error::invalid_input("compute_visibility returned no result for the surveyed orbit")
+    })?;
+    let orbit_id = opt_string(r.orbit_id).unwrap_or_default();
+    if r.delivered == 0 {
+        return Err(Error {
+            code: r.error_code,
+            message: opt_string(r.error_message).unwrap_or_default(),
+            missing_data_files: Vec::new(),
+            orbit_index: Some(0),
+            orbit_id: Some(orbit_id),
+            epoch_mjd_tdb: None,
+        });
+    }
+    let observatory_visibility = ffi_slice(r.observatories, r.num_observatories)
+        .iter()
+        .map(obs_vis_from_ffi)
+        .collect::<Result<Vec<_>>>()?;
+    let earth_orientation = (r.has_earth_orientation != 0).then_some(EarthOrientationSummary {
+        bpc_epochs: r.earth_orientation_bpc_epochs,
+        analytic_iau_2006_epochs: r.earth_orientation_analytic_iau_2006_epochs,
+    });
+    Ok(VisibilityResult {
+        orbit_id,
+        observatory_visibility,
+        earth_orientation,
+        resolved_method: crate::CovarianceKind::from_u8(r.resolved_method)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Visibility from_ffi round-trips (no engine) ──────────────────
+
+    #[test]
+    fn gate_from_ffi_maps_every_byte_and_refuses_the_unknown() {
+        assert_eq!(Gate::from_ffi(0).unwrap(), None);
+        assert_eq!(Gate::from_ffi(1).unwrap(), Some(Gate::Elongation));
+        assert_eq!(Gate::from_ffi(2).unwrap(), Some(Gate::Magnitude));
+        assert_eq!(Gate::from_ffi(3).unwrap(), Some(Gate::Elevation));
+        assert_eq!(Gate::from_ffi(4).unwrap(), Some(Gate::Darkness));
+        assert_eq!(Gate::from_ffi(5).unwrap(), Some(Gate::EndOfNight));
+        assert!(
+            Gate::from_ffi(99).is_err(),
+            "an unknown gate byte is refused"
+        );
+    }
+
+    #[test]
+    fn point_from_ffi_decodes_has_flags_as_options() {
+        let mut p = empyrean_sys::EmpyreanVisibilityPoint {
+            epoch_mjd_tdb: 61000.5,
+            solar_elongation_deg: 120.0,
+            observable: 1,
+            elongation_ok: 1,
+            magnitude_ok: 0,
+            elevation_ok: 1,
+            darkness_ok: 1,
+            lunar_elongation_deg: 45.0,
+            ..Default::default()
+        };
+        // Horizon present → elevation / sun altitude / moon measured.
+        p.has_elevation_deg = 1;
+        p.elevation_deg = 33.9;
+        p.has_sun_altitude_deg = 1;
+        p.sun_altitude_deg = -20.0;
+        p.has_moon_altitude_deg = 1;
+        p.moon_altitude_deg = -5.0;
+        p.has_moon_illuminated_fraction = 1;
+        p.moon_illuminated_fraction = 0.12;
+        // No magnitude → the gate is not applicable, not a vacuous pass.
+        p.has_mag = 0;
+        let out = point_from_ffi(&p);
+        assert_eq!(out.elevation_deg, Some(33.9));
+        assert_eq!(out.sun_altitude_deg, Some(-20.0));
+        assert_eq!(out.moon_altitude_deg, Some(-5.0));
+        assert_eq!(out.moon_illuminated_fraction, Some(0.12));
+        assert_eq!(out.mag, None, "has_mag == 0 decodes to None");
+        assert!(!out.magnitude_ok, "no magnitude is not a vacuous pass");
+        assert!(out.observable);
+        assert_eq!(out.moon_azimuth_deg, None, "has flag off → None");
+    }
+
+    #[test]
+    fn window_from_ffi_decodes_closing_gate_and_optional_extrema() {
+        let w = empyrean_sys::EmpyreanVisibilityWindow {
+            start_epoch_mjd_tdb: 61000.4,
+            end_epoch_mjd_tdb: 61000.6,
+            peak_elongation_deg: 150.0,
+            has_brightest_mag: 1,
+            brightest_mag: 20.3,
+            hours_observable: 4.8,
+            has_max_altitude_deg: 1,
+            max_altitude_deg: 61.2,
+            has_max_altitude_epoch: 1,
+            max_altitude_epoch_mjd_tdb: 61000.5,
+            closing_gate: 4, // EMPYREAN_GATE_DARKNESS
+        };
+        let out = window_from_ffi(&w).unwrap();
+        assert_eq!(out.brightest_mag, Some(20.3));
+        assert_eq!(out.max_altitude_deg, Some(61.2));
+        assert_eq!(
+            out.max_altitude_epoch.map(|e| e.mjd_tdb().unwrap()),
+            Some(61000.5)
+        );
+        assert_eq!(out.closing_gate, Some(Gate::Darkness));
+    }
+
+    #[test]
+    fn anchor_from_ffi_decodes_policy_and_absent_circumstances() {
+        // ExplicitUtc carries the anchor's own epoch as its request.
+        let a = empyrean_sys::EmpyreanAnchor {
+            policy: 3, // EMPYREAN_ANCHOR_POLICY_EXPLICIT_UTC
+            has_epoch: 1,
+            epoch_mjd_tdb: 61000.25,
+            observable: 0,
+            has_circumstances: 0,
+            circumstances: empyrean_sys::EmpyreanAnchorCircumstances::default(),
+        };
+        let out = anchor_from_ffi(&a).unwrap();
+        match out.policy {
+            AnchorPolicy::ExplicitUtc(e) => assert_eq!(e.mjd_tdb().unwrap(), 61000.25),
+            other => panic!("expected ExplicitUtc, got {other:?}"),
+        }
+        assert_eq!(out.epoch.map(|e| e.mjd_tdb().unwrap()), Some(61000.25));
+        assert!(!out.observable);
+        assert!(out.circumstances.is_none(), "has_circumstances == 0 → None");
+    }
+
+    #[test]
+    fn circ_from_ffi_decodes_options_and_absent_sky_covariance() {
+        let c = empyrean_sys::EmpyreanAnchorCircumstances {
+            altitude_deg: 33.9,
+            azimuth_deg: 180.0,
+            sun_altitude_deg: -19.0,
+            solar_elongation_deg: 130.0,
+            phase_angle_deg: 40.0,
+            lunar_elongation_deg: 60.0,
+            has_moon_altitude_deg: 1,
+            moon_altitude_deg: 12.0,
+            has_mag: 1,
+            mag: 19.4,
+            has_sky_rate: 1,
+            sky_rate: 0.5,
+            has_sky_covariance: 0,
+            ..Default::default()
+        };
+        let out = circ_from_ffi(&c).unwrap();
+        assert_eq!(out.altitude_deg, 33.9);
+        assert_eq!(out.moon_altitude_deg, Some(12.0));
+        assert_eq!(out.mag, Some(19.4));
+        assert_eq!(out.sky_rate, Some(0.5));
+        assert_eq!(out.sigma_mag, None, "has flag off → None");
+        assert!(out.sky_covariance.is_none(), "absent packed joint → None");
+        assert!(out.sky_covariance_kind.is_none());
+    }
 
     #[test]
     fn optical_constructor_carries_code_and_sigma() {
@@ -1421,6 +2197,8 @@ mod tests {
                 min_elongation_deg: 45.0,
                 min_elevation_deg: 0.0,
                 max_sun_altitude_deg: None,
+                twilight_thresholds: None,
+                explicit_anchor_utc: None,
             }],
             ..PlanningConfig::default()
         };

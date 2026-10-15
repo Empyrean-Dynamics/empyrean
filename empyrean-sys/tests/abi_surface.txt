@@ -13,6 +13,7 @@ empyrean_compute_b_planes
 empyrean_compute_b_planes_result_free
 empyrean_compute_impact_probabilities
 empyrean_compute_impact_probabilities_result_free
+empyrean_compute_visibility
 empyrean_context_free
 empyrean_context_from_data_dir
 empyrean_context_from_data_dir_with
@@ -100,3 +101,4 @@ empyrean_transform_orbits
 empyrean_version_string
 empyrean_versions
 empyrean_versions_free
+empyrean_visibility_result_free

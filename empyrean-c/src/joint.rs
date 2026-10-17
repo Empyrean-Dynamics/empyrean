@@ -778,6 +778,62 @@ pub(crate) fn push_orbit_with_joint(
 }
 
 #[cfg(test)]
+mod state_block_guard_tests {
+    use super::state_blocks_agree;
+
+    /// A diagonally-dominant, positive-definite state block in the engine
+    /// radian basis — the shape the orbit-write guard compares (the packed
+    /// joint's leading 6×6 against the flat state view).
+    fn state_block() -> [[f64; 6]; 6] {
+        let diag = [4.8e-10, 2.0e-10, 1.9e-10, 1.4e-14, 1.5e-13, 6.0e-15];
+        let mut m = [[0.0f64; 6]; 6];
+        for i in 0..6 {
+            m[i][i] = diag[i];
+        }
+        m[0][1] = 3.0e-11;
+        m[1][0] = 3.0e-11;
+        m
+    }
+
+    /// The gate accepts a block against itself and against a copy perturbed
+    /// only within its generous float-noise band: two independent deg→rad
+    /// scaling paths must never trip it on round-off.
+    #[test]
+    fn an_agreeing_state_block_is_accepted() {
+        let a = state_block();
+        assert!(state_blocks_agree(&a, &a), "a block must agree with itself");
+        let mut b = a;
+        b[0][0] *= 1.0 + 1.0e-12; // inside the 1e-9 relative band
+        assert!(
+            state_blocks_agree(&a, &b),
+            "a sub-band perturbation must not trip the gate"
+        );
+    }
+
+    /// Constructed disagreeing pair (stays red-by-design): perturbing one
+    /// variance past the gate's relative band must be refused, so a genuinely
+    /// contradictory packed-joint/flat pair can never be written as one orbit.
+    #[test]
+    fn a_disagreeing_state_block_is_refused() {
+        let a = state_block();
+        let mut b = a;
+        b[2][2] *= 1.0 + 1.0e-6; // well outside the 1e-9 relative band
+        assert!(
+            !state_blocks_agree(&a, &b),
+            "a 1e-6 relative disagreement must trip the gate"
+        );
+        // A sign flip on an off-diagonal is a contradiction at any magnitude.
+        let mut c = a;
+        c[0][1] = -c[0][1];
+        c[1][0] = -c[1][0];
+        assert!(
+            !state_blocks_agree(&a, &c),
+            "a flipped-sign off-diagonal must trip the gate"
+        );
+    }
+}
+
+#[cfg(test)]
 mod mixture_tally_tests {
     use super::*;
     use empyrean_core::propagation::{MixtureComponents, Shift};

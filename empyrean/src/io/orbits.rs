@@ -65,6 +65,7 @@ fn batch_to_ffi(
     Vec<*mut std::ffi::c_char>,
     Vec<CString>,
     Vec<Option<CString>>,
+    Vec<crate::orbit::OrbitFfiKeep>,
 )> {
     let n = batch.len();
     let mut orbit_keep: Vec<crate::orbit::OrbitFfiKeep> = Vec::with_capacity(n);
@@ -102,7 +103,24 @@ fn batch_to_ffi(
         })
         .collect();
     let _ = n;
-    Ok((ffi_orbits, id_ptrs, obj_ptrs, id_cstrings, obj_cstrings))
+    // `orbit_keep` owns every orbit's heap allocations — critically the packed
+    // joint's triangle `Vec`, into which `EmpyreanOrbit::covariance.tri` holds a
+    // borrowed raw pointer. It MUST be returned and held across the C call: the
+    // id / object `CString`s are kept alive below, but if the orbit keepalive is
+    // dropped here the triangle is freed and the writer reads a dangling pointer
+    // — the state block then comes back as garbage that disagrees with the
+    // inline flat 6×6 and the orbit-write guard refuses the (now contradictory)
+    // pair. The flat `state.covariance` is inline in the struct, so it alone was
+    // unaffected; JSON, which serializes only that flat 6×6 and never the joint
+    // triangle, wrote correctly while parquet / CSV aborted.
+    Ok((
+        ffi_orbits,
+        id_ptrs,
+        obj_ptrs,
+        id_cstrings,
+        obj_cstrings,
+        orbit_keep,
+    ))
 }
 
 pub(crate) fn ffi_batch_to_owned(batch: &empyrean_sys::EmpyreanOrbitBatch) -> Result<OrbitBatch> {
@@ -237,7 +255,10 @@ where
     F: FnOnce(*const std::ffi::c_char, *const empyrean_sys::EmpyreanOrbitBatch) -> i32,
 {
     let path_c = path_to_cstring(path)?;
-    let (ffi_orbits, id_ptrs, obj_ptrs, _ids_keep, _objs_keep) = batch_to_ffi(batch)?;
+    // `_orbit_keep` owns the packed-joint triangles the FFI orbits borrow; it
+    // must stay bound until after `c_call` returns or the writer reads a freed
+    // triangle (see `batch_to_ffi`).
+    let (ffi_orbits, id_ptrs, obj_ptrs, _ids_keep, _objs_keep, _orbit_keep) = batch_to_ffi(batch)?;
     let ffi_batch = empyrean_sys::EmpyreanOrbitBatch {
         orbits: ffi_orbits.as_ptr() as *mut empyrean_sys::EmpyreanOrbit,
         orbit_ids: id_ptrs.as_ptr() as *mut *mut std::ffi::c_char,
@@ -299,9 +320,95 @@ pub fn write_orbits_csv(path: impl AsRef<Path>, batch: &OrbitBatch) -> Result<()
 #[cfg(test)]
 mod push_code_tests {
     use crate::{
-        AxisLayout, CovarianceKind, Frame, JointFunctional, JointProvenance, JointQuality, Orbit,
-        Origin, PackedJoint, PushError,
+        AxisLayout, CoordinateState, CovarianceKind, Epoch, Frame, JointFunctional,
+        JointProvenance, JointQuality, Orbit, Origin, PackedJoint, PushError,
     };
+
+    /// A well-formed state-only (width-6) Cartesian joint with a distinctive
+    /// positive-definite diagonal, paired with the identical flat 6×6 on the
+    /// coordinate — exactly the shape a converging `determine` returns. The
+    /// flat view and the joint's state block agree by construction, so the
+    /// orbit-write guard must accept the pair: any disagreement here is a
+    /// distribution bug, not a contradictory caller input.
+    fn roundtrip_orbit() -> (Orbit, [f64; 6]) {
+        let diag = [4.8e-10, 2.0e-10, 1.9e-10, 1.4e-14, 1.5e-13, 6.0e-15];
+        let mut dense = [[0.0f64; 6]; 6];
+        let mut tri = vec![0.0f64; 21];
+        for i in 0..6 {
+            dense[i][i] = diag[i];
+            tri[i * (i + 1) / 2 + i] = diag[i];
+        }
+        let joint = PackedJoint {
+            layout: AxisLayout {
+                present: 0,
+                considered: 0,
+                marginalized: 0,
+            },
+            width: 6,
+            tri,
+            kind: CovarianceKind::Linear,
+            quality: JointQuality::PositiveDefinite,
+            functional: JointFunctional::State,
+            provenance: JointProvenance::Derived,
+            asserted_source: None,
+        };
+        let state = CoordinateState::cartesian(
+            Epoch::from_mjd_tdb(59000.0),
+            [1.0, 0.1, 0.05, -0.005, 0.015, 0.001],
+            Frame::EclipticJ2000,
+            Origin::Sun,
+        )
+        .with_covariance(dense);
+        let orbit = Orbit::new(state)
+            .with_orbit_id("roundtrip")
+            .with_covariance(joint);
+        (orbit, diag)
+    }
+
+    /// Regression for the keepalive use-after-free in `batch_to_ffi`: the
+    /// per-orbit `OrbitFfiKeep` owns the packed joint's triangle `Vec`, which
+    /// the FFI `EmpyreanOrbit::covariance.tri` borrows by raw pointer. The bag
+    /// was built in a local that was dropped before the C writer ran, so the
+    /// writer read a freed triangle; the state block came back as garbage that
+    /// disagreed with the inline flat 6×6, and the orbit-write guard aborted
+    /// parquet and CSV (JSON survived only because its row shape serializes the
+    /// inline flat 6×6 and never the joint triangle). With the keepalive held
+    /// across the call, all three formats write and the parquet round-trips the
+    /// joint's state block bit-for-bit (Cartesian: no angular scaling).
+    #[test]
+    fn a_fitted_joint_survives_every_writer_and_round_trips_through_parquet() {
+        let (orbit, diag) = roundtrip_orbit();
+        let batch = super::OrbitBatch::new(vec![orbit], vec!["roundtrip".into()], vec![None])
+            .expect("batch");
+
+        let pq = tmp_path("parquet");
+        let csv = tmp_path("csv");
+        let json = tmp_path("json");
+        super::write_orbits_parquet(&pq, &batch).expect("parquet write must succeed");
+        super::write_orbits_csv(&csv, &batch).expect("csv write must succeed");
+        super::write_orbits_json(&json, &batch).expect("json write must succeed");
+
+        let back = super::read_orbits_parquet(&pq).expect("parquet read-back");
+        let joint = back.orbits[0]
+            .covariance
+            .as_ref()
+            .expect("the written joint must survive the parquet round trip");
+        assert_eq!(joint.width, 6, "a state-only fit round-trips as width 6");
+        let sb = joint.state_block();
+        for i in 0..6 {
+            assert!(
+                (sb[i][i] - diag[i]).abs() <= 1e-18_f64.max(diag[i].abs() * 1e-12),
+                "state-block variance [{i}][{i}] must round-trip ({} vs {}), never the \
+                 freed-triangle garbage the use-after-free produced",
+                sb[i][i],
+                diag[i]
+            );
+        }
+
+        let _ = std::fs::remove_file(&pq);
+        let _ = std::fs::remove_file(&csv);
+        let _ = std::fs::remove_file(&json);
+    }
 
     /// A malformed packed joint — `width = 6` but a triangle too short for it
     /// (6 needs 21 doubles) — so the engine's ingestion refuses it with the

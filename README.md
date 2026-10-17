@@ -618,6 +618,22 @@ by the variable. Neither is the C ABI, which reads no environment
 variable at all by design: a C caller states the policy in the
 `EmpyreanDataDirOptions` it passes.
 
+### Registered kernel set (organisation members and CI)
+
+Every kernel set the engine runs against is registered in the knowledge base and
+published to the private bucket `gs://empyrean-data`, where each file is stored
+once and a set is a manifest. CI syncs the pinned set with:
+
+```text
+gcloud storage cp gs://empyrean-data/tools/empyrean-data.py .
+python3 empyrean-data.py sync kernels-full-2026-10-13 "$EMPYREAN_DATA_DIR"
+export EMPYREAN_OFFLINE=1   # a floor: nothing downloads, missing files fail loudly
+```
+
+Files already present with the right hash are kept, so a refresh moves only what
+changed. The bucket is private; `empyrean init` and the B612 data packages remain
+the path for everyone else.
+
 ## Validation
 
 Every release is validated against JPL Horizons, `find_orb`, and GRSS

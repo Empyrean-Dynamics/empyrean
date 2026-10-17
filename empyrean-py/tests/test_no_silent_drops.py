@@ -572,9 +572,18 @@ def test_impactor_event_subtables_no_silent_drops() -> None:
     and then walk every fired sub-table for silent drops.
     """
     orbit = _impactor_orbit()
-    # Last day before impact (~MJD 54746.116), fine steps so the encounter
-    # is bracketed.
-    target_epochs = Epochs.from_mjd(np.array([54746.0 + 0.04 * i for i in range(26)]), scale="tdb")
+    # Last day before impact (~MJD 54746.116). The output spacing must be
+    # shorter than the ~6-minute chord through the Earth: with 0.04 d
+    # (58 min) steps the pinned engine (villeneuve 1.24.0) can integrate
+    # across the whole chord in one step and report an atmospheric and a
+    # shadow *exit* with no impact at all. Measured 2026-10-13: that miss
+    # flips with the vintage of earth_latest_high_prec.bpc, which moves the
+    # adaptive step boundaries by a hair. 0.001 d (86 s) puts several
+    # samples inside the Earth whatever the step sequence does
+    # (empyrean-s37oj tracks the engine-side guarantee).
+    target_epochs = Epochs.from_mjd(
+        np.array([54746.0 + 0.001 * i for i in range(1001)]), scale="tdb"
+    )
     result = empyrean.propagate(orbit, target_epochs)
     events = result.events
 

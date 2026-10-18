@@ -638,6 +638,18 @@ class PhotometryConfig:
     """Max Huber-IRLS iterations. ``0`` → engine default (30)."""
     huber_k: float = 0.0
     """Huber tuning constant. ``0.0`` → engine default (1.5)."""
+    band_conversions: dict[str, tuple[float, float]] | None = None
+    """Band→V conversions layered onto the built-in MPC Magnitude Bands
+    table, as ``{code: (offset_to_v, sigma)}`` — e.g.
+    ``{"Lu": (-1.41, 0.30)}``. ``None`` (default) runs the fit on the MPC
+    table unchanged. A supplied entry replaces a code the table carries or
+    adds one it does not: the LSST ``Lu Lg Lr Li Lz Ly`` carry no MPC
+    default and are refused by name until supplied (their magnitudes are
+    then excluded from the fit with a report; the astrometry is
+    unaffected), and the comet magnitude flags ``T`` / ``N`` are refused
+    regardless. Each converted band's offset is reported back on the
+    result's per-band ``offset_applied``, so a fit is auditable against the
+    table it ran with."""
 
 
 # ── Top-level config ─────────────────────────────────────────
@@ -839,13 +851,23 @@ class ODConfig:
                 "thrust": [d.value for d in self.solve_for_flags.thrust],
             }
         if self.photometry is not None:
-            wire["photometry"] = {
+            photometry: dict[str, WireValue] = {
                 "model": _enum_value(self.photometry.model),
                 "sigma_lightcurve": self.photometry.sigma_lightcurve,
                 "include_rejected": self.photometry.include_rejected,
                 "max_irls_iterations": self.photometry.max_irls_iterations,
                 "huber_k": self.photometry.huber_k,
             }
+            # Emitted only when supplied, so the Rust parser leaves the fit
+            # on the MPC Magnitude Bands table otherwise. Each entry is an
+            # ``[offset_to_v, sigma]`` pair the PyO3 bridge reads back.
+            if self.photometry.band_conversions is not None:
+                bands: dict[str, WireValue] = {}
+                for code, pair in self.photometry.band_conversions.items():
+                    offset, sigma = pair
+                    bands[code] = [float(offset), float(sigma)]
+                photometry["band_conversions"] = bands
+            wire["photometry"] = photometry
         return wire
 
 

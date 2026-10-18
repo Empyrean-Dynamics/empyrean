@@ -18,7 +18,8 @@ use empyrean_core::io::{ADESObservations, parse_ades};
 use empyrean_core::nongrav::NonGravModel;
 use empyrean_core::orbits::Orbits;
 use empyrean_core::photometry::{
-    FittedPhotometryModel, PhotometryConfig, PhotometryModel, PhotometryResult,
+    BandConversion, BandConversions, FittedPhotometryModel, PhotometryConfig, PhotometryModel,
+    PhotometryResult,
 };
 use empyrean_core::propagation::CovarianceKind;
 
@@ -1541,12 +1542,35 @@ pub struct EmpyreanSolvedCovariance {
     pub thrust_count: u32,
 }
 
+/// One band-to-Johnson-V conversion row supplied on
+/// [`EmpyreanPhotometryConfig::band_conversions`]: the reported band
+/// `code`, its additive offset to V (\\( V = m_\text{band} +
+/// \text{offset\_to\_v} \\)), and the systematic 1σ of that conversion
+/// (the solar-colour assumption floor, not a statistical error).
+///
+/// A supplied row replaces the entry for an existing `code` or adds one
+/// for a code the built-in MPC Magnitude Bands table does not carry
+/// (the LSST `Lu Lg Lr Li Lz Ly`, Gaia `Gb`/`Gr`, the wide `VR`, …). The
+/// comet magnitude flags `T`/`N` are refused by name regardless of any
+/// supplied row — they are not bands. `code` is a borrowed NUL-terminated
+/// string the caller must keep alive for the duration of the OD call.
+#[repr(C)]
+pub struct EmpyreanBandConversion {
+    /// Reported band code (borrowed C string, e.g. `"Lu"`). Never null.
+    pub code: *const c_char,
+    /// Additive offset to Johnson V (mag): \\( V = m_\text{band} +
+    /// \text{offset\_to\_v} \\).
+    pub offset_to_v: f64,
+    /// Systematic 1σ of the conversion (mag).
+    pub sigma: f64,
+}
+
 /// Post-OD photometric-fit request (mirrors scott's `PhotometryConfig`).
 /// Enabled by [`EmpyreanODConfig::has_photometry`]; the fit runs after the
 /// orbit is solved and never touches the state (photometry has no
 /// astrometric partials). Zero-init reproduces scott's defaults.
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub struct EmpyreanPhotometryConfig {
     /// Model to fit (`EMPYREAN_PHOTOMETRY_MODEL_*`). Default = Auto (0).
     /// In Auto the fit climbs a ladder — H-only → HG12 → HG1G2 —
@@ -1563,6 +1587,18 @@ pub struct EmpyreanPhotometryConfig {
     pub max_irls_iterations: u32,
     /// Huber tuning constant. 0.0 → upstream default (1.5).
     pub huber_k: f64,
+    /// Supplied band→V conversion rows. The fit starts from the built-in
+    /// MPC Magnitude Bands table and applies each row on top (replacing a
+    /// default or adding a code the default does not carry). Null / zero
+    /// `band_conversions_len` leaves the fit on the MPC table. Non-owning:
+    /// the caller keeps the array and its `code` strings alive for the OD
+    /// call. Each converted band's offset is reported back on the result's
+    /// per-band `offset_applied`, so a fit is auditable against the table
+    /// it ran with.
+    pub band_conversions: *const EmpyreanBandConversion,
+    /// Number of rows in [`band_conversions`](Self::band_conversions); 0 =
+    /// the MPC table unchanged.
+    pub band_conversions_len: usize,
 }
 
 /// Per-band photometric statistics (mirrors scott's `BandStat`). Owned
@@ -2347,6 +2383,14 @@ pub const EMPYREAN_OD_ERROR_NON_FINITE_WEIGHT_MATRIX: i32 = 51;
 /// than silently replaced by an identity. Mirrors
 /// `scott::od::ODError::WeightMatrixNotPositiveDefinite`.
 pub const EMPYREAN_OD_ERROR_WEIGHT_MATRIX_NOT_POSITIVE_DEFINITE: i32 = 52;
+/// A solved parameter axis the observations carry no information on — a
+/// converged fit that would otherwise publish the prior back as a
+/// posterior, or a non-finite solved estimate. Refused by name rather
+/// than returning a prior echo under a posterior's name. The message
+/// names the axis (e.g. `Marsden A2`, `DT`, `AMRAT`) and states that its
+/// posterior σ did not fall below the prior σ, reporting both. Mirrors
+/// `scott::od::ODError::SolvedAxisUnconstrained`.
+pub const EMPYREAN_OD_ERROR_SOLVED_AXIS_UNCONSTRAINED: i32 = 53;
 
 /// One object's slot in a batch [`empyrean_determine`] result.
 ///
@@ -3710,6 +3754,7 @@ fn od_error_to_c(e: &ODError) -> i32 {
         ODError::WeightMatrixNotPositiveDefinite { .. } => {
             EMPYREAN_OD_ERROR_WEIGHT_MATRIX_NOT_POSITIVE_DEFINITE
         }
+        ODError::SolvedAxisUnconstrained { .. } => EMPYREAN_OD_ERROR_SOLVED_AXIS_UNCONSTRAINED,
     }
 }
 
@@ -4715,6 +4760,31 @@ fn photometry_config_from_c(c: &EmpyreanPhotometryConfig) -> Result<PhotometryCo
     }
     if c.huber_k > 0.0 {
         pc.huber_k = c.huber_k;
+    }
+    // Band→V conversions: start from the MPC Magnitude Bands table (the
+    // default) and apply each supplied row on top. Zero rows leaves the
+    // fit on the MPC table. A supplied row replaces an existing code or
+    // adds one the default does not carry (the LSST `L*` codes, …).
+    if !c.band_conversions.is_null() && c.band_conversions_len > 0 {
+        let rows =
+            unsafe { std::slice::from_raw_parts(c.band_conversions, c.band_conversions_len) };
+        let mut table = BandConversions::default();
+        for (i, row) in rows.iter().enumerate() {
+            if row.code.is_null() {
+                return Err(format!("band_conversions[{i}].code is null"));
+            }
+            let code = unsafe { CStr::from_ptr(row.code) }
+                .to_str()
+                .map_err(|_| format!("band_conversions[{i}].code is not valid UTF-8"))?;
+            table = table.with(
+                code,
+                BandConversion {
+                    offset_to_v: row.offset_to_v,
+                    sigma: row.sigma,
+                },
+            );
+        }
+        pc.band_conversions = table;
     }
     Ok(pc)
 }
@@ -6965,7 +7035,7 @@ pub(crate) mod tests {
     #[test]
     fn od_error_codes_are_distinct_contiguous_and_nonzero() {
         // Every EMPYREAN_OD_ERROR_* code (bar NONE) is unique, positive,
-        // and covers 1..=43 with no gap — a stable pinned numbering.
+        // and covers 1..=53 with no gap — a stable pinned numbering.
         let codes = [
             EMPYREAN_OD_ERROR_NOT_CARTESIAN,
             EMPYREAN_OD_ERROR_NO_COVARIANCE_ON_ORBIT,
@@ -7010,13 +7080,25 @@ pub(crate) mod tests {
             EMPYREAN_OD_ERROR_NOISE_MODEL_COMPOSITION_UNSUPPORTED,
             EMPYREAN_OD_ERROR_OBSERVED_INFORMATION_NOT_POSITIVE_DEFINITE,
             EMPYREAN_OD_ERROR_NOISE_MODEL_IRLS_NOT_CONVERGED,
+            EMPYREAN_OD_ERROR_ORBIT_PROPAGATION_FAILED,
+            EMPYREAN_OD_ERROR_ORBIT_EPHEMERIS_FAILED,
+            EMPYREAN_OD_ERROR_POSTERIOR_JOINT_CONSTRUCTION,
+            EMPYREAN_OD_ERROR_THREAD_BUDGET,
+            EMPYREAN_OD_ERROR_SPK_SUBSTITUTED_BODY,
+            EMPYREAN_OD_ERROR_UNKNOWN_OBSERVATORY_CODE,
+            EMPYREAN_OD_ERROR_INVALID_WEIGHTING_CONFIG,
+            EMPYREAN_OD_ERROR_NON_FINITE_WEIGHT_MATRIX,
+            EMPYREAN_OD_ERROR_WEIGHT_MATRIX_NOT_POSITIVE_DEFINITE,
+            EMPYREAN_OD_ERROR_SOLVED_AXIS_UNCONSTRAINED,
         ];
-        assert_eq!(codes.len(), 43);
+        assert_eq!(codes.len(), 53);
         assert_eq!(EMPYREAN_OD_ERROR_NONE, 0);
+        // The new axis is the next free code after 52.
+        assert_eq!(EMPYREAN_OD_ERROR_SOLVED_AXIS_UNCONSTRAINED, 53);
         let mut sorted = codes;
         sorted.sort_unstable();
         for (i, c) in sorted.iter().enumerate() {
-            assert_eq!(*c, i as i32 + 1, "codes must be exactly 1..=43");
+            assert_eq!(*c, i as i32 + 1, "codes must be exactly 1..=53");
         }
     }
 
@@ -7031,6 +7113,25 @@ pub(crate) mod tests {
         assert_eq!(
             od_error_to_c(&ODError::ObservedInformationNotPositiveDefinite),
             EMPYREAN_OD_ERROR_OBSERVED_INFORMATION_NOT_POSITIVE_DEFINITE
+        );
+        // The unconstrained-axis refusal maps to its own code 53, carrying
+        // the named axis and both σ in its message across the ABI. The
+        // mutation point: route this arm to any sibling code and it goes red.
+        assert_eq!(
+            od_error_to_c(&ODError::SolvedAxisUnconstrained {
+                axis: "Marsden A2".to_string(),
+                posterior_sigma: 8.2e-15,
+                prior_sigma: 8.2e-15,
+            }),
+            EMPYREAN_OD_ERROR_SOLVED_AXIS_UNCONSTRAINED
+        );
+        assert_eq!(
+            determine_od_error_code(&DetermineError::OD(ODError::SolvedAxisUnconstrained {
+                axis: "DT".to_string(),
+                posterior_sigma: f64::NAN,
+                prior_sigma: 1.0,
+            })),
+            EMPYREAN_OD_ERROR_SOLVED_AXIS_UNCONSTRAINED
         );
         assert_eq!(
             determine_od_error_code(&DetermineError::OD(ODError::NoiseModelRejectionUnset {
@@ -7130,6 +7231,70 @@ pub(crate) mod tests {
         assert_ne!(
             EMPYREAN_OD_FAILURE_UNKNOWN_OBSERVATORY_CODE,
             EMPYREAN_OD_FAILURE_OBSERVER_CONSTRUCTION
+        );
+    }
+
+    /// `photometry_config_from_c` carries the band→V table across the ABI:
+    /// no supplied rows leaves the fit on the MPC Magnitude Bands default,
+    /// a supplied row makes a code the default refuses convertible, and the
+    /// comet flags `T`/`N` are refused regardless of any supplied row.
+    #[test]
+    fn photometry_config_from_c_builds_the_band_table() {
+        // No rows → the MPC default table. Spot-check the pinned values and
+        // that an LSST code is refused by name (it carries no default).
+        let bare = EmpyreanPhotometryConfig {
+            model: 0,
+            sigma_lightcurve: 0.0,
+            include_rejected: 0,
+            max_irls_iterations: 0,
+            huber_k: 0.0,
+            band_conversions: std::ptr::null(),
+            band_conversions_len: 0,
+        };
+        let pc = photometry_config_from_c(&bare).expect("bare config builds");
+        assert_eq!(pc.band_conversions.to_v("u").unwrap().offset_to_v, -2.5);
+        assert_eq!(pc.band_conversions.to_v("g").unwrap().offset_to_v, -0.28);
+        assert_eq!(pc.band_conversions.to_v("r").unwrap().offset_to_v, 0.23);
+        assert!(
+            pc.band_conversions.to_v("Lu").is_err(),
+            "the LSST Lu code carries no default and must be refused by name"
+        );
+
+        // A supplied Lu row makes it convertible; r stays on the MPC value.
+        let lu = CString::new("Lu").unwrap();
+        let rows = [EmpyreanBandConversion {
+            code: lu.as_ptr(),
+            offset_to_v: -1.41,
+            sigma: 0.30,
+        }];
+        let cfg = EmpyreanPhotometryConfig {
+            band_conversions: rows.as_ptr(),
+            band_conversions_len: rows.len(),
+            ..bare
+        };
+        let pc = photometry_config_from_c(&cfg).expect("config with a Lu row builds");
+        let conv = pc.band_conversions.to_v("Lu").expect("Lu now convertible");
+        assert_eq!(conv.offset_to_v, -1.41);
+        assert_eq!(conv.sigma, 0.30);
+        assert_eq!(pc.band_conversions.to_v("r").unwrap().offset_to_v, 0.23);
+
+        // The comet flag `T` is refused even when a row supplies it — it is
+        // not a band.
+        let comet = CString::new("T").unwrap();
+        let comet_rows = [EmpyreanBandConversion {
+            code: comet.as_ptr(),
+            offset_to_v: 0.0,
+            sigma: 0.1,
+        }];
+        let cfg = EmpyreanPhotometryConfig {
+            band_conversions: comet_rows.as_ptr(),
+            band_conversions_len: comet_rows.len(),
+            ..bare
+        };
+        let pc = photometry_config_from_c(&cfg).expect("config with a T row builds");
+        assert!(
+            pc.band_conversions.to_v("T").is_err(),
+            "the comet total-magnitude flag T is refused regardless of a supplied row"
         );
     }
 

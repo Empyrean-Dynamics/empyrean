@@ -1575,6 +1575,17 @@ typedef struct Session Session;
 #define EMPYREAN_OD_ERROR_WEIGHT_MATRIX_NOT_POSITIVE_DEFINITE 52
 
 /**
+ * A solved parameter axis the observations carry no information on — a
+ * converged fit that would otherwise publish the prior back as a
+ * posterior, or a non-finite solved estimate. Refused by name rather
+ * than returning a prior echo under a posterior's name. The message
+ * names the axis (e.g. `Marsden A2`, `DT`, `AMRAT`) and states that its
+ * posterior σ did not fall below the prior σ, reporting both. Mirrors
+ * `scott::od::ODError::SolvedAxisUnconstrained`.
+ */
+#define EMPYREAN_OD_ERROR_SOLVED_AXIS_UNCONSTRAINED 53
+
+/**
  * The whole batch ran but **no** object produced a fit.
  *
  * `results_out` is still fully populated — every slot carries its
@@ -5060,6 +5071,36 @@ struct EmpyreanSolveFor {
 };
 
 /**
+ * One band-to-Johnson-V conversion row supplied on
+ * [`EmpyreanPhotometryConfig::band_conversions`]: the reported band
+ * `code`, its additive offset to V (\\( V = m_\text{band} +
+ * \text{offset\_to\_v} \\)), and the systematic 1σ of that conversion
+ * (the solar-colour assumption floor, not a statistical error).
+ *
+ * A supplied row replaces the entry for an existing `code` or adds one
+ * for a code the built-in MPC Magnitude Bands table does not carry
+ * (the LSST `Lu Lg Lr Li Lz Ly`, Gaia `Gb`/`Gr`, the wide `VR`, …). The
+ * comet magnitude flags `T`/`N` are refused by name regardless of any
+ * supplied row — they are not bands. `code` is a borrowed NUL-terminated
+ * string the caller must keep alive for the duration of the OD call.
+ */
+struct EmpyreanBandConversion {
+    /**
+     * Reported band code (borrowed C string, e.g. `"Lu"`). Never null.
+     */
+    const char *code;
+    /**
+     * Additive offset to Johnson V (mag): \\( V = m_\text{band} +
+     * \text{offset\_to\_v} \\).
+     */
+    double offset_to_v;
+    /**
+     * Systematic 1σ of the conversion (mag).
+     */
+    double sigma;
+};
+
+/**
  * Post-OD photometric-fit request (mirrors scott's `PhotometryConfig`).
  * Enabled by [`EmpyreanODConfig::has_photometry`]; the fit runs after the
  * orbit is solved and never touches the state (photometry has no
@@ -5091,6 +5132,22 @@ struct EmpyreanPhotometryConfig {
      * Huber tuning constant. 0.0 → upstream default (1.5).
      */
     double huber_k;
+    /**
+     * Supplied band→V conversion rows. The fit starts from the built-in
+     * MPC Magnitude Bands table and applies each row on top (replacing a
+     * default or adding a code the default does not carry). Null / zero
+     * `band_conversions_len` leaves the fit on the MPC table. Non-owning:
+     * the caller keeps the array and its `code` strings alive for the OD
+     * call. Each converted band's offset is reported back on the result's
+     * per-band `offset_applied`, so a fit is auditable against the table
+     * it ran with.
+     */
+    const struct EmpyreanBandConversion *band_conversions;
+    /**
+     * Number of rows in [`band_conversions`](Self::band_conversions); 0 =
+     * the MPC table unchanged.
+     */
+    uintptr_t band_conversions_len;
 };
 
 /**

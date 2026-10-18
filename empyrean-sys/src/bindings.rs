@@ -291,6 +291,7 @@ pub const EMPYREAN_OD_ERROR_UNKNOWN_OBSERVATORY_CODE: u32 = 49;
 pub const EMPYREAN_OD_ERROR_INVALID_WEIGHTING_CONFIG: u32 = 50;
 pub const EMPYREAN_OD_ERROR_NON_FINITE_WEIGHT_MATRIX: u32 = 51;
 pub const EMPYREAN_OD_ERROR_WEIGHT_MATRIX_NOT_POSITIVE_DEFINITE: u32 = 52;
+pub const EMPYREAN_OD_ERROR_SOLVED_AXIS_UNCONSTRAINED: u32 = 53;
 pub const EMPYREAN_DETERMINE_NONE_DELIVERED: i32 = -4;
 pub const EMPYREAN_DETERMINE_BATCH_ABORT: i32 = -3;
 pub const EMPYREAN_LOG_DET_WITHHELD_NONE: u32 = 0;
@@ -2540,9 +2541,41 @@ const _: () = {
     ["Offset of field: EmpyreanSolveFor::thrust_dispositions"]
         [::std::mem::offset_of!(EmpyreanSolveFor, thrust_dispositions) - 3usize];
 };
+#[doc = " One band-to-Johnson-V conversion row supplied on\n [`EmpyreanPhotometryConfig::band_conversions`]: the reported band\n `code`, its additive offset to V (\\\\( V = m_\\text{band} +\n \\text{offset\\_to\\_v} \\\\)), and the systematic 1σ of that conversion\n (the solar-colour assumption floor, not a statistical error).\n\n A supplied row replaces the entry for an existing `code` or adds one\n for a code the built-in MPC Magnitude Bands table does not carry\n (the LSST `Lu Lg Lr Li Lz Ly`, Gaia `Gb`/`Gr`, the wide `VR`, …). The\n comet magnitude flags `T`/`N` are refused by name regardless of any\n supplied row — they are not bands. `code` is a borrowed NUL-terminated\n string the caller must keep alive for the duration of the OD call."]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct EmpyreanBandConversion {
+    #[doc = " Reported band code (borrowed C string, e.g. `\"Lu\"`). Never null."]
+    pub code: *const ::std::os::raw::c_char,
+    #[doc = " Additive offset to Johnson V (mag): \\\\( V = m_\\text{band} +\n \\text{offset\\_to\\_v} \\\\)."]
+    pub offset_to_v: f64,
+    #[doc = " Systematic 1σ of the conversion (mag)."]
+    pub sigma: f64,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of EmpyreanBandConversion"][::std::mem::size_of::<EmpyreanBandConversion>() - 24usize];
+    ["Alignment of EmpyreanBandConversion"]
+        [::std::mem::align_of::<EmpyreanBandConversion>() - 8usize];
+    ["Offset of field: EmpyreanBandConversion::code"]
+        [::std::mem::offset_of!(EmpyreanBandConversion, code) - 0usize];
+    ["Offset of field: EmpyreanBandConversion::offset_to_v"]
+        [::std::mem::offset_of!(EmpyreanBandConversion, offset_to_v) - 8usize];
+    ["Offset of field: EmpyreanBandConversion::sigma"]
+        [::std::mem::offset_of!(EmpyreanBandConversion, sigma) - 16usize];
+};
+impl Default for EmpyreanBandConversion {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
 #[doc = " Post-OD photometric-fit request (mirrors scott's `PhotometryConfig`).\n Enabled by [`EmpyreanODConfig::has_photometry`]; the fit runs after the\n orbit is solved and never touches the state (photometry has no\n astrometric partials). Zero-init reproduces scott's defaults."]
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
+#[derive(Debug, Copy, Clone)]
 pub struct EmpyreanPhotometryConfig {
     #[doc = " Model to fit (`EMPYREAN_PHOTOMETRY_MODEL_*`). Default = Auto (0).\n In Auto the fit climbs a ladder — H-only → HG12 → HG1G2 —\n admitting the richest model the arc's phase-angle coverage and\n magnitude count support, and reports the one it fit via\n `model_used` (never Auto). An explicit code pins a model. HG12 /\n HG1G2 follow Muinonen et al. (2010); H-only holds the slope fixed."]
     pub model: i32,
@@ -2554,11 +2587,15 @@ pub struct EmpyreanPhotometryConfig {
     pub max_irls_iterations: u32,
     #[doc = " Huber tuning constant. 0.0 → upstream default (1.5)."]
     pub huber_k: f64,
+    #[doc = " Supplied band→V conversion rows. The fit starts from the built-in\n MPC Magnitude Bands table and applies each row on top (replacing a\n default or adding a code the default does not carry). Null / zero\n `band_conversions_len` leaves the fit on the MPC table. Non-owning:\n the caller keeps the array and its `code` strings alive for the OD\n call. Each converted band's offset is reported back on the result's\n per-band `offset_applied`, so a fit is auditable against the table\n it ran with."]
+    pub band_conversions: *const EmpyreanBandConversion,
+    #[doc = " Number of rows in [`band_conversions`](Self::band_conversions); 0 =\n the MPC table unchanged."]
+    pub band_conversions_len: usize,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of EmpyreanPhotometryConfig"]
-        [::std::mem::size_of::<EmpyreanPhotometryConfig>() - 32usize];
+        [::std::mem::size_of::<EmpyreanPhotometryConfig>() - 48usize];
     ["Alignment of EmpyreanPhotometryConfig"]
         [::std::mem::align_of::<EmpyreanPhotometryConfig>() - 8usize];
     ["Offset of field: EmpyreanPhotometryConfig::model"]
@@ -2571,7 +2608,20 @@ const _: () = {
         [::std::mem::offset_of!(EmpyreanPhotometryConfig, max_irls_iterations) - 20usize];
     ["Offset of field: EmpyreanPhotometryConfig::huber_k"]
         [::std::mem::offset_of!(EmpyreanPhotometryConfig, huber_k) - 24usize];
+    ["Offset of field: EmpyreanPhotometryConfig::band_conversions"]
+        [::std::mem::offset_of!(EmpyreanPhotometryConfig, band_conversions) - 32usize];
+    ["Offset of field: EmpyreanPhotometryConfig::band_conversions_len"]
+        [::std::mem::offset_of!(EmpyreanPhotometryConfig, band_conversions_len) - 40usize];
 };
+impl Default for EmpyreanPhotometryConfig {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
 #[doc = " Orbit-determination configuration.\n\n Drives `empyrean_determine`, `empyrean_evaluate`, and `empyrean_refine`.\n Mirrors [`scott::od::ODConfig`](scott::od::ODConfig) **structurally** —\n where scott has a nested config (e.g. `auto_escalation`,\n `acceptability`), this surface keeps the same nesting via\n [`EmpyreanAutoEscalationPolicy`], [`EmpyreanAcceptabilityThresholds`],\n etc., so the C-side caller's mental model matches the upstream Rust\n type. Sentinel rule for primitive fields: `0` / `0.0` requests the\n upstream default; only the few fields documented inline (e.g.\n `opposition_gap_days < 0`, `lambda < 0`) carry their own special\n values.\n\n IOD strategy configs (Gauss / Herget / SystematicRanging /\n Refinement) are not exposed here — those are tens of internal\n tuning fields that don't translate cleanly. They always run with\n their upstream defaults; reach for the empyrean-core Rust API when\n you need to override them."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -2634,7 +2684,7 @@ pub struct EmpyreanODConfig {
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of EmpyreanODConfig"][::std::mem::size_of::<EmpyreanODConfig>() - 536usize];
+    ["Size of EmpyreanODConfig"][::std::mem::size_of::<EmpyreanODConfig>() - 552usize];
     ["Alignment of EmpyreanODConfig"][::std::mem::align_of::<EmpyreanODConfig>() - 8usize];
     ["Offset of field: EmpyreanODConfig::force_model"]
         [::std::mem::offset_of!(EmpyreanODConfig, force_model) - 0usize];
@@ -2695,7 +2745,7 @@ const _: () = {
     ["Offset of field: EmpyreanODConfig::photometry"]
         [::std::mem::offset_of!(EmpyreanODConfig, photometry) - 416usize];
     ["Offset of field: EmpyreanODConfig::uncertainty_method"]
-        [::std::mem::offset_of!(EmpyreanODConfig, uncertainty_method) - 448usize];
+        [::std::mem::offset_of!(EmpyreanODConfig, uncertainty_method) - 464usize];
 };
 impl Default for EmpyreanODConfig {
     fn default() -> Self {

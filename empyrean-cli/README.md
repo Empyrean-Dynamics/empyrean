@@ -345,7 +345,11 @@ An object whose fit fails never removes the others and never disappears:
 it gets a typed failure and a `fit_summary` row saying so. The exit code
 is the batch's verdict — `0` when every object delivered, `3` when some
 did, `4` when none did — so a script can tell a partial run from a clean
-one without parsing stderr.
+one without parsing stderr. A solve that would publish the prior back as a
+posterior — a solved axis (a Marsden coefficient, `DT`, `AMRAT`) the
+observations carry no information on — is refused by name, the failure
+message naming the axis and reporting that its posterior σ did not fall
+below the prior σ, rather than returning the prior echo as an estimate.
 
 ```sh
 empyrean determine observations.psv --out-dir ./out
@@ -485,6 +489,16 @@ empyrean determine apophis.psv --photometry --out-dir ./out
 ```text
   99942:
     Photometry: H = 19.234 ± 0.041  G1 = 0.150  (model HG12, chi2_r 1.02)
+```
+
+Each magnitude is converted to Johnson V before the fit with the MPC
+Magnitude Bands table. `--band-conversion CODE=OFFSET:SIGMA` (repeatable)
+supplies entries the table does not carry — the LSST `Lu Lg Lr Li Lz Ly`
+carry no MPC conversion and are refused by name until supplied. It
+requires `--photometry`:
+
+```sh
+empyrean determine lsst.psv --photometry --band-conversion Lu=-1.41:0.30 --out-dir ./out
 ```
 
 ## Runtime requirement

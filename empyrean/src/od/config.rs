@@ -242,10 +242,95 @@ pub struct ODConfig {
     pub uncertainty_method: crate::UncertaintyMethod,
 }
 
+/// One band-to-Johnson-V conversion: the additive offset to V
+/// (\\( V = m_\text{band} + \text{offset\_to\_v} \\)) and the systematic
+/// 1σ of that conversion (the solar-colour assumption floor, not a
+/// statistical error).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BandConversion {
+    /// Additive offset to Johnson V (mag).
+    pub offset_to_v: f64,
+    /// Systematic 1σ of the conversion (mag).
+    pub sigma: f64,
+}
+
+/// Caller-supplied band→V conversions for the post-OD photometric fit.
+///
+/// [`default`](Self::default) is the MPC Magnitude Bands table unchanged
+/// — the fit converts every reported survey-band magnitude to Johnson V
+/// with it. [`with`](Self::with) supplies an entry: it replaces a code the
+/// MPC table carries or adds one it does not (the LSST `Lu Lg Lr Li Lz
+/// Ly`, Gaia `Gb`/`Gr`, the wide `VR`, …). The LSST codes carry no MPC
+/// default and are refused by name until supplied — their magnitudes are
+/// then excluded from the photometric fit with a report, and the
+/// astrometry is unaffected. The comet magnitude flags `T`/`N` are refused
+/// regardless of any supplied entry. Each converted band's offset is
+/// reported back on the result's per-band `offset_applied`, so a fit is
+/// auditable against the table it ran with.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BandConversions {
+    supplied: std::collections::BTreeMap<String, BandConversion>,
+}
+
+impl BandConversions {
+    /// Supply an entry for `code`: replaces a code the MPC table carries
+    /// or adds one it does not. Builder-style:
+    ///
+    /// ```
+    /// use empyrean::{BandConversion, BandConversions};
+    /// let table = BandConversions::default()
+    ///     .with("Lu", BandConversion { offset_to_v: -1.41, sigma: 0.30 });
+    /// ```
+    pub fn with(mut self, code: &str, conversion: BandConversion) -> Self {
+        self.supplied.insert(code.to_string(), conversion);
+        self
+    }
+
+    /// The supplied entries, in sorted code order. Empty = the MPC table
+    /// unchanged.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, BandConversion)> {
+        self.supplied
+            .iter()
+            .map(|(code, conv)| (code.as_str(), *conv))
+    }
+
+    /// True when no entry is supplied — the fit runs on the MPC table.
+    pub fn is_empty(&self) -> bool {
+        self.supplied.is_empty()
+    }
+
+    /// Marshal the supplied entries into FFI rows plus the owned `CString`
+    /// backing their `code` pointers. Both must outlive the FFI call; they
+    /// ride the [`ODConfigKeepalive`].
+    fn to_ffi_rows(
+        &self,
+    ) -> (
+        Vec<std::ffi::CString>,
+        Vec<empyrean_sys::EmpyreanBandConversion>,
+    ) {
+        let codes: Vec<std::ffi::CString> = self
+            .supplied
+            .keys()
+            .map(|c| std::ffi::CString::new(c.as_str()).expect("band code has no interior NUL"))
+            .collect();
+        let rows: Vec<empyrean_sys::EmpyreanBandConversion> = self
+            .supplied
+            .values()
+            .zip(codes.iter())
+            .map(|(conv, code)| empyrean_sys::EmpyreanBandConversion {
+                code: code.as_ptr(),
+                offset_to_v: conv.offset_to_v,
+                sigma: conv.sigma,
+            })
+            .collect();
+        (codes, rows)
+    }
+}
+
 /// Post-OD photometric-fit configuration (mirrors the engine's
 /// photometry config). Attach via [`ODConfig::photometry`]. Sentinel
 /// rule: `0` / `0.0` on a tuning field requests the engine default.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PhotometryConfig {
     /// Model to fit. Default [`PhotometryModel::Auto`].
     pub model: PhotometryModel,
@@ -258,6 +343,11 @@ pub struct PhotometryConfig {
     pub max_irls_iterations: u32,
     /// Huber tuning constant. 0.0 → engine default (1.5).
     pub huber_k: f64,
+    /// Band→V conversion table the fit converts with. Default = the MPC
+    /// Magnitude Bands table; supply entries with
+    /// [`BandConversions::with`] to add or replace a code. See
+    /// [`BandConversions`].
+    pub band_conversions: BandConversions,
 }
 
 impl Default for PhotometryConfig {
@@ -268,18 +358,25 @@ impl Default for PhotometryConfig {
             include_rejected: false,
             max_irls_iterations: 0,
             huber_k: 0.0,
+            band_conversions: BandConversions::default(),
         }
     }
 }
 
 impl PhotometryConfig {
-    fn to_ffi(self) -> empyrean_sys::EmpyreanPhotometryConfig {
+    fn to_ffi(
+        &self,
+        band_conversions: *const empyrean_sys::EmpyreanBandConversion,
+        band_conversions_len: usize,
+    ) -> empyrean_sys::EmpyreanPhotometryConfig {
         empyrean_sys::EmpyreanPhotometryConfig {
             model: self.model.to_int(),
             sigma_lightcurve: self.sigma_lightcurve,
             include_rejected: u8::from(self.include_rejected),
             max_irls_iterations: self.max_irls_iterations,
             huber_k: self.huber_k,
+            band_conversions,
+            band_conversions_len,
         }
     }
 }
@@ -339,6 +436,11 @@ pub(crate) struct ODConfigKeepalive {
     pub perturbers: Vec<i32>,
     pub weighting_layers: Vec<empyrean_sys::EmpyreanWeightingLayer>,
     pub bias_dat_path: Option<std::ffi::CString>,
+    /// Owned `code` strings the photometry band rows point into.
+    pub band_codes: Vec<std::ffi::CString>,
+    /// Photometry band→V conversion rows; the FFI photometry config points
+    /// into this `Vec`.
+    pub band_conversions: Vec<empyrean_sys::EmpyreanBandConversion>,
 }
 
 impl ODConfig {
@@ -355,6 +457,19 @@ impl ODConfig {
             OutputEpoch::LastObservation => (1, 0.0),
             OutputEpoch::Epoch(t) => (2, t),
             OutputEpoch::IODEpoch => (3, 0.0),
+        };
+        // Materialize the photometry band→V rows (and their owned code
+        // strings) before the FFI struct that points into them. Empty
+        // unless a photometry config supplies entries; empty leaves the
+        // fit on the MPC Magnitude Bands table.
+        let (band_codes, band_conversions) = match &self.photometry {
+            Some(p) => p.band_conversions.to_ffi_rows(),
+            None => (Vec::new(), Vec::new()),
+        };
+        let band_ptr = if band_conversions.is_empty() {
+            std::ptr::null()
+        } else {
+            band_conversions.as_ptr()
         };
         // Materialize weighting layers (validates obs_codes against
         // the 4-byte C-ABI field — no silent truncation).
@@ -505,13 +620,19 @@ impl ODConfig {
             solve_for_flags: self.solve_for.flags().to_ffi(),
             allow_unbracketed_maneuvers: u8::from(self.allow_unbracketed_maneuvers),
             has_photometry: u8::from(self.photometry.is_some()),
-            photometry: self.photometry.map(|p| p.to_ffi()).unwrap_or_default(),
+            photometry: self
+                .photometry
+                .as_ref()
+                .map(|p| p.to_ffi(band_ptr, band_conversions.len()))
+                .unwrap_or_default(),
             uncertainty_method: self.uncertainty_method.to_ffi(),
         };
         let keep = ODConfigKeepalive {
             perturbers,
             weighting_layers,
             bias_dat_path,
+            band_codes,
+            band_conversions,
         };
         Ok((cfg, keep))
     }
@@ -550,6 +671,104 @@ mod uncertainty_method_tests {
         };
         let (ffi, _keep) = cfg.to_ffi_with().expect("config marshals");
         assert_eq!(ffi.uncertainty_method.tag, 1);
+    }
+}
+
+#[cfg(test)]
+mod band_conversion_tests {
+    use super::*;
+
+    /// No photometry → no band rows marshalled; the FFI photometry struct
+    /// is zero-init (null table pointer), leaving the fit on the MPC table.
+    #[test]
+    fn no_photometry_marshals_no_band_rows() {
+        let cfg = ODConfig::default();
+        assert!(cfg.photometry.is_none());
+        let (ffi, keep) = cfg.to_ffi_with().expect("default config marshals");
+        assert_eq!(ffi.has_photometry, 0);
+        assert!(keep.band_conversions.is_empty());
+        assert!(ffi.photometry.band_conversions.is_null());
+        assert_eq!(ffi.photometry.band_conversions_len, 0);
+    }
+
+    /// Photometry with the default (empty) table marshals no rows — the
+    /// engine applies the MPC table, not an empty one.
+    #[test]
+    fn default_table_marshals_no_rows() {
+        let cfg = ODConfig {
+            photometry: Some(PhotometryConfig::default()),
+            ..ODConfig::default()
+        };
+        assert!(cfg.photometry.as_ref().unwrap().band_conversions.is_empty());
+        let (ffi, keep) = cfg.to_ffi_with().expect("config marshals");
+        assert_eq!(ffi.has_photometry, 1);
+        assert!(keep.band_conversions.is_empty());
+        assert!(ffi.photometry.band_conversions.is_null());
+        assert_eq!(ffi.photometry.band_conversions_len, 0);
+    }
+
+    /// A supplied entry marshals one row, with the code string, offset and
+    /// σ carried verbatim and the FFI pointer live into the keepalive.
+    #[test]
+    fn supplied_entry_marshals_one_row() {
+        let cfg = ODConfig {
+            photometry: Some(PhotometryConfig {
+                band_conversions: BandConversions::default().with(
+                    "Lu",
+                    BandConversion {
+                        offset_to_v: -1.41,
+                        sigma: 0.30,
+                    },
+                ),
+                ..PhotometryConfig::default()
+            }),
+            ..ODConfig::default()
+        };
+        let (ffi, keep) = cfg.to_ffi_with().expect("config marshals");
+        assert_eq!(ffi.photometry.band_conversions_len, 1);
+        assert_eq!(keep.band_conversions.len(), 1);
+        assert_eq!(keep.band_codes.len(), 1);
+        assert!(!ffi.photometry.band_conversions.is_null());
+        // The row the FFI pointer addresses carries the supplied values and
+        // its code string.
+        let row = unsafe { &*ffi.photometry.band_conversions };
+        assert_eq!(row.offset_to_v, -1.41);
+        assert_eq!(row.sigma, 0.30);
+        let code = unsafe { std::ffi::CStr::from_ptr(row.code) };
+        assert_eq!(code.to_str().unwrap(), "Lu");
+    }
+
+    /// `entries()` reports the supplied set in sorted code order; a second
+    /// `with` on the same code replaces it.
+    #[test]
+    fn with_replaces_and_entries_are_sorted() {
+        let table = BandConversions::default()
+            .with(
+                "r",
+                BandConversion {
+                    offset_to_v: 0.25,
+                    sigma: 0.05,
+                },
+            )
+            .with(
+                "Lu",
+                BandConversion {
+                    offset_to_v: -1.41,
+                    sigma: 0.30,
+                },
+            )
+            .with(
+                "r",
+                BandConversion {
+                    offset_to_v: 0.30,
+                    sigma: 0.06,
+                },
+            );
+        let entries: Vec<_> = table.entries().collect();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, "Lu");
+        assert_eq!(entries[1].0, "r");
+        assert_eq!(entries[1].1.offset_to_v, 0.30);
     }
 }
 

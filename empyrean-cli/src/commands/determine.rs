@@ -110,6 +110,15 @@ pub struct DetermineArgs {
     #[arg(long)]
     pub photometry: bool,
 
+    /// Supply a band→V conversion for the photometric fit, as
+    /// `CODE=OFFSET:SIGMA` (e.g. `--band-conversion Lu=-1.41:0.30`).
+    /// Repeatable. Each entry replaces a code the built-in MPC Magnitude
+    /// Bands table carries or adds one it does not (the LSST
+    /// `Lu Lg Lr Li Lz Ly` carry no default and are refused by name until
+    /// supplied). Requires `--photometry`.
+    #[arg(long = "band-conversion", value_name = "CODE=OFFSET:SIGMA")]
+    pub band_conversion: Vec<String>,
+
     /// Output directory. Receives `fitted_orbits.<format>` (one row per
     /// delivered object), `fit_summary.parquet` AND `fit_summary.csv`
     /// (one row per input object, delivered or failed), and
@@ -364,6 +373,56 @@ fn observations_for_object(
 ///
 /// Assumes [`validate_prior_flags`] has already accepted `args`, so the
 /// required prior flags for the requested axes are present.
+/// Parse the repeatable `--band-conversion CODE=OFFSET:SIGMA` specs into a
+/// [`empyrean::BandConversions`] layered onto the MPC Magnitude Bands
+/// table. Each spec replaces a code the table carries or adds one it does
+/// not; a malformed spec is a loud refusal naming the offending value.
+fn parse_band_conversions(specs: &[String]) -> Result<empyrean::BandConversions> {
+    let mut table = empyrean::BandConversions::default();
+    for spec in specs {
+        let (code, rest) = spec.split_once('=').ok_or_else(|| {
+            anyhow::anyhow!("--band-conversion {spec:?}: expected CODE=OFFSET:SIGMA")
+        })?;
+        let (offset, sigma) = rest.split_once(':').ok_or_else(|| {
+            anyhow::anyhow!(
+                "--band-conversion {spec:?}: expected CODE=OFFSET:SIGMA (missing :SIGMA)"
+            )
+        })?;
+        let code = code.trim();
+        if code.is_empty() {
+            anyhow::bail!("--band-conversion {spec:?}: CODE is empty");
+        }
+        let offset_to_v: f64 = offset.trim().parse().map_err(|_| {
+            anyhow::anyhow!("--band-conversion {spec:?}: offset {offset:?} is not a number")
+        })?;
+        let sigma: f64 = sigma.trim().parse().map_err(|_| {
+            anyhow::anyhow!("--band-conversion {spec:?}: sigma {sigma:?} is not a number")
+        })?;
+        table = table.with(code, empyrean::BandConversion { offset_to_v, sigma });
+    }
+    Ok(table)
+}
+
+/// The photometry config for a run: `None` unless `--photometry` is set,
+/// otherwise the engine defaults carrying any `--band-conversion` entries.
+/// `--band-conversion` without `--photometry` is a loud refusal — the band
+/// table is only read by the photometric fit.
+fn photometry_config(args: &DetermineArgs) -> Result<Option<empyrean::PhotometryConfig>> {
+    if !args.photometry {
+        if !args.band_conversion.is_empty() {
+            anyhow::bail!(
+                "--band-conversion requires --photometry: the band→V table is only read by \
+                 the post-OD photometric fit"
+            );
+        }
+        return Ok(None);
+    }
+    Ok(Some(empyrean::PhotometryConfig {
+        band_conversions: parse_band_conversions(&args.band_conversion)?,
+        ..empyrean::PhotometryConfig::default()
+    }))
+}
+
 fn run_refine_path(
     ctx: &empyrean::Context,
     observations: &empyrean::Observations,
@@ -387,7 +446,7 @@ fn run_refine_path(
         force_model: args.force_model.to_empyrean(),
         max_iterations: args.max_iterations,
         solve_for: base_solve,
-        photometry: args.photometry.then(empyrean::PhotometryConfig::default),
+        photometry: photometry_config(args)?,
         uncertainty_method: args.uncertainty_method.to_empyrean(),
         ..empyrean::ODConfig::default()
     };
@@ -408,7 +467,7 @@ fn run_refine_path(
         force_model: args.force_model.to_empyrean(),
         max_iterations: args.max_iterations,
         solve_for: build_solve_for(args.solve_for, args.thrust_segments)?,
-        photometry: args.photometry.then(empyrean::PhotometryConfig::default),
+        photometry: photometry_config(args)?,
         uncertainty_method: args.uncertainty_method.to_empyrean(),
         ..empyrean::ODConfig::default()
     };
@@ -782,7 +841,7 @@ pub fn run(data: &DataOptions, args: DetermineArgs) -> Result<()> {
             force_model: args.force_model.to_empyrean(),
             max_iterations: args.max_iterations,
             solve_for: build_solve_for(args.solve_for, args.thrust_segments)?,
-            photometry: args.photometry.then(empyrean::PhotometryConfig::default),
+            photometry: photometry_config(&args)?,
             uncertainty_method: args.uncertainty_method.to_empyrean(),
             ..empyrean::ODConfig::default()
         };
@@ -838,6 +897,7 @@ mod tests {
             dt_variance: None,
             thrust_segments: 0,
             photometry: false,
+            band_conversion: Vec::new(),
             uncertainty_method: UncertaintyMethodArg::FirstOrder,
             out_dir: PathBuf::from("."),
             format: OutputFormat::Parquet,
@@ -1075,5 +1135,49 @@ mod tests {
         ] {
             assert!(validate_prior_flags(&args_with(mode)).is_ok());
         }
+    }
+
+    /// `--band-conversion CODE=OFFSET:SIGMA` parses into the table, replacing
+    /// or adding a code; the supplied offset/σ ride through.
+    #[test]
+    fn band_conversion_specs_parse_into_the_table() {
+        let specs = vec!["Lu=-1.41:0.30".to_string(), "r=0.25:0.05".to_string()];
+        let table = parse_band_conversions(&specs).expect("valid specs parse");
+        let entries: std::collections::BTreeMap<_, _> = table
+            .entries()
+            .map(|(c, v)| (c.to_string(), (v.offset_to_v, v.sigma)))
+            .collect();
+        assert_eq!(entries["Lu"], (-1.41, 0.30));
+        assert_eq!(entries["r"], (0.25, 0.05));
+    }
+
+    /// A malformed spec is a loud refusal naming the offending value.
+    #[test]
+    fn malformed_band_conversion_specs_are_refused() {
+        assert!(parse_band_conversions(&["Lu".to_string()]).is_err());
+        assert!(parse_band_conversions(&["Lu=-1.41".to_string()]).is_err());
+        assert!(parse_band_conversions(&["Lu=x:0.3".to_string()]).is_err());
+        assert!(parse_band_conversions(&["=0.1:0.3".to_string()]).is_err());
+        assert!(parse_band_conversions(&["Lu=-1.41:y".to_string()]).is_err());
+    }
+
+    /// The band table is only read by the photometric fit: a
+    /// `--band-conversion` with no `--photometry` is refused, and
+    /// `--photometry` alone carries the MPC table (no supplied rows).
+    #[test]
+    fn band_conversion_requires_photometry() {
+        let mut args = args_with(SolveForArg::Auto);
+        args.band_conversion = vec!["Lu=-1.41:0.30".to_string()];
+        assert!(photometry_config(&args).is_err());
+
+        args.photometry = true;
+        let pc = photometry_config(&args).expect("photometry + band conversion builds");
+        let pc = pc.expect("photometry enabled");
+        assert_eq!(pc.band_conversions.entries().count(), 1);
+
+        let mut plain = args_with(SolveForArg::Auto);
+        plain.photometry = true;
+        let pc = photometry_config(&plain).unwrap().unwrap();
+        assert!(pc.band_conversions.is_empty());
     }
 }

@@ -61,7 +61,8 @@ mod result;
 mod weighting;
 
 pub use config::{
-    AcceptabilityThresholds, AutoEscalationPolicy, IODConfig, ODConfig, PhotometryConfig,
+    AcceptabilityThresholds, AutoEscalationPolicy, BandConversion, BandConversions, IODConfig,
+    ODConfig, PhotometryConfig,
 };
 pub use debiasing::{DebiasingConfig, DebiasingResolution};
 pub use nuisance::StationRADecConfig;

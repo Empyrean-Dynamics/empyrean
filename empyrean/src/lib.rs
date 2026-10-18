@@ -172,12 +172,12 @@ pub use joint::{
 pub use math::{MixtureComponent, eigenvector_max_6x6, split_gaussian};
 pub use observers::Observer;
 pub use od::{
-    AcceptabilityReport, AcceptabilityThresholds, AutoEscalationPolicy, BandStat,
-    CovarianceInformation, CovarianceRepresentation, CovarianceTrust, DebiasingConfig,
-    DebiasingResolution, DeliveredNoiseModel, DeliveredRejectionKind, DetermineEntry,
-    DetermineFailure, DetermineFailureKind, DetermineResult, DetermineResults, EvaluateResult,
-    GateRecord, IODConfig, MAX_THRUST_SEGMENTS, NoiseModel, ODConfig, ODError, Observation,
-    ObservationResidual, Observations, OriginPolicy, OutputEpoch, PhotometryConfig,
+    AcceptabilityReport, AcceptabilityThresholds, AutoEscalationPolicy, BandConversion,
+    BandConversions, BandStat, CovarianceInformation, CovarianceRepresentation, CovarianceTrust,
+    DebiasingConfig, DebiasingResolution, DeliveredNoiseModel, DeliveredRejectionKind,
+    DetermineEntry, DetermineFailure, DetermineFailureKind, DetermineResult, DetermineResults,
+    EvaluateResult, GateRecord, IODConfig, MAX_THRUST_SEGMENTS, NoiseModel, ODConfig, ODError,
+    Observation, ObservationResidual, Observations, OriginPolicy, OutputEpoch, PhotometryConfig,
     PhotometryModel, PhotometryResult, RadarMeasurement, RadarObservation, RadarResidual,
     RadarResidualKind, RejectionConfig, RejectionKind, RejectionReason, ResidualSummary,
     SigmaPolicy, SigmaSource, SolveFor, SolveForParams, SolvedCovariance, SolverStop,

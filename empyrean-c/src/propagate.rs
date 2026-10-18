@@ -1754,11 +1754,24 @@ pub(crate) fn empyrean_orbit_non_grav_params(orbit: &EmpyreanOrbit) -> Option<No
     // This builder carries the Marsden *values* and the g(r) model; the
     // non-grav fit prior (the Marsden 3×3 and the DT variance) rides the
     // orbit's packed joint now, attached separately via
-    // `push_orbit_with_joint`, so it is no longer a trigger here. Non-grav
-    // is present when the caller supplies Marsden values (non-zero A1/A2/A3 —
-    // the apply case) or a finite DT value.
+    // `push_orbit_with_joint`. Non-grav is present when the caller supplies
+    // Marsden values (non-zero A1/A2/A3 — the apply case), a finite DT value,
+    // OR the orbit's joint declares a Marsden axis.
+    //
+    // The joint declaration is the decisive signal: a declared Marsden
+    // covariance block (bits 0..=2 of the joint's axis table — see
+    // `joint::EmpyreanPackedJoint`) is the orbit's own, value-independent
+    // statement that it carries a Marsden model, exactly as a fit/refine
+    // request supplies it. Inferring "no non-grav" from all-zero coefficients
+    // would drop the force while that prior block stays, leaving the solve a
+    // declared-but-unforced Marsden axis: zero observation information, a NaN
+    // estimate and a posterior that silently echoes the prior. A model with
+    // zero coefficients is a model with zero coefficients, never an absent
+    // one — presence is never inferred from the coefficient values.
+    const MARSDEN_AXIS_BITS: u32 = 0b111;
+    let declares_marsden = orbit.covariance.layout_present & MARSDEN_AXIS_BITS != 0;
     let has_dt = orbit.non_grav_dt.is_finite();
-    if orbit.a1 == 0.0 && orbit.a2 == 0.0 && orbit.a3 == 0.0 && !has_dt {
+    if orbit.a1 == 0.0 && orbit.a2 == 0.0 && orbit.a3 == 0.0 && !has_dt && !declares_marsden {
         return None;
     }
     let g_func = if orbit.ng_alpha == 0.0
@@ -4504,11 +4517,37 @@ mod non_grav_input_tests {
         assert!(empyrean_orbit_non_grav_params(&base_orbit()).is_none());
     }
 
-    // DELETED `zero_coeffs_with_covariance_opens_marsden`: the non-grav prior
-    // covariance rides the orbit's packed joint (its Marsden axes) now, not
-    // `EmpyreanOrbit.non_grav_covariance` / `NonGravParams.covariance`; the
-    // presence gate is value-based (A1/A2/A3 or DT) and the joint's layout
-    // opens the Marsden column — a ruling-removed scalar surface.
+    #[test]
+    fn zero_coeffs_with_declared_marsden_joint_is_present() {
+        // Regression (the zero-seeded solved axis): a joint that declares a
+        // Marsden axis is the orbit's own, value-independent statement that it
+        // carries a Marsden model — exactly what a refine/fit request supplies,
+        // with the coefficients seeded at zero. Reading "no non-grav" off the
+        // all-zero coefficients drops the force while that prior block stays,
+        // leaving scott a declared-but-unforced Marsden axis: zero observation
+        // information, a NaN estimate, a posterior that echoes the prior. The
+        // joint's layout opens the Marsden column, so the force must survive.
+        let mut o = base_orbit();
+        // Bits 0..=2 are the Marsden A1/A2/A3 axes (`joint::EmpyreanPackedJoint`).
+        o.covariance.layout_present = 0b111;
+        let ng = empyrean_orbit_non_grav_params(&o)
+            .expect("a declared Marsden joint keeps the non-grav model present at a zero seed");
+        assert_eq!((ng.a1, ng.a2, ng.a3), (0.0, 0.0, 0.0));
+        assert!(
+            matches!(ng.model, NonGravModel::MarsdenSekanina(_)),
+            "the zero-coefficient model is still a Marsden model, not absent"
+        );
+    }
+
+    #[test]
+    fn zero_coeffs_without_joint_or_dt_is_absent() {
+        // The pure-apply case is unchanged: all-zero coefficients, no declared
+        // Marsden axis and no DT ⇒ genuinely gravity-only. A memset(0) orbit
+        // (layout_present == 0) must still read as non-grav-absent.
+        let o = base_orbit();
+        assert_eq!(o.covariance.layout_present, 0);
+        assert!(empyrean_orbit_non_grav_params(&o).is_none());
+    }
 
     #[test]
     fn zero_coeffs_with_dt_is_present() {

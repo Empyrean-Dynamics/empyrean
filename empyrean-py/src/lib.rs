@@ -6717,6 +6717,44 @@ fn build_od_config_from_dict(d: &Bound<'_, PyDict>) -> PyResult<empyrean::ODConf
         if let Some(v) = get_f64(&ph, "huber_k")? {
             pc.huber_k = v;
         }
+        // Band→V conversions: a mapping {code: (offset_to_v, sigma)} layered
+        // onto the MPC Magnitude Bands table. A supplied entry replaces a
+        // code or adds one the default does not carry (the LSST `L*` codes,
+        // …); the comet flags `T`/`N` are refused by the fit regardless.
+        if let Some(bc) = get_dict(&ph, "band_conversions")? {
+            let mut table = empyrean::BandConversions::default();
+            for (key, value) in bc.iter() {
+                let code: String = key.extract().map_err(|_| {
+                    PyValueError::new_err(
+                        "photometry.band_conversions keys must be band-code strings",
+                    )
+                })?;
+                // The value is an (offset_to_v, sigma) pair — accepted as any
+                // 2-element sequence (the wire carries a list; a caller's tuple
+                // works too).
+                let pair: Vec<f64> = value.extract().map_err(|_| {
+                    PyValueError::new_err(format!(
+                        "photometry.band_conversions[{code:?}] must be an (offset_to_v, sigma) \
+                         pair of floats"
+                    ))
+                })?;
+                if pair.len() != 2 {
+                    return Err(PyValueError::new_err(format!(
+                        "photometry.band_conversions[{code:?}] must be an (offset_to_v, sigma) \
+                         pair of floats, got {} values",
+                        pair.len()
+                    )));
+                }
+                table = table.with(
+                    &code,
+                    empyrean::BandConversion {
+                        offset_to_v: pair[0],
+                        sigma: pair[1],
+                    },
+                );
+            }
+            pc.band_conversions = table;
+        }
         cfg.photometry = Some(pc);
     }
 

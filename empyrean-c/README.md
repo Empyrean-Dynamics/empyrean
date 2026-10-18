@@ -258,6 +258,13 @@ delivered. Caller-supplied seeds are matched to groups by orbit index,
 and a seed that matches no group is reported in `unmatched_orbit_ids`
 rather than dropped.
 
+An `_OD` failure's fine cause rides a secondary `EMPYREAN_OD_ERROR_*` code
+on the slot's `od_error_code`. Among them, a solved parameter axis the
+observations carry no information on — one whose posterior σ would not fall
+below its prior, or whose estimate is non-finite — is refused by name
+(`EMPYREAN_OD_ERROR_SOLVED_AXIS_UNCONSTRAINED`), the message naming the
+axis and both σ, rather than returning the prior echo as a posterior.
+
 | return | meaning | `results_out` |
 |--------|---------|---------------|
 | `0` | the batch ran and **at least one** object delivered a fit | populated — free it |
@@ -716,11 +723,29 @@ HG12 and HG1G2 systems follow Muinonen et al. (2010). H comes back with
 an honest 1σ via the fit's `covariance` block (H, slope1, slope2
 order); the model can also be pinned with
 `EMPYREAN_PHOTOMETRY_MODEL_HONLY` / `_HG` / `_HG12` / `_HG1G2`.
-Magnitudes whose photometric band has no adopted V-band conversion are
-excluded from the photometric fit — the report counts them
-(`n_mags_dropped_unconvertible`) and lists the distinct offending band
-codes (`dropped_bands`); those observations' astrometry still
-participates in the orbit fit.
+
+Each reported magnitude is converted to Johnson V before the fit with the
+MPC Magnitude Bands table. A caller supplies entries the table does not
+carry through `band_conversions` — an array of `band_conversions_len`
+`EmpyreanBandConversion { code, offset_to_v, sigma }` rows on the config
+(null / zero length leaves the fit on the MPC table); each row replaces a
+code or adds one, e.g. the LSST `Lu Lg Lr Li Lz Ly`, which carry no MPC
+conversion and are refused by name until supplied:
+
+```c
+struct EmpyreanBandConversion bands[] = {
+    { .code = "Lu", .offset_to_v = -1.41, .sigma = 0.30 },
+};
+cfg.photometry.band_conversions = bands;
+cfg.photometry.band_conversions_len = 1;
+```
+
+Magnitudes whose band still has no conversion are excluded from the
+photometric fit — the report counts them (`n_mags_dropped_unconvertible`)
+and lists the distinct offending band codes (`dropped_bands`), and each
+converted band's offset is reported on the result's per-band
+`offset_applied`; those observations' astrometry still participates in the
+orbit fit.
 
 ### Example: refine an orbit with a non-grav prior
 

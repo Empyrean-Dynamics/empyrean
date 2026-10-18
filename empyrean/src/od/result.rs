@@ -1942,6 +1942,12 @@ pub enum ODError {
     /// An observation's assembled 2×2 weight matrix was finite but not
     /// positive-definite, so it has no Cholesky factor.
     WeightMatrixNotPositiveDefinite,
+    /// A solved parameter axis the observations carry no information on:
+    /// a converged fit that would otherwise return the prior as a
+    /// posterior, or a non-finite solved estimate. Refused by name. The
+    /// axis (`Marsden A2`, `DT`, `AMRAT`, …) and both σ are in
+    /// [`DetermineFailure::message`].
+    SolvedAxisUnconstrained,
     /// A code this build does not model — the raw wire value, kept verbatim.
     /// Its appearance means the loaded library is newer than the wrapper.
     Unknown(i32),
@@ -2042,6 +2048,9 @@ impl ODError {
             }
             empyrean_sys::EMPYREAN_OD_ERROR_WEIGHT_MATRIX_NOT_POSITIVE_DEFINITE => {
                 ODError::WeightMatrixNotPositiveDefinite
+            }
+            empyrean_sys::EMPYREAN_OD_ERROR_SOLVED_AXIS_UNCONSTRAINED => {
+                ODError::SolvedAxisUnconstrained
             }
             // Every unrecognised code (including NONE) → Unknown(raw),
             // never a valid-looking variant.
@@ -2814,11 +2823,11 @@ mod od_error_tests {
     use super::ODError;
 
     /// Every EMPYREAN_OD_ERROR_* code round-trips to the same-named wrapper
-    /// variant, all 43 map to distinct variants, and none collides with
+    /// variant, all 48 map to distinct variants, and none collides with
     /// the NONE sentinel.
     #[test]
     fn od_error_codes_round_trip_to_named_variants() {
-        let table: [(i32, ODError); 43] = [
+        let table: [(i32, ODError); 48] = [
             (
                 empyrean_sys::EMPYREAN_OD_ERROR_NOT_CARTESIAN as i32,
                 ODError::NotCartesian,
@@ -2991,6 +3000,26 @@ mod od_error_tests {
                 empyrean_sys::EMPYREAN_OD_ERROR_NOISE_MODEL_IRLS_NOT_CONVERGED as i32,
                 ODError::NoiseModelIrlsNotConverged,
             ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_UNKNOWN_OBSERVATORY_CODE as i32,
+                ODError::UnknownObservatoryCode,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_INVALID_WEIGHTING_CONFIG as i32,
+                ODError::InvalidWeightingConfig,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_NON_FINITE_WEIGHT_MATRIX as i32,
+                ODError::NonFiniteWeightMatrix,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_WEIGHT_MATRIX_NOT_POSITIVE_DEFINITE as i32,
+                ODError::WeightMatrixNotPositiveDefinite,
+            ),
+            (
+                empyrean_sys::EMPYREAN_OD_ERROR_SOLVED_AXIS_UNCONSTRAINED as i32,
+                ODError::SolvedAxisUnconstrained,
+            ),
         ];
         let mut seen_codes = std::collections::BTreeSet::new();
         let mut seen_variants = std::collections::BTreeSet::new();
@@ -3011,7 +3040,13 @@ mod od_error_tests {
                 "variant {variant:?} is not distinct"
             );
         }
-        assert_eq!(seen_codes.len(), 43);
+        assert_eq!(seen_codes.len(), 48);
+        // The unconstrained-axis code decodes to its own named variant,
+        // never Unknown — the mutation point for the new arm.
+        assert_eq!(
+            ODError::from_code(empyrean_sys::EMPYREAN_OD_ERROR_SOLVED_AXIS_UNCONSTRAINED as i32),
+            ODError::SolvedAxisUnconstrained,
+        );
     }
 
     /// A code this build does not know decodes to Unknown(raw), never a

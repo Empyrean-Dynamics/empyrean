@@ -602,10 +602,13 @@ An optional post-OD photometry fit recovers the absolute magnitude H
 and a phase-function slope from the arc's observation magnitudes. It
 runs after the orbit is solved, climbing a model ladder — H-only →
 HG₁₂ → HG₁G₂ (Muinonen et al. 2010) — to the richest model the arc's
-phase-angle coverage supports, and reports H with an honest 1σ.
-Magnitudes in bands with no adopted V-band conversion are excluded,
-counted, and their band codes listed — the observations' astrometry
-is unaffected.
+phase-angle coverage supports, and reports H with an honest 1σ. Each
+magnitude is converted to Johnson V with the MPC Magnitude Bands table;
+`PhotometryConfig.band_conversions` supplies entries the table does not
+carry (the LSST `Lu Lg Lr Li Lz Ly` carry no MPC conversion and are
+refused by name until supplied). Magnitudes in bands still without a
+conversion are excluded, counted, and their band codes listed — the
+observations' astrometry is unaffected.
 
 ### Reading the outputs back
 

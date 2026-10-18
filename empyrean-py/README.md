@@ -500,15 +500,24 @@ state. In `AUTO` it climbs a model ladder — H-only → HG12 → HG1G2
 (Muinonen et al. 2010) — admitting the richest model the arc's
 phase-angle coverage supports, and reports the model it actually fitted
 on `model_used`. *H* comes back with an honest 1σ from the fit
-covariance. Magnitudes whose band has no adopted V-band conversion are
-never silently used: the report counts them
-(`n_mags_dropped_unconvertible`) and lists the distinct offending band
-codes (`dropped_bands`) — the observations' astrometry is unaffected.
+covariance. Each reported magnitude is converted to Johnson V before the
+fit with the MPC Magnitude Bands table; `PhotometryConfig.band_conversions`
+supplies entries the table does not carry, as `{code: (offset_to_v,
+sigma)}`. The LSST codes `Lu Lg Lr Li Lz Ly` carry no MPC conversion and
+are refused by name until supplied — their magnitudes are counted
+(`n_mags_dropped_unconvertible`) and their codes listed (`dropped_bands`),
+and the observations' astrometry is unaffected. Each converted band's
+offset is reported on the result's per-band `offset_applied`.
 
 ```python
 from empyrean import ODConfig, PhotometryConfig
 
-config = ODConfig(photometry=PhotometryConfig())   # AUTO ladder
+config = ODConfig(photometry=PhotometryConfig())   # AUTO ladder, MPC table
+
+# Supply a V conversion for an LSST band so its magnitudes enter the fit:
+config = ODConfig(
+    photometry=PhotometryConfig(band_conversions={"Lu": (-1.41, 0.30)})
+)
 result = empyrean.determine(obs, config=config).single()
 
 phot = result.photometry               # None if photometry was not requested

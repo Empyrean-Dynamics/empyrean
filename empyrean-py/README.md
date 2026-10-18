@@ -1003,15 +1003,16 @@ flag), identical across all three formats; `rejection_reason` and
 `radar_kind` are written as names rather than integer codes, and a
 non-computable number is a literal `NaN` in CSV and `null` in JSON.
 
-Parquet and JSON round-trip the orbit's covariance; CSV drops it. The
-packed joint rides the orbit as its `covariance` column — the layout, the
-packed lower triangle and the tags — so a fitted orbit written to parquet
-or JSON round-trips carrying the whole joint the fit computed rather than
-its diagonal blocks, and reads back ready to re-feed. CSV is a flat scalar
-row shape that cannot express the layout distinguishing an absent axis
-from a present one, so it carries the state columns and drops the
-covariance rather than writing a projection that would read back as a
-different orbit.
+Parquet and JSON round-trip the orbit's full packed joint; CSV carries the
+state 6×6 only. The packed joint rides the orbit as its `covariance`
+column — the layout, the packed lower triangle and the tags — so a fitted
+orbit written to parquet or JSON round-trips carrying the whole joint the
+fit computed rather than its diagonal blocks, and reads back ready to
+re-feed. CSV is a flat scalar row shape that cannot express the layout
+distinguishing an absent axis from a present one, so it carries the state
+6×6 (the joint's leading block) and refuses a joint carrying
+solved-parameter axes by name rather than writing a projection that would
+read back as a different orbit.
 
 ## Turning event detection off
 

@@ -8994,21 +8994,23 @@ int32_t empyrean_compute_b_planes(const EmpyreanContext *ctx,
  * Write an orbit batch to JSON.
  *
  * This is **not** the engine's orbit schema — it is this crate's own
- * flat row shape (`OrbitRow`), and it is the least capable of the three
- * orbit formats. It carries the state, the 6×6 and the Marsden
- * coefficients with their g(r) exponents, and nothing else.
+ * flat row shape (`OrbitRow`). It carries the state, the full packed
+ * joint covariance, and the Marsden coefficients with their g(r)
+ * exponents.
  *
- * A batch carrying a state↔Marsden border or a wide cross-covariance
- * carrier is **refused by name**, pointing at parquet — the format is
- * unable to represent the joint, and writing the row short would
- * produce a file that reads back as a block-diagonal covariance with no
- * signal that anything was lost.
+ * 0.11.0: the covariance is the **full packed joint** at every width —
+ * the same value parquet stores, in the same `cov_*` field names (the
+ * packed lower triangle `cov_tri` plus the scalar tags). A joint carrying
+ * solved-parameter axes is written, not refused; the flat 6×6 is the
+ * joint's leading block, derived on read, never stored twice. (CSV still
+ * refuses a wider-than-state joint by name — see
+ * [`empyrean_orbits_write_csv`].)
  *
- * Fields this format drops without refusing, because they predate the
- * joint surface and a refusal would break callers who write them today:
- * the non-grav DT and its prior variance, the Marsden 3×3, the SRP slot
- * and the photometric block. Round-trip through parquet if you need
- * them.
+ * Fields this format still drops, because they predate the joint surface
+ * and are not covariance: the non-grav DT value, the SRP slot and the
+ * photometric block. Their covariance axes (DT / AMRAT / thrust) ride the
+ * packed joint and are carried; their model values do not — round-trip
+ * through parquet if you need those.
  */
  int32_t empyrean_orbits_write_json(const char *path, const struct EmpyreanOrbitBatch *batch);
 

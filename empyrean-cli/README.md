@@ -79,8 +79,10 @@ empyrean version
 The pipeline commands (`propagate` / `ephemeris` / `determine`) emit
 Parquet tables under `--out-dir` by default; `--format json` and
 `--format csv` are also available, and CSV is no longer a lossy choice —
-it carries the same 82-column orbit schema Parquet does, covariance
-included. The schemas match the Python and Rust API outputs exactly —
+it carries the same 82-column orbit schema Parquet does, with the state
+6×6 covariance included. Parquet and JSON carry the full packed joint (CSV
+the state 6×6 only, refusing a wider joint by name). The schemas match the
+Python and Rust API outputs exactly —
 same `orbit_id` / `object_id` join keys, same time scales, same physical
 units — so you can mix-and-match channels for the same workflow.
 
@@ -309,13 +311,14 @@ Three artifacts land under `--out-dir`:
   `empyrean propagate` / `empyrean ephemeris` with no reconstruction.
   A wide fit's orbit additionally carries the **joint** — the
   off-diagonal blocks of the fitted covariance, beyond the state+Marsden
-  9×9. Only parquet (the `--format` default) can hold them; `--format
-  csv` and `--format json` refuse such a batch **by name** rather than
-  writing it short, because a file written short reads back as a
-  block-diagonal joint, which is a tighter claim than the fit made and
-  leaves nothing in the round trip to signal the loss. Keep the default
-  format for wide fits; a fit whose orbit carries no cross terms writes
-  in whichever format you ask for.
+  9×9. Parquet (the `--format` default) **and** `--format json` carry the
+  full packed joint; `--format csv` carries the state 6×6 only and refuses
+  a joint carrying solved-parameter axes **by name** rather than writing it
+  short, because a file written short reads back as a block-diagonal joint,
+  which is a tighter claim than the fit made and leaves nothing in the
+  round trip to signal the loss. Use parquet or JSON for wide fits; a fit
+  whose orbit carries no cross terms writes in whichever format you ask
+  for.
 - `fit_summary.parquet` **and** `fit_summary.csv` — one row per *input*
   object, delivered or not: `status`, convergence, iterations, observation
   and selected counts, residual RMS, reduced χ², both acceptability

@@ -401,6 +401,57 @@ pub(crate) fn empty_packed_joint() -> EmpyreanPackedJoint {
     }
 }
 
+/// Assemble an owned C packed joint from raw JSON-wire parts: the layout
+/// bitsets, the joint width, the packed lower triangle **in this ABI's output
+/// basis** (angular state rows in degrees — the bytes read straight off the
+/// file), and the raw wire tag bytes. The triangle is copied into a
+/// library-owned heap buffer released by [`free_packed_joint`]; nothing is
+/// recomputed.
+///
+/// This crate's own flat JSON orbit row carries the packed joint verbatim and
+/// never routes it through the engine, so the tags are the bytes that were
+/// written (`kind` / `quality` / `functional` / `provenance` /
+/// `asserted_source` and the quality detail), not values re-derived from an
+/// ingested prior. A degree → JSON → degree round trip therefore returns the
+/// supplied joint bit-identically, unlike the parquet/CSV path whose engine
+/// congruence scales angular rows.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn packed_joint_from_json_wire(
+    layout_present: u32,
+    layout_considered: u32,
+    layout_marginalized: u32,
+    width: u8,
+    tri: Vec<f64>,
+    kind: u8,
+    quality: u8,
+    cov_rank: u8,
+    cov_null_axes: u32,
+    cov_min_eig_corr: f64,
+    functional: u8,
+    provenance: u8,
+    asserted_source: u8,
+) -> EmpyreanPackedJoint {
+    let tri_boxed: Box<[f64]> = tri.into_boxed_slice();
+    let tri_len = tri_boxed.len();
+    let tri = Box::into_raw(tri_boxed) as *const f64;
+    EmpyreanPackedJoint {
+        layout_present,
+        layout_considered,
+        layout_marginalized,
+        width,
+        tri,
+        tri_len,
+        kind,
+        quality,
+        cov_rank,
+        cov_null_axes,
+        cov_min_eig_corr,
+        functional,
+        provenance,
+        asserted_source,
+    }
+}
+
 /// Apply the diagonal congruence \\(D \Sigma D^\top\\) to a packed lower
 /// triangle in place: entry \\((i, j)\\) is multiplied by \\(D_i D_j\\),
 /// where \\(D_k = \text{factor}\\) on an angular state row `k` (`k` in

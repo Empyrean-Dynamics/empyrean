@@ -255,6 +255,30 @@ fn piped_json_streams_the_whole_table_aligned() {
     );
 }
 
+/// 0.11.0: the JSON orbit format carries the packed joint, so `show` prints
+/// its atomic `cov_tri` column from a JSON file just as it does from parquet.
+/// The batch here carries a state 6×6, which the writer carries as the
+/// width-6 state joint — `cov_tri` with 21 entries.
+#[test]
+fn piped_json_shows_the_packed_joint() {
+    require_engine!();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("states.json");
+    write_orbits_json(&path, &orbit_batch(1)).unwrap();
+
+    let (stdout, stderr, ok) = show(&[path.to_str().unwrap(), "--columns", "orbit_id,cov_tri"]);
+    assert!(ok, "show failed: {stderr}");
+    let header = lines(&stdout);
+    assert!(
+        header.first().is_some_and(|h| h.contains("cov_tri")),
+        "the JSON show header must carry the packed-joint cov_tri column: {header:?}"
+    );
+    assert!(
+        stdout.contains('['),
+        "cov_tri must render as its own array cell: {stdout}"
+    );
+}
+
 // ---------------------------------------------------------------------
 // Flags
 // ---------------------------------------------------------------------

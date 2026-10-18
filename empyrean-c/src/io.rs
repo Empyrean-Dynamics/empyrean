@@ -16,25 +16,28 @@
 //! parquet schemas are villeneuve-native (round-trips with the rest of
 //! the empyrean ecosystem).
 //!
-//! # The wide cross-covariance, by orbit format
+//! # The covariance, by orbit format
 //!
-//! Of the three orbit formats here, **only parquet carries** the
-//! state↔parameter and parameter↔parameter cross terms, in a tagged
-//! `wcs_*` / `wcp_*` column tail. **JSON and CSV refuse by name** on
-//! write, each pointing at parquet, rather than writing a row short and
-//! returning success — a file written short reads back as a
-//! block-diagonal joint, a tighter claim than the caller held, with
-//! nothing in the round trip to signal it. The refusal is write-side:
-//! the readers refuse nothing, because a file with no carrier columns is
-//! indistinguishable from one that never had any.
+//! **Parquet and JSON both carry the full packed joint** — the whole
+//! \\((6+P) \times (6+P)\\) covariance, state↔parameter and
+//! parameter↔parameter cross terms included — so a fitted orbit round-trips
+//! through either with the joint the fit computed rather than its diagonal
+//! blocks. Parquet carries it in villeneuve's tagged `cov_*` columns; JSON
+//! carries the same value in `OrbitRow`'s `cov_*` fields (the packed lower
+//! triangle `cov_tri` plus the scalar tags), under the same names.
 //!
-//! The JSON refusal is this crate's own: `OrbitRow` is a flat serde
-//! shape with no slot for the terms. The CSV refusal comes from the
-//! engine's writer, which raises it by name. Note that the engine
-//! additionally has a **JSONL** orbit format that does carry the
-//! carrier, keyed by a widened `cov_dim` — that format is not exposed
-//! through this ABI, and this crate's `JSON` is a different, flat shape.
-//! Do not describe this boundary in the engine's `cov_dim` terms.
+//! **CSV carries the state 6×6 only** — the joint's leading block — and a
+//! joint carrying solved-parameter axes is **refused by name** by the
+//! engine's own CSV writer, pointing at parquet, rather than written short:
+//! a file written short reads back as a block-diagonal joint, a tighter claim
+//! than the caller held, with nothing in the round trip to signal it.
+//!
+//! A carrier holding continuous-thrust \\(\Delta v\\) terms is refused
+//! wherever it is offered, because no orbit-file format can serialize the
+//! thrust arcs those terms describe. Note the engine additionally has a
+//! **JSONL** orbit format keyed by a widened `cov_dim`; that format is not
+//! exposed through this ABI, and this crate's `JSON` is a different, flat
+//! shape — do not describe this boundary in the engine's `cov_dim` terms.
 
 use std::ffi::{CStr, CString, c_char};
 use std::fs::File;
@@ -163,6 +166,12 @@ pub unsafe extern "C" fn empyrean_orbits_batch_free(batch: *mut EmpyreanOrbitBat
 // parquet I/O.
 // ────────────────────────────────────────────────────────────────────
 
+/// The schema version of the JSON orbit covariance block, mirroring the
+/// parquet covariance wire's `cov_schema` column (villeneuve's
+/// `COV_WIRE_SCHEMA`). Written on every joint-bearing row and refused by name
+/// on read if a future version ever disagrees — never silently accepted.
+const JSON_COV_SCHEMA: i32 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OrbitRow {
     orbit_id: String,
@@ -172,8 +181,53 @@ struct OrbitRow {
     representation: String,
     frame: String,
     origin: i32,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    covariance: Option<[[f64; 6]; 6]>,
+    // The removed flat 6×6 `covariance` field. Files written before 0.11.0
+    // carried the state block here, as a `[[f64; 6]; 6]`; 0.11.0 carries the
+    // full packed joint in the `cov_*` fields below and derives the state 6×6
+    // from the joint's leading block. This slot stays only to DETECT such an
+    // old file and refuse it by name on read (there is no migration shim); it
+    // is never written (`skip_serializing`).
+    #[serde(default, skip_serializing)]
+    covariance: Option<serde_json::Value>,
+    // ── The packed joint — one JSON representation of the orbit's whole
+    //    (6+P)×(6+P) covariance, the same value parquet's `cov_*` columns
+    //    carry, with the same names, for every width the joint can have.
+    //    `cov_tri` is the packed lower triangle in parquet's order; the scalar
+    //    tags ride beside it. Absent (every field `None`) when the orbit has
+    //    no covariance. The flat 6×6 is the joint's leading block, derived on
+    //    read, never stored twice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cov_schema: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cov_state_width: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cov_layout_present: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cov_layout_considered: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cov_layout_marginalized: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cov_tri: Option<Vec<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cov_kind: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cov_quality: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cov_rank: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cov_null_axes: Option<u32>,
+    // The minimum correlation-space eigenvalue is `NaN` (the ABI's
+    // not-available sentinel) for a positive-(semi)definite joint; JSON carries
+    // that absence as a missing field and restores it to `NaN` on read, rather
+    // than writing a bare `NaN` serde renders as `null`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cov_min_eig_corr: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cov_functional: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cov_provenance: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cov_asserted_source: Option<u8>,
     #[serde(default)]
     a1: f64,
     #[serde(default)]
@@ -192,8 +246,132 @@ struct OrbitRow {
     ng_k: f64,
 }
 
-fn orbit_to_row(orbit: &EmpyreanOrbit, orbit_id: &str, object_id: Option<&str>) -> OrbitRow {
-    OrbitRow {
+/// The packed-joint fields of an [`OrbitRow`], in parquet's `cov_*` names. All
+/// `None` is "no covariance"; every field `Some` is a present joint.
+#[derive(Default)]
+struct CovWire {
+    schema: Option<i32>,
+    state_width: Option<u8>,
+    layout_present: Option<u32>,
+    layout_considered: Option<u32>,
+    layout_marginalized: Option<u32>,
+    tri: Option<Vec<f64>>,
+    kind: Option<u8>,
+    quality: Option<u8>,
+    rank: Option<u8>,
+    null_axes: Option<u32>,
+    min_eig_corr: Option<f64>,
+    functional: Option<u8>,
+    provenance: Option<u8>,
+    asserted_source: Option<u8>,
+}
+
+/// The dense symmetric 6×6 state block read off a packed triangle's leading
+/// 21 entries and mirrored across the diagonal. The caller guarantees
+/// `tri.len() ≥ 21` (a present joint is width ≥ 6).
+#[allow(clippy::needless_range_loop)]
+fn state_block_from_tri(tri: &[f64]) -> [[f64; 6]; 6] {
+    let mut m = [[0.0f64; 6]; 6];
+    for i in 0..6 {
+        for j in 0..=i {
+            let v = tri[i * (i + 1) / 2 + j];
+            m[i][j] = v;
+            m[j][i] = v;
+        }
+    }
+    m
+}
+
+/// Read a C [`EmpyreanPackedJoint`]'s fields into the JSON wire form: the
+/// packed triangle (copied), the layout bitsets, and every tag read straight
+/// off the joint. The leading state-block width is the joint width less its
+/// present parameter axes (mirroring parquet's `cov_state_width`); the minimum
+/// correlation-space eigenvalue rides only when finite (a PSD joint's NaN
+/// sentinel is carried as the absent field, restored to NaN on read).
+///
+/// # Safety
+///
+/// `joint.tri` must be non-null and valid for `joint.tri_len` doubles.
+unsafe fn cov_wire_from_c_joint(joint: &crate::joint::EmpyreanPackedJoint) -> CovWire {
+    let tri = unsafe { std::slice::from_raw_parts(joint.tri, joint.tri_len) }.to_vec();
+    CovWire {
+        schema: Some(JSON_COV_SCHEMA),
+        state_width: Some(
+            joint
+                .width
+                .saturating_sub(joint.layout_present.count_ones() as u8),
+        ),
+        layout_present: Some(joint.layout_present),
+        layout_considered: Some(joint.layout_considered),
+        layout_marginalized: Some(joint.layout_marginalized),
+        tri: Some(tri),
+        kind: Some(joint.kind),
+        quality: Some(joint.quality),
+        rank: Some(joint.cov_rank),
+        null_axes: Some(joint.cov_null_axes),
+        min_eig_corr: joint
+            .cov_min_eig_corr
+            .is_finite()
+            .then_some(joint.cov_min_eig_corr),
+        functional: Some(joint.functional),
+        provenance: Some(joint.provenance),
+        asserted_source: Some(joint.asserted_source),
+    }
+}
+
+/// Read the orbit's covariance as the JSON packed-joint wire fields.
+///
+/// The packed joint on [`EmpyreanOrbit::covariance`] is the one covariance
+/// home: a present joint (width > 0) is serialized whole — its packed triangle
+/// and every tag, the same value parquet carries.
+///
+/// An orbit with only the flat state 6×6 and no joint (a hand-built C orbit) is
+/// converted through the SAME engine path the parquet / CSV writers use
+/// ([`coordinate_state_to_coordinates`] → `state_uncertainty_from_flat`), so
+/// its tags are identical across all three formats: an externally supplied
+/// flat matrix is an ASSERTED moment from `AssertedSource::ExternalFile`, its
+/// quality is the engine's definiteness check, and an asymmetric block is
+/// refused BY NAME exactly as on a parquet / CSV write — not stamped a
+/// fabricated `Derived` / positive-definite. An orbit with neither covariance
+/// leaves every `cov_*` field absent.
+fn cov_wire_from_orbit(orbit: &EmpyreanOrbit) -> Result<CovWire, String> {
+    let joint = &orbit.covariance;
+    if joint.width > 0 && !joint.tri.is_null() {
+        return Ok(unsafe { cov_wire_from_c_joint(joint) });
+    }
+    if orbit.state.has_covariance == 0 {
+        return Ok(CovWire::default());
+    }
+    // Flat-only: route the state 6×6 through the engine conversion the
+    // parquet / CSV writers use, so provenance (Asserted / ExternalFile),
+    // quality and the by-name asymmetry refusal are byte-for-byte identical
+    // across the three orbit formats. The resulting joint is marshaled back to
+    // the ABI's degree basis, read into the wire form, and its library-owned
+    // triangle freed.
+    let state = orbit.state.to_empyrean();
+    let (_coords, state_cov) =
+        coordinate_state_to_coordinates(&state).map_err(|e| format!("orbit covariance: {e}"))?;
+    match state_cov {
+        Some(unc) => {
+            let mut c = crate::joint::orbit_uncertainty_to_c(&unc);
+            let wire = unsafe { cov_wire_from_c_joint(&c) };
+            unsafe { crate::joint::free_packed_joint(&mut c) };
+            Ok(wire)
+        }
+        // `has_covariance != 0` but the engine produced no uncertainty: the
+        // state carried no representable covariance, so carry none rather than
+        // fabricate one.
+        None => Ok(CovWire::default()),
+    }
+}
+
+fn orbit_to_row(
+    orbit: &EmpyreanOrbit,
+    orbit_id: &str,
+    object_id: Option<&str>,
+) -> Result<OrbitRow, String> {
+    let cov = cov_wire_from_orbit(orbit)?;
+    Ok(OrbitRow {
         orbit_id: orbit_id.to_string(),
         object_id: object_id.map(str::to_string),
         epoch_mjd_tdb: orbit.state.epoch_mjd_tdb,
@@ -201,7 +379,21 @@ fn orbit_to_row(orbit: &EmpyreanOrbit, orbit_id: &str, object_id: Option<&str>) 
         representation: rep_int_to_str(orbit.state.representation).to_string(),
         frame: frame_int_to_str(orbit.state.frame).to_string(),
         origin: orbit.state.origin,
-        covariance: (orbit.state.has_covariance != 0).then_some(orbit.state.covariance),
+        covariance: None,
+        cov_schema: cov.schema,
+        cov_state_width: cov.state_width,
+        cov_layout_present: cov.layout_present,
+        cov_layout_considered: cov.layout_considered,
+        cov_layout_marginalized: cov.layout_marginalized,
+        cov_tri: cov.tri,
+        cov_kind: cov.kind,
+        cov_quality: cov.quality,
+        cov_rank: cov.rank,
+        cov_null_axes: cov.null_axes,
+        cov_min_eig_corr: cov.min_eig_corr,
+        cov_functional: cov.functional,
+        cov_provenance: cov.provenance,
+        cov_asserted_source: cov.asserted_source,
         a1: orbit.a1,
         a2: orbit.a2,
         a3: orbit.a3,
@@ -210,18 +402,98 @@ fn orbit_to_row(orbit: &EmpyreanOrbit, orbit_id: &str, object_id: Option<&str>) 
         ng_m: orbit.ng_m,
         ng_n: orbit.ng_n,
         ng_k: orbit.ng_k,
+    })
+}
+
+/// Reconstruct the orbit's covariance from an [`OrbitRow`]'s packed-joint
+/// fields: the library-owned [`EmpyreanPackedJoint`], its derived flat 6×6
+/// state block, and the `has_covariance` flag.
+///
+/// A row carrying the removed flat `covariance` field (a file written before
+/// 0.11.0, when the row held the state block alone) is refused BY NAME — there
+/// is no migration shim. A present joint (`cov_tri` set) is restored verbatim:
+/// the triangle is copied into a library-owned buffer (released with the
+/// batch), the tags are the bytes the file carried (never re-derived), and the
+/// flat 6×6 is the joint's leading block. A row with no covariance yields the
+/// absent joint and no flat block. A declared width that disagrees with the
+/// triangle length, or an unknown schema version, is refused by name rather
+/// than zero-filled.
+#[allow(clippy::type_complexity)]
+fn joint_from_row(
+    row: &OrbitRow,
+) -> Result<(crate::joint::EmpyreanPackedJoint, [[f64; 6]; 6], u8), String> {
+    if row.covariance.is_some() {
+        return Err(
+            "the JSON orbit file carries the removed flat 6×6 `covariance` field; \
+             0.11.0 carries the full packed joint as `cov_tri` plus its `cov_*` tags \
+             and derives the state 6×6 from the joint's leading block. Re-export the \
+             file from parquet or re-run the fit — there is no migration shim for the \
+             old flat shape."
+                .to_string(),
+        );
     }
+    let Some(tri) = row.cov_tri.as_ref() else {
+        // No joint and (guarded above) no flat field: the orbit has no
+        // covariance of any kind.
+        return Ok((crate::joint::empty_packed_joint(), [[0.0; 6]; 6], 0));
+    };
+    if let Some(schema) = row.cov_schema
+        && schema != JSON_COV_SCHEMA
+    {
+        return Err(format!(
+            "the JSON orbit covariance declares cov_schema {schema}, which this build \
+             does not read (it writes and reads cov_schema {JSON_COV_SCHEMA})"
+        ));
+    }
+    let present = row.cov_layout_present.unwrap_or(0);
+    let state_width = row.cov_state_width.unwrap_or(6) as usize;
+    let width = state_width + present.count_ones() as usize;
+    let expected = width * (width + 1) / 2;
+    if width < 6 || tri.len() != expected {
+        return Err(format!(
+            "the JSON orbit covariance declares a width-{width} joint (state_width \
+             {state_width} + {} present axes), which needs a {expected}-entry lower \
+             triangle, but `cov_tri` carries {}",
+            present.count_ones(),
+            tri.len(),
+        ));
+    }
+    // The leading 6×6 is the joint's state block — the flat view, derived, not
+    // a second stored covariance.
+    let flat = state_block_from_tri(tri);
+    let joint = crate::joint::packed_joint_from_json_wire(
+        present,
+        row.cov_layout_considered.unwrap_or(0),
+        row.cov_layout_marginalized.unwrap_or(0),
+        width as u8,
+        tri.clone(),
+        row.cov_kind
+            .unwrap_or(crate::propagate::EMPYREAN_COVARIANCE_KIND_LINEAR),
+        row.cov_quality
+            .unwrap_or(crate::joint::wire_tags::EMPYREAN_JOINT_QUALITY_POSITIVE_DEFINITE),
+        row.cov_rank.unwrap_or(0),
+        row.cov_null_axes.unwrap_or(0),
+        row.cov_min_eig_corr.unwrap_or(f64::NAN),
+        row.cov_functional
+            .unwrap_or(crate::joint::wire_tags::EMPYREAN_JOINT_FUNCTIONAL_STATE),
+        row.cov_provenance
+            .unwrap_or(crate::joint::wire_tags::EMPYREAN_JOINT_PROVENANCE_DERIVED),
+        row.cov_asserted_source
+            .unwrap_or(crate::joint::wire_tags::EMPYREAN_JOINT_ASSERTED_SOURCE_NONE),
+    );
+    Ok((joint, flat, 1))
 }
 
 fn row_to_orbit(row: &OrbitRow) -> Result<(EmpyreanOrbit, String, Option<String>), String> {
     let representation = rep_str_to_int(&row.representation)?;
     let frame = frame_str_to_int(&row.frame)?;
-    let has_covariance: u8 = if row.covariance.is_some() { 1 } else { 0 };
-    let covariance = row.covariance.unwrap_or([[0.0; 6]; 6]);
+    // The packed joint is the one covariance home; the flat 6×6 is its derived
+    // leading block. An old-shape flat `covariance` field is refused here.
+    let (covariance, flat_covariance, has_covariance) = joint_from_row(row)?;
     let state = CoordinateState {
         epoch_mjd_tdb: row.epoch_mjd_tdb,
         elements: row.elements,
-        covariance,
+        covariance: flat_covariance,
         has_covariance,
         representation,
         frame,
@@ -269,10 +541,13 @@ fn row_to_orbit(row: &OrbitRow) -> Result<(EmpyreanOrbit, String, Option<String>
         has_srp: 0,
         srp_amrat: 0.0,
         srp_cr: 0.0,
-        // `OrbitRow` is this crate's own flat serde shape: it carries no
-        // packed joint (only the 6×6 rides the flat `CoordinateState`
-        // above), so a round-tripped orbit comes back with an absent joint.
-        covariance: crate::joint::empty_packed_joint(),
+        // The orbit's full covariance as one packed joint — reconstructed
+        // from the row's `cov_*` fields (`joint_from_row`), library-owned and
+        // released with the batch. 0.11.0 carries the whole joint in JSON, so
+        // a round-tripped orbit comes back with the joint it was written with,
+        // not an absent one; the flat `state.covariance` above is its derived
+        // leading block.
+        covariance,
         // This crate's own flat JSON row shape carries no photometry at
         // all (see `phot_system` above), so there is no covariance to
         // carry either. The engine's own parquet / CSV formats DO carry
@@ -336,16 +611,39 @@ fn rows_to_batch(rows: Vec<OrbitRow>) -> Result<EmpyreanOrbitBatch, String> {
     if orbits_ptr.is_null() || orbit_ids_ptr.is_null() || object_ids_ptr.is_null() {
         return Err("allocation failed for orbit batch".into());
     }
-    for (i, row) in rows.iter().enumerate() {
-        let (orbit, orbit_id, object_id) = row_to_orbit(row)?;
-        unsafe { orbits_ptr.add(i).write(orbit) };
-        let id_c = CString::new(orbit_id.as_bytes()).unwrap_or_default();
-        unsafe { orbit_ids_ptr.add(i).write(id_c.into_raw()) };
-        let obj_c = match object_id {
-            Some(s) => CString::new(s.as_bytes()).unwrap_or_default().into_raw(),
-            None => std::ptr::null_mut(),
-        };
-        unsafe { object_ids_ptr.add(i).write(obj_c) };
+    // Each row now reconstructs a library-owned packed-joint triangle, so a
+    // failure partway through the batch has live allocations (triangles + id
+    // CStrings) to release. `written` is what the unwind walks; returning
+    // straight out would leak every joint and string already marshaled plus
+    // the three arrays.
+    let mut written = 0usize;
+    for row in rows.iter() {
+        match row_to_orbit(row) {
+            Ok((orbit, orbit_id, object_id)) => unsafe {
+                orbits_ptr.add(written).write(orbit);
+                let id_c = CString::new(orbit_id.as_bytes()).unwrap_or_default();
+                orbit_ids_ptr.add(written).write(id_c.into_raw());
+                let obj_c = match object_id {
+                    Some(s) => CString::new(s.as_bytes()).unwrap_or_default().into_raw(),
+                    None => std::ptr::null_mut(),
+                };
+                object_ids_ptr.add(written).write(obj_c);
+                written += 1;
+            },
+            Err(e) => {
+                unsafe {
+                    free_partial_batch(
+                        orbits_ptr,
+                        orbit_ids_ptr,
+                        object_ids_ptr,
+                        written,
+                        orbits_layout,
+                        ids_layout,
+                    );
+                }
+                return Err(e);
+            }
+        }
     }
     Ok(EmpyreanOrbitBatch {
         orbits: orbits_ptr,
@@ -365,28 +663,12 @@ fn batch_to_rows(batch: &EmpyreanOrbitBatch) -> Result<Vec<OrbitRow>, String> {
     let mut rows = Vec::with_capacity(batch.num_orbits);
     for i in 0..batch.num_orbits {
         let orbit = unsafe { &*batch.orbits.add(i) };
-        // This format cannot represent the joint beyond the state 6×6, so
-        // it refuses a batch whose packed joint carries solved-parameter
-        // axes rather than writing the row short and returning success.
-        //
-        // `OrbitRow` is this crate's own flat serde shape: eight scalars
-        // plus the 6×6. It has no slot for the Marsden / DT / AMRAT / thrust
-        // axes or their cross terms, and unlike the engine's CSV writer —
-        // which refuses by name — nothing on this path would have noticed.
-        // Silently dropping them writes a file that reads back as a
-        // block-diagonal joint, which is a different and tighter claim
-        // than the one the caller held, and the round trip gives no
-        // signal that it happened. A width-6 (state-only) or absent joint
-        // is representable: the flat `CoordinateState.covariance` carries it.
-        if orbit.covariance.width > 6 {
-            return Err(format!(
-                "orbit {i}: the JSON orbit format cannot represent a packed \
-                 joint carrying solved-parameter axes (width {}). Write \
-                 parquet, which carries the full joint; this format holds \
-                 the state 6×6 only.",
-                orbit.covariance.width
-            ));
-        }
+        // 0.11.0: this format carries the FULL packed joint at every width —
+        // the same value parquet stores (`cov_tri` plus the `cov_*` tags) — so
+        // a joint carrying solved-parameter axes is no longer refused here.
+        // `orbit_to_row` serializes the whole joint; a width wider than the
+        // state is written, not dropped short. (CSV still refuses a wider
+        // joint by name, through the engine's own writer.)
         let id_ptr = unsafe { *batch.orbit_ids.add(i) };
         if id_ptr.is_null() {
             return Err(format!("null orbit_id at index {i}"));
@@ -409,7 +691,7 @@ fn batch_to_rows(batch: &EmpyreanOrbitBatch) -> Result<Vec<OrbitRow>, String> {
         } else {
             None
         };
-        rows.push(orbit_to_row(orbit, orbit_id, object_id.as_deref()));
+        rows.push(orbit_to_row(orbit, orbit_id, object_id.as_deref())?);
     }
     Ok(rows)
 }
@@ -450,14 +732,14 @@ pub(crate) fn batch_to_orbits(
         // the same way the four reader paths did. It gets the same
         // treatment: the joint is attached, and the writers then decide
         // what they can represent — parquet carries the carrier, the
-        // engine's CSV writer refuses it by name, and a thrust-bearing
-        // carrier is refused wherever it is offered, because no orbit
-        // format can serialize a thrust arc to hang it on. (The JSON
-        // path does not come through here at all: it is this crate's own
-        // flat row shape, and it refuses the joint in `batch_to_rows`.)
-        // Refusing at the writer is the point: a carrier
-        // dropped here would be written short and read back as a
-        // block-diagonal joint.
+        // engine's CSV writer refuses a wider-than-state joint by name, and a
+        // thrust-bearing carrier is refused wherever it is offered, because no
+        // orbit format can serialize a thrust arc to hang it on. (The JSON
+        // path does not come through here at all: it is this crate's own flat
+        // row shape, and `batch_to_rows` serializes the full joint directly —
+        // parquet and JSON are the two formats that carry it whole.) Refusing
+        // at the writer is the point: a carrier dropped here would be written
+        // short and read back as a block-diagonal joint.
         crate::joint::push_orbit_with_joint(&mut out, orbit_id, coords, state_cov, orbit)
             .map_err(|e| e.prefixed(&format!("orbit {i}")))?;
         out.set_object_id(i, object_id);
@@ -770,21 +1052,23 @@ pub unsafe extern "C" fn empyrean_orbits_read_json(
 /// Write an orbit batch to JSON.
 ///
 /// This is **not** the engine's orbit schema — it is this crate's own
-/// flat row shape (`OrbitRow`), and it is the least capable of the three
-/// orbit formats. It carries the state, the 6×6 and the Marsden
-/// coefficients with their g(r) exponents, and nothing else.
+/// flat row shape (`OrbitRow`). It carries the state, the full packed
+/// joint covariance, and the Marsden coefficients with their g(r)
+/// exponents.
 ///
-/// A batch carrying a state↔Marsden border or a wide cross-covariance
-/// carrier is **refused by name**, pointing at parquet — the format is
-/// unable to represent the joint, and writing the row short would
-/// produce a file that reads back as a block-diagonal covariance with no
-/// signal that anything was lost.
+/// 0.11.0: the covariance is the **full packed joint** at every width —
+/// the same value parquet stores, in the same `cov_*` field names (the
+/// packed lower triangle `cov_tri` plus the scalar tags). A joint carrying
+/// solved-parameter axes is written, not refused; the flat 6×6 is the
+/// joint's leading block, derived on read, never stored twice. (CSV still
+/// refuses a wider-than-state joint by name — see
+/// [`empyrean_orbits_write_csv`].)
 ///
-/// Fields this format drops without refusing, because they predate the
-/// joint surface and a refusal would break callers who write them today:
-/// the non-grav DT and its prior variance, the Marsden 3×3, the SRP slot
-/// and the photometric block. Round-trip through parquet if you need
-/// them.
+/// Fields this format still drops, because they predate the joint surface
+/// and are not covariance: the non-grav DT value, the SRP slot and the
+/// photometric block. Their covariance axes (DT / AMRAT / thrust) ride the
+/// packed joint and are carried; their model values do not — round-trip
+/// through parquet if you need those.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn empyrean_orbits_write_json(
     path: *const c_char,
@@ -3628,6 +3912,296 @@ mod ephemeris_cov_kind_writer_tests {
         assert_eq!(header[22], "mix_n_components_total");
         assert_eq!(header[27], "mix_n_sky_linearization_refused");
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod orbit_json_joint_tests {
+    use super::residual_writer_tests::tmp_dir;
+    use super::*;
+
+    /// A one-orbit batch whose covariance is a width-9 Cartesian joint (6
+    /// state + the 3 Marsden axes) with a distinctive, strictly increasing
+    /// triangle — so a transposed, truncated or mis-tagged round trip is
+    /// visible. The joint is library-owned (built through the JSON-wire
+    /// helper), so `empyrean_orbits_batch_free` releases it.
+    fn wide_joint_batch() -> EmpyreanOrbitBatch {
+        // SAFETY: `#[repr(C)]` POD plus pointers that zero-init to null.
+        let mut orbit: EmpyreanOrbit = unsafe { std::mem::zeroed() };
+        orbit.state = CoordinateState {
+            epoch_mjd_tdb: 60320.0,
+            elements: [1.1, 0.2, 0.03, -0.004, 0.017, 0.0006],
+            covariance: [[0.0; 6]; 6],
+            has_covariance: 0,
+            representation: crate::od::EMPYREAN_REPRESENTATION_CARTESIAN,
+            frame: 0,
+            origin: 10,
+        };
+        orbit.non_grav_dt = f64::NAN;
+        orbit.h_mag = f64::NAN;
+        let tri: Vec<f64> = (0..45).map(|i| 1.0 + i as f64 * 0.5).collect();
+        orbit.covariance = crate::joint::packed_joint_from_json_wire(
+            0b111, // A1/A2/A3 present → width 6 + 3 = 9
+            0,
+            0,
+            9,
+            tri,
+            crate::propagate::EMPYREAN_COVARIANCE_KIND_LINEAR,
+            crate::joint::wire_tags::EMPYREAN_JOINT_QUALITY_POSITIVE_DEFINITE,
+            0,
+            0,
+            f64::NAN,
+            crate::joint::wire_tags::EMPYREAN_JOINT_FUNCTIONAL_STATE,
+            crate::joint::wire_tags::EMPYREAN_JOINT_PROVENANCE_DERIVED,
+            crate::joint::wire_tags::EMPYREAN_JOINT_ASSERTED_SOURCE_NONE,
+        );
+
+        let id = crate::od::alloc_cstring_for_test("wide-joint-orbit");
+        EmpyreanOrbitBatch {
+            orbits: Box::into_raw(Box::new(orbit)),
+            orbit_ids: Box::into_raw(Box::new(id)),
+            object_ids: Box::into_raw(Box::new(std::ptr::null_mut::<c_char>())),
+            num_orbits: 1,
+        }
+    }
+
+    /// The JSON orbit format now carries a joint wider than the state 6×6 —
+    /// no refusal — and restores its packed triangle and every tag
+    /// bit-identically. Before 0.11.0 this width was refused by name at the
+    /// writer; the state-only 6×6 was all the row could hold.
+    #[test]
+    fn json_carries_and_restores_a_width9_joint() {
+        let dir = tmp_dir("json-wide-joint");
+        let path = dir.join("wide.json");
+        let c_path = CString::new(path.display().to_string()).unwrap();
+
+        let written = wide_joint_batch();
+        let rc = unsafe { empyrean_orbits_write_json(c_path.as_ptr(), &written) };
+        let err = unsafe { CStr::from_ptr(crate::empyrean_last_error()) }.to_string_lossy();
+        assert_eq!(
+            rc, 0,
+            "a width-9 joint must now WRITE to JSON, not be refused: {err}"
+        );
+
+        let mut back: EmpyreanOrbitBatch = unsafe { std::mem::zeroed() };
+        let rc = unsafe { empyrean_orbits_read_json(c_path.as_ptr(), &mut back) };
+        let err = unsafe { CStr::from_ptr(crate::empyrean_last_error()) }.to_string_lossy();
+        assert_eq!(rc, 0, "reading the JSON back must succeed: {err}");
+        assert_eq!(back.num_orbits, 1);
+
+        let got = unsafe { &*back.orbits };
+        let want = unsafe { &*written.orbits };
+        assert_eq!(
+            got.covariance.width, 9,
+            "the wide joint's width must survive"
+        );
+        assert_eq!(
+            got.covariance.layout_present, 0b111,
+            "the Marsden axes survive"
+        );
+        assert_eq!(got.covariance.tri_len, want.covariance.tri_len);
+        assert_eq!(got.covariance.kind, want.covariance.kind);
+        assert_eq!(got.covariance.quality, want.covariance.quality);
+        assert_eq!(got.covariance.functional, want.covariance.functional);
+        assert_eq!(got.covariance.provenance, want.covariance.provenance);
+        assert_eq!(
+            got.covariance.asserted_source,
+            want.covariance.asserted_source
+        );
+        assert!(
+            got.covariance.cov_min_eig_corr.is_nan(),
+            "a positive-definite joint restores its NaN min-eig sentinel, not 0"
+        );
+        let got_tri =
+            unsafe { std::slice::from_raw_parts(got.covariance.tri, got.covariance.tri_len) };
+        let want_tri =
+            unsafe { std::slice::from_raw_parts(want.covariance.tri, want.covariance.tri_len) };
+        for (i, (g, w)) in got_tri.iter().zip(want_tri).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                w.to_bits(),
+                "cov_tri[{i}] must round-trip bit-identical"
+            );
+        }
+        // The flat 6×6 is the joint's derived leading block.
+        assert_eq!(
+            got.state.has_covariance, 1,
+            "the derived flat 6×6 is present"
+        );
+        assert_eq!(got.state.covariance[0][0].to_bits(), want_tri[0].to_bits());
+
+        unsafe { empyrean_orbits_batch_free(&mut back) };
+        unsafe { empyrean_orbits_batch_free(&written as *const _ as *mut _) };
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A JSON file written before 0.11.0 — carrying the removed flat 6×6
+    /// `covariance` field — is refused BY NAME on read, with a message naming
+    /// the old shape. No silent acceptance, no migration shim.
+    #[test]
+    fn json_refuses_the_removed_flat_covariance_field_by_name() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/orbit_legacy_flat_covariance.json");
+        let c_path = CString::new(fixture.display().to_string()).unwrap();
+        let mut back: EmpyreanOrbitBatch = unsafe { std::mem::zeroed() };
+        let rc = unsafe { empyrean_orbits_read_json(c_path.as_ptr(), &mut back) };
+        assert_ne!(
+            rc, 0,
+            "the legacy flat-covariance file must be refused, not read"
+        );
+        let err = unsafe { CStr::from_ptr(crate::empyrean_last_error()) }
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            err.contains("flat") && err.contains("covariance") && err.contains("packed joint"),
+            "the refusal must name the removed flat covariance shape: {err}"
+        );
+        assert_eq!(back.num_orbits, 0, "nothing is read on refusal");
+    }
+
+    /// A flat state 6×6 symmetric covariance (the shape `state_block_guard`
+    /// uses): positive-definite, with one symmetric off-diagonal pair.
+    fn symmetric_state_6x6() -> [[f64; 6]; 6] {
+        let diag = [4.8e-10, 2.0e-10, 1.9e-10, 1.4e-14, 1.5e-13, 6.0e-15];
+        let mut m = [[0.0f64; 6]; 6];
+        for (i, d) in diag.iter().enumerate() {
+            m[i][i] = *d;
+        }
+        m[0][1] = 3.0e-11;
+        m[1][0] = 3.0e-11;
+        m
+    }
+
+    /// A one-orbit Cartesian batch carrying ONLY a flat state 6×6 (no packed
+    /// joint): the hand-built C orbit the reviewer flagged. `std::mem::zeroed`
+    /// leaves `covariance` the width-0 absent joint.
+    fn flat_only_batch(cov: [[f64; 6]; 6]) -> EmpyreanOrbitBatch {
+        // SAFETY: `#[repr(C)]` POD plus pointers that zero-init to null.
+        let mut orbit: EmpyreanOrbit = unsafe { std::mem::zeroed() };
+        orbit.state = CoordinateState {
+            epoch_mjd_tdb: 60320.0,
+            elements: [1.1, 0.2, 0.03, -0.004, 0.017, 0.0006],
+            covariance: cov,
+            has_covariance: 1,
+            representation: crate::od::EMPYREAN_REPRESENTATION_CARTESIAN,
+            frame: 1,
+            origin: 10,
+        };
+        orbit.non_grav_dt = f64::NAN;
+        orbit.h_mag = f64::NAN;
+        let id = crate::od::alloc_cstring_for_test("flat-only-orbit");
+        EmpyreanOrbitBatch {
+            orbits: Box::into_raw(Box::new(orbit)),
+            orbit_ids: Box::into_raw(Box::new(id)),
+            object_ids: Box::into_raw(Box::new(std::ptr::null_mut::<c_char>())),
+            num_orbits: 1,
+        }
+    }
+
+    /// A flat-only orbit (no joint, just a state 6×6) is converted through the
+    /// SAME engine path the parquet writer uses, so JSON stamps the covariance
+    /// `provenance = ASSERTED` from `asserted_source = EXTERNAL_FILE` — never a
+    /// fabricated `DERIVED` — and its tags equal the parquet writer's for the
+    /// identical batch.
+    #[test]
+    fn flat_only_orbit_json_stamps_asserted_external_file_matching_parquet() {
+        let dir = tmp_dir("flat-only-parity");
+        let jpath = dir.join("flat.json");
+        let ppath = dir.join("flat.parquet");
+        let cj = CString::new(jpath.display().to_string()).unwrap();
+        let cp = CString::new(ppath.display().to_string()).unwrap();
+
+        let batch = flat_only_batch(symmetric_state_6x6());
+        assert_eq!(
+            unsafe { empyrean_orbits_write_json(cj.as_ptr(), &batch) },
+            0,
+            "flat-only JSON write"
+        );
+        assert_eq!(
+            unsafe { empyrean_orbits_write_parquet(cp.as_ptr(), &batch) },
+            0,
+            "flat-only parquet write"
+        );
+
+        let mut from_json: EmpyreanOrbitBatch = unsafe { std::mem::zeroed() };
+        let mut from_pq: EmpyreanOrbitBatch = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { empyrean_orbits_read_json(cj.as_ptr(), &mut from_json) },
+            0
+        );
+        assert_eq!(
+            unsafe { empyrean_orbits_read_parquet(cp.as_ptr(), &mut from_pq) },
+            0
+        );
+
+        let jc = &unsafe { &*from_json.orbits }.covariance;
+        let pc = &unsafe { &*from_pq.orbits }.covariance;
+        assert_eq!(
+            jc.provenance,
+            crate::joint::wire_tags::EMPYREAN_JOINT_PROVENANCE_ASSERTED,
+            "a flat external 6×6 is an ASSERTED moment, never fabricated as DERIVED"
+        );
+        assert_eq!(
+            jc.asserted_source,
+            crate::joint::wire_tags::EMPYREAN_JOINT_ASSERTED_SOURCE_EXTERNAL_FILE,
+            "its source is EXTERNAL_FILE, matching the engine's flat path"
+        );
+        // Every tag equals the parquet writer's for the identical input.
+        assert_eq!(jc.kind, pc.kind, "kind parity json vs parquet");
+        assert_eq!(jc.quality, pc.quality, "quality parity json vs parquet");
+        assert_eq!(jc.functional, pc.functional, "functional parity");
+        assert_eq!(jc.provenance, pc.provenance, "provenance parity");
+        assert_eq!(
+            jc.asserted_source, pc.asserted_source,
+            "asserted-source parity"
+        );
+        assert_eq!(jc.width, pc.width, "both are the width-6 state joint");
+
+        unsafe { empyrean_orbits_batch_free(&mut from_json) };
+        unsafe { empyrean_orbits_batch_free(&mut from_pq) };
+        unsafe { empyrean_orbits_batch_free(&batch as *const _ as *mut _) };
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An asymmetric flat 6×6 is refused BY NAME on the JSON write exactly as
+    /// on the parquet write — both route through the engine's flat conversion,
+    /// which refuses an `AsymmetricStateBlock`. JSON no longer accepts a
+    /// matrix parquet would reject.
+    #[test]
+    fn an_asymmetric_flat_6x6_is_refused_by_name_on_json_like_parquet() {
+        let mut cov = symmetric_state_6x6();
+        cov[1][0] = -cov[0][1]; // break symmetry on an off-diagonal pair
+
+        let dir = tmp_dir("flat-asym");
+        let jpath = dir.join("asym.json");
+        let ppath = dir.join("asym.parquet");
+        let cj = CString::new(jpath.display().to_string()).unwrap();
+        let cp = CString::new(ppath.display().to_string()).unwrap();
+
+        let batch = flat_only_batch(cov);
+        let rc_j = unsafe { empyrean_orbits_write_json(cj.as_ptr(), &batch) };
+        let err_j = unsafe { CStr::from_ptr(crate::empyrean_last_error()) }
+            .to_string_lossy()
+            .into_owned();
+        let rc_p = unsafe { empyrean_orbits_write_parquet(cp.as_ptr(), &batch) };
+        let err_p = unsafe { CStr::from_ptr(crate::empyrean_last_error()) }
+            .to_string_lossy()
+            .into_owned();
+
+        assert_ne!(rc_j, 0, "JSON must refuse an asymmetric 6×6: {err_j}");
+        assert_ne!(rc_p, 0, "parquet must refuse an asymmetric 6×6: {err_p}");
+        assert!(
+            err_j.contains("AsymmetricStateBlock"),
+            "JSON refuses by name: {err_j}"
+        );
+        assert!(
+            err_p.contains("AsymmetricStateBlock"),
+            "parquet refuses by the same name: {err_p}"
+        );
+        assert!(!jpath.exists(), "no JSON file is written on refusal");
+
+        unsafe { empyrean_orbits_batch_free(&batch as *const _ as *mut _) };
         std::fs::remove_dir_all(&dir).ok();
     }
 }

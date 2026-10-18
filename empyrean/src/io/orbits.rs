@@ -110,9 +110,10 @@ fn batch_to_ffi(
     // dropped here the triangle is freed and the writer reads a dangling pointer
     // — the state block then comes back as garbage that disagrees with the
     // inline flat 6×6 and the orbit-write guard refuses the (now contradictory)
-    // pair. The flat `state.covariance` is inline in the struct, so it alone was
-    // unaffected; JSON, which serializes only that flat 6×6 and never the joint
-    // triangle, wrote correctly while parquet / CSV aborted.
+    // pair. Since 0.11.0 the JSON writer reads the joint triangle too (it
+    // carries the full packed joint), so the keepalive is load-bearing for all
+    // three formats; the inline flat `state.covariance` is the only thing that
+    // never depended on it.
     Ok((
         ffi_orbits,
         id_ptrs,
@@ -371,10 +372,12 @@ mod push_code_tests {
     /// was built in a local that was dropped before the C writer ran, so the
     /// writer read a freed triangle; the state block came back as garbage that
     /// disagreed with the inline flat 6×6, and the orbit-write guard aborted
-    /// parquet and CSV (JSON survived only because its row shape serializes the
-    /// inline flat 6×6 and never the joint triangle). With the keepalive held
-    /// across the call, all three formats write and the parquet round-trips the
-    /// joint's state block bit-for-bit (Cartesian: no angular scaling).
+    /// parquet and CSV (JSON then still serialized only the inline flat 6×6, so
+    /// it alone survived — since 0.11.0 the JSON writer reads the joint triangle
+    /// too, so it would abort the same way without the keepalive). With the
+    /// keepalive held across the call, all three formats write and the parquet
+    /// round-trips the joint's state block bit-for-bit (Cartesian: no angular
+    /// scaling).
     #[test]
     fn a_fitted_joint_survives_every_writer_and_round_trips_through_parquet() {
         let (orbit, diag) = roundtrip_orbit();
@@ -447,6 +450,148 @@ mod push_code_tests {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         std::env::temp_dir().join(format!("empyrean_push_{nanos}_{ext}.{ext}"))
+    }
+
+    /// 0.11.0: the JSON orbit format carries the FULL packed joint — the same
+    /// value parquet stores — at every width, and restores it bit-identically.
+    /// This writes a Cartesian joint (no angular scaling at any boundary, so
+    /// the triangle is a pure copy) at widths 6, 7, 9 and 17, through
+    /// `write_orbits_json` → `read_orbits_json`, and asserts `cov_tri` and
+    /// every tag survive bit-for-bit. Before 0.11.0 a width > 6 was refused by
+    /// name at the JSON writer and only the state 6×6 was carried.
+    #[test]
+    fn json_round_trips_the_packed_joint_at_every_width() {
+        use crate::AssertedSource;
+        // (width, present bitset, quality, provenance, asserted source) — the
+        // layouts span state-only, Marsden, and a full Marsden+DT+AMRAT+two
+        // thrust segments joint, and the tags span derived / asserted-SBDB and
+        // positive-definite / repaired so every tag has to carry through.
+        let cases: [(
+            u8,
+            u32,
+            JointQuality,
+            JointProvenance,
+            Option<AssertedSource>,
+        ); 4] = [
+            (
+                6,
+                0,
+                JointQuality::PositiveDefinite,
+                JointProvenance::Derived,
+                None,
+            ),
+            (
+                7,
+                0b1,
+                JointQuality::PositiveDefinite,
+                JointProvenance::Derived,
+                None,
+            ),
+            (
+                9,
+                0b111,
+                JointQuality::PositiveDefinite,
+                JointProvenance::Asserted,
+                Some(AssertedSource::SBDB),
+            ),
+            (
+                17,
+                0b111 | (1 << 3) | (1 << 4) | (0b111 << 5) | (0b111 << 8),
+                JointQuality::Repaired {
+                    min_eig_corr: -1.5e-3,
+                },
+                JointProvenance::Derived,
+                None,
+            ),
+        ];
+        for (width, present, quality, provenance, asserted_source) in cases {
+            let w = width as usize;
+            assert_eq!(
+                6 + present.count_ones() as usize,
+                w,
+                "the layout popcount must imply width {width}"
+            );
+            let tri: Vec<f64> = (0..w * (w + 1) / 2)
+                .map(|i| 1.0 + i as f64 * 0.25)
+                .collect();
+            let joint = PackedJoint {
+                layout: AxisLayout {
+                    present,
+                    considered: 0,
+                    marginalized: 0,
+                },
+                width,
+                tri: tri.clone(),
+                kind: CovarianceKind::Linear,
+                quality,
+                functional: JointFunctional::State,
+                provenance,
+                asserted_source,
+            };
+            let state = CoordinateState::cartesian(
+                Epoch::from_mjd_tdb(59000.0),
+                [1.0, 0.1, 0.05, -0.005, 0.015, 0.001],
+                Frame::EclipticJ2000,
+                Origin::Sun,
+            );
+            let orbit = Orbit::new(state)
+                .with_orbit_id("w")
+                .with_covariance(joint.clone());
+            let batch =
+                super::OrbitBatch::new(vec![orbit], vec!["w".into()], vec![None]).expect("batch");
+
+            let path = tmp_path("json");
+            super::write_orbits_json(&path, &batch)
+                .unwrap_or_else(|e| panic!("width {width}: JSON write must not refuse: {e}"));
+            let back = super::read_orbits_json(&path)
+                .unwrap_or_else(|e| panic!("width {width}: JSON read-back: {e}"));
+            let _ = std::fs::remove_file(&path);
+
+            let got = back.orbits[0]
+                .covariance
+                .as_ref()
+                .unwrap_or_else(|| panic!("width {width}: the joint must survive the round trip"));
+            assert_eq!(got.width, width, "width {width}");
+            assert_eq!(got.layout, joint.layout, "width {width}: layout");
+            assert_eq!(got.kind, joint.kind, "width {width}: kind");
+            assert_eq!(got.quality, joint.quality, "width {width}: quality");
+            assert_eq!(
+                got.functional, joint.functional,
+                "width {width}: functional"
+            );
+            assert_eq!(
+                got.provenance, joint.provenance,
+                "width {width}: provenance"
+            );
+            assert_eq!(
+                got.asserted_source, joint.asserted_source,
+                "width {width}: asserted source"
+            );
+            assert_eq!(got.tri.len(), joint.tri.len(), "width {width}: tri length");
+            for (i, (g, w)) in got.tri.iter().zip(&joint.tri).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    w.to_bits(),
+                    "width {width}: cov_tri[{i}] must round-trip bit-identical"
+                );
+            }
+        }
+    }
+
+    /// A JSON file written before 0.11.0 — carrying the removed flat 6×6
+    /// `covariance` field — is refused BY NAME on read through the wrapper,
+    /// with a message naming the old shape. No silent acceptance, no shim.
+    #[test]
+    fn read_orbits_json_refuses_the_removed_flat_covariance_field() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../empyrean-c/tests/fixtures/orbit_legacy_flat_covariance.json");
+        let err = super::read_orbits_json(&fixture)
+            .expect_err("a legacy flat-covariance JSON file must be refused, not read");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("flat") && msg.contains("covariance"),
+            "the refusal must name the removed flat covariance shape: {msg}"
+        );
     }
 
     /// A packed-joint wire refusal reaches every push boundary as the SAME

@@ -172,3 +172,99 @@ fn the_written_parquet_round_trips_the_packed_joint() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 0.11.0: `--format json` carries the SAME packed joint `--format parquet`
+/// does. The fit is run once into each format; the JSON orbit read back
+/// carries a joint equal (within float noise) to the parquet joint from the
+/// same run — bit-for-bit for Cartesian, which `determine` emits (no angular
+/// scaling). And `empyrean show` reads the JSON back, printing the joint's
+/// atomic `cov_tri` column just as it does for parquet. Before 0.11.0 the JSON
+/// orbit carried only the state 6×6 (a wider joint was refused by name).
+#[test]
+fn determine_json_carries_the_joint_equal_to_parquet_and_show_reads_it() {
+    let Some(data_dir) = resolve_data_dir() else {
+        eprintln!("skipping: no data dir with de440.bsp");
+        return;
+    };
+    if !engine_loads() {
+        eprintln!("skipping: libempyrean does not load for this build");
+        return;
+    }
+
+    let fixture = eros_fixture();
+    let dj = temp_dir("json-joint");
+    let dp = temp_dir("parquet-joint");
+    for (dir, fmt) in [(&dj, "json"), (&dp, "parquet")] {
+        let out = run_cli(&[
+            "--data-dir",
+            &data_dir.display().to_string(),
+            "determine",
+            &fixture.display().to_string(),
+            "--out-dir",
+            &dir.display().to_string(),
+            "--format",
+            fmt,
+        ]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "determine --format {fmt} must deliver and write\nstderr:\n{stderr}"
+        );
+    }
+
+    let json_batch =
+        empyrean::read_orbits_json(dj.join("fitted_orbits.json")).expect("read the fitted JSON");
+    let pq_batch = empyrean::read_orbits_parquet(dp.join("fitted_orbits.parquet"))
+        .expect("read the fitted parquet");
+    assert!(
+        !json_batch.is_empty(),
+        "the fit delivered at least one orbit"
+    );
+    assert_eq!(
+        json_batch.len(),
+        pq_batch.len(),
+        "the same run delivers the same orbit count to each format"
+    );
+    let jj = json_batch.orbits[0]
+        .covariance
+        .as_ref()
+        .expect("the JSON orbit must carry its packed joint (0.11.0)");
+    let pj = pq_batch.orbits[0]
+        .covariance
+        .as_ref()
+        .expect("the parquet orbit carries its packed joint");
+    assert_eq!(
+        jj.width, pj.width,
+        "the JSON joint and the parquet joint from the same run must have equal width"
+    );
+    assert_eq!(jj.tri.len(), pj.tri.len(), "equal triangle length");
+    for (i, (a, b)) in jj.tri.iter().zip(&pj.tri).enumerate() {
+        let tol = 1e-9 * (a.abs() + b.abs()) + 1e-18;
+        assert!(
+            (a - b).abs() <= tol,
+            "cov_tri[{i}] JSON {a} vs parquet {b} must agree (same run, Cartesian)"
+        );
+    }
+
+    // `show <file.json>` prints the joint — the atomic `cov_tri` column.
+    let out = run_cli(&[
+        "show",
+        &dj.join("fitted_orbits.json").display().to_string(),
+        "--columns",
+        "orbit_id,cov_tri,cov_kind,cov_layout_present",
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "show must read the fitted JSON\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("cov_tri"),
+        "show must print the joint's cov_tri column\nstdout:\n{stdout}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dj);
+    let _ = std::fs::remove_dir_all(&dp);
+}

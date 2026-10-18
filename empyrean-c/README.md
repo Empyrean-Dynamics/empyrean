@@ -26,10 +26,10 @@ The C ABI carries the distribution's own version:
 not any boundary type changed. **The scheme begins with 0.10.0**, which
 reports `1000`. Every release before it reported the retired independent
 counter instead; its last published value is 2, shipped by v0.9.0. This
-tree ships the 0.10.0 ABI, reporting `1000`.
+tree ships the 0.11.0 ABI, reporting `1100`.
 
 **Only the base version is encoded** — the pre-release suffix is not, so
-`0.10.0-rc.1` and `0.10.0` both report `1000`. The number separates one
+`0.11.0-rc.0` and `0.11.0` both report `1100`. The number separates one
 version from another, never a version from its own pre-releases: if a
 boundary type moves inside a pre-release cycle the handshake will not
 catch it, and both sides must be rebuilt together. Within one version's
@@ -920,30 +920,38 @@ degrees, ICRF), one point per optical candidate — radar candidates carry
 no sky-plane prediction. Free the result with
 `empyrean_plan_result_free`.
 
-`EmpyreanObservatoryConfig` gained two visibility limits in the 0.10.0 ABI:
-`min_elevation_deg` (geometric elevation above the site's local horizon,
-ignoring refraction — `0.0` is the geometric horizon and the engine's default,
-the least-opinionated statement the geometry can make rather than an observing
-recommendation, since airmass there is about 38) and the
-`has_max_sun_altitude_deg` / `max_sun_altitude_deg` pair (the solar altitude
-at or below which the site counts as dark; unset takes the engine's default of
-−18°, astronomical twilight, with civil at −6° and nautical at −12°). The
-`has_` switch exists because `0.0` is a legal solar altitude — the Sun's
-centre on the geometric horizon — so a defaulted zero would quietly plan a
-campaign in daylight.
+`EmpyreanObservatoryConfig` carries the site-observability gates beyond the
+astrometric pair. `min_elevation_deg` is the geometric elevation above the
+site's local horizon, ignoring refraction — `0.0` is the geometric horizon
+and the engine's default, the least-opinionated statement the geometry can
+make rather than an observing recommendation, since airmass there is about
+38. The `has_max_sun_altitude_deg` / `max_sun_altitude_deg` pair is the solar
+altitude at or below which the site counts as dark; unset takes the engine's
+default of −18°, astronomical twilight, with civil at −6° and nautical at
+−12°. The `has_` switch exists because `0.0` is a legal solar altitude — the
+Sun's centre on the geometric horizon — so a defaulted zero would quietly
+plan a campaign in daylight. `has_twilight_thresholds` and its four fields
+(`sunset_sun_altitude_deg`, `civil_twilight_sun_altitude_deg`,
+`nautical_twilight_sun_altitude_deg`, `astronomical_twilight_sun_altitude_deg`)
+set the night-product twilight boundaries as a strictly-descending group —
+unset takes the engine's defaults — and `has_explicit_anchor_utc` /
+`explicit_anchor_utc_mjd_tdb` name a caller-chosen anchor epoch for every
+night whose span contains it.
 
-**No entry point exported by this ABI applies them.** Both values are
-marshaled across in full and reach the engine's own observatory config, but
-the gates that read them belong to the engine's visibility survey, which has
-no C entry point. `empyrean_evaluate_plan` — the one exported consumer of this
-struct — consults the site-invariant pair alone (solar elongation and, on
-this entry point vacuously, apparent magnitude), so
+`empyrean_compute_visibility` is the exported consumer of these gates. It
+surveys an orbit against each observatory over a time window and reports,
+per site and per local night, the twilight epochs, the local solar midnight,
+the observable windows, and a Moon-aware anchor under each policy — reading
+the elevation and darkness limits and the twilight thresholds that
+`empyrean_evaluate_plan` does not. It fills an `EmpyreanVisibilityBatch`
+(one `EmpyreanVisibilityResult` per orbit, in input order); release the tree
+with `empyrean_visibility_result_free`. Under `empyrean_evaluate_plan` those
+limits stay inert: it consults the site-invariant pair alone (solar
+elongation and, on this entry point vacuously, apparent magnitude), so
 `EmpyreanPlanCandidate::observable` means "not ruled out from Earth", not
-"schedulable from this site": a candidate can be observable at an epoch when
-the target is under that site's horizon or the sky above it is bright.
-Setting either limit therefore changes no number this ABI returns.
-They ride the struct so that exposing the survey later needs no further ABI
-break.
+"schedulable from this site" — a plan candidate can be observable at an epoch
+when the target is under that site's horizon or the sky above it is bright.
+For the site-aware verdict, call `empyrean_compute_visibility`.
 
 The struct's other two filters — `max_apparent_mag` and `min_elongation_deg` —
 are the ones `empyrean_evaluate_plan` does consult.

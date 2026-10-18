@@ -56,7 +56,7 @@ bodies like asteroids and comets, with plans to extend to cislunar space.
 | CLI    | `cargo install empyrean-cli` (or grab a binary from [Releases](https://github.com/Empyrean-Dynamics/empyrean/releases)) |
 | C      | download `libempyrean-<target>.tar.gz` from [Releases](https://github.com/Empyrean-Dynamics/empyrean/releases) — ships the shared library, `empyrean.h`, and LICENSE |
 
-Current release: **0.10.0** — see the [CHANGELOG](CHANGELOG.md).
+Current release: **0.11.0-rc.0** (release candidate) — see the [CHANGELOG](CHANGELOG.md).
 
 Prebuilt binaries — the engine cdylib, the CLI, and the Python wheels —
 target four platforms: macOS arm64 (`macos-aarch64`), macOS x86_64
@@ -94,13 +94,15 @@ wherever you make it; what differs is reach.
 | Strict-offline context construction | ● | ● | ● | ● |
 | Ephemeris overlap policy — SB441-N16 self-perturbers | ● | ● | ● | — |
 | Observation planning — optical + radar candidates | ● | ● | ● | — |
+| Observability survey — night product (twilight, windows, Moon-aware anchors) | ● | ● | ● | — |
 | `empyrean show` output browser | — | — | — | ● |
 
 ## Quickstart
 
 The three headline pipelines — **propagation**, **ephemeris generation**,
 and **orbit determination** (including iterative `Session` fitting) —
-each shown end-to-end in Python, Rust, and CLI.
+each shown end-to-end in Python, Rust, and CLI, with the observability
+**night product** alongside.
 
 > **Defaults.** Each example uses the production hot-path: Standard
 > force-model tier (Sun + planets + Moon + EIH GR + 16 SB441-N16 asteroid perturbers
@@ -284,6 +286,93 @@ dropped from the force model, your initial conditions are integrated,
 and the overlap is reported. It lives on the propagation config, so
 Python, Rust, and C all reach it; the CLI exposes no flag for it.
 
+### Observability (the night product)
+
+For an orbit and a set of ground sites, `compute_visibility` surveys when
+and whether the target is observable and reports, per site and per local
+night, the twilight epochs, the local solar midnight, the observable
+windows, and an anchor epoch under each policy — nearest to midnight,
+midnight, transit, or an explicit UTC — with its full circumstances:
+altitude, azimuth, the Moon's altitude, azimuth and illuminated fraction,
+the predicted magnitude, and the sky covariance. Every crossing is refined
+off the grid to one second. Each per-epoch row's `observable` is the
+conjunction of the site's four gates — solar elongation, magnitude,
+elevation, and darkness — the site-aware verdict plan evaluation cannot
+give.
+
+#### Python
+
+```python
+import empyrean
+
+empyrean.initialize()
+
+orbits = empyrean.query_sbdb(["99942"])
+
+# The observatory config carries the site's gates — the solar-elongation,
+# magnitude, elevation and darkness limits — and the twilight thresholds
+# that structure the night product.
+config = empyrean.PlanningConfig(
+    observatories=[
+        empyrean.ObservatoryConfig(
+            obs_code="F51",                 # Pan-STARRS 1, Haleakalā
+            sigma_arcsec=(0.2, 0.2),
+            max_apparent_mag=24.0,
+            min_elongation_deg=60.0,
+            min_elevation_deg=20.0,
+        )
+    ]
+)
+
+# Survey a three-day window on an hourly grid.
+t0 = orbits.coordinates.epoch.to_numpy()[0]
+vis = empyrean.compute_visibility(orbits, t0, t0 + 3.0, 1.0 / 24.0, config)
+
+print(vis.nights.to_dataframe())     # twilight, local solar midnight, windows
+print(vis.anchors.to_dataframe())    # one Moon-aware anchor per policy
+```
+
+#### Rust
+
+```rust,no_run
+use empyrean::{Context, Epoch, ObservatoryConfig, PlanningConfig};
+
+let ctx = Context::from_data_dir(None)?;
+let batch = empyrean::query_sbdb(&["99942"], None)?;
+let t0 = batch.orbits[0].state.epoch.mjd_tdb()?;
+
+let config = PlanningConfig {
+    observatories: vec![ObservatoryConfig {
+        obs_code: "F51".to_string(),
+        sigma_arcsec: [0.2, 0.2],
+        max_apparent_mag: 24.0,
+        min_elongation_deg: 60.0,
+        min_elevation_deg: 20.0,
+        max_sun_altitude_deg: None,   // engine default: −18°, astronomical twilight
+        twilight_thresholds: None,    // engine defaults
+        explicit_anchor_utc: None,
+    }],
+    ..PlanningConfig::default()
+};
+
+let vis = ctx.compute_visibility(
+    &batch.orbits[0],
+    None,
+    Epoch::from_mjd_tdb(t0),
+    Epoch::from_mjd_tdb(t0 + 3.0),
+    1.0 / 24.0,
+    &config,
+)?;
+println!("{} site(s) surveyed", vis.observatory_visibility.len());
+# Ok::<(), empyrean::Error>(())
+```
+
+The C ABI exposes the same survey as `empyrean_compute_visibility`, which
+fills an `EmpyreanVisibilityBatch` — one `EmpyreanVisibilityResult` per
+orbit, each carrying the per-night, window and anchor arrays — freed with
+`empyrean_visibility_result_free`. The CLI has no visibility subcommand;
+the night product is a Python, Rust, and C capability.
+
 ### Orbit determination (with `Session`)
 
 Fit Apophis's orbit from its full MPC astrometric arc — optical and
@@ -404,27 +493,30 @@ a terminal without a parquet tool. Join them in pandas / Polars / DuckDB
 the same way you would the propagation / ephemeris outputs.
 
 Every table is written whole. The residual file carries the complete
-36-field per-observation surface — the `obs_id` / `object_id` join keys,
+36-column per-observation surface — the `obs_id` / `object_id` join keys,
 observatory code, catalog and epoch, the effective residual covariances,
 the entire typed rejection block (reason, criterion, threshold, effective
 threshold, information loss), the influence diagnostics, the
-along / cross-track decomposition, and the radar block — in parquet, CSV,
-and JSON alike, all three emitted from one column table so they cannot
-disagree. The fitted-orbit CSV carries the same 82-column schema as the
-parquet, covariance included, rather than a lossy projection of it.
+along / cross-track decomposition, and the radar block — identical in
+parquet, CSV, and JSON (all three emitted from one column table, so they
+cannot disagree).
 
-Parquet **and JSON** carry the full packed joint — the state↔parameter
-and parameter↔parameter terms beyond the state+Marsden 9×9 included — so a
-fitted orbit round-trips through either with the joint the fit actually
-computed rather than its diagonal blocks. Parquet carries it in a tagged
-column tail; JSON carries the same value in its own `cov_*` fields (the
-packed lower triangle plus the tags), under the same names. CSV carries
-the state 6×6 only and refuses a joint carrying solved-parameter axes by
-name, pointing at the other two — writing it short would read back as a
-block-diagonal joint, a tighter claim than the fit made, with nothing in
-the round trip to signal it. A carrier holding thrust Δv terms is refused
-wherever it is offered, because no orbit-file format can serialize the
-thrust arcs those terms describe.
+A fitted orbit's uncertainty is **one packed joint** — a single
+lower-triangular covariance over the state and every solved parameter,
+six to seventeen wide, carrying its own layout and its tags: the
+covariance kind, quality, rank, null axes, functional, and provenance.
+Parquet and JSON both carry the whole joint — the packed triangle at the
+solved width together with its layout tags — so a fitted orbit round-trips
+through either with exactly the covariance the fit computed. The parquet
+orbits schema is 73 columns (it additionally carries the sampling and
+mixture accounting); the JSON record carries the joint in its own `cov_*`
+fields (`cov_tri` plus the tags), the flat `covariance` field is gone, and
+a file written in the old shape is refused by name on read. CSV is the
+flat, human-readable projection: 66 columns carrying the 6×6 state block
+as an explicit lower triangle plus the covariance's scalar tags, so the
+state uncertainty reads at a terminal, while a joint carrying
+solved-parameter axes beyond the state is refused by name rather than
+written short — pointing at parquet or JSON, which round-trip it in full.
 
 Residual rows are typed by observable. Optical rows carry the RA / Dec
 and along / cross-track residuals with the track-frame pair's full

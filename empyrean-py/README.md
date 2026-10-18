@@ -21,7 +21,8 @@ Uncertainty-first orbit propagation, ephemeris, orbit determination, and event d
 pip install empyrean
 ```
 
-Current release: **0.11.0**.
+Current release: **0.11.0rc0** (release candidate) — `--pre` is required
+until 0.11.0 is final.
 
 A plain install pulls empyrean
 together with the B612 Foundation's
@@ -942,10 +943,57 @@ candidates from the plan and evaluate again.
 Not exposed in this release, recorded so the omissions are not mistaken
 for oversights: the non-gravitational planning variant that solves over
 state ⊕ (A1, A2, A3) and reports the σ(A2) tightening a radar campaign
-buys, the visibility survey, batch evaluation across many orbits, and the
-encounter B-plane. An orbit carrying non-gravitational parameters is
-accepted and evaluated state-only — the acceleration still acts in the
-dynamics, but the solve-for set stays 6×6 and no σ(A2) is reported.
+buys, batch plan evaluation across many orbits, and the encounter
+B-plane. An orbit carrying non-gravitational parameters is accepted and
+evaluated state-only — the acceleration still acts in the dynamics, but
+the solve-for set stays 6×6 and no σ(A2) is reported.
+
+### Observability (the night product)
+
+`compute_visibility` surveys an orbit against a set of ground sites and
+reports, per site and per local night, the twilight epochs, the local
+solar midnight, the observable windows, and an anchor epoch under each
+policy — nearest to midnight, midnight, transit, or an explicit UTC —
+with its circumstances: altitude, azimuth, the Moon's altitude, azimuth
+and illuminated fraction, the predicted magnitude, and the sky
+covariance. Unlike `evaluate_plan`, it reads the whole
+`ObservatoryConfig` — the elevation and darkness gates and the twilight
+thresholds — so a `VisibilityPoints` row's `observable` is the
+conjunction of all four site gates (elongation, magnitude, elevation,
+darkness), the site-aware verdict plan evaluation cannot give.
+
+```python
+import empyrean
+from empyrean import ObservatoryConfig, PlanningConfig, compute_visibility
+
+config = PlanningConfig(
+    observatories=[
+        ObservatoryConfig(
+            obs_code="F51",                 # Pan-STARRS 1, Haleakalā
+            sigma_arcsec=(0.2, 0.2),
+            max_apparent_mag=24.0,
+            min_elongation_deg=60.0,
+            min_elevation_deg=20.0,
+        )
+    ]
+)
+
+# `orbits` is any Orbits table carrying a covariance (e.g. a fit's
+# `result.orbit`, or query_sbdb output). Survey a three-day window hourly.
+t0 = float(orbits.coordinates.epoch.to_numpy()[0])
+vis = compute_visibility(orbits, t0, t0 + 3.0, 1.0 / 24.0, config)
+
+vis.nights.to_dataframe()      # twilight, local solar midnight, windows
+vis.anchors.to_dataframe()     # one Moon-aware anchor per policy, with its joint
+vis.points.to_dataframe()      # per-epoch gates + Moon geometry
+```
+
+`compute_visibility` returns a `VisibilityResult` with five quivr tables —
+`points`, `windows`, `nights`, `anchors`, and the per-site
+`observatories` — joining on `orbit_id` / `obs_code` (and `night_index`
+for a night's windows and anchors). Each anchor carries its sky
+covariance as a packed joint, so an anchor's on-sky uncertainty reads
+back the same way a fitted orbit's does.
 
 Optical and radar candidates fill different blocks and the cross-block is
 null, never zero: sky-plane geometry (`along_track_sigma_arcsec`,

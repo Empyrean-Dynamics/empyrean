@@ -25,7 +25,7 @@ DuckDB, and pages through what it wrote without leaving the terminal.
 
 ## Install
 
-Current release: **0.10.0**.
+Current release: **0.11.0-rc.0** (release candidate).
 
 ```sh
 cargo install empyrean-cli
@@ -78,11 +78,14 @@ empyrean version
 
 The pipeline commands (`propagate` / `ephemeris` / `determine`) emit
 Parquet tables under `--out-dir` by default; `--format json` and
-`--format csv` are also available, and CSV is no longer a lossy choice —
-it carries the same 82-column orbit schema Parquet does, with the state
-6×6 covariance included. Parquet and JSON carry the full packed joint (CSV
-the state 6×6 only, refusing a wider joint by name). The schemas match the
-Python and Rust API outputs exactly —
+`--format csv` are also available. Parquet and JSON both carry the full
+packed joint: the parquet orbits schema is 73 columns and the JSON orbit
+record carries the joint in its own `cov_*` fields (the packed triangle
+plus its tags). CSV flattens an orbit to 66 columns carrying the 6×6 state
+covariance as an explicit lower triangle and refuses a joint with
+solved-parameter axes beyond the state by name, pointing at parquet or
+JSON. The residual tables are identical across all three formats (36
+columns). The CLI writes the same schemas the Python and Rust APIs do —
 same `orbit_id` / `object_id` join keys, same time scales, same physical
 units — so you can mix-and-match channels for the same workflow.
 
@@ -173,8 +176,8 @@ browsing them. Naming an unreadable file *directly* is still a hard
 error, by name, saying what was tried.
 
 In the pager: **space** / **enter** for the next page, **b** for the
-previous one, **←** / **→** to slide the column window (an orbits table
-is 82 columns — most of them a covariance block), **g** / **Home** to
+previous one, **←** / **→** to slide the column window (a Parquet orbits
+table is 73 columns — most of them the packed-covariance block), **g** / **Home** to
 jump back to the first row, **/** to filter rows by substring, **Esc** to
 drop the filter, **q** to quit. The status line says where you are, and
 declines to guess a total it has not reached yet:
@@ -309,16 +312,14 @@ Three artifacts land under `--out-dir`:
   keyed by its ADES designation. Fully re-feedable: state, covariance,
   and non-gravitational model carry straight into a follow-on
   `empyrean propagate` / `empyrean ephemeris` with no reconstruction.
-  A wide fit's orbit additionally carries the **joint** — the
-  off-diagonal blocks of the fitted covariance, beyond the state+Marsden
-  9×9. Parquet (the `--format` default) **and** `--format json` carry the
-  full packed joint; `--format csv` carries the state 6×6 only and refuses
-  a joint carrying solved-parameter axes **by name** rather than writing it
-  short, because a file written short reads back as a block-diagonal joint,
-  which is a tighter claim than the fit made and leaves nothing in the
-  round trip to signal the loss. Use parquet or JSON for wide fits; a fit
-  whose orbit carries no cross terms writes in whichever format you ask
-  for.
+  The covariance is **one packed joint** over the state and every solved
+  parameter (up to seventeen wide). Parquet (the `--format` default) and
+  `--format json` preserve the whole joint; `--format csv` flattens the
+  6×6 state block and refuses a joint with solved-parameter axes beyond the
+  state **by name** rather than writing it short, because a file written
+  short reads back as a block-diagonal joint — a tighter claim than the fit
+  made, with nothing in the round trip to signal the loss. Use parquet or
+  JSON when the covariance must survive the round trip.
 - `fit_summary.parquet` **and** `fit_summary.csv` — one row per *input*
   object, delivered or not: `status`, convergence, iterations, observation
   and selected counts, residual RMS, reduced χ², both acceptability

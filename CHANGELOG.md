@@ -6,6 +6,14 @@ project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.11.0-rc.0] — 2026-10-18
+
+**Validation.** On this candidate the orbit-determination family (354
+optical fits and 5 radar fits over the suite's catalogue) reproduces the
+0.11.0 run C record bit-for-bit through the core reference, the Rust
+wrapper, Python, C and CLI channels; the zero-seeded non-gravitational
+cells now deliver finite estimates with σ below the prior.
+
 **Release note.** `EmpyreanEventConfig` grew 40 → 56 bytes by value,
 shifting every field after `events` in `EmpyreanPropagationConfig`
 (296 → 312) and `EmpyreanEphemerisConfig` (320 → 336); this is a layout
@@ -18,6 +26,14 @@ Re-derive the whole layout rather than appending to it — writing
 `num_threads` at its old offset now lands inside `diagnostics`, silently.
 Recompiling against the current header is the fix; a 0.10.0 caller and a
 library from this cycle refuse each other at load by the version handshake.
+
+`EmpyreanPhotometryConfig` grows 32 → 48 bytes by value, carrying the
+`band_conversions` pointer and its `band_conversions_len` (the two new
+fields of the band-to-V table below). The config that embeds it,
+`EmpyreanODConfig`, shifts with it (536 → 552) — the same layout break,
+under the same `EMPYREAN_ABI_VERSION` 1100, so a hand-mirrored
+`EmpyreanODConfig` must re-derive its tail rather than assume the embedded
+photometry block kept its size.
 
 `EmpyreanErrorLocation` and its two accessors are additive by contrast —
 they take nothing away from any existing layout.
@@ -63,6 +79,30 @@ they take nothing away from any existing layout.
   (`empyrean/examples/retained_bytes.rs`). Consuming `self` is what makes
   it safe — the lazy accessors take `&self`, so the type system proves
   none can be called afterwards, and no config flag is involved.
+
+- **The band-to-V conversion table rides the photometry config, and it is
+  the caller's.** Survey-band magnitudes convert to V through a per-code
+  table carried at every layer: `PhotometryConfig.band_conversions`
+  (`BandConversions`) in the Rust wrapper, `EmpyreanBandConversion { code,
+  offset_to_v, sigma }` rows with `band_conversions` / `band_conversions_len`
+  in C, `PhotometryConfig(band_conversions={"Lu": (-1.41, 0.30)})` in
+  Python, and the repeatable `--band-conversion CODE=OFFSET:SIGMA` on the
+  CLI's `determine`. The default is the MPC Magnitude Bands table; a
+  supplied entry replaces a code the table already carries or adds one it
+  does not, and each converted band reports the offset it applied. The LSST
+  codes carry no adopted conversion and are refused by name until supplied —
+  their magnitudes stay out of the photometric fit, with a report, and the
+  astrometry is unaffected — and the comet magnitude flags `T` / `N` are
+  always refused.
+
+- **A solved axis the observations leave unconstrained is refused by name.**
+  Orbit determination gains OD error code 53 —
+  `EMPYREAN_OD_ERROR_SOLVED_AXIS_UNCONSTRAINED` in C,
+  `ODError::SolvedAxisUnconstrained` in the Rust wrapper — riding the
+  existing error string through the Python `DetermineFailure` and the CLI
+  failure output. A fit whose observations carry no information on a solved
+  parameter axis is now refused, with a message naming the axis and both σ,
+  rather than returning the prior back as a posterior.
 
 ### Changed
 
@@ -233,6 +273,29 @@ they take nothing away from any existing layout.
   mixture path is intact and only its trigger moved. Callers who tuned an
   inflation, or a `threshold`, against the old κ should re-check it.
 
+- **BREAKING (JSON orbit format)** — the JSON orbit record now carries the
+  full packed joint, the same value Parquet stores, on every surface. The
+  row serializes the packed lower triangle `cov_tri` and the scalar tags
+  (`cov_schema`, `cov_state_width`, the `cov_layout_*` bitsets, `cov_kind`,
+  `cov_quality`, `cov_rank`, `cov_null_axes`, `cov_min_eig_corr`,
+  `cov_functional`, `cov_provenance`, `cov_asserted_source`) under the same
+  names Parquet's columns use, at every width the joint can have — on the
+  CLI (C-ABI) path and the Python/quivr path alike. The flat 6×6
+  `covariance` field is **removed** from the JSON row; the state 6×6 is the
+  joint's leading block, derived on read, never stored twice. A JSON file
+  written before this change — carrying the old flat `covariance` field — is
+  refused by name on read, with a message naming the old shape; there is no
+  migration shim. A flat state 6×6 with no joint (a hand-built C orbit) is
+  converted through the same engine path the Parquet and CSV writers use, so
+  an externally supplied matrix is an ASSERTED moment from `ExternalFile`
+  with the engine's definiteness check and its tags are identical across the
+  three formats, and an asymmetric block is refused by name on the JSON
+  write exactly as on Parquet. CSV is unchanged — it carries the state 6×6
+  and refuses a joint with solved-parameter axes by name
+  (`ParameterCovarianceNotWritable`). The `empyrean_orbits_write_json` doc
+  comment is regenerated by cbindgen; the ABI itself — signatures, structs,
+  enums, constants — is unchanged.
+
 ### Fixed
 
 - **Event detection can be switched off, and switching it off is worth
@@ -284,6 +347,38 @@ they take nothing away from any existing layout.
   `EventConfig::enrichment` remains the one engine field this boundary
   does not carry. That omission is documented on both structs rather than
   silent, and is unchanged here.
+
+- **The orbit-batch writer read freed memory.** `empyrean determine
+  --out-dir <dir> --format parquet|csv` aborted the fitted-orbit write
+  after a clean convergence (433 Eros, 99942 Apophis) with a
+  packed-joint/flat-state disagreement on the state block. The keepalive
+  that owns each orbit's packed-joint triangle — which the C writer reads
+  by raw pointer — was dropped before the writer ran, so the writer read a
+  freed triangle whose garbage state block (a ~1e108 cell) disagreed with
+  the inline flat 6×6, and the orbit-write guard refused the pair. Parquet
+  and CSV, which reconstruct the joint, aborted; JSON survived because its
+  old row shape serialized only the inline flat 6×6; the Python/wrapper
+  path, which carries only the joint and never reached the guard, read the
+  same freed triangle and would have written the garbage joint silently.
+  The keepalive now spans the C call on every path, beside the id and
+  object keepalives; the joint remains the one covariance authority and the
+  state-block guard that caught it is unchanged.
+
+- **A non-gravitational model whose coefficients are all zero is still a
+  model.** `empyrean_orbit_non_grav_params` inferred "no non-grav model"
+  from an all-zero A1/A2/A3 vector, so an orbit refined with the Marsden
+  block solved from a zero seed reached the engine gravity-only while its
+  packed joint still declared the Marsden prior — a declared-but-unforced
+  axis the observations could not touch. Presence now rides the orbit's
+  declared joint layout alongside the coefficient values and DT, so a zero
+  seed keeps the force its prior was written for; presence is never read
+  from the coefficient values alone.
+
+- Survey-band magnitudes now convert to V with the MPC Magnitude Bands
+  API's current adopted values. The static table copied before was stale:
+  the `u` offset had the wrong sign (+2.5 → −2.5), and `g`, `r`, `i`, `z`,
+  `y` and `w` shift by 0.04–0.29 mag. A fitted H derived from those bands
+  re-baselines accordingly; astrometry is unaffected.
 
 ## [0.10.0] — 2026-08-20
 

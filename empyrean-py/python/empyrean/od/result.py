@@ -24,11 +24,17 @@ from empyrean.od.residuals import (
     ResidualSummary,
     StationBiases,
 )
+from empyrean.orbits.joint import CovarianceKind
 from empyrean.orbits.orbits import (
     CartesianOrbits,
     CometaryOrbits,
     KeplerianOrbits,
     SphericalOrbits,
+)
+from empyrean.propagation.config import (
+    UncertaintyMethod,
+    UncertaintyMethodLike,
+    _uncertainty_method_to_wire,
 )
 
 # JSON-like value type for the nested wire dicts marshaled across the
@@ -530,7 +536,7 @@ class RejectionConfig:
 
 
 @dataclass
-class StationRaDecConfig:
+class StationRADecConfig:
     """Per-station RA/Dec bias-fit configuration.
 
     Schur-eliminated nuisance parameters that absorb per-station
@@ -590,7 +596,7 @@ class SolveFor:
     """Disposition of the SRP AMRAT (requires an SRP AMRAT prior)."""
     thrust: list[ParamDisposition] = field(default_factory=list)
     """Disposition of each **declared** thrust Δv segment, positional with
-    the orbit's ``correction_covariances``.
+    the orbit's ``dv_corrections`` (the burn prior rides the packed joint).
 
     Positional rather than a count: a considered or fixed burn sits
     between solved ones as readily as after them, and a count cannot say
@@ -632,6 +638,18 @@ class PhotometryConfig:
     """Max Huber-IRLS iterations. ``0`` → engine default (30)."""
     huber_k: float = 0.0
     """Huber tuning constant. ``0.0`` → engine default (1.5)."""
+    band_conversions: dict[str, tuple[float, float]] | None = None
+    """Band→V conversions layered onto the built-in MPC Magnitude Bands
+    table, as ``{code: (offset_to_v, sigma)}`` — e.g.
+    ``{"Lu": (-1.41, 0.30)}``. ``None`` (default) runs the fit on the MPC
+    table unchanged. A supplied entry replaces a code the table carries or
+    adds one it does not: the LSST ``Lu Lg Lr Li Lz Ly`` carry no MPC
+    default and are refused by name until supplied (their magnitudes are
+    then excluded from the fit with a report; the astrometry is
+    unaffected), and the comet magnitude flags ``T`` / ``N`` are refused
+    regardless. Each converted band's offset is reported back on the
+    result's per-band ``offset_applied``, so a fit is auditable against the
+    table it ran with."""
 
 
 # ── Top-level config ─────────────────────────────────────────
@@ -709,7 +727,7 @@ class ODConfig:
     acceptability: AcceptabilityThresholds = field(default_factory=AcceptabilityThresholds)
     fit_station_biases: bool = False
     """Enable Schur-eliminated per-station RA/Dec bias fitting."""
-    station_radec: StationRaDecConfig = field(default_factory=StationRaDecConfig)
+    station_radec: StationRADecConfig = field(default_factory=StationRADecConfig)
     use_span_grouping: bool = False
 
     # ── Rejection ──────────────────────────────────────────
@@ -729,6 +747,16 @@ class ODConfig:
     photometry: PhotometryConfig | None = None
     """Post-OD photometric fit. ``None`` (default) disables it; the fit
     runs after the orbit is solved and never touches the state."""
+    uncertainty_method: UncertaintyMethodLike = UncertaintyMethod.FIRST_ORDER
+    """Uncertainty method for the fitted covariance (same vocabulary as
+    :func:`empyrean.propagate`). The OD fit is first-order by
+    construction, so :attr:`UncertaintyMethod.FIRST_ORDER` (the default)
+    is delivered and :attr:`UncertaintyMethod.AUTO` resolves to it —
+    reported on :attr:`DetermineResult.resolved_method` and, for ``AUTO``,
+    on :attr:`DetermineResult.warnings`. ``SECOND_ORDER`` / ``SIGMA_POINT``
+    / ``MONTE_CARLO`` / ``GAUSSIAN_MIXTURE`` are refused by name (a
+    :class:`ValueError` naming the method and ``determine``) rather than
+    silently downgraded."""
 
     def _to_wire_dict(self) -> dict[str, WireValue]:
         """Serialize to the nested dict shape the binding consumes.
@@ -806,6 +834,10 @@ class ODConfig:
             "auto_force_model": self.auto_force_model,
             "output_representation": _enum_value(self.output_representation),
             "allow_unbracketed_maneuvers": self.allow_unbracketed_maneuvers,
+            # Flat tag + per-variant slots, lowered through the one shared
+            # helper the propagate path uses, so a method selects the same
+            # engine variant on either seam.
+            "uncertainty_method": _uncertainty_method_to_wire(self.uncertainty_method),
         }
         # Explicit per-axis solve request and photometry config are only
         # emitted when set — the Rust parser reads these keys only when
@@ -819,13 +851,23 @@ class ODConfig:
                 "thrust": [d.value for d in self.solve_for_flags.thrust],
             }
         if self.photometry is not None:
-            wire["photometry"] = {
+            photometry: dict[str, WireValue] = {
                 "model": _enum_value(self.photometry.model),
                 "sigma_lightcurve": self.photometry.sigma_lightcurve,
                 "include_rejected": self.photometry.include_rejected,
                 "max_irls_iterations": self.photometry.max_irls_iterations,
                 "huber_k": self.photometry.huber_k,
             }
+            # Emitted only when supplied, so the Rust parser leaves the fit
+            # on the MPC Magnitude Bands table otherwise. Each entry is an
+            # ``[offset_to_v, sigma]`` pair the PyO3 bridge reads back.
+            if self.photometry.band_conversions is not None:
+                bands: dict[str, WireValue] = {}
+                for code, pair in self.photometry.band_conversions.items():
+                    offset, sigma = pair
+                    bands[code] = [float(offset), float(sigma)]
+                photometry["band_conversions"] = bands
+            wire["photometry"] = photometry
         return wire
 
 
@@ -1285,6 +1327,17 @@ class DetermineResult:
 
     ``None`` is the ordinary case. A consumer that wants the strict
     convergence contract checks ``stall_delivery is None``."""
+    resolved_method: CovarianceKind = CovarianceKind.LINEAR
+    """The kind of covariance this fit delivered. Always
+    :attr:`CovarianceKind.LINEAR`: the fit is first-order by construction,
+    and an :attr:`UncertaintyMethod.AUTO` request on the config resolves to
+    it (also named on :attr:`warnings`). Every richer method is refused by
+    name before a fit is produced. The OD analogue of
+    :attr:`~empyrean.planning.result.PlanResult.resolved_method`: one
+    vocabulary — the covariance-kind vocabulary — for what kind of
+    covariance a result carries, while the requested method stays visible on
+    the config's :attr:`~empyrean.od.result.ODConfig.uncertainty_method`
+    knob."""
 
 
 @dataclass
@@ -1298,11 +1351,17 @@ class DetermineFailure:
     kind: str
     """Classified cause, as a stable snake_case name — ``"iod"``,
     ``"od"``, ``"radar_only"``, ``"observer_construction"``,
-    ``"earth_orientation_coverage"``, ``"observation_conversion"``,
-    ``"unsupported_coordinate_system"``, ``"duplicate_obs_ids"``,
-    ``"non_grav_not_recovered"``, or ``"unknown_<code>"`` for a cause
-    this build of the bindings does not name. Branch on this rather than
-    on :attr:`message`."""
+    ``"unknown_observatory_code"``, ``"earth_orientation_coverage"``,
+    ``"observation_conversion"``, ``"unsupported_coordinate_system"``,
+    ``"duplicate_obs_ids"``, ``"non_grav_not_recovered"``, or
+    ``"unknown_<code>"`` for a cause this build of the bindings does not
+    name. Branch on this rather than on :attr:`message`.
+
+    ``"unknown_observatory_code"`` is a hard refusal, never a deselect: an
+    observation naming a site in no loaded registry and matching no station
+    table fails the object by name (the code and its observation index are
+    in :attr:`message`), rather than being silently skipped or placed at a
+    fallback geometry."""
 
 
 @dataclass

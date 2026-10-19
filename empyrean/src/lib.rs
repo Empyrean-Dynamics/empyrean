@@ -99,6 +99,8 @@
 //!   [`Frame::EclipticJ2000`] (the integration frame); set
 //!   [`PropagationConfig::frame`] to [`Frame::ICRF`] for ICRF output.
 #![warn(missing_docs)]
+// Astronomy acronyms are spelled in all caps.
+#![allow(clippy::upper_case_acronyms)]
 
 mod built_system;
 mod context;
@@ -135,7 +137,8 @@ pub use built_system::{
     SystemDescription,
 };
 pub use context::{
-    Context, DataDirOptions, DataTier, default_data_dir, download_data, offline_floor_is_active,
+    Context, DataDirOptions, DataTier, EarthOrientationCoverage, EarthOrientationKernelRole,
+    default_data_dir, download_data, earth_orientation_kernel_coverage, offline_floor_is_active,
 };
 pub use coordinate::{
     CoordinateState, Frame, Origin, Representation, frame_to_int, int_to_frame, int_to_rep,
@@ -146,7 +149,7 @@ pub use ephemeris::{
     SENSITIVITY_ROW_RA, SENSITIVITY_ROW_RANGE, SENSITIVITY_ROW_VDEC, SENSITIVITY_ROW_VRA,
     SENSITIVITY_ROW_VRANGE,
 };
-pub use error::{ENGINE_NOT_LOADED, Error, Result};
+pub use error::{ENGINE_NOT_LOADED, Error, PushError, Result};
 pub use impact::{BPlane, ImpactProbability};
 pub use io::{
     FitSummaryRow, OrbitBatch, read_orbits_csv, read_orbits_json, read_orbits_parquet,
@@ -155,7 +158,10 @@ pub use io::{
     write_fit_summary_parquet, write_orbits_csv, write_orbits_json, write_orbits_parquet,
     write_residuals_csv, write_residuals_json, write_residuals_parquet,
 };
-pub use joint::{JointCovariance, ParamColumn, ParamDisposition, WideCross};
+pub use joint::{
+    AssertedSource, AxisLayout, JointFunctional, JointProvenance, JointQuality, PackedJoint,
+    ParamDisposition,
+};
 // NAME COLLISION, resolved by module path. This root `MixtureComponent`
 // is the `split_gaussian` primitive at t₀ (weight / mean / covariance,
 // no basis tags). The AGM *read-back* component — the basis-tagged one
@@ -166,28 +172,31 @@ pub use joint::{JointCovariance, ParamColumn, ParamDisposition, WideCross};
 pub use math::{MixtureComponent, eigenvector_max_6x6, split_gaussian};
 pub use observers::Observer;
 pub use od::{
-    AcceptabilityReport, AcceptabilityThresholds, AutoEscalationPolicy, BandStat,
-    CovarianceRepresentation, CovarianceTrust, DebiasingConfig, DebiasingResolution,
+    AcceptabilityReport, AcceptabilityThresholds, AutoEscalationPolicy, BandConversion,
+    BandConversions, BandStat, CovarianceInformation, CovarianceRepresentation, CovarianceTrust,
+    DebiasingConfig, DebiasingResolution, DeliveredNoiseModel, DeliveredRejectionKind,
     DetermineEntry, DetermineFailure, DetermineFailureKind, DetermineResult, DetermineResults,
-    EvaluateResult, GateRecord, IODConfig, MAX_THRUST_SEGMENTS, ODConfig, Observation,
-    ObservationResidual, Observations, OriginPolicy, OutputEpoch, PhotometryConfig,
+    EvaluateResult, GateRecord, IODConfig, MAX_THRUST_SEGMENTS, NoiseModel, ODConfig, ODError,
+    Observation, ObservationResidual, Observations, OriginPolicy, OutputEpoch, PhotometryConfig,
     PhotometryModel, PhotometryResult, RadarMeasurement, RadarObservation, RadarResidual,
     RadarResidualKind, RejectionConfig, RejectionKind, RejectionReason, ResidualSummary,
-    SigmaPolicy, SolveFor, SolveForParams, SolvedCovariance, SolverStop, StallDelivery,
-    StationBias, StationRaDecConfig, TrustGateEvent, WeightingConfig, WeightingLayer,
-    WeightingPreset,
+    SigmaPolicy, SigmaSource, SolveFor, SolveForParams, SolvedCovariance, SolverStop,
+    StallDelivery, StationBias, StationRADecConfig, TrustGateEvent, WeightingConfig,
+    WeightingLayer, WeightingPreset,
 };
 pub use orbit::{Orbit, PhaseFunction};
 pub use planning::{
-    CandidateKind, CovarianceMetrics, ObservatoryConfig, PlanCandidate, PlanEphemerisPoint,
-    PlanResult, PlannedObservation, PlannedObservationKind, PlanningConfig, RadarMode,
-    RadarPlanSpec, RadarStation, TargetRadarProperties,
+    Anchor, AnchorCircumstances, AnchorPolicy, CandidateKind, CovarianceMetrics,
+    EarthOrientationSummary, Gate, LogDetWithheld, Night, ObservatoryConfig, ObservatoryVisibility,
+    PlanCandidate, PlanEphemerisPoint, PlanResult, PlannedObservation, PlannedObservationKind,
+    PlanningConfig, RadarMode, RadarPlanSpec, RadarStation, TargetRadarProperties,
+    TwilightThresholds, VisibilityPoint, VisibilityResult, VisibilityWindow,
 };
 pub use propagate::{
-    AdvancedIntegratorConfig, CaptureCriterion, CovarianceKind, CovarianceQuality, DenseOrigin,
-    DiagnosticsConfig, EphemerisOverlapPolicy, Event, EventConfig, ForceModelTier,
-    IntegratorChoice, OriginSwitchingConfig, PropagatedState, PropagationConfig, PropagationResult,
-    TaggedCovariance, TargetFunctional, UncertaintyMethod,
+    AdvancedIntegratorConfig, CaptureCriterion, CovarianceKind, DenseOrigin, DiagnosticsConfig,
+    EphemerisOverlapPolicy, Event, EventConfig, ForceModelTier, IntegratorChoice, MixtureTally,
+    OrbitOutcome, OriginSwitchingConfig, PropagatedState, PropagationConfig, PropagationResult,
+    TaggedCovariance, UncertaintyMethod,
 };
 pub use query::{
     query_horizons, query_horizons_vectors, query_observations, query_radar, query_sbdb,

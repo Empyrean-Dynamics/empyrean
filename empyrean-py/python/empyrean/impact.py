@@ -30,8 +30,7 @@ import quivr as qv
 from empyrean._convert import (
     AnyOrbits,
     coordinates_to_arrays,
-    extract_joint,
-    extract_non_grav_covariance,
+    extract_joint_wire,
     extract_srp,
     validate_non_grav_marsden_only,
 )
@@ -386,7 +385,7 @@ def _tags_to_method_strings(tags: npt.NDArray[np.integer[Any]]) -> list[str]:
     return [_TAG_TO_METHOD.get(int(t), f"unknown_{int(t)}") for t in tags]
 
 
-def _common_orbit_args(orbits: AnyOrbits) -> dict[str, _OrbitArg]:
+def _common_orbit_args(orbits: AnyOrbits) -> dict[str, Any]:
     """Pull the flat-array orbit fields the Rust side needs.
 
     Mirrors what :func:`empyrean.propagate` extracts before it
@@ -411,7 +410,6 @@ def _common_orbit_args(orbits: AnyOrbits) -> dict[str, _OrbitArg]:
     a2s = np.zeros(n, dtype=np.float64)
     a3s = np.zeros(n, dtype=np.float64)
     non_grav_dts: FloatArray | None = None
-    non_grav_dt_variances: FloatArray | None = None
     ng_alphas: FloatArray | None = None
     ng_r0s: FloatArray | None = None
     ng_ms: FloatArray | None = None
@@ -444,12 +442,6 @@ def _common_orbit_args(orbits: AnyOrbits) -> dict[str, _OrbitArg]:
         dt_col = np.asarray(ng.dt.to_numpy(zero_copy_only=False), dtype=np.float64)
         if np.isfinite(dt_col).any():
             non_grav_dts = dt_col
-        # DT prior variance — opens the DT column in a StateAndNonGravAndDT
-        # solve when the orbit is re-fed into a DT fit. Gated like non_grav_dts
-        # (finite positive), so the no-prior common case skips the FFI marshal.
-        dtv_col = np.asarray(ng.dt_variance.to_numpy(zero_copy_only=False), dtype=np.float64)
-        if (np.isfinite(dtv_col) & (dtv_col > 0.0)).any():
-            non_grav_dt_variances = dtv_col
         # Marsden g(r) exponents. Without them, a comet's custom g(r)
         # silently collapses to inverse-square on the IP / B-plane input
         # path (same class as the c37m propagate-input fix). Surface all
@@ -475,25 +467,22 @@ def _common_orbit_args(orbits: AnyOrbits) -> dict[str, _OrbitArg]:
             ng_ms = _col("m")
             ng_ns = _col("n")
             ng_ks = _col("k")
-    # Fitted non-grav covariance — passed through only when a row carries one
-    # (mirrors the OD output path) so a StateAndNonGrav-fitted orbit re-fed
-    # into the IP / B-plane input path keeps its prior. Gated like the other
-    # optional non-grav arrays so the common no-cov case skips the FFI marshal.
-    has_ng_cov_arr, ng_cov_arr = extract_non_grav_covariance(orbits)
-    has_non_grav_cov: FloatArray | npt.NDArray[np.bool_] | None = (
-        has_ng_cov_arr if has_ng_cov_arr.any() else None
-    )
-    non_grav_cov: FloatArray | None = ng_cov_arr if has_ng_cov_arr.any() else None
+    # The orbit's packed joint — the single covariance home. Passed through
+    # only when a row carries one, so a StateAndNonGrav-fitted orbit re-fed
+    # into the IP / B-plane input path keeps its full joint; an impact
+    # probability computed against a block-diagonal covariance would
+    # understate the tails, asserting the state and parameters were
+    # independent when one fit produced both.
+    joint_wire = extract_joint_wire(orbits)
     # SRP force slot — passed through only when a row carries one, so a
     # State+AMRAT-fitted (or SRP-primed) orbit re-fed into the IP / B-plane
     # input path keeps its slot. Gated like the other optional arrays so the
     # common no-SRP case skips the FFI marshal.
-    srp_has, srp_amrat_arr, srp_cr_arr, srp_var_arr = extract_srp(orbits)
+    srp_has, srp_amrat_arr, srp_cr_arr = extract_srp(orbits)
     srp_present = bool(srp_has.any())
     has_srp: npt.NDArray[np.uint8] | None = srp_has if srp_present else None
     srp_amrat: FloatArray | None = srp_amrat_arr if srp_present else None
     srp_cr: FloatArray | None = srp_cr_arr if srp_present else None
-    srp_amrat_variance: FloatArray | None = srp_var_arr if srp_present else None
     return {
         "epochs": epochs_arr,
         "elements": elements_arr,
@@ -506,13 +495,10 @@ def _common_orbit_args(orbits: AnyOrbits) -> dict[str, _OrbitArg]:
         "a2s": a2s,
         "a3s": a3s,
         "non_grav_dts": non_grav_dts,
-        "non_grav_dt_variances": non_grav_dt_variances,
         "has_srp": has_srp,
         "srp_amrat": srp_amrat,
         "srp_cr": srp_cr,
-        "srp_amrat_variance": srp_amrat_variance,
-        "has_non_grav_cov": has_non_grav_cov,
-        "non_grav_cov": non_grav_cov,
+        "covariance": joint_wire,
         "ng_alphas": ng_alphas,
         "ng_r0s": ng_r0s,
         "ng_ms": ng_ms,
@@ -680,18 +666,14 @@ def compute_impact_probabilities(
         **method_params,
         body_filter_naif=filter_arg,
         non_grav_dts=args["non_grav_dts"],
-        non_grav_dt_variances=args["non_grav_dt_variances"],
         has_srp=args["has_srp"],
         srp_amrat=args["srp_amrat"],
         srp_cr=args["srp_cr"],
-        srp_amrat_variance=args["srp_amrat_variance"],
-        has_non_grav_cov=args["has_non_grav_cov"],
-        non_grav_cov=args["non_grav_cov"],
-        # The joint's off-diagonal terms. An impact probability computed
-        # against a block-diagonal covariance understates the tails: it
-        # asserts the state and the parameters were independent when one
-        # fit produced both. No keys at all when no orbit carries any.
-        **extract_joint(orbits),
+        # The orbit's packed joint. An impact probability computed against a
+        # block-diagonal covariance understates the tails: it asserts the
+        # state and the parameters were independent when one fit produced
+        # both. No key when no orbit carries one.
+        covariance=args["covariance"],
         ng_alphas=args["ng_alphas"],
         ng_r0s=args["ng_r0s"],
         ng_ms=args["ng_ms"],
@@ -799,18 +781,14 @@ def compute_b_planes(
         **method_params,
         body_filter_naif=filter_arg,
         non_grav_dts=args["non_grav_dts"],
-        non_grav_dt_variances=args["non_grav_dt_variances"],
         has_srp=args["has_srp"],
         srp_amrat=args["srp_amrat"],
         srp_cr=args["srp_cr"],
-        srp_amrat_variance=args["srp_amrat_variance"],
-        has_non_grav_cov=args["has_non_grav_cov"],
-        non_grav_cov=args["non_grav_cov"],
-        # The joint's off-diagonal terms. An impact probability computed
-        # against a block-diagonal covariance understates the tails: it
-        # asserts the state and the parameters were independent when one
-        # fit produced both. No keys at all when no orbit carries any.
-        **extract_joint(orbits),
+        # The orbit's packed joint. An impact probability computed against a
+        # block-diagonal covariance understates the tails: it asserts the
+        # state and the parameters were independent when one fit produced
+        # both. No key when no orbit carries one.
+        covariance=args["covariance"],
         ng_alphas=args["ng_alphas"],
         ng_r0s=args["ng_r0s"],
         ng_ms=args["ng_ms"],

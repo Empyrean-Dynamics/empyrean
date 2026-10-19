@@ -194,6 +194,31 @@ no-op; the struct is left zeroed so a double free is safe.*/
 pub unsafe fn empyrean_missing_data_files_free(out: *mut EmpyreanMissingDataFiles) {
     unsafe { lib().empyrean_missing_data_files_free(out) }
 }
+/** Read one BPC file's Earth-orientation (ITRF93) coverage and check it
+against a kernel role's mandate, without building a context.
+
+Reuses the engine's own BPC reader and its per-kernel Earth-orientation
+mandate — the same reader and the same requirement the three-Earth-kernel
+mandate applies when a context loads — so a slot verified here and a
+context built from the same files later agree by construction. It never
+parses a BPC a second way.
+
+`role` is one of the `EMPYREAN_EARTH_KERNEL_ROLE_*` constants. On success
+the call writes `*out` and returns `0`; `out.satisfied` says whether the
+file passed, and the window and required bounds name exactly what was
+short. Returns `-1` for a null `path` / `out` or an unknown `role`, `-2`
+when the file could not be read as a BPC, `-3` when the file carries no
+Earth ITRF93 segments (`*out` is still written, with NaN bounds and
+`satisfied == 0`), and `-99` on a caught panic. Call
+`empyrean_last_error()` for the message on any non-zero return.*/
+#[inline]
+pub unsafe fn empyrean_earth_orientation_kernel_coverage(
+    path: *const ::std::os::raw::c_char,
+    role: i32,
+    out: *mut EmpyreanEarthOrientationCoverage,
+) -> i32 {
+    unsafe { lib().empyrean_earth_orientation_kernel_coverage(path, role, out) }
+}
 /** Retrieve the position of the most recent failure on this thread.
 
 The companion to `empyrean_last_error()`: that returns the prose,
@@ -306,14 +331,14 @@ pub unsafe fn empyrean_versions_free(versions: *mut EmpyreanVersions) {
     unsafe { lib().empyrean_versions_free(versions) }
 }
 /** Assemble a reusable force-model handle for `(force_model, frame)` from
-`ctx`, freezing `encounter_timescale_divisor` into its key.
+`ctx`.
 
 - `force_model`: tier code (0=Approximate, 1=Basic, 2=Standard).
 - `frame`: output/integration frame code (0=ICRF, 1=EclipticJ2000, 2=ITRF93).
-- `encounter_timescale_divisor`: pass `0.0` to freeze the engine default;
-  any positive value freezes that divisor into the key *before* it is
-  used to validate calls.
 - `out`: receives the heap-allocated handle on success.
+
+The encounter floor angle is no longer a construction argument: the engine
+derives it from the integrator tolerance and freezes it into the key.
 
 The handle snapshots `ctx`'s kernel manifest at construction so
 [`empyrean_builtsystem_describe`] is self-contained. After you load any
@@ -329,12 +354,9 @@ pub unsafe fn empyrean_builtsystem_new(
     ctx: *const EmpyreanContext,
     force_model: i32,
     frame: i32,
-    encounter_timescale_divisor: f64,
     out: *mut *mut EmpyreanBuiltSystem,
 ) -> i32 {
-    unsafe {
-        lib().empyrean_builtsystem_new(ctx, force_model, frame, encounter_timescale_divisor, out)
-    }
+    unsafe { lib().empyrean_builtsystem_new(ctx, force_model, frame, out) }
 }
 /** Assemble a handle keyed for the **orbit-determination** entry points.
 
@@ -415,7 +437,7 @@ but takes `(handle, ctx, ...)`. Runs the same identity guard as
 [`empyrean_builtsystem_propagate`] before dispatch; on pass the result is
 bit-identical to the one-shot. Note the C-ABI ephemeris config carries no
 divisor knob, so a handle frozen at a non-default divisor is rejected here
-with [`EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_DIVISOR`] rather than served under
+with [`EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_ENCOUNTER_FLOOR`] rather than served under
 the wrong dynamics — build the handle with the default divisor for
 ephemeris reuse.
 
@@ -1299,6 +1321,43 @@ pub unsafe fn empyrean_evaluate_plan(
 pub unsafe fn empyrean_plan_result_free(result: *mut EmpyreanPlanResult) {
     unsafe { lib().empyrean_plan_result_free(result) }
 }
+/** Survey the observability of one or more orbits over a time window from a
+set of observatories: the per-epoch gates, the observable windows, and the
+local-night product (twilight epochs, local solar midnight, observable
+intervals, and the Moon-aware anchor circumstances).
+
+`orbits` is an array of `n_orbits` orbits, `start` / `end` are MJD TDB and
+`step_days` the survey grid step. On success populates `*out`
+(caller-allocated) with one result per input orbit, in input order; free with
+[`empyrean_visibility_result_free`].
+
+Returns 0 on success (per-orbit failures ride each result's `error_code` /
+`error_message`), -1 for a null/invalid argument, -3 if the survey setup
+fails, -99 on an internal panic. The error message is retrievable via
+`empyrean_last_error()`.*/
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn empyrean_compute_visibility(
+    ctx: *const EmpyreanContext,
+    orbits: *const EmpyreanOrbit,
+    n_orbits: usize,
+    start: f64,
+    end: f64,
+    step_days: f64,
+    config: *const EmpyreanPlanningConfig,
+    out: *mut EmpyreanVisibilityBatch,
+) -> i32 {
+    unsafe {
+        lib().empyrean_compute_visibility(ctx, orbits, n_orbits, start, end, step_days, config, out)
+    }
+}
+/** Free the heap allocations inside a visibility batch populated by
+[`empyrean_compute_visibility`]. Does not free the caller-allocated
+`EmpyreanVisibilityBatch` struct itself.*/
+#[inline]
+pub unsafe fn empyrean_visibility_result_free(result: *mut EmpyreanVisibilityBatch) {
+    unsafe { lib().empyrean_visibility_result_free(result) }
+}
 /** Propagate orbits to the requested target times.
 
 Returns 0 on success, negative error code on failure.
@@ -1773,8 +1832,12 @@ speedup: the engine's memos are scoped to the context, so a loop over
 this function on the same context amortizes them just as well. See
 that function's docs for the measurement.
 
-Covariance is propagated through the Jacobian of the transformation
-when the input state carries one.
+The transform carries the **state only** at this engine revision: a
+state with a covariance (`has_covariance = 1`) is refused rather than
+transformed, because the engine's coordinate transform does not
+propagate a covariance through a representation / frame / origin change
+and silently dropping it is forbidden. Propagate the covariance through
+a propagate or orbit-determination path instead.
 
 Returns 0 on success or a negative error code on failure.
 Call `empyrean_last_error()` to retrieve the error message on failure.*/
@@ -1798,45 +1861,83 @@ pub unsafe fn empyrean_transform_coordinates_single(
         )
     }
 }
+/** Transform a batch of **orbits** — state AND its full packed-joint
+covariance — to a new representation, frame, and/or origin.
 
-/**The propagated joint's CROSS terms at a single `(orbit_index,
-epoch_index)` — the state↔Marsden border and the wide carrier that
-[`EmpyreanTaggedCovariance::matrix`] is the state block of.
+The orbit-level dual of [`empyrean_transform_coordinates`]: where that
+transforms a bare [`CoordinateState`] and **refuses** a covariance-bearing
+input ([`EMPYREAN_TRANSFORM_COVARIANCE_UNSUPPORTED`]), this transports each
+orbit's whole \\((6+P)\\)-wide joint under the first-order element Jacobian,
+alongside its state; every force-model parameter (non-grav / SRP / thrust /
+photometry) and the ids ride through unchanged.
+
+`orbits` is a caller-owned array of `num_orbits` [`EmpyreanOrbit`]; `out` is
+a caller-allocated [`EmpyreanOrbitBatch`] the library fills and the caller
+releases with [`empyrean_orbits_batch_free`] — each output joint's triangle
+is library-owned, the same ownership the orbit readers use. Each output
+orbit's covariance is the transported joint, marshaled through the one
+packed-joint wire (angular state rows in degrees); the flat
+`CoordinateState.covariance` is its state block, derived from the joint.
+
+# Returns
+
+`0` on success. `-1` for a null pointer or an unresolvable target basis. A
+per-orbit input refusal keeps its packed-joint code (−40…−49, e.g. a
+malformed wire joint). `-2` when the engine refuses the transform — the
+failing orbit's index is named in `empyrean_last_error` (the engine's
+`TransformError::Element`) — or when the result cannot be marshaled back
+out. `num_orbits == 0` is a valid no-op leaving `out` empty.*/
+#[inline]
+pub unsafe fn empyrean_transform_orbits(
+    ctx: *const EmpyreanContext,
+    orbits: *const EmpyreanOrbit,
+    num_orbits: usize,
+    target_representation: i32,
+    target_frame: i32,
+    target_origin: i32,
+    out: *mut EmpyreanOrbitBatch,
+) -> i32 {
+    unsafe {
+        lib().empyrean_transform_orbits(
+            ctx,
+            orbits,
+            num_orbits,
+            target_representation,
+            target_frame,
+            target_origin,
+            out,
+        )
+    }
+}
+
+/**The full WIDE joint (the state block together with the state↔parameter
+border and carrier) at a single `(orbit_index, epoch_index)`, as one
+packed joint.
 
 # Why this is a separate call
 
-[`EmpyreanTaggedCovariance`] is a plain-old-data struct: a caller
-declares one on the stack, fills it through
-[`empyrean_propagation_covariance_at_cartesian`], and frees nothing.
-Putting the carrier on it would have made every such caller — code
-that is correct today and recompiles without a murmur — leak two
-allocations per call. Nothing would fail; memory would simply grow.
-So the joint is opt-in through this call instead, and the tagged
-covariance keeps its contract.
-
-The same `(orbit_index, epoch_index)` addresses both surfaces, so a
-consumer walking a series
-([`empyrean_propagation_covariance_series_cartesian`]) can ask for
-the joint of any entry without the series itself owning anything new.
+The inline `orbit_cov` on each [`EmpyreanPropagatedState`] is the
+STATE-ONLY resolved covariance; the wide off-diagonal blocks ride the
+covariance series instead. This accessor hands back the wide joint for a
+single epoch so a caller need not walk the whole series.
 
 # Absence is reported, never fabricated
 
-`has_non_grav_cross = 0` with null carrier pointers means the engine
-produced no cross terms at this row — not that they were zero. Every
-uncertainty method that reaches this accessor carries the payload
-when it has one, including the sampled paths, which recover the
-state↔parameter columns from the cloud. A row genuinely without a
-joint is one whose orbit declared no solved-parameter block.
+The wide joint lives on the covariance series, which is a SUBSEQUENCE of
+the output epochs (a sigma row the cloud was short at, or a withheld
+orbit, carries none). The requested epoch is matched in the series by
+value; an epoch the series does not carry is refused BY NAME, never
+returned as an empty joint.
 
 # Ownership
 
-On success `out` owns two heap arrays; release them with
+On success `out` owns the joint's heap triangle; release it with
 [`empyrean_orbit_covariance_free`]. On any non-zero return `out` is
 untouched and there is nothing to free.
 
 # Returns
 
-The same `EMPYREAN_TAGGED_COV_*` codes as the tagged-covariance
+The same `EMPYREAN_TAGGED_COV_*` codes as the covariance-series
 accessors, so a caller branches on one set.
 
 # Safety
@@ -1847,23 +1948,24 @@ pub unsafe fn empyrean_propagation_joint_at(
     result: *const EmpyreanPropagationResult,
     orbit_index: usize,
     epoch_index: usize,
-    out: *mut EmpyreanOrbitCovariance,
+    out: *mut EmpyreanPackedJoint,
 ) -> i32 {
     unsafe { lib().empyrean_propagation_joint_at(result, orbit_index, epoch_index, out) }
 }
 
-/**Release the arrays owned by an [`EmpyreanOrbitCovariance`](crate::joint::EmpyreanOrbitCovariance)
-written by [`empyrean_propagation_joint_at`].
+/**Release the heap triangle owned by an
+[`EmpyreanPackedJoint`](crate::joint::EmpyreanPackedJoint) written by
+[`empyrean_propagation_joint_at`].
 
-Idempotent — the pointers are nulled and the counts zeroed — and a
-null argument is a no-op. Do **not** call it on the `orbit_cov` of an
-OD result or a propagated state: those are owned by their parent and
+Idempotent — the pointer is nulled and the length zeroed — and a null
+argument is a no-op. Do **not** call it on the `orbit_cov` of an OD
+result or a propagated state: those are owned by their parent and
 released by the parent's own free function.
 
 # Safety
-`cov` must be null or a struct written by
+`cov` must be null or a joint written by
 [`empyrean_propagation_joint_at`] and not already freed.*/
 #[inline]
-pub unsafe fn empyrean_orbit_covariance_free(cov: *mut EmpyreanOrbitCovariance) {
+pub unsafe fn empyrean_orbit_covariance_free(cov: *mut EmpyreanPackedJoint) {
     unsafe { lib().empyrean_orbit_covariance_free(cov) }
 }

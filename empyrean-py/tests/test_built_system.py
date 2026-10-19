@@ -58,8 +58,9 @@ def test_build_system_freezes_key() -> None:
     assert isinstance(system, BuiltSystem)
     assert system.force_model is ForceModelTier.STANDARD
     assert system.frame is Frame.ICRF
-    # 0.0 sentinel resolves to the engine default divisor.
-    assert system.encounter_timescale_divisor == 1000.0
+    # The encounter-floor angle is resolved by the engine (not a caller knob)
+    # and read back onto the handle.
+    assert system.encounter_floor_angle == pytest.approx(0.04631500395488421)
     assert "standard" in repr(system) and "icrf" in repr(system)
 
 
@@ -134,7 +135,7 @@ def test_describe_reports_full_provenance() -> None:
     assert isinstance(desc, SystemDescription)
     assert desc.force_model is ForceModelTier.STANDARD
     assert desc.frame is Frame.ICRF
-    assert desc.encounter_timescale_divisor == 1000.0
+    assert desc.encounter_floor_angle == pytest.approx(0.04631500395488421)
     assert desc.relativistic is True
     assert desc.asteroids is True
     assert desc.has_bpc is True
@@ -180,15 +181,6 @@ def test_guard_fires_on_frame_mismatch() -> None:
     bad = PropagationConfig(force_model=ForceModelTier.STANDARD, frame=Frame.ECLIPTICJ2000)
     with pytest.raises(ValueError, match="frame mismatch"):
         system.propagate(_orbit(), _epochs(), bad)
-
-
-def test_guard_fires_on_divisor_mismatch() -> None:
-    # Freeze a non-default divisor; a default-divisor config trips the guard.
-    system = build_system(force_model="standard", frame="icrf", encounter_timescale_divisor=500.0)
-    assert system.encounter_timescale_divisor == 500.0
-    cfg = PropagationConfig(force_model=ForceModelTier.STANDARD, frame=Frame.ICRF)  # divisor 1000
-    with pytest.raises(ValueError, match="divisor mismatch"):
-        system.propagate(_orbit(), _epochs(), cfg)
 
 
 def test_guard_message_says_rebuild_not_silent() -> None:

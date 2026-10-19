@@ -1,11 +1,14 @@
 """Internal conversion utilities between Rust dicts and quivr types."""
 
-from typing import Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import numpy as np
 import numpy.typing as npt
 import pyarrow as pa
 import quivr as qv
+
+if TYPE_CHECKING:
+    from empyrean.orbits.joint import PackedJoints
 
 from empyrean.coordinates.coordinates import (
     CartesianCoordinates,
@@ -601,8 +604,9 @@ def orbit_batch_dict_to_orbits(result: dict[str, Any]) -> AnyOrbits:
 
     epochs = np.asarray(result["epoch_mjd_tdb"], dtype=np.float64)
     elements = np.asarray(result["elements"], dtype=np.float64)
-    has_cov = np.asarray(result["has_covariance"], dtype=bool)
-    cov_matrices = np.asarray(result["covariance"], dtype=np.float64)
+    # The orbit's covariance is the one packed joint; its leading 6x6 is the
+    # derived state block, so no separate flat covariance rides this wire.
+    joint = joint_from_result(result)
     frames = result["frame"]  # list of strings ("icrf" / "ecliptic_j2000")
     origins = np.asarray(result["origin"], dtype=np.int32)
 
@@ -625,8 +629,19 @@ def orbit_batch_dict_to_orbits(result: dict[str, Any]) -> AnyOrbits:
     }
     for j, name in enumerate(col_names):
         coords_kwargs[name] = elements[:, j]
-    if has_cov.any():
-        coords_kwargs["covariance"] = _covariance_from_matrix(cov_cls, cov_matrices)
+    # Derive the state 6x6 from each joint's leading block, as a read-only
+    # convenience mirror of the authoritative packed joint. A row with no
+    # joint carries no state covariance (NaN), never a block of zeros.
+    if joint is not None:
+        state_blocks = np.full((n, 6, 6), np.nan, dtype=np.float64)
+        any_state = False
+        for i in range(n):
+            pj = joint.joint(i)
+            if pj is not None:
+                state_blocks[i] = np.asarray(pj.state_block(), dtype=np.float64)
+                any_state = True
+        if any_state:
+            coords_kwargs["covariance"] = _covariance_from_matrix(cov_cls, state_blocks)
     # Bind validate / permit_nulls explicitly so the splat maps only onto
     # quivr's trailing column ``**kwargs``, not its leading bool params.
     coordinates = coord_cls.from_kwargs(validate=True, permit_nulls=False, **coords_kwargs)
@@ -653,9 +668,6 @@ def orbit_batch_dict_to_orbits(result: dict[str, Any]) -> AnyOrbits:
         ng_n = np.asarray(result.get("ng_n", np.zeros(n)), dtype=np.float64)
         ng_k = np.asarray(result.get("ng_k", np.zeros(n)), dtype=np.float64)
         ng_dt = np.asarray(result.get("non_grav_dt", np.full(n, np.nan)), dtype=np.float64)
-        ng_dt_variance = np.asarray(
-            result.get("non_grav_dt_variance", np.full(n, np.nan)), dtype=np.float64
-        )
         models: list[str] = []
         for i in range(n):
             if ng_alpha[i] != 0.0:
@@ -683,7 +695,6 @@ def orbit_batch_dict_to_orbits(result: dict[str, Any]) -> AnyOrbits:
             n=ng_n,
             k=ng_k,
             dt=ng_dt,
-            dt_variance=ng_dt_variance,
         )
 
     # SRP force slot — reconstruct ``orbits.srp`` when any row carries an SRP
@@ -695,12 +706,10 @@ def orbit_batch_dict_to_orbits(result: dict[str, Any]) -> AnyOrbits:
     if has_srp.any():
         srp_amrat = np.asarray(result.get("srp_amrat", np.full(n, np.nan)), dtype=np.float64)
         srp_cr = np.asarray(result.get("srp_cr", np.full(n, np.nan)), dtype=np.float64)
-        srp_var = np.asarray(result.get("srp_amrat_variance", np.full(n, np.nan)), dtype=np.float64)
         present = has_srp != 0
         orbits_kwargs["srp"] = SRPParams.from_kwargs(
             amrat=np.where(present, srp_amrat, np.nan),
             cr=np.where(present, srp_cr, np.nan),
-            amrat_variance=np.where(present, srp_var, np.nan),
         )
 
     # Photometry — populated when the upstream source (e.g. SBDB's
@@ -786,9 +795,52 @@ def orbit_batch_dict_to_orbits(result: dict[str, Any]) -> AnyOrbits:
             covariance=cov_list,
         )
 
+    # The one packed joint per orbit — the covariance authority.
+    if joint is not None:
+        orbits_kwargs["covariance"] = joint
+
     # Bind validate / permit_nulls explicitly so the splat maps only onto
     # quivr's trailing column ``**kwargs``, not its leading bool params.
     return orbits_cls.from_kwargs(validate=True, permit_nulls=False, **orbits_kwargs)
+
+
+# The documented spelling of PhotometricParams.model (lowercase), so an
+# Orbits -> dict -> Orbits round trip returns the caller's own tag rather
+# than rewriting its case.
+_MODEL_INT_TO_TAG = {0: "hg", 1: "hg1g2", 2: "hg12"}
+
+
+def _photometry_wire(orbits: AnyOrbits) -> dict[str, Any]:
+    """The photometry fragment of the orbit wire, shared by every
+    Python -> Rust orbit marshaler.
+
+    Both the batch orbits-table dict and the determine / evaluate /
+    visibility orbit dict carry an orbit's ``(phase function, H, slope1,
+    slope2)`` quad plus its optional 3x3 under these keys. Emitting them
+    from one place keeps the two seams from drifting: the visibility /
+    evaluate dict dropped them entirely, so the engine saw a
+    photometry-less orbit, apparent magnitude came back NaN, and the
+    magnitude gate could never pass.
+
+    A model tag with no absolute magnitude is not photometry — the phase
+    function alone predicts nothing — so such a row carries a null tag
+    rather than a tag beside a fabricated H.
+    """
+    phot_h, phot_slope1, phot_slope2, phot_model, has_phot_cov, phot_cov = extract_photometry(
+        orbits
+    )
+    phot_system = [
+        _MODEL_INT_TO_TAG.get(int(m)) if np.isfinite(h) else None
+        for m, h in zip(phot_model, phot_h, strict=True)
+    ]
+    return {
+        "phot_system": phot_system,
+        "phot_h": phot_h,
+        "phot_slope1": phot_slope1,
+        "phot_slope2": phot_slope2,
+        "has_phot_covariance": has_phot_cov,
+        "phot_covariance": phot_cov,
+    }
 
 
 def orbits_to_orbit_batch_dict(orbits: AnyOrbits) -> dict[str, Any]:
@@ -813,19 +865,10 @@ def orbits_to_orbit_batch_dict(orbits: AnyOrbits) -> dict[str, Any]:
         [_column_to_numpy(getattr(orbits.coordinates, c)) for c in col_names]
     )
 
-    # Same contract as `coordinates_to_arrays`: every class in
-    # `_COORD_TYPE_MAP` declares a nullable `covariance` sub-table column and
-    # quivr materialises it as all-null rather than `None`, so there is no
-    # "no covariance column" branch. A fifth representation must declare one
-    # too, or gain a guard here that raises rather than substituting zeros.
+    # The orbit's covariance is the one packed joint; its leading 6x6 is the
+    # derived state block, so no separate flat covariance rides this wire.
     orbit_ids = orbits.orbit_id.to_pylist()
-    cov_matrices, cov_present = _covariance_matrices_and_presence(
-        orbits.coordinates.covariance,
-        entry_point="orbits_to_orbit_batch_dict",
-        n_rows=n,
-        orbit_ids=orbit_ids,
-    )
-    has_cov = cov_present.astype(np.uint8)
+    joint_wire = extract_joint_wire(orbits)
 
     # ``orbits.coordinates.frame`` is the stored string (``Frame`` is a
     # ``str`` enum, so its value serialises directly). Key by those value
@@ -850,7 +893,6 @@ def orbits_to_orbit_batch_dict(orbits: AnyOrbits) -> dict[str, Any]:
     ng_n = np.zeros(n)
     ng_k = np.zeros(n)
     ng_dt = np.full(n, np.nan)
-    ng_dt_variance = np.full(n, np.nan)
     if orbits.non_grav is not None:
         ng = orbits.non_grav
         a1 = np.nan_to_num(_column_to_numpy(ng.a1), nan=0.0)
@@ -867,42 +909,25 @@ def orbits_to_orbit_batch_dict(orbits: AnyOrbits) -> dict[str, Any]:
         # Preserve NaN as "no thermal-lag delay" — 0.0 is a real delay,
         # so do NOT nan_to_num this one.
         ng_dt = _column_to_numpy(ng.dt)
-        # DT prior variance (opens the DT column in a StateAndNonGravAndDT
-        # solve). Preserve NaN as "no prior" — do NOT nan_to_num.
-        ng_dt_variance = _column_to_numpy(ng.dt_variance)
 
-    # SRP force slot (has_srp explicit switch + amrat/cr/variance). Additive
-    # with the Marsden non-grav above; validated + gated in extract_srp.
-    has_srp, srp_amrat, srp_cr, srp_amrat_variance = extract_srp(orbits)
+    # SRP force slot (has_srp explicit switch + amrat/cr). Additive with the
+    # Marsden non-grav above; validated + gated in extract_srp. The AMRAT
+    # prior rides the packed joint.
+    has_srp, srp_amrat, srp_cr = extract_srp(orbits)
 
-    # Photometry. The reverse direction (orbit_batch_dict_to_orbits) has
-    # always read these keys back; this direction emitted none of them, so
-    # an orbit batch written through the Python I/O surface lost its H/G
-    # entirely — including the H uncertainty the engine's parquet / CSV
-    # formats do carry.
-    phot_h, phot_slope1, phot_slope2, phot_model, has_phot_cov, phot_cov = extract_photometry(
-        orbits
-    )
-    # The documented spelling of PhotometricParams.model (lowercase), so
-    # an Orbits -> dict -> Orbits round trip returns the caller's own
-    # tag rather than rewriting its case.
-    _MODEL_INT_TO_TAG = {0: "hg", 1: "hg1g2", 2: "hg12"}
-    # A model tag with no absolute magnitude is not photometry: the
-    # phase function alone predicts nothing. Emit no tag for such a row
-    # so the file carries NULL, rather than a tag beside a fabricated H.
-    phot_system = [
-        _MODEL_INT_TO_TAG.get(int(m)) if np.isfinite(h) else None
-        for m, h in zip(phot_model, phot_h, strict=True)
-    ]
+    # Photometry — the (phase function, H, slope1, slope2) quad plus its
+    # optional 3x3, shared verbatim with the determine / evaluate /
+    # visibility orbit dict via `_photometry_wire` so the two seams cannot
+    # drift. The reverse direction (orbit_batch_dict_to_orbits) has always
+    # read these keys back.
+    phot_wire = _photometry_wire(orbits)
 
     object_ids = [s if s else "" for s in orbits.object_id.to_pylist()]
-    return {
+    out: dict[str, Any] = {
         "orbit_ids": orbit_ids,
         "object_ids": object_ids,
         "epoch_mjd_tdb": epochs,
         "elements": elements,
-        "covariance": cov_matrices,
-        "has_covariance": has_cov,
         "representation": [rep] * n,
         "frame": [frame_str] * n,
         "origin": origin_naif,
@@ -915,18 +940,16 @@ def orbits_to_orbit_batch_dict(orbits: AnyOrbits) -> dict[str, Any]:
         "ng_n": ng_n,
         "ng_k": ng_k,
         "non_grav_dt": ng_dt,
-        "non_grav_dt_variance": ng_dt_variance,
         "has_srp": has_srp,
         "srp_amrat": srp_amrat,
         "srp_cr": srp_cr,
-        "srp_amrat_variance": srp_amrat_variance,
-        "phot_system": phot_system,
-        "phot_h": phot_h,
-        "phot_slope1": phot_slope1,
-        "phot_slope2": phot_slope2,
-        "has_phot_covariance": has_phot_cov,
-        "phot_covariance": phot_cov,
+        **phot_wire,
     }
+    # The one packed joint per orbit — the covariance authority. No key at
+    # all when no orbit carried a joint.
+    if joint_wire is not None:
+        out["covariance"] = joint_wire
+    return out
 
 
 # Relative tolerance on the photometric covariance's symmetry. A matrix
@@ -1002,8 +1025,7 @@ def extract_photometry(
 
     ``has_phot_cov`` / ``phot_cov`` are the ``(n,)`` bool mask + ``(n, 3,
     3)`` row-major covariance over ``(H, slope1, slope2)``, all-False +
-    zeros where no row carries one. Same shape as
-    :func:`extract_non_grav_covariance`. Each supplied 3x3 is validated
+    zeros where no row carries one. Each supplied 3x3 is validated
     finite and symmetric — the file formats store only the lower
     triangle, so an asymmetric matrix would come back truncated. A
     covariance on a row with no absolute magnitude or no model tag is a
@@ -1108,204 +1130,55 @@ def extract_photometry(
     return h, slope1, slope2, model_ints, has_phot_cov, phot_cov
 
 
-def extract_non_grav_covariance(
-    orbits: AnyOrbits,
-) -> tuple[npt.NDArray[np.bool_], FloatArray]:
-    """Extract the fitted non-grav 3x3 covariance from orbits.
-
-    Returns ``(has_non_grav_cov, non_grav_cov)`` — a ``(n,)`` bool mask and a
-    ``(n, 3, 3)`` float64 array (row-major, zeros where absent). Mirrors the OD
-    output path's marshal (``empyrean.od.determine._orbits_to_dict``) so a
-    ``StateAndNonGrav``-fitted orbit re-fed into the forward model
-    (propagate / generate_ephemeris / impact) keeps its non-grav prior instead
-    of silently dropping it. All-False + zeros when the orbit has no
-    ``non_grav`` sub-table or no row carries a fitted covariance.
-    """
-    n = len(orbits)
-    has_non_grav_cov = np.zeros(n, dtype=bool)
-    non_grav_cov = np.zeros((n, 3, 3), dtype=np.float64)
-    if orbits.non_grav is not None:
-        for i, c in enumerate(orbits.non_grav.covariance.to_pylist()):
-            if c is not None:
-                non_grav_cov[i] = np.asarray(c, dtype=np.float64).reshape(3, 3)
-                has_non_grav_cov[i] = True
-    return has_non_grav_cov, non_grav_cov
-
-
-# ── The joint covariance (shared marshal helpers) ────────────────────
+# ── The packed joint covariance (shared marshal helpers) ─────────────
 #
-# The state block of a joint solved-parameter covariance rides
-# ``coordinates.covariance``; its off-diagonal blocks ride
-# :class:`~empyrean.orbits.nongrav.NonGravParams.non_grav_cross` (the
-# state-Marsden border) and
-# :class:`~empyrean.orbits.wide_cross.WideCross` (everything else).
-# These helpers carry that pair across the extension boundary in both
-# directions, as six parallel per-row lists named for the columns they
-# feed.
+# A fit over the state and P parameters produces one (6+P)x(6+P) matrix.
+# It rides as the single :class:`~empyrean.orbits.joint.PackedJoints`
+# column on the orbit (the covariance authority); its leading 6x6 is the
+# derived state block. These helpers carry the per-row packed joint
+# across the extension boundary in both directions, as the one
+# ``covariance`` key the extension reads and writes.
 #
-# Absence is a ``None`` ROW at every hop, never a row of zeros. An entry
-# whose values are all zero is a supplied zero correlation that engages
-# the engine's definiteness gate, so zero-filling an absent row would
-# turn "this orbit has no cross terms" into "this orbit asserts
-# uncorrelated" — a different and stronger claim than the caller made.
-
-# Number of values in the row-major 6x3 state-Marsden border.
-_BORDER_VALUES = 18
-
-# The six keys the extension reads and writes. One list per key, one
-# entry per orbit row.
-_JOINT_KEYS = (
-    "non_grav_cross",
-    "wide_columns",
-    "wide_state",
-    "wide_pair_a",
-    "wide_pair_b",
-    "wide_pair_value",
-)
+# Absence is a ``None`` ROW at every hop, never a zero-filled joint: a
+# joint of zeros would read as a supplied zero covariance that engages
+# the engine's definiteness gate.
 
 
-def extract_joint(orbits: AnyOrbits) -> dict[str, list[Any]]:
-    """Extract an orbit table's joint cross terms for the extension.
+def extract_joint_wire(orbits: AnyOrbits) -> list[dict[str, Any] | None] | None:
+    """Extract an orbit table's packed joint as the extension's wire list.
 
-    Returns the six parallel per-row lists keyed by
-    :data:`_JOINT_KEYS`, or an **empty dict** when no row carries
-    anything — so a caller can splat the result into an extension call
-    and a batch with no joint passes no joint keys at all.
+    Returns the per-orbit-row list of packed-joint dicts (or ``None``
+    rows for orbits with no covariance), or ``None`` when no row carries
+    a joint at all — so a caller passes the ``covariance`` key only when
+    the batch has one.
 
-    Shared by every orbit-marshaling entry point (propagate, determine /
-    evaluate / refine) so none of them silently drops a caller's cross
-    terms. A fitted or propagated orbit re-fed with only its ``6x6``
-    reports a tighter uncertainty than the run that produced it
-    supports, because the state-parameter columns it drops are non-zero
-    even when the original input was block-diagonal.
-
-    Raises
-    ------
-    ValueError
-        If a row's border is not 18 values, or its tag and payload
-        lengths disagree. Both are refused rather than reshaped: a
-        mismatch means the two were written out of step, and reshaping
-        anyway attaches one parameter's covariances to another.
+    Shared by every orbit-marshaling entry point (propagate, impact,
+    generate_ephemeris, determine / evaluate / refine) so none of them
+    silently drops a caller's joint. A fitted or propagated orbit re-fed
+    with only its ``6x6`` reports a tighter uncertainty than the run that
+    produced it supports, because the state-parameter columns it drops
+    are non-zero even when the original input was block-diagonal.
     """
-    n = len(orbits)
-    border: list[list[float] | None] = [None] * n
-    if orbits.non_grav is not None:
-        for i, row in enumerate(orbits.non_grav.non_grav_cross.to_pylist()):
-            if row is None:
-                continue
-            if len(row) != _BORDER_VALUES:
-                raise ValueError(
-                    f"orbits.non_grav.non_grav_cross[{i}] has {len(row)} values but "
-                    f"the state-Marsden border is 6x3 = {_BORDER_VALUES}, row-major "
-                    "(state elements down, A1/A2/A3 across). A short or long row "
-                    "cannot be reshaped without guessing which element went missing."
-                )
-            border[i] = [float(v) for v in row]
-
-    # A nullable sub-table column is never None — quivr returns a table
-    # of parent length regardless — so this reads per-row nulls rather
-    # than testing the sub-table for absence.
-    wide = orbits.wide_cross
-    columns: list[list[str] | None] = wide.columns.to_pylist()
-    state: list[list[float] | None] = wide.state.to_pylist()
-    pair_a: list[list[str] | None] = wide.pair_a.to_pylist()
-    pair_b: list[list[str] | None] = wide.pair_b.to_pylist()
-    pair_value: list[list[float] | None] = wide.pair_value.to_pylist()
-
-    for i, (tags, values) in enumerate(zip(columns, state, strict=True)):
-        n_tags = len(tags) if tags else 0
-        n_values = len(values) if values else 0
-        if n_values != 6 * n_tags:
-            raise ValueError(
-                f"orbits.wide_cross row {i}: the state payload has {n_values} values "
-                f"but {n_tags} tagged column(s) need {6 * n_tags}. The payload is "
-                "row-major 6-per-column; a mismatch means the two were written out "
-                "of step, and reshaping anyway would attach one parameter's "
-                "covariances to another."
-            )
-
-    # Erased to the return type's element type: the six lists differ in
-    # payload (floats, tags) but are handled identically from here.
-    carried: list[list[Any]] = [border, columns, state, pair_a, pair_b, pair_value]
-    if not any(any(row is not None for row in column) for column in carried):
-        return {}
-    return dict(zip(_JOINT_KEYS, carried, strict=True))
+    joint = orbits.covariance
+    rows = joint.to_wire_list()
+    if not any(row is not None for row in rows):
+        return None
+    return rows
 
 
-def joint_columns_from_result(
-    result: dict[str, Any], n: int, prefix: str = ""
-) -> tuple[list[list[float] | None] | None, qv.Table | None]:
-    """Rebuild the joint's two homes from an extension result dict.
+def joint_from_result(result: dict[str, Any], prefix: str = "") -> "PackedJoints | None":
+    """Rebuild the packed joint column from an extension result dict.
 
-    Returns ``(non_grav_cross, wide_cross)`` — the per-row border column
-    for :class:`~empyrean.orbits.nongrav.NonGravParams` and a populated
-    :class:`~empyrean.orbits.wide_cross.WideCross`, each ``None`` when
-    the result carried none. Inverse of :func:`extract_joint`.
-
-    Rows the engine produced no joint for stay ``None``; nothing is
-    zero-filled on the way back either.
+    Returns a :class:`~empyrean.orbits.joint.PackedJoints` built from the
+    result's ``{prefix}covariance`` per-row list, or ``None`` when the
+    result carried no joint. Inverse of :func:`extract_joint_wire`. Rows
+    the engine produced no joint for stay ``None``; nothing is zero-filled
+    on the way back either.
     """
-    from empyrean.orbits.wide_cross import WideCross
+    from empyrean.orbits.joint import PackedJoints
 
-    border = result.get(f"{prefix}non_grav_cross")
-    columns = result.get(f"{prefix}wide_columns")
-    state = result.get(f"{prefix}wide_state")
-    pair_a = result.get(f"{prefix}wide_pair_a")
-    pair_b = result.get(f"{prefix}wide_pair_b")
-    pair_value = result.get(f"{prefix}wide_pair_value")
-
-    # Gated on CONTENT, not on the key being present. The six lists are
-    # written as a group whenever any of them carries something, so a
-    # result with a carrier but no state-Marsden border still writes a
-    # border column of all-nulls. Treating that as "a border arrived"
-    # attaches an all-null NonGravParams to an orbit that declares no
-    # Marsden block — harmless in value, but it says the orbit has a
-    # non-grav block when it has none.
-    border_col: list[list[float] | None] | None = None
-    if border is not None and any(row is not None for row in border):
-        border_col = [list(row) if row is not None else None for row in border]
-
-    wide: qv.Table | None = None
-    if any(c is not None for c in (columns, state, pair_a, pair_b, pair_value)):
-        empty: list[None] = [None] * n
-        wide = WideCross.from_kwargs(
-            columns=columns if columns is not None else empty,
-            state=state if state is not None else empty,
-            pair_a=pair_a if pair_a is not None else empty,
-            pair_b=pair_b if pair_b is not None else empty,
-            pair_value=pair_value if pair_value is not None else empty,
-        )
-    return border_col, wide
-
-
-def non_grav_border_only(border: list[list[float] | None]) -> qv.Table:
-    """A :class:`NonGravParams` carrying the border and nothing else.
-
-    A propagation output carries the *propagated* state-Marsden border,
-    but not the Marsden coefficients or their ``3x3`` — those are inputs
-    that propagation passes through unchanged, and restating them on the
-    output would give one orbit's force model two homes that can
-    disagree.
-
-    So the other columns are written **explicitly null**, which is the
-    same shape quivr materialises for a sub-table column the caller
-    never set. They are declared non-nullable, so this is the one
-    construction in this module that passes ``permit_nulls``; a
-    fabricated zero ``a1`` would read as "this orbit has no radial
-    non-grav acceleration", which the output does not claim.
-    """
-    from empyrean.orbits.nongrav import NonGravParams
-
-    n = len(border)
-    nulls_f64 = pa.nulls(n, pa.float64())
-    return NonGravParams.from_kwargs(
-        a1=nulls_f64,
-        a2=nulls_f64,
-        a3=nulls_f64,
-        model=pa.nulls(n, pa.large_string()),
-        non_grav_cross=border,
-        permit_nulls=True,
-    )
+    rows = result.get(f"{prefix}covariance")
+    return PackedJoints.from_wire_list(rows)
 
 
 # ── SRP force slot (shared marshal helpers) ──────────────────────────
@@ -1380,32 +1253,28 @@ def validate_non_grav_marsden_only(orbits: AnyOrbits) -> None:
 
 def extract_srp(
     orbits: AnyOrbits,
-) -> tuple[npt.NDArray[np.uint8], FloatArray, FloatArray, FloatArray]:
+) -> tuple[npt.NDArray[np.uint8], FloatArray, FloatArray]:
     """Extract the SRP force slot from ``orbits.srp`` as parallel arrays.
 
-    Returns ``(has_srp, srp_amrat, srp_cr, srp_amrat_variance)`` — a ``(n,)``
-    ``uint8`` switch and three ``(n,)`` float64 arrays. ``has_srp[i] == 1``
-    only where the ``srp`` sub-table is present for row ``i`` (a finite
-    ``amrat``); SRP is never value-inferred. Absent rows read
-    ``has_srp = 0`` with ``amrat = cr = 0`` and ``amrat_variance = NaN``.
+    Returns ``(has_srp, srp_amrat, srp_cr)`` — a ``(n,)`` ``uint8`` switch
+    and two ``(n,)`` float64 arrays. ``has_srp[i] == 1`` only where the
+    ``srp`` sub-table is present for row ``i`` (a finite ``amrat``); SRP is
+    never value-inferred. Absent rows read ``has_srp = 0`` with
+    ``amrat = cr = 0``. The AMRAT prior rides the orbit's packed joint.
 
     Validates loudly (mirrors the C-ABI ``empyrean_orbit_srp_params`` rules):
-    a present row must have a finite ``amrat`` and ``cr`` both ``> 0``, and a
-    finite ``amrat_variance`` must be ``> 0`` (NaN / null = no prior).
+    a present row must have a finite ``amrat`` and ``cr`` both ``> 0``.
     """
     n = len(orbits)
     has_srp = np.zeros(n, dtype=np.uint8)
     srp_amrat = np.zeros(n, dtype=np.float64)
     srp_cr = np.zeros(n, dtype=np.float64)
-    srp_amrat_variance = np.full(n, np.nan, dtype=np.float64)
     if orbits.srp is None:
-        return has_srp, srp_amrat, srp_cr, srp_amrat_variance
+        return has_srp, srp_amrat, srp_cr
 
     srp = orbits.srp
     amrat = np.asarray(srp.amrat.to_numpy(zero_copy_only=False), dtype=np.float64)
     cr = np.asarray(srp.cr.to_numpy(zero_copy_only=False), dtype=np.float64)
-    # Nullable column: nulls come back as NaN = "no prior".
-    variance = np.asarray(srp.amrat_variance.to_numpy(zero_copy_only=False), dtype=np.float64)
 
     # A row is present exactly when its (non-nullable) amrat is non-null. quivr
     # returns NaN for a null sub-table row (and an all-null SRPParams even when
@@ -1424,14 +1293,7 @@ def extract_srp(
                 f"orbits.srp.cr[{i}] must be finite and > 0 (radiation-pressure "
                 f"coefficient); got {cr[i]}"
             )
-        if np.isfinite(variance[i]) and variance[i] <= 0.0:
-            raise ValueError(
-                f"orbits.srp.amrat_variance[{i}] must be > 0 when set (AMRAT "
-                f"prior variance, (m^2/kg)^2); got {variance[i]} — use null for "
-                f"no prior"
-            )
         has_srp[i] = 1
         srp_amrat[i] = amrat[i]
         srp_cr[i] = cr[i]
-        srp_amrat_variance[i] = variance[i]
-    return has_srp, srp_amrat, srp_cr, srp_amrat_variance
+    return has_srp, srp_amrat, srp_cr

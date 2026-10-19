@@ -21,17 +21,25 @@ import numpy.typing as npt
 from empyrean._convert import AnyOrbits, naif_to_origin
 from empyrean.coordinates.epoch import Epochs
 from empyrean.od.determine import _orbits_to_dict
+from empyrean.orbits.joint import _KIND_BY_CODE, CovarianceKind, PackedJoints
 from empyrean.planning.result import (
     _INT_TO_KIND,
+    _INT_TO_LOG_DET_WITHHELD,
     _INT_TO_RADAR_MODE,
     STAGE_POSTERIOR,
     STAGE_PRIOR,
+    Nights,
+    ObservatorySummary,
     PlanCandidates,
     PlanEphemeris,
     PlanMetrics,
     PlannedObservation,
     PlanningConfig,
     PlanResult,
+    VisibilityAnchors,
+    VisibilityPoints,
+    VisibilityResult,
+    VisibilityWindows,
     _nan_to_null,
 )
 
@@ -112,6 +120,28 @@ def _metrics_table(out: ResultDict) -> PlanMetrics:
     def column(name: str) -> list[float]:
         return [float(out[f"{prefix}{name}"]) for _, prefix in _METRIC_STAGES]
 
+    def withheld(prefix: str) -> str:
+        code = int(out[f"{prefix}log_det_withheld"])
+        try:
+            return _INT_TO_LOG_DET_WITHHELD[code]
+        except KeyError:
+            raise RuntimeError(
+                f"engine returned an unknown log-det withheld code: {code}"
+            ) from None
+
+    def withheld_method(prefix: str) -> str | None:
+        # -1 is the "no sampled method applies" sentinel (every reason but
+        # SAMPLED_MOMENT); it maps to a null, never to a kind.
+        code = int(out[f"{prefix}log_det_withheld_method"])
+        if code < 0:
+            return None
+        try:
+            return _KIND_BY_CODE[code].value
+        except KeyError:
+            raise RuntimeError(
+                f"engine returned an unknown log-det withheld method code: {code}"
+            ) from None
+
     return PlanMetrics.from_kwargs(
         stage=[stage for stage, _ in _METRIC_STAGES],
         position_sigma_km=column("position_sigma_km"),
@@ -119,6 +149,8 @@ def _metrics_table(out: ResultDict) -> PlanMetrics:
         semi_major_km=column("semi_major_km"),
         semi_minor_km=column("semi_minor_km"),
         log_det=column("log_det"),
+        log_det_withheld=[withheld(prefix) for _, prefix in _METRIC_STAGES],
+        log_det_withheld_method=[withheld_method(prefix) for _, prefix in _METRIC_STAGES],
     )
 
 
@@ -409,10 +441,295 @@ def evaluate_plan(
         dec_deg=_floats(out, "ephemeris_dec_deg"),
     )
 
+    resolved_code = int(out["resolved_method"])
+    try:
+        resolved_method = _KIND_BY_CODE[resolved_code]
+    except KeyError:
+        raise RuntimeError(
+            f"engine returned an unknown resolved-method covariance-kind code: {resolved_code}"
+        ) from None
+
     return PlanResult(
         orbit_id=str(out["orbit_id"]),
         metrics=_metrics_table(out),
         candidates=candidates,
         ephemeris=ephemeris,
         active_width=int(out["active_width"]),
+        log_det_gain=float(out["log_det_gain"]),
+        resolved_method=resolved_method,
+    )
+
+
+def compute_visibility(
+    orbits: AnyOrbits,
+    start: float,
+    end: float,
+    step_days: float,
+    config: PlanningConfig | None = None,
+) -> VisibilityResult:
+    """Survey when and whether each orbit is observable from a set of sites.
+
+    For every orbit in ``orbits`` and every observatory in
+    ``config.observatories``, step across ``[start, end]`` (MJD TDB) on a
+    ``step_days`` grid and report:
+
+    - the per-epoch :class:`~empyrean.VisibilityPoints` (the four
+      observability gates and the Moon's altitude, azimuth and illuminated
+      fraction);
+    - the contiguous observable :class:`~empyrean.VisibilityWindows`;
+    - for a ground site, the :class:`~empyrean.Nights` product — twilight
+      epochs, local solar midnight, the per-night observable intervals, and
+      the :class:`~empyrean.VisibilityAnchors` (a chosen epoch and its
+      Moon-aware circumstances under each policy).
+
+    Unlike :func:`evaluate_plan`, this reads the whole of each
+    :class:`~empyrean.ObservatoryConfig`: the elevation and darkness gates
+    and the night-product twilight thresholds, not just the site-invariant
+    pair. A :class:`~empyrean.VisibilityPoints` row's ``observable`` is the
+    conjunction of all four gates — the site-aware verdict plan evaluation
+    cannot give.
+
+    Parameters
+    ----------
+    orbits : Orbits
+        One or more orbits to survey. Each is surveyed independently; the
+        result tables carry its ``orbit_id``.
+    start, end : float
+        Survey window, MJD TDB.
+    step_days : float
+        Grid step in days; each twilight / midnight / transit epoch is
+        refined by bisection off this grid to one second.
+    config : PlanningConfig, optional
+        Must carry at least one :attr:`PlanningConfig.observatories` entry.
+
+    Returns
+    -------
+    VisibilityResult
+        The :class:`~empyrean.VisibilityPoints`,
+        :class:`~empyrean.VisibilityWindows`, :class:`~empyrean.Nights` and
+        :class:`~empyrean.VisibilityAnchors` tables, plus the per-observatory
+        :class:`~empyrean.ObservatorySummary`.
+
+    Raises
+    ------
+    ValueError
+        ``config`` carries no observatory, or a twilight-threshold set is
+        partial.
+    RuntimeError
+        The engine refused a survey — an invalid window, a non-descending
+        twilight set (named by the observatory), an unresolvable station
+        code, or a propagation failure.
+    """
+    from empyrean._empyrean_rs import _compute_visibility
+
+    if config is None:
+        config = PlanningConfig()
+    if not config.observatories:
+        raise ValueError(
+            "compute_visibility needs at least one observatory in "
+            "PlanningConfig.observatories — each carries the site's gates and "
+            "the night-product twilight thresholds."
+        )
+    config_wire = config._to_wire_dict()
+
+    point_cols: dict[str, list[Any]] = {}
+    window_cols: dict[str, list[Any]] = {}
+    night_cols: dict[str, list[Any]] = {}
+    anchor_cols: dict[str, list[Any]] = {}
+    obs_cols: dict[str, list[Any]] = {}
+    anchor_joint_wires: list[dict[str, Any] | None] = []
+
+    def extend(store: dict[str, list[Any]], out: ResultDict, prefix: str, orbit_id: str) -> None:
+        keys = [k for k in out if k.startswith(prefix)]
+        n = len(out[keys[0]]) if keys else 0
+        store.setdefault("orbit_id", []).extend([orbit_id] * n)
+        for k in keys:
+            store.setdefault(k[len(prefix) :], []).extend(out[k])
+
+    for i in range(len(orbits)):
+        single = orbits[i : i + 1]
+        orbit_dict = _orbits_to_dict(single)
+        out: ResultDict = _compute_visibility(
+            orbit_dict,
+            config_wire,
+            float(start),
+            float(end),
+            float(step_days),
+            None,
+        )
+        orbit_id = str(out["orbit_id"])
+        extend(point_cols, out, "point_", orbit_id)
+        extend(window_cols, out, "window_", orbit_id)
+        extend(night_cols, out, "night_", orbit_id)
+        extend(anchor_cols, out, "anchor_", orbit_id)
+        # Per-observatory metadata: the un-prefixed obs_* keys.
+        n_obs = len(out["obs_code"])
+        obs_cols.setdefault("orbit_id", []).extend([orbit_id] * n_obs)
+        obs_cols.setdefault("obs_code", []).extend(out["obs_code"])
+        obs_cols.setdefault("note", []).extend(out["obs_note"])
+        obs_cols.setdefault("resolved_method", []).extend(
+            CovarianceKind(_KIND_BY_CODE[int(c)]).value for c in out["obs_resolved_method"]
+        )
+        obs_cols.setdefault("earth_orientation_present", []).extend(
+            out["obs_earth_orientation_present"]
+        )
+        obs_cols.setdefault("earth_orientation_bpc_epochs", []).extend(
+            out["obs_earth_orientation_bpc_epochs"]
+        )
+        obs_cols.setdefault("earth_orientation_analytic_iau_2006_epochs", []).extend(
+            out["obs_earth_orientation_analytic_iau_2006_epochs"]
+        )
+        # The anchor sky-covariance joints ride a parallel list (one wire dict
+        # or None per anchor), joined positionally to the anchor rows.
+        anchor_joint_wires.extend(out["anchor_joints"])
+
+    points = VisibilityPoints.from_kwargs(
+        orbit_id=point_cols.get("orbit_id", []),
+        obs_code=point_cols.get("obs_code", []),
+        epoch_mjd_tdb=point_cols.get("epoch", []),
+        solar_elongation_deg=point_cols.get("solar_elongation_deg", []),
+        elevation_deg=_nan_to_null(
+            np.asarray(point_cols.get("elevation_deg", []), dtype=np.float64)
+        ),
+        sun_altitude_deg=_nan_to_null(
+            np.asarray(point_cols.get("sun_altitude_deg", []), dtype=np.float64)
+        ),
+        observable=point_cols.get("observable", []),
+        elongation_ok=point_cols.get("elongation_ok", []),
+        mag=_nan_to_null(np.asarray(point_cols.get("mag", []), dtype=np.float64)),
+        magnitude_ok=point_cols.get("magnitude_ok", []),
+        elevation_ok=point_cols.get("elevation_ok", []),
+        darkness_ok=point_cols.get("darkness_ok", []),
+        moon_altitude_deg=_nan_to_null(
+            np.asarray(point_cols.get("moon_altitude_deg", []), dtype=np.float64)
+        ),
+        moon_azimuth_deg=_nan_to_null(
+            np.asarray(point_cols.get("moon_azimuth_deg", []), dtype=np.float64)
+        ),
+        moon_illuminated_fraction=_nan_to_null(
+            np.asarray(point_cols.get("moon_illuminated_fraction", []), dtype=np.float64)
+        ),
+        lunar_elongation_deg=point_cols.get("lunar_elongation_deg", []),
+    )
+
+    windows = VisibilityWindows.from_kwargs(
+        orbit_id=window_cols.get("orbit_id", []),
+        obs_code=window_cols.get("obs_code", []),
+        night_index=np.asarray(window_cols.get("night_index", []), dtype=np.int64),
+        start_epoch_mjd_tdb=window_cols.get("start_epoch", []),
+        end_epoch_mjd_tdb=window_cols.get("end_epoch", []),
+        peak_elongation_deg=window_cols.get("peak_elongation_deg", []),
+        brightest_mag=_nan_to_null(
+            np.asarray(window_cols.get("brightest_mag", []), dtype=np.float64)
+        ),
+        hours_observable=window_cols.get("hours_observable", []),
+        max_altitude_deg=_nan_to_null(
+            np.asarray(window_cols.get("max_altitude_deg", []), dtype=np.float64)
+        ),
+        max_altitude_epoch_mjd_tdb=_nan_to_null(
+            np.asarray(window_cols.get("max_altitude_epoch", []), dtype=np.float64)
+        ),
+        closing_gate=window_cols.get("closing_gate", []),
+    )
+
+    nights = Nights.from_kwargs(
+        orbit_id=night_cols.get("orbit_id", []),
+        obs_code=night_cols.get("obs_code", []),
+        night_index=np.asarray(night_cols.get("index", []), dtype=np.int64),
+        local_date_year=np.asarray(night_cols.get("year", []), dtype=np.int64),
+        local_date_month=np.asarray(night_cols.get("month", []), dtype=np.int64),
+        local_date_day=np.asarray(night_cols.get("day", []), dtype=np.int64),
+        noon_start_mjd_tdb=night_cols.get("noon_start", []),
+        noon_end_mjd_tdb=night_cols.get("noon_end", []),
+        sunset_mjd_tdb=_nan_to_null(np.asarray(night_cols.get("sunset", []), dtype=np.float64)),
+        civil_dusk_mjd_tdb=_nan_to_null(
+            np.asarray(night_cols.get("civil_dusk", []), dtype=np.float64)
+        ),
+        nautical_dusk_mjd_tdb=_nan_to_null(
+            np.asarray(night_cols.get("nautical_dusk", []), dtype=np.float64)
+        ),
+        astronomical_dusk_mjd_tdb=_nan_to_null(
+            np.asarray(night_cols.get("astronomical_dusk", []), dtype=np.float64)
+        ),
+        local_solar_midnight_mjd_tdb=_nan_to_null(
+            np.asarray(night_cols.get("local_solar_midnight", []), dtype=np.float64)
+        ),
+        astronomical_dawn_mjd_tdb=_nan_to_null(
+            np.asarray(night_cols.get("astronomical_dawn", []), dtype=np.float64)
+        ),
+        nautical_dawn_mjd_tdb=_nan_to_null(
+            np.asarray(night_cols.get("nautical_dawn", []), dtype=np.float64)
+        ),
+        civil_dawn_mjd_tdb=_nan_to_null(
+            np.asarray(night_cols.get("civil_dawn", []), dtype=np.float64)
+        ),
+        sunrise_mjd_tdb=_nan_to_null(np.asarray(night_cols.get("sunrise", []), dtype=np.float64)),
+        note=night_cols.get("note", []),
+    )
+
+    anchors = VisibilityAnchors.from_kwargs(
+        orbit_id=anchor_cols.get("orbit_id", []),
+        obs_code=anchor_cols.get("obs_code", []),
+        night_index=np.asarray(anchor_cols.get("night_index", []), dtype=np.int64),
+        policy=anchor_cols.get("policy", []),
+        epoch_mjd_tdb=_nan_to_null(np.asarray(anchor_cols.get("epoch", []), dtype=np.float64)),
+        observable=anchor_cols.get("observable", []),
+        altitude_deg=_nan_to_null(
+            np.asarray(anchor_cols.get("altitude_deg", []), dtype=np.float64)
+        ),
+        azimuth_deg=_nan_to_null(np.asarray(anchor_cols.get("azimuth_deg", []), dtype=np.float64)),
+        sun_altitude_deg=_nan_to_null(
+            np.asarray(anchor_cols.get("sun_altitude_deg", []), dtype=np.float64)
+        ),
+        solar_elongation_deg=_nan_to_null(
+            np.asarray(anchor_cols.get("solar_elongation_deg", []), dtype=np.float64)
+        ),
+        phase_angle_deg=_nan_to_null(
+            np.asarray(anchor_cols.get("phase_angle_deg", []), dtype=np.float64)
+        ),
+        lunar_elongation_deg=_nan_to_null(
+            np.asarray(anchor_cols.get("lunar_elongation_deg", []), dtype=np.float64)
+        ),
+        moon_altitude_deg=_nan_to_null(
+            np.asarray(anchor_cols.get("moon_altitude_deg", []), dtype=np.float64)
+        ),
+        moon_illuminated_fraction=_nan_to_null(
+            np.asarray(anchor_cols.get("moon_illuminated_fraction", []), dtype=np.float64)
+        ),
+        mag=_nan_to_null(np.asarray(anchor_cols.get("mag", []), dtype=np.float64)),
+        sigma_mag=_nan_to_null(np.asarray(anchor_cols.get("sigma_mag", []), dtype=np.float64)),
+        sky_rate=_nan_to_null(np.asarray(anchor_cols.get("sky_rate", []), dtype=np.float64)),
+        position_angle_deg=_nan_to_null(
+            np.asarray(anchor_cols.get("position_angle_deg", []), dtype=np.float64)
+        ),
+        hour_angle_deg=_nan_to_null(
+            np.asarray(anchor_cols.get("hour_angle_deg", []), dtype=np.float64)
+        ),
+        sky_covariance_kind=[
+            None if int(c) < 0 else CovarianceKind(_KIND_BY_CODE[int(c)]).value
+            for c in anchor_cols.get("sky_covariance_kind", [])
+        ],
+        joint=PackedJoints.from_wire_list(anchor_joint_wires),
+    )
+
+    observatories = ObservatorySummary.from_kwargs(
+        orbit_id=obs_cols.get("orbit_id", []),
+        obs_code=obs_cols.get("obs_code", []),
+        note=obs_cols.get("note", []),
+        resolved_method=obs_cols.get("resolved_method", []),
+        earth_orientation_present=obs_cols.get("earth_orientation_present", []),
+        earth_orientation_bpc_epochs=np.asarray(
+            obs_cols.get("earth_orientation_bpc_epochs", []), dtype=np.int64
+        ),
+        earth_orientation_analytic_iau_2006_epochs=np.asarray(
+            obs_cols.get("earth_orientation_analytic_iau_2006_epochs", []), dtype=np.int64
+        ),
+    )
+
+    return VisibilityResult(
+        points=points,
+        windows=windows,
+        nights=nights,
+        anchors=anchors,
+        observatories=observatories,
     )

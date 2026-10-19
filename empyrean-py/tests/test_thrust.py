@@ -9,11 +9,11 @@ identical ballistic orbit.
 
 The burn INPUT is the deliverable here: a finite-burn arc reaches the
 engine dynamics and changes propagation. The burn-sensitivity segment
-*count* in the tagged-covariance readback
-(:attr:`~empyrean.TaggedCovariance.thrust_segments`) is an engine-output
-concern — the currently linked engine reports the marginalized 6x6 state
-block (``thrust_segments == 0``, ``solved_width == 6``), so the readback
-test pins that the output path is wired rather than a specific count.
+count is no longer a tagged-covariance column — it rides the packed
+joint's thrust-axis layout — so the readback test pins that the output
+path is wired (via ``solved_width``) rather than a specific count: the
+currently linked engine reports the marginalized 6x6 state block
+(``solved_width == 6``).
 """
 
 from __future__ import annotations
@@ -120,7 +120,6 @@ def test_public_thrust_types_expose_wrapper_field_names() -> None:
     params = ThrustParams(arcs=[arc])
     assert params.arcs == [arc]
     assert params.dv_corrections == []
-    assert params.correction_covariances == []
 
 
 def test_thrust_arcs_length_must_match_orbit_count() -> None:
@@ -190,20 +189,22 @@ def test_central_body_accepts_origin_naif_and_string() -> None:
 
 
 def test_thrust_tagged_covariance_readback_is_wired() -> None:
-    """With a Δv correction + covariance the tagged-covariance readback
-    stays populated and the ``thrust_segments`` / ``solved_width`` columns
-    are readable for a thrust orbit (the output path is wired).
+    """With a Δv correction the tagged-covariance readback stays populated
+    and the ``solved_width`` column is readable for a thrust orbit (the
+    output path is wired).
 
-    The segment *count* is an engine-output concern: the currently linked
-    engine reports the marginalized 6x6 block (``thrust_segments == 0``,
-    ``solved_width == 6``), so this asserts the plumbing rather than a
-    specific solved width.
+    The burn-sensitivity segment count is no longer a tagged-covariance
+    column — it is encoded in the packed joint's thrust-axis layout — so
+    the remaining per-row wiring check is ``solved_width``: the currently
+    linked engine reports the marginalized 6x6 block (``solved_width ==
+    6``), so this asserts the plumbing rather than a specific solved width.
     """
-    eye = [[1.0e-20, 0.0, 0.0], [0.0, 1.0e-20, 0.0], [0.0, 0.0, 1.0e-20]]
+    # The burn-prior covariance now rides the orbit's packed joint (its
+    # thrust axes), not a `correction_covariances` sibling; this test pins
+    # that the tagged-covariance readback path is wired for a thrust orbit.
     thrust = ThrustParams(
         arcs=[_rtn_arc()],
         dv_corrections=[(0.0, 0.0, 0.0)],
-        correction_covariances=[eye],
     )
     result = empyrean.propagate(
         _orbit("tagged"),
@@ -215,32 +216,8 @@ def test_thrust_tagged_covariance_readback_is_wired() -> None:
     tc = result.tagged_covariance
     assert tc is not None
     assert len(tc) == len(_EPOCHS)
-    segs = tc.column("thrust_segments").to_numpy(zero_copy_only=False)
     widths = tc.column("solved_width").to_numpy(zero_copy_only=False)
-    # Columns are present, aligned 1:1 with states, and non-negative /
-    # state-inclusive — the readback path is wired end to end.
-    assert len(segs) == len(_EPOCHS)
-    assert (segs >= 0).all()
+    # The column is present, aligned 1:1 with states, and state-inclusive —
+    # the readback path is wired end to end.
+    assert len(widths) == len(_EPOCHS)
     assert (widths >= 6).all()
-
-
-def test_correction_covariance_mismatch_surfaces_loudly() -> None:
-    """A ``correction_covariances`` length that does not match
-    ``dv_corrections`` is a contract violation the engine rejects. It must
-    surface as a clear Python exception naming the offending field — never
-    silently dropped or repaired.
-
-    This is the reachable arm of the "surface loudly, never degrade" path
-    shared with the ThirdOrder + correction-covariance rejection.
-    ThirdOrder itself is not constructible through the wrapper's
-    ``UncertaintyMethod`` (FirstOrder / SecondOrder / Auto / SigmaPoint /
-    MonteCarlo — parity with the C ABI, which has no ThirdOrder input
-    tag), so the exact ThirdOrder combination cannot be formed at this
-    layer, but the identical non-degrading surface carries either
-    rejection up.
-    """
-    eye = [[1.0e-20, 0.0, 0.0], [0.0, 1.0e-20, 0.0], [0.0, 0.0, 1.0e-20]]
-    # One arc, zero Δv corrections, but a correction covariance.
-    thrust = ThrustParams(arcs=[_rtn_arc()], correction_covariances=[eye])
-    with pytest.raises(Exception, match="correction_covariances"):
-        empyrean.propagate(_orbit("mismatch"), _EPOCHS, config=_cfg(), thrust_arcs=[thrust])

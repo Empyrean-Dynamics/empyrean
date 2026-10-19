@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from empyrean._convert import coordinates_to_arrays, orbits_to_orbit_batch_dict
+from empyrean._convert import coordinates_to_arrays
 from empyrean.coordinates.coordinates import (
     CartesianCoordinates,
     CometaryCoordinates,
@@ -38,7 +38,42 @@ from empyrean.coordinates.covariance import (
 )
 from empyrean.coordinates.enums import Origin
 from empyrean.coordinates.epoch import Epochs
+from empyrean.coordinates.transform import transform_orbits
+from empyrean.orbits.joint import (
+    CovarianceKind,
+    JointFunctional,
+    JointProvenance,
+    JointQuality,
+    PackedJoint,
+    PackedJoints,
+)
 from empyrean.orbits.orbits import CartesianOrbits
+
+
+def _state_joint(cov6: np.ndarray) -> PackedJoint:
+    """A width-6 derived state joint whose state block is ``cov6`` (6x6).
+
+    The one covariance home for an orbit: a covariance-bearing transform
+    now rides the orbit's packed joint, not a flat coordinate covariance,
+    so a transform test builds its covariance here.
+    """
+    tri = [cov6[i, j] for i in range(6) for j in range(i + 1)]
+    return PackedJoint(
+        layout_present=0,
+        layout_considered=0,
+        layout_marginalized=0,
+        width=6,
+        tri=np.asarray(tri, dtype=np.float64),
+        kind=CovarianceKind.LINEAR,
+        quality=JointQuality.POSITIVE_DEFINITE,
+        cov_rank=0,
+        cov_null_axes=0,
+        cov_min_eig_corr=float("nan"),
+        functional=JointFunctional.STATE,
+        provenance=JointProvenance.DERIVED,
+        asserted_source=None,
+    )
+
 
 # (coordinate class, covariance class, element kwargs for one row)
 _REPRESENTATIONS = [
@@ -125,26 +160,6 @@ def test_null_diagonal_row_raises_at_coordinates_entry_point() -> None:
     assert "vy" in message
 
 
-def test_null_diagonal_row_raises_at_orbits_entry_point() -> None:
-    """DISCRIMINATING.
-
-    Same defect through the orbit-batch entry point. Both entry points see the
-    same coordinate classes, so the error must name the entry point (not just
-    the class) and, here, the ``orbit_id`` — otherwise a user cannot tell which
-    call failed or which record to fix.
-    """
-    cov = _good_matrix()
-    cov[0, 0, 0] = np.nan
-    orbits = _cartesian_orbits(cov, orbit_ids=["BAD-ORBIT"])
-
-    with pytest.raises(ValueError) as excinfo:
-        orbits_to_orbit_batch_dict(orbits)
-    message = str(excinfo.value)
-    assert "orbits_to_orbit_batch_dict" in message
-    assert "BAD-ORBIT" in message
-    assert "'x'" in message
-
-
 def test_non_finite_entry_raises() -> None:
     """DISCRIMINATING.
 
@@ -181,14 +196,10 @@ def test_negative_infinite_off_diagonal_raises() -> None:
                 _coords(*_REPRESENTATIONS[0][:2], _REPRESENTATIONS[0][2], _good_matrix())
             ),
         ),
-        (
-            "orbits_to_orbit_batch_dict",
-            lambda: orbits_to_orbit_batch_dict(_cartesian_orbits(_good_matrix())),
-        ),
     ],
 )
 def test_conversion_failure_is_not_swallowed(monkeypatch, entry_point, invoke) -> None:
-    """DISCRIMINATING, at BOTH sites.
+    """DISCRIMINATING at the coordinate marshal chokepoint.
 
     Forces the conversion itself to fail. The pre-fix code caught it and
     returned zeros with ``has_covariance = False``; the caller had no way to
@@ -239,24 +250,6 @@ def test_propagate_surfaces_malformed_covariance() -> None:
         empyrean.propagate(
             _cartesian_orbits(cov), Epochs.from_mjd(np.array([60001.0]), scale="tdb")
         )
-
-
-def test_write_orbits_parquet_surfaces_malformed_covariance(tmp_path) -> None:
-    """DISCRIMINATING.
-
-    Writing is the worse case: a silently zeroed covariance becomes a
-    persisted file that looks authoritative. ``write_orbits_parquet`` must
-    raise rather than write the fabrication to disk.
-    """
-    from empyrean.io.orbits import write_orbits_parquet
-
-    cov = _good_matrix()
-    cov[0, 3, 3] = np.nan
-    target = tmp_path / "bad.parquet"
-
-    with pytest.raises(ValueError, match="orbits_to_orbit_batch_dict"):
-        write_orbits_parquet(str(target), _cartesian_orbits(cov))
-    assert not target.exists(), "a malformed covariance reached disk"
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -400,8 +393,15 @@ def test_partial_off_diagonal_is_accepted() -> None:
 # geometry only, which the control test below pins.
 
 
-def _cartesian_at(x, y, z, vx, vy, vz):
-    return CartesianCoordinates.from_kwargs(
+def _cartesian_orbit_at(x, y, z, vx, vy, vz) -> CartesianOrbits:
+    """A one-row Cartesian orbit carrying a width-6 state joint.
+
+    The orbit-level analogue of the old flat-covariance coordinate fixture:
+    a covariance-bearing transform rides the orbit's packed joint and goes
+    through :func:`transform_orbits`.
+    """
+    cov6 = np.diag([1e-10, 1e-10, 1e-10, 1e-14, 1e-14, 1e-14])
+    coords = CartesianCoordinates.from_kwargs(
         epoch=np.array([60000.0]),
         x=[x],
         y=[y],
@@ -411,19 +411,22 @@ def _cartesian_at(x, y, z, vx, vy, vz):
         vz=[vz],
         frame="ecliptic",
         origin=[str(Origin.SUN)],
-        covariance=CartesianCovariance.from_matrix(
-            np.diag([1e-10, 1e-10, 1e-10, 1e-14, 1e-14, 1e-14])[None, :, :]
-        ),
+    )
+    return CartesianOrbits.from_kwargs(
+        orbit_id=["deg"],
+        coordinates=coords,
+        covariance=PackedJoints.from_joints([_state_joint(cov6)]),
     )
 
 
 @pytest.mark.parametrize("target", ["keplerian", "cometary"])
 def test_degenerate_transform_surfaces_undefined_element(target) -> None:
     """DISCRIMINATING. An exactly-circular-plane / at-periapsis geometry
-    transforms to a covariance with a NaN angular-element variance. Before
-    the fix that was zero-filled and marshalled as a *present* covariance
-    asserting zero variance on an undefined element; now it raises, and the
-    message points at the transform rather than at the caller's input."""
+    transforms to a joint whose angular-element variance is NaN. The
+    covariance rides the orbit's packed joint, so the transport goes through
+    :func:`transform_orbits`; the joint's derived state 6x6 carries that NaN,
+    and the marshal chokepoint must refuse it rather than zero-filling a
+    *present* covariance that asserts zero variance on an undefined element."""
     import empyrean
 
     empyrean.initialize()
@@ -433,24 +436,24 @@ def test_degenerate_transform_surfaces_undefined_element(target) -> None:
     v = np.sqrt(mu * (2 / r - 1 / a))
     # Position on +x with velocity purely transverse: exactly at periapsis
     # and exactly in-plane, so an angular element is undefined.
-    coords = _cartesian_at(r, 0.0, 0.0, 0.0, v, 0.0)
-    out = empyrean.transform_coordinates(coords, target)
+    orb = _cartesian_orbit_at(r, 0.0, 0.0, 0.0, v, 0.0)
+    out = transform_orbits(orb, target)
 
-    matrix = out.covariance.to_matrix()[0]
-    assert np.isnan(np.diagonal(matrix)).any(), "expected a NaN angular-element variance"
+    state_block = out.covariance.joint(0).state_block()
+    assert np.isnan(np.diagonal(state_block)).any(), "expected a NaN angular-element variance"
 
+    # The derived coordinate 6x6 carries that NaN; the marshal chokepoint must
+    # refuse it (a null/NaN diagonal is not an omitted correlation).
     with pytest.raises(ValueError, match="null or NaN variance"):
-        coordinates_to_arrays(out)
-    with pytest.raises(ValueError, match="transform_coordinates"):
-        coordinates_to_arrays(out)
+        coordinates_to_arrays(out.coordinates)
 
 
 @pytest.mark.parametrize("target", ["keplerian", "cometary", "cartesian"])
 def test_ordinary_orbits_still_transform_and_marshal(target) -> None:
     """REGRESSION GUARD — the important half. The narrowed rule must not
-    reject ordinary science input. Generic (non-degenerate) states and a real
-    catalogue orbit round-trip through every representation untouched;
-    measured 0/120 rejections across randomised generic states."""
+    reject ordinary science input. Generic (non-degenerate) states
+    round-trip through every representation untouched, their joints
+    transported by :func:`transform_orbits`."""
     import empyrean
 
     empyrean.initialize()
@@ -467,9 +470,9 @@ def test_ordinary_orbits_still_transform_and_marshal(target) -> None:
         # for an unbound draw and skipped.
         if 0.5 * float(vel @ vel) - mu / float(np.linalg.norm(pos)) >= 0.0:
             continue
-        out = empyrean.transform_coordinates(_cartesian_at(*pos, *vel), target)
-        assert np.isfinite(np.diagonal(out.covariance.to_matrix()[0])).all()
-        coordinates_to_arrays(out)
+        out = transform_orbits(_cartesian_orbit_at(*pos, *vel), target)
+        assert np.isfinite(np.diagonal(out.covariance.joint(0).state_block())).all()
+        coordinates_to_arrays(out.coordinates)
         checked += 1
     # Without this the screen could reject every draw and the guard would
     # pass by testing nothing — the exact failure mode this file exists for.

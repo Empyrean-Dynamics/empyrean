@@ -271,6 +271,108 @@ fn capture_location() -> (Option<usize>, Option<String>, Option<f64>) {
     (index, orbit_id, epoch)
 }
 
+/// A packed-joint wire refusal, as one typed variant per failure axis.
+///
+/// When a caller supplies a packed joint the engine cannot accept — a layout
+/// that violates the axis-table invariants, a triangle length that disagrees
+/// with the width, a retired or unknown discriminant — the C ABI refuses it by
+/// name with a dedicated negative code (−40…−49) rather than collapsing every
+/// cause to one message. [`Error::push_error`] recovers the axis from a failed
+/// call so a caller can react per cause without matching raw integers; the
+/// cause's full message is carried on [`Error::message`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushError {
+    /// The layout bitsets violate the axis-table invariants (−40).
+    LayoutInvalid,
+    /// The packed triangle length disagrees with the width-implied
+    /// `width·(width+1)/2` (−41).
+    TriangleLength,
+    /// `width` disagrees with the layout-implied width (−42).
+    WidthMismatch,
+    /// The `functional` discriminant is unknown or retired (−43).
+    UnknownFunctional,
+    /// The `provenance` discriminant is unknown or retired (−44).
+    UnknownProvenance,
+    /// The `kind` discriminant is retired — the third-order (2) tag is the one
+    /// such value (−45).
+    RetiredDiscriminant,
+    /// The covariance's row epoch disagrees with the state's basis epoch (−46).
+    EpochMismatch,
+    /// The engine refused the prior for a cause outside the structural axes
+    /// above (−47).
+    EngineRefused,
+    /// The input covariance kind is not one the ingestion path accepts (−48).
+    UnsupportedInputKind,
+    /// An asserted-provenance moment carries no recognized source (−49).
+    UnknownAssertedSource,
+    /// A flat state covariance was supplied to a coordinate transform, which
+    /// transforms bare states only: use
+    /// [`transform_orbits`](crate::Context::transform_orbits), whose Jacobian
+    /// transports the whole joint (−50). Not a push refusal — the state-level
+    /// transform declines to drop a covariance silently.
+    TransformCovarianceUnsupported,
+}
+
+impl PushError {
+    /// Recover the typed refusal from a C return code, or `None` for any code
+    /// outside the −40…−50 band.
+    pub(crate) fn from_code(code: i32) -> Option<Self> {
+        Some(match code {
+            c if c == empyrean_sys::EMPYREAN_PUSH_LAYOUT_INVALID => Self::LayoutInvalid,
+            c if c == empyrean_sys::EMPYREAN_PUSH_TRIANGLE_LENGTH => Self::TriangleLength,
+            c if c == empyrean_sys::EMPYREAN_PUSH_WIDTH_MISMATCH => Self::WidthMismatch,
+            c if c == empyrean_sys::EMPYREAN_PUSH_UNKNOWN_FUNCTIONAL => Self::UnknownFunctional,
+            c if c == empyrean_sys::EMPYREAN_PUSH_UNKNOWN_PROVENANCE => Self::UnknownProvenance,
+            c if c == empyrean_sys::EMPYREAN_PUSH_RETIRED_DISCRIMINANT => Self::RetiredDiscriminant,
+            c if c == empyrean_sys::EMPYREAN_PUSH_EPOCH_MISMATCH => Self::EpochMismatch,
+            c if c == empyrean_sys::EMPYREAN_PUSH_ENGINE_REFUSED => Self::EngineRefused,
+            c if c == empyrean_sys::EMPYREAN_PUSH_UNSUPPORTED_INPUT_KIND => {
+                Self::UnsupportedInputKind
+            }
+            c if c == empyrean_sys::EMPYREAN_PUSH_UNKNOWN_ASSERTED_SOURCE => {
+                Self::UnknownAssertedSource
+            }
+            c if c == empyrean_sys::EMPYREAN_TRANSFORM_COVARIANCE_UNSUPPORTED => {
+                Self::TransformCovarianceUnsupported
+            }
+            _ => return None,
+        })
+    }
+
+    /// The C ABI return code for this refusal.
+    pub fn code(self) -> i32 {
+        match self {
+            Self::LayoutInvalid => empyrean_sys::EMPYREAN_PUSH_LAYOUT_INVALID,
+            Self::TriangleLength => empyrean_sys::EMPYREAN_PUSH_TRIANGLE_LENGTH,
+            Self::WidthMismatch => empyrean_sys::EMPYREAN_PUSH_WIDTH_MISMATCH,
+            Self::UnknownFunctional => empyrean_sys::EMPYREAN_PUSH_UNKNOWN_FUNCTIONAL,
+            Self::UnknownProvenance => empyrean_sys::EMPYREAN_PUSH_UNKNOWN_PROVENANCE,
+            Self::RetiredDiscriminant => empyrean_sys::EMPYREAN_PUSH_RETIRED_DISCRIMINANT,
+            Self::EpochMismatch => empyrean_sys::EMPYREAN_PUSH_EPOCH_MISMATCH,
+            Self::EngineRefused => empyrean_sys::EMPYREAN_PUSH_ENGINE_REFUSED,
+            Self::UnsupportedInputKind => empyrean_sys::EMPYREAN_PUSH_UNSUPPORTED_INPUT_KIND,
+            Self::UnknownAssertedSource => empyrean_sys::EMPYREAN_PUSH_UNKNOWN_ASSERTED_SOURCE,
+            Self::TransformCovarianceUnsupported => {
+                empyrean_sys::EMPYREAN_TRANSFORM_COVARIANCE_UNSUPPORTED
+            }
+        }
+    }
+}
+
+impl Error {
+    /// If this error is a packed-joint wire refusal (codes −40…−49) or the
+    /// state-transform covariance refusal (−50), the typed variant; otherwise
+    /// `None`.
+    ///
+    /// The same refusal reaches every push boundary — a direct call and a file
+    /// writer alike — as the same code, so this classifies a failure the same
+    /// way wherever it was raised. The full cause is on
+    /// [`message`](Self::message).
+    pub fn push_error(&self) -> Option<PushError> {
+        PushError::from_code(self.code)
+    }
+}
+
 impl fmt::Display for Error {
     /// Renders the position after the message when the failure carries
     /// one, so a caller that only logs the error still sees which orbit
@@ -346,7 +448,40 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]
 mod tests {
-    use super::{ENGINE_NOT_LOADED, Error, dedupe_io_prefix};
+    use super::{ENGINE_NOT_LOADED, Error, PushError, dedupe_io_prefix};
+
+    #[test]
+    fn every_push_code_round_trips_to_its_own_variant() {
+        for v in [
+            PushError::LayoutInvalid,
+            PushError::TriangleLength,
+            PushError::WidthMismatch,
+            PushError::UnknownFunctional,
+            PushError::UnknownProvenance,
+            PushError::RetiredDiscriminant,
+            PushError::EpochMismatch,
+            PushError::EngineRefused,
+            PushError::UnsupportedInputKind,
+            PushError::UnknownAssertedSource,
+            PushError::TransformCovarianceUnsupported,
+        ] {
+            assert_eq!(PushError::from_code(v.code()), Some(v));
+            // An Error carrying that code classifies to the same variant,
+            // whatever boundary raised it.
+            let e = Error {
+                code: v.code(),
+                message: String::new(),
+                missing_data_files: Vec::new(),
+                orbit_index: None,
+                orbit_id: None,
+                epoch_mjd_tdb: None,
+            };
+            assert_eq!(e.push_error(), Some(v));
+        }
+        // Codes outside the band are not push refusals.
+        assert_eq!(PushError::from_code(-1), None);
+        assert_eq!(PushError::from_code(-5), None);
+    }
 
     #[test]
     fn collapses_doubled_io_prefix() {

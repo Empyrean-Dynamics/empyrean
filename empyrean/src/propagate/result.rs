@@ -5,7 +5,6 @@
 // loops, which read more clearly than iterator adapters here.
 #![allow(clippy::needless_range_loop)]
 
-use crate::JointCovariance;
 use std::ffi::CStr;
 
 use crate::coordinate::{Frame, Origin};
@@ -21,8 +20,6 @@ pub enum CovarianceKind {
     Linear,
     /// Park–Scheeres second-order (Jet2 STT) correction.
     SecondOrder,
-    /// Third-order (Jet3 STT3) extension.
-    ThirdOrder,
     /// Adaptive Gaussian Mixture. This *tag's* matrix is the mixture's
     /// moment collapse \\(\Sigma = \sum_k w_k (\Sigma_k + d_k d_k^\top)\\)
     /// — a single second moment, which is all a covariance readback can
@@ -39,16 +36,28 @@ pub enum CovarianceKind {
 }
 
 impl CovarianceKind {
+    /// Decode a [`CovarianceKind`] from its C-ABI `u8` wire tag — the public
+    /// wire contract, the inverse of [`to_u8`](Self::to_u8).
+    ///
+    /// The tag is the `EMPYREAN_COVARIANCE_KIND_*` value every layer of the
+    /// distribution carries (the Rust wrapper, the C ABI, the Python
+    /// `_KIND_TO_CODE` table and the CLI). It is exposed so a consumer can
+    /// map the kind tag it reads off a result's packed joint — or a cross-FFI
+    /// value — without restating the table. A retired tag (2, third-order) or
+    /// any value this build has no variant for is refused by name rather than
+    /// defaulted.
     // The C tag is a `u8` field; bindgen renders the `#define`d
     // constants as `u32`, so compare in `u32`.
-    pub(crate) fn from_u8(tag: u8) -> Result<Self> {
+    pub fn from_u8(tag: u8) -> Result<Self> {
         Ok(match tag as u32 {
             empyrean_sys::EMPYREAN_COVARIANCE_KIND_LINEAR => Self::Linear,
             empyrean_sys::EMPYREAN_COVARIANCE_KIND_SECOND_ORDER => Self::SecondOrder,
-            empyrean_sys::EMPYREAN_COVARIANCE_KIND_THIRD_ORDER => Self::ThirdOrder,
             empyrean_sys::EMPYREAN_COVARIANCE_KIND_MIXTURE => Self::Mixture,
             empyrean_sys::EMPYREAN_COVARIANCE_KIND_MONTE_CARLO => Self::MonteCarlo,
             empyrean_sys::EMPYREAN_COVARIANCE_KIND_SIGMA_POINT => Self::SigmaPoint,
+            // Tag 2 was third-order, retired with the engine; the unknown
+            // tag (254) is refused by every decoder. Both land here rather
+            // than being defaulted.
             other => {
                 return Err(Error::invalid_input(format!(
                     "C ABI returned unknown covariance kind tag: {other}"
@@ -57,12 +66,15 @@ impl CovarianceKind {
         })
     }
 
-    /// The C ABI `u8` tag for this kind — inverse of [`from_u8`](Self::from_u8).
-    pub(crate) fn to_u8(self) -> u8 {
+    /// The C ABI `u8` wire tag for this kind — the public wire contract, the
+    /// inverse of [`from_u8`](Self::from_u8). This is the
+    /// `EMPYREAN_COVARIANCE_KIND_*` value the C ABI, Python and the CLI all
+    /// agree on, exposed so a consumer can encode a kind to the wire without
+    /// restating the table.
+    pub fn to_u8(self) -> u8 {
         let tag = match self {
             Self::Linear => empyrean_sys::EMPYREAN_COVARIANCE_KIND_LINEAR,
             Self::SecondOrder => empyrean_sys::EMPYREAN_COVARIANCE_KIND_SECOND_ORDER,
-            Self::ThirdOrder => empyrean_sys::EMPYREAN_COVARIANCE_KIND_THIRD_ORDER,
             Self::Mixture => empyrean_sys::EMPYREAN_COVARIANCE_KIND_MIXTURE,
             Self::MonteCarlo => empyrean_sys::EMPYREAN_COVARIANCE_KIND_MONTE_CARLO,
             Self::SigmaPoint => empyrean_sys::EMPYREAN_COVARIANCE_KIND_SIGMA_POINT,
@@ -71,89 +83,131 @@ impl CovarianceKind {
     }
 }
 
-/// Definiteness of a covariance matrix.
+/// The engine's pre-retention Gaussian-mixture accounting, carried beside a
+/// covariance whose kind is [`Mixture`](CovarianceKind::Mixture) — the six
+/// tallies the engine reads off its own `Derivation::Mixture` payload. It
+/// rides WITH the covariance it describes (on every covariance-bearing result
+/// type), distinct from the retained-component status table
+/// ([`PropagationResult::mixtures`]), which is the per-close-approach object.
+///
+/// A count is `None` when the producing site did not carry that tally — "not
+/// carried", which is distinct from a real `0` and is never fabricated as one.
+/// [`n_components_total`](Self::n_components_total) and
+/// [`weight_delivered`](Self::weight_delivered) are always carried on a
+/// mixture; the four refusal / failure counts may each be absent.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum CovarianceQuality {
-    /// All eigenvalues positive within round-off.
-    PositiveDefinite,
-    /// At least one meaningfully negative eigenvalue (`min_eig`).
-    Indefinite {
-        /// The most-negative eigenvalue found.
-        min_eig: f64,
-    },
-    /// Explicitly repaired to PSD; `min_eig` is the value *before* repair.
-    Repaired {
-        /// The most-negative eigenvalue before the PSD repair.
-        min_eig: f64,
-    },
-    /// Definite, but the second-order expansion that produced it is not
-    /// clearly valid at this epoch: the quadratic term is not small
-    /// against the linear one.
-    ///
-    /// Deliberately **not** folded into
-    /// [`PositiveDefinite`](Self::PositiveDefinite) — the matrix is
-    /// definite, so a consumer checking only for definiteness would
-    /// receive a degraded covariance with a clean bill of health.
-    ExpansionSuspect {
-        /// κ_state, the block-wise quadratic/linear ratio that produced
-        /// this classification. `f64::INFINITY` when a zero-spread block
-        /// carried a nonzero second-order correction. **Read-only
-        /// provenance** — `is_nan`/`is_infinite`-guard before any
-        /// arithmetic; never feed it to a clamp.
-        kappa_state: f64,
-    },
+pub struct MixtureTally {
+    /// Total number of components before retention.
+    pub n_components_total: u32,
+    /// Pre-renormalization surviving mass.
+    pub weight_delivered: f64,
+    /// Members whose sub-propagation failed, or `None` when not carried.
+    pub n_failed: Option<u32>,
+    /// Members still inside a zone at their horizon, or `None` when not carried.
+    pub n_unresolved: Option<u32>,
+    /// Components refused for state-space curvature, or `None` when not carried.
+    pub n_curvature_refused: Option<u32>,
+    /// Components refused because their projected spread overflowed the
+    /// flat-sky linearization, or `None` when not carried. Engine-`None` on the
+    /// propagation seam at the current engine pin — read it as absent, never 0.
+    pub n_sky_linearization_refused: Option<u32>,
 }
 
-/// The functional a covariance's second moment describes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TargetFunctional {
-    /// Generic Cartesian-state second moment.
-    CartesianState,
-    /// Tied to the close-approach miss-distance functional — not a
-    /// generic state σ.
-    CloseApproachMissDistance,
+impl MixtureTally {
+    /// Decode the mixture tally beside a covariance: `Some` when the carrier's
+    /// `has_mixture_tally` flag is set, `None` otherwise. A `-1` wire count is
+    /// the engine's `None` ("not carried"), mapped to `None` here rather than a
+    /// fabricated `0`.
+    pub(crate) fn from_ffi(has: u8, t: &empyrean_sys::EmpyreanMixtureTally) -> Option<Self> {
+        if has == 0 {
+            return None;
+        }
+        let opt = |v: i64| -> Option<u32> { (v >= 0).then_some(v as u32) };
+        Some(Self {
+            n_components_total: t.n_components_total,
+            weight_delivered: t.weight_delivered,
+            n_failed: opt(t.n_failed),
+            n_unresolved: opt(t.n_unresolved),
+            n_curvature_refused: opt(t.n_curvature_refused),
+            n_sky_linearization_refused: opt(t.n_sky_linearization_refused),
+        })
+    }
+
+    /// Encode this tally to its C-ABI wire form (`None` counts → `-1`). The
+    /// dual of [`from_ffi`](Self::from_ffi), used on the write paths that
+    /// re-marshal a wrapper value back across the FFI boundary. Takes `self`
+    /// by value — the type is `Copy`.
+    pub(crate) fn to_ffi(self) -> empyrean_sys::EmpyreanMixtureTally {
+        let wire = |v: Option<u32>| -> i64 { v.map(|x| x as i64).unwrap_or(-1) };
+        empyrean_sys::EmpyreanMixtureTally {
+            n_components_total: self.n_components_total,
+            weight_delivered: self.weight_delivered,
+            n_failed: wire(self.n_failed),
+            n_unresolved: wire(self.n_unresolved),
+            n_curvature_refused: wire(self.n_curvature_refused),
+            n_sky_linearization_refused: wire(self.n_sky_linearization_refused),
+        }
+    }
 }
 
 /// Provenance-tagged, resolved-kind covariance readback at one
 /// `(orbit, epoch)` — the honest covariance, distinct from the bare
 /// linear [`PropagatedState::covariance`].
 ///
-/// The corrected mean is
-/// `state + mean_shift_prop.unwrap_or([0;6]) + mean_shift_input.unwrap_or([0;6])`.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// The whole \\((6+P)\\)-wide matrix rides one packed [`joint`](Self::joint);
+/// its tags (kind, quality, functional), the solved width, and the layout all
+/// read off that joint. The corrected mean is
+/// `state + mean_shift_prop.unwrap_or([0;6])`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct TaggedCovariance {
     /// Epoch of this covariance.
     pub epoch: crate::Epoch,
     /// Co-located propagated nominal state `[x, y, z, vx, vy, vz]` (AU, AU/day).
     pub state: [f64; 6],
-    /// The 6×6 covariance (AU², AU²/day, AU²/day² blocks).
-    pub matrix: [[f64; 6]; 6],
-    /// How the covariance was derived.
-    pub kind: CovarianceKind,
-    /// Monte-Carlo run seed (`Some` only when `kind == MonteCarlo`).
+    /// The covariance as one packed joint — the single covariance home. Its
+    /// `kind` / `quality` / `functional` name what it describes, and its
+    /// `layout` / `width` name which parameters were solved.
+    pub joint: crate::PackedJoint,
+    /// Monte-Carlo run seed. `Some` only when the joint's kind is
+    /// [`MonteCarlo`](CovarianceKind::MonteCarlo), but not on every such row:
+    /// an ensemble seeded from system entropy is not reproducible by
+    /// construction and carries `None`.
     pub mc_seed: Option<u64>,
     /// Second-order propagation mean shift δμ_prop (zero at t₀).
     pub mean_shift_prop: Option<[f64; 6]>,
-    /// OD-estimator mean shift δμ₀ (nonzero at t₀).
-    pub mean_shift_input: Option<[f64; 6]>,
-    /// Definiteness of `matrix`.
-    pub quality: CovarianceQuality,
     /// Origin body of the basis.
     pub origin: Origin,
     /// Reference frame of the basis.
     pub frame: Frame,
-    /// [A1, A2, A3] non-grav solved flags. The matrix is the
-    /// *marginalized* state block of a possibly-wider fit.
-    pub non_grav: [bool; 3],
-    /// Thrust Δv segments solved for.
-    pub thrust_segments: u32,
-    /// Solved width (6 / 9 / 12 / …) — the conservative-vs-optimistic IP axis.
-    pub solved_width: u32,
-    /// The functional this second moment describes.
-    pub target_functional: TargetFunctional,
+    /// The engine's pre-retention mixture accounting for this covariance, or
+    /// `None` when its kind is not [`Mixture`](CovarianceKind::Mixture). See
+    /// [`MixtureTally`].
+    pub mixture_tally: Option<MixtureTally>,
 }
 
 impl TaggedCovariance {
+    /// The 6×6 state covariance (AU², AU²/day, AU²/day² blocks) — a derived
+    /// read-only view of the joint's leading state block.
+    pub fn matrix(&self) -> [[f64; 6]; 6] {
+        self.joint.state_block()
+    }
+
+    /// How the covariance was derived — the joint's kind.
+    pub fn kind(&self) -> CovarianceKind {
+        self.joint.kind
+    }
+
+    /// The definiteness of the matrix — the joint's quality.
+    pub fn quality(&self) -> crate::JointQuality {
+        self.joint.quality
+    }
+
+    /// The solved width (6 / 9 / 12 / …) — the conservative-vs-optimistic IP
+    /// axis. Reads the joint's width.
+    pub fn solved_width(&self) -> u8 {
+        self.joint.width
+    }
+
     pub(crate) fn from_ffi(s: &empyrean_sys::EmpyreanTaggedCovariance) -> Result<Self> {
         let origin = Origin::from_naif_id(s.origin).ok_or_else(|| {
             Error::invalid_input(format!(
@@ -162,55 +216,21 @@ impl TaggedCovariance {
             ))
         })?;
         let frame = crate::coordinate::int_to_frame(s.frame)?;
-        let quality = match s.quality as u32 {
-            empyrean_sys::EMPYREAN_COVARIANCE_QUALITY_POSITIVE_DEFINITE => {
-                CovarianceQuality::PositiveDefinite
-            }
-            empyrean_sys::EMPYREAN_COVARIANCE_QUALITY_INDEFINITE => CovarianceQuality::Indefinite {
-                min_eig: s.quality_min_eig,
-            },
-            empyrean_sys::EMPYREAN_COVARIANCE_QUALITY_REPAIRED => CovarianceQuality::Repaired {
-                min_eig: s.quality_min_eig,
-            },
-            empyrean_sys::EMPYREAN_COVARIANCE_QUALITY_EXPANSION_SUSPECT => {
-                CovarianceQuality::ExpansionSuspect {
-                    kappa_state: s.quality_kappa_state,
-                }
-            }
-            other => {
-                return Err(Error::invalid_input(format!(
-                    "C ABI returned unknown covariance quality tag: {other}"
-                )));
-            }
-        };
-        let target_functional = match s.target_functional as u32 {
-            empyrean_sys::EMPYREAN_TARGET_FUNCTIONAL_CARTESIAN_STATE => {
-                TargetFunctional::CartesianState
-            }
-            empyrean_sys::EMPYREAN_TARGET_FUNCTIONAL_CLOSE_APPROACH_MISS_DISTANCE => {
-                TargetFunctional::CloseApproachMissDistance
-            }
-            other => {
-                return Err(Error::invalid_input(format!(
-                    "C ABI returned unknown target functional tag: {other}"
-                )));
-            }
-        };
+        let joint = unsafe { crate::PackedJoint::from_ffi(&s.joint) }?.ok_or_else(|| {
+            Error::invalid_input(
+                "C ABI returned a width-0 joint for a tagged covariance, which must carry a \
+                 matrix",
+            )
+        })?;
         Ok(Self {
             epoch: crate::Epoch::from_mjd_tdb(s.epoch_mjd_tdb),
             state: s.state,
-            matrix: s.matrix,
-            kind: CovarianceKind::from_u8(s.kind)?,
+            joint,
             mc_seed: (s.has_mc_seed != 0).then_some(s.mc_seed),
             mean_shift_prop: (s.has_mean_shift_prop != 0).then_some(s.mean_shift_prop),
-            mean_shift_input: (s.has_mean_shift_input != 0).then_some(s.mean_shift_input),
-            quality,
             origin,
             frame,
-            non_grav: [s.non_grav[0] != 0, s.non_grav[1] != 0, s.non_grav[2] != 0],
-            thrust_segments: s.thrust_segments,
-            solved_width: s.solved_width,
-            target_functional,
+            mixture_tally: MixtureTally::from_ffi(s.has_mixture_tally, &s.mixture_tally),
         })
     }
 }
@@ -267,21 +287,27 @@ pub struct PropagatedState {
     /// (Linear outside `Auto` CA windows). The full provenance is on
     /// [`PropagationResult::covariance_series_cartesian`].
     pub resolved_kind: CovarianceKind,
-    /// The propagated joint's cross terms at this epoch, in the
-    /// Cartesian basis of [`covariance`](Self::covariance).
+    /// The propagated joint at this epoch — the whole \\((6+P)\\)-wide
+    /// covariance as one packed object, in the Cartesian basis of
+    /// [`covariance`](Self::covariance). `None` when the state carries no
+    /// covariance.
     ///
-    /// [`covariance`](Self::covariance) is only the state block. Feeding
-    /// a second leg that block alone hands the engine a block-diagonal
-    /// covariance, while the joint it computed has non-zero
-    /// state↔parameter columns **even when the input was
-    /// block-diagonal** — propagation generates that correlation. So a
-    /// chained propagation built on the 6×6 alone reports a tighter
+    /// [`covariance`](Self::covariance) is a derived read-only view of this
+    /// joint's leading \\(6 \times 6\\) state block. Feeding a second leg that
+    /// block alone hands the engine a block-diagonal covariance, while the
+    /// joint it computed has non-zero state↔parameter columns **even when the
+    /// input was block-diagonal** — propagation generates that correlation. So
+    /// a chained propagation built on the 6×6 alone reports a tighter
     /// uncertainty than the first leg supports.
     ///
-    /// Copy it onto the next leg's [`Orbit`](crate::Orbit), together
-    /// with the parameter blocks it is conditioned on, which propagation
-    /// carries through from the input orbit unchanged.
-    pub joint: crate::JointCovariance,
+    /// Copy it onto the next leg's [`Orbit`](crate::Orbit) via
+    /// [`Orbit::with_covariance`](crate::Orbit::with_covariance) to carry the
+    /// whole matrix the first leg computed.
+    pub joint: Option<crate::PackedJoint>,
+    /// The engine's pre-retention mixture accounting for this row's resolved
+    /// covariance, or `None` when it was not derived as a mixture. See
+    /// [`MixtureTally`].
+    pub mixture_tally: Option<MixtureTally>,
 }
 
 impl PropagatedState {
@@ -303,7 +329,8 @@ impl PropagatedState {
             stm: (s.has_stm != 0).then_some(s.stm),
             stt: (s.has_stt != 0).then(|| Box::new(s.stt)),
             resolved_kind: CovarianceKind::from_u8(s.resolved_kind)?,
-            joint: unsafe { crate::JointCovariance::from_ffi(&s.orbit_cov) }?,
+            joint: unsafe { crate::PackedJoint::from_ffi(&s.orbit_cov) }?,
+            mixture_tally: MixtureTally::from_ffi(s.has_mixture_tally, &s.mixture_tally),
         })
     }
 }
@@ -428,7 +455,7 @@ pub struct Event {
 }
 
 impl Event {
-    pub(crate) fn from_ffi(e: &empyrean_sys::EmpyreanEvent) -> Self {
+    pub(crate) fn from_ffi(e: &empyrean_sys::EmpyreanEvent) -> Result<Self> {
         fn cstr_to_string(ptr: *const std::ffi::c_char) -> String {
             if ptr.is_null() {
                 String::new()
@@ -444,17 +471,24 @@ impl Event {
         } else {
             Origin::from_naif_id(e.body_naif_id)
         };
-        // `0xFF` is the C ABI's "not a regime event" sentinel; any other
-        // tag that fails to resolve also degrades to `None` rather than
-        // failing the whole batch.
-        let kind_opt = |tag: u8| {
+        // `0xFF` is the C ABI's "not a regime event" sentinel and the
+        // ONLY tag that legitimately means "no kind here".
+        //
+        // Every other unresolvable tag is an error, not a `None`. The C
+        // ABI grew `EMPYREAN_COVARIANCE_KIND_UNKNOWN` (0xFE) precisely so
+        // that a kind this ABI has no tag for is refused rather than
+        // folded onto a concrete one — and swallowing it here would undo
+        // that at the last hop, reporting "this event has no covariance
+        // kind" for an event that has one this build cannot name. The two
+        // facts are not the same and must not share a representation.
+        let kind_opt = |tag: u8| -> Result<Option<CovarianceKind>> {
             if tag == 0xFF {
-                None
+                Ok(None)
             } else {
-                CovarianceKind::from_u8(tag).ok()
+                CovarianceKind::from_u8(tag).map(Some)
             }
         };
-        Self {
+        Ok(Self {
             event_type: cstr_to_string(e.event_type),
             orbit_id: cstr_to_string(e.orbit_id),
             object_id: cstr_to_string(e.object_id),
@@ -488,12 +522,12 @@ impl Event {
             nonlinearity: e.nonlinearity,
             ip_agm: e.ip_agm,
             ip_mc: e.ip_mc,
-            previous_kind: kind_opt(e.previous_kind),
-            regime_resolved_kind: kind_opt(e.resolved_kind),
+            previous_kind: kind_opt(e.previous_kind)?,
+            regime_resolved_kind: kind_opt(e.resolved_kind)?,
             kappa: e.kappa,
             threshold_below: e.threshold_below,
             threshold_above: e.threshold_above,
-        }
+        })
     }
 }
 
@@ -518,7 +552,7 @@ impl Event {
 /// [`split_gaussian`](crate::split_gaussian) primitive at \\(t_0\\);
 /// reach this one by its module path,
 /// `empyrean::propagate::MixtureComponent`.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MixtureComponent {
     /// Prior split weight from the Gaussian splitting library — never
     /// likelihood-reweighted.
@@ -527,17 +561,74 @@ pub struct MixtureComponent {
     /// CA epoch (AU, AU/day), in the basis given by
     /// [`frame`](Self::frame) / [`origin`](Self::origin).
     pub mean: [f64; 6],
-    /// Linearly-mapped component covariance \\(\Phi \Sigma_k \Phi^\top\\)
-    /// in the same basis as [`mean`](Self::mean).
-    pub covariance: [[f64; 6]; 6],
-    /// Reference frame `mean` / `covariance` are expressed in — the
-    /// integration frame of the run.
+    /// The component covariance as one packed joint — the single covariance
+    /// home. Its leading \\(6 \times 6\\) is \\(\Phi \Sigma_k \Phi^\top\\) in
+    /// the same basis as [`mean`](Self::mean).
+    pub joint: crate::PackedJoint,
+    /// How this component resolved at the close approach.
+    pub status: ComponentStatus,
+    /// Reference frame `mean` / `joint` are expressed in — the integration
+    /// frame of the run.
     pub frame: Frame,
     /// Origin (center body) `mean` is expressed relative to. Matches the
     /// propagation origin at the split's close-approach epoch, so it can
     /// differ between CA epochs of the same chain when origin switching
     /// occurred.
     pub origin: Origin,
+}
+
+/// How one adaptive-Gaussian-mixture component resolved at a close approach.
+///
+/// The four states are distinct outcomes, surfaced rather than collapsed: a
+/// component that could not be resolved is not the same as one that resolved
+/// to a flat curvature, and neither is a failure.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ComponentStatus {
+    /// The component resolved to a usable second moment.
+    Resolved,
+    /// The curvature test refused the second-order correction; `rho` is the
+    /// measured quadratic/linear ratio that drove the refusal.
+    CurvatureRefused {
+        /// The measured curvature ρ.
+        rho: f64,
+    },
+    /// The component did not resolve at this epoch.
+    Unresolved,
+    /// The component's sub-propagation failed.
+    Failed,
+    /// The sampled on-sky ensemble overflowed the flat-sky linearization
+    /// bound; `extent` is the measured on-sky angular spread in RADIANS that
+    /// drove the refusal — a different quantity from `CurvatureRefused`'s
+    /// dimensionless `rho`, carried through the same C ABI side-value slot.
+    SkyLinearizationRefused {
+        /// The measured on-sky angular extent, radians.
+        extent: f64,
+    },
+}
+
+impl ComponentStatus {
+    pub(crate) fn from_ffi(status: u8, rho: f64) -> Result<Self> {
+        Ok(match status as u32 {
+            empyrean_sys::EMPYREAN_MIXTURE_COMPONENT_STATUS_RESOLVED => Self::Resolved,
+            empyrean_sys::EMPYREAN_MIXTURE_COMPONENT_STATUS_CURVATURE_REFUSED => {
+                Self::CurvatureRefused { rho }
+            }
+            empyrean_sys::EMPYREAN_MIXTURE_COMPONENT_STATUS_UNRESOLVED => Self::Unresolved,
+            empyrean_sys::EMPYREAN_MIXTURE_COMPONENT_STATUS_FAILED => Self::Failed,
+            empyrean_sys::EMPYREAN_MIXTURE_COMPONENT_STATUS_SKY_LINEARIZATION_REFUSED => {
+                // The C ABI's single side-value slot (`rho`) carries the
+                // on-sky angular extent (radians) for this status, not a
+                // curvature — decoded here by name so a consumer never reads
+                // a radian spread as a ρ.
+                Self::SkyLinearizationRefused { extent: rho }
+            }
+            other => {
+                return Err(Error::invalid_input(format!(
+                    "C ABI returned unknown mixture component status tag: {other}"
+                )));
+            }
+        })
+    }
 }
 
 /// One orbit's retained AGM mixture decomposition — the components
@@ -557,7 +648,8 @@ pub struct MixtureComponent {
 /// - **Only CA epochs where AGM fired.** An orbit that never triggered
 ///   a split gets an empty chain, not a one-component chain.
 /// - **Component covariance is the linear map.** Each
-///   [`MixtureComponent::covariance`] is \\(\Phi \Sigma_k \Phi^\top\\);
+///   the leading \\(6 \times 6\\) of [`MixtureComponent::joint`] is
+///   \\(\Phi \Sigma_k \Phi^\top\\);
 ///   the second-order mean correction is intentionally omitted.
 /// - **Retained weights may sum to less than 1.** A sub-Gaussian whose
 ///   own sub-propagation missed the close approach (or failed to
@@ -591,10 +683,17 @@ impl MixtureComponent {
             ))
         })?;
         let frame = crate::coordinate::int_to_frame(c.frame)?;
+        let joint = unsafe { crate::PackedJoint::from_ffi(&c.joint) }?.ok_or_else(|| {
+            Error::invalid_input(
+                "C ABI returned a width-0 joint for a mixture component, which must carry a \
+                 covariance",
+            )
+        })?;
         Ok(Self {
             weight: c.weight,
             mean: c.mean,
-            covariance: c.covariance,
+            joint,
+            status: ComponentStatus::from_ffi(c.status, c.rho)?,
             frame,
             origin,
         })
@@ -721,10 +820,50 @@ impl MixtureChain {
     }
 }
 
+/// The delivery outcome of one input orbit in a batch
+/// [`Context::propagate`](crate::Context::propagate), one entry per input orbit
+/// in input order ([`PropagationResult::outcomes`]).
+///
+/// A per-orbit failure no longer ends the whole batch: the failing orbit's slot
+/// is [`Failed`](OrbitOutcome::Failed) while every other orbit delivers, and the
+/// call still succeeds. Delivery is this value alone — never a row count, which
+/// is zero for a [`Delivered`](OrbitOutcome::Delivered) orbit whose marker stop
+/// fired before its first requested epoch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrbitOutcome {
+    /// The orbit was propagated; its rows are
+    /// `states[first_row .. first_row + num_rows]` (which may be empty).
+    Delivered {
+        /// Offset of this orbit's first delivered row in
+        /// [`PropagationResult::states`].
+        first_row: usize,
+        /// Delivered row count for this orbit.
+        num_rows: usize,
+    },
+    /// The orbit failed; no rows were delivered for it.
+    Failed {
+        /// The `EMPYREAN_PROPAGATE_FAILURE_*` classification of the failure.
+        code: i32,
+        /// The engine's full failure text.
+        message: String,
+    },
+}
+
+impl OrbitOutcome {
+    /// Whether this orbit was delivered.
+    pub fn is_delivered(&self) -> bool {
+        matches!(self, OrbitOutcome::Delivered { .. })
+    }
+}
+
 /// Result of propagating one or more orbits.
 ///
-/// `states` is organized as `num_orbits × num_epochs` flat entries in
-/// orbit-major order.
+/// `states` is flat and orbit-major: each input orbit's delivered rows form
+/// a contiguous block, in input order. It is `num_orbits × num_epochs` only
+/// when every orbit delivered every epoch — a failed or short orbit
+/// contributes fewer rows (or none), so map rows to orbits with
+/// [`rows_for`](Self::rows_for) / [`outcomes`](Self::outcomes), never a
+/// uniform `orbit_index × num_epochs` grid.
 ///
 /// Holds the underlying C-ABI result so the on-demand tagged-covariance
 /// accessors ([`covariance_series_cartesian`](Self::covariance_series_cartesian)
@@ -744,7 +883,10 @@ pub struct PropagationResult {
     /// against an ascending, duplicate-free request grid is exact; for
     /// any other request shape, join on each state's `epoch`.
     pub states: Vec<PropagatedState>,
-    /// Object identifiers aligned with the orbits input.
+    /// Object identifiers, one per delivered state row and positionally
+    /// parallel to [`states`](Self::states) (not one per input orbit — a
+    /// failed orbit contributes no row here). Map rows to input orbits with
+    /// [`rows_for`](Self::rows_for) / [`outcomes`](Self::outcomes).
     pub object_ids: Vec<String>,
     /// Detected events (one list across all orbits — disambiguate via
     /// `Event::orbit_id`).
@@ -767,6 +909,11 @@ pub struct PropagationResult {
     /// depth-0 only, CA epochs only, linear component covariance, and
     /// retained weights that may sum to less than 1.
     pub mixtures: Vec<MixtureChain>,
+    /// Per-input-orbit delivery outcome, one entry per input orbit in input
+    /// order. A failed orbit is carried here rather than ending the batch;
+    /// read delivery from this, never from a row count. Map rows to orbits
+    /// with [`rows_for`](Self::rows_for).
+    pub outcomes: Vec<OrbitOutcome>,
     /// Retained C-ABI result, freed on drop. The owned `states` /
     /// `object_ids` / `events` / `mixtures` above are independent
     /// copies; this is kept solely to back the lazy tagged-covariance
@@ -834,6 +981,7 @@ impl PropagationResult {
         object_ids: Vec<String>,
         events: Vec<Event>,
         mixtures: Vec<MixtureChain>,
+        outcomes: Vec<OrbitOutcome>,
         ffi: empyrean_sys::EmpyreanPropagationResult,
     ) -> Self {
         Self {
@@ -841,6 +989,7 @@ impl PropagationResult {
             object_ids,
             events,
             mixtures,
+            outcomes,
             ffi: RetainedFfiResult(Box::new(ffi)),
         }
     }
@@ -920,6 +1069,7 @@ impl PropagationResult {
             object_ids,
             events,
             mixtures,
+            outcomes,
             ffi,
         } = self;
         // Free the engine result first, so the peak this method exists
@@ -929,7 +1079,33 @@ impl PropagationResult {
         drop(object_ids);
         drop(events);
         drop(mixtures);
+        drop(outcomes);
         states
+    }
+
+    /// The INPUT orbit count — one [`OrbitOutcome`] per input orbit, whatever
+    /// each delivered.
+    pub fn num_orbits(&self) -> usize {
+        self.outcomes.len()
+    }
+
+    /// Whether every input orbit was delivered.
+    pub fn all_delivered(&self) -> bool {
+        self.outcomes.iter().all(OrbitOutcome::is_delivered)
+    }
+
+    /// The delivered rows of input orbit `orbit_index`, or `None` if the index
+    /// is out of range or the orbit failed. A delivered orbit with zero rows
+    /// (a marker stop before its first requested epoch) returns an empty slice,
+    /// not `None` — delivery is the outcome, never the row count.
+    pub fn rows_for(&self, orbit_index: usize) -> Option<&[PropagatedState]> {
+        match self.outcomes.get(orbit_index)? {
+            OrbitOutcome::Delivered {
+                first_row,
+                num_rows,
+            } => self.states.get(*first_row..*first_row + *num_rows),
+            OrbitOutcome::Failed { .. } => None,
+        }
     }
 
     /// Retained mixture components for one orbit at a close-approach
@@ -968,8 +1144,11 @@ impl PropagationResult {
     /// distinguishes a second-order close-approach ellipsoid from the
     /// bare linear [`PropagatedState::covariance`].
     ///
-    /// Entry `k` corresponds to the orbit's `k`-th output epoch, aligned
-    /// with `states[orbit_index * num_epochs + k]`.
+    /// Entry `k` corresponds to the orbit's `k`-th delivered output epoch,
+    /// aligned with the orbit's own block of
+    /// [`states`](Self::states) — [`rows_for`](Self::rows_for)`(orbit_index)[k]`
+    /// — not a uniform `orbit_index * num_epochs + k` grid, which a failed or
+    /// short earlier orbit shifts.
     pub fn covariance_series_cartesian(&self, orbit_index: usize) -> Result<Vec<TaggedCovariance>> {
         let mut out_series: *mut empyrean_sys::EmpyreanTaggedCovarianceSeries =
             std::ptr::null_mut();
@@ -1018,29 +1197,29 @@ impl PropagationResult {
         TaggedCovariance::from_ffi(&init)
     }
 
-    /// The propagated joint's cross terms at one
-    /// `(orbit_index, epoch_index)` — the state↔Marsden border and the
-    /// wide carrier whose state block is
-    /// [`TaggedCovariance::matrix`](crate::TaggedCovariance).
+    /// The propagated joint at one `(orbit_index, epoch_index)` — the whole
+    /// \\((6+P)\\)-wide covariance as one packed object, whose leading
+    /// \\(6 \times 6\\) state block is the same matrix
+    /// [`TaggedCovariance::matrix`](crate::TaggedCovariance::matrix) returns.
     ///
     /// # Why it is a separate call from the covariance
     ///
-    /// The C ABI keeps its tagged-covariance struct free of owned
-    /// storage, so a C caller who wants only the \\(6 \\times 6\\) frees
-    /// nothing. Asking for the joint is an explicit acquisition there,
-    /// and this mirrors that shape rather than folding the two together
-    /// — the parity rule is by name and semantics, and hiding an
-    /// allocation behind the covariance accessor would give the two
-    /// channels different ownership stories for the same call.
+    /// The C ABI owns the joint's triangle (`tri`), so asking for the joint is
+    /// an explicit acquisition there, freed with the dedicated free call. This
+    /// mirrors that shape rather than folding the two together — the parity
+    /// rule is by name and semantics.
     ///
-    /// Rust callers get the allocation released for them: the FFI arrays
-    /// are copied into owned Rust values and freed before this returns.
+    /// Rust callers get the allocation released for them: the triangle is
+    /// copied into an owned Rust value and freed before this returns.
     ///
-    /// An empty [`JointCovariance`] means the engine produced no cross
-    /// terms at this row — the orbit declared no solved-parameter block
-    /// — not that the terms were zero.
-    pub fn joint_at(&self, orbit_index: usize, epoch_index: usize) -> Result<JointCovariance> {
-        let mut out = empyrean_sys::EmpyreanOrbitCovariance::default();
+    /// `None` means the engine produced a width-0 joint at this row — the
+    /// orbit declared no covariance — not that the terms were zero.
+    pub fn joint_at(
+        &self,
+        orbit_index: usize,
+        epoch_index: usize,
+    ) -> Result<Option<crate::PackedJoint>> {
+        let mut out = empyrean_sys::EmpyreanPackedJoint::default();
         let code = unsafe {
             empyrean_sys::empyrean_propagation_joint_at(
                 &*self.ffi,
@@ -1052,10 +1231,10 @@ impl PropagationResult {
         if code != 0 {
             return Err(Error::capture(code));
         }
-        // Copy out, then release the engine's arrays before returning:
-        // the owned Rust value must not alias storage the caller has no
-        // handle to free.
-        let joint = unsafe { JointCovariance::from_ffi(&out) };
+        // Copy out, then release the engine's triangle before returning: the
+        // owned Rust value must not alias storage the caller has no handle to
+        // free.
+        let joint = unsafe { crate::PackedJoint::from_ffi(&out) };
         unsafe { empyrean_sys::empyrean_orbit_covariance_free(&mut out) };
         joint
     }
@@ -1165,10 +1344,11 @@ mod order_lock_tests {
 
             // resolved-kind alignment, and FirstOrder + no CA ⟹ Linear.
             assert_eq!(
-                tagged.kind, st.resolved_kind,
+                tagged.kind(),
+                st.resolved_kind,
                 "series[{k}] kind != per-state resolved_kind"
             );
-            assert_eq!(tagged.kind, CovarianceKind::Linear);
+            assert_eq!(tagged.kind(), CovarianceKind::Linear);
         }
     }
 }
@@ -1184,7 +1364,6 @@ mod tests {
         for kind in [
             CovarianceKind::Linear,
             CovarianceKind::SecondOrder,
-            CovarianceKind::ThirdOrder,
             CovarianceKind::Mixture,
             CovarianceKind::MonteCarlo,
             CovarianceKind::SigmaPoint,
@@ -1195,7 +1374,110 @@ mod tests {
             CovarianceKind::from_u8(5).unwrap(),
             CovarianceKind::SigmaPoint
         );
+        // Tag 2 (retired third-order) and 6 (unassigned) are both refused.
+        assert!(CovarianceKind::from_u8(2).is_err(), "retired tags reject");
         assert!(CovarianceKind::from_u8(6).is_err(), "unknown tags reject");
+    }
+
+    /// Every mixture-component status decodes from its C-ABI `(status, rho)`
+    /// pair, including `SkyLinearizationRefused` (code 4, new in villeneuve
+    /// 1.26.0): its side value is the on-sky angular extent in radians,
+    /// carried through the same slot `CurvatureRefused`'s ρ uses but decoded
+    /// to a distinct variant by name. Collapsing the code-4 arm makes the C
+    /// ABI return an "unknown status tag" error, failing this round-trip.
+    #[test]
+    fn component_status_round_trips_c_tags() {
+        use super::ComponentStatus;
+        use empyrean_sys::{
+            EMPYREAN_MIXTURE_COMPONENT_STATUS_CURVATURE_REFUSED,
+            EMPYREAN_MIXTURE_COMPONENT_STATUS_FAILED, EMPYREAN_MIXTURE_COMPONENT_STATUS_RESOLVED,
+            EMPYREAN_MIXTURE_COMPONENT_STATUS_SKY_LINEARIZATION_REFUSED,
+            EMPYREAN_MIXTURE_COMPONENT_STATUS_UNRESOLVED,
+        };
+        let f = |code: u32, rho: f64| ComponentStatus::from_ffi(code as u8, rho).unwrap();
+        assert_eq!(
+            f(EMPYREAN_MIXTURE_COMPONENT_STATUS_RESOLVED, f64::NAN),
+            ComponentStatus::Resolved
+        );
+        assert_eq!(
+            f(EMPYREAN_MIXTURE_COMPONENT_STATUS_CURVATURE_REFUSED, 2.5),
+            ComponentStatus::CurvatureRefused { rho: 2.5 }
+        );
+        assert_eq!(
+            f(EMPYREAN_MIXTURE_COMPONENT_STATUS_UNRESOLVED, f64::NAN),
+            ComponentStatus::Unresolved
+        );
+        assert_eq!(
+            f(EMPYREAN_MIXTURE_COMPONENT_STATUS_FAILED, f64::NAN),
+            ComponentStatus::Failed
+        );
+        assert_eq!(
+            f(
+                EMPYREAN_MIXTURE_COMPONENT_STATUS_SKY_LINEARIZATION_REFUSED,
+                0.5
+            ),
+            ComponentStatus::SkyLinearizationRefused { extent: 0.5 }
+        );
+        // An unknown tag is refused loudly, never silently defaulted.
+        assert!(ComponentStatus::from_ffi(7, f64::NAN).is_err());
+    }
+}
+
+#[cfg(test)]
+mod event_kind_decode_tests {
+    use super::Event;
+
+    /// A zeroed `EmpyreanEvent` — every pointer null (the string readers
+    /// handle null) and every payload 0 — so a test can set exactly the
+    /// two tag fields it is about. `#[repr(C)]` POD with raw pointers,
+    /// so an all-zero bit pattern is a valid value.
+    fn blank_event() -> empyrean_sys::EmpyreanEvent {
+        unsafe { std::mem::zeroed() }
+    }
+
+    /// `0xFF` is the only tag that means "this event has no covariance
+    /// kind", and it must keep decoding to `None`.
+    #[test]
+    fn the_not_applicable_sentinel_decodes_to_none() {
+        let mut e = blank_event();
+        e.previous_kind = 0xFF;
+        e.resolved_kind = 0xFF;
+        let ev = Event::from_ffi(&e).expect("0xFF is not an error — it is 'no kind here'");
+        assert!(ev.previous_kind.is_none());
+        assert!(ev.regime_resolved_kind.is_none());
+    }
+
+    /// `EMPYREAN_COVARIANCE_KIND_UNKNOWN` (0xFE) must ERROR, not decode
+    /// to `None`.
+    ///
+    /// The two facts are different and must not share a representation:
+    /// `None` says "this event carries no covariance kind", while 0xFE
+    /// says "it carries one this build has no name for". Swallowing the
+    /// second into the first would undo, at the last hop, the entire
+    /// reason the UNKNOWN tag exists — and the C ABI's own documentation
+    /// promises the wrappers above it stop on an unrecognised tag.
+    #[test]
+    fn the_unknown_kind_tag_errors_rather_than_reading_as_absent() {
+        let mut e = blank_event();
+        e.previous_kind = 0xFF;
+        e.resolved_kind = 0xFE;
+        let err = Event::from_ffi(&e)
+            .expect_err("an UNKNOWN covariance kind must not decode as 'no kind'");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("254") || msg.to_lowercase().contains("unknown"),
+            "the error must name the tag it could not resolve, got {msg:?}"
+        );
+
+        // ...and on the other tag field too — both are decoded, so both
+        // must refuse.
+        let mut e = blank_event();
+        e.previous_kind = 0xFE;
+        e.resolved_kind = 0xFF;
+        assert!(
+            Event::from_ffi(&e).is_err(),
+            "previous_kind must refuse an UNKNOWN tag as well"
+        );
     }
 }
 
@@ -1204,13 +1486,35 @@ mod mixture_marshal_tests {
     use super::{MixtureChain, MixtureComponent};
     use crate::coordinate::{Frame, Origin};
 
+    /// A width-6 state triangle backing every synthetic component's joint.
+    /// `static` so its pointer is valid for the whole `from_ffi` call the
+    /// borrowed C structs are read through.
+    static COMP_TRI: [f64; 21] = [1.0; 21];
+
     /// Build a component with a recognizable weight so slices can be
     /// identified by value.
     fn comp(weight: f64) -> empyrean_sys::EmpyreanMixtureComponent {
         empyrean_sys::EmpyreanMixtureComponent {
             weight,
             mean: [weight; 6],
-            covariance: [[weight; 6]; 6],
+            joint: empyrean_sys::EmpyreanPackedJoint {
+                layout_present: 0b111_111,
+                layout_considered: 0,
+                layout_marginalized: 0,
+                width: 6,
+                tri: COMP_TRI.as_ptr(),
+                tri_len: COMP_TRI.len(),
+                kind: 0,
+                quality: 0,
+                cov_rank: 0,
+                cov_null_axes: 0,
+                cov_min_eig_corr: f64::NAN,
+                functional: 0,
+                provenance: 0,
+                asserted_source: empyrean_sys::EMPYREAN_JOINT_ASSERTED_SOURCE_NONE as u8,
+            },
+            status: 0,
+            rho: f64::NAN,
             // 0 = ICRF, 399 = Earth — the encodings the C ABI documents.
             frame: 0,
             origin: 399,
@@ -1407,7 +1711,21 @@ mod mixture_marshal_tests {
             MixtureComponent {
                 weight,
                 mean: [0.0; 6],
-                covariance: [[0.0; 6]; 6],
+                joint: crate::PackedJoint {
+                    layout: crate::AxisLayout {
+                        present: 0b111_111,
+                        considered: 0,
+                        marginalized: 0,
+                    },
+                    width: 6,
+                    tri: vec![0.0; 21],
+                    kind: crate::CovarianceKind::Linear,
+                    quality: crate::JointQuality::PositiveDefinite,
+                    functional: crate::JointFunctional::State,
+                    provenance: crate::JointProvenance::Derived,
+                    asserted_source: None,
+                },
+                status: super::ComponentStatus::Resolved,
                 frame: Frame::ICRF,
                 origin: Origin::EARTH,
             }
@@ -1421,6 +1739,7 @@ mod mixture_marshal_tests {
                 ca_epochs_mjd_tdb: vec![60000.0, 60000.5],
                 components: vec![vec![component(0.25)], vec![component(0.75)]],
             }],
+            Vec::new(),
             empyrean_sys::EmpyreanPropagationResult {
                 states: std::ptr::null_mut(),
                 num_states: 0,
@@ -1430,6 +1749,8 @@ mod mixture_marshal_tests {
                 mixtures: std::ptr::null_mut(),
                 num_mixtures: 0,
                 lazy_handle: std::ptr::null_mut(),
+                num_orbits: 0,
+                outcomes: std::ptr::null_mut(),
             },
         );
 
@@ -1469,7 +1790,8 @@ mod result_weight_tests {
         stm: Option<[[f64; 6]; 6]>,
         stt: Option<[[[f64; 6]; 6]; 6]>,
         resolved_kind: super::CovarianceKind,
-        joint: crate::JointCovariance,
+        joint: Option<crate::PackedJoint>,
+        mixture_tally: Option<super::MixtureTally>,
     }
 
     /// Boxing the STT is the whole of F4's per-state win, and it is
@@ -1492,8 +1814,8 @@ mod result_weight_tests {
             8,
             "a boxed STT slot is one niche-optimized pointer — no discriminant word"
         );
-        assert_eq!(inline, 2616, "PropagatedState with the tensor inline");
-        assert_eq!(boxed, 888, "PropagatedState with the tensor boxed");
+        assert_eq!(inline, 2520, "PropagatedState with the tensor inline");
+        assert_eq!(boxed, 792, "PropagatedState with the tensor boxed");
         assert_eq!(
             inline - boxed,
             1728,
@@ -1525,7 +1847,7 @@ mod result_weight_tests {
     fn the_c_abi_row_still_carries_the_tensor_inline() {
         assert_eq!(
             std::mem::size_of::<empyrean_sys::EmpyreanPropagatedState>(),
-            2576,
+            2504,
             "the C row must not move: F4 is a wrapper-side change"
         );
     }
@@ -1546,6 +1868,7 @@ mod into_states_tests {
     /// tests exercise the release path without a data directory.
     fn empty_result() -> PropagationResult {
         PropagationResult::new(
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -1589,5 +1912,231 @@ mod into_states_tests {
             before + 1,
             "dropping a result releases the retained result exactly once"
         );
+    }
+}
+
+#[cfg(test)]
+mod outcome_channel_tests {
+    use super::*;
+    use crate::coordinate::CoordinateState;
+    use crate::{Context, Epoch, Frame, Orbit, Origin, PropagationConfig};
+    use std::path::PathBuf;
+
+    fn try_context() -> Option<Context> {
+        let candidates = [
+            std::env::var("EMPYREAN_DATA_DIR").ok().map(PathBuf::from),
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".empyrean/data")),
+        ];
+        for dir in candidates.into_iter().flatten() {
+            if let Ok(ctx) = Context::from_data_dir(Some(&dir)) {
+                return Some(ctx);
+            }
+        }
+        None
+    }
+
+    /// A valid heliocentric Cartesian orbit (delivers at every epoch).
+    fn delivered(id: &str, px: f64) -> Orbit {
+        let state = CoordinateState::cartesian(
+            Epoch::from_mjd_tdb(59000.0),
+            [px, 0.0, 0.0, 0.0, 0.012_17, 0.0],
+            Frame::EclipticJ2000,
+            Origin::Sun,
+        );
+        Orbit::new(state).with_orbit_id(id)
+    }
+
+    /// An orbit the engine refuses to integrate: a finite state whose epoch is
+    /// far outside the ephemeris span, so the perturber lookup fails on the
+    /// first integration step — a carried per-orbit `Failed`, not a call-level
+    /// error.
+    fn refused(id: &str) -> Orbit {
+        let state = CoordinateState::cartesian(
+            Epoch::from_mjd_tdb(400_000.0),
+            [1.0, 0.0, 0.0, 0.0, 0.012_17, 0.0],
+            Frame::EclipticJ2000,
+            Origin::Sun,
+        );
+        Orbit::new(state).with_orbit_id(id)
+    }
+
+    /// The same mixed batch the C contract test runs, through the safe wrapper:
+    /// outcomes read by variant, `all_delivered()` false, and `rows_for`
+    /// selecting one orbit's rows out of the shared `states`.
+    #[test]
+    fn a_mixed_batch_exposes_outcomes_and_rows_for() {
+        let Some(ctx) = try_context() else {
+            eprintln!("skipping a_mixed_batch_exposes_outcomes_and_rows_for: no data dir");
+            return;
+        };
+        let orbits = [delivered("a", 1.0), refused("b"), delivered("c", 1.2)];
+        let epochs: Vec<Epoch> = [59000.0, 59005.0, 59012.0]
+            .iter()
+            .map(|&t| Epoch::from_mjd_tdb(t))
+            .collect();
+        let result = ctx
+            .propagate(&orbits, &epochs, &PropagationConfig::default())
+            .expect("a per-orbit failure does not end the batch");
+
+        assert_eq!(result.num_orbits(), 3, "one outcome per input orbit");
+        assert!(!result.all_delivered(), "the middle orbit failed");
+
+        match &result.outcomes[0] {
+            OrbitOutcome::Delivered {
+                first_row,
+                num_rows,
+            } => {
+                assert_eq!(*first_row, 0);
+                assert_eq!(*num_rows, 3);
+            }
+            other => panic!("orbit 0 should deliver, got {other:?}"),
+        }
+        match &result.outcomes[1] {
+            OrbitOutcome::Failed { code, message } => {
+                assert_ne!(*code, 0, "a failed orbit carries a classified code");
+                assert!(!message.is_empty(), "a failed orbit carries its message");
+            }
+            other => panic!("orbit 1 should fail, got {other:?}"),
+        }
+
+        // rows_for selects one orbit's block; the failed orbit has none.
+        assert!(result.rows_for(1).is_none(), "a failed orbit has no rows");
+        let rows2 = result.rows_for(2).expect("orbit 2 delivered rows");
+        assert_eq!(rows2.len(), 3, "orbit 2 delivers one row per epoch");
+
+        // rows_for returns a slice of the SAME states (not a copy): the first
+        // row of orbit 2's block is exactly states[first_row].
+        let OrbitOutcome::Delivered { first_row, .. } = &result.outcomes[2] else {
+            panic!("orbit 2 should deliver");
+        };
+        assert_eq!(
+            rows2[0].epoch.mjd_tdb().unwrap(),
+            result.states[*first_row].epoch.mjd_tdb().unwrap(),
+            "rows_for(2) is the slice of states starting at outcome 2's first_row"
+        );
+        // The failed middle orbit occupies NO rows, so orbit 2 begins right
+        // after orbit 0's three rows.
+        assert_eq!(*first_row, 3, "orbit 2's rows follow orbit 0's immediately");
+        assert_eq!(
+            result.states.len(),
+            6,
+            "num_states is delivered rows only (orbits 0 and 2)"
+        );
+    }
+
+    /// Regression pin for the distribution-side out-of-bounds read: a mixed
+    /// batch (delivered, failed, delivered) resolved to a SINGLE target epoch
+    /// gives `num_states` (2) < `num_orbits` (3). The marshal once sized the
+    /// object-id read by `num_orbits`, reading one `*const c_char` past the
+    /// C-allocated array — a release segfault (debug survived by heap luck).
+    /// Reaching these assertions at all proves the read stayed in bounds; the
+    /// object-id column is parallel to `states` (one per delivered row), never
+    /// to the input orbits. Reverting the read length to `num_orbits` makes
+    /// this test crash or fail.
+    #[test]
+    fn a_single_epoch_mixed_batch_reads_object_ids_safely() {
+        let Some(ctx) = try_context() else {
+            eprintln!("skipping a_single_epoch_mixed_batch_reads_object_ids_safely: no data dir");
+            return;
+        };
+        let orbits = [delivered("a", 1.0), refused("b"), delivered("c", 1.2)];
+        let epochs = [Epoch::from_mjd_tdb(59012.0)];
+        let result = ctx
+            .propagate(&orbits, &epochs, &PropagationConfig::default())
+            .expect("a per-orbit failure does not end the batch");
+
+        assert_eq!(result.num_orbits(), 3, "one outcome per input orbit");
+        assert!(!result.all_delivered(), "the middle orbit failed");
+        assert_eq!(
+            result.states.len(),
+            2,
+            "two delivered orbits, one epoch each; num_states < num_orbits"
+        );
+        // The object-id column — the array the OOB read ran past — is sized by
+        // num_states (parallel to states), not num_orbits.
+        assert_eq!(
+            result.object_ids.len(),
+            result.states.len(),
+            "object_ids is one per delivered state row"
+        );
+        assert!(!result.outcomes[1].is_delivered(), "orbit 1 failed");
+        assert_eq!(result.rows_for(0).map(<[_]>::len), Some(1));
+        assert!(result.rows_for(1).is_none(), "a failed orbit has no rows");
+        assert_eq!(result.rows_for(2).map(<[_]>::len), Some(1));
+    }
+
+    /// A covariance-bearing orbit at the standard epoch — needed for a tagged
+    /// covariance series to exist.
+    fn delivered_with_cov(id: &str, px: f64) -> Orbit {
+        let mut cov = [[0.0_f64; 6]; 6];
+        for (i, row) in cov.iter_mut().enumerate() {
+            row[i] = if i < 3 { 1.0e-16 } else { 1.0e-20 };
+        }
+        let state = CoordinateState::cartesian(
+            Epoch::from_mjd_tdb(59000.0),
+            [px, 0.0, 0.0, 0.0, 0.012_17, 0.0],
+            Frame::EclipticJ2000,
+            Origin::Sun,
+        )
+        .with_covariance(cov);
+        Orbit::new(state).with_orbit_id(id)
+    }
+
+    /// Regression pin for the lazy covariance-series accessor's row index: a
+    /// covariance-bearing mixed batch (delivered, FAILED, delivered) over
+    /// several epochs. The accessor co-locates each series entry's nominal
+    /// state through the engine's per-orbit row ranges, so querying orbit 2 —
+    /// whose block is shifted earlier because the failed orbit 1 delivered no
+    /// rows — returns orbit 2's own states, bit-identical to the delivered
+    /// state table's slice. The old `orbit_index * n_times` grid indexed past
+    /// orbit 2's block and refused the whole series (STATE_MISSING); restoring
+    /// it makes this fail.
+    #[test]
+    fn covariance_series_reindexes_through_orbit_blocks_for_a_mixed_batch() {
+        let Some(ctx) = try_context() else {
+            eprintln!(
+                "skipping covariance_series_reindexes_through_orbit_blocks_for_a_mixed_batch: \
+                 no data dir"
+            );
+            return;
+        };
+        let orbits = [
+            delivered_with_cov("a", 1.0),
+            refused("b"),
+            delivered_with_cov("c", 1.2),
+        ];
+        let epochs: Vec<Epoch> = [59000.0, 59005.0, 59012.0]
+            .iter()
+            .map(|&t| Epoch::from_mjd_tdb(t))
+            .collect();
+        let result = ctx
+            .propagate(&orbits, &epochs, &PropagationConfig::default())
+            .expect("a per-orbit failure does not end the batch");
+
+        let series = result
+            .covariance_series_cartesian(2)
+            .expect("orbit 2 carries a covariance series");
+        let rows2 = result.rows_for(2).expect("orbit 2 delivered rows");
+        assert_eq!(
+            series.len(),
+            rows2.len(),
+            "one series entry per delivered epoch"
+        );
+        for (entry, state) in series.iter().zip(rows2.iter()) {
+            let expected = [
+                state.position[0],
+                state.position[1],
+                state.position[2],
+                state.velocity[0],
+                state.velocity[1],
+                state.velocity[2],
+            ];
+            assert_eq!(
+                entry.state, expected,
+                "the series co-locates orbit 2's own nominal state (rows_for(2)), bit-identical"
+            );
+        }
     }
 }

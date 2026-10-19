@@ -161,11 +161,7 @@ fn the_builtsystem_path_names_the_offending_orbit() {
     let Some(ctx) = try_context() else { return };
 
     let system = ctx
-        .built_system(
-            config().force_model,
-            config().frame,
-            config().advanced.encounter_timescale_divisor,
-        )
+        .built_system(config().force_model, config().frame)
         .expect("build a force-model handle");
     let err = system
         .propagate(&ctx, &batch_with_one_bad_orbit(), &epochs(), &config())

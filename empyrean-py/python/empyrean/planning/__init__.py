@@ -8,11 +8,14 @@ variant, the visibility survey, batch evaluation, and the encounter
 B-plane — and why a non-gravitational orbit is evaluated state-only.
 """
 
-from empyrean.planning.plan import evaluate_plan
+from empyrean.planning.plan import compute_visibility, evaluate_plan
 from empyrean.planning.result import (
     STAGE_POSTERIOR,
     STAGE_PRIOR,
+    LogDetWithheld,
+    Nights,
     ObservatoryConfig,
+    ObservatorySummary,
     PlanCandidates,
     PlanEphemeris,
     PlanMetrics,
@@ -22,12 +25,19 @@ from empyrean.planning.result import (
     PlanResult,
     RadarMode,
     RadarStation,
+    VisibilityAnchors,
+    VisibilityPoints,
+    VisibilityResult,
+    VisibilityWindows,
 )
 
 __all__ = [
     "STAGE_POSTERIOR",
     "STAGE_PRIOR",
+    "LogDetWithheld",
+    "Nights",
     "ObservatoryConfig",
+    "ObservatorySummary",
     "PlanCandidates",
     "PlanEphemeris",
     "PlanMetrics",
@@ -37,5 +47,10 @@ __all__ = [
     "PlanningConfig",
     "RadarMode",
     "RadarStation",
+    "VisibilityAnchors",
+    "VisibilityPoints",
+    "VisibilityResult",
+    "VisibilityWindows",
+    "compute_visibility",
     "evaluate_plan",
 ]

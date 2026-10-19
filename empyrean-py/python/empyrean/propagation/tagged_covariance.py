@@ -4,38 +4,53 @@ The honest per-``(orbit, epoch)`` covariance distinct from the bare
 linear ``Φ Σ₀ Φᵀ`` mapping carried on the propagated states. When a
 propagation crosses an ``Auto`` close-approach window the resolved
 covariance there can be a second-order Park–Scheeres ellipsoid rather
-than the linear one; this table records *which* kind produced each
-epoch's matrix, along with its definiteness, any mean shifts, the
-solved-for width, and the basis (origin / frame).
+than the linear one; this table records the packed joint produced at each
+epoch — the single covariance authority — along with its co-located
+nominal state, any second-order mean shift, and the basis
+(origin / frame). The joint's :class:`~empyrean.orbits.joint.CovarianceKind`,
+:class:`~empyrean.orbits.joint.JointQuality`, state ``6×6`` and solved
+width ride beside it as derived convenience columns.
 
 Two shapes, mirroring the rest of the package:
 
 - :class:`TaggedCovariances` — a flat quivr Table, one row per
-  ``(orbit, epoch)``, rows grouped contiguously by ``orbit_id`` to
-  match propagation's orbit-major output. The 6×6 matrix rides as 21
-  lower-triangular ``cov_*`` columns, exactly like
-  :class:`~empyrean.coordinates.covariance.CartesianCovariance`.
-- :class:`TaggedCovariance` — a small per-epoch dataclass with the
-  matrix re-materialized as a contiguous ``(6, 6)`` ``np.ndarray`` and
-  the enums decoded, returned by
-  :meth:`~empyrean.PropagationResult.tagged_covariance_series`.
+  ``(orbit, epoch)``, rows grouped contiguously by ``orbit_id`` to match
+  propagation's orbit-major output. The joint rides as the
+  :class:`~empyrean.orbits.joint.PackedJoints` column; its leading state
+  ``6×6`` is mirrored as 21 lower-triangular ``cov_*`` columns.
+- :class:`TaggedCovariance` — a small per-epoch dataclass carrying the
+  :class:`~empyrean.orbits.joint.PackedJoint` with the matrix, kind,
+  quality and solved width derived from it.
 """
 
 from __future__ import annotations
 
-import enum
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import quivr as qv
 
-from empyrean._convert import joint_columns_from_result
 from empyrean.coordinates.covariance import (
     _cov_column_names,
     _lower_tri_indices,
 )
-from empyrean.orbits.wide_cross import WideCross
+from empyrean.orbits.joint import (
+    _KIND_BY_CODE,
+    _QUALITY_BY_CODE,
+    CovarianceKind,
+    JointQuality,
+    PackedJoint,
+    PackedJoints,
+)
+
+__all__ = [
+    "CovarianceKind",
+    "JointQuality",
+    "TaggedCovariance",
+    "TaggedCovariances",
+    "build_tagged_covariances",
+]
 
 # 6×6 Cartesian state labels — the matrix basis is always Cartesian
 # [x, y, z, vx, vy, vz] for the tagged readback.
@@ -44,94 +59,14 @@ _COV_NAMES = _cov_column_names(_STATE_LABELS)
 _LOWER_TRI = _lower_tri_indices(6)
 
 
-class CovarianceKind(str, enum.Enum):
-    """How a covariance was derived at an output epoch.
-
-    Subclasses ``str`` so values serialize directly into the
-    ``TaggedCovariances.kind`` string column. The integer codes match
-    the C ABI ``EMPYREAN_COVARIANCE_KIND_*`` order.
-    """
-
-    LINEAR = "linear"
-    """Linear STM mapping ``Φ Σ₀ Φᵀ`` (code 0)."""
-    SECOND_ORDER = "second_order"
-    """Park–Scheeres second-order (Jet2 STT) correction (code 1)."""
-    THIRD_ORDER = "third_order"
-    """Third-order (Jet3 STT3) extension (code 2)."""
-    MIXTURE = "mixture"
-    """Adaptive Gaussian Mixture, moment-collapsed (code 3)."""
-    MONTE_CARLO = "monte_carlo"
-    """Monte Carlo sample covariance (code 4)."""
-    SIGMA_POINT = "sigma_point"
-    """Sigma-point sample covariance — the second moment of the
-    propagated canonical 2N+1 sigma-point set (code 5)."""
-
-
-class CovarianceQuality(str, enum.Enum):
-    """Definiteness of a tagged covariance matrix.
-
-    Each member's payload rides alongside in its own column /
-    dataclass field, and is NaN on every other member: ``min_eig`` for
-    :attr:`INDEFINITE` and :attr:`REPAIRED`, ``kappa_state`` for
-    :attr:`EXPANSION_SUSPECT`. The tag is the presence rule.
-    """
-
-    POSITIVE_DEFINITE = "positive_definite"
-    """All eigenvalues positive within round-off (code 0)."""
-    INDEFINITE = "indefinite"
-    """At least one meaningfully negative eigenvalue (code 1)."""
-    REPAIRED = "repaired"
-    """Explicitly repaired to PSD; ``min_eig`` is the value before
-    repair (code 2)."""
-    EXPANSION_SUSPECT = "expansion_suspect"
-    """Definite, but the second-order expansion behind it is not
-    clearly valid here — the quadratic term is not small against the
-    linear one (code 3). ``quality_kappa_state`` carries the ratio.
-
-    Deliberately not folded into :attr:`POSITIVE_DEFINITE`: the matrix
-    *is* definite, so a check for definiteness alone would accept a
-    covariance the engine does not vouch for."""
-
-
-class TargetFunctional(str, enum.Enum):
-    """The functional a tagged covariance's second moment describes."""
-
-    CARTESIAN_STATE = "cartesian_state"
-    """Generic Cartesian-state second moment (code 0)."""
-    CLOSE_APPROACH_MISS_DISTANCE = "close_approach_miss_distance"
-    """Tied to the close-approach miss-distance functional, not a
-    generic state σ (code 1)."""
-
-
-# Integer-code → enum decoders. The codes are the wire values the
-# Rust extension emits (matching the C ABI EMPYREAN_* constants).
-_KIND_BY_CODE = {
-    0: CovarianceKind.LINEAR,
-    1: CovarianceKind.SECOND_ORDER,
-    2: CovarianceKind.THIRD_ORDER,
-    3: CovarianceKind.MIXTURE,
-    4: CovarianceKind.MONTE_CARLO,
-    5: CovarianceKind.SIGMA_POINT,
-}
-_QUALITY_BY_CODE = {
-    0: CovarianceQuality.POSITIVE_DEFINITE,
-    1: CovarianceQuality.INDEFINITE,
-    2: CovarianceQuality.REPAIRED,
-    3: CovarianceQuality.EXPANSION_SUSPECT,
-}
-_TARGET_BY_CODE = {
-    0: TargetFunctional.CARTESIAN_STATE,
-    1: TargetFunctional.CLOSE_APPROACH_MISS_DISTANCE,
-}
-
-
 @dataclass
 class TaggedCovariance:
     """Provenance-tagged covariance at a single ``(orbit, epoch)``.
 
     The ergonomic per-epoch view yielded by
-    :meth:`~empyrean.PropagationResult.tagged_covariance_series`. The
-    matrix is a contiguous ``(6, 6)`` array and the enums are decoded.
+    :meth:`TaggedCovariances.to_series`. The packed
+    :attr:`joint` is the authority; :attr:`matrix`, :attr:`kind`,
+    :attr:`quality` and :attr:`solved_width` are derived from it.
 
     Attributes
     ----------
@@ -140,88 +75,59 @@ class TaggedCovariance:
     state : np.ndarray
         Co-located propagated nominal state ``[x, y, z, vx, vy, vz]``
         (AU, AU/day), shape ``(6,)``.
-    matrix : np.ndarray
-        The 6×6 covariance, contiguous, shape ``(6, 6)``.
-    kind : CovarianceKind
-        How the covariance was derived.
-    quality : CovarianceQuality
-        Definiteness of ``matrix``.
-    quality_min_eig : float
-        Minimum eigenvalue for indefinite / repaired matrices; NaN for
-        every other ``quality``.
-    quality_kappa_state : float
-        κ_state, the block-wise quadratic/linear ratio that produced an
-        :attr:`CovarianceQuality.EXPANSION_SUSPECT` tag; NaN for every
-        other ``quality``, and ``inf`` when a zero-spread block carried
-        a nonzero second-order correction. Read-only provenance —
-        guard with :func:`math.isfinite` before any arithmetic.
+    joint : PackedJoint
+        The packed joint covariance — the single covariance home.
     mc_seed : int, optional
-        Monte-Carlo run seed (set only when ``kind`` is
-        :attr:`CovarianceKind.MONTE_CARLO`).
+        Monte-Carlo run seed. Set only when :attr:`kind` is
+        :attr:`CovarianceKind.MONTE_CARLO`, and not on every such row: an
+        ensemble seeded from system entropy carries ``None``.
     mean_shift_prop : np.ndarray, optional
         Second-order propagation mean shift ``δμ_prop`` (zero at t₀),
         shape ``(6,)`` or ``None``.
-    mean_shift_input : np.ndarray, optional
-        OD-estimator mean shift ``δμ₀`` (nonzero at t₀), shape ``(6,)``
-        or ``None``.
-    non_grav : np.ndarray
-        ``[A1, A2, A3]`` non-grav solved flags, shape ``(3,)`` bool.
-    thrust_segments : int
-        Thrust Δv segments solved for.
-    solved_width : int
-        Solved width (6 / 9 / 12 / …) — the conservative-vs-optimistic
-        information-product axis.
-    target_functional : TargetFunctional
-        The functional this second moment describes.
     origin : str
         Canonical origin (center body) name of the basis.
     frame : str
         Reference frame of the basis (canonical name, e.g. ``"icrf"``).
-    non_grav_cross : np.ndarray, optional
-        The ``(6, 3)`` state-to-(A1, A2, A3) cross covariance, in the
-        same basis as :attr:`matrix`; ``None`` when the orbit declared
-        no Marsden block.
-    state_cross : dict[str, np.ndarray]
-        Every other state-parameter column, keyed by parameter tag
-        (``"DT"``, ``"AMRAT"``, ``"thrust[0].x"``), each a 6-vector.
-        Empty when the layout carries none.
-    param_cross : dict[tuple[str, str], float]
-        Parameter-parameter terms, keyed by canonical ``(a, b)`` pair.
-        Empty when the layout carries none.
     """
 
     epoch_mjd_tdb: float
     state: np.ndarray
-    matrix: np.ndarray
-    kind: CovarianceKind
-    quality: CovarianceQuality
-    quality_min_eig: float
-    quality_kappa_state: float
+    joint: PackedJoint
     mc_seed: int | None
     mean_shift_prop: np.ndarray | None
-    mean_shift_input: np.ndarray | None
-    non_grav: np.ndarray
-    thrust_segments: int
-    solved_width: int
-    target_functional: TargetFunctional
     origin: str
     frame: str
-    non_grav_cross: np.ndarray | None
-    state_cross: dict[str, np.ndarray]
-    param_cross: dict[tuple[str, str], float]
+
+    @property
+    def matrix(self) -> np.ndarray:
+        """The state ``6×6``, derived from the joint's leading block."""
+        return self.joint.state_block()
+
+    @property
+    def kind(self) -> CovarianceKind:
+        """How the covariance was derived (derived from the joint)."""
+        return self.joint.kind
+
+    @property
+    def quality(self) -> JointQuality:
+        """Definiteness of the matrix (derived from the joint)."""
+        return self.joint.quality
+
+    @property
+    def solved_width(self) -> int:
+        """Solved width ``6 + P`` (derived from the joint)."""
+        return self.joint.width
 
     @property
     def corrected_mean(self) -> np.ndarray:
-        """The corrected mean: ``state + δμ_prop + δμ_input``.
+        """The corrected mean: ``state + δμ_prop``.
 
-        Mean shifts default to zero when absent, so this always returns
-        a ``(6,)`` array.
+        The mean shift defaults to zero when absent, so this always
+        returns a ``(6,)`` array.
         """
         out = np.asarray(self.state, dtype=np.float64).copy()
         if self.mean_shift_prop is not None:
             out = out + self.mean_shift_prop
-        if self.mean_shift_input is not None:
-            out = out + self.mean_shift_input
         return np.ascontiguousarray(out, dtype=np.float64)
 
 
@@ -238,16 +144,15 @@ class TaggedCovariances(qv.Table):
 
     Notes
     -----
-    The 6×6 matrix rides as 21 lower-triangular ``cov_{i}_{j}`` columns
-    (same layout as
-    :class:`~empyrean.coordinates.covariance.CartesianCovariance`). The
-    co-located nominal state and the optional mean-shift vectors ride as
-    six scalar columns each, paired with a presence flag for the
-    optional vectors.
+    The packed joint rides as the
+    :class:`~empyrean.orbits.joint.PackedJoints` column — the covariance
+    authority. Its leading state ``6×6`` is mirrored as 21
+    lower-triangular ``cov_*`` columns, and its kind / quality / solved
+    width ride as derived convenience columns.
 
-    ``has_tagged`` is ``False`` on rows where the underlying orbit
-    carried no covariance — those rows are zero-filled placeholders that
-    keep the table aligned 1:1 with the propagated states.
+    ``has_tagged`` is ``False`` on rows where the underlying orbit carried
+    no covariance — those rows are zero-filled placeholders that keep the
+    table aligned 1:1 with the propagated states.
     """
 
     orbit_id = qv.LargeStringColumn()
@@ -266,18 +171,24 @@ class TaggedCovariances(qv.Table):
     state_vz = qv.Float64Column()
 
     kind = qv.LargeStringColumn()
-    """Resolved covariance kind (``CovarianceKind`` value)."""
+    """Resolved covariance kind (``CovarianceKind`` value), derived from
+    the joint."""
     quality = qv.LargeStringColumn()
-    """Definiteness (``CovarianceQuality`` value)."""
-    quality_min_eig = qv.Float64Column(nullable=True)
-    """Minimum eigenvalue for indefinite / repaired matrices; NaN for
-    every other ``quality``."""
-    quality_kappa_state = qv.Float64Column(nullable=True)
-    """κ_state behind an ``expansion_suspect`` tag; NaN for every other
-    ``quality``. Read-only provenance — check ``np.isfinite`` first."""
+    """Definiteness (``JointQuality`` value), derived from the joint."""
+    quality_rank = qv.UInt32Column(nullable=True)
+    """Numerical rank for a positive-semidefinite joint."""
+    quality_null_axes = qv.UInt32Column(nullable=True)
+    """Null-space dimension for a positive-semidefinite joint."""
+    quality_min_eig_corr = qv.Float64Column(nullable=True)
+    """Most-negative correlation-scaled eigenvalue for an indefinite /
+    repaired joint; NaN otherwise."""
+    solved_width = qv.UInt32Column()
+    """Solved width ``6 + P``, derived from the joint."""
 
     mc_seed = qv.UInt64Column(nullable=True)
-    """Monte-Carlo run seed; null unless ``kind`` is ``monte_carlo``."""
+    """Monte-Carlo run seed; null unless ``kind`` is ``monte_carlo``, and
+    null on a ``monte_carlo`` row whose ensemble was seeded from system
+    entropy (not reproducible by construction)."""
 
     # Second-order propagation mean shift δμ_prop (zero at t₀).
     mean_shift_prop_x = qv.Float64Column(nullable=True)
@@ -289,35 +200,13 @@ class TaggedCovariances(qv.Table):
     has_mean_shift_prop = qv.BooleanColumn()
     """Whether ``mean_shift_prop_*`` carries a value on this row."""
 
-    # OD-estimator mean shift δμ₀ (nonzero at t₀).
-    mean_shift_input_x = qv.Float64Column(nullable=True)
-    mean_shift_input_y = qv.Float64Column(nullable=True)
-    mean_shift_input_z = qv.Float64Column(nullable=True)
-    mean_shift_input_vx = qv.Float64Column(nullable=True)
-    mean_shift_input_vy = qv.Float64Column(nullable=True)
-    mean_shift_input_vz = qv.Float64Column(nullable=True)
-    has_mean_shift_input = qv.BooleanColumn()
-    """Whether ``mean_shift_input_*`` carries a value on this row."""
-
-    # [A1, A2, A3] non-grav solved flags.
-    non_grav_a1 = qv.BooleanColumn()
-    non_grav_a2 = qv.BooleanColumn()
-    non_grav_a3 = qv.BooleanColumn()
-
-    thrust_segments = qv.UInt32Column()
-    """Thrust Δv segments solved for."""
-    solved_width = qv.UInt32Column()
-    """Solved width (6 / 9 / 12 / …)."""
-    target_functional = qv.LargeStringColumn()
-    """The functional this second moment describes
-    (``TargetFunctional`` value)."""
-
     origin = qv.LargeStringColumn()
     """Canonical origin (center body) name of the basis."""
     frame = qv.LargeStringColumn()
     """Reference frame of the basis (canonical name)."""
 
-    # 6×6 covariance as 21 lower-triangular columns.
+    # 6×6 state block as 21 lower-triangular columns (derived from the
+    # joint's leading block).
     cov_x_x = qv.Float64Column(nullable=True)
     cov_x_y = qv.Float64Column(nullable=True)
     cov_y_y = qv.Float64Column(nullable=True)
@@ -344,22 +233,10 @@ class TaggedCovariances(qv.Table):
     """``False`` on zero-filled placeholder rows where the underlying
     orbit carried no covariance."""
 
-    non_grav_cross = qv.LargeListColumn(qv.Float64Column(), nullable=True)
-    """6×3 row-major state-to-(A1, A2, A3) cross covariance, 18 values,
-    in the Cartesian basis of the ``cov_*`` columns above.
-
-    The off-diagonal half of the matrix those columns are the state block
-    of. Null on a row whose orbit declared no Marsden block — never a
-    block of zeros, which would read as a supplied zero correlation."""
-
-    wide_cross = WideCross.as_column(nullable=True)
-    """Cross terms beyond the state+Marsden ``9x9`` — state↔DT,
-    state↔AMRAT, state↔Δv, and every mixed parameter pair.
-
-    Populated on every uncertainty method that produces a joint,
-    including the sampled ones, which recover the state-parameter
-    columns from the propagated cloud. Absence is per-row nulls; see
-    :meth:`WideCross.row_is_empty`."""
+    covariance = PackedJoints.as_column(nullable=True)
+    """The packed joint per ``(orbit, epoch)`` — the covariance authority.
+    Null on a row whose orbit carried no covariance; see
+    :meth:`PackedJoints.row_is_empty`."""
 
     # ── Introspection ─────────────────────────────────────────
 
@@ -378,8 +255,8 @@ class TaggedCovariances(qv.Table):
     def matrices(self) -> np.ndarray:
         """Reshape the lower-tri ``cov_*`` columns to ``(n, 6, 6)``.
 
-        Rows with ``has_tagged=False`` come back zero-filled. Works on
-        the full table or a filtered single chain.
+        Rows with ``has_tagged=False`` come back zero-filled. Works on the
+        full table or a filtered single chain.
         """
         n = len(self)
         mat = np.zeros((n, 6, 6), dtype=np.float64)
@@ -400,20 +277,11 @@ class TaggedCovariances(qv.Table):
         ``select("orbit_id", oid)`` first to get one orbit's series.
         """
         n = len(self)
-        mats = self.matrices()
         epochs = self.column("epoch_mjd_tdb").to_numpy(zero_copy_only=False)
-        kinds = self.column("kind").to_pylist()
-        qualities = self.column("quality").to_pylist()
-        min_eigs = self.column("quality_min_eig").to_numpy(zero_copy_only=False)
-        kappas = self.column("quality_kappa_state").to_numpy(zero_copy_only=False)
-        targets = self.column("target_functional").to_pylist()
         origins = self.column("origin").to_pylist()
         frames = self.column("frame").to_pylist()
-        thrust = self.column("thrust_segments").to_numpy(zero_copy_only=False)
-        widths = self.column("solved_width").to_numpy(zero_copy_only=False)
         mc_seeds = self.column("mc_seed").to_pylist()
         has_prop = self.column("has_mean_shift_prop").to_numpy(zero_copy_only=False)
-        has_input = self.column("has_mean_shift_input").to_numpy(zero_copy_only=False)
 
         state = np.column_stack(
             [self.column(f"state_{lab}").to_numpy(zero_copy_only=False) for lab in _STATE_LABELS]
@@ -424,55 +292,25 @@ class TaggedCovariances(qv.Table):
                 for lab in _STATE_LABELS
             ]
         )
-        inp = np.column_stack(
-            [
-                self.column(f"mean_shift_input_{lab}").to_numpy(zero_copy_only=False)
-                for lab in _STATE_LABELS
-            ]
-        )
-        ng = np.column_stack(
-            [self.column(f"non_grav_a{k}").to_numpy(zero_copy_only=False) for k in (1, 2, 3)]
-        )
-        # The cross terms, read through the same accessors the table
-        # exposes so the two views cannot describe the same joint
-        # differently.
-        borders = self.non_grav_cross.to_pylist()
 
         out: list[TaggedCovariance] = []
         for i in range(n):
+            pj = self.covariance.joint(i)
+            if pj is None:
+                continue
             out.append(
                 TaggedCovariance(
                     epoch_mjd_tdb=float(epochs[i]),
                     state=np.ascontiguousarray(state[i], dtype=np.float64),
-                    matrix=np.ascontiguousarray(mats[i], dtype=np.float64),
-                    kind=CovarianceKind(kinds[i]),
-                    quality=CovarianceQuality(qualities[i]),
-                    quality_min_eig=float(min_eigs[i]),
-                    quality_kappa_state=float(kappas[i]),
+                    joint=pj,
                     mc_seed=int(mc_seeds[i]) if mc_seeds[i] is not None else None,
                     mean_shift_prop=(
                         np.ascontiguousarray(prop[i], dtype=np.float64)
                         if bool(has_prop[i])
                         else None
                     ),
-                    mean_shift_input=(
-                        np.ascontiguousarray(inp[i], dtype=np.float64)
-                        if bool(has_input[i])
-                        else None
-                    ),
-                    non_grav=np.asarray(ng[i], dtype=bool),
-                    thrust_segments=int(thrust[i]),
-                    solved_width=int(widths[i]),
-                    target_functional=TargetFunctional(targets[i]),
                     origin=str(origins[i]),
                     frame=str(frames[i]),
-                    non_grav_cross=(
-                        np.asarray(borders[i], dtype=np.float64).reshape(6, 3)
-                        if borders[i] is not None
-                        else None
-                    ),
-                    state_cross=self.wide_cross.state_cross(i),
-                    param_cross=self.wide_cross.param_cross(i),
                 )
             )
         return out
@@ -489,10 +327,10 @@ def build_tagged_covariances(
     ``result`` is the dict returned by the ``_propagate`` extension when
     ``with_tagged_covariance=True``; ``orbit_ids`` / ``object_ids`` /
     ``epochs_mjd_tdb`` are the already-flattened per-row arrays from the
-    states (length ``n``, orbit-major). Returns ``None`` if the
-    extension produced no tagged sub-dict.
+    states (length ``n``, orbit-major). Returns ``None`` if the extension
+    produced no tagged sub-dict.
     """
-    from empyrean._convert import int_to_frame, naif_to_origin
+    from empyrean._convert import int_to_frame, joint_from_result, naif_to_origin
 
     tagged = result.get("tagged_covariance")
     if tagged is None:
@@ -505,15 +343,11 @@ def build_tagged_covariances(
     has_mc_seed = np.asarray(tagged["has_mc_seed"], dtype=bool)
     mean_shift_prop = np.asarray(tagged["mean_shift_prop"], dtype=np.float64)
     has_mean_shift_prop = np.asarray(tagged["has_mean_shift_prop"], dtype=bool)
-    mean_shift_input = np.asarray(tagged["mean_shift_input"], dtype=np.float64)
-    has_mean_shift_input = np.asarray(tagged["has_mean_shift_input"], dtype=bool)
     quality_codes = np.asarray(tagged["quality"])
-    quality_min_eig = np.asarray(tagged["quality_min_eig"], dtype=np.float64)
-    quality_kappa_state = np.asarray(tagged["quality_kappa_state"], dtype=np.float64)
-    non_grav = np.asarray(tagged["non_grav"], dtype=bool)  # (n, 3)
-    thrust_segments = np.asarray(tagged["thrust_segments"], dtype=np.uint32)
+    quality_rank = np.asarray(tagged["quality_rank"], dtype=np.uint32)
+    quality_null_axes = np.asarray(tagged["quality_null_axes"], dtype=np.uint32)
+    quality_min_eig_corr = np.asarray(tagged["quality_min_eig_corr"], dtype=np.float64)
     solved_width = np.asarray(tagged["solved_width"], dtype=np.uint32)
-    target_codes = np.asarray(tagged["target_functional"])
     origin_codes = np.asarray(tagged["origin"], dtype=np.int64)
     frame_codes = np.asarray(tagged["frame"], dtype=np.int64)
     has_tagged = np.asarray(tagged["has_tagged"], dtype=bool)
@@ -522,11 +356,10 @@ def build_tagged_covariances(
 
     kind_strs = [_KIND_BY_CODE[int(c)].value for c in kind_codes]
     quality_strs = [_QUALITY_BY_CODE[int(c)].value for c in quality_codes]
-    target_strs = [_TARGET_BY_CODE[int(c)].value for c in target_codes]
     origin_strs = [naif_to_origin(int(o)) for o in origin_codes]
     frame_strs = [int_to_frame(int(f)).value for f in frame_codes]
 
-    # mc_seed → null where absent; min_eig stays NaN for PD (nullable).
+    # mc_seed → null where absent.
     mc_seed_col = [int(mc_seed[i]) if has_mc_seed[i] else None for i in range(n)]
 
     kwargs: dict[str, Any] = {
@@ -541,8 +374,10 @@ def build_tagged_covariances(
         "state_vz": state[:, 5],
         "kind": kind_strs,
         "quality": quality_strs,
-        "quality_min_eig": quality_min_eig,
-        "quality_kappa_state": quality_kappa_state,
+        "quality_rank": quality_rank,
+        "quality_null_axes": quality_null_axes,
+        "quality_min_eig_corr": quality_min_eig_corr,
+        "solved_width": solved_width,
         "mc_seed": mc_seed_col,
         "mean_shift_prop_x": mean_shift_prop[:, 0],
         "mean_shift_prop_y": mean_shift_prop[:, 1],
@@ -551,33 +386,18 @@ def build_tagged_covariances(
         "mean_shift_prop_vy": mean_shift_prop[:, 4],
         "mean_shift_prop_vz": mean_shift_prop[:, 5],
         "has_mean_shift_prop": has_mean_shift_prop,
-        "mean_shift_input_x": mean_shift_input[:, 0],
-        "mean_shift_input_y": mean_shift_input[:, 1],
-        "mean_shift_input_z": mean_shift_input[:, 2],
-        "mean_shift_input_vx": mean_shift_input[:, 3],
-        "mean_shift_input_vy": mean_shift_input[:, 4],
-        "mean_shift_input_vz": mean_shift_input[:, 5],
-        "has_mean_shift_input": has_mean_shift_input,
-        "non_grav_a1": non_grav[:, 0],
-        "non_grav_a2": non_grav[:, 1],
-        "non_grav_a3": non_grav[:, 2],
-        "thrust_segments": thrust_segments,
-        "solved_width": solved_width,
-        "target_functional": target_strs,
         "origin": origin_strs,
         "frame": frame_strs,
         "has_tagged": has_tagged,
     }
-    # 6×6 matrix → 21 lower-tri columns.
+    # 6×6 state block → 21 lower-tri columns (derived convenience mirror
+    # of the joint's leading block).
     for name, (i, j) in zip(_COV_NAMES, _LOWER_TRI, strict=False):
         kwargs[name] = matrix[:, i, j]
 
-    # The cross terms the 21 columns above are the state block of. Same
-    # two homes and same shapes as an orbit table's, so a consumer reads
-    # one surface the same way it reads the other.
-    border, wide = joint_columns_from_result(tagged, n)
-    kwargs["non_grav_cross"] = border if border is not None else [None] * n
-    if wide is not None:
-        kwargs["wide_cross"] = wide
+    # The packed joint per row — the covariance authority.
+    joint = joint_from_result(tagged)
+    if joint is not None:
+        kwargs["covariance"] = joint
 
     return TaggedCovariances.from_kwargs(**kwargs)

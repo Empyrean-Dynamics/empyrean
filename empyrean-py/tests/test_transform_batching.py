@@ -36,6 +36,49 @@ from empyrean import (
     KeplerianCoordinates,
     Origin,
 )
+from empyrean.coordinates.transform import transform_orbits
+from empyrean.orbits.joint import (
+    CovarianceKind,
+    JointFunctional,
+    JointProvenance,
+    JointQuality,
+    PackedJoint,
+    PackedJoints,
+)
+from empyrean.orbits.orbits import CartesianOrbits, KeplerianOrbits
+
+
+def _state_joint(cov6: np.ndarray) -> PackedJoint:
+    """A width-6 derived state joint whose state block is ``cov6`` (6x6)."""
+    tri = [cov6[i, j] for i in range(6) for j in range(i + 1)]
+    return PackedJoint(
+        layout_present=0,
+        layout_considered=0,
+        layout_marginalized=0,
+        width=6,
+        tri=np.asarray(tri, dtype=np.float64),
+        kind=CovarianceKind.LINEAR,
+        quality=JointQuality.POSITIVE_DEFINITE,
+        cov_rank=0,
+        cov_null_axes=0,
+        cov_min_eig_corr=float("nan"),
+        functional=JointFunctional.STATE,
+        provenance=JointProvenance.DERIVED,
+        asserted_source=None,
+    )
+
+
+def _orbit_table(n: int) -> CartesianOrbits:
+    """An ``n``-row Cartesian orbit table carrying a per-row width-6 joint —
+    the orbit-level analogue of :func:`_table` for ``transform_orbits``."""
+    coords = _table(n, with_covariance=False)
+    joints = [_state_joint(_covariance(_EPOCHS[i])) for i in range(n)]
+    return CartesianOrbits.from_kwargs(
+        orbit_id=[f"o{i}" for i in range(n)],
+        coordinates=coords,
+        covariance=PackedJoints.from_joints(joints),
+    )
+
 
 # A small spread of bound heliocentric states. Rows 0 and 2 deliberately
 # share an epoch so both the memo-hit and memo-miss arms of the engine's
@@ -140,25 +183,25 @@ def test_batch_elements_are_bit_identical_to_single_rows(target, frame, origin):
 def test_covariance_survives_the_batch_bit_identically():
     """Covariance is propagated through the Jacobian per row, unmixed.
 
-    The batch is the interesting case: one shared Jacobian applied to
-    every row, or a row's matrix landing on its neighbour, are both
-    plausible batching bugs and both show up as a mismatch here.
+    A covariance-bearing transform rides the orbit's packed joint, so the
+    transport goes through :func:`transform_orbits`. The batch is the
+    interesting case: one shared Jacobian applied to every row, or a row's
+    matrix landing on its neighbour, are both plausible batching bugs and
+    both show up as a mismatch between the joint's state block batched vs
+    alone.
     """
     n = 4
-    table = _table(n, with_covariance=True)
-    batch = empyrean.transform_coordinates(
-        table, KeplerianCoordinates, frame=Frame.ECLIPTICJ2000, origin=Origin.SSB
-    )
-    assert batch.covariance is not None
-    batch_matrices = batch.covariance.to_matrix()
+    orbits = _orbit_table(n)
+    batch = transform_orbits(orbits, KeplerianOrbits, frame=Frame.ECLIPTICJ2000, origin=Origin.SSB)
+    batch_blocks = [batch.covariance.joint(i).state_block() for i in range(n)]
 
     for i in range(n):
-        alone = empyrean.transform_coordinates(
-            table[i : i + 1], KeplerianCoordinates, frame=Frame.ECLIPTICJ2000, origin=Origin.SSB
+        alone = transform_orbits(
+            orbits[i : i + 1], KeplerianOrbits, frame=Frame.ECLIPTICJ2000, origin=Origin.SSB
         )
         np.testing.assert_array_equal(
-            batch_matrices[i],
-            alone.covariance.to_matrix()[0],
+            batch_blocks[i],
+            alone.covariance.joint(0).state_block(),
             err_msg=(
                 f"element {i}: the batched covariance must be BIT-identical to the single-row call"
             ),
@@ -166,7 +209,7 @@ def test_covariance_survives_the_batch_bit_identically():
 
     # Distinct inputs must stay distinct — a shared-Jacobian bug collapses
     # them and would otherwise pass the comparison above only by accident.
-    assert not np.array_equal(batch_matrices[0], batch_matrices[1]), (
+    assert not np.array_equal(batch_blocks[0], batch_blocks[1]), (
         "distinct input covariances must not come back identical"
     )
 

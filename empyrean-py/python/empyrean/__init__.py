@@ -21,7 +21,7 @@ from empyrean.coordinates.enums import Frame, Origin
 from empyrean.coordinates.epoch import Epochs, TimeScale
 
 # ── Function re-exports (organized by subpackage) ────────────
-from empyrean.coordinates.transform import transform_coordinates
+from empyrean.coordinates.transform import transform_coordinates, transform_orbits
 from empyrean.ephemeris.generate import generate_ephemeris
 from empyrean.ephemeris.result import Ephemeris, EphemerisConfig, EphemerisResult
 from empyrean.ephemeris.sensitivity import (
@@ -34,6 +34,7 @@ from empyrean.ephemeris.sensitivity import (
     ObservationSensitivities,
     StateSensitivities,
 )
+from empyrean.errors import PushError, PushErrorVariant
 from empyrean.impact import (
     BPlanes,
     ImpactProbabilities,
@@ -93,7 +94,7 @@ from empyrean.od.result import (
     SolveFor,
     SolveForParams,
     StallDelivery,
-    StationRaDecConfig,
+    StationRADecConfig,
     TrustGateEvent,
     WeightingConfig,
     WeightingLayer,
@@ -101,6 +102,15 @@ from empyrean.od.result import (
     WeightingPreset,
 )
 from empyrean.od.session import Session, SessionDiff
+from empyrean.orbits.joint import (
+    AssertedSource,
+    CovarianceKind,
+    JointFunctional,
+    JointProvenance,
+    JointQuality,
+    PackedJoint,
+    PackedJoints,
+)
 from empyrean.orbits.nongrav import NonGravParams
 from empyrean.orbits.orbits import (
     CartesianOrbits,
@@ -118,12 +128,14 @@ from empyrean.orbits.thrust import (
     ThrustParams,
     VelocityTangent,
 )
-from empyrean.orbits.wide_cross import WideCross
-from empyrean.planning.plan import evaluate_plan
+from empyrean.planning.plan import compute_visibility, evaluate_plan
 from empyrean.planning.result import (
     STAGE_POSTERIOR,
     STAGE_PRIOR,
+    LogDetWithheld,
+    Nights,
     ObservatoryConfig,
+    ObservatorySummary,
     PlanCandidates,
     PlanEphemeris,
     PlanMetrics,
@@ -133,6 +145,10 @@ from empyrean.planning.result import (
     PlanResult,
     RadarMode,
     RadarStation,
+    VisibilityAnchors,
+    VisibilityPoints,
+    VisibilityResult,
+    VisibilityWindows,
 )
 from empyrean.propagation.config import (
     AdvancedIntegratorConfig,
@@ -165,15 +181,13 @@ from empyrean.propagation.events import (
     ShadowEntries,
     ShadowExits,
 )
-from empyrean.propagation.mixtures import MixtureChains
+from empyrean.propagation.mixtures import ComponentStatus, MixtureChains
 from empyrean.propagation.propagate import propagate
 from empyrean.propagation.result import PropagationResult
+from empyrean.propagation.status import OrbitOutcome, OrbitStatuses
 from empyrean.propagation.tagged_covariance import (
-    CovarianceKind,
-    CovarianceQuality,
     TaggedCovariance,
     TaggedCovariances,
-    TargetFunctional,
 )
 from empyrean.states import get_states
 from empyrean.system import (
@@ -329,6 +343,96 @@ _B612_TO_VILLENEUVE_FILENAME = {
     "mpc_obscodes": "obscodes_extended.json",
 }
 
+# The subset of :data:`_B612_TO_VILLENEUVE_FILENAME` slots that carry an
+# Earth-orientation coverage requirement, mapped to the engine kernel-role
+# code (0 historical, 1 high-precision, 2 predict) their linked file is
+# checked against at provisioning. A slot absent here has no coverage
+# contract; a slot present is verified the same way, so the check at the
+# link point is one table lookup, never a per-slot branch. See the
+# `EMPYREAN_EARTH_KERNEL_ROLE_*` constants in the C ABI.
+_EARTH_ORIENTATION_SLOT_ROLE = {
+    "earth_historical": 0,
+    "earth_high_prec": 1,
+    "earth_predict": 2,
+}
+
+
+class KernelCoverageError(RuntimeError):
+    """A kernel a data package shipped for a slot does not cover the slot.
+
+    Raised at provisioning — before any context is built — when the file a
+    pip data package ships for an Earth-orientation slot does not reach the
+    coverage that slot's role mandates (the long-term ``earth_*_predict.bpc``
+    slot must reach the 2125 mandate horizon; the historical and
+    high-precision slots must cover their own bands). It names the slot, the
+    file actually linked into it, the Earth-orientation coverage found in
+    that file and the coverage the slot required, so the shortfall is named
+    where it is introduced rather than surfacing as a mandate failure the
+    first time :func:`initialize` builds a context.
+
+    Attributes:
+        slot: The slot filename the kernel was linked as.
+        linked_file: The path of the file actually linked into the slot.
+        coverage_found: ``(start_mjd_tdb, end_mjd_tdb)`` read from the file.
+        required: ``(floor_mjd_tdb, horizon_mjd_tdb)`` the slot required;
+            ``floor`` is NaN for a slot with no start-floor requirement.
+    """
+
+    def __init__(
+        self,
+        *,
+        slot: str,
+        linked_file: str,
+        coverage_found: tuple[float, float],
+        required: tuple[float, float],
+    ) -> None:
+        self.slot = slot
+        self.linked_file = linked_file
+        self.coverage_found = coverage_found
+        self.required = required
+        import math
+
+        start, end = coverage_found
+        floor, horizon = required
+        # NaN floor (e.g. the predict role, checked on its end alone) carries
+        # no start requirement to report.
+        floor_clause = "" if math.isnan(floor) else f" and begin at or before MJD TDB {floor:.0f}"
+        super().__init__(
+            f"the file linked into the {slot!r} slot ({linked_file}) covers Earth "
+            f"orientation only over MJD TDB [{start:.1f}, {end:.1f}], but the slot "
+            f"requires coverage reaching MJD TDB {horizon:.0f}{floor_clause}. A data "
+            f"package shipped a file that cannot satisfy the three-Earth-kernel "
+            f"mandate for this slot; install the package version whose kernel reaches "
+            f"the mandate horizon, or stage the correct file into the data directory."
+        )
+
+
+def _verify_earth_orientation_slot(
+    key: str, slot_filename: str, link: pathlib.Path, source: pathlib.Path
+) -> None:
+    """Verify a just-linked Earth-orientation slot covers what it mandates.
+
+    No-op for a slot with no coverage contract (any ``key`` absent from
+    :data:`_EARTH_ORIENTATION_SLOT_ROLE`). Otherwise reads the linked file's
+    coverage through the engine's own BPC reader and raises
+    :class:`KernelCoverageError` when it does not satisfy the slot's role —
+    the same reader and requirement the three-Earth-kernel mandate applies at
+    load, so a slot that passes here and a context built later agree.
+    """
+    role = _EARTH_ORIENTATION_SLOT_ROLE.get(key)
+    if role is None:
+        return
+    from empyrean._empyrean_rs import _earth_orientation_kernel_coverage
+
+    satisfied, start, end, floor, horizon = _earth_orientation_kernel_coverage(str(link), role)
+    if not satisfied:
+        raise KernelCoverageError(
+            slot=slot_filename,
+            linked_file=str(source),
+            coverage_found=(start, end),
+            required=(floor, horizon),
+        )
+
 
 def _ensure_data_dir(cache: pathlib.Path) -> None:
     """Create the data directory, naming a broken path instead of ``Errno 17``.
@@ -415,7 +519,13 @@ def _stage_b612_cache(b612: dict[str, str]) -> pathlib.Path:
     for key, filename in _B612_TO_VILLENEUVE_FILENAME.items():
         if key not in b612:
             continue
-        _link_if_safe(Path(b612[key]), cache / filename)
+        source = Path(b612[key])
+        link = cache / filename
+        _link_if_safe(source, link)
+        # Verify the file we just linked covers what the slot requires before
+        # declaring the slot provisioned — a name-vs-content check at the one
+        # link point, so a wrong file is named here, not at initialize().
+        _verify_earth_orientation_slot(key, filename, link, source)
 
     # Bundled gm_de440.tpc (not available from B612)
     gm_src = Path(_bundled_gm_path())

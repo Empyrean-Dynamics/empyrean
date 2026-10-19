@@ -52,6 +52,7 @@ fn residuals_to_ffi_array(
             R::Adaptive => 4,
             R::UnsupportedObservatory => 5,
             R::CMC2003 => 6,
+            R::Blunder => 16,
             R::RadarObservationsUnsupported => 7,
             R::OccultationObservationsUnsupported => 8,
             R::OutsideArc => 9,
@@ -60,13 +61,33 @@ fn residuals_to_ffi_array(
             R::NotEvaluated => -1,
         }
     };
+    let sigma_source_to_int = |s: crate::od::SigmaSource| -> u8 {
+        use crate::od::SigmaSource as S;
+        (match s {
+            S::Reported => empyrean_sys::EMPYREAN_SIGMA_SOURCE_REPORTED,
+            S::Preset => empyrean_sys::EMPYREAN_SIGMA_SOURCE_PRESET,
+            S::Layer => empyrean_sys::EMPYREAN_SIGMA_SOURCE_LAYER,
+            S::Default => empyrean_sys::EMPYREAN_SIGMA_SOURCE_DEFAULT,
+            S::NotWeighted => empyrean_sys::EMPYREAN_SIGMA_SOURCE_NOT_WEIGHTED,
+            S::Unknown => empyrean_sys::EMPYREAN_SIGMA_SOURCE_UNKNOWN,
+        }) as u8
+    };
     residuals
         .iter()
         .map(|r| {
             let mut code = [0u8; 4];
             let bytes = r.obs_code.as_bytes();
-            let take = bytes.len().min(3);
-            code[..take].copy_from_slice(&bytes[..take]);
+            // Full 4-byte width, left-aligned and NUL-padded; a code longer
+            // than the field is refused by name rather than clipped to a
+            // prefix that names a different observatory.
+            if bytes.len() > 4 {
+                return Err(Error::invalid_input(format!(
+                    "observatory code \"{}\" is longer than the 4-byte MPC code \
+                     field; truncating it would name a different observatory",
+                    r.obs_code
+                )));
+            }
+            code[..bytes.len()].copy_from_slice(bytes);
             Ok(empyrean_sys::EmpyreanObservationResult {
                 obs_id: opt_str_ptr(&r.obs_id, keep_strings),
                 // The grouping key travels with the row, so a residual
@@ -115,6 +136,15 @@ fn residuals_to_ffi_array(
                     }
                     _ => empyrean_sys::EMPYREAN_RADAR_KIND_DELAY as u8,
                 },
+                noise_model: r.noise_model.to_ffi().tag,
+                noise_model_nu: r.noise_model.to_ffi().nu,
+                robust_weight: r.robust_weight,
+                sigma_ra_used_arcsec: r.sigma_ra_used_arcsec,
+                sigma_dec_used_arcsec: r.sigma_dec_used_arcsec,
+                sigma_eff_ra_arcsec: r.sigma_eff_ra_arcsec,
+                sigma_eff_dec_arcsec: r.sigma_eff_dec_arcsec,
+                sigma_source: sigma_source_to_int(r.sigma_source),
+                sigma_scale_applied: r.sigma_scale_applied,
             })
         })
         .collect()

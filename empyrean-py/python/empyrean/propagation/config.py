@@ -332,6 +332,67 @@ def _uncertainty_method_params(
     return _UNCERTAINTY_PARAM_DEFAULTS
 
 
+def _uncertainty_method_to_int(uncertainty_method: UncertaintyMethodLike | int) -> int:
+    """Resolve one method spec to its integer tag, the discriminator every
+    distribution channel marshals.
+
+    The parameterized dataclasses map by type, the enum and its wire string by
+    value, and a legacy integer passes through; a ``bool`` is rejected rather
+    than silently read as ``0`` / ``1``. Shared by :func:`_uncertainty_method_to_wire`
+    and the propagate / ephemeris entry points so one tag space serves all.
+    """
+    if isinstance(uncertainty_method, (SigmaPoint, MonteCarlo, GaussianMixture, Auto)):
+        return _DATACLASS_TO_INT[type(uncertainty_method)]
+    if isinstance(uncertainty_method, bool):
+        raise TypeError(
+            "uncertainty_method must be UncertaintyMethod, a SigmaPoint / MonteCarlo / "
+            "GaussianMixture / Auto dataclass, str, or int; got bool"
+        )
+    if isinstance(uncertainty_method, str):
+        tag = _UNCERTAINTY_METHOD_TO_INT.get(uncertainty_method.lower())
+        if tag is None:
+            raise ValueError(f"unknown uncertainty method: {uncertainty_method}")
+        return tag
+    if isinstance(uncertainty_method, UncertaintyMethod):
+        return _UNCERTAINTY_METHOD_TO_INT[uncertainty_method]
+    if isinstance(uncertainty_method, int):
+        return uncertainty_method
+    raise TypeError(
+        "uncertainty_method must be UncertaintyMethod, a SigmaPoint / MonteCarlo / "
+        "GaussianMixture / Auto dataclass, str, or int; got "
+        f"{type(uncertainty_method).__name__}"
+    )
+
+
+def _uncertainty_method_to_wire(
+    uncertainty_method: UncertaintyMethodLike | int,
+) -> dict[str, Any]:
+    """Lower one method spec to the flat sub-dict the OD / planning wire dicts
+    carry: the integer ``tag`` plus every per-variant slot, one key per
+    ``build_uncertainty_method`` argument on the Rust side.
+
+    Reuses the shared :func:`_uncertainty_method_params` lowering, so a config
+    passed to :func:`empyrean.determine` / :func:`empyrean.evaluate_plan`
+    selects exactly the method the same spec would on the propagation seam —
+    the two paths cannot drift. ``mc_seed`` carries ``None`` through unchanged
+    (the entropy-seeded Monte-Carlo case), distinct from a real ``0`` seed.
+    """
+    params = _uncertainty_method_params(uncertainty_method)
+    return {"tag": _uncertainty_method_to_int(uncertainty_method), **params._asdict()}
+
+
+def _uncertainty_method_from_int(tag: int) -> "UncertaintyMethod":
+    """Decode an ``EMPYREAN_UNCERTAINTY_*`` tag a result carries back to the
+    :class:`UncertaintyMethod` enum — the inverse of
+    :func:`_uncertainty_method_to_int` over the non-parameterized names a
+    result reports (a result names the method it resolved to, never its tuning
+    parameters)."""
+    name = _INT_TO_UNCERTAINTY_METHOD.get(tag)
+    if name is None:
+        raise ValueError(f"result carried an unknown uncertainty-method tag: {tag}")
+    return UncertaintyMethod(name)
+
+
 @dataclass
 class DiagnosticsConfig:
     """Per-trajectory diagnostic outputs (sensitivity, nonlinearity,
@@ -387,16 +448,29 @@ class EphemerisOverlapPolicy(str, enum.Enum):
     The SPK is the authoritative solution for that body, so for the body
     itself these states are exact. What it costs: the caller's initial
     condition is **discarded**, and nothing is integrated, so there is no
-    dense trajectory, no STM, and no sensitivity chain — which is why
-    :func:`empyrean.generate_ephemeris` fails outright for such a body
-    under this policy."""
+    STM and no sensitivity chain.
+
+    :func:`empyrean.generate_ephemeris` **succeeds** under this policy —
+    the rows are served off the body's own SPK-backed trajectory — and
+    the substitution is reported in
+    :attr:`EphemerisResult.warnings <empyrean.EphemerisResult.warnings>`,
+    naming the body and saying whether a declared covariance was
+    dropped. Those rows carry **no sky covariance**: a covariance
+    describes the initial condition this policy discards. Radar
+    generation still fails outright, because its Jacobian is composed on
+    the STM a substitution never produces."""
 
     EXCLUDE_AND_INTEGRATE = "exclude_and_integrate"
     """Drop the overlapped perturber from the force model, integrate the
     caller's own initial conditions, and report the overlap.
 
-    This is what generating an ephemeris for an SB441-N16 body at
-    Standard tier requires."""
+    This is what generating an ephemeris for an SB441-N16 body from the
+    initial condition you supplied requires — and the only route to a
+    transported sky covariance or a radar prediction for one. The
+    exclusion is reported in
+    :attr:`EphemerisResult.warnings <empyrean.EphemerisResult.warnings>`,
+    because these rows come from a force model one perturber short and a
+    caller reading their σ needs to know that."""
 
 
 @dataclass
@@ -440,8 +514,6 @@ class AdvancedIntegratorConfig:
     """Initial step size in days. ``None`` = auto from orbital timescale."""
     dt_min: float | None = None
     """Minimum allowed step size in days. ``None`` = auto."""
-    encounter_timescale_divisor: float = 1000.0
-    """Divisor K for encounter dynamical-timescale step floor."""
     max_steps: int = 10_000_000
     max_dense_steps: int = 100_000
     cache_integrator_steps: bool = False
@@ -615,7 +687,6 @@ class PropagationConfig:
                 "epsilon": adv.epsilon,
                 "dt_initial": adv.dt_initial,
                 "dt_min": adv.dt_min,
-                "encounter_timescale_divisor": adv.encounter_timescale_divisor,
                 "max_steps": adv.max_steps,
                 "max_dense_steps": adv.max_dense_steps,
                 "cache_integrator_steps": adv.cache_integrator_steps,

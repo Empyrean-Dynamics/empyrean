@@ -13,8 +13,8 @@ use anyhow::{Context, Result};
 use empyrean::{DetermineResults, FitSummaryRow, OrbitBatch};
 
 use super::{DataOptions, load_context};
-use crate::ForceModel;
 use crate::io::output::{self, OutputFormat};
+use crate::{ForceModel, UncertaintyMethodArg};
 
 /// Every object delivered a fit.
 pub const EXIT_ALL_DELIVERED: i32 = 0;
@@ -40,9 +40,11 @@ pub enum SolveForArg {
     /// State + Marsden + the non-grav time delay DT.
     Dt,
     /// State + SRP AMRAT.
-    Amrat,
+    #[value(name = "amrat")]
+    AMRAT,
     /// State + Marsden + SRP AMRAT.
-    NonGravAmrat,
+    #[value(name = "non-grav-amrat")]
+    NonGravAMRAT,
 }
 
 #[derive(clap::Args)]
@@ -61,6 +63,14 @@ pub struct DetermineArgs {
     /// Parameters to solve for.
     #[arg(long, value_enum, default_value_t = SolveForArg::Auto)]
     pub solve_for: SolveForArg,
+
+    /// Uncertainty method for the fitted covariance (same spelling and
+    /// values as `propagate --uncertainty-method`). The fit is first-order
+    /// by construction: `first-order` is delivered and `auto` resolves to
+    /// it (reported on the fit's warnings); `second-order`, `sigma-point`
+    /// and `monte-carlo` are refused by name rather than downgraded.
+    #[arg(long, value_enum, default_value_t = UncertaintyMethodArg::FirstOrder)]
+    pub uncertainty_method: UncertaintyMethodArg,
 
     /// SRP area-to-mass ratio AMRAT (m²/kg) — the fittable SRP parameter.
     /// Priors the SRP slot on the seed orbit. Required with
@@ -100,6 +110,15 @@ pub struct DetermineArgs {
     #[arg(long)]
     pub photometry: bool,
 
+    /// Supply a band→V conversion for the photometric fit, as
+    /// `CODE=OFFSET:SIGMA` (e.g. `--band-conversion Lu=-1.41:0.30`).
+    /// Repeatable. Each entry replaces a code the built-in MPC Magnitude
+    /// Bands table carries or adds one it does not (the LSST
+    /// `Lu Lg Lr Li Lz Ly` carry no default and are refused by name until
+    /// supplied). Requires `--photometry`.
+    #[arg(long = "band-conversion", value_name = "CODE=OFFSET:SIGMA")]
+    pub band_conversion: Vec<String>,
+
     /// Output directory. Receives `fitted_orbits.<format>` (one row per
     /// delivered object), `fit_summary.parquet` AND `fit_summary.csv`
     /// (one row per input object, delivered or failed), and
@@ -116,6 +135,96 @@ pub struct DetermineArgs {
     pub format: OutputFormat,
 }
 
+/// Non-grav time delay ΔT axis — bit 3 of the packed-joint axis table
+/// (only alongside the Marsden axes, bits 0–2).
+const DT_AXIS_BIT: u32 = 3;
+/// SRP area-to-mass-ratio axis — bit 4 of the packed-joint axis table.
+const AMRAT_AXIS_BIT: u32 = 4;
+
+/// Append parameter axes to a packed joint as diagonal prior variances
+/// (zero cross terms), preserving everything the seed already carries.
+///
+/// This is how the refine opens a parameter column now that the per-param
+/// `amrat_variance` / `dt_variance` fields are gone: the variance on a
+/// parameter's own diagonal is the prior that opens its column. Append-only
+/// — each new axis bit must exceed every bit already present, because the
+/// packed columns are ordered by ascending axis bit. That holds for the
+/// CLI's axes: the ΔT (bit 3) and AMRAT (bit 4) axes always follow the
+/// Marsden axes (bits 0–2) a seed may carry, so a new column lands at the
+/// end of the triangle. A bit already present, or one that would not
+/// append after the seed's highest bit, is refused by name rather than
+/// misplaced.
+// Packed-triangle index arithmetic with mirrored (i, j)/(j, i) assignment;
+// the explicit indices carry the symmetry an iterator form would obscure —
+// the same shape as the wrapper's `PackedJoint::state_block`.
+#[allow(clippy::needless_range_loop)]
+fn append_prior_axes(
+    base: &empyrean::PackedJoint,
+    new_axes: &[(u32, f64)],
+) -> Result<empyrean::PackedJoint> {
+    use empyrean::{AxisLayout, PackedJoint};
+
+    let mut axes = new_axes.to_vec();
+    axes.sort_by_key(|&(bit, _)| bit);
+    let max_present = (0..32u32)
+        .rev()
+        .find(|b| base.layout.present & (1 << b) != 0);
+    for &(bit, _) in &axes {
+        if base.layout.present & (1 << bit) != 0 {
+            anyhow::bail!("parameter axis bit {bit} is already present on the seed joint");
+        }
+        if let Some(m) = max_present
+            && bit <= m
+        {
+            anyhow::bail!(
+                "parameter axis bit {bit} would not append after the seed's highest present \
+                 bit {m} (packed columns are ordered by ascending axis bit)"
+            );
+        }
+    }
+
+    let old_w = base.width as usize;
+    let new_w = old_w + axes.len();
+    // Expand the seed's packed lower triangle to a dense symmetric matrix,
+    // then set the new parameter diagonals and re-pack.
+    let mut full = vec![vec![0.0f64; new_w]; new_w];
+    for i in 0..old_w {
+        for j in 0..=i {
+            let idx = i * (i + 1) / 2 + j;
+            let v = base.tri.get(idx).copied().unwrap_or(0.0);
+            full[i][j] = v;
+            full[j][i] = v;
+        }
+    }
+    for (k, &(_, var)) in axes.iter().enumerate() {
+        full[old_w + k][old_w + k] = var;
+    }
+    let mut tri = Vec::with_capacity(new_w * (new_w + 1) / 2);
+    for i in 0..new_w {
+        for j in 0..=i {
+            tri.push(full[i][j]);
+        }
+    }
+    let mut present = base.layout.present;
+    for &(bit, _) in &axes {
+        present |= 1 << bit;
+    }
+    Ok(PackedJoint {
+        layout: AxisLayout {
+            present,
+            considered: base.layout.considered,
+            marginalized: base.layout.marginalized,
+        },
+        width: new_w as u8,
+        tri,
+        kind: base.kind,
+        quality: base.quality,
+        functional: base.functional,
+        provenance: base.provenance,
+        asserted_source: base.asserted_source,
+    })
+}
+
 /// The `(marsden, dt, amrat)` fit axes a coarse [`SolveForArg`] expands to.
 /// Shared by [`build_solve_for`] and the refine-path priming so the wide
 /// solve and the priors that open its columns never drift apart.
@@ -124,8 +233,8 @@ fn solve_for_axes(mode: SolveForArg) -> (bool, bool, bool) {
         SolveForArg::Auto | SolveForArg::StateOnly => (false, false, false),
         SolveForArg::NonGrav => (true, false, false),
         SolveForArg::Dt => (true, true, false),
-        SolveForArg::Amrat => (false, false, true),
-        SolveForArg::NonGravAmrat => (true, false, true),
+        SolveForArg::AMRAT => (false, false, true),
+        SolveForArg::NonGravAMRAT => (true, false, true),
     }
 }
 
@@ -264,6 +373,56 @@ fn observations_for_object(
 ///
 /// Assumes [`validate_prior_flags`] has already accepted `args`, so the
 /// required prior flags for the requested axes are present.
+/// Parse the repeatable `--band-conversion CODE=OFFSET:SIGMA` specs into a
+/// [`empyrean::BandConversions`] layered onto the MPC Magnitude Bands
+/// table. Each spec replaces a code the table carries or adds one it does
+/// not; a malformed spec is a loud refusal naming the offending value.
+fn parse_band_conversions(specs: &[String]) -> Result<empyrean::BandConversions> {
+    let mut table = empyrean::BandConversions::default();
+    for spec in specs {
+        let (code, rest) = spec.split_once('=').ok_or_else(|| {
+            anyhow::anyhow!("--band-conversion {spec:?}: expected CODE=OFFSET:SIGMA")
+        })?;
+        let (offset, sigma) = rest.split_once(':').ok_or_else(|| {
+            anyhow::anyhow!(
+                "--band-conversion {spec:?}: expected CODE=OFFSET:SIGMA (missing :SIGMA)"
+            )
+        })?;
+        let code = code.trim();
+        if code.is_empty() {
+            anyhow::bail!("--band-conversion {spec:?}: CODE is empty");
+        }
+        let offset_to_v: f64 = offset.trim().parse().map_err(|_| {
+            anyhow::anyhow!("--band-conversion {spec:?}: offset {offset:?} is not a number")
+        })?;
+        let sigma: f64 = sigma.trim().parse().map_err(|_| {
+            anyhow::anyhow!("--band-conversion {spec:?}: sigma {sigma:?} is not a number")
+        })?;
+        table = table.with(code, empyrean::BandConversion { offset_to_v, sigma });
+    }
+    Ok(table)
+}
+
+/// The photometry config for a run: `None` unless `--photometry` is set,
+/// otherwise the engine defaults carrying any `--band-conversion` entries.
+/// `--band-conversion` without `--photometry` is a loud refusal — the band
+/// table is only read by the photometric fit.
+fn photometry_config(args: &DetermineArgs) -> Result<Option<empyrean::PhotometryConfig>> {
+    if !args.photometry {
+        if !args.band_conversion.is_empty() {
+            anyhow::bail!(
+                "--band-conversion requires --photometry: the band→V table is only read by \
+                 the post-OD photometric fit"
+            );
+        }
+        return Ok(None);
+    }
+    Ok(Some(empyrean::PhotometryConfig {
+        band_conversions: parse_band_conversions(&args.band_conversion)?,
+        ..empyrean::PhotometryConfig::default()
+    }))
+}
+
 fn run_refine_path(
     ctx: &empyrean::Context,
     observations: &empyrean::Observations,
@@ -287,7 +446,8 @@ fn run_refine_path(
         force_model: args.force_model.to_empyrean(),
         max_iterations: args.max_iterations,
         solve_for: base_solve,
-        photometry: args.photometry.then(empyrean::PhotometryConfig::default),
+        photometry: photometry_config(args)?,
+        uncertainty_method: args.uncertainty_method.to_empyrean(),
         ..empyrean::ODConfig::default()
     };
     eprintln!(
@@ -307,7 +467,8 @@ fn run_refine_path(
         force_model: args.force_model.to_empyrean(),
         max_iterations: args.max_iterations,
         solve_for: build_solve_for(args.solve_for, args.thrust_segments)?,
-        photometry: args.photometry.then(empyrean::PhotometryConfig::default),
+        photometry: photometry_config(args)?,
+        uncertainty_method: args.uncertainty_method.to_empyrean(),
         ..empyrean::ODConfig::default()
     };
     eprintln!(
@@ -333,7 +494,15 @@ fn run_refine_path(
 
         // Prime: attach the requested priors to the seed orbit. The prior
         // variance is the trigger that opens each wide column in the refine.
+        // Under 0.11.0 a parameter's prior variance rides the seed orbit's
+        // packed joint (the AMRAT axis = bit 4, the non-grav ΔT axis = bit 3)
+        // — the removed `amrat_variance` / `dt_variance` fields had no home.
+        // The parameter VALUE still rides `with_srp` / `with_non_grav_dt`;
+        // only its prior variance moved onto the joint. Collect the requested
+        // axes and append them once, in ascending bit order, to whatever the
+        // seed already carries (state-only, or state + Marsden).
         let mut primed = seed.orbit.clone();
+        let mut prior_axes: Vec<(u32, f64)> = Vec::new();
         if amrat_axis {
             // Present by construction — validate_prior_flags required both.
             let amrat = args
@@ -342,9 +511,8 @@ fn run_refine_path(
             let amrat_variance = args
                 .amrat_variance
                 .expect("validate_prior_flags requires --amrat-variance for an AMRAT solve");
-            primed = primed
-                .with_srp(amrat, args.cr.unwrap_or(1.0))
-                .with_srp_amrat_variance(Some(amrat_variance));
+            primed = primed.with_srp(amrat, args.cr.unwrap_or(1.0));
+            prior_axes.push((AMRAT_AXIS_BIT, amrat_variance));
         }
         if dt_axis {
             let dt_variance = args
@@ -355,7 +523,16 @@ fn run_refine_path(
             if let Some(dt) = args.dt {
                 primed = primed.with_non_grav_dt(Some(dt));
             }
-            primed = primed.with_non_grav_dt_variance(Some(dt_variance));
+            prior_axes.push((DT_AXIS_BIT, dt_variance));
+        }
+        if !prior_axes.is_empty() {
+            let base = primed.covariance.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "seed orbit for {object_id} carries no covariance to prior the requested \
+                     parameter axis onto"
+                )
+            })?;
+            primed = primed.with_covariance(append_prior_axes(&base, &prior_axes)?);
         }
 
         let object_obs = observations_for_object(observations, &object_id)?;
@@ -365,6 +542,9 @@ fn run_refine_path(
                     object_id: object_id.clone(),
                     message: format!("wide refine failed: {}", e.message),
                     kind: DetermineFailureKind::OD,
+                    // The wrapper's refine surfaces its error on the scalar
+                    // channel (message only), not the per-object OD code.
+                    od_error: None,
                 });
         entries.push(DetermineEntry { object_id, outcome });
     }
@@ -569,16 +749,28 @@ fn batch_residual_rows(results: &DetermineResults) -> Vec<empyrean::ObservationR
         .collect()
 }
 
-/// The process exit code for a finished batch: success only when every
-/// object delivered.
-pub fn exit_code_for(results: &DetermineResults) -> i32 {
-    if results.delivered_count() == results.len() && !results.is_empty() {
-        EXIT_ALL_DELIVERED
-    } else if results.delivered_count() == 0 {
+/// The process exit code for any finished batch, from its delivery count.
+///
+/// The one place the `0` / `3` / `4` convention lives: `0` only when every
+/// input item delivered, `4` when the batch ran but none did (an empty
+/// batch delivered nothing either), `3` for a partial. Shared verbatim by
+/// `determine`, `propagate` and `ephemeris` — one helper, no per-command
+/// sibling — so the three commands cannot drift apart on what a partial
+/// run's exit code is.
+pub fn batch_exit_code(delivered: usize, total: usize) -> i32 {
+    if delivered == 0 {
         EXIT_NONE_DELIVERED
+    } else if delivered == total {
+        EXIT_ALL_DELIVERED
     } else {
         EXIT_PARTIAL
     }
+}
+
+/// The process exit code for a finished batch: success only when every
+/// object delivered.
+pub fn exit_code_for(results: &DetermineResults) -> i32 {
+    batch_exit_code(results.delivered_count(), results.len())
 }
 
 pub fn run(data: &DataOptions, args: DetermineArgs) -> Result<()> {
@@ -592,13 +784,21 @@ pub fn run(data: &DataOptions, args: DetermineArgs) -> Result<()> {
 
     // The daemon protocol only carries force_model + max_iterations, so a
     // fitting request (non-grav / DT / AMRAT / thrust / photometry) must
-    // run in-process — the daemon can't express it yet.
+    // run in-process — the daemon can't express it yet. A non-default
+    // `--uncertainty-method` is in the same bucket: the daemon request
+    // carries no uncertainty field, so serving a non-`FirstOrder` request
+    // through it would silently ignore the method (and drop the typed
+    // refusal a richer method is owed). Route it in-process instead.
     //
     // `--no-refresh` also runs in-process: a running daemon's context was
     // built under its own policy and cannot honour a strict-offline
     // request retroactively, so serving it would quietly ignore the flag.
-    let uses_fitting =
-        args.solve_for != SolveForArg::Auto || args.thrust_segments > 0 || args.photometry;
+    let non_default_uncertainty =
+        !matches!(args.uncertainty_method, UncertaintyMethodArg::FirstOrder);
+    let uses_fitting = args.solve_for != SolveForArg::Auto
+        || args.thrust_segments > 0
+        || args.photometry
+        || non_default_uncertainty;
     if !uses_fitting && data.daemon_eligible() {
         let request = crate::daemon::protocol::Request::Determine {
             ades_path: args.ades_file.display().to_string(),
@@ -641,7 +841,8 @@ pub fn run(data: &DataOptions, args: DetermineArgs) -> Result<()> {
             force_model: args.force_model.to_empyrean(),
             max_iterations: args.max_iterations,
             solve_for: build_solve_for(args.solve_for, args.thrust_segments)?,
-            photometry: args.photometry.then(empyrean::PhotometryConfig::default),
+            photometry: photometry_config(&args)?,
+            uncertainty_method: args.uncertainty_method.to_empyrean(),
             ..empyrean::ODConfig::default()
         };
         ctx.determine(&observations, None, &config)
@@ -696,9 +897,38 @@ mod tests {
             dt_variance: None,
             thrust_segments: 0,
             photometry: false,
+            band_conversion: Vec::new(),
+            uncertainty_method: UncertaintyMethodArg::FirstOrder,
             out_dir: PathBuf::from("."),
             format: OutputFormat::Parquet,
         }
+    }
+
+    /// Wire-compat for the `--solve-for` value strings: renaming the variants
+    /// to all-caps acronyms (`AMRAT` / `NonGravAMRAT`) must not move the CLI
+    /// words, which are pinned by `#[value(name = ...)]`.
+    #[test]
+    fn solve_for_cli_words_are_stable() {
+        use clap::ValueEnum;
+        assert_eq!(
+            SolveForArg::AMRAT.to_possible_value().unwrap().get_name(),
+            "amrat"
+        );
+        assert_eq!(
+            SolveForArg::NonGravAMRAT
+                .to_possible_value()
+                .unwrap()
+                .get_name(),
+            "non-grav-amrat"
+        );
+        assert_eq!(
+            SolveForArg::from_str("amrat", true).unwrap(),
+            SolveForArg::AMRAT
+        );
+        assert_eq!(
+            SolveForArg::from_str("non-grav-amrat", true).unwrap(),
+            SolveForArg::NonGravAMRAT
+        );
     }
 
     #[test]
@@ -709,9 +939,9 @@ mod tests {
         );
         assert_eq!(solve_for_axes(SolveForArg::NonGrav), (true, false, false));
         assert_eq!(solve_for_axes(SolveForArg::Dt), (true, true, false));
-        assert_eq!(solve_for_axes(SolveForArg::Amrat), (false, false, true));
+        assert_eq!(solve_for_axes(SolveForArg::AMRAT), (false, false, true));
         assert_eq!(
-            solve_for_axes(SolveForArg::NonGravAmrat),
+            solve_for_axes(SolveForArg::NonGravAMRAT),
             (true, false, true)
         );
     }
@@ -739,12 +969,12 @@ mod tests {
         assert!(dt.thrust.iter().all(|d| *d == OFF));
 
         // AMRAT alone: only the AMRAT column.
-        let amrat = explicit(SolveForArg::Amrat);
+        let amrat = explicit(SolveForArg::AMRAT);
         assert_eq!((amrat.marsden, amrat.dt, amrat.amrat), (OFF, OFF, ON));
         assert!(amrat.thrust.iter().all(|d| *d == OFF));
 
         // Non-grav + AMRAT: Marsden + AMRAT.
-        let both = explicit(SolveForArg::NonGravAmrat);
+        let both = explicit(SolveForArg::NonGravAMRAT);
         assert_eq!((both.marsden, both.dt, both.amrat), (ON, OFF, ON));
         assert!(both.thrust.iter().all(|d| *d == OFF));
     }
@@ -774,11 +1004,11 @@ mod tests {
     #[test]
     fn amrat_solve_requires_amrat_and_variance() {
         // No priors at all.
-        let err = validate_prior_flags(&args_with(SolveForArg::Amrat)).unwrap_err();
+        let err = validate_prior_flags(&args_with(SolveForArg::AMRAT)).unwrap_err();
         assert!(err.to_string().contains("--amrat"), "{err}");
 
         // AMRAT value but no variance.
-        let mut a = args_with(SolveForArg::Amrat);
+        let mut a = args_with(SolveForArg::AMRAT);
         a.amrat = Some(3.0e-3);
         let err = validate_prior_flags(&a).unwrap_err();
         assert!(err.to_string().contains("--amrat-variance"), "{err}");
@@ -802,7 +1032,7 @@ mod tests {
 
     #[test]
     fn non_grav_amrat_solve_requires_amrat_priors() {
-        let mut a = args_with(SolveForArg::NonGravAmrat);
+        let mut a = args_with(SolveForArg::NonGravAMRAT);
         assert!(validate_prior_flags(&a).is_err());
         a.amrat = Some(3.0e-3);
         a.amrat_variance = Some(1.0e-8);
@@ -824,7 +1054,7 @@ mod tests {
         assert!(err.to_string().contains("--cr"), "{err}");
 
         // DT prior set but AMRAT (not DT) solve.
-        let mut a = args_with(SolveForArg::Amrat);
+        let mut a = args_with(SolveForArg::AMRAT);
         a.amrat = Some(3.0e-3);
         a.amrat_variance = Some(1.0e-8);
         a.dt_variance = Some(1.0e-2);
@@ -847,6 +1077,7 @@ mod tests {
                     object_id: id.to_string(),
                     message: "no viable IOD seed".to_string(),
                     kind: DetermineFailureKind::IOD,
+                    od_error: None,
                 }),
             }
         }
@@ -882,6 +1113,7 @@ mod tests {
                 object_id: "K25A00B".to_string(),
                 message: "no viable IOD seed".to_string(),
                 kind: DetermineFailureKind::IOD,
+                od_error: None,
             }),
         }];
         let results = DetermineResults::from_entries(entries, Vec::new());
@@ -903,5 +1135,49 @@ mod tests {
         ] {
             assert!(validate_prior_flags(&args_with(mode)).is_ok());
         }
+    }
+
+    /// `--band-conversion CODE=OFFSET:SIGMA` parses into the table, replacing
+    /// or adding a code; the supplied offset/σ ride through.
+    #[test]
+    fn band_conversion_specs_parse_into_the_table() {
+        let specs = vec!["Lu=-1.41:0.30".to_string(), "r=0.25:0.05".to_string()];
+        let table = parse_band_conversions(&specs).expect("valid specs parse");
+        let entries: std::collections::BTreeMap<_, _> = table
+            .entries()
+            .map(|(c, v)| (c.to_string(), (v.offset_to_v, v.sigma)))
+            .collect();
+        assert_eq!(entries["Lu"], (-1.41, 0.30));
+        assert_eq!(entries["r"], (0.25, 0.05));
+    }
+
+    /// A malformed spec is a loud refusal naming the offending value.
+    #[test]
+    fn malformed_band_conversion_specs_are_refused() {
+        assert!(parse_band_conversions(&["Lu".to_string()]).is_err());
+        assert!(parse_band_conversions(&["Lu=-1.41".to_string()]).is_err());
+        assert!(parse_band_conversions(&["Lu=x:0.3".to_string()]).is_err());
+        assert!(parse_band_conversions(&["=0.1:0.3".to_string()]).is_err());
+        assert!(parse_band_conversions(&["Lu=-1.41:y".to_string()]).is_err());
+    }
+
+    /// The band table is only read by the photometric fit: a
+    /// `--band-conversion` with no `--photometry` is refused, and
+    /// `--photometry` alone carries the MPC table (no supplied rows).
+    #[test]
+    fn band_conversion_requires_photometry() {
+        let mut args = args_with(SolveForArg::Auto);
+        args.band_conversion = vec!["Lu=-1.41:0.30".to_string()];
+        assert!(photometry_config(&args).is_err());
+
+        args.photometry = true;
+        let pc = photometry_config(&args).expect("photometry + band conversion builds");
+        let pc = pc.expect("photometry enabled");
+        assert_eq!(pc.band_conversions.entries().count(), 1);
+
+        let mut plain = args_with(SolveForArg::Auto);
+        plain.photometry = true;
+        let pc = photometry_config(&plain).unwrap().unwrap();
+        assert!(pc.band_conversions.is_empty());
     }
 }

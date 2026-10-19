@@ -105,16 +105,6 @@ fn ffi_batch_to_owned(batch: &empyrean_sys::EmpyreanOrbitBatch) -> Result<OrbitB
             } else {
                 None
             },
-            non_grav_dt_variance: if ffi_orbit.non_grav_dt_variance.is_finite()
-                && ffi_orbit.non_grav_dt_variance > 0.0
-            {
-                Some(ffi_orbit.non_grav_dt_variance)
-            } else {
-                None
-            },
-            // Non-grav covariance is an OD-output concept; SBDB/query orbits
-            // don't carry it.
-            ng_covariance: None,
             phot_system,
             h_mag: ffi_orbit.h_mag,
             slope1: ffi_orbit.slope1,
@@ -130,15 +120,16 @@ fn ffi_batch_to_owned(batch: &empyrean_sys::EmpyreanOrbitBatch) -> Result<OrbitB
             thrust: None,
             // SBDB populates an SRP AMR slot for objects it fits area-to-mass
             // for; carry it through when the engine set it.
-            srp: crate::orbit::SrpParams::from_ffi(
+            srp: crate::orbit::SRPParams::from_ffi(
                 ffi_orbit.srp_amrat,
                 ffi_orbit.srp_cr,
                 ffi_orbit.has_srp,
-                ffi_orbit.srp_amrat_variance,
             ),
-            // SBDB publishes a state and, at most, a Marsden block — no
-            // cross terms of any kind. Absent, not dropped.
-            wide_cross: None,
+            // The orbit's covariance as one packed joint, read back from the
+            // library-owned batch (copied into an owned Vec). SBDB publishes a
+            // state and, at most, a Marsden block — a width-0 joint reads back
+            // as `None`.
+            covariance: unsafe { crate::PackedJoint::from_ffi(&ffi_orbit.covariance) }?,
         });
         let id_ptr = unsafe { *batch.orbit_ids.add(i) };
         let id = if id_ptr.is_null() {
@@ -206,6 +197,8 @@ pub fn query_horizons(
         num_sensitivity: 0,
         warnings: std::ptr::null_mut(),
         num_warnings: 0,
+        num_orbits: 0,
+        outcomes: std::ptr::null_mut(),
     };
     let code = unsafe {
         empyrean_sys::empyrean_query_horizons(
@@ -221,14 +214,18 @@ pub fn query_horizons(
     if code != 0 {
         return Err(Error::capture(code));
     }
-    let entries: Vec<EphemerisEntry> = unsafe {
+    // Decode fallibly (a Horizons row carries no covariance, so the kind
+    // decode never fails here, but the marshaler is uniformly fallible now);
+    // free the C result BEFORE propagating any decode error so the error path
+    // leaks nothing.
+    let entries: Result<Vec<EphemerisEntry>> = unsafe {
         std::slice::from_raw_parts(result.entries, result.num_entries)
             .iter()
             .map(EphemerisEntry::from_ffi)
             .collect()
     };
     unsafe { empyrean_sys::empyrean_ephemeris_result_free(&mut result) };
-    Ok(entries)
+    entries
 }
 
 /// Query JPL Horizons for a Cartesian state vector at a single epoch.

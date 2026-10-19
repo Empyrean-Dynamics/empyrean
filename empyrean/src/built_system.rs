@@ -3,7 +3,7 @@
 //! A [`BuiltSystem`] assembles the force model — perturber set,
 //! spherical-harmonic gravity, the post-Newtonian relativistic correction,
 //! and the integration frame — **once** for a frozen
-//! `{force_model, frame, divisor}` key, then reuses it across every
+//! `{force_model, frame, encounter_floor}` key, then reuses it across every
 //! propagation or ephemeris call made through it. For workloads dominated by
 //! short forward models (fit / predict / screen loops) the per-call
 //! force-model assembly is the dominant cost; the handle amortizes it away.
@@ -17,8 +17,8 @@
 //! let ctx = Context::from_data_dir(None)?;
 //! let batch = empyrean::query_sbdb(&["99942"], None)?;
 //!
-//! // Assemble the ~27-body force model once, at the engine-default divisor.
-//! let system = ctx.built_system(ForceModelTier::Standard, Frame::EclipticJ2000, 0.0)?;
+//! // Assemble the ~27-body force model once, at the engine-default settings.
+//! let system = ctx.built_system(ForceModelTier::Standard, Frame::EclipticJ2000)?;
 //!
 //! // Reuse it across many short propagations with a matching config.
 //! let cfg = PropagationConfig::default();
@@ -33,7 +33,8 @@
 //! was built from the SAME ephemeris data the passed [`Context`] holds,
 //! (b) the per-call config matches the frozen key, and (c) the source data
 //! has not been mutated since the handle was built. Any mismatch — data
-//! identity, frame, force model, divisor, or staleness — returns a loud,
+//! identity, frame, force model, encounter-floor angle, or staleness —
+//! returns a loud,
 //! distinct [`Error`] (classify it with [`Error::builtsystem_guard`]). The
 //! handle never silently rebuilds and never serves wrong physics. **Rebuild
 //! the handle after any `load_*` on the context** (a new kernel changes the
@@ -86,9 +87,9 @@ pub enum BuiltSystemGuardError {
     KeyMismatchFrame,
     /// The per-call config's force-model tier diverges from the frozen tier.
     KeyMismatchForceModel,
-    /// The per-call config's encounter-timescale divisor diverges from the
-    /// frozen divisor.
-    KeyMismatchDivisor,
+    /// The per-call config's encounter-floor angle diverges from the frozen
+    /// angle.
+    KeyMismatchEncounterFloor,
     /// The context's ephemeris data was mutated (a kernel load) after the
     /// handle was built. Rebuild the handle.
     Stale,
@@ -120,8 +121,8 @@ impl Error {
             c if c == empyrean_sys::EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_FORCE_MODEL => {
                 Some(BuiltSystemGuardError::KeyMismatchForceModel)
             }
-            c if c == empyrean_sys::EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_DIVISOR => {
-                Some(BuiltSystemGuardError::KeyMismatchDivisor)
+            c if c == empyrean_sys::EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_ENCOUNTER_FLOOR => {
+                Some(BuiltSystemGuardError::KeyMismatchEncounterFloor)
             }
             c if c == empyrean_sys::EMPYREAN_BUILTSYSTEM_STALE => {
                 Some(BuiltSystemGuardError::Stale)
@@ -142,11 +143,11 @@ impl Error {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelKind {
     /// SPK ephemeris kernel (planetary / small-body / spacecraft states).
-    Spk,
+    SPK,
     /// Binary PCK body-orientation kernel (Earth / Moon rotation).
-    Bpc,
+    BPC,
     /// Text PCK of gravitational parameters.
-    Tpc,
+    TPC,
     /// Gravity-field coefficient model (spherical-harmonics file or built-in field).
     Gravity,
     /// Observatory-code registry.
@@ -200,8 +201,8 @@ pub struct SystemDescription {
     pub force_model: ForceModelTier,
     /// The frozen integration/output frame.
     pub frame: Frame,
-    /// The frozen encounter-timescale divisor.
-    pub encounter_timescale_divisor: f64,
+    /// The frozen encounter-floor angle (radians).
+    pub encounter_floor_angle: f64,
     /// Whether the post-Newtonian (EIH) relativistic correction is enabled.
     pub relativistic: bool,
     /// Whether the N16 asteroid perturbers are included.
@@ -249,32 +250,25 @@ const _: fn() = || {
 };
 
 impl Context {
-    /// Assemble a reusable force-model handle for `(force_model, frame)`,
-    /// freezing `encounter_timescale_divisor` into its key.
+    /// Assemble a reusable force-model handle for `(force_model, frame)`.
     ///
-    /// Pass `0.0` for `encounter_timescale_divisor` to freeze the engine
-    /// default; any positive value freezes that divisor into the key before
-    /// it is used to validate calls. The handle snapshots this context's
-    /// kernel manifest so [`BuiltSystem::describe`] is self-contained.
+    /// The handle freezes the force-model tier, the frame and the engine's
+    /// encounter-floor angle into its key, and snapshots this context's kernel
+    /// manifest so [`BuiltSystem::describe`] is self-contained. The frozen
+    /// encounter-floor angle is read back from [`SystemDescription`].
     ///
     /// Reuse the returned handle across many [`BuiltSystem::propagate`] /
     /// [`BuiltSystem::generate_ephemeris`] calls with a config matching the
     /// frozen key. **After loading any additional kernel into this context,
     /// rebuild the handle** — a stale handle is rejected loudly by every
     /// forward-model call, never silently reused.
-    pub fn built_system(
-        &self,
-        force_model: ForceModelTier,
-        frame: Frame,
-        encounter_timescale_divisor: f64,
-    ) -> Result<BuiltSystem> {
+    pub fn built_system(&self, force_model: ForceModelTier, frame: Frame) -> Result<BuiltSystem> {
         let mut raw: *mut empyrean_sys::EmpyreanBuiltSystem = std::ptr::null_mut();
         let code = unsafe {
             empyrean_sys::empyrean_builtsystem_new(
                 self.as_raw(),
                 force_model as i32,
                 frame as i32,
-                encounter_timescale_divisor,
                 &mut raw,
             )
         };
@@ -393,11 +387,10 @@ impl BuiltSystem {
     /// Parallels [`Context::generate_ephemeris`] but reuses the frozen force
     /// model. Runs the same identity guard as [`BuiltSystem::propagate`]
     /// before dispatch; on pass the result is bit-identical to the one-shot.
-    /// The ephemeris config carries no divisor knob, so a handle frozen at a
-    /// non-default divisor is rejected here as a
-    /// [`KeyMismatchDivisor`](BuiltSystemGuardError::KeyMismatchDivisor)
-    /// rather than served under the wrong dynamics — build ephemeris-reuse
-    /// handles at the default divisor (`0.0`).
+    /// A handle whose frozen encounter-floor angle diverges from the call's is
+    /// rejected here as a
+    /// [`KeyMismatchEncounterFloor`](BuiltSystemGuardError::KeyMismatchEncounterFloor)
+    /// rather than served under the wrong dynamics.
     pub fn generate_ephemeris(
         &self,
         ctx: &Context,
@@ -424,7 +417,7 @@ impl BuiltSystem {
         if code != 0 {
             return Err(Error::capture(code));
         }
-        Ok(marshal_ephemeris_result(&mut ffi_result))
+        marshal_ephemeris_result(&mut ffi_result)
     }
 
     /// Return a full reproducibility summary of the frozen force model and
@@ -480,7 +473,7 @@ fn system_description_from_ffi(
     Ok(SystemDescription {
         force_model,
         frame,
-        encounter_timescale_divisor: d.encounter_timescale_divisor,
+        encounter_floor_angle: d.encounter_floor_angle,
         relativistic: d.relativistic != 0,
         asteroids: d.asteroids != 0,
         has_bpc: d.has_bpc != 0,
@@ -526,9 +519,9 @@ fn kernel_record_from_ffi(r: &empyrean_sys::EmpyreanKernelRecord) -> Result<Kern
 /// error — never a silent fallback into a wrong category.
 fn int_to_kernel_kind(v: i32) -> Result<KernelKind> {
     match v {
-        x if x == empyrean_sys::EMPYREAN_KERNEL_KIND_SPK as i32 => Ok(KernelKind::Spk),
-        x if x == empyrean_sys::EMPYREAN_KERNEL_KIND_BPC as i32 => Ok(KernelKind::Bpc),
-        x if x == empyrean_sys::EMPYREAN_KERNEL_KIND_TPC as i32 => Ok(KernelKind::Tpc),
+        x if x == empyrean_sys::EMPYREAN_KERNEL_KIND_SPK as i32 => Ok(KernelKind::SPK),
+        x if x == empyrean_sys::EMPYREAN_KERNEL_KIND_BPC as i32 => Ok(KernelKind::BPC),
+        x if x == empyrean_sys::EMPYREAN_KERNEL_KIND_TPC as i32 => Ok(KernelKind::TPC),
         x if x == empyrean_sys::EMPYREAN_KERNEL_KIND_GRAVITY as i32 => Ok(KernelKind::Gravity),
         x if x == empyrean_sys::EMPYREAN_KERNEL_KIND_OBSCODES as i32 => Ok(KernelKind::ObsCodes),
         other => Err(Error::invalid_input(format!(
@@ -595,8 +588,8 @@ mod tests {
                 BuiltSystemGuardError::KeyMismatchForceModel,
             ),
             (
-                empyrean_sys::EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_DIVISOR,
-                BuiltSystemGuardError::KeyMismatchDivisor,
+                empyrean_sys::EMPYREAN_BUILTSYSTEM_KEY_MISMATCH_ENCOUNTER_FLOOR,
+                BuiltSystemGuardError::KeyMismatchEncounterFloor,
             ),
             (
                 empyrean_sys::EMPYREAN_BUILTSYSTEM_STALE,
@@ -675,7 +668,7 @@ mod tests {
         let one_shot = ctx.propagate(&orbits, &epochs, &cfg).expect("one-shot");
 
         let system = ctx
-            .built_system(ForceModelTier::Standard, Frame::ICRF, 0.0)
+            .built_system(ForceModelTier::Standard, Frame::ICRF)
             .expect("build handle");
         let via_handle = system
             .propagate(&ctx, &orbits, &epochs, &cfg)
@@ -732,7 +725,7 @@ mod tests {
             .expect("one-shot ephemeris");
 
         let system = ctx
-            .built_system(ForceModelTier::Standard, Frame::ICRF, 0.0)
+            .built_system(ForceModelTier::Standard, Frame::ICRF)
             .expect("build handle");
         let via_handle = system
             .generate_ephemeris(&ctx, &orbits, &observers, &eph_cfg)
@@ -765,15 +758,15 @@ mod tests {
             }
         };
         let system = ctx
-            .built_system(ForceModelTier::Standard, Frame::ICRF, 0.0)
+            .built_system(ForceModelTier::Standard, Frame::ICRF)
             .expect("build handle");
         let desc = system.describe().expect("describe");
 
         assert_eq!(desc.force_model, ForceModelTier::Standard);
         assert_eq!(desc.frame, Frame::ICRF);
-        assert_eq!(
-            desc.encounter_timescale_divisor, 1000.0,
-            "engine default divisor"
+        assert!(
+            desc.encounter_floor_angle.is_finite() && desc.encounter_floor_angle > 0.0,
+            "the engine freezes a finite, positive encounter-floor angle"
         );
         assert!(desc.relativistic, "Standard tier includes GR");
         assert!(desc.asteroids, "Standard tier includes N16 asteroids");
@@ -832,7 +825,7 @@ mod tests {
             }
         };
         let system = ctx
-            .built_system(ForceModelTier::Standard, Frame::ICRF, 0.0)
+            .built_system(ForceModelTier::Standard, Frame::ICRF)
             .expect("build handle");
         let orbits = [base_orbit()];
         let epochs = [Epoch::from_mjd_tdb(59000.0), Epoch::from_mjd_tdb(59010.0)];
@@ -889,7 +882,7 @@ mod tests {
             }
         };
         let system = ctx_a
-            .built_system(ForceModelTier::Standard, Frame::ICRF, 0.0)
+            .built_system(ForceModelTier::Standard, Frame::ICRF)
             .expect("build handle");
         let orbits = [base_orbit()];
         let epochs = [Epoch::from_mjd_tdb(59000.0), Epoch::from_mjd_tdb(59010.0)];

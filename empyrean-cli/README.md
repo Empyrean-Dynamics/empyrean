@@ -25,7 +25,7 @@ DuckDB, and pages through what it wrote without leaving the terminal.
 
 ## Install
 
-Current release: **0.10.0**.
+Current release: **0.11.0-rc.0** (release candidate).
 
 ```sh
 cargo install empyrean-cli
@@ -78,9 +78,14 @@ empyrean version
 
 The pipeline commands (`propagate` / `ephemeris` / `determine`) emit
 Parquet tables under `--out-dir` by default; `--format json` and
-`--format csv` are also available, and CSV is no longer a lossy choice —
-it carries the same 82-column orbit schema Parquet does, covariance
-included. The schemas match the Python and Rust API outputs exactly —
+`--format csv` are also available. Parquet and JSON both carry the full
+packed joint: the parquet orbits schema is 73 columns and the JSON orbit
+record carries the joint in its own `cov_*` fields (the packed triangle
+plus its tags). CSV flattens an orbit to 66 columns carrying the 6×6 state
+covariance as an explicit lower triangle and refuses a joint with
+solved-parameter axes beyond the state by name, pointing at parquet or
+JSON. The residual tables are identical across all three formats (36
+columns). The CLI writes the same schemas the Python and Rust APIs do —
 same `orbit_id` / `object_id` join keys, same time scales, same physical
 units — so you can mix-and-match channels for the same workflow.
 
@@ -171,8 +176,8 @@ browsing them. Naming an unreadable file *directly* is still a hard
 error, by name, saying what was tried.
 
 In the pager: **space** / **enter** for the next page, **b** for the
-previous one, **←** / **→** to slide the column window (an orbits table
-is 82 columns — most of them a covariance block), **g** / **Home** to
+previous one, **←** / **→** to slide the column window (a Parquet orbits
+table is 73 columns — most of them the packed-covariance block), **g** / **Home** to
 jump back to the first row, **/** to filter rows by substring, **Esc** to
 drop the filter, **q** to quit. The status line says where you are, and
 declines to guess a total it has not reached yet:
@@ -245,15 +250,14 @@ is never silently dropped.
       "central_body":   10
     }
   ],
-  "dv_corrections":         [[0.0, 0.0, 0.0]],
-  "correction_covariances": [[[1e-20, 0, 0], [0, 1e-20, 0], [0, 0, 1e-20]]]
+  "dv_corrections": [[0.0, 0.0, 0.0]]
 }
 ```
 
 - `isp_s` is optional — omit or `null` for constant mass; otherwise mass depletes over the burn.
 - `steering.type` is `constant_rtn` (with `alpha_rad`, `beta_rad`), `velocity_tangent`, or `inertial_fixed` (with `direction`).
 - `central_body` is a NAIF body code (10 = Sun, 399 = Earth, 301 = Moon) — the reference for the RTN / velocity-tangent frame.
-- `dv_corrections` is positional with `arcs`; `correction_covariances`, when present, must match its length. A mismatch is rejected at propagation time, never silently repaired.
+- `dv_corrections` is positional with `arcs`. A per-correction burn prior rides the orbit's packed covariance joint (its thrust axes), not a separate per-segment covariance carrier; a file still declaring the removed carrier field is refused by name.
 
 ```sh
 empyrean propagate --object-id 99942 --epoch 64922.0 --thrust-arcs burn.json --out-dir ./out
@@ -308,15 +312,14 @@ Three artifacts land under `--out-dir`:
   keyed by its ADES designation. Fully re-feedable: state, covariance,
   and non-gravitational model carry straight into a follow-on
   `empyrean propagate` / `empyrean ephemeris` with no reconstruction.
-  A wide fit's orbit additionally carries the **joint** — the
-  off-diagonal blocks of the fitted covariance, beyond the state+Marsden
-  9×9. Only parquet (the `--format` default) can hold them; `--format
-  csv` and `--format json` refuse such a batch **by name** rather than
-  writing it short, because a file written short reads back as a
-  block-diagonal joint, which is a tighter claim than the fit made and
-  leaves nothing in the round trip to signal the loss. Keep the default
-  format for wide fits; a fit whose orbit carries no cross terms writes
-  in whichever format you ask for.
+  The covariance is **one packed joint** over the state and every solved
+  parameter (up to seventeen wide). Parquet (the `--format` default) and
+  `--format json` preserve the whole joint; `--format csv` flattens the
+  6×6 state block and refuses a joint with solved-parameter axes beyond the
+  state **by name** rather than writing it short, because a file written
+  short reads back as a block-diagonal joint — a tighter claim than the fit
+  made, with nothing in the round trip to signal the loss. Use parquet or
+  JSON when the covariance must survive the round trip.
 - `fit_summary.parquet` **and** `fit_summary.csv` — one row per *input*
   object, delivered or not: `status`, convergence, iterations, observation
   and selected counts, residual RMS, reduced χ², both acceptability
@@ -342,7 +345,11 @@ An object whose fit fails never removes the others and never disappears:
 it gets a typed failure and a `fit_summary` row saying so. The exit code
 is the batch's verdict — `0` when every object delivered, `3` when some
 did, `4` when none did — so a script can tell a partial run from a clean
-one without parsing stderr.
+one without parsing stderr. A solve that would publish the prior back as a
+posterior — a solved axis (a Marsden coefficient, `DT`, `AMRAT`) the
+observations carry no information on — is refused by name, the failure
+message naming the axis and reporting that its posterior σ did not fall
+below the prior σ, rather than returning the prior echo as an estimate.
 
 ```sh
 empyrean determine observations.psv --out-dir ./out
@@ -482,6 +489,16 @@ empyrean determine apophis.psv --photometry --out-dir ./out
 ```text
   99942:
     Photometry: H = 19.234 ± 0.041  G1 = 0.150  (model HG12, chi2_r 1.02)
+```
+
+Each magnitude is converted to Johnson V before the fit with the MPC
+Magnitude Bands table. `--band-conversion CODE=OFFSET:SIGMA` (repeatable)
+supplies entries the table does not carry — the LSST `Lu Lg Lr Li Lz Ly`
+carry no MPC conversion and are refused by name until supplied. It
+requires `--photometry`:
+
+```sh
+empyrean determine lsst.psv --photometry --band-conversion Lu=-1.41:0.30 --out-dir ./out
 ```
 
 ## Runtime requirement

@@ -7,7 +7,7 @@
 /// pointing offsets, fit alongside the orbit. Defaults target modern
 /// survey arcs.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct StationRaDecConfig {
+pub struct StationRADecConfig {
     /// Default 1-sigma prior (arcsec).
     pub sigma_prior_arcsec: f64,
     /// Minimum observations per station required to allocate a bias
@@ -15,7 +15,7 @@ pub struct StationRaDecConfig {
     pub min_obs_per_station: usize,
 }
 
-impl Default for StationRaDecConfig {
+impl Default for StationRADecConfig {
     fn default() -> Self {
         // The "modern arc" defaults: 0.3″ sigma, 5-obs minimum.
         Self {

@@ -62,6 +62,92 @@ fn rejection_config_struct_has_cmc2003_fields() {
 }
 
 #[test]
+fn noise_model_constants_are_visible_through_ffi() {
+    // Wire values for the observation error law. Gaussian is 0 so a
+    // zero-initialized EmpyreanNoiseModel is the pre-noise-model default.
+    assert_eq!(EMPYREAN_NOISE_MODEL_GAUSSIAN, 0);
+    assert_eq!(EMPYREAN_NOISE_MODEL_STUDENT_T, 1);
+    assert_eq!(EMPYREAN_NOISE_MODEL_NIGHT_SCALE, 2);
+    assert_eq!(EMPYREAN_COVARIANCE_INFORMATION_OBSERVED, 0);
+    assert_eq!(EMPYREAN_COVARIANCE_INFORMATION_EXPECTED, 1);
+    // The blunder rejection reason and gate.
+    assert_eq!(EMPYREAN_REJECTION_BLUNDER, 16);
+    assert_eq!(EMPYREAN_REJECTION_KIND_BLUNDER, 2);
+    // Rejection enable tri-state (zero-init = engine default), matching the
+    // EMPYREAN_ORIGIN_SWITCHING_* DEFAULT/ON/OFF convention.
+    assert_eq!(EMPYREAN_REJECTION_ENABLED_DEFAULT, 0);
+    assert_eq!(EMPYREAN_REJECTION_ENABLED_ON, 1);
+    assert_eq!(EMPYREAN_REJECTION_ENABLED_OFF, 2);
+    // Sigma provenance tags are contiguous and distinct; UNKNOWN is its own
+    // code, never folded into NOT_WEIGHTED.
+    assert_eq!(EMPYREAN_SIGMA_SOURCE_REPORTED, 0);
+    assert_eq!(EMPYREAN_SIGMA_SOURCE_NOT_WEIGHTED, 4);
+    assert_eq!(EMPYREAN_SIGMA_SOURCE_UNKNOWN, 5);
+    assert_ne!(
+        EMPYREAN_SIGMA_SOURCE_UNKNOWN,
+        EMPYREAN_SIGMA_SOURCE_NOT_WEIGHTED
+    );
+}
+
+#[test]
+fn od_error_codes_are_visible_and_the_slot_carries_the_field() {
+    // NONE is 0 (delivered / not-applicable); the variant codes start at 1
+    // and run contiguously to 43.
+    assert_eq!(EMPYREAN_OD_ERROR_NONE, 0);
+    assert_eq!(EMPYREAN_OD_ERROR_NOT_CARTESIAN, 1);
+    assert_eq!(EMPYREAN_OD_ERROR_NOISE_MODEL_REJECTION_UNSET, 39);
+    assert_eq!(EMPYREAN_OD_ERROR_NOISE_MODEL_IRLS_NOT_CONVERGED, 43);
+    assert_ne!(
+        EMPYREAN_OD_ERROR_NOISE_MODEL_REJECTION_UNSET,
+        EMPYREAN_OD_ERROR_OBSERVED_INFORMATION_NOT_POSITIVE_DEFINITE
+    );
+    // The batch slot carries the specific OD code beside the failure kind.
+    let slot: EmpyreanODObjectResult = Default::default();
+    let _: i32 = slot.od_error_code;
+    let _: i32 = slot.error_code;
+}
+
+#[test]
+fn noise_model_and_result_structs_carry_the_new_fields() {
+    // Touch the new struct fields so a dropped field fails the build,
+    // and confirm the config structs still zero-init through Default.
+    let nm: EmpyreanNoiseModel = Default::default();
+    assert_eq!(nm.tag, 0);
+    let _ = nm.nu;
+
+    let w: EmpyreanWeightingConfig = Default::default();
+    let _ = w.noise_model.tag;
+    let _ = w.covariance_information;
+
+    let layer: EmpyreanWeightingLayer = Default::default();
+    let _ = layer.has_noise_model;
+    let _ = layer.noise_model.nu;
+
+    // The rejection tri-state is an unsigned byte; zero-init = engine
+    // default (EMPYREAN_REJECTION_ENABLED_DEFAULT).
+    let r: EmpyreanRejectionConfig = Default::default();
+    let _: u8 = r.enabled;
+    assert_eq!(r.enabled, EMPYREAN_REJECTION_ENABLED_DEFAULT as u8);
+
+    let row: EmpyreanObservationResult = Default::default();
+    let _ = row.noise_model;
+    let _ = row.noise_model_nu;
+    let _ = row.robust_weight;
+    let _ = row.sigma_eff_ra_arcsec;
+    let _ = row.sigma_source;
+    let _ = row.sigma_scale_applied;
+
+    let s: EmpyreanResidualSummary = Default::default();
+    let _ = s.n_eff;
+    let _ = s.expected_median_d2;
+    let _ = s.expected_tail;
+
+    let od: EmpyreanODResult = Default::default();
+    let _ = od.rejection_kind;
+    let _ = od.rejection_enabled;
+}
+
+#[test]
 fn the_loaded_engine_reports_the_abi_version_this_crate_compiled_against() {
     // `dlsym` matches on symbol name, not signature, so a stale
     // `libempyrean` resolves every symbol and then reads the caller's

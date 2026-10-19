@@ -13,10 +13,10 @@ from empyrean.coordinates.coordinates import (
     KeplerianCoordinates,
     SphericalCoordinates,
 )
+from empyrean.orbits.joint import PackedJoints
 from empyrean.orbits.nongrav import NonGravParams
 from empyrean.orbits.photometry import PhotometricParams
 from empyrean.orbits.srp import SRPParams
-from empyrean.orbits.wide_cross import WideCross
 
 T = TypeVar("T", bound=qv.Table)
 
@@ -66,7 +66,7 @@ class CartesianOrbits(qv.Table):
     object_id = qv.LargeStringColumn(nullable=True)
     coordinates = CartesianCoordinates.as_column()
     non_grav = NonGravParams.as_column(nullable=True)
-    wide_cross = WideCross.as_column(nullable=True)
+    covariance = PackedJoints.as_column(nullable=True)
     srp = SRPParams.as_column(nullable=True)
     photometric = PhotometricParams.as_column(nullable=True)
 
@@ -86,7 +86,7 @@ class KeplerianOrbits(qv.Table):
     object_id = qv.LargeStringColumn(nullable=True)
     coordinates = KeplerianCoordinates.as_column()
     non_grav = NonGravParams.as_column(nullable=True)
-    wide_cross = WideCross.as_column(nullable=True)
+    covariance = PackedJoints.as_column(nullable=True)
     srp = SRPParams.as_column(nullable=True)
     photometric = PhotometricParams.as_column(nullable=True)
 
@@ -106,7 +106,7 @@ class CometaryOrbits(qv.Table):
     object_id = qv.LargeStringColumn(nullable=True)
     coordinates = CometaryCoordinates.as_column()
     non_grav = NonGravParams.as_column(nullable=True)
-    wide_cross = WideCross.as_column(nullable=True)
+    covariance = PackedJoints.as_column(nullable=True)
     srp = SRPParams.as_column(nullable=True)
     photometric = PhotometricParams.as_column(nullable=True)
 
@@ -126,7 +126,7 @@ class SphericalOrbits(qv.Table):
     object_id = qv.LargeStringColumn(nullable=True)
     coordinates = SphericalCoordinates.as_column()
     non_grav = NonGravParams.as_column(nullable=True)
-    wide_cross = WideCross.as_column(nullable=True)
+    covariance = PackedJoints.as_column(nullable=True)
     srp = SRPParams.as_column(nullable=True)
     photometric = PhotometricParams.as_column(nullable=True)
 

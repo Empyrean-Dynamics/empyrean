@@ -22,6 +22,7 @@ import tempfile
 
 import empyrean
 import numpy as np
+import pytest
 from empyrean import (
     CartesianCoordinates,
     CartesianCovariance,
@@ -137,13 +138,16 @@ def test_tagged_covariance_no_input_covariance() -> None:
 
     tc = result.tagged_covariance
     assert tc is not None
-    # Still aligned 1:1, but flagged false and zero-filled.
+    # Still aligned 1:1, but flagged false and zero-filled (no joint rides a
+    # joint-less orbit).
     assert len(tc) == n
     assert not any(tc.has_tagged.to_pylist())
 
-    series = result.tagged_covariance_series(0)
-    assert len(series) == n
-    assert np.allclose(series[0].matrix, 0.0)
+    # The per-orbit series request is refused BY NAME — never an empty series.
+    # A joint-less orbit carries no tagged covariance, and fabricating a
+    # zero-filled series from it would read as a supplied zero covariance.
+    with pytest.raises(ValueError, match="no input covariance"):
+        result.tagged_covariance_series(0)
 
 
 def test_tagged_covariance_round_trip() -> None:

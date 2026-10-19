@@ -30,6 +30,7 @@ from empyrean import (
 )
 from empyrean.coordinates.coordinates import CartesianCoordinates
 from empyrean.coordinates.covariance import CartesianCovariance
+from empyrean.ephemeris.result import OrbitOutcome
 from empyrean.orbits.orbits import CartesianOrbits
 
 _TARGET = "Apophis"
@@ -155,67 +156,69 @@ def test_sbdb_cartesian_sigma_point_is_genuine(sbdb_orbit_cartesian, sbdb_grid) 
     _assert_sigma_point_is_not_linear(res_fo, res_sp)
 
 
-def test_agm_impact_probability_fires_and_labels_correctly() -> None:
-    """GaussianMixture (AGM) in ``compute_impact_probabilities`` on REAL
-    data — the firing case the offline acceptance test in ``test_impact``
-    cannot reach (its heliocentric fixture has no encounter → empty
-    table). A short-arc (covariance-inflated) 2024 YR4 through its
-    2032-12-22 Earth encounter produces a tag-5 impact row that:
+def test_agm_fires_and_labels_on_a_synthetic_earth_encounter() -> None:
+    """GaussianMixture (AGM) in ``compute_impact_probabilities`` fires and
+    labels correctly on a SYNTHETIC Earth-encounter orbit — the firing case
+    the heliocentric offline fixtures in ``test_impact`` cannot reach (no
+    encounter → empty table), reached here with no network query and no
+    bug-report object.
 
-    1. is labelled ``"gaussian_mixture"`` — NOT silently relabelled
+    The orbit is the validation suite's synthetic ``impactor`` (a
+    constructed Earth-crossing Cartesian state from
+    ``fixtures/parity_manifest.json``), its covariance inflated ×1e6 so the
+    encounter's nonlinearity clears the AGM firing threshold. Measured
+    against the pinned engine (villeneuve 1.26.0): the splitter does not
+    fire below κ ≈ 1 (κ = 0.95 at ×1e4, mixture absent) and fires above it
+    (κ ≈ 9.5 at ×1e6, an 3-component mixture, ``ip_agm`` ≈ 3e-3). The tag-5
+    row must:
+
+    1. be labelled ``"gaussian_mixture"`` — NOT silently relabelled
        ``"first_order"`` as it was before the ``method_from_tag`` readback
-       fix (``empyrean/src/impact.rs``); this is the exact assertion that
-       would have caught the pre-fix bug; and
-    2. carries a finite, mixture-corrected ``ip_agm`` (the AGM splitter
-       fires above its nonlinearity threshold at this inflation).
+       fix (``empyrean/src/impact.rs``); the paired ``first_order`` row with
+       a distinct label proves the tag is not collapsed in the round-trip;
+       and
+    2. carry a non-null ``agm_components`` count and a finite,
+       mixture-corrected ``ip_agm`` (the splitter constructed a mixture).
 
-    The paired ``first_order`` row with a distinct label proves the tag is
-    not collapsed anywhere in the round-trip. Network-gated (SBDB); slow
-    (AGM splitting through a multi-year propagation).
+    Offline: needs the local SPICE kernels (``EMPYREAN_DATA_DIR``), no SBDB.
     """
     empyrean.initialize()
-    try:
-        orb = empyrean.query_sbdb(["2024 YR4"])
-    except Exception as e:  # noqa: BLE001 — any network/parse failure → skip
-        pytest.skip(f"SBDB query for 2024 YR4 unavailable: {type(e).__name__}: {e}")
-    if orb.coordinates.covariance is None:
-        pytest.skip("SBDB record for 2024 YR4 carries no covariance")
-
-    t0 = float(orb.coordinates.epoch.to_numpy(zero_copy_only=False)[0])
-    r0 = empyrean.propagate(
-        orb,
-        Epochs.from_mjd(np.array([t0]), scale="tdb"),
-        uncertainty_method=UncertaintyMethod.FIRST_ORDER,
-    )
-    c = r0.states.coordinates
-    cov0 = c.covariance.to_matrix()[0]
-
-    def col(name):
-        return float(getattr(c, name).to_numpy(zero_copy_only=False)[0])
-
-    frame = c.frame if isinstance(c.frame, str) else c.frame.to_pylist()[0]
-    # Inflate the covariance ×1e6 (σ×1000) to simulate an early short-arc
-    # solution — the large-covariance regime where the AGM splitter fires.
-    yr4 = CartesianOrbits.from_kwargs(
-        orbit_id=["yr4"],
-        object_id=["yr4"],
+    # Synthetic Earth-impactor from the validation parity manifest — a
+    # constructed fixture, never a real or bug-report object.
+    epoch = 54746.0
+    state = [
+        0.9703740077176525,
+        0.24140202303297825,
+        0.00010161047612020427,
+        -0.008415158408739472,
+        0.01715090747796052,
+        -0.0008295684050048718,
+    ]
+    base_diag = np.array([1e-12, 1e-12, 1e-12, 1e-16, 1e-16, 1e-16])
+    # ×1e6 puts the encounter's nonlinearity at κ ≈ 9.5 — well above the
+    # ~κ=1 firing threshold measured above, so the firing is robust to the
+    # ~1e-10 platform spread in the SPICE-backed propagation.
+    cov = np.diag(base_diag * 1e6)
+    impactor = CartesianOrbits.from_kwargs(
+        orbit_id=["impactor"],
+        object_id=["impactor"],
         coordinates=CartesianCoordinates.from_kwargs(
-            epoch=np.array([t0]),
-            x=[col("x")],
-            y=[col("y")],
-            z=[col("z")],
-            vx=[col("vx")],
-            vy=[col("vy")],
-            vz=[col("vz")],
-            frame=frame,
-            origin=c.origin.to_pylist(),
-            covariance=CartesianCovariance.from_matrix((cov0 * 1e6)[None, :, :]),
+            epoch=np.array([epoch]),
+            x=[state[0]],
+            y=[state[1]],
+            z=[state[2]],
+            vx=[state[3]],
+            vy=[state[4]],
+            vz=[state[5]],
+            frame="ecliptic_j2000",
+            origin=[str(Origin.SUN)],
+            covariance=CartesianCovariance.from_matrix(cov[None, :, :]),
         ),
     )
-    # 2032-12-22 encounter is ≈ MJD 63588.5; end a few days past it.
+    # The encounter is within a day of the epoch; end just past it.
     ips = compute_impact_probabilities(
-        yr4,
-        end_epoch=Epochs.from_mjd([63594.0], scale="tdb"),
+        impactor,
+        end_epoch=Epochs.from_mjd([54748.0], scale="tdb"),
         methods=[UncertaintyMethod.FIRST_ORDER, GaussianMixture()],
         body_filter=[Origin.EARTH],
     )
@@ -226,9 +229,12 @@ def test_agm_impact_probability_fires_and_labels_correctly() -> None:
     assert "first_order" in labels, f"first_order row missing; got {labels}"
 
     gm = df[df["method"] == "gaussian_mixture"].iloc[0]
-    # The AGM fired: the mixture-corrected IP is finite (a genuine payoff,
-    # not a NaN no-op), alongside the always-present linear IP.
-    assert np.isfinite(gm["ip_agm"]), "AGM did not fire (ip_agm NaN) at cov×1e6"
+    # The splitter fired: a mixture was constructed (non-null component
+    # count) and the mixture-corrected impact probability is finite.
+    assert np.isfinite(gm["agm_components"]) and gm["agm_components"] > 0, (
+        f"AGM did not construct a mixture; agm_components={gm['agm_components']}"
+    )
+    assert np.isfinite(gm["ip_agm"]), "AGM fired but ip_agm is not finite"
     assert np.isfinite(gm["ip_linear"])
 
 
@@ -264,10 +270,68 @@ def test_sbdb_cometary_sigma_point_is_genuine(sbdb_orbit, sbdb_grid) -> None:
     _assert_sigma_point_is_not_linear(res_fo, res_sp)
 
 
-def test_sbdb_generate_ephemeris_rejects_sampling(sbdb_orbit, sbdb_grid) -> None:
-    """generate_ephemeris rejects the sampling methods with a typed error
-    (the silent-ignore fix), on a real SBDB orbit + observer."""
+def test_sbdb_generate_ephemeris_sampling_is_the_engines_call(
+    sbdb_orbit, sbdb_orbit_cartesian, sbdb_grid
+) -> None:
+    """generate_ephemeris adds no wrapper gate on the sampling methods: the
+    engine decides, and on a real SBDB record both of its answers are pinned
+    here, as the engine delivers them.
+
+    The record as queried carries a Cometary primary coordinate. The one
+    cause this test pins: villeneuve #264 samples a non-Cartesian primary
+    (Cometary, Keplerian, Spherical) in its OWN representation, so the
+    sampled sky path now DELIVERS for it — ephemeris rows and a per-orbit
+    ``DELIVERED`` outcome — instead of returning an empty ephemeris (the old
+    uncovered-Cometary residue) or refusing by name. Apophis's SBDB
+    element-space covariance is wide enough that the sampled sky moment over
+    a year is not positive-definite, so the per-row sky covariance is
+    *withheld* and the reason rides ``EphemerisResult.warnings`` while the
+    ephemeris rows themselves are still delivered — delivery with a named,
+    withheld covariance, never a silent empty table. A future engine that
+    returns to an empty ephemeris or a by-name refusal for a Cometary
+    primary is caught here. The SAME record as a Cartesian orbit, whose
+    propagated-to-epoch covariance is well conditioned, delivers a finite
+    sky covariance that is not the first-order projection.
+    """
     observers = empyrean.get_observer_states(["500"], Epochs.from_mjd(sbdb_grid, scale="tdb"))
-    for method in (UncertaintyMethod.SIGMA_POINT, UncertaintyMethod.MONTE_CARLO):
-        with pytest.raises(ValueError, match="sampling uncertainty methods"):
-            empyrean.generate_ephemeris(sbdb_orbit, observers, uncertainty_method=method)
+
+    # Cometary primary under a sampling method: the engine samples it in its
+    # own representation and DELIVERS. Rows + a `delivered` outcome come
+    # through; the wide element-space cloud's sky moment is not
+    # positive-definite, so the covariance is withheld with a named warning.
+    for method in (UncertaintyMethod.SIGMA_POINT, MonteCarlo(n_samples=64, seed=7)):
+        eph = empyrean.generate_ephemeris(sbdb_orbit, observers, uncertainty_method=method)
+        assert len(eph.ephemeris) == len(sbdb_grid), (
+            f"{method}: a non-Cartesian primary now DELIVERS sampled ephemeris rows "
+            "(villeneuve #264 samples it in its own representation), not an empty table"
+        )
+        assert eph.all_delivered, (
+            f"{method}: the per-orbit outcome must be DELIVERED, not FAILED: "
+            f"{eph.status.outcome.to_pylist()}"
+        )
+        assert eph.status.outcome[0].as_py() == OrbitOutcome.DELIVERED.value
+        assert any("CovarianceWithheld" in w for w in eph.warnings), (
+            f"{method}: a withheld sampled covariance must be named in warnings; "
+            f"got {eph.warnings!r}"
+        )
+        assert any("not positive-definite" in w for w in eph.warnings), (
+            f"{method}: the withheld-covariance warning must name the reason "
+            f"(sky moment not positive-definite); got {eph.warnings!r}"
+        )
+
+    # Cartesian primary: delivered — a finite sampled sky covariance distinct
+    # from the first-order projection.
+    def sky(method):
+        cov = empyrean.generate_ephemeris(
+            sbdb_orbit_cartesian, observers, uncertainty_method=method
+        ).ephemeris.coordinates.covariance
+        assert cov is not None, f"{method}: sky covariance column missing"
+        return cov.to_matrix()
+
+    fo = sky(UncertaintyMethod.FIRST_ORDER)
+    for method in (UncertaintyMethod.SIGMA_POINT, MonteCarlo(n_samples=64, seed=7)):
+        m = sky(method)
+        assert m.shape[0] > 0 and np.isfinite(m).all(), (
+            f"{method}: sampled sky covariance not finite"
+        )
+        assert not np.array_equal(m, fo), f"{method}: sky covariance is the first-order one"

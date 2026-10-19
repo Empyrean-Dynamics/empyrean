@@ -118,6 +118,28 @@ class StateSensitivities(qv.Table):
     ``linear`` / ``second_order`` / …), or ``None`` if the propagation did
     not resolve a covariance for this row."""
 
+    # The engine's pre-retention Gaussian-mixture accounting for this row's
+    # covariance — the six tallies that ride WITH a mixture covariance
+    # (distinct from the retained-component status table on
+    # :class:`~empyrean.propagation.mixtures.MixtureChains`). The column names
+    # match the validation schema so a channel row maps 1:1. ``None`` on every
+    # non-mixture row, and ``None`` (not 0) on a count the engine did not
+    # carry — read absence by name, never as a 0.
+    mix_n_components_total = qv.Int64Column(nullable=True)
+    """Total components before retention, or ``None`` on a non-mixture row."""
+    mix_weight_delivered = qv.Float64Column(nullable=True)
+    """Pre-renormalization surviving mass, or ``None`` on a non-mixture row."""
+    mix_n_failed = qv.Int64Column(nullable=True)
+    """Members whose sub-propagation failed, or ``None`` when not carried."""
+    mix_n_unresolved = qv.Int64Column(nullable=True)
+    """Members still inside a zone at their horizon, or ``None`` when not carried."""
+    mix_n_curvature_refused = qv.Int64Column(nullable=True)
+    """Components refused for state-space curvature, or ``None`` when not carried."""
+    mix_n_sky_linearization_refused = qv.Int64Column(nullable=True)
+    """Components refused by the flat-sky linearization, or ``None`` when not
+    carried — engine-``None`` on the propagation seam at the current engine
+    pin, so read as absent, never 0."""
+
     # ── Introspection ─────────────────────────────────────────
 
     def orbit_ids_unique(self) -> list[str]:
@@ -339,6 +361,25 @@ class ObservationSensitivities(qv.Table):
       ``6·n_params`` (``jacobian[n_params·r + c] = J[r, c]``).
     - ``hessian`` is ``(6, n_params, n_params)`` flattened to length
       ``6·n_params²``.
+
+    The Hessian is COMPOSED to the same input axis as the Jacobian — the
+    orbit-epoch state in ``frame``/``origin`` — so the pair is one
+    second-order expansion (villeneuve 1.25.0; earlier engines published
+    the LOCAL topocentric second derivative here, a different input
+    domain from the Jacobian beside it, and any consumer that contracted
+    the two together read the wrong quantity). It is populated on
+    ``second_order`` rows of orbits declaring a state covariance and no
+    solved force-model parameters, where ``n_params == 6``, and is null
+    on every other row.
+
+    **Consumer note (fold builders).** The per-row sky covariance
+    delivered alongside this tensor under a second-order method is the
+    moment *about the published nominal*: it already contains the
+    mean-shift outer product ``δμ_a · δμ_b``, with
+    ``δμ_a = ½ tr(H_a Σ)`` built from this tensor. A consumer building
+    its own bias-corrected update must not ALSO subtract that shift from
+    the innovation while using the delivered matrix as its noise term —
+    that double-counts the correction.
 
     The ``n_params`` column documents which: ``6`` for a state-only DC,
     ``9`` when non-gravitational parameters (A1, A2, A3) are also free

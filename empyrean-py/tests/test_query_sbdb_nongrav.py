@@ -38,8 +38,10 @@ def _sbdb_dict(**overrides: Any) -> dict[str, Any]:
         "representation": ["cartesian"],
         "epoch_mjd_tdb": np.array([59000.0]),
         "elements": np.array([[3.5, 0.0, 0.0, 0.0, 0.006, 0.0]]),
-        "has_covariance": np.array([0], dtype=np.uint8),
-        "covariance": np.zeros((1, 6, 6)),
+        # The orbit's covariance is the one packed joint, carried as a per-row
+        # wire list; a joint-less row is a None entry (the flat 6x6 is derived
+        # from the joint, so there is no separate flat / has_covariance key).
+        "covariance": [None],
         "frame": ["icrf"],
         "origin": np.array([10], dtype=np.int32),  # Sun
         "a1": np.array([P67_A1]),

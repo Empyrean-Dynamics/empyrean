@@ -86,8 +86,8 @@ pub use config::{
     PropagationConfig, UncertaintyMethod,
 };
 pub use result::{
-    CovarianceKind, CovarianceQuality, Event, MixtureChain, MixtureComponent, PropagatedState,
-    PropagationResult, TaggedCovariance, TargetFunctional,
+    ComponentStatus, CovarianceKind, Event, MixtureChain, MixtureComponent, MixtureTally,
+    OrbitOutcome, PropagatedState, PropagationResult, TaggedCovariance,
 };
 
 // Internal types other modules in this crate reach for via the
@@ -146,6 +146,9 @@ impl Context {
             // Opaque retained-result handle, filled by empyrean_propagate
             // and freed by empyrean_propagation_result_free.
             lazy_handle: std::ptr::null_mut(),
+            // Per-orbit delivery channel, filled by empyrean_propagate.
+            num_orbits: 0,
+            outcomes: std::ptr::null_mut(),
         };
         let code = unsafe {
             empyrean_sys::empyrean_propagate(
@@ -173,8 +176,10 @@ impl Context {
 /// Shared by the one-shot [`Context::propagate`] and the pre-built
 /// [`BuiltSystem::propagate`](crate::BuiltSystem::propagate) so both produce
 /// byte-identical output — the handle only changes *when* the force model is
-/// assembled, never the marshaling. `num_orbits` sizes the object-id array
-/// (one id per input orbit).
+/// assembled, never the marshaling. `num_orbits` is the INPUT orbit count,
+/// used to size the per-orbit mixture-chain padding; the object-id array is
+/// sized by the C side at `num_states` (one id per delivered state row,
+/// parallel to `states`), not per input orbit.
 pub(crate) fn marshal_propagation_result(
     ffi_result: empyrean_sys::EmpyreanPropagationResult,
     num_orbits: usize,
@@ -193,7 +198,15 @@ pub(crate) fn marshal_propagation_result(
     let object_ids = if ffi_result.object_ids.is_null() {
         Vec::new()
     } else {
-        unsafe { std::slice::from_raw_parts(ffi_result.object_ids, num_orbits) }
+        // The C side sizes this array at `num_states` — one id per delivered
+        // state row, parallel to `states` — NOT at `num_orbits`. Reading
+        // `num_orbits` entries runs past the allocation whenever
+        // `num_states < num_orbits`, which is exactly a mixed batch (a failed
+        // orbit contributes no rows) resolved to a single epoch; the read
+        // then dereferences one element of uninitialized/foreign heap as a
+        // `*const c_char` and segfaults in release (debug survived by heap
+        // luck). Size it by the field the C side allocated, wrote and frees by.
+        unsafe { std::slice::from_raw_parts(ffi_result.object_ids, ffi_result.num_states) }
             .iter()
             .map(|&p| {
                 if p.is_null() {
@@ -210,7 +223,7 @@ pub(crate) fn marshal_propagation_result(
         unsafe { std::slice::from_raw_parts(ffi_result.events, ffi_result.num_events) }
             .iter()
             .map(Event::from_ffi)
-            .collect()
+            .collect::<Result<Vec<_>>>()?
     };
 
     // Per-orbit AGM mixture chains. The C ABI emits one row per input
@@ -251,11 +264,43 @@ pub(crate) fn marshal_propagation_result(
         }
     };
 
+    // Per-input-orbit delivery outcomes. One entry per input orbit; a failed
+    // orbit is carried here rather than ending the batch. Copied eagerly like
+    // the arrays above: the owning C strings are freed with the retained
+    // `ffi_result` on drop, so a borrow would outlive its storage.
+    let outcomes: Vec<OrbitOutcome> = if ffi_result.outcomes.is_null() {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(ffi_result.outcomes, ffi_result.num_orbits) }
+            .iter()
+            .map(|o| {
+                if o.status == empyrean_sys::EMPYREAN_ORBIT_OUTCOME_FAILED {
+                    let message = if o.error_message.is_null() {
+                        String::new()
+                    } else {
+                        unsafe { CStr::from_ptr(o.error_message) }
+                            .to_string_lossy()
+                            .into_owned()
+                    };
+                    OrbitOutcome::Failed {
+                        code: o.error_code,
+                        message,
+                    }
+                } else {
+                    OrbitOutcome::Delivered {
+                        first_row: o.first_row,
+                        num_rows: o.num_rows,
+                    }
+                }
+            })
+            .collect()
+    };
+
     // Retain the FFI result (rather than freeing it here) so the lazy
     // tagged-covariance accessors stay callable; it is freed when the
     // returned `PropagationResult` drops. The owned `states` / `object_ids`
     // / `events` / `mixtures` above are independent copies.
     Ok(PropagationResult::new(
-        states, object_ids, events, mixtures, ffi_result,
+        states, object_ids, events, mixtures, outcomes, ffi_result,
     ))
 }

@@ -69,17 +69,17 @@ def _state(orbit) -> np.ndarray:
 
 
 def test_od_system_freezes_the_recipe_a_fit_runs_under() -> None:
-    """The whole reason ``od_system`` exists: the frame and the divisor an
-    OD fit uses are not the caller's to choose, and the frame is the easy
-    one to get wrong."""
+    """The whole reason ``od_system`` exists: the frame and the
+    engine-resolved encounter-floor angle an OD fit uses are not the
+    caller's to choose, and the frame is the easy one to get wrong."""
     system = od_system()
     assert system.force_model is ForceModelTier.STANDARD
     assert system.frame is Frame.ECLIPTICJ2000, "OD does not integrate in ICRF"
-    assert system.encounter_timescale_divisor == 1000.0
+    assert system.encounter_floor_angle == pytest.approx(0.04631500395488421)
 
     described = system.describe()
     assert described.frame is Frame.ECLIPTICJ2000
-    assert described.encounter_timescale_divisor == 1000.0
+    assert described.encounter_floor_angle == pytest.approx(0.04631500395488421)
     assert described.force_model is ForceModelTier.STANDARD
 
 
@@ -160,17 +160,6 @@ def test_a_wrong_tier_handle_is_refused_by_axis(short_arc, prior_orbit) -> None:
     standard = ODConfig()  # force_model defaults to Standard
     with pytest.raises(ValueError, match="force-model mismatch"):
         basic.refine(prior_orbit, short_arc, config=standard)
-
-
-def test_a_non_default_divisor_handle_is_refused_by_axis(short_arc, prior_orbit) -> None:
-    odd = build_system(
-        force_model="standard",
-        frame="ecliptic_j2000",
-        encounter_timescale_divisor=500.0,
-    )
-    assert odd.encounter_timescale_divisor == 500.0
-    with pytest.raises(ValueError, match="divisor mismatch"):
-        odd.refine(prior_orbit, short_arc)
 
 
 def test_auto_force_model_is_refused_rather_than_silently_unamortized(

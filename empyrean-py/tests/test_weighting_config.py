@@ -249,6 +249,30 @@ def test_preset_none_uses_user_default_sigma(probe_orbit, f51_observations):
     np.testing.assert_allclose(c_none2, c_uniform / 4.0, rtol=1e-12)
 
 
+def test_python_default_weighting_matches_extension_default(probe_orbit, f51_observations):
+    """Ruling (a) — Python-vs-extension: the default weighting the Python
+    ``WeightingConfig()`` sends is the default the extension reports.
+
+    The Python layer carries no engine, so it pins the default it emits
+    against the extension's own ``WeightingConfig::default()``
+    behaviourally: an empty weighting wire dict leaves every field for the
+    extension to fill from its default, and the resulting fit is compared
+    to the one the Python default ``WeightingConfig()`` produces. The C and
+    wrapper ruling tests pin the default's *values* engine-side (noise model
+    Gaussian, observed covariance); this pins that the minimal Python
+    surface does not disagree with them — the fields it does not expose it
+    can only inherit, so an agreeing fit proves agreement on every field.
+    """
+    c_python_default = _chi2(probe_orbit, f51_observations, WeightingConfig())
+    # The extension's own default: hand it an empty weighting dict so every
+    # field — including the ones the Python surface never sends — is filled
+    # from WeightingConfig::default().
+    c_extension_default = _eval_raw(probe_orbit, f51_observations, {}).summary.chi2
+    assert np.isfinite(c_python_default)
+    assert c_python_default > 0.0
+    np.testing.assert_allclose(c_python_default, c_extension_default, rtol=1e-12)
+
+
 # ── (b) user layers beat preset rules ────────────────────────────────
 
 
@@ -707,3 +731,51 @@ def test_session_constructor_rejects_invalid_layer(case, raw, message, fittable_
     )
     with pytest.raises(RuntimeError, match=message):
         Session(fittable_f51_observations, config=cfg)
+
+
+# ── (f) an unresolvable observatory code is refused by name ──────────
+#
+# scott v1.19.0 splits an unresolvable observatory code out of the
+# generic observer-construction failure. A ground station in no loaded
+# registry is refused BY NAME — never silently skipped, never placed at
+# a fallback geometry — and that refusal crosses the C ABI as the typed
+# ``unknown_observatory_code`` failure kind, carrying the code and its
+# observation index in the message.
+
+
+def test_unknown_observatory_code_refuses_the_fit_by_name(probe_orbit):
+    """Every ground ``stn`` relabelled to a code the registry does not
+    know (``ZZZ``) makes ``determine`` refuse the object by name instead
+    of fitting it against a default geometry.
+
+    Mutation: map the engine's ``UnknownObservatoryCode`` onto the
+    generic observer-construction code and ``kind`` reads
+    ``observer_construction`` — this goes red.
+    """
+    epochs = [61001.1 + 30.0 * i / 14 for i in range(15)]
+    observers = Observers.from_code("F51", Epochs.from_mjd(epochs, scale="tdb"))
+    eph = generate_ephemeris(probe_orbit, observers, force_model=ForceModelTier.APPROXIMATE)
+    ra = eph.ephemeris.coordinates.lon.to_numpy(zero_copy_only=False)
+    dec = eph.ephemeris.coordinates.lat.to_numpy(zero_copy_only=False)
+    n = len(ra)
+    # Real F51 astrometry, every ground station relabelled to ZZZ.
+    relabelled = ADESObservations.from_kwargs(
+        stn=["ZZZ"] * n,
+        obs_time=[_mjd_to_iso(e) for e in epochs],
+        ra=ra.tolist(),
+        dec=(dec + 1.0 / 3600.0).tolist(),
+        rms_ra=[None] * n,
+        rms_dec=[None] * n,
+        trk_sub=["probe"] * n,
+    )
+
+    results = determine(relabelled, config=ODConfig(force_model=ForceModelTier.APPROXIMATE))
+
+    # The object is accounted for as a failure, never a silent drop and
+    # never a fit against a fallback site.
+    assert "probe" in results.failures
+    failure = results.failures["probe"]
+    assert failure.kind == "unknown_observatory_code"
+    # The message names the offending code and its observation index.
+    assert "ZZZ" in failure.message
+    assert "observation" in failure.message

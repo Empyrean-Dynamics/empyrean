@@ -774,6 +774,95 @@ pub fn download_data(data_dir: Option<&Path>) -> Result<PathBuf> {
     }
 }
 
+/// Which of the three Earth-orientation kernels a coverage check concerns.
+///
+/// The historical and high-precision kernels must cover a band (a floor and
+/// a horizon); the long-term predict kernel is the only one that must reach
+/// the 2125 mandate horizon, and is checked on its end alone. Pass one to
+/// [`earth_orientation_kernel_coverage`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EarthOrientationKernelRole {
+    /// Historical Earth-orientation kernel (`earth_620120_*.bpc`).
+    Historical,
+    /// High-precision measured-EOP kernel (`earth_latest_high_prec.bpc`).
+    HighPrecision,
+    /// Long-term predict kernel (`earth_*_predict.bpc`).
+    Predict,
+}
+
+impl EarthOrientationKernelRole {
+    fn as_ffi(self) -> i32 {
+        match self {
+            Self::Historical => empyrean_sys::EMPYREAN_EARTH_KERNEL_ROLE_HISTORICAL,
+            Self::HighPrecision => empyrean_sys::EMPYREAN_EARTH_KERNEL_ROLE_HIGH_PRECISION,
+            Self::Predict => empyrean_sys::EMPYREAN_EARTH_KERNEL_ROLE_PREDICT,
+        }
+    }
+}
+
+/// One Earth-orientation BPC file's coverage, checked against a kernel role.
+///
+/// Returned by [`earth_orientation_kernel_coverage`]. `satisfied` is the
+/// engine's own per-kernel mandate verdict; the window and required bounds
+/// name exactly what a short file was short of.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EarthOrientationCoverage {
+    /// Start of the file's Earth ITRF93 coverage (MJD TDB).
+    pub start_mjd_tdb: f64,
+    /// End of the file's Earth ITRF93 coverage (MJD TDB).
+    pub end_mjd_tdb: f64,
+    /// Latest start the role allows (MJD TDB); NaN for a role with no
+    /// start-floor requirement (predict).
+    pub required_floor_mjd_tdb: f64,
+    /// Earliest end the role allows (MJD TDB).
+    pub required_horizon_mjd_tdb: f64,
+    /// Whether the file's coverage satisfies the role.
+    pub satisfied: bool,
+}
+
+/// Read one BPC file's Earth-orientation coverage and check it against a
+/// kernel role's mandate, without building a context.
+///
+/// Reuses the engine's own BPC reader and its per-kernel Earth-orientation
+/// mandate — the same reader and requirement the three-Earth-kernel mandate
+/// applies when a context loads — so a kernel file verified here and a
+/// context built from it later agree by construction. A provisioner that
+/// links a file into an Earth-orientation slot can verify the linked file
+/// against the slot's role before declaring the slot provisioned, naming
+/// exactly what a short file was short of rather than discovering it at load.
+///
+/// `Ok` carries the coverage whether or not it [`satisfied`] the role: a
+/// short file is a valid, successful read. An `Err` means the file could not
+/// be read as a BPC, carried no Earth ITRF93 segments, or an argument was
+/// invalid — see [`Error::code`].
+///
+/// [`satisfied`]: EarthOrientationCoverage::satisfied
+pub fn earth_orientation_kernel_coverage(
+    path: &Path,
+    role: EarthOrientationKernelRole,
+) -> Result<EarthOrientationCoverage> {
+    ensure_engine_loaded()?;
+    let c_path = path_to_cstring(path)?;
+    let mut out = empyrean_sys::EmpyreanEarthOrientationCoverage::default();
+    let code = unsafe {
+        empyrean_sys::empyrean_earth_orientation_kernel_coverage(
+            c_path.as_ptr(),
+            role.as_ffi(),
+            &mut out,
+        )
+    };
+    if code != 0 {
+        return Err(Error::capture(code));
+    }
+    Ok(EarthOrientationCoverage {
+        start_mjd_tdb: out.start_mjd_tdb,
+        end_mjd_tdb: out.end_mjd_tdb,
+        required_floor_mjd_tdb: out.required_floor_mjd_tdb,
+        required_horizon_mjd_tdb: out.required_horizon_mjd_tdb,
+        satisfied: out.satisfied != 0,
+    })
+}
+
 impl Drop for Context {
     fn drop(&mut self) {
         unsafe { empyrean_sys::empyrean_context_free(self.raw.as_ptr()) }

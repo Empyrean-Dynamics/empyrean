@@ -55,7 +55,16 @@ from empyrean import (
 )
 from empyrean.coordinates.covariance import CartesianCovariance
 from empyrean.coordinates.enums import Frame
+from empyrean.coordinates.transform import transform_orbits
 from empyrean.observers.observers import Observers
+from empyrean.orbits.joint import (
+    CovarianceKind,
+    JointFunctional,
+    JointProvenance,
+    JointQuality,
+    PackedJoint,
+    PackedJoints,
+)
 from empyrean.propagation.config import (
     AdvancedIntegratorConfig,
     ForceModelTier,
@@ -63,6 +72,38 @@ from empyrean.propagation.config import (
     PropagationConfig,
 )
 from empyrean.propagation.events import EventConfig
+
+
+def _prior_joint(state6: np.ndarray, param_vars: list[float], present_bits: int) -> PackedJoint:
+    """A block-diagonal joint: the 6x6 state block plus one diagonal prior
+    variance per parameter axis (zero cross terms).
+
+    ``present_bits`` masks the P parameter axes beyond the six state axes
+    (bit 0=A1, 1=A2, 2=A3, 3=DT, 4=AMRAT). The whole feature-set covariance —
+    state 6x6 plus the Marsden / AMRAT priors — rides this one joint now.
+    """
+    width = 6 + len(param_vars)
+    full = np.zeros((width, width), dtype=np.float64)
+    full[:6, :6] = np.asarray(state6, dtype=np.float64)
+    for k, v in enumerate(param_vars):
+        full[6 + k, 6 + k] = v
+    tri = [full[i, j] for i in range(width) for j in range(i + 1)]
+    return PackedJoint(
+        layout_present=present_bits,
+        layout_considered=0,
+        layout_marginalized=0,
+        width=width,
+        tri=np.asarray(tri, dtype=np.float64),
+        kind=CovarianceKind.LINEAR,
+        quality=JointQuality.POSITIVE_DEFINITE,
+        cov_rank=0,
+        cov_null_axes=0,
+        cov_min_eig_corr=float("nan"),
+        functional=JointFunctional.STATE,
+        provenance=JointProvenance.DERIVED,
+        asserted_source=None,
+    )
+
 
 # ── Allow-list ───────────────────────────────────────────────────────
 #
@@ -95,15 +136,27 @@ ALLOWED_ALL_NULL: dict[str, str] = {
     "PropagatedStates.non_grav.n": "schema-artifact (input fields on output table)",
     "PropagatedStates.non_grav.k": "schema-artifact (input fields on output table)",
     "PropagatedStates.non_grav.dt": "schema-artifact (input fields on output table)",
-    "PropagatedStates.non_grav.dt_variance": "schema-artifact (input fields on output table)",
-    "PropagatedStates.non_grav.covariance": "schema-artifact (input fields on output table)",
     # SRP is a first-class, additive input force slot (orbits.srp); like the
     # non_grav sub-table above it rides on the CartesianOrbits schema and is
     # not repopulated on a propagation OUTPUT.
     "PropagatedStates.srp": "schema-artifact (input fields on output table)",
     "PropagatedStates.srp.amrat": "schema-artifact (input fields on output table)",
     "PropagatedStates.srp.cr": "schema-artifact (input fields on output table)",
-    "PropagatedStates.srp.amrat_variance": "schema-artifact (input fields on output table)",
+    # ── The one packed joint: the covariance authority on the output states.
+    # It IS populated (a joint-bearing orbit propagates to a joint-bearing
+    # output), so none of its carrier columns are allow-listed — EXCEPT the
+    # two sub-fields that are meaningful only for a tag this positive-definite,
+    # engine-DERIVED joint never carries: ``cov_min_eig_corr`` (the
+    # most-negative correlation-scaled eigenvalue, meaningful only for an
+    # indefinite / repaired joint; NaN on a PD one) and ``asserted_source``
+    # (which external source asserted the joint; None on a derived one). ──
+    "PropagatedStates.covariance.cov_min_eig_corr": "by-design (NaN for a positive-definite joint)",
+    "PropagatedStates.covariance.asserted_source": "by-design (None for a derived joint)",
+    # The ephemeris row's sky packed joint carries the same two tag-only
+    # sub-fields, null for the same reason on a positive-definite, derived
+    # sky joint.
+    "Ephemeris.joint.cov_min_eig_corr": "by-design (NaN for a positive-definite joint)",
+    "Ephemeris.joint.asserted_source": "by-design (None for a derived joint)",
     "PropagatedStates.photometric": "schema-artifact (input fields on output table)",
     "PropagatedStates.photometric.model": "schema-artifact (input fields on output table)",
     "PropagatedStates.photometric.h": "schema-artifact (input fields on output table)",
@@ -135,6 +188,25 @@ ALLOWED_ALL_NULL: dict[str, str] = {
     # The Hessian stays: it is genuinely Jet2-only and null for the
     # first-order fixture. ──
     "ObservationSensitivities.hessian": "by-design (Jet2 method only)",
+    # ── Pre-retention Gaussian-mixture tallies: populated only on a mixture
+    # covariance, and no fixture splits into a mixture at the current engine
+    # pin, so these ride every covariance-bearing row as absent (null) here.
+    # They are a real, populated surface when a close approach splits — NOT a
+    # silent drop — proven structurally by the C/wrapper unit tests. ──
+    "StateSensitivities.mix_n_components_total": "by-design (no mixture at this engine pin)",
+    "StateSensitivities.mix_weight_delivered": "by-design (no mixture at this engine pin)",
+    "StateSensitivities.mix_n_failed": "by-design (no mixture at this engine pin)",
+    "StateSensitivities.mix_n_unresolved": "by-design (no mixture at this engine pin)",
+    "StateSensitivities.mix_n_curvature_refused": "by-design (no mixture at this engine pin)",
+    "StateSensitivities.mix_n_sky_linearization_refused": (
+        "by-design (no mixture at this engine pin)"
+    ),
+    "Ephemeris.mix_n_components_total": "by-design (no mixture at this engine pin)",
+    "Ephemeris.mix_weight_delivered": "by-design (no mixture at this engine pin)",
+    "Ephemeris.mix_n_failed": "by-design (no mixture at this engine pin)",
+    "Ephemeris.mix_n_unresolved": "by-design (no mixture at this engine pin)",
+    "Ephemeris.mix_n_curvature_refused": "by-design (no mixture at this engine pin)",
+    "Ephemeris.mix_n_sky_linearization_refused": "by-design (no mixture at this engine pin)",
     # ── Impact probabilities: by-design when method != MonteCarlo ──
     "ImpactProbabilities.mc_n_samples": "by-design (MC method only)",
     "ImpactProbabilities.mc_n_impacts": "by-design (MC method only)",
@@ -177,6 +249,16 @@ ALLOWED_ALL_NULL: dict[str, str] = {
     "PossibleImpacts.nonlinearity": "by-design (Jet2 method only)",
     "PossibleImpacts.ip_agm": "by-design (AGM method only)",
     "PossibleImpacts.ip_mc": "by-design (MonteCarlo method only)",
+    # ── PlanMetrics: the withheld sampled-transport kind is null whenever
+    # log_det is delivered, which is always on this seam — it runs the
+    # single-linearization (Linear) fold, so log_det_withheld is "none" and
+    # no sampled method applies. The column carries a kind ONLY under a
+    # SAMPLED_MOMENT withholding, which this planning entry point never
+    # produces. (log_det_withheld itself is non-nullable and always "none"
+    # here, so it is not — and must not be — listed.) ──
+    "PlanMetrics.log_det_withheld_method": (
+        "by-design (sampled transport only; this seam runs Linear)"
+    ),
 }
 
 
@@ -205,8 +287,6 @@ def _full_feature_orbit() -> CartesianOrbits:
     real wiring gap.
     """
     s = APOPHIS_STATE
-    cov_matrix = np.diag([1e-16, 1e-16, 1e-16, 1e-20, 1e-20, 1e-20])[None, :, :]
-    covariance = CartesianCovariance.from_matrix(cov_matrix)
     coords = CartesianCoordinates.from_kwargs(
         epoch=[s["epoch"]],
         x=[s["x"]],
@@ -215,23 +295,23 @@ def _full_feature_orbit() -> CartesianOrbits:
         vx=[s["vx"]],
         vy=[s["vy"]],
         vz=[s["vz"]],
-        covariance=covariance,
         frame="ecliptic_j2000",
         origin=[str(Origin.SUN)],
     )
-    # Fitted non-grav 3x3 (A1, A2, A3) covariance, row-major flattened, so the
-    # full-feature input exercises the ng_covariance marshal channel too (the
-    # OD-output field the forward-model paths historically dropped). The A
-    # coefficients are zero here, so this covariance is inert on the output
-    # (it only inflates the propagated covariance when the non-grav force term
-    # is active) — the load-bearing DIFFERENCE check lives in
-    # test_ng_covariance_reaches_propagated_covariance with an active fixture.
+    # The whole feature-set covariance rides one packed joint now: the state
+    # 6x6 plus the fitted Marsden (A1, A2, A3) prior on the joint's Marsden
+    # axes (bits 0/1/2). The A coefficients are zero here, so this covariance
+    # is inert on the output (it only inflates the propagated covariance when
+    # the non-grav force term is active) — the load-bearing DIFFERENCE check
+    # lives in test_ng_covariance_reaches_propagated_covariance with an active
+    # fixture.
+    state6 = np.diag([1e-16, 1e-16, 1e-16, 1e-20, 1e-20, 1e-20])
+    joint = _prior_joint(state6, [1e-20, 1e-20, 1e-20], present_bits=0b111)
     non_grav = NonGravParams.from_kwargs(
         a1=[0.0],
         a2=[0.0],
         a3=[0.0],
         model=["inverse_square"],
-        covariance=[np.diag([1e-20, 1e-20, 1e-20]).reshape(9).tolist()],
     )
     # Photometric 3x3 over (H, G, unused), row-major flattened, so the
     # full-feature input exercises the phot_covariance marshal channel too
@@ -250,21 +330,18 @@ def _full_feature_orbit() -> CartesianOrbits:
         coordinates=coords,
         non_grav=non_grav,
         photometric=photometric,
+        covariance=PackedJoints.from_joints([joint]),
     )
 
 
 def _wide_layout_orbit() -> CartesianOrbits:
     """:func:`_full_feature_orbit` plus an SRP slot with an AMRAT prior.
 
-    The fourth solved axis, and what widens the layout past the
-    state+Marsden ``9x9``. A Marsden-only orbit's cross terms fit
-    entirely inside the ``6x3`` border on ``non_grav``, so the
-    ``wide_cross`` columns have no input at all from
-    :func:`_full_feature_orbit` — they would read as a silent drop when
-    they are really an unexercised channel. AMRAT is the cheapest axis
-    that opens them: the SRP slot is additive with the Marsden block, and
-    the state-AMRAT column plus the ``A_i``-AMRAT pairs have no home but
-    the carrier.
+    The fourth solved axis, and what widens the joint past the
+    state+Marsden ``9x9`` to a ``10x10``: the AMRAT prior rides the joint's
+    AMRAT axis (bit 4) beside the state block and the Marsden A1/A2/A3 block.
+    The SRP slot is additive with the Marsden block, so this exercises the
+    widest joint layout the feature set reaches on a propagation output.
 
     Kept separate from :func:`_full_feature_orbit` rather than folded
     into it, because an AMRAT prior is not free elsewhere: the
@@ -275,9 +352,10 @@ def _wide_layout_orbit() -> CartesianOrbits:
     with a ~10% prior sigma.
     """
     orbits = _full_feature_orbit()
-    return orbits.set_column(
-        "srp",
-        SRPParams.from_kwargs(amrat=[4.0e-6], cr=[1.0], amrat_variance=[1.6e-13]),
+    state6 = np.diag([1e-16, 1e-16, 1e-16, 1e-20, 1e-20, 1e-20])
+    joint = _prior_joint(state6, [1e-20, 1e-20, 1e-20, 1.6e-13], present_bits=0b111 | (1 << 4))
+    return orbits.set_column("srp", SRPParams.from_kwargs(amrat=[4.0e-6], cr=[1.0])).set_column(
+        "covariance", PackedJoints.from_joints([joint])
     )
 
 
@@ -1135,7 +1213,6 @@ def _non_grav_solved_orbit(with_cov: bool) -> CartesianOrbits:
     engine.
     """
     s = APOPHIS_STATE
-    cov_matrix = np.diag([1e-16, 1e-16, 1e-16, 1e-20, 1e-20, 1e-20])[None, :, :]
     coords = CartesianCoordinates.from_kwargs(
         epoch=[s["epoch"]],
         x=[s["x"]],
@@ -1144,25 +1221,31 @@ def _non_grav_solved_orbit(with_cov: bool) -> CartesianOrbits:
         vx=[s["vx"]],
         vy=[s["vy"]],
         vz=[s["vz"]],
-        covariance=CartesianCovariance.from_matrix(cov_matrix),
         frame="ecliptic_j2000",
         origin=[str(Origin.SUN)],
     )
-    ng_kwargs: dict[str, object] = {
-        "a1": [0.0],
-        "a2": [1.0e-14],  # transverse Yarkovsky (AU/day^2) — activates the non-grav term
-        "a3": [0.0],
-        "model": ["inverse_square"],
-    }
+    non_grav = NonGravParams.from_kwargs(
+        a1=[0.0],
+        a2=[1.0e-14],  # transverse Yarkovsky (AU/day^2) — activates the non-grav term
+        a3=[0.0],
+        model=["inverse_square"],
+    )
+    state6 = np.diag([1e-16, 1e-16, 1e-16, 1e-20, 1e-20, 1e-20])
     if with_cov:
-        # Fitted (A1, A2, A3) covariance, row-major flattened (9 values).
-        ng_kwargs["covariance"] = [np.diag([1.0e-20, 1.0e-20, 1.0e-20]).reshape(9).tolist()]
-    non_grav = NonGravParams.from_kwargs(**ng_kwargs)
+        # The fitted (A1, A2, A3) prior rides the joint's Marsden axes
+        # (a width-9 state+Marsden joint).
+        joint = _prior_joint(state6, [1.0e-20, 1.0e-20, 1.0e-20], present_bits=0b111)
+    else:
+        # Byte-identical state prior, no Marsden covariance: a width-6
+        # state-only joint, so any difference in the propagated covariance is
+        # attributable solely to the Marsden prior reaching the engine.
+        joint = _prior_joint(state6, [], present_bits=0)
     return CartesianOrbits.from_kwargs(
         orbit_id=["NG_COV_TEST"],
         object_id=["99942 Apophis"],
         coordinates=coords,
         non_grav=non_grav,
+        covariance=PackedJoints.from_joints([joint]),
     )
 
 
@@ -1287,18 +1370,13 @@ def _plan_orbit_barycentric() -> CartesianOrbits:
     """Apophis with a covariance, shifted to the barycentric basis the
     planner evaluates in.
 
-    Derived from :data:`APOPHIS_STATE` through
-    :func:`transform_coordinates` so the two fixtures cannot drift; the
-    origin shift is a pure translation, so the covariance carries over
-    unchanged.
+    Derived from :func:`_full_feature_orbit` through
+    :func:`transform_orbits` (the covariance-bearing transform) so the two
+    fixtures cannot drift; the origin shift is a pure translation, so the
+    packed joint carries over unchanged.
     """
-    orbits = _full_feature_orbit()
-    coords = transform_coordinates(orbits.coordinates, CartesianCoordinates, origin="SSB")
-    return CartesianOrbits.from_kwargs(
-        orbit_id=["PLAN_TEST"],
-        object_id=["forcing_test_obj"],
-        coordinates=coords,
-    )
+    orbits = transform_orbits(_full_feature_orbit(), CartesianOrbits, origin=Origin.SSB)
+    return orbits.set_column("orbit_id", pa.array(["PLAN_TEST"], type=pa.large_string()))
 
 
 def _plan_candidates() -> list[PlannedObservation]:
@@ -1354,8 +1432,9 @@ def test_plan_subtables_coverage_is_complete() -> None:
         # `from __future__ import annotations` makes these strings.
         return t if isinstance(t, str) else getattr(t, "__name__", str(t))
 
-    # The two labels (orbit_id, active_width) are scalars, not tables.
-    scalars = {"orbit_id", "active_width"}
+    # The scalar labels (orbit_id, active_width, log_det_gain, resolved_method)
+    # are not tables.
+    scalars = {"orbit_id", "active_width", "log_det_gain", "resolved_method"}
     declared = {
         name: class_name(t)
         for name, t in _planmod.PlanResult.__annotations__.items()
@@ -1456,14 +1535,20 @@ def _photometric_orbit(phot_cov: np.ndarray | None) -> CartesianOrbits:
         frame=coords.frame,
         origin=coords.origin,
     )
-    return orbits.set_column("coordinates", stripped).set_column(
-        "photometric",
-        PhotometricParams.from_kwargs(
-            model=["hg"],
-            h=[19.7],
-            g=[0.15],
-            covariance=[None if phot_cov is None else phot_cov.reshape(9).tolist()],
-        ),
+    return (
+        orbits.set_column("coordinates", stripped)
+        # Clear the packed joint too, so there is no state covariance at all
+        # and ``mag_sigma`` isolates the sigma_photo term.
+        .set_column("covariance", PackedJoints.from_joints([None]))
+        .set_column(
+            "photometric",
+            PhotometricParams.from_kwargs(
+                model=["hg"],
+                h=[19.7],
+                g=[0.15],
+                covariance=[None if phot_cov is None else phot_cov.reshape(9).tolist()],
+            ),
+        )
     )
 
 

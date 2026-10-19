@@ -20,6 +20,87 @@ pub enum SigmaPolicy {
     Floor,
 }
 
+/// The observation-error **law** — the shape axis of the error model.
+///
+/// [`Gaussian`](Self::Gaussian) is the default, under which the fit is
+/// bit-identical to the pre-noise-model engine: no iteratively-reweighted
+/// least-squares pass runs and every per-row `robust_weight` is `1.0`.
+/// [`StudentT`](Self::StudentT) is the heavy-tailed law fitted by
+/// iteratively-reweighted least squares — a residual at squared distance
+/// \\(\delta^2\\) carries robust weight \\(\nu/(\nu+\delta^2) \in (0,1]\\),
+/// so a large residual is down-weighted rather than removed, and is best
+/// paired with [`RejectionKind::Blunder`](super::rejection::RejectionKind::Blunder).
+///
+/// \\(\nu \le 2\\) has no finite variance and is refused by the engine at
+/// the FFI boundary; a stray `nu` on [`Gaussian`](Self::Gaussian) is
+/// likewise refused rather than dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum NoiseModel {
+    /// The classical Gaussian (normal) error law. Default.
+    #[default]
+    Gaussian,
+    /// A Student-t error law with \\(\nu > 2\\) degrees of freedom.
+    StudentT {
+        /// Degrees of freedom \\(\nu > 2\\).
+        nu: f64,
+    },
+    /// A per-station-night latent-scale mixture with \\(\nu > 2\\). Accepted
+    /// by the config surface so the type is stable, but a fit configured
+    /// with it is refused by the engine at fit time (its calibration is
+    /// downstream work) — use [`StudentT`](Self::StudentT) with the nightly
+    /// de-weighting layer until then.
+    NightScale {
+        /// Degrees of freedom \\(\nu > 2\\).
+        nu: f64,
+    },
+}
+
+impl NoiseModel {
+    /// Pack into the C-ABI tagged value. The Gaussian law carries no ν
+    /// (0.0, which the engine reads as unset).
+    pub(crate) fn to_ffi(self) -> empyrean_sys::EmpyreanNoiseModel {
+        let (tag, nu) = match self {
+            NoiseModel::Gaussian => (empyrean_sys::EMPYREAN_NOISE_MODEL_GAUSSIAN as u8, 0.0),
+            NoiseModel::StudentT { nu } => (empyrean_sys::EMPYREAN_NOISE_MODEL_STUDENT_T as u8, nu),
+            NoiseModel::NightScale { nu } => {
+                (empyrean_sys::EMPYREAN_NOISE_MODEL_NIGHT_SCALE as u8, nu)
+            }
+        };
+        empyrean_sys::EmpyreanNoiseModel { tag, nu }
+    }
+}
+
+/// Which information matrix the fit inverts for the posterior covariance
+/// under a non-Gaussian [`NoiseModel`]. Both reduce to the Gauss–Newton
+/// normal matrix under [`NoiseModel::Gaussian`], so this only bites for a
+/// heavy-tailed law.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CovarianceInformation {
+    /// **Observed** information — the negative Hessian of the robust
+    /// log-likelihood at the solution (Efron & Hinkley 1978); the default.
+    /// Conditions on which rows this fit down-weighted; can be
+    /// non-positive-definite, which the engine refuses by name.
+    #[default]
+    Observed,
+    /// **Expected** (Fisher) information — a scalar multiple of the Gaussian
+    /// normal matrix, always positive definite when that is, but blind to
+    /// which rows were down-weighted.
+    Expected,
+}
+
+impl CovarianceInformation {
+    pub(super) fn to_ffi(self) -> u8 {
+        match self {
+            CovarianceInformation::Observed => {
+                empyrean_sys::EMPYREAN_COVARIANCE_INFORMATION_OBSERVED as u8
+            }
+            CovarianceInformation::Expected => {
+                empyrean_sys::EMPYREAN_COVARIANCE_INFORMATION_EXPECTED as u8
+            }
+        }
+    }
+}
+
 /// One element of the weighting pipeline.
 #[derive(Debug, Clone, PartialEq)]
 pub enum WeightingLayer {
@@ -36,6 +117,10 @@ pub enum WeightingLayer {
         end_epoch_mjd_tdb: Option<f64>,
         /// Scale factor on the final weight. Default 1.0.
         scale: f64,
+        /// Per-station error **law**, or `None` to inherit the global
+        /// [`WeightingConfig::noise_model`]. Resolved by first match on
+        /// `obs_code` + time range, on a pass separate from σ resolution.
+        noise_model: Option<NoiseModel>,
     },
     /// Down-weight correlated observations from the same observing
     /// night (same station within `max_gap_days`).
@@ -60,7 +145,7 @@ pub enum WeightingPreset {
     #[default]
     VFCC2017,
     /// NEODyS production preset.
-    Neodys,
+    NEODYS,
 }
 
 /// Observation weighting pipeline.
@@ -90,6 +175,16 @@ pub struct WeightingConfig {
     /// keep the production per-night 1/√N de-weighting. At most one
     /// nightly layer is accepted per chain.
     pub additional_layers: Vec<WeightingLayer>,
+    /// The global observation-error **law** for every row a per-station
+    /// [`WeightingLayer::ObservatoryRule`] does not override. Default
+    /// [`NoiseModel::Gaussian`], under which the fit is bit-identical to the
+    /// pre-noise-model engine.
+    pub noise_model: NoiseModel,
+    /// Which information matrix the fit inverts for the posterior covariance
+    /// under a non-Gaussian [`noise_model`](Self::noise_model). Default
+    /// [`CovarianceInformation::Observed`]; irrelevant under the Gaussian
+    /// law.
+    pub covariance_information: CovarianceInformation,
 }
 
 impl Default for WeightingConfig {
@@ -107,6 +202,8 @@ impl Default for WeightingConfig {
             default_sigma_arcsec: 1.0,
             sigma_policy: None,
             additional_layers: vec![WeightingLayer::NightlyDeweighting { max_gap_days: 0.5 }],
+            noise_model: NoiseModel::Gaussian,
+            covariance_information: CovarianceInformation::Observed,
         }
     }
 }
@@ -135,6 +232,8 @@ pub(super) fn weighting_layer_to_ffi(
         end_epoch_mjd_tdb: f64::NAN,
         scale: 0.0,
         max_gap_days: 0.0,
+        has_noise_model: 0,
+        noise_model: NoiseModel::Gaussian.to_ffi(),
     };
     match layer {
         WeightingLayer::ObservatoryRule {
@@ -143,6 +242,7 @@ pub(super) fn weighting_layer_to_ffi(
             start_epoch_mjd_tdb,
             end_epoch_mjd_tdb,
             scale,
+            noise_model,
         } => {
             let bytes = obs_code.as_bytes();
             if bytes.len() > 4 {
@@ -172,6 +272,13 @@ pub(super) fn weighting_layer_to_ffi(
             ffi.start_epoch_mjd_tdb = start_epoch_mjd_tdb.unwrap_or(f64::NAN);
             ffi.end_epoch_mjd_tdb = end_epoch_mjd_tdb.unwrap_or(f64::NAN);
             ffi.scale = *scale;
+            // Per-station error law: a presence flag guards it so a rule
+            // that sets no law INHERITS the global one rather than forcing
+            // Gaussian on its station.
+            if let Some(nm) = noise_model {
+                ffi.has_noise_model = 1;
+                ffi.noise_model = nm.to_ffi();
+            }
         }
         WeightingLayer::NightlyDeweighting { max_gap_days } => {
             ffi.kind = empyrean_sys::EMPYREAN_WEIGHTING_LAYER_NIGHTLY_DEWEIGHTING as i32;
@@ -179,4 +286,99 @@ pub(super) fn weighting_layer_to_ffi(
         }
     }
     Ok(ffi)
+}
+
+#[cfg(test)]
+mod weighting_default_tests {
+    use super::{WeightingConfig, WeightingLayer, WeightingPreset};
+
+    /// The wrapper's OD weighting default mirrors the production default the C
+    /// surface reports: VFCC2017 station floors WITH a nightly-deweighting
+    /// layer, enabled, a 1″ fallback σ.
+    ///
+    /// The wrapper has no engine access, so this is a wrapper-vs-C comparison
+    /// rather than wrapper-vs-engine: it pins the wrapper-side default against
+    /// the same production default the C ruling test pins engine-side (that
+    /// test compares the C preset default against
+    /// `empyrean_core::determination::WeightingConfig::default()`). The two
+    /// must agree, or `determine()` diverges from the direct-engine path on
+    /// same-night / same-station observation clusters.
+    #[test]
+    fn the_default_weighting_mirrors_the_production_default() {
+        let d = WeightingConfig::default();
+        assert!(d.enabled, "weighting is on by default");
+        assert_eq!(d.preset, WeightingPreset::VFCC2017);
+        assert_eq!(d.default_sigma_arcsec, 1.0);
+        assert_eq!(
+            d.additional_layers,
+            vec![WeightingLayer::NightlyDeweighting { max_gap_days: 0.5 }],
+            "production chains nightly de-weighting on top of the preset"
+        );
+    }
+}
+
+#[cfg(test)]
+mod noise_model_tests {
+    use super::*;
+
+    #[test]
+    fn noise_model_packs_tag_and_nu() {
+        let g = NoiseModel::Gaussian.to_ffi();
+        assert_eq!(g.tag as u32, empyrean_sys::EMPYREAN_NOISE_MODEL_GAUSSIAN);
+        assert_eq!(g.nu, 0.0, "the Gaussian law carries no nu");
+
+        let t = NoiseModel::StudentT { nu: 4.0 }.to_ffi();
+        assert_eq!(t.tag as u32, empyrean_sys::EMPYREAN_NOISE_MODEL_STUDENT_T);
+        assert_eq!(t.nu, 4.0);
+
+        let n = NoiseModel::NightScale { nu: 6.0 }.to_ffi();
+        assert_eq!(n.tag as u32, empyrean_sys::EMPYREAN_NOISE_MODEL_NIGHT_SCALE);
+        assert_eq!(n.nu, 6.0);
+    }
+
+    #[test]
+    fn covariance_information_packs_its_selector() {
+        assert_eq!(
+            CovarianceInformation::Observed.to_ffi() as u32,
+            empyrean_sys::EMPYREAN_COVARIANCE_INFORMATION_OBSERVED
+        );
+        assert_eq!(
+            CovarianceInformation::Expected.to_ffi() as u32,
+            empyrean_sys::EMPYREAN_COVARIANCE_INFORMATION_EXPECTED
+        );
+    }
+
+    #[test]
+    fn a_law_only_station_rule_sets_the_presence_flag() {
+        let layer = WeightingLayer::ObservatoryRule {
+            obs_code: "F51".to_string(),
+            sigma: [0.2, 0.2],
+            start_epoch_mjd_tdb: None,
+            end_epoch_mjd_tdb: None,
+            scale: 1.0,
+            noise_model: Some(NoiseModel::StudentT { nu: 4.0 }),
+        };
+        let ffi = weighting_layer_to_ffi(0, &layer).unwrap();
+        assert_eq!(ffi.has_noise_model, 1);
+        assert_eq!(
+            ffi.noise_model.tag as u32,
+            empyrean_sys::EMPYREAN_NOISE_MODEL_STUDENT_T
+        );
+        assert_eq!(ffi.noise_model.nu, 4.0);
+
+        // A rule with no per-station law inherits the global one: the
+        // presence flag stays 0 rather than forcing Gaussian.
+        let inherit = WeightingLayer::ObservatoryRule {
+            obs_code: "F51".to_string(),
+            sigma: [0.2, 0.2],
+            start_epoch_mjd_tdb: None,
+            end_epoch_mjd_tdb: None,
+            scale: 1.0,
+            noise_model: None,
+        };
+        assert_eq!(
+            weighting_layer_to_ffi(0, &inherit).unwrap().has_noise_model,
+            0
+        );
+    }
 }

@@ -35,6 +35,7 @@ from empyrean import (
     STAGE_POSTERIOR,
     STAGE_PRIOR,
     CartesianOrbits,
+    LogDetWithheld,
     ObservatoryConfig,
     PlanCandidates,
     PlanEphemeris,
@@ -48,6 +49,16 @@ from empyrean import (
 )
 from empyrean.coordinates.coordinates import CartesianCoordinates
 from empyrean.coordinates.covariance import CartesianCovariance
+from empyrean.coordinates.transform import transform_orbits
+from empyrean.orbits.joint import (
+    CovarianceKind,
+    JointFunctional,
+    JointProvenance,
+    JointQuality,
+    PackedJoint,
+    PackedJoints,
+)
+from empyrean.planning.plan import _metrics_table
 from empyrean.planning.result import (
     _INT_TO_KIND,
     _INT_TO_RADAR_MODE,
@@ -86,8 +97,8 @@ EXPECTED_COLUMNS = [
 ]
 
 # The PlanMetrics schema, in order. `stage` labels which end of the
-# campaign a row describes; the other five mirror
-# EmpyreanCovarianceMetrics.
+# campaign a row describes; the rest mirror EmpyreanCovarianceMetrics —
+# the five summary scalars plus the log-det delivered/withheld contract.
 EXPECTED_METRIC_COLUMNS = [
     "stage",
     "position_sigma_km",
@@ -95,6 +106,8 @@ EXPECTED_METRIC_COLUMNS = [
     "semi_major_km",
     "semi_minor_km",
     "log_det",
+    "log_det_withheld",
+    "log_det_withheld_method",
 ]
 
 # Apophis state at MJD 61000 TDB, shifted to the barycentric ecliptic
@@ -243,24 +256,31 @@ def test_planning_config_default_lowering_is_a_no_op():
     assert wire["num_threads"] == -1, f"num_threads=0 must lower to -1, got {wire['num_threads']}"
 
 
-def test_config_knobs_the_planner_never_reads_are_refused_at_construction():
+def test_config_knobs_evaluate_plan_never_reads_are_refused_at_its_call():
     """``observatories`` and ``num_threads`` ride the shared planning
-    config but are unread on this entry point.
+    config but are unread by ``evaluate_plan``.
 
-    Accepting either silently would be a dead knob carried across three
-    layers, so both are rejected with a message naming the field and the
+    Since ``compute_visibility`` **does** read the observatories (they
+    carry its gates and twilight thresholds), a config carrying them is
+    valid to CONSTRUCT — the refusal is specific to ``evaluate_plan`` and
+    fires at its call, with a message naming the field and the
     alternative. Delete the matching arm in
-    ``PlanningConfig._reject_unread_knobs`` — and the field's doc caveat
-    — if a release ever wires one of them through.
+    ``PlanningConfig._reject_unread_knobs`` if a release ever wires one of
+    them through evaluate_plan too.
     """
+    orbit = _plan_orbit()
+    planned = [PlannedObservation.optical(_EPOCH_MJD_TDB + 10.0, "F51", (0.2, 0.2))]
+
+    # Construction no longer refuses observatories — compute_visibility reads them.
+    cfg = PlanningConfig(observatories=[_observatory()])
     with pytest.raises(ValueError) as exc:
-        PlanningConfig(observatories=[_observatory()])
+        evaluate_plan(orbit, planned, cfg)
     message = str(exc.value)
     assert "observatories" in message, message
     assert "PlannedObservation" in message, f"the refusal must name the alternative: {message}"
 
     with pytest.raises(ValueError, match="num_threads"):
-        PlanningConfig(num_threads=4)
+        evaluate_plan(orbit, planned, PlanningConfig(num_threads=4))
 
 
 def test_unread_config_knobs_set_after_construction_are_still_refused_as_valueerror():
@@ -355,6 +375,13 @@ def test_observatory_config_lowering_covers_every_dataclass_field():
             min_elongation_deg=45.0,
             min_elevation_deg=30.0,
             max_sun_altitude_deg=-12.0,
+            # The night-product fields (0.11.0) must reach the wire too. The
+            # four thresholds are all-or-nothing and must strictly descend.
+            sunset_sun_altitude_deg=-0.833,
+            civil_twilight_sun_altitude_deg=-6.0,
+            nautical_twilight_sun_altitude_deg=-12.0,
+            astronomical_twilight_sun_altitude_deg=-18.0,
+            explicit_anchor_utc_mjd_tdb=61000.5,
         )._to_wire_dict()
     )
     missing = declared - lowered
@@ -497,6 +524,68 @@ def test_plan_metrics_schema_is_pinned():
     )
 
 
+def _metrics_out(
+    prior_withheld: int,
+    prior_method: int,
+    post_withheld: int,
+    post_method: int,
+) -> dict[str, object]:
+    """A minimal binding output dict feeding ``_metrics_table`` — the two
+    metric blocks with a chosen log-det contract per stage. A non-zero
+    withheld code carries a NaN value, mirroring the binding."""
+    out: dict[str, object] = {}
+    for prefix, wh, meth in (
+        ("prior_", prior_withheld, prior_method),
+        ("posterior_", post_withheld, post_method),
+    ):
+        out[f"{prefix}position_sigma_km"] = 25.0
+        out[f"{prefix}velocity_sigma_m_s"] = 3.0e-3
+        out[f"{prefix}semi_major_km"] = 15.0
+        out[f"{prefix}semi_minor_km"] = 0.7
+        out[f"{prefix}log_det"] = float("nan") if wh != 0 else -221.0
+        out[f"{prefix}log_det_withheld"] = wh
+        out[f"{prefix}log_det_withheld_method"] = meth
+    return out
+
+
+def test_metrics_table_decodes_the_log_det_contract():
+    """A delivered metric carries a finite ``log_det`` and the ``"none"``
+    reason; a metric past a second-order transport carries a NaN AND the
+    ``SECOND_ORDER_MOMENT`` reason — the pair, never a NaN without it."""
+    # prior delivered (code 0), posterior withheld under second-order (1).
+    metrics = _metrics_table(_metrics_out(0, -1, 1, -1))
+    prior = metrics.prior()
+    posterior = metrics.posterior()
+
+    assert prior.log_det_withheld[0].as_py() == LogDetWithheld.NONE.value == "none"
+    assert np.isfinite(prior.log_det[0].as_py())
+    assert prior.log_det_withheld_method[0].as_py() is None
+
+    assert np.isnan(posterior.log_det[0].as_py())
+    assert (
+        posterior.log_det_withheld[0].as_py()
+        == LogDetWithheld.SECOND_ORDER_MOMENT.value
+        == "second_order_moment"
+    )
+    assert posterior.log_det_withheld_method[0].as_py() is None
+
+
+def test_metrics_table_names_the_sampled_transport_kind():
+    """A ``SAMPLED_MOMENT`` reason rides with the sampled kind in the
+    CovarianceKind vocabulary (code 5 = sigma_point)."""
+    metrics = _metrics_table(_metrics_out(0, -1, 2, 5))
+    posterior = metrics.posterior()
+    assert posterior.log_det_withheld[0].as_py() == LogDetWithheld.SAMPLED_MOMENT.value
+    assert posterior.log_det_withheld_method[0].as_py() == "sigma_point"
+
+
+def test_metrics_table_refuses_an_unknown_withheld_code():
+    """An unrecognized reason is refused by name, never coerced to
+    'delivered' — which would read a NaN as a real log-det."""
+    with pytest.raises(RuntimeError, match="withheld"):
+        _metrics_table(_metrics_out(0, -1, 9, -1))
+
+
 def test_plan_metrics_stage_helpers_filter_by_label():
     metrics = PlanMetrics.from_kwargs(
         stage=[STAGE_PRIOR, STAGE_POSTERIOR],
@@ -505,6 +594,7 @@ def test_plan_metrics_stage_helpers_filter_by_label():
         semi_major_km=[15.0, 14.9],
         semi_minor_km=[15.0, 0.7],
         log_det=[-221.0, -238.0],
+        log_det_withheld=["none", "none"],
     )
     assert metrics.prior().position_sigma_km[0].as_py() == 25.0
     assert metrics.posterior().position_sigma_km[0].as_py() == 16.0
@@ -681,6 +771,34 @@ def test_plan_round_trip_populates_every_block(plan):
     )
     assert posterior.log_det[0].as_py() <= prior.log_det[0].as_py(), (
         f"posterior log_det {posterior.log_det[0].as_py()} exceeds prior {prior.log_det[0].as_py()}"
+    )
+
+
+@pytest.mark.validation
+def test_log_det_is_delivered_and_the_gain_is_finite(plan):
+    """This seam runs the single-linearization (Linear) fold, so both
+    metric rows DELIVER log_det (finite) and name no withheld reason — the
+    delivered half of the complementary pair. The epoch-invariant gain
+    rides the result and is finite regardless."""
+    prior = plan.metrics.prior()
+    posterior = plan.metrics.posterior()
+    for label, row in (("prior", prior), ("posterior", posterior)):
+        assert row.log_det_withheld[0].as_py() == "none", (
+            f"{label}: the Linear fold delivers log_det, so the withheld "
+            f"reason must be 'none', got {row.log_det_withheld[0].as_py()!r}"
+        )
+        assert np.isfinite(row.log_det[0].as_py()), (
+            f"{label}: a delivered log_det is a real number, got {row.log_det[0].as_py()}"
+        )
+        # Delivered ⇔ no sampled method applies.
+        assert row.log_det_withheld_method[0].as_py() is None, (
+            f"{label}: a delivered metric names no sampled method"
+        )
+    # The whole-plan information gain is epoch-invariant and finite, and
+    # negative because the candidates shrink the covariance volume.
+    assert np.isfinite(plan.log_det_gain), plan.log_det_gain
+    assert plan.log_det_gain < 0.0, (
+        f"folding observations shrinks the volume, so the gain is negative: {plan.log_det_gain}"
     )
 
 
@@ -1132,12 +1250,31 @@ def test_planned_columns_map_covers_the_whole_wire_dict():
 # ── Input basis ──────────────────────────────────────────────────────
 
 
-def _reexpress(orbit, target_type, **kwargs):
-    """Re-express the fixture orbit in another representation, keeping
-    its covariance."""
-    from empyrean import transform_coordinates
+def _state_joint(cov6: np.ndarray) -> PackedJoint:
+    """A width-6 derived state joint whose state block is ``cov6`` (6x6)."""
+    tri = [cov6[i, j] for i in range(6) for j in range(i + 1)]
+    return PackedJoint(
+        layout_present=0,
+        layout_considered=0,
+        layout_marginalized=0,
+        width=6,
+        tri=np.asarray(tri, dtype=np.float64),
+        kind=CovarianceKind.LINEAR,
+        quality=JointQuality.POSITIVE_DEFINITE,
+        cov_rank=0,
+        cov_null_axes=0,
+        cov_min_eig_corr=float("nan"),
+        functional=JointFunctional.STATE,
+        provenance=JointProvenance.DERIVED,
+        asserted_source=None,
+    )
 
-    return transform_coordinates(orbit.coordinates, target_type, **kwargs)
+
+def _plan_orbit_with_joint() -> CartesianOrbits:
+    """:func:`_plan_orbit` carrying a width-6 state joint — the covariance
+    authority ``transform_orbits`` transports to a non-Cartesian basis."""
+    cov6 = np.diag([1e-14, 1e-14, 1e-14, 1e-18, 1e-18, 1e-18])
+    return _plan_orbit().set_column("covariance", PackedJoints.from_joints([_state_joint(cov6)]))
 
 
 @pytest.mark.parametrize("target", ["cometary", "keplerian"])
@@ -1150,26 +1287,17 @@ def test_evaluate_plan_refuses_a_non_cartesian_orbit(target):
     positions and 3-5 as AU/day velocities regardless. A cometary
     covariance therefore produced plausible finite numbers that meant
     nothing — the worst failure shape, since no exception ever surfaced.
+
+    The covariance rides the orbit's packed joint, so a non-Cartesian
+    covariance-bearing orbit is built via :func:`transform_orbits` (the
+    covariance-bearing transform) — and the guard must still refuse it.
     """
     from empyrean import CometaryOrbits, KeplerianOrbits
-    from empyrean.coordinates.coordinates import (
-        CometaryCoordinates,
-        KeplerianCoordinates,
-    )
 
-    cartesian = _plan_orbit()
-    if target == "cometary":
-        coords = _reexpress(cartesian, CometaryCoordinates)
-        orbit = CometaryOrbits.from_kwargs(
-            orbit_id=cartesian.orbit_id, object_id=cartesian.object_id, coordinates=coords
-        )
-    else:
-        coords = _reexpress(cartesian, KeplerianCoordinates)
-        orbit = KeplerianOrbits.from_kwargs(
-            orbit_id=cartesian.orbit_id, object_id=cartesian.object_id, coordinates=coords
-        )
+    orbit_cls = CometaryOrbits if target == "cometary" else KeplerianOrbits
+    orbit = transform_orbits(_plan_orbit_with_joint(), orbit_cls)
 
-    assert coords.covariance is not None, "fixture must keep its covariance"
+    assert not orbit.covariance.row_is_empty(0), "fixture must keep its covariance"
     with pytest.raises(ValueError) as exc:
         evaluate_plan(orbit, _full_plan())
     message = str(exc.value)

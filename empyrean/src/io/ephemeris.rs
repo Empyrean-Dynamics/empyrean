@@ -24,8 +24,17 @@ fn ephemeris_to_ffi_array(
             keep.push(id_c);
             let mut obs_code = [0u8; 4];
             let bytes = e.obs_code.as_bytes();
-            let n = bytes.len().min(3);
-            obs_code[..n].copy_from_slice(&bytes[..n]);
+            // Full 4-byte width, left-aligned and NUL-padded; a code longer
+            // than the field is refused by name rather than clipped to a
+            // prefix that names a different observatory.
+            if bytes.len() > 4 {
+                return Err(Error::invalid_input(format!(
+                    "observatory code \"{}\" is longer than the 4-byte MPC code \
+                     field; truncating it would name a different observatory",
+                    e.obs_code
+                )));
+            }
+            obs_code[..bytes.len()].copy_from_slice(bytes);
             Ok(empyrean_sys::EmpyreanEphemerisEntry {
                 orbit_id: id_ptr,
                 epoch_mjd_tdb: e.epoch.mjd_tdb()?,
@@ -53,6 +62,28 @@ fn ephemeris_to_ffi_array(
                 aberrated_state: e.aberrated_state,
                 has_aberrated_covariance: u8::from(e.aberrated_covariance.is_some()),
                 aberrated_covariance: e.aberrated_covariance.unwrap_or([[f64::NAN; 6]; 6]),
+                // The row's covariance kind rides through faithfully. The
+                // packed joint is a library-owned output field the file
+                // writers do not read on this input path, so it is sent
+                // absent (width 0) rather than marshaling a borrowed triangle
+                // the writer would ignore; the bare 6×6 above is what the
+                // ephemeris file columns carry.
+                cov_kind: e.cov_kind.to_u8(),
+                joint: empyrean_sys::EmpyreanPackedJoint::default(),
+                // The mixture accounting rides through to the file writers
+                // (the six mix_* columns); absent when the row's covariance
+                // was not a mixture.
+                has_mixture_tally: u8::from(e.mixture_tally.is_some()),
+                mixture_tally: e.mixture_tally.map(|t| t.to_ffi()).unwrap_or_else(|| {
+                    empyrean_sys::EmpyreanMixtureTally {
+                        n_components_total: 0,
+                        weight_delivered: 0.0,
+                        n_failed: -1,
+                        n_unresolved: -1,
+                        n_curvature_refused: -1,
+                        n_sky_linearization_refused: -1,
+                    }
+                }),
             })
         })
         .collect::<Result<Vec<_>>>()?;

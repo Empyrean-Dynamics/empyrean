@@ -16,14 +16,12 @@ from empyrean._convert import (
     _COORD_TYPE_MAP,
     AnyOrbits,
     coordinates_to_arrays,
-    extract_joint,
-    extract_non_grav_covariance,
+    extract_joint_wire,
     extract_photometry,
     extract_srp,
     int_to_frame,
-    joint_columns_from_result,
+    joint_from_result,
     naif_to_origin,
-    non_grav_border_only,
     validate_non_grav_marsden_only,
 )
 from empyrean.coordinates.coordinates import CartesianCoordinates
@@ -32,6 +30,7 @@ from empyrean.coordinates.covariance import (
 )
 from empyrean.coordinates.covariance import _CovarianceTable
 from empyrean.coordinates.epoch import Epochs, _epochs_mjd_tdb
+from empyrean.orbits.joint import _KIND_BY_CODE
 from empyrean.orbits.orbits import CartesianOrbits
 from empyrean.propagation.config import (
     _DATACLASS_TO_INT,
@@ -65,7 +64,7 @@ from empyrean.propagation.events import (
 )
 from empyrean.propagation.mixtures import build_mixture_chains
 from empyrean.propagation.result import PropagationResult
-from empyrean.propagation.tagged_covariance import _KIND_BY_CODE
+from empyrean.propagation.status import build_orbit_statuses
 
 # Quivr event sub-tables share the build helpers below; the helpers
 # return the same concrete table subclass they are handed.
@@ -153,12 +152,22 @@ def propagate(
           (reproducibly, for a fixed ``seed``) and reports the
           Monte-Carlo impact probability on the
           :attr:`~empyrean.PossibleImpacts.ip_mc` column of any
-          possible-impact event. It does **not** reconstruct a per-epoch
-          state covariance — the propagated states carry no state
-          covariance under ``MONTE_CARLO`` (use ``SIGMA_POINT`` for a
-          sampled state covariance, or
-          :func:`~empyrean.compute_impact_probabilities` for the
-          full Monte-Carlo impact-probability workflow).
+          possible-impact event. It also publishes the per-epoch
+          ensemble covariance — the centered sample second moment about
+          the ensemble mean — read back tagged ``monte_carlo`` with the
+          run's seed.
+
+          Two absences are honest rather than missing. Below a floor of
+          **7 draws** no covariance is published at all: ``n`` draws give
+          a sample moment of rank at most ``n − 1``, so a 6×6 built from
+          fewer is rank-deficient by construction. The engine names that
+          case with a warning the propagate path cannot yet surface at
+          this layer, so from Python the sub-floor case is visible only
+          as the absent (all-NaN) covariance — see
+          ``bd empyrean-snr0w``. And a run seeded from system entropy
+          (``MonteCarlo(seed=None)``) publishes its covariance with a
+          **null** seed, never ``0``: that ensemble is not reproducible
+          by construction, and ``0`` is a real, reproducible seed.
         * ``GAUSSIAN_MIXTURE`` splits the input Gaussian into an adaptive
           mixture at close approaches; its distinctive product is the
           mixture-corrected impact probability. Away from encounters the
@@ -216,13 +225,8 @@ def propagate(
         ``None`` for a fully ballistic batch). Build each entry from
         :class:`~empyrean.ThrustParams` /
         :class:`~empyrean.ThrustArc` / a
-        :class:`~empyrean.orbits.thrust.SteeringLaw` variant. A non-empty
-        :attr:`~empyrean.ThrustParams.correction_covariances` triggers the
-        burn-sensitivity propagation whose solved segments surface in the
-        tagged-covariance
-        :attr:`~empyrean.TaggedCovariance.thrust_segments` (requires
-        ``tagged_covariance=True``). Length or arc/correction mismatches
-        raise, never silently degrade.
+        :class:`~empyrean.orbits.thrust.SteeringLaw` variant. Length or
+        arc/correction mismatches raise, never silently degrade.
 
     Returns
     -------
@@ -239,23 +243,16 @@ def propagate(
     result's ``epoch_mjd_tdb`` column.
 
     The joint covariance travels in both directions. An input orbit
-    carrying cross terms — on ``non_grav.non_grav_cross`` (the 6x3
-    state-Marsden border) and ``wide_cross`` (everything else) — is
-    propagated against them rather than against its ``6x6`` alone, and
-    every output row carries the propagated cross terms in the same two
-    columns. This is what makes a chained propagation agree with the
-    single-leg answer: the state-parameter columns are non-zero even
-    when the input was block-diagonal, because propagation itself
-    generates that correlation, so a second leg handed only the ``6x6``
-    reports a tighter uncertainty than the first leg supports.
-
-    Cross terms are refused without the parameter blocks they are
-    conditioned on (the non-grav ``3x3``, the DT and AMRAT prior
-    variances). Propagation passes those through unchanged rather than
-    restating them on every output row, so when chaining legs by hand
-    take them from the orbit that started the chain. A row with no cross
-    terms is null, never zero — an absent correlation and a measured
-    zero correlation are different claims.
+    carrying a packed joint on ``orbits.covariance`` is propagated against
+    the whole ``(6+P)x(6+P)`` matrix rather than against its leading
+    ``6x6`` state block alone, and every output row carries the propagated
+    joint on the same column. This is what makes a chained propagation
+    agree with the single-leg answer: the state-parameter columns are
+    non-zero even when the input was block-diagonal, because propagation
+    itself generates that correlation, so a second leg handed only the
+    ``6x6`` reports a tighter uncertainty than the first leg supports. A
+    row with no joint is null, never zero — an absent covariance and a
+    measured zero covariance are different claims.
 
     Raises
     ------
@@ -356,9 +353,8 @@ def propagate(
     # NonGravParams is Marsden-only; reject a stray model='srp' / cr before
     # marshaling (SRP rides its own slot, extracted below).
     validate_non_grav_marsden_only(orbits)
-    has_srp, srp_amrat, srp_cr, srp_amrat_variance = extract_srp(orbits)
+    has_srp, srp_amrat, srp_cr = extract_srp(orbits)
     non_grav_dts: np.ndarray | None = None
-    non_grav_dt_variances: np.ndarray | None = None
     # g(r) Marsden–Sekanina exponents. Passed only when a non-default g(r)
     # is present (any non-zero α/r0/m/n/k); all-zero is the inverse-square
     # asteroid default that the engine applies without a marshal.
@@ -382,12 +378,6 @@ def propagate(
         dt_col = np.asarray(ng.dt.to_numpy(zero_copy_only=False), dtype=np.float64)
         if np.isfinite(dt_col).any():
             non_grav_dts = dt_col
-        # DT prior variance — opens the DT column in a StateAndNonGravAndDT
-        # solve. Gated like non_grav_dts (finite positive) so the no-prior
-        # asteroid-only case avoids an FFI marshal.
-        dtv_col = np.asarray(ng.dt_variance.to_numpy(zero_copy_only=False), dtype=np.float64)
-        if (np.isfinite(dtv_col) & (dtv_col > 0.0)).any():
-            non_grav_dt_variances = dtv_col
         # g(r) exponents — carry the comet Marsden–Sekanina g(r) so a fitted
         # or SBDB comet orbit isn't silently propagated with inverse-square.
         alpha_col = np.nan_to_num(
@@ -436,13 +426,11 @@ def propagate(
     has_phot_cov: np.ndarray | None = has_phot_cov_arr if has_phot_cov_arr.any() else None
     phot_cov: np.ndarray | None = phot_cov_arr if has_phot_cov_arr.any() else None
 
-    # Fitted non-grav covariance — passed through only when a row carries one
-    # (mirrors the OD output path) so a StateAndNonGrav-fitted orbit re-fed
-    # into propagate keeps its prior. Gated like the other optional non-grav
-    # arrays so the common no-cov case skips the FFI marshal.
-    has_ng_cov_arr, ng_cov_arr = extract_non_grav_covariance(orbits)
-    has_non_grav_cov: np.ndarray | None = has_ng_cov_arr if has_ng_cov_arr.any() else None
-    non_grav_cov: np.ndarray | None = ng_cov_arr if has_ng_cov_arr.any() else None
+    # The orbit's packed joint — the single covariance home. Passed through
+    # only when a row carries one, so a StateAndNonGrav-fitted orbit re-fed
+    # into propagate keeps its full joint (the state-parameter correlation a
+    # chained run needs), while a gravity-only batch marshals no joint at all.
+    joint_wire = extract_joint_wire(orbits)
 
     # ── Map force model to int ───────────────────────────────
     if isinstance(force_model, str):
@@ -539,22 +527,17 @@ def propagate(
         epsilon=epsilon,
         thrust_arcs=thrust_arg,
         non_grav_dts=non_grav_dts,
-        non_grav_dt_variances=non_grav_dt_variances,
         has_srp=has_srp,
         srp_amrat=srp_amrat,
         srp_cr=srp_cr,
-        srp_amrat_variance=srp_amrat_variance,
-        has_non_grav_cov=has_non_grav_cov,
-        non_grav_cov=non_grav_cov,
         phot_slope2=phot_slope2,
         has_phot_cov=has_phot_cov,
         phot_cov=phot_cov,
-        # The joint's off-diagonal terms, when the input carries them.
-        # A leg fed its predecessor's joint propagates the covariance
-        # that leg actually computed; fed the 6x6 alone it reports a
-        # tighter uncertainty than the first leg supports. No keys at
-        # all when no orbit carries cross terms.
-        **extract_joint(orbits),
+        # The orbit's packed joint, when the input carries one. A leg fed
+        # its predecessor's joint propagates the covariance that leg
+        # actually computed; fed the 6x6 state block alone it reports a
+        # tighter uncertainty than the first leg supports.
+        covariance=joint_wire,
         ng_alphas=ng_alphas,
         ng_r0s=ng_r0s,
         ng_ms=ng_ms,
@@ -599,12 +582,18 @@ def propagate(
     # Empty table when nothing split.
     mixtures = build_mixture_chains(result)
 
+    # ── Per-input-orbit delivery status (always on) ───────────
+    # One row per input orbit, whether or not it delivered. A failed orbit
+    # is carried here rather than vanishing from a shorter states table.
+    status = build_orbit_statuses(result["outcomes"])
+
     return PropagationResult(
         states=states,
         events=detected_events,
         sensitivity=sensitivity,
         tagged_covariance=tagged,
         mixtures=mixtures,
+        status=status,
     )
 
 
@@ -680,6 +669,21 @@ def _build_state_sensitivity(result: dict[str, Any]) -> "StateSensitivities | No
     else:
         resolved_kind_col = [None] * n
 
+    # The engine's pre-retention mixture tallies ride beside the resolved kind.
+    # A `-1` count / NaN weight in the dict is "absent" → `None` here, never 0.
+    def _mix_int(key: str) -> list[int | None]:
+        arr = result.get(key)
+        if arr is None:
+            return [None] * n
+        return [int(v) if int(v) >= 0 else None for v in np.asarray(arr)]
+
+    def _mix_weight() -> list[float | None]:
+        arr = result.get("mix_weight_delivered")
+        if arr is None:
+            return [None] * n
+        a = np.asarray(arr, dtype=np.float64)
+        return [None if np.isnan(v) else float(v) for v in a]
+
     return StateSensitivities.from_kwargs(
         orbit_id=orbit_ids,
         object_id=object_ids,
@@ -687,6 +691,12 @@ def _build_state_sensitivity(result: dict[str, Any]) -> "StateSensitivities | No
         stm=stm_col,
         stt=stt_col,
         resolved_kind=resolved_kind_col,
+        mix_n_components_total=_mix_int("mix_n_components_total"),
+        mix_weight_delivered=_mix_weight(),
+        mix_n_failed=_mix_int("mix_n_failed"),
+        mix_n_unresolved=_mix_int("mix_n_unresolved"),
+        mix_n_curvature_refused=_mix_int("mix_n_curvature_refused"),
+        mix_n_sky_linearization_refused=_mix_int("mix_n_sky_linearization_refused"),
     )
 
 
@@ -758,18 +768,15 @@ def _build_cartesian_orbits(result: dict[str, Any]) -> CartesianOrbits:
         "coordinates": cart_coords,
     }
 
-    # The propagated joint's off-diagonal blocks. `coordinates.covariance`
-    # above is only the state block: propagation generates state-parameter
-    # correlation even from a block-diagonal input, so a chained run built
-    # on the 6x6 alone is a tighter claim than this leg supports. Attached
-    # only when the engine produced cross terms — a gravity-only or
-    # parameter-free orbit leaves both columns unset rather than carrying
-    # rows of zeros.
-    border, wide = joint_columns_from_result(result, m)
-    if border is not None:
-        orbits_kwargs["non_grav"] = non_grav_border_only(border)
-    if wide is not None:
-        orbits_kwargs["wide_cross"] = wide
+    # The propagated packed joint. `coordinates.covariance` above is only the
+    # derived state block: propagation generates state-parameter correlation
+    # even from a block-diagonal input, so a chained run built on the 6x6
+    # alone is a tighter claim than this leg supports. Attached only when the
+    # engine produced a joint — a gravity-only or parameter-free orbit leaves
+    # the column unset rather than carrying rows of zeros.
+    joint = joint_from_result(result)
+    if joint is not None:
+        orbits_kwargs["covariance"] = joint
 
     return CartesianOrbits.from_kwargs(**orbits_kwargs)
 

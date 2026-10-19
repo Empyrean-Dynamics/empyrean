@@ -6,6 +6,14 @@ project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.11.0-rc.0] — 2026-10-18
+
+**Validation.** On this candidate the orbit-determination family (354
+optical fits and 5 radar fits over the suite's catalogue) reproduces the
+0.11.0 run C record bit-for-bit through the core reference, the Rust
+wrapper, Python, C and CLI channels; the zero-seeded non-gravitational
+cells now deliver finite estimates with σ below the prior.
+
 **Release note.** `EmpyreanEventConfig` grew 40 → 56 bytes by value,
 shifting every field after `events` in `EmpyreanPropagationConfig`
 (296 → 312) and `EmpyreanEphemerisConfig` (320 → 336); this is a layout
@@ -18,6 +26,14 @@ Re-derive the whole layout rather than appending to it — writing
 `num_threads` at its old offset now lands inside `diagnostics`, silently.
 Recompiling against the current header is the fix; a 0.10.0 caller and a
 library from this cycle refuse each other at load by the version handshake.
+
+`EmpyreanPhotometryConfig` grows 32 → 48 bytes by value, carrying the
+`band_conversions` pointer and its `band_conversions_len` (the two new
+fields of the band-to-V table below). The config that embeds it,
+`EmpyreanODConfig`, shifts with it (536 → 552) — the same layout break,
+under the same `EMPYREAN_ABI_VERSION` 1100, so a hand-mirrored
+`EmpyreanODConfig` must re-derive its tail rather than assume the embedded
+photometry block kept its size.
 
 `EmpyreanErrorLocation` and its two accessors are additive by contrast —
 they take nothing away from any existing layout.
@@ -64,6 +80,30 @@ they take nothing away from any existing layout.
   it safe — the lazy accessors take `&self`, so the type system proves
   none can be called afterwards, and no config flag is involved.
 
+- **The band-to-V conversion table rides the photometry config, and it is
+  the caller's.** Survey-band magnitudes convert to V through a per-code
+  table carried at every layer: `PhotometryConfig.band_conversions`
+  (`BandConversions`) in the Rust wrapper, `EmpyreanBandConversion { code,
+  offset_to_v, sigma }` rows with `band_conversions` / `band_conversions_len`
+  in C, `PhotometryConfig(band_conversions={"Lu": (-1.41, 0.30)})` in
+  Python, and the repeatable `--band-conversion CODE=OFFSET:SIGMA` on the
+  CLI's `determine`. The default is the MPC Magnitude Bands table; a
+  supplied entry replaces a code the table already carries or adds one it
+  does not, and each converted band reports the offset it applied. The LSST
+  codes carry no adopted conversion and are refused by name until supplied —
+  their magnitudes stay out of the photometric fit, with a report, and the
+  astrometry is unaffected — and the comet magnitude flags `T` / `N` are
+  always refused.
+
+- **A solved axis the observations leave unconstrained is refused by name.**
+  Orbit determination gains OD error code 53 —
+  `EMPYREAN_OD_ERROR_SOLVED_AXIS_UNCONSTRAINED` in C,
+  `ODError::SolvedAxisUnconstrained` in the Rust wrapper — riding the
+  existing error string through the Python `DetermineFailure` and the CLI
+  failure output. A fit whose observations carry no information on a solved
+  parameter axis is now refused, with a message naming the axis and both σ,
+  rather than returning the prior back as a posterior.
+
 ### Changed
 
 - **BREAKING (Rust wrapper)** — `PropagatedState::stt` is now
@@ -82,6 +122,179 @@ they take nothing away from any existing layout.
   invalid-argument naming that orbit's index and id, instead of
   integrating into a NaN trajectory and surfacing from deep inside the
   engine as prose with no index in it.
+
+- The observation-sensitivity `hessian` payload on the C ABI (and every
+  channel above it) is now the tensor COMPOSED to the same input axis as
+  the `jacobian` beside it — the orbit-epoch state — so the pair is one
+  second-order expansion. Earlier releases published the LOCAL topocentric
+  second derivative under the same field, a different input domain; a
+  consumer that contracted the two together read the wrong quantity. The
+  tensor is populated on `SECOND_ORDER` rows of orbits declaring a state
+  covariance and no solved force-model parameters (`n_params == 6`), and
+  is null elsewhere — the `6 * n_params²` length contract is unchanged.
+- Ephemeris generation for a body that is also one of its own perturbers
+  (any of the sixteen SB441-N16 asteroids at Standard tier) now SUCCEEDS
+  under the default `SUBSTITUTE_SPK` overlap policy, where it previously
+  failed outright for want of a dense trajectory. The rows are served off
+  the body's own SPK — the authoritative solution for that body, but not a
+  propagation of the caller's initial condition — and the substitution is
+  reported on the result's warnings channel, naming the body and saying
+  whether a declared covariance was dropped. Those rows carry no sky
+  covariance, because a covariance describes the initial condition the
+  substitution discards. `EXCLUDE_AND_INTEGRATE` is unchanged and remains
+  the way to propagate the supplied state (and its covariance); it now
+  reports its exclusion on the same channel. Radar generation still
+  refuses under the substituting policy — its Jacobian is composed on an
+  STM a substitution never produces.
+- `SIGMA_POINT` and `MONTE_CARLO` on the ephemeris path
+  (`empyrean_generate_ephemeris`, the handle-based
+  `empyrean_builtsystem_generate_ephemeris`, and every channel above them)
+  now deliver the sampled ensemble's sky moments as the row covariance:
+  the member set flies through the generation pipeline, light time and
+  all. Under the previous engine the same `SIGMA_POINT` call returned a
+  first-order STM projection under the sigma-point name, and `MONTE_CARLO`
+  failed with an opaque integrator error — so a C or Rust caller passing
+  either method gets different numbers from the same call. The engine
+  enforces the envelope by name: the unscented set is the parameter-free
+  canonical 2N+1 construction (`n_sigma == 1.0`, `samples_per_plane == 8`;
+  anything else is refused), fewer than 8 Monte-Carlo draws is refused
+  (no full-rank sky moment), a prior whose members disperse beyond the
+  engine's sky chart is refused rather than folded, and so is an orbit
+  whose primary coordinate is not Cartesian (the delivery flies the state
+  and state+Marsden solved spaces today). The Python wrapper,
+  which had pre-emptively refused both methods on this path with its own
+  `ValueError`, now passes them through like the C ABI and the Rust
+  wrapper do; the engine's refusals surface as `RuntimeError` naming the
+  method.
+- **BREAKING** — `GaussianMixture` on the ephemeris path is now a typed
+  refusal naming the method and the seam, where it previously returned a
+  first-order sky covariance under the mixture's name. Nothing about the
+  numbers changed; what changed is that the silent downgrade is now an
+  error a caller can see. Mixture components are born during propagation
+  and retained on-grid only, so no per-observation sky projection exists
+  yet; the on-grid moment-matched mixture covariance remains available
+  from the propagation result's covariance series, and `GaussianMixture`
+  on `propagate` is unaffected. Callers who were requesting it on the
+  ephemeris path were receiving first-order results and should now either
+  request `FIRST_ORDER` explicitly or move to the covariance series.
+- Monte-Carlo propagation now publishes a per-epoch state covariance — the
+  centered sample second moment about the ensemble mean, tagged
+  `MONTE_CARLO` with the run's seed — where the states previously carried
+  none. Two absences are deliberate: an ensemble below a floor of 7 draws
+  publishes no covariance (n draws give a sample moment of rank at most
+  n−1, so a 6×6 built from fewer is rank-deficient by construction), and
+  an entropy-seeded run publishes its covariance with no seed beside it.
+- A Monte-Carlo covariance row no longer always carries a seed. The engine's
+  result tag now records the run's seed as optional, so a Monte-Carlo run
+  seeded from system entropy (`mc_seed_some = 0` on the request) produces a
+  row tagged `EMPYREAN_COVARIANCE_KIND_MONTE_CARLO` with `has_mc_seed == 0` —
+  honest about an ensemble that is not reproducible by construction, rather
+  than reporting seed `0`, which is a real and reproducible seed. `kind ==
+  MONTE_CARLO` therefore no longer implies a valid `mc_seed`: read
+  `has_mc_seed`. Unchanged for every run given an explicit seed, and the
+  layers above already modelled the seed as nullable (`Option<u64>` in the
+  Rust wrapper, a nullable `mc_seed` column in Python), so both surface the
+  absence as `None` / null with no signature change.
+- Two version-skew tripwire codes joined the C ABI, for the case where the
+  engine resolves a covariance kind — or refuses a covariance series for a
+  reason — that this ABI has no tag for. `EMPYREAN_COVARIANCE_KIND_UNKNOWN`
+  (254) can now appear anywhere a `resolved_kind` / tagged-covariance `kind`
+  does, and `EMPYREAN_TAGGED_COV_UNKNOWN` (-98) anywhere the tagged-covariance
+  accessors return a code. Neither is a value to interpret: both say the
+  engine outran the ABI, and both exist so that such a row is never folded
+  onto a concrete kind or a sibling error code, which would be undetectable
+  downstream. Additive — no existing code or tag changed value, and the
+  shipped engine/ABI pairing emits neither.
+- The second-order sensitivity payloads — the `stt` on propagation rows and
+  the observation-sensitivity `hessian` — keep their shape, their type and
+  every value on the lower triangle exactly, but a MIRRORED (upper-triangle)
+  cell of a rotated or stitched tensor can move by up to ~1e-13 relative
+  against a build on the previous engine (≤ 2.4e-15 on the engine's own
+  pinned fixtures). The engine now stores its symmetric sensitivity tensors
+  packed lower-triangular — one slot per index pair, since each slice is
+  symmetric in its two input indices by Schwarz — and mirrors them back out
+  for this ABI, so the two halves of a slice are now the same number. The
+  dense storage accumulated the mirrored half separately, in the transposed
+  term order, and the two halves disagreed at that rounding level. The
+  movement reaches rows whose tensor was rotated (`transform`) or stitched
+  across windows (the `AUTO` windowed path); a single-window untransformed
+  tensor is unchanged. Nothing in the wire format moved: the `6 * n_params²`
+  hessian length, the 6×6×6 `stt`, and the generated `empyrean.h` are all
+  as before.
+- **The second-order close-approach statistics are re-baselined — published
+  numbers move, deliberately.** The engine modelled the periapsis distance
+  but contracted the FIXED-EPOCH distance Hessian at the bisected close
+  approach. The gradient is exact there (the envelope theorem kills the
+  chain term at `r·v = 0`); the second derivative is not. The engine now
+  publishes the periapsis-distance Hessian, which carries the
+  implicit-epoch rank-1 term the fixed-epoch tensor omitted. That term is
+  negative semidefinite, so omitting it biased the mean distance high and
+  the second-order impact probability LOW — the unsafe direction.
+  What moves, on identical inputs: `nonlinearity` (κ) falls on every
+  fixture measured, from −2 % to −238×, because the held-epoch tensor
+  manufactured curvature that is not in the map; `ip_second_order` rises
+  toward the Monte-Carlo answer, by up to +17× on a deep wide-covariance
+  flyby. On the PDC27 exercise object, κ falls every night (07-08
+  51.2 → 11.2; 07-12 13.8 → 11.5; 07-31 35.8 → 27.7; a quiet week
+  2.3–10 → 0.0–0.2, where the corrected second order now simply equals
+  the linear answer it used to under-report by ~3×) and `ip_second_order`
+  moves toward the Monte-Carlo anchor at every high-κ checkpoint
+  (07-12 0.0415 → 0.0496; 07-17 0.0420 → 0.0550; 07-24 0.0452 → 0.0583;
+  07-31 0.0478 → 0.0618, +29 %). `ip_linear` and seeded Monte Carlo are
+  bit-identical throughout — they are the controls, and they did not move.
+  Three shipped-fixture close approaches whose Edgeworth correction
+  exceeds the Gaussian term previously published `ip_second_order` = 0.0,
+  below their own `ip_linear` by the whole of it (Earth at `ip_linear`
+  2.098e-3; Moon at 8.348e-4; Moon at 1.203e-3). The engine now refuses
+  those by name rather than publishing the clamped zero. **That refusal
+  reason is not yet exposed on this ABI**: the engine carries a typed
+  `second_order_refusal` (five arms) on its impact records, but this ABI
+  has no field for it, so a refused row arrives as `ip_second_order` =
+  NaN — the same not-available sentinel a row that was never asked for
+  second-order statistics carries. A caller therefore cannot yet tell
+  "the engine refused, and why" from "not computed", and must not read
+  either as zero. Surfacing `second_order_refusal` through the C ABI and
+  the Python wrapper is adoption work still to be done. The change is
+  strictly safer than what it replaces, which published a `0.0` that was
+  indistinguishable from a real answer.
+- **The adaptive Gaussian mixture fires in a different regime.** The AGM
+  splitter is gated on the same κ the re-baseline lowers, so an input
+  whose κ used to clear the default `threshold` of 1.0 can now fall below
+  it and return `ip_agm` = NaN — the splitter declining to fire, not
+  failing. Measured on one live-SBDB 2024 YR4 solution carried through
+  its 2032-12-22 Earth encounter with the covariance inflated ×1e6, the
+  same bytes either side of the engine change: κ 1.329 → 0.026 (−50.6×)
+  and `ip_agm` 1.822e-3 → NaN, while `ip_second_order` rose
+  4.480e-3 → 6.658e-3, up from well under its own `ip_linear` to just
+  above it. The controls held bit-identical across the pair — `ip_linear`
+  6.533e-3 and a miss distance of 278333.067503 km — which is what makes
+  the κ move attributable to the corrected tensor and not to the input.
+  The same state at ×1e10 gives κ 2.625 and a splitter that fires, so the
+  mixture path is intact and only its trigger moved. Callers who tuned an
+  inflation, or a `threshold`, against the old κ should re-check it.
+
+- **BREAKING (JSON orbit format)** — the JSON orbit record now carries the
+  full packed joint, the same value Parquet stores, on every surface. The
+  row serializes the packed lower triangle `cov_tri` and the scalar tags
+  (`cov_schema`, `cov_state_width`, the `cov_layout_*` bitsets, `cov_kind`,
+  `cov_quality`, `cov_rank`, `cov_null_axes`, `cov_min_eig_corr`,
+  `cov_functional`, `cov_provenance`, `cov_asserted_source`) under the same
+  names Parquet's columns use, at every width the joint can have — on the
+  CLI (C-ABI) path and the Python/quivr path alike. The flat 6×6
+  `covariance` field is **removed** from the JSON row; the state 6×6 is the
+  joint's leading block, derived on read, never stored twice. A JSON file
+  written before this change — carrying the old flat `covariance` field — is
+  refused by name on read, with a message naming the old shape; there is no
+  migration shim. A flat state 6×6 with no joint (a hand-built C orbit) is
+  converted through the same engine path the Parquet and CSV writers use, so
+  an externally supplied matrix is an ASSERTED moment from `ExternalFile`
+  with the engine's definiteness check and its tags are identical across the
+  three formats, and an asymmetric block is refused by name on the JSON
+  write exactly as on Parquet. CSV is unchanged — it carries the state 6×6
+  and refuses a joint with solved-parameter axes by name
+  (`ParameterCovarianceNotWritable`). The `empyrean_orbits_write_json` doc
+  comment is regenerated by cbindgen; the ABI itself — signatures, structs,
+  enums, constants — is unchanged.
 
 ### Fixed
 
@@ -134,6 +347,38 @@ they take nothing away from any existing layout.
   `EventConfig::enrichment` remains the one engine field this boundary
   does not carry. That omission is documented on both structs rather than
   silent, and is unchanged here.
+
+- **The orbit-batch writer read freed memory.** `empyrean determine
+  --out-dir <dir> --format parquet|csv` aborted the fitted-orbit write
+  after a clean convergence (433 Eros, 99942 Apophis) with a
+  packed-joint/flat-state disagreement on the state block. The keepalive
+  that owns each orbit's packed-joint triangle — which the C writer reads
+  by raw pointer — was dropped before the writer ran, so the writer read a
+  freed triangle whose garbage state block (a ~1e108 cell) disagreed with
+  the inline flat 6×6, and the orbit-write guard refused the pair. Parquet
+  and CSV, which reconstruct the joint, aborted; JSON survived because its
+  old row shape serialized only the inline flat 6×6; the Python/wrapper
+  path, which carries only the joint and never reached the guard, read the
+  same freed triangle and would have written the garbage joint silently.
+  The keepalive now spans the C call on every path, beside the id and
+  object keepalives; the joint remains the one covariance authority and the
+  state-block guard that caught it is unchanged.
+
+- **A non-gravitational model whose coefficients are all zero is still a
+  model.** `empyrean_orbit_non_grav_params` inferred "no non-grav model"
+  from an all-zero A1/A2/A3 vector, so an orbit refined with the Marsden
+  block solved from a zero seed reached the engine gravity-only while its
+  packed joint still declared the Marsden prior — a declared-but-unforced
+  axis the observations could not touch. Presence now rides the orbit's
+  declared joint layout alongside the coefficient values and DT, so a zero
+  seed keeps the force its prior was written for; presence is never read
+  from the coefficient values alone.
+
+- Survey-band magnitudes now convert to V with the MPC Magnitude Bands
+  API's current adopted values. The static table copied before was stale:
+  the `u` offset had the wrong sign (+2.5 → −2.5), and `g`, `r`, `i`, `z`,
+  `y` and `w` shift by 0.04–0.29 mag. A fitted H derived from those bands
+  re-baselines accordingly; astrometry is unaffected.
 
 ## [0.10.0] — 2026-08-20
 

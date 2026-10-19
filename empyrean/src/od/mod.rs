@@ -61,21 +61,25 @@ mod result;
 mod weighting;
 
 pub use config::{
-    AcceptabilityThresholds, AutoEscalationPolicy, IODConfig, ODConfig, PhotometryConfig,
+    AcceptabilityThresholds, AutoEscalationPolicy, BandConversion, BandConversions, IODConfig,
+    ODConfig, PhotometryConfig,
 };
 pub use debiasing::{DebiasingConfig, DebiasingResolution};
-pub use nuisance::StationRaDecConfig;
+pub use nuisance::StationRADecConfig;
 pub use observation::{Observation, Observations, RadarMeasurement, RadarObservation};
 pub use rejection::{RejectionConfig, RejectionKind};
 pub use result::{
-    AcceptabilityReport, BandStat, CovarianceRepresentation, CovarianceTrust, DetermineEntry,
-    DetermineFailure, DetermineFailureKind, DetermineResult, DetermineResults, EvaluateResult,
-    GateRecord, MAX_THRUST_SEGMENTS, ObservationResidual, OriginPolicy, OutputEpoch,
-    PhotometryModel, PhotometryResult, RadarResidual, RadarResidualKind, RejectionReason,
-    ResidualSummary, SolveFor, SolveForParams, SolvedCovariance, SolverStop, StallDelivery,
-    StationBias, TrustGateEvent,
+    AcceptabilityReport, BandStat, CovarianceRepresentation, CovarianceTrust, DeliveredNoiseModel,
+    DeliveredRejectionKind, DetermineEntry, DetermineFailure, DetermineFailureKind,
+    DetermineResult, DetermineResults, EvaluateResult, GateRecord, MAX_THRUST_SEGMENTS, ODError,
+    ObservationResidual, OriginPolicy, OutputEpoch, PhotometryModel, PhotometryResult,
+    RadarResidual, RadarResidualKind, RejectionReason, ResidualSummary, SigmaSource, SolveFor,
+    SolveForParams, SolvedCovariance, SolverStop, StallDelivery, StationBias, TrustGateEvent,
 };
-pub use weighting::{SigmaPolicy, WeightingConfig, WeightingLayer, WeightingPreset};
+pub use weighting::{
+    CovarianceInformation, NoiseModel, SigmaPolicy, WeightingConfig, WeightingLayer,
+    WeightingPreset,
+};
 
 use std::ffi::CString;
 
@@ -479,6 +483,8 @@ fn ffi_determine_results_to_rust(
                 object_id: object_id.clone(),
                 message: ffi_string(slot.error),
                 kind: DetermineFailureKind::from_code(slot.error_code),
+                od_error: (slot.od_error_code != empyrean_sys::EMPYREAN_OD_ERROR_NONE as i32)
+                    .then(|| ODError::from_code(slot.od_error_code)),
             })
         };
         entries.push(DetermineEntry { object_id, outcome });
@@ -597,6 +603,8 @@ fn ffi_od_result_to_rust(
         covariance_9x9: (result.has_covariance_9x9 != 0).then_some(result.covariance_9x9),
         non_grav_delta: (result.has_non_grav_delta != 0).then_some(result.non_grav_delta),
         rejection_passes: result.rejection_passes,
+        rejection_kind: result::rejection_kind_from_ffi(result.rejection_kind),
+        rejection_enabled: result.rejection_enabled != 0,
         num_oppositions_fit: result.num_oppositions_fit,
         force_model_used,
         // Reconstruct the solved axes: an Explicit fit's exact set is
@@ -628,6 +636,7 @@ fn ffi_od_result_to_rust(
         final_solve_iterations: (result.final_solve_iterations >= 0)
             .then_some(result.final_solve_iterations as usize),
         stall_delivery: StallDelivery::from_ffi(result),
+        resolved_method: crate::CovarianceKind::from_u8(result.resolved_method)?,
     })
 }
 
@@ -707,35 +716,18 @@ fn ffi_od_result_orbit(result: &empyrean_sys::EmpyreanODResult) -> crate::error:
         if ng.has_dt != 0 {
             orbit = orbit.with_non_grav_dt(Some(ng.non_grav_dt));
         }
-        // Carry the fitted non-grav covariance so the orbit re-feeds into a
-        // StateAndNonGrav refine without losing its non-grav prior.
-        if ng.has_covariance != 0 {
-            orbit = orbit.with_nongrav_covariance(Some(ng.covariance));
-        }
-    }
-    // The DT posterior. It had no wire before the 0.10.0 ABI, so a solved-DT
-    // fit used to round-trip with its DT column closed.
-    if result.has_non_grav != 0 && result.non_grav.has_dt_variance != 0 {
-        orbit = orbit.with_non_grav_dt_variance(Some(result.non_grav.dt_variance));
     }
     // Carry the fitted/absolute SRP slot so a solved AMRAT orbit re-feeds into
-    // propagate / refine without silently dropping its SRP force. When the
-    // AMRAT was solved, `amrat_variance` is the fitted posterior — chaining the
-    // correct prior into a follow-on StateAndAMRAT refine.
+    // propagate / refine without silently dropping its SRP force.
     if result.has_srp != 0 {
         let srp = &result.srp;
         orbit = orbit.with_srp(srp.amrat, srp.cr);
-        if srp.has_amrat_variance != 0 {
-            orbit = orbit.with_srp_amrat_variance(Some(srp.amrat_variance));
-        }
     }
-    // The cross terms — the half of the posterior that is not a diagonal
-    // block. Both halves land where a re-feed reads them: the border on
-    // the coordinate beside its 6×6, the carrier on the orbit. Without
-    // this the returned orbit carries a block-diagonal covariance, which
-    // is a tighter claim than the fit made.
-    let joint = unsafe { crate::JointCovariance::from_ffi(&result.orbit.orbit_cov) }?;
-    orbit.state.non_grav_cross = joint.non_grav_cross;
-    orbit.wide_cross = joint.wide_cross;
+    // The whole fitted posterior rides one packed joint — the state block, the
+    // Marsden / DT / AMRAT / thrust diagonal blocks, and every cross term. A
+    // re-feed reads one field, so the returned orbit carries the full
+    // \\((6+P)\\)-wide matrix the fit made, never a tighter block-diagonal
+    // claim. A width-0 joint reads back as `None`.
+    orbit.covariance = unsafe { crate::PackedJoint::from_ffi(&result.orbit.orbit_cov) }?;
     Ok(orbit)
 }

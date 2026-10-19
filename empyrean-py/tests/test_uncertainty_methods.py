@@ -20,14 +20,23 @@ module is the differential coverage that pins the fixed behavior:
   covariance, tagged ``sigma_point`` and numerically distinct from the
   linear first-order one.
 * ``propagate(MONTE_CARLO)`` runs and reports the Monte-Carlo impact
-  probability (seed-reproducibly); it produces no per-epoch state
-  covariance (that is the engine contract, not a bug), so covariance-
-  bearing rows come back with the standard "absent covariance"
-  representation.
-* ``generate_ephemeris`` rejects the sampling methods with a typed,
-  descriptive ``ValueError`` instead of silently downgrading to first
-  order (the sky-plane covariance is a first-order STM projection that
-  cannot consume a sampled ensemble).
+  probability (seed-reproducibly), and since villeneuve 1.25.0
+  (bd empyrean-z28n8) also publishes the per-epoch ensemble covariance —
+  the centered sample second moment about the ensemble mean, tagged
+  ``monte_carlo`` with the run's seed. Two absences stay honest: an
+  ensemble below the 7-draw rank floor publishes nothing (n draws give
+  rank ≤ n−1, and n ∈ {0, 1} would publish NaN / all-zero matrices), and
+  a run seeded from system entropy publishes a covariance with no seed
+  beside it, because that ensemble is not reproducible by construction.
+* ``generate_ephemeris`` HONORS the sampling methods since villeneuve
+  1.25.0 (bd empyrean-848gm.1): the member set flies through the
+  generation pipeline and the row covariance is the ensemble's sky
+  moment — numerically distinct from the first-order projection, seed-
+  reproducible for Monte Carlo — and what the engine does not deliver
+  (a non-canonical sigma knob, fewer than 8 draws) comes back as the
+  engine's own typed refusal naming the method, never as a silent
+  downgrade. The wrapper adds no gate of its own on this seam, so it is
+  exactly as strict as the C ABI and the Rust wrapper beneath it.
 """
 
 from __future__ import annotations
@@ -151,29 +160,134 @@ def test_propagate_sigma_point_non_default_params_raise(
 # ══════════════════════════════════════════════════════════════════
 
 
-def test_propagate_monte_carlo_omits_state_covariance(
+def test_propagate_monte_carlo_publishes_the_ensemble_covariance(
     orbit: CartesianOrbits, times: Epochs
 ) -> None:
-    """``MONTE_CARLO`` runs but produces NO per-epoch state covariance —
-    its deliverable is the Monte-Carlo impact probability, not a sampled
-    state covariance. The covariance therefore comes back as the standard
-    "absent" (all-NaN) representation, measurably different from the
-    finite first-order covariance on the same input.
+    """``MONTE_CARLO`` publishes a per-epoch state covariance: the
+    centered sample second moment of the propagated ensemble, tagged
+    ``monte_carlo`` and carrying the seed that produced it.
+
+    It must agree with the first-order covariance to sampling noise on
+    this mildly nonlinear arc — the cross-check that separates a real
+    ensemble moment from a mislabelled linear readback. The relative
+    standard error of a sampled sigma at n = 256 is ~4.4%; the band below
+    is villeneuve's own, wide enough to absorb that plus genuine
+    nonlinearity over the arc.
+
+    Mirrors villeneuve ``tests/test_uncertainty_methods.rs::
+    test_monte_carlo_populates_the_single_epoch_covariance``
+    (bd empyrean-z28n8).
     """
     res_fo = empyrean.propagate(orbit, times, uncertainty_method=UncertaintyMethod.FIRST_ORDER)
-    res_mc = empyrean.propagate(orbit, times, uncertainty_method=MonteCarlo(n_samples=64, seed=7))
+    res_mc = empyrean.propagate(
+        orbit, times, uncertainty_method=MonteCarlo(n_samples=256, seed=3), tagged_covariance=True
+    )
 
     m_fo = res_fo.states.coordinates.covariance.to_matrix()
     assert np.isfinite(m_fo).all(), "first-order state covariance not finite"
 
-    # Monte-Carlo attaches no state covariance: quivr represents the
-    # absent covariance as all-NaN (identical to a first-order propagate
-    # of an orbit that carries no input covariance). This is the honest
-    # "no covariance here" signal, not a NaN masquerading as a real one.
     m_mc = res_mc.states.coordinates.covariance.to_matrix()
-    assert np.isnan(m_mc).all(), (
-        "MONTE_CARLO produced a (partly) finite state covariance — the engine does not "
-        "reconstruct one on this path; a finite value would be a spurious readback"
+    assert np.isfinite(m_mc).all(), (
+        "MONTE_CARLO published no state covariance — the ensemble moment is the "
+        "deliverable of this path since villeneuve 1.25.0"
+    )
+    # A covariance is a second moment: its diagonal cannot be negative.
+    assert (np.diagonal(m_mc, axis1=1, axis2=2) > 0.0).all()
+
+    # The rows say which construction produced them, and name the seed —
+    # without both, a sampled covariance is indistinguishable from a
+    # linear one and cannot be reproduced.
+    assert set(res_mc.tagged_covariance.kind.to_pylist()) == {"monte_carlo"}
+    assert set(res_mc.tagged_covariance.mc_seed.to_pylist()) == {3}
+
+    # Sampling-noise cross-check against the linear transport.
+    pos_sigma = lambda m: np.sqrt(m[:, 0, 0] + m[:, 1, 1] + m[:, 2, 2])  # noqa: E731
+    ratio = pos_sigma(m_mc) / pos_sigma(m_fo)
+    assert np.all((ratio > 0.8) & (ratio < 1.25)), (
+        f"MC ensemble sigma vs first-order — ratios {ratio} outside the sampling-noise band"
+    )
+
+    # Entrywise, under the correlation normalization |a−b| / √(b_ii·b_jj).
+    # The scalar position-sigma ratio above is blind to exactly the
+    # defects this docstring claims to catch: a wrong basis, a dropped
+    # velocity block, or a truncation slip moves OFF-DIAGONAL structure
+    # while leaving the position trace almost untouched. Single-entry
+    # sampling noise is ~1/√n ≈ 6.3% at n = 256, but the worst of 36
+    # correlated entries runs 3–4× that — measured 0.229 here on the
+    # frozen seed, and villeneuve measures 0.223 on its own. The 0.4 bar
+    # is villeneuve's, sitting above the extreme-value band and many
+    # orders below what a basis error produces.
+    denom = np.sqrt(
+        m_fo.diagonal(axis1=1, axis2=2)[:, :, None] * m_fo.diagonal(axis1=1, axis2=2)[:, None, :]
+    )
+    worst = float(np.abs((m_mc - m_fo) / denom).max())
+    assert worst < 0.4, (
+        f"MC vs first-order entrywise gap {worst:.3f} past the n = 256 sampling budget — "
+        "a scalar sigma ratio would not have caught this"
+    )
+
+
+def test_propagate_monte_carlo_below_the_rank_floor_publishes_nothing(
+    orbit: CartesianOrbits, times: Epochs
+) -> None:
+    """Below the 7-draw rank floor no covariance is published at all.
+
+    ``n`` draws give a sample moment of rank ≤ ``n−1``, so a 6×6 built
+    from fewer than 7 is rank-deficient by construction; publishing one
+    would hand back a NaN or all-zero matrix wearing a covariance's name.
+    The absence is the honest answer, and it appears exactly at the
+    floor.
+
+    Mirrors villeneuve ``tests/test_uncertainty_methods.rs::
+    test_monte_carlo_moments_floor``. NOTE: villeneuve also names the
+    reason once per run via ``PropagationWarning::
+    MonteCarloEnsembleBelowFloor``; that warning has no channel on the
+    propagate path at any layer of this distribution (the C ABI marshals
+    a warnings list for ephemeris generation only), so Python can see the
+    absence but not its reason. Tracked as the parity gap it is rather
+    than asserted here.
+    """
+    for n in (1, 6):
+        res = empyrean.propagate(orbit, times, uncertainty_method=MonteCarlo(n_samples=n, seed=3))
+        m = res.states.coordinates.covariance.to_matrix()
+        assert np.isnan(m).all(), (
+            f"n = {n} is below the rank floor — a published covariance here would be "
+            "rank-deficient by construction"
+        )
+
+    at_floor = empyrean.propagate(
+        orbit, times, uncertainty_method=MonteCarlo(n_samples=7, seed=3), tagged_covariance=True
+    )
+    m_floor = at_floor.states.coordinates.covariance.to_matrix()
+    assert np.isfinite(m_floor).all(), "at the floor the ensemble covariance must publish"
+    assert set(at_floor.tagged_covariance.kind.to_pylist()) == {"monte_carlo"}
+
+
+def test_propagate_monte_carlo_without_a_seed_publishes_no_seed(
+    orbit: CartesianOrbits, times: Epochs
+) -> None:
+    """An entropy-seeded run still publishes its ensemble covariance, but
+    reports NO seed beside it.
+
+    ``MonteCarlo(seed=None)`` draws from system entropy, so the ensemble
+    is not reproducible by construction and there is no seed to report.
+    The seed column is null rather than ``0`` — zero is a real,
+    reproducible seed, and reporting it would offer a reproducibility the
+    run cannot deliver. This is the Python end of the C ABI's
+    ``has_mc_seed`` presence flag: ``kind == monte_carlo`` does not imply
+    a seed, so read the flag (here, the null), not the kind.
+    """
+    res = empyrean.propagate(
+        orbit,
+        times,
+        uncertainty_method=MonteCarlo(n_samples=64, seed=None),
+        tagged_covariance=True,
+    )
+    m = res.states.coordinates.covariance.to_matrix()
+    assert np.isfinite(m).all(), "an entropy-seeded run still publishes its ensemble covariance"
+    assert set(res.tagged_covariance.kind.to_pylist()) == {"monte_carlo"}
+    assert set(res.tagged_covariance.mc_seed.to_pylist()) == {None}, (
+        "an entropy-seeded ensemble has no seed to report — null, never 0"
     )
 
 
@@ -327,22 +441,319 @@ def observers():
     )
 
 
-@pytest.mark.parametrize(
-    "method",
-    [
-        UncertaintyMethod.SIGMA_POINT,
-        SigmaPoint(),
-        UncertaintyMethod.MONTE_CARLO,
-        MonteCarlo(n_samples=64, seed=7),
-    ],
-)
-def test_generate_ephemeris_rejects_sampling_methods(
+def _sky_cov(eph) -> np.ndarray:
+    cov = eph.ephemeris.coordinates.covariance
+    assert cov is not None, "sky covariance column missing"
+    return cov.to_matrix()
+
+
+def test_generate_ephemeris_row_carries_sky_cov_kind_and_joint(
+    orbit: CartesianOrbits, observers
+) -> None:
+    """Each ephemeris row carries, beside its bare sky 6x6, the covariance's
+    kind tag and the self-describing packed joint — the same accessors the
+    propagation result exposes. Under SecondOrder the kind is ``second_order``
+    and the joint is a width-6 ``sky`` functional whose state block equals the
+    bare sky covariance; under FirstOrder the kind is ``linear``.
+
+    Mutation record: drop the kind in the C marshaler and the ``second_order``
+    assertion goes red; return the absent joint for a covariance-bearing row
+    and the width-6 / state-block assertions go red.
+    """
+    for method, want in [
+        (UncertaintyMethod.FIRST_ORDER, "linear"),
+        (UncertaintyMethod.SECOND_ORDER, "second_order"),
+    ]:
+        eph = empyrean.generate_ephemeris(orbit, observers, uncertainty_method=method).ephemeris
+        assert len(eph) > 0
+        assert set(eph.cov_kind.to_pylist()) == {want}, f"cov_kind under {method}"
+        bare = eph.coordinates.covariance.to_matrix()
+        for i in range(len(eph)):
+            assert not eph.joint.row_is_empty(i), "a delivered row carries its joint"
+            j = eph.joint.joint(i)
+            assert j is not None
+            assert int(j.width) == 6, "the sky joint is width 6"
+            assert j.functional.value == "sky", "the joint describes the sky functional"
+            assert j.kind.value == want, "the joint's own kind matches cov_kind"
+            np.testing.assert_array_equal(
+                j.state_block(), bare[i], "the joint's state block is the bare sky 6x6"
+            )
+
+
+def test_write_ephemeris_files_carry_cov_kind(orbit: CartesianOrbits, observers, tmp_path) -> None:
+    """The three ephemeris file writers carry each row's covariance KIND as its
+    wire code, so a written parquet / CSV / JSON preserves the kind the CLI and
+    Python API resolved rather than dropping it at the file boundary. Under
+    SecondOrder every row's cov_kind is the SecondOrder code.
+
+    Mutation record: drop cov_kind from ``_ephemeris_to_dict`` (or the C
+    writers) and the files carry the Linear default / no column — every
+    assertion below goes red.
+    """
+    import json
+
+    import pyarrow.parquet as pq
+    from empyrean.io.ephemeris import (
+        write_ephemeris_csv,
+        write_ephemeris_json,
+        write_ephemeris_parquet,
+    )
+    from empyrean.orbits.joint import KIND_TO_CODE, CovarianceKind
+
+    eph = empyrean.generate_ephemeris(
+        orbit, observers, uncertainty_method=UncertaintyMethod.SECOND_ORDER
+    ).ephemeris
+    assert len(eph) > 0
+    want = KIND_TO_CODE[CovarianceKind.SECOND_ORDER]
+
+    pqp, csp, jsp = tmp_path / "e.parquet", tmp_path / "e.csv", tmp_path / "e.json"
+    write_ephemeris_parquet(str(pqp), eph)
+    write_ephemeris_csv(str(csp), eph)
+    write_ephemeris_json(str(jsp), eph)
+
+    t = pq.read_table(str(pqp))
+    assert "cov_kind" in t.column_names, "parquet carries the appended cov_kind column"
+    assert t.column("cov_kind").to_pylist() == [want] * len(eph)
+
+    header = csp.read_text().splitlines()[0].split(",")
+    # cov_kind keeps its position; the six mixture-tally columns were appended
+    # after it, so it is no longer the trailing column.
+    assert "cov_kind" in header, "cov_kind is a CSV column"
+    assert header[-1] == "mix_n_sky_linearization_refused", (
+        "the mixture-tally columns trail cov_kind"
+    )
+
+    rows = json.loads(jsp.read_text())
+    assert [r["cov_kind"] for r in rows] == [want] * len(eph)
+
+
+def test_write_ephemeris_files_round_trip_mixture_tallies(
+    orbit: CartesianOrbits, observers, tmp_path
+) -> None:
+    """The three ephemeris file writers carry each row's six pre-retention
+    mixture tallies through the full Python -> dict -> FFI write path, not just
+    the file schema's empty columns. No fixture splits into a mixture at this
+    engine pin, so a synthetic table stands in: row 0 is a mixture with every
+    tally set to a distinct non-negative value, row 1 is absent (null). After a
+    parquet / CSV / JSON round-trip the mixture row's values survive and the
+    absent row carries the wire's absent encoding (``-1`` counts, NaN weight),
+    never a fabricated 0. The synthetic row's ``cov_kind`` is immaterial here:
+    the write path gates the tally on ``mix_n_components_total >= 0``, not on
+    the kind.
+
+    Mutation record: drop any one of the six ``mix_*`` columns from
+    ``_ephemeris_to_dict`` and ``pydict_to_ephemeris`` refuses the dict by name
+    ("missing 'mix_...'"), so all three writes raise and every assertion below
+    goes red — the columns are required keys, like ``cov_kind``.
+    """
+    import csv
+    import json
+    import math
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from empyrean.io.ephemeris import (
+        write_ephemeris_csv,
+        write_ephemeris_json,
+        write_ephemeris_parquet,
+    )
+
+    base = empyrean.generate_ephemeris(
+        orbit, observers, uncertainty_method=UncertaintyMethod.SECOND_ORDER
+    ).ephemeris
+    assert len(base) >= 2, "need two rows: one synthetic mixture, one absent"
+    eph = (
+        base.take([0, 1])
+        .set_column("mix_n_components_total", pa.array([7, None], type=pa.int64()))
+        .set_column("mix_weight_delivered", pa.array([0.9, None], type=pa.float64()))
+        .set_column("mix_n_failed", pa.array([2, None], type=pa.int64()))
+        .set_column("mix_n_unresolved", pa.array([1, None], type=pa.int64()))
+        .set_column("mix_n_curvature_refused", pa.array([3, None], type=pa.int64()))
+        .set_column("mix_n_sky_linearization_refused", pa.array([4, None], type=pa.int64()))
+    )
+
+    want_mixture = {
+        "mix_n_components_total": 7,
+        "mix_n_failed": 2,
+        "mix_n_unresolved": 1,
+        "mix_n_curvature_refused": 3,
+        "mix_n_sky_linearization_refused": 4,
+    }
+
+    pqp, csp, jsp = tmp_path / "e.parquet", tmp_path / "e.csv", tmp_path / "e.json"
+    write_ephemeris_parquet(str(pqp), eph)
+    write_ephemeris_csv(str(csp), eph)
+    write_ephemeris_json(str(jsp), eph)
+
+    # Parquet: mixture row keeps its values; absent row carries -1 / NaN.
+    t = pq.read_table(str(pqp))
+    for name, want in want_mixture.items():
+        col = t.column(name).to_pylist()
+        assert col[0] == want, f"parquet mixture row keeps {name}={want}"
+        assert col[1] == -1, f"parquet absent row carries -1 for {name}, never 0"
+    w = t.column("mix_weight_delivered").to_pylist()
+    assert w[0] == 0.9, "parquet mixture row keeps the delivered mass"
+    assert math.isnan(w[1]), "parquet absent weight is NaN, never a fabricated 0"
+
+    # JSON: counts are integers (-1 absent, never null); serde maps the absent
+    # weight's NaN to null.
+    rows = json.loads(jsp.read_text())
+    assert len(rows) == 2
+    for name, want in want_mixture.items():
+        assert rows[0][name] == want, f"json mixture row keeps {name}"
+        assert rows[1][name] == -1, f"json absent row carries -1 for {name}, never 0"
+    assert rows[0]["mix_weight_delivered"] == 0.9
+    assert rows[1]["mix_weight_delivered"] is None, "json absent weight serializes as null"
+
+    # CSV: same values via the header-named columns.
+    with open(csp, newline="") as fh:
+        crows = list(csv.DictReader(fh))
+    assert len(crows) == 2
+    for name, want in want_mixture.items():
+        assert int(crows[0][name]) == want, f"csv mixture row keeps {name}"
+        assert int(crows[1][name]) == -1, f"csv absent row carries -1 for {name}, never 0"
+    assert float(crows[0]["mix_weight_delivered"]) == 0.9
+    absent_w = crows[1]["mix_weight_delivered"]
+    assert absent_w == "" or math.isnan(float(absent_w)), (
+        "csv absent weight is the absent encoding (NaN / empty), never 0 or a value"
+    )
+
+
+def test_propagation_states_carry_absent_mixture_tally_by_name(
+    orbit: CartesianOrbits, times: Epochs
+) -> None:
+    """The propagation states' sensitivity table carries the six mixture-tally
+    columns by the validation schema's names. No fixture splits into a mixture
+    at the current engine pin, so every row reads ``None`` (absent) — in
+    particular ``mix_n_sky_linearization_refused`` is read by name and is
+    absent, NOT a fabricated ``0``.
+
+    Mutation record: fabricating ``0`` instead of the ``-1`` / absent sentinel
+    at the C marshal (or wiring the dict to ``0``) turns the ``is None``
+    assertions red — the point of the column is to tell "not carried" from a
+    real ``0``.
+    """
+    result = empyrean.propagate(orbit, times, uncertainty_method=UncertaintyMethod.SECOND_ORDER)
+    sens = result.sensitivity
+    assert sens is not None and len(sens) > 0, "a SecondOrder covariance run traces the STM"
+    for name in (
+        "mix_n_components_total",
+        "mix_weight_delivered",
+        "mix_n_failed",
+        "mix_n_unresolved",
+        "mix_n_curvature_refused",
+        "mix_n_sky_linearization_refused",
+    ):
+        col = getattr(sens, name)
+        assert all(v is None for v in col.to_pylist()), (
+            f"{name} is absent (None) on a non-mixture seam, never a fabricated 0"
+        )
+
+
+def test_generate_ephemeris_rows_carry_absent_mixture_tally_by_name(
+    orbit: CartesianOrbits, observers
+) -> None:
+    """The ephemeris table carries the same six mixture-tally columns by name
+    (1:1 with the states table). No mixture is produced at this engine pin, so
+    every row reads ``None`` — ``mix_n_sky_linearization_refused`` read by name
+    is absent, not ``0``.
+    """
+    eph = empyrean.generate_ephemeris(
+        orbit, observers, uncertainty_method=UncertaintyMethod.SECOND_ORDER
+    ).ephemeris
+    assert len(eph) > 0
+    for name in (
+        "mix_n_components_total",
+        "mix_weight_delivered",
+        "mix_n_failed",
+        "mix_n_unresolved",
+        "mix_n_curvature_refused",
+        "mix_n_sky_linearization_refused",
+    ):
+        col = getattr(eph, name)
+        assert all(v is None for v in col.to_pylist()), (
+            f"{name} is absent (None) on a non-mixture ephemeris row, never 0"
+        )
+
+
+@pytest.mark.parametrize("method", [UncertaintyMethod.SIGMA_POINT, SigmaPoint()])
+def test_generate_ephemeris_sigma_point_delivers_a_sampled_sky_covariance(
     orbit: CartesianOrbits, observers, method
 ) -> None:
-    """The core ephemeris fix: a sampling method is rejected with a
-    typed, descriptive ``ValueError`` — never silently downgraded to the
-    first-order sky covariance (the old hidden-fallback behavior)."""
-    with pytest.raises(ValueError, match="sampling uncertainty methods"):
+    """Mirrors villeneuve ``sigma_sky_matches_linear_on_a_tight_prior``:
+    on this tight (1e-6 AU) prior the unscented sky moment agrees with
+    the first-order projection to better than a percent on the diagonal
+    — and is NOT the same array, which is the delivery witness (the old
+    hidden fallback returned the first-order matrix under the sigma-point
+    name; the wrapper then refused the method outright)."""
+    sp = _sky_cov(empyrean.generate_ephemeris(orbit, observers, uncertainty_method=method))
+    fo = _sky_cov(
+        empyrean.generate_ephemeris(
+            orbit, observers, uncertainty_method=UncertaintyMethod.FIRST_ORDER
+        )
+    )
+    assert sp.shape == fo.shape
+    assert np.isfinite(sp).all(), "sigma-point sky covariance not finite"
+    assert (np.diagonal(sp, axis1=1, axis2=2) >= 0).all()
+    assert not np.array_equal(sp, fo), (
+        "sigma-point sky covariance is bit-identical to first order — the sampled "
+        "delivery did not run"
+    )
+    d_sp = np.diagonal(sp, axis1=1, axis2=2)
+    d_fo = np.diagonal(fo, axis1=1, axis2=2)
+    rel = np.abs(d_sp - d_fo) / np.abs(d_fo)
+    assert (rel < 1e-2).all(), f"sigma vs linear diag rel {rel.max():.2e} on a tight prior"
+
+
+def test_generate_ephemeris_monte_carlo_is_seed_reproducible(
+    orbit: CartesianOrbits, observers
+) -> None:
+    """Mirrors villeneuve ``mc_sky_is_seed_reproducible_and_floor_gated``:
+    the same seed reproduces the delivered rows bit for bit, a different
+    seed moves the sampled moments, and the Monte-Carlo sky is not the
+    first-order projection."""
+    a = _sky_cov(
+        empyrean.generate_ephemeris(
+            orbit, observers, uncertainty_method=MonteCarlo(n_samples=64, seed=7)
+        )
+    )
+    b = _sky_cov(
+        empyrean.generate_ephemeris(
+            orbit, observers, uncertainty_method=MonteCarlo(n_samples=64, seed=7)
+        )
+    )
+    c = _sky_cov(
+        empyrean.generate_ephemeris(
+            orbit, observers, uncertainty_method=MonteCarlo(n_samples=64, seed=8)
+        )
+    )
+    fo = _sky_cov(
+        empyrean.generate_ephemeris(
+            orbit, observers, uncertainty_method=UncertaintyMethod.FIRST_ORDER
+        )
+    )
+    assert np.isfinite(a).all()
+    assert np.array_equal(a, b), "same seed must reproduce the sky moments bit-exactly"
+    assert not np.array_equal(a, c), "a different seed must move the sampled moments"
+    assert not np.array_equal(a, fo), "Monte-Carlo sky is not the first-order projection"
+
+
+@pytest.mark.parametrize(
+    ("method", "name"),
+    [
+        (SigmaPoint(n_sigma=2.0), "SigmaPoint"),
+        (SigmaPoint(samples_per_plane=4), "SigmaPoint"),
+        (MonteCarlo(n_samples=4, seed=7), "MonteCarlo"),
+    ],
+)
+def test_generate_ephemeris_engine_refuses_non_canonical_sampling_by_name(
+    orbit: CartesianOrbits, observers, method, name
+) -> None:
+    """What the engine does not deliver it refuses BY NAME, from the
+    engine (``RuntimeError``), not from a wrapper gate: the unscented set
+    is parameter-free, and an ensemble under 8 draws has no full-rank sky
+    moment."""
+    with pytest.raises(RuntimeError, match=name):
         empyrean.generate_ephemeris(orbit, observers, uncertainty_method=method)
 
 

@@ -3,9 +3,9 @@
 //! Runs the real `empyrean` binary (`CARGO_BIN_EXE_empyrean`) with a JSON
 //! thrust file (`--thrust-arcs`) and asserts the burn reaches the engine
 //! and changes propagation: the thrusted trajectory diverges from the
-//! identical ballistic orbit. A second test asserts the engine's
-//! `dv_corrections` / `correction_covariances` length contract surfaces
-//! as a loud, non-zero-exit CLI error — never silently repaired.
+//! identical ballistic orbit. A second test asserts a thrust file still
+//! carrying the removed `correction_covariances` field is refused by name
+//! as a loud, non-zero-exit CLI error — never silently dropped.
 //!
 //! Needs kernels (`EMPYREAN_DATA_DIR` or `~/.empyrean/data`) + the
 //! `libempyrean` dylib. If the ballistic reference propagation can't run
@@ -102,8 +102,8 @@ fn tmp_dir(tag: &str) -> PathBuf {
     dir
 }
 
-/// A ConstantRTN thrust file (strong burn) with a Δv correction + 3×3
-/// covariance — the full input schema, mirroring the wrapper's
+/// A ConstantRTN thrust file (strong burn) with a Δv correction — the
+/// full input schema, mirroring the wrapper's
 /// `propagate_with_thrust_perturbs_trajectory` scenario.
 const THRUST_JSON: &str = r#"{
     "arcs": [{
@@ -115,8 +115,7 @@ const THRUST_JSON: &str = r#"{
         "sharpness": 100.0,
         "central_body": 10
     }],
-    "dv_corrections": [[0.0, 0.0, 0.0]],
-    "correction_covariances": [[[1e-20, 0, 0], [0, 1e-20, 0], [0, 0, 1e-20]]]
+    "dv_corrections": [[0.0, 0.0, 0.0]]
 }"#;
 
 #[test]
@@ -197,22 +196,22 @@ fn propagate_with_thrust_json_perturbs_trajectory() {
 }
 
 #[test]
-fn thrust_correction_covariance_mismatch_fails_cli() {
+fn thrust_removed_correction_covariances_field_is_refused() {
     let Some(data_dir) = resolve_data_dir() else {
-        eprintln!("skipping thrust_correction_covariance_mismatch_fails_cli: no data dir");
+        eprintln!("skipping thrust_removed_correction_covariances_field_is_refused: no data dir");
         return;
     };
     let data_dir = data_dir.to_str().unwrap().to_string();
 
-    let dir = tmp_dir("mismatch");
+    let dir = tmp_dir("removed_field");
     let input = write_input_orbit(&dir);
     let input = input.to_str().unwrap().to_string();
 
-    // One arc, zero Δv corrections, but a correction covariance: the
-    // engine's ThrustParams contract requires the covariance length to
-    // match the Δv-correction length. Must reach the CLI as a non-zero
-    // exit + named error — never silently dropped/repaired.
-    let mismatch_json = r#"{
+    // A per-correction burn prior rides the orbit's packed joint now, so the
+    // thrust file's old `correction_covariances` carrier is gone. A stale
+    // file still naming it must reach the CLI as a non-zero exit + named
+    // refusal (`deny_unknown_fields`) — never silently dropped.
+    let stale_json = r#"{
         "arcs": [{
             "start_mjd_tdb": 59000.0,
             "end_mjd_tdb": 59010.0,
@@ -224,11 +223,11 @@ fn thrust_correction_covariance_mismatch_fails_cli() {
         }],
         "correction_covariances": [[[1e-20, 0, 0], [0, 1e-20, 0], [0, 0, 1e-20]]]
     }"#;
-    let thrust_path = dir.join("thrust_mismatch.json");
-    std::fs::write(&thrust_path, mismatch_json).expect("write thrust json");
+    let thrust_path = dir.join("thrust_stale.json");
+    std::fs::write(&thrust_path, stale_json).expect("write thrust json");
 
-    // Guard: confirm a plain ballistic run works here (kernels present),
-    // so a failure below is genuinely the contract rejection, not a skip.
+    // Guard: confirm a plain ballistic run works here (kernels present), so
+    // a failure below is genuinely the field refusal, not a context-load skip.
     let ballistic = run_cli(&[
         "--data-dir",
         &data_dir,
@@ -243,7 +242,7 @@ fn thrust_correction_covariance_mismatch_fails_cli() {
         "json",
     ]);
     if !ballistic.status.success() {
-        eprintln!("skipping thrust_correction_covariance_mismatch_fails_cli: no kernels");
+        eprintln!("skipping thrust_removed_correction_covariances_field_is_refused: no kernels");
         return;
     }
 
@@ -264,12 +263,12 @@ fn thrust_correction_covariance_mismatch_fails_cli() {
     ]);
     assert!(
         !out.status.success(),
-        "mismatched correction_covariances must fail the CLI, not degrade silently"
+        "a stale correction_covariances field must fail the CLI, not degrade silently"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("correction_covariances") || stderr.contains("propagation failed"),
-        "CLI error must name the offending field / surface the propagation failure; stderr:\n{stderr}"
+        stderr.contains("correction_covariances"),
+        "CLI error must name the removed field; stderr:\n{stderr}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

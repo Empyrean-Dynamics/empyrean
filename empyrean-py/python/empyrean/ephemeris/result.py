@@ -18,7 +18,9 @@ from empyrean.coordinates.coordinates import (
     SphericalCoordinates,
 )
 from empyrean.ephemeris.sensitivity import ObservationSensitivities
+from empyrean.orbits.joint import PackedJoints
 from empyrean.propagation.config import PropagationConfig
+from empyrean.propagation.status import OrbitOutcome, OrbitStatuses
 
 # ── Ephemeris quivr table ────────────────────────────────────
 
@@ -38,6 +40,19 @@ class Ephemeris(qv.Table):
 
     # Topocentric astrometry (covariance lives inside coordinates)
     coordinates = SphericalCoordinates.as_column()
+
+    # Derivation kind of the row's sky covariance — a
+    # :class:`~empyrean.orbits.joint.CovarianceKind` value, the same
+    # vocabulary the propagation result uses. ``"linear"`` when the row
+    # carried no covariance (read delivery from ``joint`` /
+    # ``coordinates.covariance``, not this tag).
+    cov_kind = qv.LargeStringColumn()
+    # The row's sky covariance as the one packed joint — the same
+    # :class:`~empyrean.orbits.joint.PackedJoints` column the propagation rows
+    # carry, with ``functional == JointFunctional.SKY``. Its leading 6x6
+    # state block is the sky covariance on ``coordinates``. Null for a row
+    # with no covariance.
+    joint = PackedJoints.as_column(nullable=True)
 
     # Aberrated state at light-time corrected epoch
     aberrated_state = CartesianCoordinates.as_column(nullable=True)
@@ -93,6 +108,18 @@ class Ephemeris(qv.Table):
     # Sky motion
     position_angle = qv.Float64Column(nullable=True)
     sky_rate = qv.Float64Column(nullable=True)
+
+    # The engine's pre-retention Gaussian-mixture accounting for this row's sky
+    # covariance — the six tallies that ride WITH a mixture covariance. Column
+    # names match the propagation states table and the validation schema so a
+    # channel row maps 1:1. ``None`` on every non-mixture row, and ``None``
+    # (not 0) on a count the engine did not carry.
+    mix_n_components_total = qv.Int64Column(nullable=True)
+    mix_weight_delivered = qv.Float64Column(nullable=True)
+    mix_n_failed = qv.Int64Column(nullable=True)
+    mix_n_unresolved = qv.Int64Column(nullable=True)
+    mix_n_curvature_refused = qv.Int64Column(nullable=True)
+    mix_n_sky_linearization_refused = qv.Int64Column(nullable=True)
 
 
 # ── Configuration ────────────────────────────────────────────
@@ -189,18 +216,54 @@ class EphemerisResult:
         orbit / observatory / epoch where applicable (e.g.
         Earth-orientation kernel coverage gaps handled by an analytic
         fallback, or rows whose sensitivity chain was skipped).
+    status : OrbitStatuses
+        Per-input-orbit delivery table — one row per input orbit, in input
+        order, whether or not it delivered. A per-orbit failure no longer
+        ends the batch: the failing orbit is carried here as a ``FAILED``
+        row with its classified ``error_code`` and the engine's
+        ``error_message``, while every other orbit still delivers its
+        ephemeris. Read delivery from this table, never from
+        ``len(ephemeris)``. Use :attr:`all_delivered` for the batch verdict
+        and :meth:`rows_for` to select one orbit's ephemeris rows.
     """
 
     ephemeris: Ephemeris
     sensitivity: ObservationSensitivities | None = None
     warnings: list[str] = field(default_factory=list)
+    status: OrbitStatuses = field(default_factory=OrbitStatuses.empty)
+
+    @property
+    def all_delivered(self) -> bool:
+        """Whether every input orbit delivered (no ``FAILED`` status row)."""
+        return self.status.all_delivered
+
+    def rows_for(self, orbit_index: int) -> Ephemeris | None:
+        """The delivered ephemeris rows of input orbit ``orbit_index``.
+
+        Returns the orbit's ``[first_row, first_row + num_rows)`` block of
+        :attr:`ephemeris`, ``None`` if the orbit failed (it delivered no
+        rows), or ``None`` if ``orbit_index`` is out of range. A delivered
+        orbit with zero rows returns an empty table, not ``None``.
+        """
+        if orbit_index < 0 or orbit_index >= len(self.status):
+            return None
+        if self.status.outcome[orbit_index].as_py() != OrbitOutcome.DELIVERED.value:
+            return None
+        first = self.status.first_row[orbit_index].as_py()
+        num = self.status.num_rows[orbit_index].as_py()
+        return self.ephemeris[first : first + num]
 
     def to_dir(self, path: str) -> None:
         """Persist to ``<path>/ephemeris.parquet`` +
-        ``<path>/sensitivity.parquet`` (+ ``<path>/warnings.json`` when
-        the run produced warnings)."""
+        ``<path>/sensitivity.parquet`` + ``<path>/status.parquet`` (+
+        ``<path>/warnings.json`` when the run produced warnings).
+
+        The per-orbit delivery :attr:`status` table rides this Parquet
+        bundle and is read back by :meth:`from_dir`; a flat, state-only
+        export of ``ephemeris`` alone does not carry it."""
         os.makedirs(path, exist_ok=True)
         self.ephemeris.to_parquet(os.path.join(path, "ephemeris.parquet"))
+        self.status.to_parquet(os.path.join(path, "status.parquet"))
         if self.sensitivity is not None and len(self.sensitivity) > 0:
             self.sensitivity.to_parquet(os.path.join(path, "sensitivity.parquet"))
         warn_path = os.path.join(path, "warnings.json")
@@ -225,4 +288,15 @@ class EphemerisResult:
                 warnings = json.load(f)
         else:
             warnings = []
-        return cls(ephemeris=ephemeris, sensitivity=sensitivity, warnings=warnings)
+        status_path = os.path.join(path, "status.parquet")
+        status = (
+            OrbitStatuses.from_parquet(status_path)
+            if os.path.exists(status_path)
+            else OrbitStatuses.empty()
+        )
+        return cls(
+            ephemeris=ephemeris,
+            sensitivity=sensitivity,
+            warnings=warnings,
+            status=status,
+        )

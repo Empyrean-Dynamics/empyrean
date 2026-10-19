@@ -8,7 +8,9 @@ use std::ffi::CString;
 /// Observer state at one epoch.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Observer {
-    /// MPC observatory code (3 characters).
+    /// MPC observatory code (up to 4 characters). Carried across the FFI
+    /// boundary in a fixed 4-byte field; a code longer than four bytes is
+    /// refused by name when marshalled, never truncated.
     pub obs_code: String,
     /// Epoch.
     pub epoch: crate::Epoch,

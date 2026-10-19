@@ -19,44 +19,33 @@ pub enum PhaseFunction {
 }
 
 /// Solar-radiation-pressure force slot: an area-to-mass ratio (the fittable
-/// AMRAT), a fixed radiation-pressure coefficient Cr, and an optional prior
-/// variance that makes AMRAT a fittable parameter. An additive force slot —
-/// combinable with the Marsden non-grav on the same orbit.
+/// AMRAT) and a fixed radiation-pressure coefficient Cr. An additive force
+/// slot — combinable with the Marsden non-grav on the same orbit.
 ///
 /// Only the product \\(C_r \cdot \text{AMRAT}\\) enters the dynamics, so a
 /// fitted AMRAT absorbs Cr (the JPL AMR convention); Cr is fixed, never fitted.
+/// Whether AMRAT is solved, considered, or held is carried by the orbit's
+/// packed [`covariance`](Orbit::covariance) joint (its AMRAT axis) and the OD
+/// solve-for configuration, not by this slot.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct SrpParams {
+pub struct SRPParams {
     /// Area-to-mass ratio AMRAT (m²/kg) — the SRP-effective, fittable
     /// parameter. Must be finite and > 0.
     pub amrat: f64,
     /// Radiation-pressure coefficient Cr (typically 1.0–2.0). Fixed, never
     /// fitted. Must be finite and > 0.
     pub cr: f64,
-    /// Prior variance on AMRAT ((m²/kg)²). `Some(v)` with `v > 0` opens and
-    /// priors the AMRAT column in a `StateAndAMRAT` / `StateAndNonGravAndAMRAT`
-    /// refine; `None` applies SRP as a fixed force.
-    pub amrat_variance: Option<f64>,
 }
 
-impl SrpParams {
+impl SRPParams {
     /// Reconstruct an SRP slot from a C-ABI orbit's SRP fields (`has_srp` +
-    /// `srp_amrat` / `srp_cr` / `srp_amrat_variance`). `has_srp == 0` ⇒ `None`;
-    /// a finite positive variance ⇒ AMRAT carries a fittable prior, else the
-    /// SRP is a fixed force. Shared by every C→`Orbit` reverse-marshal path.
-    pub(crate) fn from_ffi(amrat: f64, cr: f64, has_srp: u8, amrat_variance: f64) -> Option<Self> {
+    /// `srp_amrat` / `srp_cr`). `has_srp == 0` ⇒ `None`. Shared by every
+    /// C→`Orbit` reverse-marshal path.
+    pub(crate) fn from_ffi(amrat: f64, cr: f64, has_srp: u8) -> Option<Self> {
         if has_srp == 0 {
             return None;
         }
-        Some(Self {
-            amrat,
-            cr,
-            amrat_variance: if amrat_variance.is_finite() && amrat_variance > 0.0 {
-                Some(amrat_variance)
-            } else {
-                None
-            },
-        })
+        Some(Self { amrat, cr })
     }
 }
 
@@ -118,15 +107,6 @@ pub struct Orbit {
     /// `None` is the asteroid default (no time delay); SBDB populates
     /// this for some Jupiter-family comets and 2I/Borisov.
     pub non_grav_dt: Option<f64>,
-    /// Prior variance on the non-grav time delay DT (days²). `None` = no
-    /// prior (the DT column stays closed); `Some(v)` with `v > 0` opens and
-    /// priors the DT column in a `StateAndNonGravAndDT` refine.
-    pub non_grav_dt_variance: Option<f64>,
-    /// Fitted non-grav 3×3 covariance for (A1, A2, A3), row-major. Set by
-    /// the OD output path (a fitted orbit) so the orbit re-feeds into a
-    /// `StateAndNonGrav` refine without losing its non-grav prior.
-    /// `None` for hand-built / SBDB / propagate inputs.
-    pub ng_covariance: Option<[[f64; 3]; 3]>,
     /// Phase function. `None` disables magnitude computation in ephemeris
     /// generation; the corresponding row gets `mag = NaN`.
     pub phot_system: Option<PhaseFunction>,
@@ -159,29 +139,25 @@ pub struct Orbit {
     /// short.
     pub phot_covariance: Option<[[f64; 3]; 3]>,
     /// Continuous-thrust parameters (arcs + optional Δv corrections).
-    /// `None` is a pure gravity + non-grav orbit. When
-    /// [`ThrustParams::correction_covariances`] is non-empty the
-    /// resulting burn-sensitivity segments surface in the propagated
-    /// [`TaggedCovariance::thrust_segments`](crate::TaggedCovariance).
+    /// `None` is a pure gravity + non-grav orbit. The per-correction
+    /// burn-prior covariance rides the orbit's packed
+    /// [`covariance`](Self::covariance) joint (its thrust axes).
     pub thrust: Option<ThrustParams>,
     /// Solar-radiation-pressure slot. `None` = no SRP. Additive with the
-    /// Marsden non-grav above; a `Some` with `amrat_variance` set opens the
-    /// AMRAT column in a `StateAndAMRAT` / `StateAndNonGravAndAMRAT` refine.
-    pub srp: Option<SrpParams>,
-    /// Cross-covariance terms beyond the state+Marsden \\(9 \\times 9\\) —
-    /// state↔DT, state↔AMRAT, state↔\\(\Delta v\\), and every mixed
-    /// parameter pair.
+    /// Marsden non-grav above.
+    pub srp: Option<SRPParams>,
+    /// The orbit's covariance over the state and solved parameters, as one
+    /// packed joint — the single covariance home.
     ///
-    /// `None` is an orbit with no such terms, which is what every
-    /// hand-built and SBDB orbit is. Set it from a fit's own
-    /// [`JointCovariance`](crate::JointCovariance) to hand the next leg
-    /// the joint that fit computed rather than its diagonal blocks.
-    ///
-    /// The state↔Marsden border is NOT here — it rides
-    /// [`CoordinateState::non_grav_cross`](crate::CoordinateState::non_grav_cross),
-    /// beside the 6×6 it borders, so the two halves of one matrix travel
-    /// together through a transform.
-    pub wide_cross: Option<crate::WideCross>,
+    /// `None` is an orbit with no covariance, which is what every hand-built
+    /// orbit is. Set it from a fit's own joint (a
+    /// [`DetermineEntry`](crate::DetermineEntry)'s joint, or the covariance
+    /// read off a propagated state) to hand the next leg the whole
+    /// \\((6+P)\\)-wide matrix the fit computed rather than its diagonal
+    /// blocks. The leading \\(6 \times 6\\) is the state block; the parameter
+    /// columns (Marsden / DT / AMRAT / thrust) follow per the joint's
+    /// [`layout`](crate::AxisLayout).
+    pub covariance: Option<crate::PackedJoint>,
 }
 
 impl Orbit {
@@ -201,8 +177,6 @@ impl Orbit {
             ng_n: 0.0,
             ng_k: 0.0,
             non_grav_dt: None,
-            non_grav_dt_variance: None,
-            ng_covariance: None,
             phot_system: None,
             h_mag: f64::NAN,
             slope1: 0.0,
@@ -210,7 +184,7 @@ impl Orbit {
             phot_covariance: None,
             thrust: None,
             srp: None,
-            wide_cross: None,
+            covariance: None,
         }
     }
 
@@ -264,20 +238,11 @@ impl Orbit {
         self
     }
 
-    /// Set the prior variance on the non-grav time delay DT (days²). Pass
-    /// `None` (the default) to leave the DT column closed; pass `Some(v)`
-    /// with `v > 0` to open and prior the DT column in a
-    /// `StateAndNonGravAndDT` refine.
-    pub fn with_non_grav_dt_variance(mut self, v: Option<f64>) -> Self {
-        self.non_grav_dt_variance = v;
-        self
-    }
-
-    /// Attach the fitted non-grav 3×3 covariance for (A1, A2, A3). Set by
-    /// the OD output path so a fitted orbit re-feeds into a `StateAndNonGrav`
-    /// refine without losing its non-grav prior.
-    pub fn with_nongrav_covariance(mut self, covariance: Option<[[f64; 3]; 3]>) -> Self {
-        self.ng_covariance = covariance;
+    /// Attach the orbit's covariance as one packed joint — the single
+    /// covariance home. Set it from a fit's own joint so a fitted orbit
+    /// re-feeds the whole \\((6+P)\\)-wide matrix into the next leg.
+    pub fn with_covariance(mut self, joint: crate::PackedJoint) -> Self {
+        self.covariance = Some(joint);
         self
     }
 
@@ -307,12 +272,9 @@ impl Orbit {
     /// Pass `None` (the default) for an orbit with no photometric
     /// uncertainty.
     ///
-    /// The companion to [`Orbit::with_photometry`], in the same shape as
-    /// [`Orbit::with_nongrav_covariance`] /
-    /// [`Orbit::with_non_grav_dt_variance`] /
-    /// [`Orbit::with_srp_amrat_variance`]: the parameters and their
-    /// covariance are set separately because most orbits carry the
-    /// former without the latter.
+    /// The companion to [`Orbit::with_photometry`]: the photometric
+    /// parameters and their covariance are set separately because most orbits
+    /// carry the former without the latter.
     ///
     /// With it attached, ephemeris generation reports
     /// \\[
@@ -363,37 +325,22 @@ impl Orbit {
     }
 
     /// Attach continuous-thrust parameters (arcs + optional Δv
-    /// corrections). Pass `None` for a pure gravity + non-grav orbit.
-    /// A non-empty [`ThrustParams::correction_covariances`] engages the
-    /// burn-sensitivity propagation whose solved segments appear in the
-    /// output [`TaggedCovariance::thrust_segments`](crate::TaggedCovariance).
+    /// corrections). Pass `None` for a pure gravity + non-grav orbit. The
+    /// burn-prior covariance rides the orbit's packed
+    /// [`covariance`](Orbit::covariance) joint (its thrust axes).
     pub fn with_thrust(mut self, thrust: Option<ThrustParams>) -> Self {
         self.thrust = thrust;
         self
     }
 
-    /// Attach a solar-radiation-pressure slot (a fixed force) with the given
-    /// area-to-mass ratio AMRAT (m²/kg) and radiation coefficient Cr. Combine
-    /// with a Marsden non-grav on the same orbit via [`Orbit::with_nongrav`].
-    /// Make AMRAT fittable with [`Orbit::with_srp_amrat_variance`].
+    /// Attach a solar-radiation-pressure slot with the given area-to-mass
+    /// ratio AMRAT (m²/kg) and radiation coefficient Cr. Combine with a
+    /// Marsden non-grav on the same orbit via [`Orbit::with_nongrav`]. Whether
+    /// AMRAT is solved is carried by the orbit's packed
+    /// [`covariance`](Orbit::covariance) joint and the OD solve-for
+    /// configuration, not by this slot.
     pub fn with_srp(mut self, amrat: f64, cr: f64) -> Self {
-        let amrat_variance = self.srp.and_then(|s| s.amrat_variance);
-        self.srp = Some(SrpParams {
-            amrat,
-            cr,
-            amrat_variance,
-        });
-        self
-    }
-
-    /// Make the SRP AMRAT a fittable parameter by attaching a prior variance
-    /// ((m²/kg)²) — the trigger + Bayesian prior that opens the AMRAT column in
-    /// a `StateAndAMRAT` / `StateAndNonGravAndAMRAT` refine. Requires an SRP
-    /// slot first ([`Orbit::with_srp`]); a no-op if none is set.
-    pub fn with_srp_amrat_variance(mut self, v: Option<f64>) -> Self {
-        if let Some(srp) = self.srp.as_mut() {
-            srp.amrat_variance = v;
-        }
+        self.srp = Some(SRPParams { amrat, cr });
         self
     }
 
@@ -458,11 +405,6 @@ impl Orbit {
             .as_ref()
             .map(|tp| tp.dv_corrections.clone())
             .unwrap_or_default();
-        let correction_covariances: Vec<[[f64; 3]; 3]> = self
-            .thrust
-            .as_ref()
-            .map(|tp| tp.correction_covariances.clone())
-            .unwrap_or_default();
         // `slice::as_ptr` on an empty Vec is non-null (dangling); the C
         // ABI keys off the length, but keep the null/0 pairing explicit so
         // an empty side array reads as "absent", matching every other
@@ -477,27 +419,20 @@ impl Orbit {
         } else {
             dv_corrections.as_ptr()
         };
-        let correction_covariances_ptr = if correction_covariances.is_empty() {
-            std::ptr::null()
-        } else {
-            correction_covariances.as_ptr()
-        };
-        // The wide carrier's two side arrays follow the same
-        // caller-owned / borrowed-for-the-call contract as the thrust
-        // arrays above, and the keepalive owns them for the same reason.
-        let (state_param_cross, param_pair_cross) = match self.wide_cross.as_ref() {
-            Some(w) => w.to_ffi_arrays(),
-            None => (Vec::new(), Vec::new()),
-        };
-        let state_param_cross_ptr = if state_param_cross.is_empty() {
-            std::ptr::null()
-        } else {
-            state_param_cross.as_ptr()
-        };
-        let param_pair_cross_ptr = if param_pair_cross.is_empty() {
-            std::ptr::null()
-        } else {
-            param_pair_cross.as_ptr()
+        // The packed joint's triangle follows the same caller-owned /
+        // borrowed-for-the-call contract as the thrust arrays above: the
+        // keepalive owns the Vec and the `EmpyreanPackedJoint` on
+        // `EmpyreanOrbit::covariance` borrows a raw pointer into it (a Vec's
+        // heap buffer address is stable across the move into the keep). An
+        // absent joint is the width-0 default — null `tri`, nothing to free.
+        let cov_tri: Vec<f64> = self
+            .covariance
+            .as_ref()
+            .map(|p| p.tri.clone())
+            .unwrap_or_default();
+        let covariance = match self.covariance.as_ref() {
+            Some(p) => p.to_ffi_borrowing(&cov_tri)?,
+            None => empyrean_sys::EmpyreanPackedJoint::default(),
         };
         let ffi = empyrean_sys::EmpyreanOrbit {
             state: self.state.to_ffi()?,
@@ -515,14 +450,6 @@ impl Orbit {
             // struct can't carry an Option directly. The C side checks
             // is_finite() to decide whether to populate NonGravParams.dt.
             non_grav_dt: self.non_grav_dt.unwrap_or(f64::NAN),
-            // C ABI uses NaN as the "no DT prior" sentinel; the C side checks
-            // is_finite() && > 0 to decide whether to open + prior the DT
-            // column in a StateAndNonGravAndDT fit.
-            non_grav_dt_variance: self.non_grav_dt_variance.unwrap_or(f64::NAN),
-            // Carry the fitted non-grav prior covariance into the FFI so a
-            // fitted orbit re-feeds into a StateAndNonGrav refine.
-            has_non_grav_covariance: u8::from(self.ng_covariance.is_some()),
-            non_grav_covariance: self.ng_covariance.unwrap_or([[0.0; 3]; 3]),
             phot_system: phase_int,
             h_mag: h,
             slope1: s1,
@@ -531,23 +458,15 @@ impl Orbit {
             n_thrust_arcs: thrust_arcs.len(),
             dv_corrections: dv_corrections_ptr,
             n_dv_corrections: dv_corrections.len(),
-            correction_covariances: correction_covariances_ptr,
-            n_correction_covariances: correction_covariances.len(),
             // SRP slot. `has_srp` is the explicit switch (SRP is never
-            // value-inferred); the C side reads the amrat/cr/variance only
-            // when it is 1. NaN variance = fixed-force SRP (AMRAT column
-            // closed); finite > 0 opens + priors the AMRAT column.
+            // value-inferred); the C side reads amrat/cr only when it is 1.
             has_srp: u8::from(self.srp.is_some()),
             srp_amrat: self.srp.map(|s| s.amrat).unwrap_or(0.0),
             srp_cr: self.srp.map(|s| s.cr).unwrap_or(0.0),
-            srp_amrat_variance: self.srp.and_then(|s| s.amrat_variance).unwrap_or(f64::NAN),
-            state_param_cross: state_param_cross_ptr,
-            n_state_param_cross: state_param_cross.len(),
-            param_pair_cross: param_pair_cross_ptr,
-            n_param_pair_cross: param_pair_cross.len(),
-            // Photometric parameter covariance. Same explicit-switch
-            // shape as `has_non_grav_covariance` above; the C side reads
-            // the 3×3 only when the switch is 1.
+            // The orbit's covariance as one packed joint, borrowing `cov_tri`.
+            covariance,
+            // Photometric parameter covariance. Explicit-switch shape; the C
+            // side reads the 3×3 only when the switch is 1.
             has_phot_covariance: u8::from(self.phot_covariance.is_some()),
             phot_covariance: self.phot_covariance.unwrap_or([[0.0; 3]; 3]),
         };
@@ -556,9 +475,7 @@ impl Orbit {
             _object_id: object_id_cstr,
             _thrust_arcs: thrust_arcs,
             _dv_corrections: dv_corrections,
-            _correction_covariances: correction_covariances,
-            _state_param_cross: state_param_cross,
-            _param_pair_cross: param_pair_cross,
+            _cov_tri: cov_tri,
         };
         Ok((ffi, keep))
     }
@@ -624,12 +541,9 @@ pub(crate) struct OrbitFfiKeep {
     _thrust_arcs: Vec<empyrean_sys::EmpyreanThrustArc>,
     /// Δv-correction side array the FFI `EmpyreanOrbit` borrows.
     _dv_corrections: Vec<[f64; 3]>,
-    /// Correction-covariance side array the FFI `EmpyreanOrbit` borrows.
-    _correction_covariances: Vec<[[f64; 3]; 3]>,
-    /// State↔parameter cross columns the FFI `EmpyreanOrbit` borrows.
-    _state_param_cross: Vec<empyrean_sys::EmpyreanStateParamCross>,
-    /// Parameter↔parameter cross terms the FFI `EmpyreanOrbit` borrows.
-    _param_pair_cross: Vec<empyrean_sys::EmpyreanParamPairCross>,
+    /// The packed joint's lower triangle the FFI `EmpyreanOrbit.covariance`
+    /// borrows.
+    _cov_tri: Vec<f64>,
 }
 
 /// Marshal a batch of orbits into their FFI representation plus the
@@ -675,65 +589,62 @@ mod srp_tests {
     fn no_srp_marshals_absent() {
         let (ffi, _keep) = cartesian_orbit().to_ffi_with_keep().unwrap();
         assert_eq!(ffi.has_srp, 0);
-        assert!(
-            SrpParams::from_ffi(
-                ffi.srp_amrat,
-                ffi.srp_cr,
-                ffi.has_srp,
-                ffi.srp_amrat_variance
-            )
-            .is_none()
-        );
+        assert!(SRPParams::from_ffi(ffi.srp_amrat, ffi.srp_cr, ffi.has_srp).is_none());
     }
 
     #[test]
-    fn fixed_force_srp_round_trips() {
+    fn srp_round_trips() {
         let o = cartesian_orbit().with_srp(3.0e-3, 1.2);
         let (ffi, _keep) = o.to_ffi_with_keep().unwrap();
         assert_eq!(ffi.has_srp, 1);
         assert_eq!(ffi.srp_amrat, 3.0e-3);
         assert_eq!(ffi.srp_cr, 1.2);
-        assert!(ffi.srp_amrat_variance.is_nan()); // no prior ⇒ fixed force
-        let back = SrpParams::from_ffi(
-            ffi.srp_amrat,
-            ffi.srp_cr,
-            ffi.has_srp,
-            ffi.srp_amrat_variance,
-        )
-        .unwrap();
+        let back = SRPParams::from_ffi(ffi.srp_amrat, ffi.srp_cr, ffi.has_srp).unwrap();
         assert_eq!(
             back,
-            SrpParams {
+            SRPParams {
                 amrat: 3.0e-3,
-                cr: 1.2,
-                amrat_variance: None
+                cr: 1.2
             }
         );
     }
 
     #[test]
-    fn fittable_srp_round_trips() {
-        let o = cartesian_orbit()
-            .with_srp(3.0e-3, 1.0)
-            .with_srp_amrat_variance(Some(1.0e-8));
+    fn a_packed_joint_marshals_onto_the_orbit_covariance() {
+        // The orbit's packed joint is the single covariance home; marshaling
+        // sets `EmpyreanOrbit.covariance` and the kept triangle backs its
+        // borrowed `tri` pointer. Synthetic Cartesian: no basis scaling.
+        let tri: Vec<f64> = (0..21).map(|i| 1.0 + i as f64).collect();
+        let joint = crate::PackedJoint {
+            layout: crate::AxisLayout {
+                present: 0b111_111,
+                considered: 0,
+                marginalized: 0,
+            },
+            width: 6,
+            tri: tri.clone(),
+            kind: crate::CovarianceKind::Linear,
+            quality: crate::JointQuality::PositiveDefinite,
+            functional: crate::JointFunctional::State,
+            provenance: crate::JointProvenance::Derived,
+            asserted_source: None,
+        };
+        let o = cartesian_orbit().with_covariance(joint);
         let (ffi, _keep) = o.to_ffi_with_keep().unwrap();
-        assert_eq!(ffi.srp_amrat_variance, 1.0e-8);
-        let back = SrpParams::from_ffi(
-            ffi.srp_amrat,
-            ffi.srp_cr,
-            ffi.has_srp,
-            ffi.srp_amrat_variance,
-        )
-        .unwrap();
-        assert_eq!(back.amrat_variance, Some(1.0e-8));
+        assert_eq!(ffi.covariance.width, 6);
+        assert_eq!(ffi.covariance.tri_len, 21);
+        let borrowed =
+            unsafe { std::slice::from_raw_parts(ffi.covariance.tri, ffi.covariance.tri_len) };
+        for (a, b) in borrowed.iter().zip(tri.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
     }
 
     #[test]
-    fn amrat_variance_without_srp_is_noop() {
-        // The variance builder requires an SRP slot; without one it's a no-op
-        // (never fabricates a slot).
-        let o = cartesian_orbit().with_srp_amrat_variance(Some(1.0e-8));
-        assert!(o.srp.is_none());
+    fn no_covariance_marshals_the_absent_joint() {
+        let (ffi, _keep) = cartesian_orbit().to_ffi_with_keep().unwrap();
+        assert_eq!(ffi.covariance.width, 0);
+        assert!(ffi.covariance.tri.is_null());
     }
 }
 

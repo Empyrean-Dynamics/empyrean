@@ -6,7 +6,8 @@ use crate::error::{Error, Result};
 use crate::observers::{Observer, obs_code_from_bytes};
 use crate::orbit::Orbit;
 use crate::propagate::{
-    DiagnosticsConfig, EventConfig, ForceModelTier, PropagationConfig, UncertaintyMethod,
+    DiagnosticsConfig, EventConfig, ForceModelTier, OrbitOutcome, PropagationConfig,
+    UncertaintyMethod,
 };
 use std::ffi::CStr;
 
@@ -110,16 +111,42 @@ pub struct EphemerisEntry {
     /// 6×6 Cartesian covariance of the aberrated state, row-major. `None`
     /// when the input orbit carried no state covariance.
     pub aberrated_covariance: Option<[[f64; 6]; 6]>,
+    /// Derivation kind of the row's sky covariance — the same
+    /// [`CovarianceKind`](crate::CovarianceKind) vocabulary the propagation
+    /// result carries. The bare [`covariance`](Self::covariance) 6×6 is the
+    /// moment this names: [`Linear`](crate::CovarianceKind::Linear) under a
+    /// first-order method, [`SecondOrder`](crate::CovarianceKind::SecondOrder)
+    /// under a second-order one, and so on. `Linear` when
+    /// [`covariance`](Self::covariance) is `None` (no uncertainty path ran) —
+    /// read delivery from `covariance` / [`joint`](Self::joint), not this tag.
+    pub cov_kind: crate::CovarianceKind,
+    /// The row's sky covariance as one packed joint — the single covariance
+    /// home, the same [`PackedJoint`](crate::PackedJoint) the propagation rows
+    /// carry, with [`functional`](crate::JointFunctional::Sky) `Sky`. Its
+    /// [`state_block`](crate::PackedJoint::state_block) equals
+    /// [`covariance`](Self::covariance) (the same (AU, deg) sky 6×6). `None`
+    /// when the input orbit carried no state covariance.
+    pub joint: Option<crate::PackedJoint>,
+    /// The engine's pre-retention mixture accounting for this row's sky
+    /// covariance, or `None` when it was not derived as a mixture. See
+    /// [`MixtureTally`](crate::MixtureTally).
+    pub mixture_tally: Option<crate::MixtureTally>,
 }
 
 impl EphemerisEntry {
-    pub(crate) fn from_ffi(e: &empyrean_sys::EmpyreanEphemerisEntry) -> Self {
+    pub(crate) fn from_ffi(e: &empyrean_sys::EmpyreanEphemerisEntry) -> Result<Self> {
         let orbit_id = if e.orbit_id.is_null() {
             String::new()
         } else {
             unsafe { CStr::from_ptr(e.orbit_id).to_string_lossy().into_owned() }
         };
-        Self {
+        // The sky covariance kind and the packed joint beside the bare 6×6.
+        // A kind tag this build has no variant for, or a malformed joint, is
+        // refused by name here (the same loud decode the propagation rows
+        // take) rather than defaulted.
+        let cov_kind = crate::CovarianceKind::from_u8(e.cov_kind)?;
+        let joint = unsafe { crate::PackedJoint::from_ffi(&e.joint) }?;
+        Ok(Self {
             orbit_id,
             epoch: crate::Epoch::from_mjd_tdb(e.epoch_mjd_tdb),
             ra_deg: e.ra_deg,
@@ -145,7 +172,10 @@ impl EphemerisEntry {
             aberrated_state: e.aberrated_state,
             aberrated_covariance: (e.has_aberrated_covariance != 0)
                 .then_some(e.aberrated_covariance),
-        }
+            cov_kind,
+            joint,
+            mixture_tally: crate::MixtureTally::from_ffi(e.has_mixture_tally, &e.mixture_tally),
+        })
     }
 }
 
@@ -235,10 +265,31 @@ pub struct ObservationSensitivity {
     /// Hessian ∂²(observable)/∂(input)², row-major `[6][n_params][n_params]`
     /// flattened. Empty unless a second-order method ran.
     ///
+    /// The tensor is COMPOSED to the same input axis as
+    /// [`jacobian`](Self::jacobian) — the orbit-epoch state in
+    /// `frame`/`origin` — so the pair is one second-order expansion
+    /// (villeneuve 1.25.0; earlier engines published the LOCAL
+    /// topocentric second derivative here, a different input domain from
+    /// the Jacobian beside it, and any consumer that contracted the two
+    /// together read the wrong quantity). Populated on `SecondOrder`
+    /// rows of orbits declaring a state covariance and no solved
+    /// force-model parameters, where `n_params == 6`; empty on every
+    /// other row.
+    ///
     /// Leading index is the observable, in the same order and the same
     /// units-per-input-unit as [`jacobian`](Self::jacobian) — index it
     /// with the same `SENSITIVITY_ROW_*` constants. Element `(row, i, j)`
     /// is `hessian[(row * np + i) * np + j]` with `np = n_params as usize`.
+    ///
+    /// # Consumer note (fold builders)
+    ///
+    /// The per-row sky covariance delivered alongside this tensor under
+    /// a second-order method is the moment **about the published
+    /// nominal**: it already contains the mean-shift outer product
+    /// `δμ_a · δμ_b`, with `δμ_a = ½ tr(H_a Σ)` built from THIS tensor.
+    /// A consumer building its own bias-corrected update must not ALSO
+    /// subtract that shift from the innovation while using the delivered
+    /// matrix as its noise term — that double-counts the correction.
     pub hessian: Vec<f64>,
     /// Frame of the input axis (Frame enum as int).
     pub frame: i32,
@@ -305,6 +356,38 @@ pub struct EphemerisResult {
     /// or rows whose observation-sensitivity chain was skipped
     /// (astrometry present, partials absent).
     pub warnings: Vec<String>,
+    /// Per-input-orbit delivery outcome, one entry per input orbit in input
+    /// order. A per-orbit generation failure is carried here rather than ending
+    /// the batch; read delivery from this, never from a row count. A failed
+    /// orbit's [`code`](OrbitOutcome::Failed) is an `EMPYREAN_EPHEMERIS_FAILURE_*`
+    /// value. Map entries to orbits with [`rows_for`](EphemerisResult::rows_for).
+    pub outcomes: Vec<OrbitOutcome>,
+}
+
+impl EphemerisResult {
+    /// The INPUT orbit count — one [`OrbitOutcome`] per input orbit.
+    pub fn num_orbits(&self) -> usize {
+        self.outcomes.len()
+    }
+
+    /// Whether every input orbit was delivered.
+    pub fn all_delivered(&self) -> bool {
+        self.outcomes.iter().all(OrbitOutcome::is_delivered)
+    }
+
+    /// The delivered ephemeris entries of input orbit `orbit_index`, or `None`
+    /// if the index is out of range or the orbit failed. A delivered orbit with
+    /// no entries returns an empty slice — delivery is the outcome, never the
+    /// row count.
+    pub fn rows_for(&self, orbit_index: usize) -> Option<&[EphemerisEntry]> {
+        match self.outcomes.get(orbit_index)? {
+            OrbitOutcome::Delivered {
+                first_row,
+                num_rows,
+            } => self.entries.get(*first_row..*first_row + *num_rows),
+            OrbitOutcome::Failed { .. } => None,
+        }
+    }
 }
 
 /// Ephemeris-generation configuration.
@@ -466,10 +549,16 @@ impl Context {
     /// Generate predicted ephemeris for orbits as seen by observers.
     ///
     /// Returns `num_orbits * num_observers` entries, orbit-major; within
-    /// each orbit, entries (and [`ObservationSensitivity`] rows) follow
-    /// the **observer-input order**. Each observer carries its own epoch,
-    /// so there is no separate epoch axis — positional pairing against
-    /// the input observers is safe within an orbit block.
+    /// each orbit, entries and [`ObservationSensitivity`] rows follow the
+    /// **observer-input order**, so the two pair up position for position.
+    /// Each observer carries its own epoch, so there is no separate epoch
+    /// axis — positional pairing against the input observers is safe within
+    /// an orbit block. A row whose sensitivity chain the engine could not
+    /// build is omitted, so [`sensitivity`](EphemerisResult::sensitivity)
+    /// can be shorter than [`entries`](EphemerisResult::entries); realign
+    /// that case on each row's
+    /// [`obs_code`](ObservationSensitivity::obs_code) and
+    /// [`epoch_mjd_tdb`](ObservationSensitivity::epoch_mjd_tdb).
     pub fn generate_ephemeris(
         &self,
         orbits: &[Orbit],
@@ -487,6 +576,8 @@ impl Context {
             num_sensitivity: 0,
             warnings: std::ptr::null_mut(),
             num_warnings: 0,
+            num_orbits: 0,
+            outcomes: std::ptr::null_mut(),
         };
         let (ffi_config, _config_keep) = config.to_ffi_with()?;
         let code = unsafe {
@@ -503,7 +594,7 @@ impl Context {
         if code != 0 {
             return Err(Error::capture(code));
         }
-        Ok(marshal_ephemeris_result(&mut result))
+        marshal_ephemeris_result(&mut result)
     }
 }
 
@@ -519,15 +610,16 @@ pub(crate) fn observers_to_ffi(
         .map(|o| {
             let mut code_bytes = [0u8; 4];
             let src = o.obs_code.as_bytes();
-            // The engine's observatory registry keys 3-byte MPC codes. A
-            // longer code must not be truncated: its 3-byte prefix would
-            // silently resolve to a DIFFERENT observatory (wrong
-            // topocentric geometry, no diagnostic).
-            if src.len() > 3 {
+            // The observatory code rides into the fixed 4-byte FFI field,
+            // left-aligned and NUL-padded; a 4-character code fills all four
+            // bytes. A code longer than the field is refused by name rather
+            // than truncated — a clipped code silently resolves to a
+            // DIFFERENT observatory (wrong topocentric geometry, no
+            // diagnostic).
+            if src.len() > 4 {
                 return Err(Error::invalid_input(format!(
-                    "observatory code \"{}\" is longer than 3 bytes; \
-                     4-character MPC codes are not yet supported by the \
-                     engine's observatory registry",
+                    "observatory code \"{}\" is longer than the 4-byte MPC code \
+                     field; truncating it would name a different observatory",
                     o.obs_code
                 )));
             }
@@ -561,9 +653,12 @@ pub(crate) fn observers_to_ffi(
 /// so both produce byte-identical output.
 pub(crate) fn marshal_ephemeris_result(
     result: &mut empyrean_sys::EmpyreanEphemerisResult,
-) -> EphemerisResult {
-    let entries = if result.entries.is_null() {
-        Vec::new()
+) -> Result<EphemerisResult> {
+    // Decode fallibly, but free the C result BEFORE propagating any decode
+    // error (an unknown covariance-kind tag or a malformed joint) so the
+    // error path leaks nothing.
+    let entries_res: Result<Vec<EphemerisEntry>> = if result.entries.is_null() {
+        Ok(Vec::new())
     } else {
         unsafe {
             std::slice::from_raw_parts(result.entries, result.num_entries)
@@ -598,12 +693,44 @@ pub(crate) fn marshal_ephemeris_result(
                 .collect()
         }
     };
+    // Per-input-orbit delivery outcomes. Extracted BEFORE the free, since the
+    // owning C strings are released by `empyrean_ephemeris_result_free`. A
+    // failed orbit's `code` is an `EMPYREAN_EPHEMERIS_FAILURE_*` value.
+    let outcomes: Vec<OrbitOutcome> = if result.outcomes.is_null() {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(result.outcomes, result.num_orbits) }
+            .iter()
+            .map(|o| {
+                if o.status == empyrean_sys::EMPYREAN_ORBIT_OUTCOME_FAILED {
+                    let message = if o.error_message.is_null() {
+                        String::new()
+                    } else {
+                        unsafe { CStr::from_ptr(o.error_message) }
+                            .to_string_lossy()
+                            .into_owned()
+                    };
+                    OrbitOutcome::Failed {
+                        code: o.error_code,
+                        message,
+                    }
+                } else {
+                    OrbitOutcome::Delivered {
+                        first_row: o.first_row,
+                        num_rows: o.num_rows,
+                    }
+                }
+            })
+            .collect()
+    };
     unsafe { empyrean_sys::empyrean_ephemeris_result_free(result) };
-    EphemerisResult {
+    let entries = entries_res?;
+    Ok(EphemerisResult {
         entries,
         sensitivity,
         warnings,
-    }
+        outcomes,
+    })
 }
 
 #[cfg(test)]
@@ -643,44 +770,60 @@ mod tests {
         assert_eq!(rows, [0, 1, 2, 3, 4, 5]);
     }
 
-    /// A 4-character observatory code must be a loud error at the FFI
-    /// boundary: clipped to 3 bytes it would silently alias a different
-    /// observatory.
-    #[test]
-    fn four_char_obs_code_is_rejected() {
-        let observer = Observer {
-            obs_code: "W68a".to_string(),
+    fn observer_with_code(code: &str) -> Observer {
+        Observer {
+            obs_code: code.to_string(),
             epoch: crate::Epoch::from_mjd_tdb(61000.0),
             position: [1.0, 0.0, 0.0],
             velocity: [0.0, 0.01, 0.0],
             observing_night: -1,
             frame: crate::Frame::ICRF,
             origin: crate::Origin::SSB,
-        };
-        let err = observers_to_ffi(&[observer])
-            .expect_err("4-character observatory code must not marshal");
-        let msg = err.to_string();
-        assert!(msg.contains("W68a"), "error names the code: {msg}");
-        assert!(
-            msg.contains("longer than 3 bytes"),
-            "error states the contract: {msg}"
+        }
+    }
+
+    /// A 4-character observatory code round-trips through the ephemeris
+    /// observer carrier: it fills all four bytes of the FFI field (no
+    /// terminator) and reads back byte-for-byte. (Restoring the old
+    /// `min(3)` / reject-over-3 marshal reddens this: the code would be
+    /// clipped to or rejected at three characters.)
+    #[test]
+    fn four_char_obs_code_round_trips() {
+        let ffi =
+            observers_to_ffi(&[observer_with_code("W68a")]).expect("4-character code marshals");
+        assert_eq!(&ffi[0].obs_code, b"W68a");
+        assert_eq!(
+            crate::observers::obs_code_from_bytes(&ffi[0].obs_code),
+            "W68a",
+            "the 4-byte field reads back the full code"
         );
     }
 
-    /// 3-character (and shorter) codes still marshal, NUL-padded.
+    /// A shorter code (the classic 3-byte MPC code) still marshals,
+    /// NUL-padded, and reads back without the padding.
     #[test]
     fn three_char_obs_code_marshals() {
-        let observer = Observer {
-            obs_code: "W68".to_string(),
-            epoch: crate::Epoch::from_mjd_tdb(61000.0),
-            position: [1.0, 0.0, 0.0],
-            velocity: [0.0, 0.01, 0.0],
-            observing_night: -1,
-            frame: crate::Frame::ICRF,
-            origin: crate::Origin::SSB,
-        };
-        let ffi = observers_to_ffi(&[observer]).expect("3-character code marshals");
+        let ffi = observers_to_ffi(&[observer_with_code("W68")]).expect("3-byte code marshals");
         assert_eq!(&ffi[0].obs_code, b"W68\0");
+        assert_eq!(
+            crate::observers::obs_code_from_bytes(&ffi[0].obs_code),
+            "W68"
+        );
+    }
+
+    /// A 5-character code does not fit the 4-byte field, so it is refused
+    /// by name rather than truncated. (Truncating to four bytes instead of
+    /// refusing reddens this.)
+    #[test]
+    fn five_char_obs_code_is_refused_by_name() {
+        let err = observers_to_ffi(&[observer_with_code("W68ab")])
+            .expect_err("5-character observatory code must not marshal");
+        let msg = err.to_string();
+        assert!(msg.contains("W68ab"), "error names the code: {msg}");
+        assert!(
+            msg.contains("4-byte"),
+            "error states the field width: {msg}"
+        );
     }
 }
 
@@ -903,5 +1046,321 @@ mod ephemeris_config_validation_tests {
         assert!(d.sensitivity_threshold.is_nan());
         assert!(d.lyapunov_threshold.is_nan());
         assert!(d.nonlinearity_threshold.is_nan());
+    }
+}
+
+#[cfg(test)]
+mod outcome_channel_tests {
+    use super::*;
+    use crate::coordinate::CoordinateState;
+    use crate::{Context, Epoch, Frame, Orbit, Origin};
+    use std::path::PathBuf;
+
+    fn try_context() -> Option<Context> {
+        let candidates = [
+            std::env::var("EMPYREAN_DATA_DIR").ok().map(PathBuf::from),
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".empyrean/data")),
+        ];
+        for dir in candidates.into_iter().flatten() {
+            if let Ok(ctx) = Context::from_data_dir(Some(&dir)) {
+                return Some(ctx);
+            }
+        }
+        None
+    }
+
+    fn delivered(id: &str, px: f64) -> Orbit {
+        let state = CoordinateState::cartesian(
+            Epoch::from_mjd_tdb(59000.0),
+            [px, 0.1, 0.05, -0.005, 0.015, 0.001],
+            Frame::ICRF,
+            Origin::Sun,
+        );
+        Orbit::new(state).with_orbit_id(id)
+    }
+
+    /// Out-of-span epoch → carried per-orbit generation failure.
+    fn refused(id: &str) -> Orbit {
+        let state = CoordinateState::cartesian(
+            Epoch::from_mjd_tdb(400_000.0),
+            [1.0, 0.1, 0.05, -0.005, 0.015, 0.001],
+            Frame::ICRF,
+            Origin::Sun,
+        );
+        Orbit::new(state).with_orbit_id(id)
+    }
+
+    fn observer() -> Observer {
+        Observer {
+            obs_code: "500".to_string(),
+            epoch: Epoch::from_mjd_tdb(59200.0),
+            position: [0.9, -0.42, -0.18],
+            velocity: [0.0075, 0.0148, 0.0064],
+            observing_night: -1,
+            frame: Frame::ICRF,
+            origin: Origin::SSB,
+        }
+    }
+
+    /// A covariance-bearing orbit's ephemeris row carries, beside the bare
+    /// sky 6×6, the covariance kind and the self-describing packed joint: the
+    /// kind matches the requested method (SecondOrder → `SecondOrder`,
+    /// FirstOrder → `Linear`), the joint is a width-6 `Sky` functional, and
+    /// its `state_block()` equals the bare `covariance`. Mutation record: drop
+    /// the kind in the C marshaler and the `SecondOrder` branch goes red;
+    /// return the absent joint and the `Some(joint)` / width-6 asserts go red.
+    #[test]
+    fn an_ephemeris_row_carries_sky_cov_kind_and_joint() {
+        let Some(ctx) = try_context() else {
+            eprintln!("skipping an_ephemeris_row_carries_sky_cov_kind_and_joint: no data dir");
+            return;
+        };
+        let mut cov = [[0.0f64; 6]; 6];
+        cov[0][0] = 1e-12;
+        cov[1][1] = 1e-12;
+        cov[2][2] = 1e-12;
+        cov[3][3] = 1e-16;
+        cov[4][4] = 1e-16;
+        cov[5][5] = 1e-16;
+        let state = CoordinateState::cartesian(
+            Epoch::from_mjd_tdb(59000.0),
+            [1.0, 0.1, 0.05, -0.005, 0.015, 0.001],
+            Frame::ICRF,
+            Origin::Sun,
+        )
+        .with_covariance(cov);
+        let orbit = Orbit::new(state).with_orbit_id("cov");
+        let observers = [observer()];
+
+        for (method, want_kind) in [
+            (UncertaintyMethod::FirstOrder, crate::CovarianceKind::Linear),
+            (
+                UncertaintyMethod::SecondOrder,
+                crate::CovarianceKind::SecondOrder,
+            ),
+        ] {
+            let cfg = EphemerisConfig {
+                propagation: PropagationConfig {
+                    uncertainty_method: method.clone(),
+                    ..PropagationConfig::default()
+                },
+                ..EphemerisConfig::default()
+            };
+            let result = ctx
+                .generate_ephemeris(std::slice::from_ref(&orbit), &observers, &cfg)
+                .expect("covariance-bearing ephemeris generates");
+            let row = &result.entries[0];
+            let bare = row.covariance.expect("the sky covariance was delivered");
+            assert_eq!(row.cov_kind, want_kind, "row kind under {method:?}");
+            let joint = row
+                .joint
+                .as_ref()
+                .expect("a delivered row carries its joint");
+            assert_eq!(joint.width, 6, "the sky joint is width 6");
+            assert_eq!(
+                joint.functional,
+                crate::JointFunctional::Sky,
+                "the joint describes the sky functional"
+            );
+            assert_eq!(joint.kind, want_kind, "the joint's own kind matches");
+            assert_eq!(
+                joint.state_block(),
+                bare,
+                "the joint's state block is the bare sky 6×6"
+            );
+        }
+    }
+
+    /// The mixed batch through the safe wrapper: outcomes by variant,
+    /// `all_delivered()` false, and `rows_for` selecting one orbit's entries.
+    #[test]
+    fn a_mixed_ephemeris_batch_exposes_outcomes_and_rows_for() {
+        let Some(ctx) = try_context() else {
+            eprintln!(
+                "skipping a_mixed_ephemeris_batch_exposes_outcomes_and_rows_for: no data dir"
+            );
+            return;
+        };
+        let orbits = [delivered("a", 1.0), refused("b"), delivered("c", 1.2)];
+        let observers = [observer()];
+        let result = ctx
+            .generate_ephemeris(&orbits, &observers, &EphemerisConfig::default())
+            .expect("a per-orbit failure does not end the batch");
+
+        assert_eq!(result.num_orbits(), 3, "one outcome per input orbit");
+        assert!(!result.all_delivered(), "the middle orbit failed");
+        assert!(result.outcomes[0].is_delivered());
+        match &result.outcomes[1] {
+            OrbitOutcome::Failed { code, message } => {
+                assert_ne!(*code, 0, "a failed orbit carries a classified code");
+                assert!(!message.is_empty(), "a failed orbit carries its message");
+            }
+            other => panic!("orbit 1 should fail, got {other:?}"),
+        }
+        assert!(
+            result.rows_for(1).is_none(),
+            "a failed orbit has no entries"
+        );
+        let rows0 = result.rows_for(0).expect("orbit 0 delivered entries");
+        let rows2 = result.rows_for(2).expect("orbit 2 delivered entries");
+        assert_eq!(
+            rows0.len(),
+            1,
+            "one observer → one entry per delivered orbit"
+        );
+        assert_eq!(rows2.len(), 1);
+        // The failed middle orbit occupies no entries.
+        let OrbitOutcome::Delivered { first_row, .. } = &result.outcomes[2] else {
+            panic!("orbit 2 should deliver");
+        };
+        assert_eq!(
+            *first_row,
+            rows0.len(),
+            "orbit 2's entries follow orbit 0's"
+        );
+        assert_eq!(
+            result.entries.len(),
+            2,
+            "num_entries is delivered rows only"
+        );
+    }
+
+    /// The doc's promise, pinned at the safe wrapper: within an orbit
+    /// block the sensitivity rows arrive in **observer-input order**, so
+    /// row `k` pairs position-for-position with observer `k` (same code,
+    /// same epoch) and with `entries[k]` (same epoch). Interleaving two
+    /// observatory labels and repeating one `(code, epoch)` exposure is
+    /// the arc the engine's per-`(orbit, obs_code)` BTreeMap scrambles —
+    /// iterating the chains hands back every `500` row, then every `I41`
+    /// row, an order that disagrees with the observer-input entries at the
+    /// interleaved positions. The code is only a label and the chain key
+    /// here; the geometry rides the explicit observer state, so reusing one
+    /// state under two labels is exactly that interleaved arc. The repeated
+    /// exposure is the case no `(code, epoch)` key can disambiguate, so the
+    /// positional contract is the only thing that can carry it.
+    ///
+    /// Mutation: drop the `sort_by_key` in the C flatten and this goes red,
+    /// the rows coming back grouped by code and disagreeing with the
+    /// request at the first interleaved position.
+    #[test]
+    fn sensitivity_rows_follow_observer_input_order() {
+        let Some(ctx) = try_context() else {
+            eprintln!("skipping sensitivity_rows_follow_observer_input_order: no data dir");
+            return;
+        };
+        let observer_coded = |code: &str, epoch_mjd_tdb: f64| Observer {
+            obs_code: code.to_string(),
+            epoch: Epoch::from_mjd_tdb(epoch_mjd_tdb),
+            ..observer()
+        };
+
+        // Request order: 500, I41, 500 (the duplicate of row 0), I41, 500.
+        // "500" sorts before "I41", so the BTreeMap places every 500 row
+        // ahead of every I41 row — an order that disagrees here at 1 and 3.
+        let (e0, e1, e2) = (59200.0, 59210.0, 59220.0);
+        let observers = [
+            observer_coded("500", e0),
+            observer_coded("I41", e1),
+            observer_coded("500", e0),
+            observer_coded("I41", e1),
+            observer_coded("500", e2),
+        ];
+
+        let cfg = EphemerisConfig {
+            propagation: PropagationConfig {
+                compute_stm: true,
+                ..PropagationConfig::default()
+            },
+            ..EphemerisConfig::default()
+        };
+        let orbit = delivered("x", 1.0);
+        let result = ctx
+            .generate_ephemeris(std::slice::from_ref(&orbit), &observers, &cfg)
+            .expect("ephemeris generates");
+
+        assert_eq!(
+            result.entries.len(),
+            observers.len(),
+            "one entry per observer, the duplicate exposure included"
+        );
+        assert_eq!(
+            result.sensitivity.len(),
+            result.entries.len(),
+            "every entry carries a sensitivity row on this fixture, so the two \
+             arrays are the same length and pair up position for position"
+        );
+
+        for (k, (obs, row)) in observers.iter().zip(&result.sensitivity).enumerate() {
+            assert_eq!(
+                row.obs_code, obs.obs_code,
+                "row {k}: sensitivity code {} != request code {} — the rows are \
+                 not in observer-input order",
+                row.obs_code, obs.obs_code
+            );
+            let obs_epoch = obs.epoch.mjd_tdb().expect("observer epoch is TDB");
+            assert_eq!(
+                row.epoch_mjd_tdb.to_bits(),
+                obs_epoch.to_bits(),
+                "row {k}: sensitivity epoch {} != request epoch {obs_epoch}",
+                row.epoch_mjd_tdb,
+            );
+            let entry_epoch = result.entries[k]
+                .epoch
+                .mjd_tdb()
+                .expect("entry epoch is TDB");
+            assert_eq!(
+                row.epoch_mjd_tdb.to_bits(),
+                entry_epoch.to_bits(),
+                "row {k}: sensitivity epoch disagrees with entry epoch {entry_epoch}"
+            );
+            assert!(
+                !row.jacobian.is_empty(),
+                "row {k}: compute_stm was set, so the row carries a Jacobian"
+            );
+        }
+    }
+
+    /// A four-character observatory code round-trips from the engine through
+    /// the ephemeris output row unaltered. The code is only a label here (the
+    /// geometry rides the explicit observer state), so the engine builds an
+    /// `ObservatoryCode` of all four characters and the C marshal copies its
+    /// full four-byte NUL-padded form into the row's fixed field, which the
+    /// wrapper reads back whole. `W68a` must NOT alias its three-character
+    /// prefix `W68`, a different, real observatory — the aliasing a registry
+    /// with no four-character entry cannot otherwise expose.
+    ///
+    /// Mutation: truncate the engine→C marshal to three bytes at the ephemeris
+    /// `obs_code` seam (restore the old `o.code[0..3]` copy) and this goes red,
+    /// the row reading back `W68`.
+    #[test]
+    fn four_char_obs_code_round_trips_from_the_engine() {
+        let Some(ctx) = try_context() else {
+            eprintln!("skipping four_char_obs_code_round_trips_from_the_engine: no data dir");
+            return;
+        };
+        let observers = [Observer {
+            obs_code: "W68a".to_string(),
+            ..observer()
+        }];
+        let orbit = delivered("x", 1.0);
+        let result = ctx
+            .generate_ephemeris(
+                std::slice::from_ref(&orbit),
+                &observers,
+                &EphemerisConfig::default(),
+            )
+            .expect("ephemeris generates for a four-character observatory code");
+        assert_eq!(result.entries.len(), 1, "one observer delivers one row");
+        assert_eq!(
+            result.entries[0].obs_code, "W68a",
+            "the four-character code reads back whole from the engine, not \
+             clipped to its three-character prefix"
+        );
+        assert_ne!(
+            result.entries[0].obs_code, "W68",
+            "the code must not collapse onto its three-character prefix"
+        );
     }
 }

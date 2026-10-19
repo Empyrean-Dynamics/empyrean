@@ -1,3 +1,6 @@
+// Astronomy acronyms are spelled in all caps.
+#![allow(clippy::upper_case_acronyms)]
+
 mod commands;
 mod daemon;
 mod io;

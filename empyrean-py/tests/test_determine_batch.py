@@ -316,6 +316,97 @@ def test_multi_object_determine_end_to_end(tmp_path):
         assert set(results.residuals.object_id.to_pylist()) <= set(results.object_ids)
 
 
+def test_determine_refuses_an_id_less_row_by_name():
+    """scott #126 at the Python surface: an observation row carrying no
+    object identifier (``permID`` / ``provID`` / ``trkSub`` all null)
+    refuses the WHOLE batch by name — a ``RuntimeError`` whose message names
+    the offending row indices — rather than silently skipping the row and
+    reporting a complete-looking batch (the no-hidden-fallbacks failure mode
+    the old single-fit path had).
+
+    The row indices reach the message so the caller can repair the exact
+    rows. Mutation guard: dropping the offending row list from the refusal
+    (the C ABI's ``set_last_error(&e.to_string())`` that surfaces the engine
+    message) empties the ``optical rows: [3]`` match and this fails.
+    """
+    import empyrean
+    from empyrean.od.ades_observations import ADESObservations
+
+    # Three attributable rows for one object, then one row carrying NO
+    # identifier at index 3. A single id-less row aborts the batch by name.
+    ids = [
+        ("", "SYNTH01", ""),
+        ("", "SYNTH01", ""),
+        ("", "SYNTH01", ""),
+        (None, None, None),
+    ]
+    n = len(ids)
+    obs = ADESObservations.from_kwargs(
+        perm_id=[p for p, _, _ in ids],
+        prov_id=[v for _, v, _ in ids],
+        trk_sub=[t for _, _, t in ids],
+        stn=["500"] * n,
+        obs_time=["2024-01-01T00:00:00Z"] * n,
+        ra=[0.0] * n,
+        dec=[0.0] * n,
+    )
+    with pytest.raises(RuntimeError, match=r"no object identifier"):
+        empyrean.determine(obs)
+    # The index of the offending row is named, so the caller can repair it.
+    with pytest.raises(RuntimeError, match=r"optical rows: \[3\]"):
+        empyrean.determine(obs)
+
+
+def test_unmatched_seed_orbit_reaches_python_from_the_engine():
+    """The ``unmatched`` channel survives the C ABI → Python marshaling.
+
+    ``test_unmatched_seed_orbits_are_reported_not_dropped`` above pins the
+    dict-assembly reader; this pins the other half — that ``_determine``
+    actually populates ``unmatched_orbit_ids`` from a real engine batch.
+    Seeds pair positionally with observation groups in first-appearance
+    order, so a seed beyond the last group is attributed to no object and
+    reported here rather than dropped. One group + two seeds leaves the
+    second seed unmatched.
+
+    Mutation guard: dropping the ``unmatched_orbit_ids`` ``set_item`` in the
+    PyO3 ``_determine`` empties the list and this fails.
+    """
+    import empyrean
+    from empyrean.coordinates.coordinates import CartesianCoordinates
+    from empyrean.orbits.orbits import CartesianOrbits
+
+    psv = (
+        "# version=2022\n"
+        "permID|provID|trkSub|mode|stn|obsTime|ra|dec|rmsRA|rmsDec|astCat\n"
+        "|SYNTH01||CCD|703|2024-01-10T08:00:00.000Z|120.000000|15.000000|0.5|0.5|Gaia2\n"
+        "|SYNTH01||CCD|703|2024-01-10T09:00:00.000Z|120.010000|15.004000|0.5|0.5|Gaia2\n"
+    )
+    optical, _radar = empyrean.read_ades(psv)
+
+    def seed(orbit_id: str) -> CartesianOrbits:
+        coords = CartesianCoordinates.from_kwargs(
+            epoch=[60000.0],
+            x=[2.0],
+            y=[0.0],
+            z=[0.0],
+            vx=[0.0],
+            vy=[0.01217],
+            vz=[0.0],
+            frame="eclipticj2000",
+            origin=["Sun"],
+        )
+        return CartesianOrbits.from_kwargs(orbit_id=[orbit_id], coordinates=coords)
+
+    results = empyrean.determine(
+        optical, initial_orbits={"REALSEED": seed("REALSEED"), "GHOST": seed("GHOST")}
+    )
+    # The second seed pairs with no group; the engine reports it by its
+    # positional C-ABI orbit id ("orbit_1"), carried across as a Python list.
+    assert isinstance(results.unmatched_orbit_ids, list)
+    assert len(results.unmatched_orbit_ids) == 1, results.unmatched_orbit_ids
+    assert results.unmatched_orbit_ids == ["orbit_1"], results.unmatched_orbit_ids
+
+
 def test_residual_marshaling_carries_every_observation_column():
     """The Python residual writers must hand the Rust side the whole
     table.

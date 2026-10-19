@@ -14,6 +14,37 @@ from empyrean import (
     KeplerianCoordinates,
     Origin,
 )
+from empyrean.coordinates.transform import transform_orbits
+from empyrean.orbits.joint import (
+    CovarianceKind,
+    JointFunctional,
+    JointProvenance,
+    JointQuality,
+    PackedJoint,
+    PackedJoints,
+)
+from empyrean.orbits.orbits import CartesianOrbits, CometaryOrbits
+
+
+def _state_joint(cov6: np.ndarray) -> PackedJoint:
+    """A width-6 derived state joint whose state block is ``cov6`` (6x6)."""
+    tri = [cov6[i, j] for i in range(6) for j in range(i + 1)]
+    return PackedJoint(
+        layout_present=0,
+        layout_considered=0,
+        layout_marginalized=0,
+        width=6,
+        tri=np.asarray(tri, dtype=np.float64),
+        kind=CovarianceKind.LINEAR,
+        quality=JointQuality.POSITIVE_DEFINITE,
+        cov_rank=0,
+        cov_null_axes=0,
+        cov_min_eig_corr=float("nan"),
+        functional=JointFunctional.STATE,
+        provenance=JointProvenance.DERIVED,
+        asserted_source=None,
+    )
+
 
 # ── Fixtures ─────────────────────────────────────────────────
 
@@ -66,14 +97,15 @@ def make_batch_cometary(n):
     )
 
 
-def make_batch_cometary_with_cov(n):
-    """Create a batch of N cometary coordinates with covariance."""
+def make_batch_cometary_orbits_with_cov(n):
+    """Create a batch of N cometary orbits each carrying a width-6 joint.
+
+    A covariance-bearing transform rides the orbit's packed joint, so the
+    benchmark measures the orbit-level ``transform_orbits`` call.
+    """
     rng = np.random.default_rng(42)
-    cov = np.zeros((n, 6, 6))
-    for i in range(n):
-        diag = rng.uniform(1e-10, 1e-6, 6)
-        cov[i] = np.diag(diag)
-    return CometaryCoordinates.from_kwargs(
+    joints = [_state_joint(np.diag(rng.uniform(1e-10, 1e-6, 6))) for _ in range(n)]
+    coords = CometaryCoordinates.from_kwargs(
         epoch=np.full(n, 60200.0),
         q=0.7 + rng.uniform(0, 0.5, n),
         e=0.1 + rng.uniform(0, 0.4, n),
@@ -83,7 +115,11 @@ def make_batch_cometary_with_cov(n):
         tp=60100.0 + rng.uniform(0, 200, n),
         frame=Frame.ECLIPTICJ2000.value,
         origin=[str(Origin.SUN)] * n,
-        covariance=CometaryCovariance.from_matrix(cov),
+    )
+    return CometaryOrbits.from_kwargs(
+        orbit_id=[f"o{i}" for i in range(n)],
+        coordinates=coords,
+        covariance=PackedJoints.from_joints(joints),
     )
 
 
@@ -126,12 +162,12 @@ class TestTransformBenchmarks:
         )
 
     def test_cometary_to_cartesian_with_covariance(self, benchmark):
-        """Batch of 100 cometary → Cartesian with covariance propagation."""
-        coords = make_batch_cometary_with_cov(100)
+        """Batch of 100 cometary orbits → Cartesian with joint propagation."""
+        orbits = make_batch_cometary_orbits_with_cov(100)
         benchmark(
-            empyrean.transform_coordinates,
-            coords,
-            CartesianCoordinates,
+            transform_orbits,
+            orbits,
+            CartesianOrbits,
         )
 
     def test_origin_translation_sun_to_ssb(self, benchmark, single_cometary):

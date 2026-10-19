@@ -1,15 +1,18 @@
 blank_issues_enabled: false
 contact_links:
   - name: Question or general discussion
-    url: https://github.com/Empyrean-Dynamics/empyrean/discussions
+    url: https://github.com/Empyrean-Dynamics/empyrean/discussions/categories/q-a
     about: |
-      Usage questions, design / methodology discussion, comparisons against
-      other tools, anything that isn't a concrete bug or a specific feature
-      request. Issues are reserved for actionable, reproducible reports.
+      The discussion board for everything Empyrean: usage questions, design and
+      methodology, comparisons against other tools, scenario questions. Tag
+      scenario and validation topics with those labels. Issues are reserved for
+      actionable, reproducible reports.
+  - name: Scenario problem or proposal
+    url: https://github.com/Empyrean-Dynamics/empyrean-scenarios/issues/new/choose
+    about: A problem with one of the demonstration scenarios, on the website or in the empyrean-scenarios repository, or a proposal for a new one.
   - name: Validation finding
-    url: https://github.com/Empyrean-Dynamics/empyrean/discussions/categories/validation
-    about: |
-      If empyrean's numbers disagree with another tool (JPL Horizons, ASSIST,
-      find_orb, …) or with a published reference at a level you don't
-      consider acceptable, post the diff in Discussions → Validation. We
-      triage validation findings the same week.
+    url: https://github.com/Empyrean-Dynamics/empyrean-validation/issues/new/choose
+    about: empyrean disagrees with another tool or a published reference at a level you do not consider acceptable. Our own comparisons are at https://validation.empyrean-dynamics.com.
+  - name: Documentation
+    url: https://docs.empyrean-dynamics.com
+    about: API reference and guides for the Python, Rust, CLI and C ABI surfaces.

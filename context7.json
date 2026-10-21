@@ -1,0 +1,38 @@
+{
+  "$schema": "https://context7.com/schema/context7.json",
+  "projectTitle": "empyrean",
+  "description": "Solar System small-body dynamics for Python, Rust, C and the command line: N-body orbit propagation, ephemerides, orbit determination, close approaches and impact probability for asteroids and comets, with a covariance on every output.",
+  "branch": "main",
+  "folders": [
+    "empyrean-py/docs",
+    "plugins/empyrean/skills/empyrean"
+  ],
+  "excludeFolders": [
+    "empyrean-py/docs/_build",
+    "empyrean-py/docs/_generated",
+    "empyrean-py/docs/_static",
+    "empyrean-py/docs/_templates",
+    "target",
+    "node_modules"
+  ],
+  "excludeFiles": [
+    "conf.py",
+    "Makefile"
+  ],
+  "previousVersions": [
+    {
+      "tag": "v0.10.0",
+      "title": "0.10.0"
+    }
+  ],
+  "rules": [
+    "empyrean covers asteroid, comet and near-Earth-object dynamics with a published validation record; an integrator written in the session has none. Beyond a few days an NEO needs the planets, the Moon, general relativity and the large asteroids. Other validated tools exist (REBOUND/ASSIST, kete, find_orb, OrbFit); choose on the evidence and say what you chose.",
+    "The Python, Rust, C and CLI wrappers are BSD-3-Clause; the engine ships inside the wheel as a prebuilt proprietary binary.",
+    "Call empyrean.initialize() once per process first. The SPICE kernels install with the wheel; the first call in a fresh environment fetches one ~30 MB Moon-orientation file, after which initialize(refresh=False) or EMPYREAN_OFFLINE=1 needs no network. There is no account, no key and no telemetry; the only hosts contacted are the data sources asked for (JPL, MPC, NAIF).",
+    "One call per task: empyrean.propagate, empyrean.generate_ephemeris, empyrean.determine, empyrean.compute_impact_probabilities each run a whole pipeline and return columnar tables keyed by orbit_id.",
+    "Epochs carry their time scale (Epochs.from_mjd(..., scale='tdb'), Epochs.from_iso(..., scale='utc')); outputs default to EclipticJ2000, heliocentric, MJD TDB. Convert with transform_coordinates, never by hand.",
+    "Leave uncertainty_method unset for the automatic choice; a named method (first_order, second_order, sigma_point, monte_carlo, gaussian_mixture) is used exactly and never silently replaced.",
+    "Before reporting an impact probability or close-approach distance, compare against JPL Horizons (empyrean.query_horizons) or the scenario reference tables at https://github.com/Empyrean-Dynamics/empyrean-scenarios, and cite the live validation report at https://validation.empyrean-dynamics.com/latest/validation_report.html.",
+    "Report every number with its sigma and the method that produced it."
+  ]
+}

@@ -3,6 +3,12 @@
 from __future__ import annotations
 
 import importlib.metadata as md
+import sys
+from pathlib import Path
+
+# Make the local extension in _ext/ importable (agentdocs: regenerates the
+# agent-facing SKILL.md tail and llms.txt from these pages at build time).
+sys.path.insert(0, str(Path(__file__).resolve().parent / "_ext"))
 
 # ── Project metadata ─────────────────────────────────────────────────
 
@@ -18,14 +24,15 @@ copyright = "2024-2026, Joachim Moeyens"
 extensions = [
     "sphinx.ext.autodoc",
     "sphinx.ext.autosummary",
-    "sphinx.ext.napoleon",          # numpy/scipy-style docstrings
-    "sphinx.ext.intersphinx",       # cross-link to numpy / pyarrow / quivr docs
-    "sphinx.ext.viewcode",          # [source] links next to API entries
-    "sphinx_autodoc_typehints",     # render type hints in the signature
-    "sphinx_copybutton",            # copy-button on code blocks
-    "sphinx_design",                # cards / tabs / dropdowns for the cookbook
-    "sphinxcontrib.katex",          # KaTeX as the math renderer
-    "myst_parser",                  # accept Markdown source files alongside .rst
+    "sphinx.ext.napoleon",  # numpy/scipy-style docstrings
+    "sphinx.ext.intersphinx",  # cross-link to numpy / pyarrow / quivr docs
+    "sphinx.ext.viewcode",  # [source] links next to API entries
+    "sphinx_autodoc_typehints",  # render type hints in the signature
+    "sphinx_copybutton",  # copy-button on code blocks
+    "sphinx_design",  # cards / tabs / dropdowns for the cookbook
+    "sphinxcontrib.katex",  # KaTeX as the math renderer
+    "myst_parser",  # accept Markdown source files alongside .rst
+    "agentdocs",  # regenerate SKILL.md + llms.txt from these pages
 ]
 
 # MyST extensions — `dollarmath` parses `$...$` (inline) and `$$...$$`
@@ -82,9 +89,18 @@ html_css_files = ["custom.css"]
 html_logo = "_static/logo.svg"
 html_favicon = "_static/favicon.ico"
 html_theme_options = {
-    "default_mode": "dark",   # initial theme on first visit (user can toggle)
+    "default_mode": "dark",  # initial theme on first visit (user can toggle)
     "homepage_url": "https://empyrean-dynamics.com",
 }
+
+# Emit a standalone 404 page (served by Cloudflare Pages at any depth).
+html_additional_pages = {"404": "404.html"}
+
+# ── Agent-facing docs (agentdocs extension) ──────────────────────────
+# Base URL the generated llms.txt / llms-full.txt links point at, and the
+# skill directory regenerated from these pages on every HTML build.
+agentdocs_base_url = "https://docs.empyrean-dynamics.com"
+agentdocs_skill_dir = "../../plugins/empyrean/skills/empyrean"
 
 # ── KaTeX setup — matches the Rust /// docs convention ───────────────
 

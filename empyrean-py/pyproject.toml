@@ -111,8 +111,15 @@ dev = [
     {include-group = "docs"},
 ]
 
-# [project.urls] left intentionally unset — fill in once public homepage
-# / docs / issue-tracker URLs are settled.
+[project.urls]
+Homepage = "https://www.empyrean-dynamics.com"
+Documentation = "https://docs.empyrean-dynamics.com"
+"Documentation (plain text)" = "https://docs.empyrean-dynamics.com/llms.txt"
+Source = "https://github.com/Empyrean-Dynamics/empyrean"
+Changelog = "https://github.com/Empyrean-Dynamics/empyrean/blob/main/CHANGELOG.md"
+Issues = "https://github.com/Empyrean-Dynamics/empyrean/issues"
+Validation = "https://validation.empyrean-dynamics.com/latest/validation_report.html"
+Scenarios = "https://github.com/Empyrean-Dynamics/empyrean-scenarios"
 
 # Source overrides for development. Once empyrean-sphinx-theme has a
 # tagged release on its private GitHub repo, replace this block with a

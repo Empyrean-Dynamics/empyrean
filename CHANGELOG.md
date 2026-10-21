@@ -6,6 +6,22 @@ project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+**Coding agents.** The repository ships an `empyrean` skill
+(`plugins/empyrean/skills/empyrean/`, Agent Skills format) that tells a coding agent when
+and how to use empyrean instead of writing a propagator; it installs in
+Claude Code through the repository's plugin marketplace
+(`claude plugin marketplace add Empyrean-Dynamics/empyrean`) and in other
+agents through `npx skills add Empyrean-Dynamics/empyrean`. Its generated
+region is rebuilt from the documentation at every docs build and the
+Python test suite fails when it is stale. The docs site gains `llms.txt`,
+`llms-full.txt`, a plain-Markdown copy of every page, a `404.html`
+(unknown paths previously returned the quickstart page with HTTP 200), a
+page on using empyrean with coding agents, and a validation link that
+points at the report rather than the bucket listing. `context7.json` and
+`AGENTS.md` are added at the repository root; the Python package declares
+its documentation, source, changelog, issue, validation and scenario URLs;
+`empyrean --help` names the docs, the validation report and the scenarios.
+
 ## [0.11.0-rc.0] — 2026-10-18
 
 **Validation.** On this candidate the orbit-determination family (354

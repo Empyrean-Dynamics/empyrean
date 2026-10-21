@@ -84,5 +84,11 @@ htmlcov/
 .vscode/
 *.swp
 
-# Claude Code session artifacts (agent memory, scratch, transcripts)
-.claude/
+# Claude Code session artifacts (agent memory, scratch, transcripts).
+# `.claude/skills/` is the one tracked entry: a symlink to plugins/empyrean/skills/empyrean
+# so a checkout exposes the skill to Claude Code without the plugin.
+.claude/*
+!.claude/skills/
+
+# Plugin eval runs (claude plugin eval): reports and transcripts, never committed
+plugins/empyrean/evals/results/

@@ -84,6 +84,7 @@ cookbook/impact-probability
 cookbook/orbit-determination
 cookbook/sensitivity
 cookbook/data-setup
+agents
 ```
 
 ```{toctree}

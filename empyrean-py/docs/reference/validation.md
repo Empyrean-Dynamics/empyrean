@@ -7,7 +7,7 @@ underlying physics is checked against independent external references
 NEOs, main-belt asteroids, comets, and atmospheric impactors.
 
 **Live results:
-[validation.empyrean-dynamics.com](https://validation.empyrean-dynamics.com)**
+[validation.empyrean-dynamics.com](https://validation.empyrean-dynamics.com/latest/validation_report.html)**
 — the full cross-channel suite, regenerated on every release, with
 per-row precision, σ on every published number, and the reference for
 each comparison.

@@ -95,6 +95,17 @@ jobs:
             printf "  OK  %-20s %s\n" "pyproject.toml" "$py_version"
           fi
 
+          plugin_version=$(jq -r '.version' plugins/empyrean/.claude-plugin/plugin.json)
+          if [ -z "$plugin_version" ] || [ "$plugin_version" = "null" ]; then
+            echo "::error::could not read version from plugins/empyrean/.claude-plugin/plugin.json"
+            mismatch=1
+          elif [ "$(canon "$plugin_version")" != "$(canon "$want")" ]; then
+            echo "::error::plugins/empyrean/.claude-plugin/plugin.json version is $plugin_version, expected $want"
+            mismatch=1
+          else
+            printf "  OK  %-20s %s\n" "plugin.json" "$plugin_version"
+          fi
+
           [ "$mismatch" -eq 0 ] || { echo; echo "Version mismatch — bump the manifests to $want before preparing."; exit 1; }
           echo
           echo "All distribution channels at version $want."

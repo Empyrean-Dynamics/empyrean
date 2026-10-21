@@ -50,6 +50,14 @@ rather than used through a layout that may have moved. Nothing to
 configure; the bundled engine always matches. It matters only if you
 point the loader at an engine of your own.
 
+Documentation lives at <https://docs.empyrean-dynamics.com> (a plain-text
+index for coding agents at `/llms.txt`, everything in one file at
+`/llms-full.txt`). Every release is compared across its Python, Rust, C
+and CLI channels and against JPL Horizons and ASSIST in the
+[validation report](https://validation.empyrean-dynamics.com/latest/validation_report.html),
+and nine runnable [scenarios](https://github.com/Empyrean-Dynamics/empyrean-scenarios)
+carry reference values to check a result against.
+
 ## What it does
 
 - **Propagation** — N-body (Sun, planets, Moon, Pluto) with EIH general relativity, Sun J2 and Earth J2–J4 zonal harmonics, 16 asteroid perturbers, and the Marsden non-gravitational model — selectable across Approximate / Basic / Standard force-model tiers (Standard is the default). GR15 and DOP853 integrators. Optional finite-burn thrust arcs — constant-RTN, velocity-tangent, or inertial-fixed steering, with per-arc Δv targeting corrections — layer on as a continuous-thrust force input.

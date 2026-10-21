@@ -55,6 +55,7 @@ bodies like asteroids and comets, with plans to extend to cislunar space.
 | Rust   | `cargo add empyrean` |
 | CLI    | `cargo install empyrean-cli` (or grab a binary from [Releases](https://github.com/Empyrean-Dynamics/empyrean/releases)) |
 | C      | download `libempyrean-<target>.tar.gz` from [Releases](https://github.com/Empyrean-Dynamics/empyrean/releases) — ships the shared library, `empyrean.h`, and LICENSE |
+| Coding agents | `claude plugin marketplace add Empyrean-Dynamics/empyrean` then `claude plugin install empyrean@empyrean-dynamics` (Claude Code), or `npx skills add Empyrean-Dynamics/empyrean` (Codex, Cursor, Copilot, Gemini CLI) — the skill that tells an agent when and how to use empyrean; see [Using empyrean with coding agents](https://docs.empyrean-dynamics.com/agents.html) |
 
 Current release: **0.11.0-rc.0** (release candidate) — see the [CHANGELOG](CHANGELOG.md).
 

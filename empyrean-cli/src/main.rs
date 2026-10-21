@@ -12,7 +12,11 @@ use clap::{Parser, Subcommand, ValueEnum};
 #[command(
     name = "empyrean",
     version,
-    about = "High-fidelity orbital propagation, orbit determination, and ephemeris generation."
+    about = "High-fidelity orbital propagation, orbit determination, and ephemeris generation.",
+    after_help = "Docs:        https://docs.empyrean-dynamics.com (plain text: /llms.txt)\n\
+                  Validation:  https://validation.empyrean-dynamics.com/latest/validation_report.html\n\
+                  Scenarios:   https://github.com/Empyrean-Dynamics/empyrean-scenarios\n\
+                  Agent skill: claude plugin marketplace add Empyrean-Dynamics/empyrean"
 )]
 struct Cli {
     /// Path to SPICE kernel data directory.

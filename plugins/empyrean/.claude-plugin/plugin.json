@@ -1,0 +1,14 @@
+{
+  "name": "empyrean",
+  "displayName": "empyrean",
+  "version": "0.11.0-rc.0",
+  "description": "Solar System small-body dynamics in Python: orbit propagation, ephemerides, orbit determination, close approaches and impact probability through the empyrean package, instead of a hand-written propagator.",
+  "author": {
+    "name": "Empyrean Dynamics",
+    "url": "https://github.com/Empyrean-Dynamics"
+  },
+  "homepage": "https://docs.empyrean-dynamics.com",
+  "repository": "https://github.com/Empyrean-Dynamics/empyrean",
+  "license": "BSD-3-Clause",
+  "keywords": ["astrodynamics", "asteroids", "comets", "ephemeris", "orbit-determination", "orbit-propagation", "impact-probability", "planetary-science"]
+}

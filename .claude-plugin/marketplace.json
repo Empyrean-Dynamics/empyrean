@@ -1,0 +1,15 @@
+{
+  "name": "empyrean-dynamics",
+  "description": "Plugins from Empyrean Dynamics, installable straight from the empyrean repository.",
+  "owner": {
+    "name": "Empyrean Dynamics",
+    "url": "https://github.com/Empyrean-Dynamics"
+  },
+  "plugins": [
+    {
+      "name": "empyrean",
+      "source": "./plugins/empyrean",
+      "description": "Solar System small-body dynamics in Python: orbit propagation, ephemerides, orbit determination, close approaches and impact probability through the empyrean package, instead of a hand-written propagator."
+    }
+  ]
+}

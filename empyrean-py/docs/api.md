@@ -61,7 +61,8 @@
    empyrean.NonGravParams
    empyrean.PhotometricParams
    empyrean.SRPParams
-   empyrean.WideCross
+   empyrean.PackedJoint
+   empyrean.PackedJoints
    empyrean.Epochs
    empyrean.TimeScale
    empyrean.Frame

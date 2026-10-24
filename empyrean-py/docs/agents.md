@@ -31,6 +31,11 @@ or copy `plugins/empyrean/skills/empyrean/` into your project's `.agents/skills/
 
 ::::
 
+The Claude Code install serves the plugin from the repository's `release`
+branch, which moves only when a final version has been published to PyPI
+and crates.io, so the skill documents the version `pip install empyrean`
+installs. The other agents read the copy on `main`.
+
 Once installed, the agent loads the skill's description at the start of
 a session and its body when a task matches; nothing is sent anywhere.
 

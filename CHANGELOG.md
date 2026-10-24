@@ -21,6 +21,11 @@ points at the report rather than the bucket listing. `context7.json` and
 `AGENTS.md` are added at the repository root; the Python package declares
 its documentation, source, changelog, issue, validation and scenario URLs;
 `empyrean --help` names the docs, the validation report and the scenarios.
+The plugin is served from the `release` branch, which the release workflow
+fast-forwards once a final tag has been published to PyPI and crates.io,
+so the installed skill documents the version `pip install empyrean`
+installs; the plugin folder gains the README that Anthropic's plugin
+directory shows as the listing.
 
 ## [0.11.0-rc.0] — 2026-10-18
 

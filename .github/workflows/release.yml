@@ -8,6 +8,8 @@ name: Release
 # hash-pinned libempyrean tarballs; it reuses the exact tarballs prepared in
 # step 1, re-verifies them against the committed empyrean-sys/checksums.txt,
 # and fails closed on any mismatch. Run prepare-release.yml before tagging.
+# Once PyPI and crates.io have both published a final tag, the last job
+# fast-forwards the `release` branch to it (see `release-branch` below).
 on:
   push:
     tags:
@@ -695,3 +697,36 @@ jobs:
           files: |
             artifacts/**/*.tar.gz
             artifacts/**/*.whl
+
+  # ── Move the `release` branch to this tag ───────────────────────────
+  # The coding-agent plugin (plugins/empyrean) is served from the `release`
+  # branch: the marketplace entry in .claude-plugin/marketplace.json points
+  # at it and Anthropic's plugin directory follows it, so the skill people
+  # install documents the version `pip install empyrean` installs. Nothing
+  # else writes the branch. A final tag whose release completed (both
+  # publishes and the GitHub Release) fast-forwards it here; a pre-release
+  # tag (any `-` in the name, e.g. v0.11.0-rc.1) leaves it alone, since PyPI
+  # does not install pre-releases by default. The push is never forced: a
+  # non-fast-forward means the branch was moved by hand, and the job fails
+  # so that is seen.
+  release-branch:
+    name: Move the release branch
+    needs: [release]
+    if: ${{ !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # Full history: with a depth-1 checkout git cannot see that the
+      # branch's current commit is an ancestor of the tag and rejects the
+      # push as a non-fast-forward even when it is one.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fast-forward release to the tagged commit
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse 'HEAD^{commit}')
+          echo "release -> ${sha} (${GITHUB_REF_NAME})"
+          git push origin "${sha}:refs/heads/release"

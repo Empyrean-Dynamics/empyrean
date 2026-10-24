@@ -9,7 +9,34 @@ use crate::propagate::{
     DiagnosticsConfig, EventConfig, ForceModelTier, OrbitOutcome, PropagationConfig,
     UncertaintyMethod,
 };
+use std::collections::HashMap;
 use std::ffi::CStr;
+
+/// Maps a requested observer epoch's MJD TDB (as a bit pattern) to the
+/// caller's own [`Epoch`](crate::Epoch). Ephemeris observation epochs are
+/// requested instants, so each output row echoes the caller's own value
+/// rather than round-tripping the engine's TDB return through a conversion.
+pub(crate) type EpochEcho = HashMap<u64, crate::Epoch>;
+
+/// Build the [`EpochEcho`] for an observer batch. The engine echoes each
+/// observer's MJD TDB exactly, so the bit pattern of `e.epoch_mjd_tdb` on a
+/// returned row matches an observer's `mjd_tdb()` here.
+pub(crate) fn observer_echo(observers: &[Observer]) -> Result<EpochEcho> {
+    let mut echo = EpochEcho::with_capacity(observers.len());
+    for o in observers {
+        echo.insert(o.epoch.mjd_tdb()?.to_bits(), o.epoch);
+    }
+    Ok(echo)
+}
+
+/// Echo a requested observation epoch: return the caller's own `Epoch` for
+/// the engine's MJD TDB return, refusing by name if it matches none (an
+/// output epoch that is not one of the requested observer epochs).
+fn echo_observation_epoch(echo: &EpochEcho, engine_mjd_tdb: f64) -> Result<crate::Epoch> {
+    echo.get(&engine_mjd_tdb.to_bits()).copied().ok_or_else(|| {
+        Error::invalid_input("an ephemeris output epoch did not match any requested observer epoch")
+    })
+}
 
 /// One row of predicted astrometry.
 #[derive(Debug, Clone, PartialEq)]
@@ -134,7 +161,10 @@ pub struct EphemerisEntry {
 }
 
 impl EphemerisEntry {
-    pub(crate) fn from_ffi(e: &empyrean_sys::EmpyreanEphemerisEntry) -> Result<Self> {
+    pub(crate) fn from_ffi(
+        e: &empyrean_sys::EmpyreanEphemerisEntry,
+        echo: &EpochEcho,
+    ) -> Result<Self> {
         let orbit_id = if e.orbit_id.is_null() {
             String::new()
         } else {
@@ -148,7 +178,10 @@ impl EphemerisEntry {
         let joint = unsafe { crate::PackedJoint::from_ffi(&e.joint) }?;
         Ok(Self {
             orbit_id,
-            epoch: crate::Epoch::from_mjd_tdb(e.epoch_mjd_tdb),
+            // The observation epoch is a requested observer epoch: echo the
+            // caller's own `Epoch` back (same value, same scale), not a
+            // round-trip of the engine's TDB return.
+            epoch: echo_observation_epoch(echo, e.epoch_mjd_tdb)?,
             ra_deg: e.ra_deg,
             dec_deg: e.dec_deg,
             rho_au: e.rho_au,
@@ -233,8 +266,9 @@ pub struct ObservationSensitivity {
     pub object_id: Option<String>,
     /// MPC observatory code.
     pub obs_code: String,
-    /// Observation epoch (MJD TDB).
-    pub epoch_mjd_tdb: f64,
+    /// Observation epoch, in the request scale (the observers' epochs'
+    /// scale). A requested instant, echoed bit-for-bit when that is TDB.
+    pub epoch: crate::Epoch,
     /// Solved-parameter dimension: 6 (state) or 9 (state + non-grav).
     pub n_params: u8,
     /// Jacobian ∂(observable)/∂(input), row-major `[6][n_params]` flattened.
@@ -298,7 +332,10 @@ pub struct ObservationSensitivity {
 }
 
 impl ObservationSensitivity {
-    pub(crate) fn from_ffi(e: &empyrean_sys::EmpyreanObservationSensitivity) -> Self {
+    pub(crate) fn from_ffi(
+        e: &empyrean_sys::EmpyreanObservationSensitivity,
+        echo: &EpochEcho,
+    ) -> Result<Self> {
         let orbit_id = if e.orbit_id.is_null() {
             String::new()
         } else {
@@ -319,17 +356,19 @@ impl ObservationSensitivity {
         } else {
             unsafe { std::slice::from_raw_parts(e.hessian, e.hessian_len).to_vec() }
         };
-        Self {
+        Ok(Self {
             orbit_id,
             object_id,
             obs_code: obs_code_from_bytes(&e.obs_code),
-            epoch_mjd_tdb: e.epoch_mjd_tdb,
+            // A sensitivity row sits at a requested observer epoch (a short
+            // chain delivers fewer rows); echo the caller's own `Epoch`.
+            epoch: echo_observation_epoch(echo, e.epoch_mjd_tdb)?,
             n_params: e.n_params,
             jacobian,
             hessian,
             frame: e.frame,
             origin: e.origin,
-        }
+        })
     }
 }
 
@@ -558,7 +597,7 @@ impl Context {
     /// can be shorter than [`entries`](EphemerisResult::entries); realign
     /// that case on each row's
     /// [`obs_code`](ObservationSensitivity::obs_code) and
-    /// [`epoch_mjd_tdb`](ObservationSensitivity::epoch_mjd_tdb).
+    /// [`epoch`](ObservationSensitivity::epoch).
     pub fn generate_ephemeris(
         &self,
         orbits: &[Orbit],
@@ -567,6 +606,10 @@ impl Context {
     ) -> Result<EphemerisResult> {
         let _ = (Frame::ICRF, UncertaintyMethod::FirstOrder); // suppress unused-import in default-config branch
         let (ffi_orbits, _orbit_keep) = crate::orbit::orbits_to_ffi(orbits)?;
+        // Refuse a mixed-scale observer batch, then build the echo map that
+        // hands each output row back the caller's own observer epoch.
+        observers_request_scale(observers)?;
+        let echo = observer_echo(observers)?;
         let ffi_observers = observers_to_ffi(observers)?;
 
         let mut result = empyrean_sys::EmpyreanEphemerisResult {
@@ -594,8 +637,18 @@ impl Context {
         if code != 0 {
             return Err(Error::capture(code));
         }
-        marshal_ephemeris_result(&mut result)
+        marshal_ephemeris_result(&mut result, &echo)
     }
+}
+
+/// The single request scale shared by an observer batch's epochs.
+///
+/// Ephemeris epochs are the observer epochs (requested instants), so the
+/// result is handed back in this scale. An observer batch that mixes
+/// scales is refused by name. One call carries one scale.
+pub(crate) fn observers_request_scale(observers: &[Observer]) -> Result<crate::TimeScale> {
+    let epochs: Vec<crate::Epoch> = observers.iter().map(|o| o.epoch).collect();
+    crate::time::request_scale(&epochs)
 }
 
 /// Marshal an observer batch into the FFI representation. Shared by the
@@ -653,27 +706,28 @@ pub(crate) fn observers_to_ffi(
 /// so both produce byte-identical output.
 pub(crate) fn marshal_ephemeris_result(
     result: &mut empyrean_sys::EmpyreanEphemerisResult,
+    echo: &EpochEcho,
 ) -> Result<EphemerisResult> {
     // Decode fallibly, but free the C result BEFORE propagating any decode
-    // error (an unknown covariance-kind tag or a malformed joint) so the
-    // error path leaks nothing.
+    // error (an unknown covariance-kind tag, a malformed joint, or an
+    // undefined scale conversion) so the error path leaks nothing.
     let entries_res: Result<Vec<EphemerisEntry>> = if result.entries.is_null() {
         Ok(Vec::new())
     } else {
         unsafe {
             std::slice::from_raw_parts(result.entries, result.num_entries)
                 .iter()
-                .map(EphemerisEntry::from_ffi)
+                .map(|e| EphemerisEntry::from_ffi(e, echo))
                 .collect()
         }
     };
-    let sensitivity = if result.sensitivity.is_null() {
-        Vec::new()
+    let sensitivity_res: Result<Vec<ObservationSensitivity>> = if result.sensitivity.is_null() {
+        Ok(Vec::new())
     } else {
         unsafe {
             std::slice::from_raw_parts(result.sensitivity, result.num_sensitivity)
                 .iter()
-                .map(ObservationSensitivity::from_ffi)
+                .map(|s| ObservationSensitivity::from_ffi(s, echo))
                 .collect()
         }
     };
@@ -725,6 +779,7 @@ pub(crate) fn marshal_ephemeris_result(
     };
     unsafe { empyrean_sys::empyrean_ephemeris_result_free(result) };
     let entries = entries_res?;
+    let sensitivity = sensitivity_res?;
     Ok(EphemerisResult {
         entries,
         sensitivity,
@@ -1300,18 +1355,18 @@ mod outcome_channel_tests {
                 row.obs_code, obs.obs_code
             );
             let obs_epoch = obs.epoch.mjd_tdb().expect("observer epoch is TDB");
+            let row_epoch = row.epoch.mjd_tdb().expect("sensitivity epoch is TDB");
             assert_eq!(
-                row.epoch_mjd_tdb.to_bits(),
+                row_epoch.to_bits(),
                 obs_epoch.to_bits(),
-                "row {k}: sensitivity epoch {} != request epoch {obs_epoch}",
-                row.epoch_mjd_tdb,
+                "row {k}: sensitivity epoch {row_epoch} != request epoch {obs_epoch}",
             );
             let entry_epoch = result.entries[k]
                 .epoch
                 .mjd_tdb()
                 .expect("entry epoch is TDB");
             assert_eq!(
-                row.epoch_mjd_tdb.to_bits(),
+                row_epoch.to_bits(),
                 entry_epoch.to_bits(),
                 "row {k}: sensitivity epoch disagrees with entry epoch {entry_epoch}"
             );

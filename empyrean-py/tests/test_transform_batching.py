@@ -36,6 +36,7 @@ from empyrean import (
     KeplerianCoordinates,
     Origin,
 )
+from empyrean.coordinates.epoch import Epochs
 from empyrean.coordinates.transform import transform_orbits
 from empyrean.orbits.joint import (
     CovarianceKind,
@@ -103,7 +104,7 @@ def _table(n: int, *, with_covariance: bool) -> CartesianCoordinates:
     """An ``n``-row Cartesian table in ICRF about the Sun."""
     states = np.array(_STATES[:n], dtype=np.float64)
     kwargs = {
-        "epoch": np.array(_EPOCHS[:n], dtype=np.float64),
+        "epochs": Epochs.from_kwargs(mjd=np.array(_EPOCHS[:n], dtype=np.float64), scale="tdb"),
         "x": states[:, 0],
         "y": states[:, 1],
         "z": states[:, 2],

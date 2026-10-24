@@ -20,6 +20,7 @@ from empyrean import (
 )
 from empyrean.coordinates.coordinates import CartesianCoordinates
 from empyrean.coordinates.covariance import CartesianCovariance
+from empyrean.coordinates.epoch import Epochs
 from empyrean.orbits.photometry import PhotometricParams
 
 _T0 = 61000.0
@@ -41,7 +42,7 @@ def _orbit() -> CartesianOrbits:
         orbit_id=["apophis_vis"],
         object_id=["99942"],
         coordinates=CartesianCoordinates.from_kwargs(
-            epoch=np.array([_T0]),
+            epochs=Epochs.from_kwargs(mjd=np.array([_T0]), scale="tdb"),
             x=[_APOPHIS_SSB_ECLIPTIC["x"]],
             y=[_APOPHIS_SSB_ECLIPTIC["y"]],
             z=[_APOPHIS_SSB_ECLIPTIC["z"]],
@@ -68,7 +69,7 @@ def _config() -> PlanningConfig:
                 max_apparent_mag=24.0,
                 min_elongation_deg=60.0,
                 min_elevation_deg=20.0,
-                explicit_anchor_utc_mjd_tdb=_T0 + 1.0,
+                explicit_anchor_utc=Epochs.from_mjd(_T0 + 1.0, scale="tdb"),
             ),
             ObservatoryConfig(
                 obs_code="500",
@@ -81,7 +82,13 @@ def _config() -> PlanningConfig:
 
 
 def _result() -> empyrean.VisibilityResult:
-    return compute_visibility(_orbit(), _T0, _T0 + 2.0, 0.02, _config())
+    return compute_visibility(
+        _orbit(),
+        Epochs.from_mjd(_T0, scale="tdb"),
+        Epochs.from_mjd(_T0 + 2.0, scale="tdb"),
+        0.02,
+        _config(),
+    )
 
 
 # ── Table columns pinned by name ─────────────────────────────────────
@@ -92,7 +99,7 @@ def test_tables_carry_their_pinned_columns():
     for col in [
         "orbit_id",
         "obs_code",
-        "epoch_mjd_tdb",
+        "epochs",
         "solar_elongation_deg",
         "elevation_deg",
         "sun_altitude_deg",
@@ -110,7 +117,7 @@ def test_tables_carry_their_pinned_columns():
         assert hasattr(r.points, col), f"VisibilityPoints is missing {col}"
     for col in ["night_index", "closing_gate", "hours_observable", "max_altitude_deg"]:
         assert hasattr(r.windows, col)
-    for col in ["sunset_mjd_tdb", "local_solar_midnight_mjd_tdb", "sunrise_mjd_tdb", "note"]:
+    for col in ["sunset_epochs", "local_solar_midnight_epochs", "sunrise_epochs", "note"]:
         assert hasattr(r.nights, col)
     for col in ["policy", "altitude_deg", "moon_altitude_deg", "sky_covariance_kind", "joint"]:
         assert hasattr(r.anchors, col)
@@ -155,7 +162,13 @@ def _gate_window() -> empyrean.VisibilityResult:
             )
         ]
     )
-    return compute_visibility(_orbit(), _T0 + 90.0, _T0 + 98.0, 0.02, config)
+    return compute_visibility(
+        _orbit(),
+        Epochs.from_mjd(_T0 + 90.0, scale="tdb"),
+        Epochs.from_mjd(_T0 + 98.0, scale="tdb"),
+        0.02,
+        config,
+    )
 
 
 def test_observable_is_the_conjunction_of_all_four_gates():
@@ -256,7 +269,13 @@ def test_partial_twilight_thresholds_are_refused_before_the_engine():
         ]
     )
     with pytest.raises(ValueError, match="all-or-nothing"):
-        compute_visibility(_orbit(), _T0, _T0 + 1.0, 0.05, cfg)
+        compute_visibility(
+            _orbit(),
+            Epochs.from_mjd(_T0, scale="tdb"),
+            Epochs.from_mjd(_T0 + 1.0, scale="tdb"),
+            0.05,
+            cfg,
+        )
 
 
 def test_non_descending_twilight_is_refused_by_the_observatory_code():
@@ -275,4 +294,10 @@ def test_non_descending_twilight_is_refused_by_the_observatory_code():
         ]
     )
     with pytest.raises(RuntimeError, match="F51"):
-        compute_visibility(_orbit(), _T0, _T0 + 1.0, 0.05, cfg)
+        compute_visibility(
+            _orbit(),
+            Epochs.from_mjd(_T0, scale="tdb"),
+            Epochs.from_mjd(_T0 + 1.0, scale="tdb"),
+            0.05,
+            cfg,
+        )

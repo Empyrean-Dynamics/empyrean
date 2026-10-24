@@ -344,7 +344,10 @@ impl Context {
                     orbit_id: unsafe { cstr_to_string(rec.orbit_id) },
                     object_id: unsafe { cstr_to_string(rec.object_id) },
                     body,
-                    epoch: crate::Epoch::from_mjd_tdb(rec.epoch_mjd_tdb),
+                    // Engine-found close-approach instant, returned in the
+                    // scale of the request's `end_epoch` argument.
+                    epoch: crate::Epoch::from_mjd_tdb(rec.epoch_mjd_tdb)
+                        .to_scale(end_epoch.scale())?,
                     miss_distance_au: rec.miss_distance_au,
                     miss_distance_km: rec.miss_distance_km,
                     effective_radius_au: rec.effective_radius_au,
@@ -442,7 +445,10 @@ impl Context {
                 out.push(BPlane {
                     method: method_from_tag(rec.method_tag),
                     body,
-                    epoch: crate::Epoch::from_mjd_tdb(rec.epoch_mjd_tdb),
+                    // Engine-found close-approach instant, returned in the
+                    // scale of the request's `end_epoch` argument.
+                    epoch: crate::Epoch::from_mjd_tdb(rec.epoch_mjd_tdb)
+                        .to_scale(end_epoch.scale())?,
                     b_dot_t_km: rec.b_dot_t_km,
                     b_dot_r_km: rec.b_dot_r_km,
                     b_mag_km: rec.b_mag_km,

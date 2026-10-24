@@ -16,6 +16,7 @@ from typing import TypeAlias
 import numpy as np
 
 from empyrean.coordinates.enums import Frame, Origin
+from empyrean.coordinates.epoch import Epochs
 from empyrean.od.disposition import ParamDisposition
 from empyrean.od.residuals import (
     AcceptabilityReport,
@@ -129,7 +130,7 @@ class OutputEpochMode(str, Enum):
     ``epoch.eq0`` and find_orb's "anchor at most recent good fit"
     pattern."""
     EXPLICIT = "explicit"
-    """:attr:`OutputEpoch.mjd_tdb` is honored."""
+    """:attr:`OutputEpoch.epoch` is honored."""
 
 
 @dataclass
@@ -139,8 +140,25 @@ class OutputEpoch:
     """
 
     mode: OutputEpochMode = OutputEpochMode.MID_ARC
-    mjd_tdb: float | None = None
-    """Required when ``mode == OutputEpochMode.EXPLICIT``."""
+    epoch: Epochs | None = None
+    """Explicit output epoch as a single-row :class:`~empyrean.Epochs`
+    (the scale-carrying scalar-time-input shape used by impact's
+    ``end_epoch`` and ``compute_visibility``, and the mirror of the Rust
+    ``OutputEpoch::Epoch(Epoch)``). Required when
+    ``mode == OutputEpochMode.EXPLICIT``; converted to TDB at the FFI, so a
+    UTC or TDB value is accepted."""
+
+    def __post_init__(self) -> None:
+        if self.mode == OutputEpochMode.EXPLICIT:
+            if self.epoch is None:
+                raise ValueError(
+                    "OutputEpoch(mode=EXPLICIT) requires `epoch`, a single-row Epochs "
+                    "(e.g. Epochs.from_mjd(value, scale='tdb'))."
+                )
+            if len(self.epoch) != 1:
+                raise ValueError(
+                    f"OutputEpoch.epoch must hold exactly one epoch, got {len(self.epoch)}."
+                )
 
 
 # ── Origin policy (tagged-union dataclass) ───────────────────
@@ -288,12 +306,14 @@ class WeightingLayer:
     case-sensitively."""
     sigma: tuple[float, float] = (1.0, 1.0)
     """1σ (RA·cos(δ), Dec) in arcseconds."""
-    start_epoch_mjd_tdb: float | None = None
-    """Start of applicable time range (MJD TDB). ``None`` =
-    unbounded."""
-    end_epoch_mjd_tdb: float | None = None
-    """End of applicable time range (MJD TDB). ``None`` =
-    unbounded."""
+    start_epoch: Epochs | None = None
+    """Start of the applicable time range, a single-row scale-carrying
+    :class:`~empyrean.Epochs` (converted to TDB at the FFI). ``None`` =
+    unbounded. (Named ``start_epoch`` rather than ``scale``-prefixed
+    because :attr:`scale` below is the weight factor, not a time scale.)"""
+    end_epoch: Epochs | None = None
+    """End of the applicable time range, a single-row :class:`~empyrean.Epochs`.
+    ``None`` = unbounded."""
     scale: float = 1.0
     """Scale factor on the final weight."""
 
@@ -311,10 +331,10 @@ class WeightingLayer:
                 inert.append(f"obs_code={self.obs_code!r}")
             if tuple(self.sigma) != (1.0, 1.0):
                 inert.append(f"sigma={tuple(self.sigma)!r}")
-            if self.start_epoch_mjd_tdb is not None:
-                inert.append(f"start_epoch_mjd_tdb={self.start_epoch_mjd_tdb!r}")
-            if self.end_epoch_mjd_tdb is not None:
-                inert.append(f"end_epoch_mjd_tdb={self.end_epoch_mjd_tdb!r}")
+            if self.start_epoch is not None:
+                inert.append(f"start_epoch={self.start_epoch!r}")
+            if self.end_epoch is not None:
+                inert.append(f"end_epoch={self.end_epoch!r}")
             if self.scale != 1.0:
                 inert.append(f"scale={self.scale!r}")
             if inert:
@@ -379,14 +399,14 @@ class WeightingLayer:
                     f"1.0 for no scaling."
                 )
             for name, value in (
-                ("start_epoch_mjd_tdb", self.start_epoch_mjd_tdb),
-                ("end_epoch_mjd_tdb", self.end_epoch_mjd_tdb),
+                ("start_epoch", self.start_epoch),
+                ("end_epoch", self.end_epoch),
             ):
-                if value is not None and not math.isfinite(value):
+                if value is not None and len(value) != 1:
                     raise ValueError(
                         f"OBSERVATORY_RULE layer (obs_code={self.obs_code!r}): "
-                        f"{name} must be a finite MJD TDB or None for "
-                        f"unbounded, got {value!r}."
+                        f"{name} must be a single-row Epochs or None for "
+                        f"unbounded, got {len(value)} rows."
                     )
 
 
@@ -792,7 +812,13 @@ class ODConfig:
             },
             "output_epoch": {
                 "mode": self.output_epoch.mode,
-                "mjd_tdb": self.output_epoch.mjd_tdb,
+                # The wire carries MJD TDB (the engine scale); the explicit
+                # epoch is converted to TDB here, at the FFI boundary.
+                "mjd_tdb": (
+                    float(self.output_epoch.epoch.mjd_tdb()[0])
+                    if self.output_epoch.epoch is not None
+                    else None
+                ),
             },
             "max_iterations": self.max_iterations,
             "convergence_tol": self.convergence_tol,
@@ -910,8 +936,14 @@ def _weighting_layer_to_dict(layer: WeightingLayer) -> dict[str, WireValue]:
         "kind": _enum_value(layer.kind),
         "obs_code": layer.obs_code,
         "sigma": list(layer.sigma),
-        "start_epoch_mjd_tdb": layer.start_epoch_mjd_tdb,
-        "end_epoch_mjd_tdb": layer.end_epoch_mjd_tdb,
+        # The wire carries the time range as MJD TDB (the engine scale);
+        # convert the scale-carrying endpoints here, at the FFI boundary.
+        "start_epoch_mjd_tdb": (
+            float(layer.start_epoch.mjd_tdb()[0]) if layer.start_epoch is not None else None
+        ),
+        "end_epoch_mjd_tdb": (
+            float(layer.end_epoch.mjd_tdb()[0]) if layer.end_epoch is not None else None
+        ),
         "scale": layer.scale,
     }
 
@@ -1077,8 +1109,10 @@ class TrustGateEvent:
 
     kind: str
     """``"close_approach"`` or ``"high_nonlinearity"``."""
-    epoch_mjd_tdb: float
-    """Epoch of the event (MJD TDB)."""
+    epoch: Epochs
+    """Epoch of the event as a single-row :class:`~empyrean.Epochs`, in the
+    OD result's scale (UTC, following the observations), an engine-found
+    instant carrying its scale as data."""
     body: str | None = None
     """Name of the approached body (close-approach events only)."""
     distance_au: float | None = None

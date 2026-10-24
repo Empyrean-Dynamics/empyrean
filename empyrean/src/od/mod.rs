@@ -248,6 +248,7 @@ impl Context {
         let summary = ResidualSummary::from_ffi(&result.summary);
         unsafe { empyrean_sys::empyrean_evaluate_result_free(&mut result) };
 
+        let residuals = residuals_in_observation_scale(residuals)?;
         Ok(EvaluateResult { residuals, summary })
     }
 
@@ -421,6 +422,7 @@ impl BuiltSystem {
         let summary = ResidualSummary::from_ffi(&result.summary);
         unsafe { empyrean_sys::empyrean_evaluate_result_free(&mut result) };
 
+        let residuals = residuals_in_observation_scale(residuals)?;
         Ok(EvaluateResult { residuals, summary })
     }
 
@@ -533,6 +535,7 @@ fn ffi_od_result_to_rust(
             .map(ObservationResidual::from_ffi)
             .collect()
     };
+    let residuals = residuals_in_observation_scale(residuals)?;
     let summary = ResidualSummary::from_ffi(&result.summary);
     let acceptability = AcceptabilityReport::from_ffi(&result.acceptability);
     let force_model_used = match result.force_model_used {
@@ -588,7 +591,11 @@ fn ffi_od_result_to_rust(
     };
     let photometry =
         (result.has_photometry != 0).then(|| PhotometryResult::from_ffi(&result.photometry));
-    let covariance_trust = CovarianceTrust::from_ffi(result);
+    // The trust event is part of the OD result, so its epoch comes back in
+    // the observations' scale (UTC), like the residuals and the orbit epoch.
+    let covariance_trust = CovarianceTrust::from_ffi(result)
+        .map(|ct| ct.into_scale(crate::TimeScale::UTC))
+        .transpose()?;
     Ok(DetermineResult {
         orbit,
         residuals,
@@ -646,6 +653,24 @@ fn ffi_od_result_to_rust(
 /// is what `evaluate` / `refine` / `propagate` /
 /// `compute_impact_probabilities` accept directly — no reconstruction, no
 /// silently-dropped force model.
+/// Re-express residual epochs in the observations' scale.
+///
+/// Engine residual epochs cross the FFI as MJD TDB; ADES observations are
+/// UTC by definition, so an OD result follows that input-table scale: the
+/// residual epochs and the fitted orbit epoch alike (parity with the Python
+/// OD result). These are requested observation instants, converted once.
+fn residuals_in_observation_scale(
+    residuals: Vec<ObservationResidual>,
+) -> crate::error::Result<Vec<ObservationResidual>> {
+    residuals
+        .into_iter()
+        .map(|mut r| {
+            r.epoch = r.epoch.to_scale(crate::TimeScale::UTC)?;
+            Ok(r)
+        })
+        .collect()
+}
+
 fn ffi_od_result_orbit(result: &empyrean_sys::EmpyreanODResult) -> crate::error::Result<Orbit> {
     use crate::coordinate::Origin;
     let s = &result.orbit;
@@ -657,7 +682,10 @@ fn ffi_od_result_orbit(result: &empyrean_sys::EmpyreanODResult) -> crate::error:
     })?;
     let frame = crate::coordinate::int_to_frame(s.frame)?;
     let mut state = crate::CoordinateState::cartesian(
-        crate::Epoch::from_mjd_tdb(s.epoch_mjd_tdb),
+        // The fit is anchored to the observations (ADES UTC by definition),
+        // so the fitted orbit's epoch follows that input-table scale: the
+        // same scale the residual epochs carry. The engine returns TDB.
+        crate::Epoch::from_mjd_tdb(s.epoch_mjd_tdb).to_scale(crate::TimeScale::UTC)?,
         [s.x, s.y, s.z, s.vx, s.vy, s.vz],
         frame,
         origin,

@@ -26,6 +26,7 @@ from empyrean.coordinates.covariance import (
     CartesianCovariance as _CartesianCovariance,
 )
 from empyrean.coordinates.covariance import _CovarianceTable
+from empyrean.coordinates.epoch import Epochs
 from empyrean.od.ades_observations import ADESObservations
 from empyrean.od.radar_observations import ADESRadarObservations
 from empyrean.od.residuals import (
@@ -321,7 +322,11 @@ def _build_observation_results(result: ResultDict) -> ObservationResults:
         object_id=list(result.get("object_ids", [None] * len(result["obs_ids"]))),
         obs_code=list(result["obs_codes"]),
         ast_cat=list(result["ast_cats"]),
-        epoch_mjd_tdb=np.asarray(result["obs_epochs"]),
+        # ADES observation times are UTC by definition; residuals come back
+        # in that scale.
+        epochs=Epochs.from_kwargs(mjd=np.asarray(result["obs_epochs"]), scale="tdb").to_scale(
+            "utc"
+        ),
         # Core residuals
         ra_residual=np.asarray(result["ra_residuals"]),
         dec_residual=np.asarray(result["dec_residuals"]),
@@ -458,7 +463,11 @@ def _build_cartesian_orbits_single(result: ResultDict, prefix: str = "") -> Cart
     # copy — the state 6×6 is the joint's derived leading block, read through
     # `orbit.covariance`. `{p}covariance` is the joint wire, not a flat matrix.
     coord_kwargs: dict[str, KwargValue] = {
-        "epoch": epoch,
+        # The fit is anchored to the observations, which are ADES UTC by
+        # definition, so the fitted orbit's epoch follows that input-table
+        # scale: the same scale the residuals already come back in (one
+        # result, one scale). The engine returns TDB; convert to UTC.
+        "epochs": Epochs.from_kwargs(mjd=epoch, scale="tdb").to_scale("utc"),
         "x": x,
         "y": y,
         "z": z,
@@ -1206,7 +1215,12 @@ def _build_covariance_trust(d: dict[str, Any] | None) -> CovarianceTrust | None:
     event = (
         TrustGateEvent(
             kind=str(event_d["kind"]),
-            epoch_mjd_tdb=float(event_d["epoch_mjd_tdb"]),
+            # The wire carries the event epoch as MJD TDB; the OD result
+            # follows the observations' scale (UTC), like the residuals and
+            # the fitted orbit epoch.
+            epoch=Epochs.from_kwargs(mjd=[float(event_d["epoch_mjd_tdb"])], scale="tdb").to_scale(
+                "utc"
+            ),
             body=event_d.get("body"),
             distance_au=event_d.get("distance_au"),
             nonlinearity=event_d.get("nonlinearity"),

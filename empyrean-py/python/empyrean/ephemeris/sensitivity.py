@@ -28,6 +28,7 @@ Helper accessors on the filtered table (``stms_array``,
 from typing import Literal
 
 import numpy as np
+import pyarrow as pa
 import quivr as qv
 
 # ``pyarrow.compute`` generates its comparison wrappers (``less_equal`` …)
@@ -106,8 +107,8 @@ class StateSensitivities(qv.Table):
     """Orbit primary key (matches the input ``Orbits.orbit_id``)."""
     object_id = qv.LargeStringColumn(nullable=True)
     """Object metadata label, if carried on the input orbit."""
-    epoch_mjd_tdb = qv.Float64Column()
-    """Output epoch (MJD TDB)."""
+    epochs = Epochs.as_column()
+    """Output epochs as an :class:`~empyrean.Epochs` sub-table, in the request scale."""
     stm = qv.LargeListColumn(qv.Float64Column(), nullable=True)
     """Row-major flattened 6×6 STM (length 36 per row), or ``None``."""
     stt = qv.LargeListColumn(qv.Float64Column(), nullable=True)
@@ -213,7 +214,7 @@ class StateSensitivities(qv.Table):
         """
         _require_single_state_chain(self, "index_at")
         target = _require_single_epoch(epoch, "StateSensitivities.index_at() epoch")
-        mjd = self.column("epoch_mjd_tdb").to_numpy(zero_copy_only=False)
+        mjd = self.epochs.mjd_tdb()
         diffs = np.abs(mjd - target)
         i = int(np.argmin(diffs))
         if diffs[i] > atol:
@@ -225,12 +226,12 @@ class StateSensitivities(qv.Table):
         return i
 
     def up_to(self, epoch: Epochs) -> "StateSensitivities":
-        """Subset including rows with ``epoch_mjd_tdb ≤`` the target.
+        """Subset including rows with ``epochs`` at or before the target.
 
         ``epoch`` is a length-1 :class:`Epochs` in any time scale.
         """
         target = _require_single_epoch(epoch, "StateSensitivities.up_to() epoch")
-        mask = call_function("less_equal", [self.column("epoch_mjd_tdb"), target])
+        mask = call_function("less_equal", [pa.array(self.epochs.mjd_tdb()), target])
         return self.apply_mask(mask)
 
     # ── Covariance propagation ────────────────────────────────
@@ -421,8 +422,8 @@ class ObservationSensitivities(qv.Table):
     """Object metadata label."""
     obs_code = qv.LargeStringColumn()
     """MPC observatory code."""
-    epoch_mjd_tdb = qv.Float64Column()
-    """Observation epoch (MJD TDB)."""
+    epochs = Epochs.as_column()
+    """Observation epochs as an :class:`~empyrean.Epochs` sub-table, in the request scale."""
     n_params = qv.UInt8Column()
     """Last-axis dimension of Jacobian / Hessian. 6 for state-only DC,
     9 when non-grav A1/A2/A3 are free. Constant within a chain."""
@@ -503,7 +504,7 @@ class ObservationSensitivities(qv.Table):
         """
         _require_single_obs_chain(self, "index_at")
         target = _require_single_epoch(epoch, "ObservationSensitivities.index_at() epoch")
-        mjd = self.column("epoch_mjd_tdb").to_numpy(zero_copy_only=False)
+        mjd = self.epochs.mjd_tdb()
         diffs = np.abs(mjd - target)
         i = int(np.argmin(diffs))
         if diffs[i] > atol:
@@ -515,12 +516,12 @@ class ObservationSensitivities(qv.Table):
         return i
 
     def up_to(self, epoch: Epochs) -> "ObservationSensitivities":
-        """Subset including rows with ``epoch_mjd_tdb ≤`` the target.
+        """Subset including rows with ``epochs`` at or before the target.
 
         ``epoch`` is a length-1 :class:`Epochs` in any time scale.
         """
         target = _require_single_epoch(epoch, "ObservationSensitivities.up_to() epoch")
-        mask = call_function("less_equal", [self.column("epoch_mjd_tdb"), target])
+        mask = call_function("less_equal", [pa.array(self.epochs.mjd_tdb()), target])
         return self.apply_mask(mask)
 
     # ── Covariance propagation ────────────────────────────────

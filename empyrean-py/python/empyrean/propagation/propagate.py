@@ -29,7 +29,7 @@ from empyrean.coordinates.covariance import (
     CartesianCovariance as _CartesianCovariance,
 )
 from empyrean.coordinates.covariance import _CovarianceTable
-from empyrean.coordinates.epoch import Epochs, _epochs_mjd_tdb
+from empyrean.coordinates.epoch import Epochs, _echo_epochs, _empty_in_scale, _epochs_mjd_tdb
 from empyrean.orbits.joint import _KIND_BY_CODE
 from empyrean.orbits.orbits import CartesianOrbits
 from empyrean.propagation.config import (
@@ -284,6 +284,10 @@ def propagate(
     # Refused here, at the entry point, before any orbit is marshaled —
     # a bare array is a caller error, not a modelling result.
     times_mjd_tdb = _epochs_mjd_tdb(epochs, "propagate() epochs")
+    # Results come back in the scale the caller requested: propagated states
+    # echo the requested epochs, engine-found events / close approaches
+    # convert to it. The engine works in TDB throughout.
+    request_scale = epochs.scale
 
     # ── Assemble PropagationConfig ────────────────────────────
     if config is None:
@@ -568,19 +572,19 @@ def propagate(
     )
 
     # ── Build CartesianOrbits from result ─────────────────────
-    states = _build_cartesian_orbits(result)
-    detected_events = _build_events(result)
+    states = _build_cartesian_orbits(result, epochs)
+    detected_events = _build_events(result, request_scale)
 
     # ── Build per-orbit StateSensitivity chains ───────────────
-    sensitivity = _build_state_sensitivity(result)
+    sensitivity = _build_state_sensitivity(result, request_scale)
 
     # ── Build provenance-tagged covariance table (opt-in) ─────
-    tagged = _build_tagged_covariance(result) if tagged_covariance else None
+    tagged = _build_tagged_covariance(result, request_scale) if tagged_covariance else None
 
     # ── Retained AGM mixture components (always on) ───────────
     # Free: the components already crossed the boundary with the result.
     # Empty table when nothing split.
-    mixtures = build_mixture_chains(result)
+    mixtures = build_mixture_chains(result, request_scale)
 
     # ── Per-input-orbit delivery status (always on) ───────────
     # One row per input orbit, whether or not it delivered. A failed orbit
@@ -598,7 +602,7 @@ def propagate(
 
 
 def _build_tagged_covariance(
-    result: dict[str, Any],
+    result: dict[str, Any], request_scale: str
 ) -> "TaggedCovariances | None":
     """Build a :class:`TaggedCovariances` table from the pyo3 result.
 
@@ -615,10 +619,12 @@ def _build_tagged_covariance(
     orbit_ids: list[str] = list(result["orbit_ids"])
     object_ids: list[str | None] = [s if s else None for s in result["object_ids"]]
     epochs_arr = np.asarray(result["epochs"], dtype=np.float64)
-    return build_tagged_covariances(result, orbit_ids, object_ids, epochs_arr)
+    return build_tagged_covariances(result, orbit_ids, object_ids, epochs_arr, request_scale)
 
 
-def _build_state_sensitivity(result: dict[str, Any]) -> "StateSensitivities | None":
+def _build_state_sensitivity(
+    result: dict[str, Any], request_scale: str
+) -> "StateSensitivities | None":
     """Build a :class:`StateSensitivities` table from the pyo3 result.
 
     Flattens the per-row (6, 6) STM and (6, 6, 6) STT arrays into the
@@ -687,7 +693,7 @@ def _build_state_sensitivity(result: dict[str, Any]) -> "StateSensitivities | No
     return StateSensitivities.from_kwargs(
         orbit_id=orbit_ids,
         object_id=object_ids,
-        epoch_mjd_tdb=epochs_arr,
+        epochs=Epochs.from_kwargs(mjd=epochs_arr, scale="tdb").to_scale(request_scale),
         stm=stm_col,
         stt=stt_col,
         resolved_kind=resolved_kind_col,
@@ -700,11 +706,18 @@ def _build_state_sensitivity(result: dict[str, Any]) -> "StateSensitivities | No
     )
 
 
-def _build_cartesian_orbits(result: dict[str, Any]) -> CartesianOrbits:
-    """Build CartesianOrbits from the Rust result dict."""
+def _build_cartesian_orbits(result: dict[str, Any], request_epochs: Epochs) -> CartesianOrbits:
+    """Build CartesianOrbits from the Rust result dict.
+
+    The states are the requested propagation instants (orbit-major; a
+    failed or short orbit simply delivers fewer rows), so each row's
+    ``epochs`` sub-table echoes the caller's own supplied value in the
+    caller's scale, matched by value against the engine's TDB return,
+    never a round-trip of that TDB number back through a conversion.
+    """
     m = len(result["epochs"])
 
-    out_epochs = np.asarray(result["epochs"])
+    out_epochs = _echo_epochs(np.asarray(result["epochs"]), request_epochs)
     out_x = np.asarray(result["x"])
     out_y = np.asarray(result["y"])
     out_z = np.asarray(result["z"])
@@ -735,7 +748,7 @@ def _build_cartesian_orbits(result: dict[str, Any]) -> CartesianOrbits:
     frame_value = frame.value if hasattr(frame, "value") else frame
     if cov is not None:
         cart_coords = CartesianCoordinates.from_kwargs(
-            epoch=out_epochs,
+            epochs=out_epochs,
             x=out_x,
             y=out_y,
             z=out_z,
@@ -748,7 +761,7 @@ def _build_cartesian_orbits(result: dict[str, Any]) -> CartesianOrbits:
         )
     else:
         cart_coords = CartesianCoordinates.from_kwargs(
-            epoch=out_epochs,
+            epochs=out_epochs,
             x=out_x,
             y=out_y,
             z=out_z,
@@ -795,8 +808,12 @@ def _nullable_str_list(values: Sequence[str | None]) -> list[str | None]:
     return [s if s else None for s in values]
 
 
-def _build_events(result: dict[str, Any]) -> Events:
+def _build_events(result: dict[str, Any], request_scale: str) -> Events:
     """Build Events container from the Rust result dict.
+
+    Detected events are instants the engine found, so each table's
+    ``epochs`` sub-table is converted from the engine's TDB into the
+    caller's ``request_scale``.
 
     The Rust extension returns a single flat events sub-dict with an
     ``event_types`` discriminator column carrying ``distance_au`` /
@@ -809,20 +826,22 @@ def _build_events(result: dict[str, Any]) -> Events:
     """
     ev = result.get("events")
     if ev is None or len(ev["event_types"]) == 0:
+        # No events: every sub-table is empty, and each carries the
+        # caller's request scale (D9) rather than the carrier default.
         return Events(
-            summary=EventSummary.empty(),
-            close_approach_starts=CloseApproachStarts.empty(),
-            close_approach_ends=CloseApproachEnds.empty(),
-            periapses=Periapses.empty(),
-            impacts=Impacts.empty(),
-            possible_impacts=PossibleImpacts.empty(),
-            atmospheric_entries=AtmosphericEntries.empty(),
-            atmospheric_exits=AtmosphericExits.empty(),
-            capture_starts=CaptureStarts.empty(),
-            capture_ends=CaptureEnds.empty(),
-            shadow_entries=ShadowEntries.empty(),
-            shadow_exits=ShadowExits.empty(),
-            covariance_regime_changes=CovarianceRegimeChanges.empty(),
+            summary=_empty_in_scale(EventSummary, request_scale),
+            close_approach_starts=_empty_in_scale(CloseApproachStarts, request_scale),
+            close_approach_ends=_empty_in_scale(CloseApproachEnds, request_scale),
+            periapses=_empty_in_scale(Periapses, request_scale),
+            impacts=_empty_in_scale(Impacts, request_scale),
+            possible_impacts=_empty_in_scale(PossibleImpacts, request_scale),
+            atmospheric_entries=_empty_in_scale(AtmosphericEntries, request_scale),
+            atmospheric_exits=_empty_in_scale(AtmosphericExits, request_scale),
+            capture_starts=_empty_in_scale(CaptureStarts, request_scale),
+            capture_ends=_empty_in_scale(CaptureEnds, request_scale),
+            shadow_entries=_empty_in_scale(ShadowEntries, request_scale),
+            shadow_exits=_empty_in_scale(ShadowExits, request_scale),
+            covariance_regime_changes=_empty_in_scale(CovarianceRegimeChanges, request_scale),
         )
 
     orbit_ids = list(ev["orbit_ids"])
@@ -880,7 +899,7 @@ def _build_events(result: dict[str, Any]) -> Events:
         object_id=_nullable_str_list(object_ids),
         event_type=event_types,
         body=bodies,
-        epoch=epochs,
+        epochs=Epochs.from_kwargs(mjd=epochs, scale="tdb").to_scale(request_scale),
     )
 
     # Filter helpers ---------------------------------------------------
@@ -896,15 +915,20 @@ def _build_events(result: dict[str, Any]) -> Events:
     def _arr(values: np.ndarray, idx: list[int]) -> np.ndarray:
         return values[idx] if len(idx) > 0 else np.zeros(0, dtype=values.dtype)
 
+    def _ev_epochs(idx: list[int]) -> Epochs:
+        """The event epochs for ``idx`` as an :class:`Epochs` sub-table in
+        the caller's request scale (converted from the engine's TDB)."""
+        return Epochs.from_kwargs(mjd=_arr(epochs, idx), scale="tdb").to_scale(request_scale)
+
     def _common(tag: str, cls: type[_EventTableT]) -> _EventTableT:
         idx = _idx(tag)
         if not idx:
-            return cls.empty()
+            return _empty_in_scale(cls, request_scale)
         return cls.from_kwargs(
             orbit_id=_str(orbit_ids, idx),
             object_id=_str_opt(object_ids, idx),
             body=_str(bodies, idx),
-            epoch=_arr(epochs, idx),
+            epochs=_ev_epochs(idx),
             distance_au=_arr(distance_au, idx),
             distance_km=_arr(distance_km, idx),
         )
@@ -919,7 +943,7 @@ def _build_events(result: dict[str, Any]) -> Events:
             orbit_id=_str(orbit_ids, per_idx),
             object_id=_str_opt(object_ids, per_idx),
             body=_str(bodies, per_idx),
-            epoch=_arr(epochs, per_idx),
+            epochs=_ev_epochs(per_idx),
             distance_au=_arr(distance_au, per_idx),
             distance_km=_arr(distance_km, per_idx),
             relative_velocity_au_day=_arr(rel_v, per_idx),
@@ -931,7 +955,7 @@ def _build_events(result: dict[str, Any]) -> Events:
             relative_vz=_arr(relative_vz, per_idx),
         )
     else:
-        periapses = Periapses.empty()
+        periapses = _empty_in_scale(Periapses, request_scale)
 
     # Impacts: planetodetic surface-intercept lat/lon/alt now carried by
     # the flat schema (NaN -> null where the impact geometry was
@@ -942,7 +966,7 @@ def _build_events(result: dict[str, Any]) -> Events:
             orbit_id=_str(orbit_ids, imp_idx),
             object_id=_str_opt(object_ids, imp_idx),
             body=_str(bodies, imp_idx),
-            epoch=_arr(epochs, imp_idx),
+            epochs=_ev_epochs(imp_idx),
             latitude_deg=_nullable_float(_arr(impact_lat, imp_idx)),
             longitude_deg=_nullable_float(_arr(impact_lon, imp_idx)),
             altitude_km=_nullable_float(_arr(impact_alt, imp_idx)),
@@ -952,7 +976,7 @@ def _build_events(result: dict[str, Any]) -> Events:
             relative_velocity_au_day=_nullable_float(_arr(rel_v, imp_idx)),
         )
     else:
-        impacts = Impacts.empty()
+        impacts = _empty_in_scale(Impacts, request_scale)
 
     # Possible impacts: probabilistic fields not in the flat schema.
     pi_idx = _idx("possible_impact")
@@ -970,7 +994,7 @@ def _build_events(result: dict[str, Any]) -> Events:
             orbit_id=_str(orbit_ids, pi_idx),
             object_id=_str_opt(object_ids, pi_idx),
             body=_str(bodies, pi_idx),
-            epoch=_arr(epochs, pi_idx),
+            epochs=_ev_epochs(pi_idx),
             miss_distance_au=_arr(distance_au, pi_idx),
             miss_distance_km=_arr(distance_km, pi_idx),
             effective_radius_au=_arr(pi_effective_radius_au, pi_idx),
@@ -984,7 +1008,7 @@ def _build_events(result: dict[str, Any]) -> Events:
             ip_mc=_nullable_float(_arr(pi_ip_mc, pi_idx)),
         )
     else:
-        possible_impacts = PossibleImpacts.empty()
+        possible_impacts = _empty_in_scale(PossibleImpacts, request_scale)
 
     # Atmospheric entries: distance_au is the body-CENTER crossing
     # distance (the Karman radius), NOT an altitude. The true altitude
@@ -998,7 +1022,7 @@ def _build_events(result: dict[str, Any]) -> Events:
             orbit_id=_str(orbit_ids, ae_idx),
             object_id=_str_opt(object_ids, ae_idx),
             body=_str(bodies, ae_idx),
-            epoch=_arr(epochs, ae_idx),
+            epochs=_ev_epochs(ae_idx),
             distance_au=_arr(distance_au, ae_idx),
             altitude_km=_nullable_float(_arr(impact_alt, ae_idx)),
             relative_velocity_au_day=_nullable_float(_arr(rel_v, ae_idx)),
@@ -1006,17 +1030,17 @@ def _build_events(result: dict[str, Any]) -> Events:
             longitude_deg=_nullable_float(_arr(impact_lon, ae_idx)),
         )
     else:
-        atmospheric_entries = AtmosphericEntries.empty()
+        atmospheric_entries = _empty_in_scale(AtmosphericEntries, request_scale)
 
     def _simple_entry_exit(tag: str, cls: type[_EventTableT]) -> _EventTableT:
         idx = _idx(tag)
         if not idx:
-            return cls.empty()
+            return _empty_in_scale(cls, request_scale)
         return cls.from_kwargs(
             orbit_id=_str(orbit_ids, idx),
             object_id=_str_opt(object_ids, idx),
             body=_str(bodies, idx),
-            epoch=_arr(epochs, idx),
+            epochs=_ev_epochs(idx),
             distance_au=_arr(distance_au, idx),
         )
 
@@ -1027,12 +1051,12 @@ def _build_events(result: dict[str, Any]) -> Events:
     def _capture(tag: str, cls: type[_EventTableT], with_n_periapses: bool = False) -> _EventTableT:
         idx = _idx(tag)
         if not idx:
-            return cls.empty()
+            return _empty_in_scale(cls, request_scale)
         kwargs: dict[str, Any] = {
             "orbit_id": _str(orbit_ids, idx),
             "object_id": _str_opt(object_ids, idx),
             "body": _str(bodies, idx),
-            "epoch": _arr(epochs, idx),
+            "epochs": _ev_epochs(idx),
             "distance_au": _arr(distance_au, idx),
             "distance_km": _arr(distance_km, idx),
             "relative_velocity_au_day": _arr(rel_v, idx),
@@ -1054,12 +1078,12 @@ def _build_events(result: dict[str, Any]) -> Events:
     def _shadow(tag: str, cls: type[_EventTableT]) -> _EventTableT:
         idx = _idx(tag)
         if not idx:
-            return cls.empty()
+            return _empty_in_scale(cls, request_scale)
         return cls.from_kwargs(
             orbit_id=_str(orbit_ids, idx),
             object_id=_str_opt(object_ids, idx),
             body=_str(bodies, idx),
-            epoch=_arr(epochs, idx),
+            epochs=_ev_epochs(idx),
             shadow_fraction=_arr(shadow_fraction, idx),
             illumination=_arr(illumination, idx),
         )
@@ -1079,7 +1103,7 @@ def _build_events(result: dict[str, Any]) -> Events:
             orbit_id=_str(orbit_ids, crc_idx),
             object_id=_str_opt(object_ids, crc_idx),
             body=_str_opt(bodies, crc_idx),
-            epoch=_arr(epochs, crc_idx),
+            epochs=_ev_epochs(crc_idx),
             previous_kind=[_kind_label(c) for c in _arr(previous_kind, crc_idx)],
             resolved_kind=[_kind_label(c) for c in _arr(regime_resolved_kind, crc_idx)],
             kappa=_nullable_float(_arr(kappa, crc_idx)),
@@ -1087,7 +1111,7 @@ def _build_events(result: dict[str, Any]) -> Events:
             threshold_above=_nullable_float(_arr(threshold_above, crc_idx)),
         )
     else:
-        covariance_regime_changes = CovarianceRegimeChanges.empty()
+        covariance_regime_changes = _empty_in_scale(CovarianceRegimeChanges, request_scale)
 
     return Events(
         summary=summary,

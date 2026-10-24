@@ -102,9 +102,9 @@ class ImpactProbabilities(qv.Table):
     but populated when MC is among the requested methods.
 
     The closest-approach time is carried as an :class:`Epochs`
-    sub-table (always emitted in TDB) rather than a raw MJD float
-    so consumers can do ``ips.epochs.to_utc()`` and get back the
-    same row alignment.
+    sub-table in the request scale (the ``end_epoch`` argument's scale)
+    rather than a raw MJD float, so the scale travels with the value and
+    ``ips.epochs.to_utc()`` / ``.to_tdb()`` convert without re-stating it.
     """
 
     method = qv.LargeStringColumn()
@@ -121,7 +121,8 @@ class ImpactProbabilities(qv.Table):
     :meth:`Origin.from_string` to lift the column value into a typed
     :class:`Origin`."""
     epochs = Epochs.as_column()
-    """Closest-approach epoch as an :class:`Epochs` sub-table (TDB)."""
+    """Closest-approach epoch as an :class:`Epochs` sub-table, in the
+    request scale (the ``end_epoch`` argument's scale)."""
     miss_distance_au = qv.Float64Column()
     """Closest-approach geocentric (or body-centric) distance at the
     nominal trajectory, in AU."""
@@ -241,7 +242,8 @@ class BPlanes(qv.Table):
     """Body name; B-plane is defined relative to this body's
     hyperbolic-excess-velocity asymptote at closest approach."""
     epochs = Epochs.as_column()
-    """Closest-approach epoch (TDB)."""
+    """Closest-approach epoch as an :class:`Epochs` sub-table, in the
+    request scale (the ``end_epoch`` argument's scale)."""
     b_dot_t_km = qv.Float64Column()
     """Öpik :math:`B \\cdot T` coordinate in km. T points along the
     projection of the planet's heliocentric velocity onto the
@@ -696,7 +698,7 @@ def compute_impact_probabilities(
         orbit_id=fixed_orbit_ids,
         object_id=fixed_object_ids,
         body=out["body"],
-        epochs=Epochs.from_kwargs(mjd=out["epoch_mjd_tdb"], scale="tdb"),
+        epochs=Epochs.from_kwargs(mjd=out["epoch_mjd_tdb"], scale="tdb").to_scale(end_epoch.scale),
         miss_distance_au=out["miss_distance_au"],
         miss_distance_km=out["miss_distance_km"],
         effective_radius_au=out["effective_radius_au"],
@@ -799,7 +801,7 @@ def compute_b_planes(
     return BPlanes.from_kwargs(
         method=_tags_to_method_strings(out["method_tag"]),
         body=out["body"],
-        epochs=Epochs.from_kwargs(mjd=out["epoch_mjd_tdb"], scale="tdb"),
+        epochs=Epochs.from_kwargs(mjd=out["epoch_mjd_tdb"], scale="tdb").to_scale(end_epoch.scale),
         b_dot_t_km=out["b_dot_t_km"],
         b_dot_r_km=out["b_dot_r_km"],
         b_mag_km=out["b_mag_km"],

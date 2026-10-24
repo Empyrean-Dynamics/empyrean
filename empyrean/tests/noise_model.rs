@@ -227,8 +227,8 @@ fn a_per_station_rule_reports_its_law_on_that_station_alone() {
         empyrean::WeightingLayer::ObservatoryRule {
             obs_code: target.clone(),
             sigma: [0.5, 0.5],
-            start_epoch_mjd_tdb: None,
-            end_epoch_mjd_tdb: None,
+            start_epoch: None,
+            end_epoch: None,
             scale: 1.0,
             noise_model: Some(NoiseModel::StudentT { nu: 4.0 }),
         },

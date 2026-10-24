@@ -19,6 +19,7 @@ from empyrean._convert import (
 if TYPE_CHECKING:
     import pyarrow as pa
 
+from empyrean.coordinates.epoch import Epochs, _echo_epochs, _empty_in_scale
 from empyrean.ephemeris.result import EphemerisConfig, EphemerisResult
 from empyrean.observers.observers import Observers
 from empyrean.propagation.config import (
@@ -277,7 +278,10 @@ def generate_ephemeris(
     # ── Extract observer arrays ──────────────────────────────
     obs_codes = observers.obs_code.to_pylist()
     oc = observers.coordinates
-    obs_epochs = np.asarray(oc.epoch.to_numpy(zero_copy_only=False), dtype=np.float64)
+    obs_epochs = oc.epochs.mjd_tdb()
+    # Ephemeris results come back in the observers' scale (the request
+    # scale); the engine works in TDB.
+    request_scale = oc.epochs.scale
     # Only the code and the epoch cross the boundary. The binding
     # recomputes each observer's state from that pair — the table's own
     # position/velocity columns are not a second input, because two
@@ -448,7 +452,10 @@ def generate_ephemeris(
     )
 
     spherical_kwargs: dict[str, Any] = {
-        "epoch": np.asarray(result["epoch"]),
+        # Observation (observer) epochs are requested instants: echo the
+        # observers' own supplied values back in the request scale, matched
+        # by value against the engine's TDB return.
+        "epochs": _echo_epochs(np.asarray(result["epoch"]), oc.epochs),
         "rho": np.asarray(result["rho"]),
         "lon": np.asarray(result["ra"]),
         "lat": np.asarray(result["dec"]),
@@ -502,7 +509,9 @@ def generate_ephemeris(
     _lt = np.asarray(result["light_time"], dtype=np.float64)
     emission_epoch = np.where(np.isfinite(_lt), _obs_epoch - _lt, _obs_epoch)
     aberrated_kwargs: dict[str, Any] = {
-        "epoch": emission_epoch,
+        # Photon-emission epoch (t_obs - tau), an engine-found instant; in
+        # the request scale.
+        "epochs": Epochs.from_kwargs(mjd=emission_epoch, scale="tdb").to_scale(request_scale),
         "x": aberrated_arr[:, 0],
         "y": aberrated_arr[:, 1],
         "z": aberrated_arr[:, 2],
@@ -562,13 +571,22 @@ def generate_ephemeris(
     # second-order method ran. Empty table on the f64-only path.
     n_sens = len(result.get("sensitivity_orbit_id", []))
     if n_sens == 0:
-        sensitivity = ObservationSensitivities.empty()
+        # An empty result still carries the request scale (D9): a UTC
+        # request with no sensitivity rows says "utc", not the carrier
+        # default.
+        sensitivity = _empty_in_scale(ObservationSensitivities, request_scale)
     else:
         sensitivity = ObservationSensitivities.from_kwargs(
             orbit_id=result["sensitivity_orbit_id"],
             object_id=result["sensitivity_object_id"],
             obs_code=result["sensitivity_obs_code"],
-            epoch_mjd_tdb=np.asarray(result["sensitivity_epoch_mjd_tdb"], dtype=np.float64),
+            # Sensitivity rows sit at requested observer epochs (a short
+            # chain delivers fewer rows): echo the observers' supplied
+            # values, matched by value against the engine's TDB return.
+            epochs=_echo_epochs(
+                np.asarray(result["sensitivity_epoch_mjd_tdb"], dtype=np.float64),
+                oc.epochs,
+            ),
             n_params=np.asarray(result["sensitivity_n_params"], dtype=np.uint8),
             jacobian=result["sensitivity_jacobian"],
             hessian=result["sensitivity_hessian"],

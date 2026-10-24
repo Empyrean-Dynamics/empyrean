@@ -27,6 +27,7 @@ from empyrean import (
 )
 from empyrean.coordinates.coordinates import CartesianCoordinates
 from empyrean.coordinates.covariance import CartesianCovariance
+from empyrean.coordinates.epoch import Epochs
 from empyrean.od.result import ODConfig
 from empyrean.orbits.joint import CovarianceKind
 from empyrean.orbits.orbits import CartesianOrbits
@@ -169,7 +170,7 @@ def _plan_orbit() -> CartesianOrbits:
         orbit_id=["apophis_plan"],
         object_id=["99942"],
         coordinates=CartesianCoordinates.from_kwargs(
-            epoch=np.array([_EPOCH_MJD_TDB]),
+            epochs=Epochs.from_kwargs(mjd=np.array([_EPOCH_MJD_TDB]), scale="tdb"),
             x=[_APOPHIS_SSB_ECLIPTIC["x"]],
             y=[_APOPHIS_SSB_ECLIPTIC["y"]],
             z=[_APOPHIS_SSB_ECLIPTIC["z"]],
@@ -185,8 +186,12 @@ def _plan_orbit() -> CartesianOrbits:
 
 def _plan() -> list[PlannedObservation]:
     return [
-        PlannedObservation.optical(_EPOCH_MJD_TDB + 10.0, "F51", (0.2, 0.2)),
-        PlannedObservation.optical(_EPOCH_MJD_TDB + 12.0, "568", (0.3, 0.3)),
+        PlannedObservation.optical(
+            Epochs.from_mjd(_EPOCH_MJD_TDB + 10.0, scale="tdb"), "F51", (0.2, 0.2)
+        ),
+        PlannedObservation.optical(
+            Epochs.from_mjd(_EPOCH_MJD_TDB + 12.0, scale="tdb"), "568", (0.3, 0.3)
+        ),
     ]
 
 

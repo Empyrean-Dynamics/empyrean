@@ -14,6 +14,7 @@ from empyrean import (
     KeplerianCoordinates,
     Origin,
 )
+from empyrean.coordinates.epoch import Epochs
 from empyrean.coordinates.transform import transform_orbits
 from empyrean.orbits.joint import (
     CovarianceKind,
@@ -53,13 +54,13 @@ def _state_joint(cov6: np.ndarray) -> PackedJoint:
 def single_cometary():
     """A single cometary coordinate (Apophis-like)."""
     return CometaryCoordinates.from_kwargs(
-        epoch=[60200.0],
+        epochs=Epochs.from_kwargs(mjd=[60200.0], scale="tdb"),
         q=[0.7461],
         e=[0.1914],
         i=[3.339],
         raan=[204.446],
         ap=[126.687],
-        tp=[60159.0],
+        perihelion_epochs=Epochs.from_kwargs(mjd=[60159.0], scale="tdb"),
         frame=Frame.ECLIPTICJ2000.value,
         origin=[str(Origin.SUN)],
     )
@@ -69,7 +70,7 @@ def single_cometary():
 def single_cartesian():
     """A single Cartesian coordinate."""
     return CartesianCoordinates.from_kwargs(
-        epoch=[60200.0],
+        epochs=Epochs.from_kwargs(mjd=[60200.0], scale="tdb"),
         x=[0.5],
         y=[-0.8],
         z=[-0.1],
@@ -85,13 +86,13 @@ def make_batch_cometary(n):
     """Create a batch of N cometary coordinates with slight variations."""
     rng = np.random.default_rng(42)
     return CometaryCoordinates.from_kwargs(
-        epoch=np.full(n, 60200.0),
+        epochs=Epochs.from_kwargs(mjd=np.full(n, 60200.0), scale="tdb"),
         q=0.7 + rng.uniform(0, 0.5, n),
         e=0.1 + rng.uniform(0, 0.4, n),
         i=rng.uniform(0, 30, n),
         raan=rng.uniform(0, 360, n),
         ap=rng.uniform(0, 360, n),
-        tp=60100.0 + rng.uniform(0, 200, n),
+        perihelion_epochs=Epochs.from_kwargs(mjd=60100.0 + rng.uniform(0, 200, n), scale="tdb"),
         frame=Frame.ECLIPTICJ2000.value,
         origin=[str(Origin.SUN)] * n,
     )
@@ -106,13 +107,13 @@ def make_batch_cometary_orbits_with_cov(n):
     rng = np.random.default_rng(42)
     joints = [_state_joint(np.diag(rng.uniform(1e-10, 1e-6, 6))) for _ in range(n)]
     coords = CometaryCoordinates.from_kwargs(
-        epoch=np.full(n, 60200.0),
+        epochs=Epochs.from_kwargs(mjd=np.full(n, 60200.0), scale="tdb"),
         q=0.7 + rng.uniform(0, 0.5, n),
         e=0.1 + rng.uniform(0, 0.4, n),
         i=rng.uniform(0, 30, n),
         raan=rng.uniform(0, 360, n),
         ap=rng.uniform(0, 360, n),
-        tp=60100.0 + rng.uniform(0, 200, n),
+        perihelion_epochs=Epochs.from_kwargs(mjd=60100.0 + rng.uniform(0, 200, n), scale="tdb"),
         frame=Frame.ECLIPTICJ2000.value,
         origin=[str(Origin.SUN)] * n,
     )

@@ -27,6 +27,7 @@ from empyrean.coordinates.covariance import (
 from empyrean.coordinates.covariance import (
     SphericalCovariance as _SphericalCovariance,
 )
+from empyrean.coordinates.epoch import Epochs
 
 # The covariance classes are built dynamically by
 # ``_make_covariance_class`` (via ``type(...)``), so its return is typed
@@ -58,16 +59,16 @@ def _stack(*cols: FloatArray) -> FloatArray:
 class CartesianCoordinates(qv.Table):
     """Cartesian state vectors."""
 
-    epoch = qv.Float64Column()
-    """Epoch of this row, **MJD TDB by definition**.
+    epochs = Epochs.as_column()
+    """Epoch of each row as an :class:`~empyrean.Epochs` sub-table: the
+    ``mjd`` values together with their time ``scale``.
 
-    The one input column that stays a plain float rather than an
-    :class:`~empyrean.Epochs`: the scale is fixed by the column's
-    definition, so there is nothing here for a caller to state. It is
-    therefore *not* a time input in the sense the rest of the package
-    uses — to hand this epoch back to empyrean as a time, convert it with
-    ``Epochs.from_mjd(values, scale="tdb")``, or offset it into a target
-    grid with :meth:`~empyrean.Epochs.from_orbits`.
+    Results come back in the scale the caller supplied: a table produced
+    from a UTC request carries ``scale == "utc"``, one from a TDB request
+    ``"tdb"``. Read the values in a known scale with
+    :meth:`~empyrean.Epochs.mjd_tdb` / :meth:`~empyrean.Epochs.mjd_utc`,
+    and hand this straight back to empyrean as a time input. The scale
+    travels with it, so there is nothing to restate.
     """
     x = qv.Float64Column()  # AU
     y = qv.Float64Column()  # AU
@@ -139,16 +140,16 @@ class CartesianCoordinates(qv.Table):
 class KeplerianCoordinates(qv.Table):
     """Keplerian orbital elements."""
 
-    epoch = qv.Float64Column()
-    """Epoch of this row, **MJD TDB by definition**.
+    epochs = Epochs.as_column()
+    """Epoch of each row as an :class:`~empyrean.Epochs` sub-table: the
+    ``mjd`` values together with their time ``scale``.
 
-    The one input column that stays a plain float rather than an
-    :class:`~empyrean.Epochs`: the scale is fixed by the column's
-    definition, so there is nothing here for a caller to state. It is
-    therefore *not* a time input in the sense the rest of the package
-    uses — to hand this epoch back to empyrean as a time, convert it with
-    ``Epochs.from_mjd(values, scale="tdb")``, or offset it into a target
-    grid with :meth:`~empyrean.Epochs.from_orbits`.
+    Results come back in the scale the caller supplied: a table produced
+    from a UTC request carries ``scale == "utc"``, one from a TDB request
+    ``"tdb"``. Read the values in a known scale with
+    :meth:`~empyrean.Epochs.mjd_tdb` / :meth:`~empyrean.Epochs.mjd_utc`,
+    and hand this straight back to empyrean as a time input. The scale
+    travels with it, so there is nothing to restate.
     """
     a = qv.Float64Column()  # semi-major axis (AU)
     e = qv.Float64Column()  # eccentricity
@@ -194,26 +195,56 @@ class KeplerianCoordinates(qv.Table):
 class CometaryCoordinates(qv.Table):
     """Cometary orbital elements."""
 
-    epoch = qv.Float64Column()
-    """Epoch of this row, **MJD TDB by definition**.
+    epochs = Epochs.as_column()
+    """Epoch of each row as an :class:`~empyrean.Epochs` sub-table: the
+    ``mjd`` values together with their time ``scale``.
 
-    The one input column that stays a plain float rather than an
-    :class:`~empyrean.Epochs`: the scale is fixed by the column's
-    definition, so there is nothing here for a caller to state. It is
-    therefore *not* a time input in the sense the rest of the package
-    uses — to hand this epoch back to empyrean as a time, convert it with
-    ``Epochs.from_mjd(values, scale="tdb")``, or offset it into a target
-    grid with :meth:`~empyrean.Epochs.from_orbits`.
+    Results come back in the scale the caller supplied: a table produced
+    from a UTC request carries ``scale == "utc"``, one from a TDB request
+    ``"tdb"``. Read the values in a known scale with
+    :meth:`~empyrean.Epochs.mjd_tdb` / :meth:`~empyrean.Epochs.mjd_utc`,
+    and hand this straight back to empyrean as a time input. The scale
+    travels with it, so there is nothing to restate.
     """
     q = qv.Float64Column()  # perihelion distance (AU)
     e = qv.Float64Column()  # eccentricity
     i = qv.Float64Column()  # inclination (deg)
     raan = qv.Float64Column()  # longitude of ascending node (deg)
     ap = qv.Float64Column()  # argument of perihelion (deg)
-    tp = qv.Float64Column()  # time of perihelion passage (MJD TDB)
+    perihelion_epochs = Epochs.as_column()
+    """``tp``, the time of perihelion passage, as an
+    :class:`~empyrean.Epochs` sub-table: the ``mjd`` values together with
+    their time ``scale``, not a bare MJD. It is a time like :attr:`epochs`,
+    so it carries a scale: a table from a UTC request has both in ``"utc"``,
+    one from a TDB request both in ``"tdb"``. One table carries one scale,
+    so :meth:`from_kwargs` refuses a ``perihelion_epochs`` whose scale
+    differs from ``epochs``. The 6-element covariance is still over
+    ``[q, e, i, raan, ap, tp]`` (``tp`` in days), unchanged."""
     covariance = CometaryCovariance.as_column(nullable=True)
     frame = qv.StringAttribute()
     origin = qv.LargeStringColumn()
+
+    @classmethod
+    def from_kwargs(
+        cls, validate: bool = True, permit_nulls: bool = False, **kwargs: Any
+    ) -> "CometaryCoordinates":
+        """Build a :class:`CometaryCoordinates`, refusing a within-table
+        scale mix.
+
+        ``perihelion_epochs`` (``tp``) is a time, so it carries a scale
+        just like ``epochs``. One table carries one scale: a
+        ``perihelion_epochs`` whose scale differs from ``epochs`` is
+        refused by name rather than silently mixing a UTC epoch with a TDB
+        perihelion time.
+        """
+        table = super().from_kwargs(validate=validate, permit_nulls=permit_nulls, **kwargs)
+        if table.perihelion_epochs.scale != table.epochs.scale:
+            raise ValueError(
+                "CometaryCoordinates carries one time scale: perihelion_epochs "
+                f"({table.perihelion_epochs.scale!r}) must match epochs "
+                f"({table.epochs.scale!r}). Convert one with .to_scale(...) so both agree."
+            )
+        return table
 
     @property
     def is_hyperbolic(self) -> np.ndarray[Any, np.dtype[np.bool_]]:
@@ -250,16 +281,16 @@ class CometaryCoordinates(qv.Table):
 class SphericalCoordinates(qv.Table):
     """Spherical coordinates (topocentric / observer-centric)."""
 
-    epoch = qv.Float64Column()
-    """Epoch of this row, **MJD TDB by definition**.
+    epochs = Epochs.as_column()
+    """Epoch of each row as an :class:`~empyrean.Epochs` sub-table: the
+    ``mjd`` values together with their time ``scale``.
 
-    The one input column that stays a plain float rather than an
-    :class:`~empyrean.Epochs`: the scale is fixed by the column's
-    definition, so there is nothing here for a caller to state. It is
-    therefore *not* a time input in the sense the rest of the package
-    uses — to hand this epoch back to empyrean as a time, convert it with
-    ``Epochs.from_mjd(values, scale="tdb")``, or offset it into a target
-    grid with :meth:`~empyrean.Epochs.from_orbits`.
+    Results come back in the scale the caller supplied: a table produced
+    from a UTC request carries ``scale == "utc"``, one from a TDB request
+    ``"tdb"``. Read the values in a known scale with
+    :meth:`~empyrean.Epochs.mjd_tdb` / :meth:`~empyrean.Epochs.mjd_utc`,
+    and hand this straight back to empyrean as a time input. The scale
+    travels with it, so there is nothing to restate.
     """
     rho = qv.Float64Column()  # radial distance (AU)
     lon = qv.Float64Column()  # longitude / RA (deg)

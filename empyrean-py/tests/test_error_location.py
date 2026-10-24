@@ -45,7 +45,7 @@ def _batch(*, break_row: int | None) -> CartesianOrbits:
     if break_row is not None:
         vz[break_row] = float("nan")
     coords = CartesianCoordinates.from_kwargs(
-        epoch=[T0] * n,
+        epochs=Epochs.from_kwargs(mjd=[T0] * n, scale="tdb"),
         x=[APOPHIS[0]] * n,
         y=[APOPHIS[1]] * n,
         z=[APOPHIS[2]] * n,

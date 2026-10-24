@@ -201,7 +201,7 @@ EPOCH_TOL_DAYS = _MANIFEST["tolerances"]["epoch_tol_days"]
 def _build_orbit(s: dict) -> CartesianOrbits:
     cov = CartesianCovariance.from_matrix(np.diag(s["cov"])[None, :, :])
     coords = CartesianCoordinates.from_kwargs(
-        epoch=[s["epoch"]],
+        epochs=Epochs.from_kwargs(mjd=[s["epoch"]], scale="tdb"),
         x=[s["state"][0]],
         y=[s["state"][1]],
         z=[s["state"][2]],
@@ -319,7 +319,7 @@ def _channel_fingerprint() -> dict[str, float | None]:
                     name,
                     "generate_ephemeris",
                     "ephemeris",
-                    np.asarray(eph.coordinates.epoch, dtype=float),
+                    np.asarray(eph.coordinates.epochs.mjd_tdb(), dtype=float),
                     cols,
                 )
     return fp

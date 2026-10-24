@@ -107,8 +107,9 @@ fn tmp_dir(tag: &str) -> PathBuf {
 /// `propagate_with_thrust_perturbs_trajectory` scenario.
 const THRUST_JSON: &str = r#"{
     "arcs": [{
-        "start_mjd_tdb": 59000.0,
-        "end_mjd_tdb": 59010.0,
+        "start_mjd": 59000.0,
+        "end_mjd": 59010.0,
+        "scale": "tdb",
         "thrust_n": 1000.0,
         "mass_kg": 1000.0,
         "steering": {"type": "constant_rtn", "alpha_rad": 0.1, "beta_rad": 0.2},
@@ -145,6 +146,8 @@ fn propagate_with_thrust_json_perturbs_trajectory() {
         &input,
         "--epoch",
         "59012.0",
+        "--scale",
+        "tdb",
         "--out-dir",
         ballistic_out.to_str().unwrap(),
         "--format",
@@ -170,6 +173,8 @@ fn propagate_with_thrust_json_perturbs_trajectory() {
         thrust_path.to_str().unwrap(),
         "--epoch",
         "59012.0",
+        "--scale",
+        "tdb",
         "--out-dir",
         thrust_out.to_str().unwrap(),
         "--format",
@@ -213,8 +218,9 @@ fn thrust_removed_correction_covariances_field_is_refused() {
     // refusal (`deny_unknown_fields`) — never silently dropped.
     let stale_json = r#"{
         "arcs": [{
-            "start_mjd_tdb": 59000.0,
-            "end_mjd_tdb": 59010.0,
+            "start_mjd": 59000.0,
+            "end_mjd": 59010.0,
+            "scale": "tdb",
             "thrust_n": 1000.0,
             "mass_kg": 1000.0,
             "steering": {"type": "constant_rtn", "alpha_rad": 0.1, "beta_rad": 0.2},
@@ -236,6 +242,8 @@ fn thrust_removed_correction_covariances_field_is_refused() {
         &input,
         "--epoch",
         "59005.0",
+        "--scale",
+        "tdb",
         "--out-dir",
         dir.join("ballistic").to_str().unwrap(),
         "--format",
@@ -256,6 +264,8 @@ fn thrust_removed_correction_covariances_field_is_refused() {
         thrust_path.to_str().unwrap(),
         "--epoch",
         "59005.0",
+        "--scale",
+        "tdb",
         "--out-dir",
         dir.join("thrust").to_str().unwrap(),
         "--format",

@@ -72,7 +72,7 @@ _ORBIT_EPOCH_MJD_TDB = 61000.0
 def sample_orbit() -> CartesianOrbits:
     """A single heliocentric orbit, no covariance — enough to propagate."""
     coordinates = CartesianCoordinates.from_kwargs(
-        epoch=[_ORBIT_EPOCH_MJD_TDB],
+        epochs=Epochs.from_kwargs(mjd=[_ORBIT_EPOCH_MJD_TDB], scale="tdb"),
         x=[2.0],
         y=[0.0],
         z=[0.0],
@@ -384,6 +384,16 @@ def test_query_horizons_refuses_bare_times(bare: Any) -> None:
 
 
 @pytest.mark.parametrize("bare", [61000.5, np.float64(61000.5), [61000.5]])
+def test_query_horizons_vectors_refuses_a_bare_epoch(bare: Any) -> None:
+    """The single-epoch vector query takes an Epochs; a bare value is
+    refused at the entry point, before any network call is made (the echo
+    itself needs a Horizons response and has no offline seam)."""
+    with pytest.raises(TypeError) as excinfo:
+        empyrean.query_horizons_vectors("99942;", bare)
+    _assert_teaches_the_fix(str(excinfo.value))
+
+
+@pytest.mark.parametrize("bare", [61000.5, np.float64(61000.5), [61000.5]])
 def test_compute_impact_probabilities_refuses_a_bare_end_epoch(
     sample_orbit: Any, bare: Any
 ) -> None:
@@ -445,7 +455,7 @@ def _orbit_with_joint() -> CartesianOrbits:
         asserted_source=None,
     )
     coordinates = CartesianCoordinates.from_kwargs(
-        epoch=[_ORBIT_EPOCH_MJD_TDB],
+        epochs=Epochs.from_kwargs(mjd=[_ORBIT_EPOCH_MJD_TDB], scale="tdb"),
         x=[2.0],
         y=[0.0],
         z=[0.0],

@@ -53,7 +53,7 @@ def _mixed_batch() -> CartesianOrbits:
     """Three orbits whose MIDDLE one is stamped outside the ephemeris span."""
     epochs = [_GOOD_EPOCH, _BAD_EPOCH, _GOOD_EPOCH]
     coords = CartesianCoordinates.from_kwargs(
-        epoch=epochs,
+        epochs=Epochs.from_kwargs(mjd=epochs, scale="tdb"),
         x=[_STATE["x"]] * 3,
         y=[_STATE["y"]] * 3,
         z=[_STATE["z"]] * 3,
@@ -211,7 +211,7 @@ def _mixed_cov_batch(bad_middle: bool) -> CartesianOrbits:
     cov = np.diag([1e-16, 1e-16, 1e-16, 1e-20, 1e-20, 1e-20])
     covariance = CartesianCovariance.from_matrix(np.repeat(cov[None, :, :], 3, axis=0))
     coords = CartesianCoordinates.from_kwargs(
-        epoch=[_GOOD_EPOCH, mid, _GOOD_EPOCH],
+        epochs=Epochs.from_kwargs(mjd=[_GOOD_EPOCH, mid, _GOOD_EPOCH], scale="tdb"),
         x=[_STATE["x"]] * 3,
         y=[_STATE["y"]] * 3,
         z=[_STATE["z"]] * 3,

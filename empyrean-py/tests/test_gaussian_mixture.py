@@ -94,7 +94,7 @@ def _orbit_with_covariance() -> CartesianOrbits:
         orbit_id=["contract"],
         object_id=["contract"],
         coordinates=CartesianCoordinates.from_kwargs(
-            epoch=np.array([_EPOCH_MJD_TDB]),
+            epochs=Epochs.from_kwargs(mjd=np.array([_EPOCH_MJD_TDB]), scale="tdb"),
             x=[1.6],
             y=[0.1],
             z=[0.02],
@@ -312,7 +312,7 @@ def test_generate_ephemeris_delivers_gaussian_mixture(
     """
     eph = empyrean.generate_ephemeris(orbit, observers, uncertainty_method=method)
 
-    assert len(eph.ephemeris) == len(observers.coordinates.epoch.to_numpy()), (
+    assert len(eph.ephemeris) == len(observers.coordinates.epochs.mjd_tdb()), (
         "GaussianMixture now delivers one ephemeris row per observer, not a refusal"
     )
     assert eph.all_delivered, (
@@ -403,7 +403,7 @@ def _apophis_loose() -> CartesianOrbits:
         orbit_id=["apophis-mixture"],
         object_id=["99942"],
         coordinates=CartesianCoordinates.from_kwargs(
-            epoch=np.array([_APOPHIS_EPOCH_MJD_TDB]),
+            epochs=Epochs.from_kwargs(mjd=np.array([_APOPHIS_EPOCH_MJD_TDB]), scale="tdb"),
             x=[s[0]],
             y=[s[1]],
             z=[s[2]],
@@ -454,7 +454,7 @@ def test_mixture_components_reach_python(encounter_result) -> None:
     for name in (
         "orbit_id",
         "orbit_index",
-        "ca_epoch_mjd_tdb",
+        "ca_epochs",
         "component_index",
         "weight",
         "mean_x",
@@ -488,7 +488,7 @@ def test_mixture_weights_never_exceed_one(encounter_result) -> None:
     missed the close approach contributes nothing and the deficit is not
     recorded anywhere — but they must never sum to more."""
     table = encounter_result.mixtures
-    epochs = table.ca_epoch_mjd_tdb.to_numpy(zero_copy_only=False)
+    epochs = table.ca_epochs.mjd_tdb()
     weights = table.weight.to_numpy(zero_copy_only=False)
     for t in np.unique(epochs):
         total = float(weights[epochs == t].sum())
@@ -499,7 +499,7 @@ def test_mixture_chains_accessor_groups_by_ca_epoch(encounter_result) -> None:
     """``to_chains`` regroups the flat table into one list per retained CA
     epoch, with the matrices re-materialized as contiguous (6, 6)."""
     chains = encounter_result.mixture_chains(0)
-    assert len(chains) == len(encounter_result.mixtures.ca_epochs(0))
+    assert len(chains) == len(encounter_result.mixtures.ca_epoch_values(0))
     assert any(len(group) > 0 for group in chains)
     flat = [c for group in chains for c in group]
     assert len(flat) == len(encounter_result.mixtures)
@@ -554,7 +554,7 @@ def test_a_missing_mixtures_key_raises_rather_than_reading_as_nothing_split() ->
     from empyrean.propagation.mixtures import build_mixture_chains
 
     with pytest.raises(RuntimeError, match="older than this Python package"):
-        build_mixture_chains({"states": []})
+        build_mixture_chains({"states": []}, "tdb")
 
 
 def test_a_present_but_empty_mixtures_key_is_nothing_split() -> None:
@@ -579,4 +579,4 @@ def test_a_present_but_empty_mixtures_key_is_nothing_split() -> None:
         "mixture_frame": np.zeros(0, dtype=np.int64),
         "mixture_origin": np.zeros(0, dtype=np.int64),
     }
-    assert len(build_mixture_chains({"mixtures": empty})) == 0
+    assert len(build_mixture_chains({"mixtures": empty}, "tdb")) == 0

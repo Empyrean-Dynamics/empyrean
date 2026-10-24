@@ -395,11 +395,16 @@ impl Orbit {
         // the move into `OrbitFfiKeep` and the outer keep vector, so the
         // pointers stay valid for the FFI call (same contract as the id
         // CStrings above). Absent thrust → null pointers + zero lengths.
-        let thrust_arcs: Vec<empyrean_sys::EmpyreanThrustArc> = self
-            .thrust
-            .as_ref()
-            .map(|tp| tp.arcs.iter().map(ThrustArc::to_ffi).collect())
-            .unwrap_or_default();
+        let thrust_arcs: Vec<empyrean_sys::EmpyreanThrustArc> = match self.thrust.as_ref() {
+            // Each arc's start/end epoch converts to TDB here, at the FFI
+            // boundary; a UTC epoch with no defined conversion fails by name.
+            Some(tp) => tp
+                .arcs
+                .iter()
+                .map(ThrustArc::to_ffi)
+                .collect::<crate::Result<Vec<_>>>()?,
+            None => Vec::new(),
+        };
         let dv_corrections: Vec<[f64; 3]> = self
             .thrust
             .as_ref()

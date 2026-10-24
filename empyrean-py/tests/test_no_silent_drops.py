@@ -288,7 +288,7 @@ def _full_feature_orbit() -> CartesianOrbits:
     """
     s = APOPHIS_STATE
     coords = CartesianCoordinates.from_kwargs(
-        epoch=[s["epoch"]],
+        epochs=Epochs.from_kwargs(mjd=[s["epoch"]], scale="tdb"),
         x=[s["x"]],
         y=[s["y"]],
         z=[s["z"]],
@@ -392,13 +392,13 @@ def _impactor_orbit() -> CartesianOrbits:
     """
     c = TC3_COMETARY
     com = CometaryCoordinates.from_kwargs(
-        epoch=[c["epoch"]],
+        epochs=Epochs.from_kwargs(mjd=[c["epoch"]], scale="tdb"),
         q=[c["q"]],
         e=[c["e"]],
         i=[c["i"]],
         raan=[c["raan"]],
         ap=[c["ap"]],
-        tp=[c["tp"]],
+        perihelion_epochs=Epochs.from_kwargs(mjd=[c["tp"]], scale="tdb"),
         frame="ecliptic_j2000",
         origin=[str(Origin.SUN)],
     )
@@ -761,7 +761,7 @@ def _grazing_flyby_orbit() -> tuple[CartesianOrbits, np.ndarray]:
     helio_v = e_v + v_geo - s_v
 
     coords = CartesianCoordinates.from_kwargs(
-        epoch=[epoch],
+        epochs=Epochs.from_kwargs(mjd=[epoch], scale="tdb"),
         x=[helio_x[0]],
         y=[helio_x[1]],
         z=[helio_x[2]],
@@ -844,7 +844,7 @@ def _cd3_capture_orbit() -> CartesianOrbits:
     covariance exercises that column rather than masking it.
     """
     kep = KeplerianCoordinates.from_kwargs(
-        epoch=[61000.0],
+        epochs=Epochs.from_kwargs(mjd=[61000.0], scale="tdb"),
         a=[1.0290321],
         e=[0.0123739],
         i=[0.63395],
@@ -946,7 +946,7 @@ def _auto_escalation_orbit() -> CartesianOrbits:
         ]
     )[None, :, :]
     coords = CartesianCoordinates.from_kwargs(
-        epoch=[s["epoch"]],
+        epochs=Epochs.from_kwargs(mjd=[s["epoch"]], scale="tdb"),
         x=[s["x"]],
         y=[s["y"]],
         z=[s["z"]],
@@ -1214,7 +1214,7 @@ def _non_grav_solved_orbit(with_cov: bool) -> CartesianOrbits:
     """
     s = APOPHIS_STATE
     coords = CartesianCoordinates.from_kwargs(
-        epoch=[s["epoch"]],
+        epochs=Epochs.from_kwargs(mjd=[s["epoch"]], scale="tdb"),
         x=[s["x"]],
         y=[s["y"]],
         z=[s["z"]],
@@ -1390,16 +1390,16 @@ def _plan_candidates() -> list[PlannedObservation]:
     """
     t0 = APOPHIS_STATE["epoch"]
     return [
-        PlannedObservation.optical(t0 + 10.0, "F51", (0.2, 0.2)),
-        PlannedObservation.optical(t0 + 12.0, "568", (0.3, 0.3)),
+        PlannedObservation.optical(Epochs.from_mjd(t0 + 10.0, scale="tdb"), "F51", (0.2, 0.2)),
+        PlannedObservation.optical(Epochs.from_mjd(t0 + 12.0, scale="tdb"), "568", (0.3, 0.3)),
         PlannedObservation.radar(
-            t0 + 15.0,
+            Epochs.from_mjd(t0 + 15.0, scale="tdb"),
             radar_bandwidth_hz=1.0e5,
             radar_freq_resolution_hz=0.1,
             radar_snr=50.0,
         ),
         PlannedObservation.radar(
-            t0 + 20.0,
+            Epochs.from_mjd(t0 + 20.0, scale="tdb"),
             radar_bandwidth_hz=1.0e5,
             radar_freq_resolution_hz=0.1,
             radar_target_h_mag=19.7,
@@ -1525,7 +1525,7 @@ def _photometric_orbit(phot_cov: np.ndarray | None) -> CartesianOrbits:
     orbits = _full_feature_orbit()
     coords = orbits.coordinates
     stripped = CartesianCoordinates.from_kwargs(
-        epoch=coords.epoch,
+        epochs=coords.epochs,
         x=coords.x,
         y=coords.y,
         z=coords.z,

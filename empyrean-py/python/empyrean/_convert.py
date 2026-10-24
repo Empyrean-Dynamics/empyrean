@@ -24,6 +24,7 @@ from empyrean.coordinates.covariance import (
     _CovarianceTable,
 )
 from empyrean.coordinates.enums import Frame, Origin
+from empyrean.coordinates.epoch import Epochs
 from empyrean.orbits.orbits import (
     CartesianOrbits,
     CometaryOrbits,
@@ -410,6 +411,24 @@ def _column_to_numpy(col: pa.Array) -> FloatArray:
     return arr
 
 
+def _coord_element_column(coords: "AnyCoordinates", name: str) -> FloatArray:
+    """Return the ``name`` element of a coordinate table as MJD-TDB-ready
+    float64 values.
+
+    The cometary ``tp`` element (time of perihelion passage) lives in the
+    ``perihelion_epochs`` :class:`Epochs` sub-table, not a bare column, so
+    it is read out in TDB (the scale the engine's 6-element vector is in),
+    exactly as :attr:`epochs` is. Every other element is a plain column.
+    """
+    if name == "tp":
+        # `tp` is unique to the cometary representation, where the time of
+        # perihelion passage rides the `perihelion_epochs` sub-table.
+        assert isinstance(coords, CometaryCoordinates)
+        tp_epochs: FloatArray = coords.perihelion_epochs.mjd_tdb()
+        return tp_epochs
+    return _column_to_numpy(getattr(coords, name))
+
+
 # ── Coordinates → arrays ─────────────────────────────────────
 
 
@@ -437,8 +456,8 @@ def coordinates_to_arrays(
     rep_int = rep_to_int(rep_str)
     n = len(coords)
 
-    epochs = _column_to_numpy(coords.epoch)
-    elements = np.column_stack([_column_to_numpy(getattr(coords, c)) for c in col_names])
+    epochs = coords.epochs.mjd_tdb()
+    elements = np.column_stack([_coord_element_column(coords, c) for c in col_names])
 
     frame_int = frame_to_int(coords.frame)
     frames = np.full(n, frame_int, dtype=np.int32)
@@ -478,7 +497,7 @@ def coordinates_to_arrays(
 
 
 def arrays_to_coordinates(
-    result_dict: dict[str, npt.NDArray[Any]], representation: str
+    result_dict: dict[str, npt.NDArray[Any]], representation: str, scale: str = "tdb"
 ) -> AnyCoordinates:
     """Convert a Rust result dict to a quivr coordinate table.
 
@@ -486,9 +505,14 @@ def arrays_to_coordinates(
     ----------
     result_dict : dict
         Dict from _transform_coordinates with epochs, elements,
-        covariances, has_covariance, frames, origins arrays.
+        covariances, has_covariance, frames, origins arrays. The ``epochs``
+        array is MJD TDB (the engine scale).
     representation : str
         Target representation name.
+    scale : str, default ``"tdb"``
+        Time scale to tag the output ``epochs`` sub-table with. A
+        coordinate transform carries no time argument, so it echoes the
+        input table's scale; the TDB values are converted to it.
     """
     rep = representation.lower()
     coord_cls = _REP_TO_COORD_TYPE[rep]
@@ -516,13 +540,24 @@ def arrays_to_coordinates(
     else:
         cov = None
 
+    # The engine returns TDB; echo the input table's scale (a transform
+    # carries no time argument) by tagging TDB and converting to it.
+    out_epochs = Epochs.from_kwargs(mjd=epochs, scale="tdb").to_scale(scale)
     kwargs: dict[str, npt.NDArray[Any] | list[str] | str | qv.Table] = {
-        "epoch": epochs,
+        "epochs": out_epochs,
         "frame": frame.value,
         "origin": origin_strs,
     }
     for j, name in enumerate(col_names):
-        kwargs[name] = elements[:, j]
+        if name == "tp":
+            # The cometary time of perihelion is a time: it rides the
+            # `perihelion_epochs` Epochs sub-table in the table's scale
+            # (the engine returns it as TDB element 5), not a bare column.
+            kwargs["perihelion_epochs"] = Epochs.from_kwargs(
+                mjd=elements[:, j], scale="tdb"
+            ).to_scale(scale)
+        else:
+            kwargs[name] = elements[:, j]
     if cov is not None:
         kwargs["covariance"] = cov
 
@@ -573,7 +608,7 @@ def orbit_batch_dict_to_orbits(result: dict[str, Any]) -> AnyOrbits:
             orbit_id=[],
             object_id=[],
             coordinates=_REP_TO_COORD_TYPE["cartesian"].from_kwargs(
-                epoch=np.zeros(0),
+                epochs=Epochs.from_kwargs(mjd=np.zeros(0), scale="tdb"),
                 x=np.zeros(0),
                 y=np.zeros(0),
                 z=np.zeros(0),
@@ -622,13 +657,20 @@ def orbit_batch_dict_to_orbits(result: dict[str, Any]) -> AnyOrbits:
     }[frame_str]
     origin_strs = [naif_to_origin(int(o)) for o in origins]
 
+    # SBDB / file orbit epochs are MJD TDB (the engine/file convention).
     coords_kwargs: dict[str, npt.NDArray[Any] | list[str] | str | qv.Table] = {
-        "epoch": epochs,
+        "epochs": Epochs.from_kwargs(mjd=epochs, scale="tdb"),
         "frame": frame.value,
         "origin": origin_strs,
     }
     for j, name in enumerate(col_names):
-        coords_kwargs[name] = elements[:, j]
+        if name == "tp":
+            # Cometary time of perihelion → `perihelion_epochs` sub-table.
+            # SBDB / file orbit epochs are MJD TDB, so it carries TDB, the
+            # same scale as `epochs` above.
+            coords_kwargs["perihelion_epochs"] = Epochs.from_kwargs(mjd=elements[:, j], scale="tdb")
+        else:
+            coords_kwargs[name] = elements[:, j]
     # Derive the state 6x6 from each joint's leading block, as a read-only
     # convenience mirror of the authoritative packed joint. A row with no
     # joint carries no state covariance (NaN), never a block of zeros.
@@ -860,10 +902,8 @@ def orbits_to_orbit_batch_dict(orbits: AnyOrbits) -> dict[str, Any]:
     validate_non_grav_marsden_only(orbits)
 
     n = len(orbits)
-    epochs = _column_to_numpy(orbits.coordinates.epoch)
-    elements = np.column_stack(
-        [_column_to_numpy(getattr(orbits.coordinates, c)) for c in col_names]
-    )
+    epochs = orbits.coordinates.epochs.mjd_tdb()
+    elements = np.column_stack([_coord_element_column(orbits.coordinates, c) for c in col_names])
 
     # The orbit's covariance is the one packed joint; its leading 6x6 is the
     # derived state block, so no separate flat covariance rides this wire.

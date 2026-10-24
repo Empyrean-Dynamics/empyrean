@@ -21,7 +21,7 @@ Uncertainty-first orbit propagation, ephemeris, orbit determination, and event d
 pip install empyrean
 ```
 
-Current release: **0.11.0rc0** (release candidate) — `--pre` is required
+Current release: **0.11.0rc1** (release candidate); `--pre` is required
 until 0.11.0 is final.
 
 A plain install pulls empyrean
@@ -85,19 +85,27 @@ for i in range(len(result.events.summary)):
     ev = result.events.summary
     print(f"{ev.event_type.to_pylist()[i]:25s} "
           f"{ev.body.to_pylist()[i]:8s} "
-          f"MJD {ev.epoch.to_numpy()[i]:.2f}")
+          f"MJD {ev.epochs.mjd_tdb()[i]:.2f}")
 ```
 
 Every time you hand to empyrean is an `Epochs`, and every `Epochs`
-states its scale — apart from the carve-outs whose scale is fixed by
-definition (columns named `mjd_tdb`, arguments named `epoch_mjd_tdb`,
-and the coordinate tables' `epoch` column, which is MJD TDB). A bare
-list or array is refused: `61000.5` read as UTC
-and `61000.5` read as TDB are about 69 seconds apart — easily enough to
-move an encounter geometry — so which one you mean is stated rather than
+states its scale. A bare list or array is refused: `61000.5` read as UTC
+and `61000.5` read as TDB are about 69 seconds apart, easily enough to
+move an encounter geometry, so which one you mean is stated rather than
 defaulted. Build them with `Epochs.from_mjd(values, scale="tdb")` /
 `scale="utc"`, `Epochs.from_jd`, or `Epochs.from_iso([...])` for ISO-8601
 UTC timestamps.
+
+Every time empyrean returns is an `Epochs` as well, in the scale you
+supplied. A table's primary time column is `epochs` and any other time
+column is `<role>_epochs` (`start_epochs`, `ca_epochs`,
+`perihelion_epochs`); one table carries one scale. Instants you asked for
+come back as your own values, and instants the engine found (close
+approaches, impacts, events, rise and set) are converted into your scale
+on the way out. Orbit-determination results follow the observations and
+come back in UTC. Two things keep a scale fixed by name instead: files
+written by the `io` writers and the CLI carry `epoch_mjd_tdb` columns in
+TDB, and the error-location diagnostic reports `epoch_mjd_tdb`.
 
 ## Orbit determination
 
@@ -742,8 +750,9 @@ from empyrean.orbits.thrust import ConstantRTN, ThrustArc, ThrustParams
 # mass depleting at Isp = 3000 s, steered at constant RTN angles
 # relative to the Sun. `sharpness` sets the tanh on/off transition.
 arc = ThrustArc(
-    start_mjd_tdb=65000.0,
-    end_mjd_tdb=65010.0,
+    start_mjd=65000.0,
+    end_mjd=65010.0,
+    scale="tdb",
     thrust_n=1.0,
     mass_kg=500.0,
     steering=ConstantRTN(alpha_rad=0.0, beta_rad=0.0),
@@ -884,6 +893,7 @@ before you spend the telescope time:
 import empyrean
 from empyrean import (
     CartesianCoordinates,
+    Epochs,
     PlannedObservation,
     transform_coordinates,
 )
@@ -893,15 +903,14 @@ from empyrean import (
 # pure translation, so the covariance and its metrics come across unchanged.
 coords = transform_coordinates(fit.orbit.coordinates, CartesianCoordinates, origin="SSB")
 orbit = fit.orbit.set_column("coordinates", coords)
-t0 = float(coords.epoch.to_numpy()[0])
+t0 = float(coords.epochs.mjd_tdb()[0])
 
 plan = empyrean.evaluate_plan(
     orbit,
     [
-        PlannedObservation.optical(t0 + 30.0, "F51", (0.2, 0.2)),
-        PlannedObservation.optical(t0 + 31.0, "568", (0.3, 0.3)),
-        PlannedObservation.radar(
-            t0 + 45.0,
+        PlannedObservation.optical(Epochs.from_mjd(t0 + 30.0, scale="tdb"), "F51", (0.2, 0.2)),
+        PlannedObservation.optical(Epochs.from_mjd(t0 + 31.0, scale="tdb"), "568", (0.3, 0.3)),
+        PlannedObservation.radar(Epochs.from_mjd(t0 + 45.0, scale="tdb"),
             radar_bandwidth_hz=1.0e5,
             radar_freq_resolution_hz=0.1,
             radar_snr=50.0,
@@ -981,7 +990,7 @@ darkness), the site-aware verdict plan evaluation cannot give.
 
 ```python
 import empyrean
-from empyrean import ObservatoryConfig, PlanningConfig, compute_visibility
+from empyrean import Epochs, ObservatoryConfig, PlanningConfig, compute_visibility
 
 config = PlanningConfig(
     observatories=[
@@ -997,8 +1006,12 @@ config = PlanningConfig(
 
 # `orbits` is any Orbits table carrying a covariance (e.g. a fit's
 # `result.orbit`, or query_sbdb output). Survey a three-day window hourly.
-t0 = float(orbits.coordinates.epoch.to_numpy()[0])
-vis = compute_visibility(orbits, t0, t0 + 3.0, 1.0 / 24.0, config)
+t0 = float(orbits.coordinates.epochs.mjd_tdb()[0])
+# The survey window is a scale-carrying input, like impact's end_epoch; the
+# result epochs come back in the window's scale.
+start = Epochs.from_mjd(t0, scale="tdb")
+end = Epochs.from_mjd(t0 + 3.0, scale="tdb")
+vis = compute_visibility(orbits, start, end, 1.0 / 24.0, config)
 
 vis.nights.to_dataframe()      # twilight, local solar midnight, windows
 vis.anchors.to_dataframe()     # one Moon-aware anchor per policy, with its joint
@@ -1031,8 +1044,7 @@ inputs are refused alongside it rather than dropped:
 plan = empyrean.evaluate_plan(
     orbit,
     [
-        PlannedObservation.radar(
-            t0 + 45.0,
+        PlannedObservation.radar(Epochs.from_mjd(t0 + 45.0, scale="tdb"),
             radar_bandwidth_hz=1.0e5,
             radar_freq_resolution_hz=0.1,
             radar_target_h_mag=19.7,

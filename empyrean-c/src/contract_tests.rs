@@ -238,6 +238,12 @@ fn wire_discriminant_consts_are_stable() {
     assert_eq!(EMPYREAN_JOINT_ASSERTED_SOURCE_SBDB, 0);
     assert_eq!(EMPYREAN_JOINT_ASSERTED_SOURCE_EXTERNAL_FILE, 1);
     assert_eq!(EMPYREAN_JOINT_ASSERTED_SOURCE_NONE, 255);
+
+    // Time-scale integers named in the header and accepted by
+    // `empyrean_iso_to_mjd` / `empyrean_mjd_to_iso`: UTC is 0, TDB is 1.
+    // Pinned beside the other wire discriminants so a drift is caught here.
+    assert_eq!(crate::EMPYREAN_TIME_SCALE_UTC, 0);
+    assert_eq!(crate::EMPYREAN_TIME_SCALE_TDB, 1);
 }
 
 /// Ruling: the retired `CovarianceKind::ThirdOrder` (old wire discriminant 2)

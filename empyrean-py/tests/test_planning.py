@@ -49,6 +49,7 @@ from empyrean import (
 )
 from empyrean.coordinates.coordinates import CartesianCoordinates
 from empyrean.coordinates.covariance import CartesianCovariance
+from empyrean.coordinates.epoch import Epochs
 from empyrean.coordinates.transform import transform_orbits
 from empyrean.orbits.joint import (
     CovarianceKind,
@@ -138,7 +139,7 @@ def _plan_orbit() -> CartesianOrbits:
         orbit_id=["apophis_plan"],
         object_id=["99942"],
         coordinates=CartesianCoordinates.from_kwargs(
-            epoch=np.array([_EPOCH_MJD_TDB]),
+            epochs=Epochs.from_kwargs(mjd=np.array([_EPOCH_MJD_TDB]), scale="tdb"),
             x=[_APOPHIS_SSB_ECLIPTIC["x"]],
             y=[_APOPHIS_SSB_ECLIPTIC["y"]],
             z=[_APOPHIS_SSB_ECLIPTIC["z"]],
@@ -162,16 +163,20 @@ def _full_plan() -> list[PlannedObservation]:
     notes.
     """
     return [
-        PlannedObservation.optical(_EPOCH_MJD_TDB + 10.0, "F51", (0.2, 0.2)),
-        PlannedObservation.optical(_EPOCH_MJD_TDB + 12.0, "568", (0.3, 0.3)),
+        PlannedObservation.optical(
+            Epochs.from_mjd(_EPOCH_MJD_TDB + 10.0, scale="tdb"), "F51", (0.2, 0.2)
+        ),
+        PlannedObservation.optical(
+            Epochs.from_mjd(_EPOCH_MJD_TDB + 12.0, scale="tdb"), "568", (0.3, 0.3)
+        ),
         PlannedObservation.radar(
-            _EPOCH_MJD_TDB + 15.0,
+            Epochs.from_mjd(_EPOCH_MJD_TDB + 15.0, scale="tdb"),
             radar_bandwidth_hz=1.0e5,
             radar_freq_resolution_hz=0.1,
             radar_snr=50.0,
         ),
         PlannedObservation.radar(
-            _EPOCH_MJD_TDB + 20.0,
+            Epochs.from_mjd(_EPOCH_MJD_TDB + 20.0, scale="tdb"),
             radar_mode=RadarMode.DELAY,
             radar_bandwidth_hz=1.0e5,
             radar_freq_resolution_hz=0.1,
@@ -187,7 +192,7 @@ def _full_plan() -> list[PlannedObservation]:
 
 
 def test_optical_candidate_lowers_every_field():
-    obs = PlannedObservation.optical(61010.0, "F51", (0.2, 0.35))
+    obs = PlannedObservation.optical(Epochs.from_mjd(61010.0, scale="tdb"), "F51", (0.2, 0.35))
     wire = obs._to_wire_dict()
 
     assert wire["kind"] == 0, f"optical must lower to kind 0, got {wire['kind']}"
@@ -204,7 +209,7 @@ def test_optical_candidate_lowers_every_field():
 
 def test_radar_candidate_lowers_absent_properties_to_nan():
     obs = PlannedObservation.radar(
-        61020.0,
+        Epochs.from_mjd(61020.0, scale="tdb"),
         radar_transmit_station=RadarStation.GOLDSTONE_DSS14,
         radar_receive_station=RadarStation.GREEN_BANK,
         radar_mode=RadarMode.DELAY,
@@ -238,7 +243,7 @@ def test_radar_candidate_lowers_absent_properties_to_nan():
 
 def test_supplied_snr_lowers_as_a_number():
     obs = PlannedObservation.radar(
-        61020.0,
+        Epochs.from_mjd(61020.0, scale="tdb"),
         radar_bandwidth_hz=1.0e5,
         radar_freq_resolution_hz=0.1,
         radar_snr=50.0,
@@ -269,7 +274,11 @@ def test_config_knobs_evaluate_plan_never_reads_are_refused_at_its_call():
     them through evaluate_plan too.
     """
     orbit = _plan_orbit()
-    planned = [PlannedObservation.optical(_EPOCH_MJD_TDB + 10.0, "F51", (0.2, 0.2))]
+    planned = [
+        PlannedObservation.optical(
+            Epochs.from_mjd(_EPOCH_MJD_TDB + 10.0, scale="tdb"), "F51", (0.2, 0.2)
+        )
+    ]
 
     # Construction no longer refuses observatories — compute_visibility reads them.
     cfg = PlanningConfig(observatories=[_observatory()])
@@ -294,7 +303,11 @@ def test_unread_config_knobs_set_after_construction_are_still_refused_as_valueer
     before the engine runs, and not what the field docstrings promise.
     """
     orbit = _plan_orbit()
-    planned = [PlannedObservation.optical(_EPOCH_MJD_TDB + 10.0, "F51", (0.2, 0.2))]
+    planned = [
+        PlannedObservation.optical(
+            Epochs.from_mjd(_EPOCH_MJD_TDB + 10.0, scale="tdb"), "F51", (0.2, 0.2)
+        )
+    ]
 
     mutated = PlanningConfig()
     mutated.num_threads = 4
@@ -367,6 +380,9 @@ def test_observatory_config_lowering_covers_every_dataclass_field():
     declared = {f.name for f in dataclasses.fields(ObservatoryConfig)}
     # sigma_arcsec is a pair that splits into two wire columns.
     declared.discard("sigma_arcsec")
+    # explicit_anchor_utc (an Epochs) lowers to the `explicit_anchor_utc_mjd_tdb`
+    # TDB wire column: the scale-carrying field, converted at the FFI.
+    declared.discard("explicit_anchor_utc")
     lowered = set(
         ObservatoryConfig(
             obs_code="F51",
@@ -381,7 +397,7 @@ def test_observatory_config_lowering_covers_every_dataclass_field():
             civil_twilight_sun_altitude_deg=-6.0,
             nautical_twilight_sun_altitude_deg=-12.0,
             astronomical_twilight_sun_altitude_deg=-18.0,
-            explicit_anchor_utc_mjd_tdb=61000.5,
+            explicit_anchor_utc=Epochs.from_mjd(61000.5, scale="tdb"),
         )._to_wire_dict()
     )
     missing = declared - lowered
@@ -413,7 +429,12 @@ def test_planned_observation_lowering_covers_every_dataclass_field():
     declared = {f.name for f in dataclasses.fields(PlannedObservation)}
     # optical_sigma_arcsec is a pair that splits into two wire columns.
     declared.discard("optical_sigma_arcsec")
-    lowered = set(PlannedObservation.optical(61000.0, "F51")._to_wire_dict())
+    # epoch (an Epochs) lowers to the `epoch_mjd_tdb` TDB wire column: the
+    # scale-carrying field, converted at the FFI.
+    declared.discard("epoch")
+    lowered = set(
+        PlannedObservation.optical(Epochs.from_mjd(61000.0, scale="tdb"), "F51")._to_wire_dict()
+    )
     missing = declared - lowered
     assert not missing, (
         f"PlannedObservation field(s) never reach the wire: {sorted(missing)} — "
@@ -428,7 +449,7 @@ def test_planned_observation_lowering_covers_every_dataclass_field():
 def test_optical_candidate_rejects_radar_fields():
     with pytest.raises(ValueError) as exc:
         PlannedObservation(
-            epoch_mjd_tdb=61000.0,
+            epoch=Epochs.from_mjd(61000.0, scale="tdb"),
             kind=PlannedObservationKind.OPTICAL,
             optical_code="F51",
             radar_bandwidth_hz=1.0e5,
@@ -442,7 +463,7 @@ def test_optical_candidate_rejects_radar_fields():
 def test_radar_candidate_rejects_optical_fields():
     with pytest.raises(ValueError) as exc:
         PlannedObservation(
-            epoch_mjd_tdb=61000.0,
+            epoch=Epochs.from_mjd(61000.0, scale="tdb"),
             kind=PlannedObservationKind.RADAR,
             optical_code="F51",
             optical_sigma_arcsec=(0.2, 0.2),
@@ -455,12 +476,14 @@ def test_radar_candidate_rejects_optical_fields():
 
 def test_optical_candidate_requires_a_station_code():
     with pytest.raises(ValueError, match="optical_code"):
-        PlannedObservation(epoch_mjd_tdb=61000.0, kind=PlannedObservationKind.OPTICAL)
+        PlannedObservation(
+            epoch=Epochs.from_mjd(61000.0, scale="tdb"), kind=PlannedObservationKind.OPTICAL
+        )
 
 
 def test_optical_sigma_must_be_positive():
     with pytest.raises(ValueError, match="optical_sigma_arcsec"):
-        PlannedObservation.optical(61000.0, "F51", (0.0, 0.2))
+        PlannedObservation.optical(Epochs.from_mjd(61000.0, scale="tdb"), "F51", (0.0, 0.2))
 
 
 def test_non_positive_snr_is_rejected_rather_than_read_as_absent():
@@ -468,7 +491,7 @@ def test_non_positive_snr_is_rejected_rather_than_read_as_absent():
     budget — only ``None`` means that."""
     with pytest.raises(ValueError, match="radar_snr"):
         PlannedObservation.radar(
-            61000.0,
+            Epochs.from_mjd(61000.0, scale="tdb"),
             radar_bandwidth_hz=1.0e5,
             radar_freq_resolution_hz=0.1,
             radar_snr=0.0,
@@ -476,8 +499,8 @@ def test_non_positive_snr_is_rejected_rather_than_read_as_absent():
 
 
 def test_non_finite_epoch_is_rejected():
-    with pytest.raises(ValueError, match="epoch_mjd_tdb"):
-        PlannedObservation.optical(float("nan"), "F51")
+    with pytest.raises(ValueError, match="finite MJD"):
+        PlannedObservation.optical(Epochs.from_mjd(float("nan"), scale="tdb"), "F51")
 
 
 # ── Enum maps ────────────────────────────────────────────────────────
@@ -687,7 +710,7 @@ def test_evaluate_plan_rejects_an_orbit_without_covariance():
         orbit_id=orbit.orbit_id,
         object_id=orbit.object_id,
         coordinates=CartesianCoordinates.from_kwargs(
-            epoch=orbit.coordinates.epoch,
+            epochs=Epochs.from_kwargs(mjd=orbit.coordinates.epochs.mjd_tdb(), scale="tdb"),
             x=orbit.coordinates.x,
             y=orbit.coordinates.y,
             z=orbit.coordinates.z,
@@ -711,7 +734,7 @@ def test_evaluate_plan_names_the_fix_for_a_non_barycentric_orbit():
         orbit_id=orbit.orbit_id,
         object_id=orbit.object_id,
         coordinates=CartesianCoordinates.from_kwargs(
-            epoch=coords.epoch,
+            epochs=coords.epochs,
             x=coords.x,
             y=coords.y,
             z=coords.z,
@@ -931,7 +954,7 @@ def test_a_defunct_dish_is_refused_rather_than_scheduled():
             _plan_orbit(),
             [
                 PlannedObservation.radar(
-                    _EPOCH_MJD_TDB + 15.0,
+                    Epochs.from_mjd(_EPOCH_MJD_TDB + 15.0, scale="tdb"),
                     radar_transmit_station=RadarStation.ARECIBO,
                     radar_receive_station=RadarStation.ARECIBO,
                     radar_bandwidth_hz=1.0e5,
@@ -951,7 +974,7 @@ def test_an_underspecified_link_budget_is_refused_rather_than_defaulted():
             _plan_orbit(),
             [
                 PlannedObservation.radar(
-                    _EPOCH_MJD_TDB + 15.0,
+                    Epochs.from_mjd(_EPOCH_MJD_TDB + 15.0, scale="tdb"),
                     radar_bandwidth_hz=1.0e5,
                     radar_freq_resolution_hz=0.1,
                     radar_integration_s=600.0,
@@ -992,12 +1015,18 @@ def test_unobservable_candidates_still_fold_into_the_posterior():
     an unobservable candidate to a plan still tightens the posterior.
     """
     orbit = _plan_orbit()
-    base = [PlannedObservation.optical(_EPOCH_MJD_TDB + 10.0, "F51", (0.2, 0.2))]
+    base = [
+        PlannedObservation.optical(
+            Epochs.from_mjd(_EPOCH_MJD_TDB + 10.0, scale="tdb"), "F51", (0.2, 0.2)
+        )
+    ]
 
     baseline = evaluate_plan(orbit, base)
     # Solar conjunction: inside the engine's elongation floor, so this
     # candidate comes back unobservable.
-    conjunction = PlannedObservation.optical(_EPOCH_MJD_TDB + 100.0, "F51", (0.2, 0.2))
+    conjunction = PlannedObservation.optical(
+        Epochs.from_mjd(_EPOCH_MJD_TDB + 100.0, scale="tdb"), "F51", (0.2, 0.2)
+    )
     widened = evaluate_plan(orbit, [*base, conjunction])
 
     flags = widened.candidates.observable.to_pylist()
@@ -1089,13 +1118,13 @@ def test_a_radar_only_plan_returns_an_empty_ephemeris():
         _plan_orbit(),
         [
             PlannedObservation.radar(
-                _EPOCH_MJD_TDB + 15.0,
+                Epochs.from_mjd(_EPOCH_MJD_TDB + 15.0, scale="tdb"),
                 radar_bandwidth_hz=1.0e5,
                 radar_freq_resolution_hz=0.1,
                 radar_snr=50.0,
             ),
             PlannedObservation.radar(
-                _EPOCH_MJD_TDB + 18.0,
+                Epochs.from_mjd(_EPOCH_MJD_TDB + 18.0, scale="tdb"),
                 radar_bandwidth_hz=1.0e5,
                 radar_freq_resolution_hz=0.1,
                 radar_snr=40.0,
@@ -1130,7 +1159,7 @@ def test_a_singular_prior_covariance_is_refused():
         orbit_id=orbit.orbit_id,
         object_id=orbit.object_id,
         coordinates=CartesianCoordinates.from_kwargs(
-            epoch=orbit.coordinates.epoch,
+            epochs=Epochs.from_kwargs(mjd=orbit.coordinates.epochs.mjd_tdb(), scale="tdb"),
             x=orbit.coordinates.x,
             y=orbit.coordinates.y,
             z=orbit.coordinates.z,
@@ -1164,7 +1193,7 @@ def test_link_budget_fields_are_refused_alongside_a_supplied_snr():
     link-budget inputs have nowhere to go in it."""
     with pytest.raises(ValueError) as exc:
         PlannedObservation.radar(
-            61000.0,
+            Epochs.from_mjd(61000.0, scale="tdb"),
             radar_bandwidth_hz=1.0e5,
             radar_freq_resolution_hz=0.1,
             radar_snr=50.0,
@@ -1179,14 +1208,22 @@ def test_link_budget_fields_are_refused_alongside_a_supplied_snr():
 
 def test_a_waveform_the_mode_needs_must_be_positive():
     with pytest.raises(ValueError, match="radar_bandwidth_hz"):
-        PlannedObservation.radar(61000.0, radar_mode=RadarMode.DELAY, radar_snr=50.0)
+        PlannedObservation.radar(
+            Epochs.from_mjd(61000.0, scale="tdb"), radar_mode=RadarMode.DELAY, radar_snr=50.0
+        )
     with pytest.raises(ValueError, match="radar_freq_resolution_hz"):
         PlannedObservation.radar(
-            61000.0, radar_mode=RadarMode.DOPPLER, radar_bandwidth_hz=1.0e5, radar_snr=50.0
+            Epochs.from_mjd(61000.0, scale="tdb"),
+            radar_mode=RadarMode.DOPPLER,
+            radar_bandwidth_hz=1.0e5,
+            radar_snr=50.0,
         )
     # A delay-only candidate does not need a Doppler resolution.
     PlannedObservation.radar(
-        61000.0, radar_mode=RadarMode.DELAY, radar_bandwidth_hz=1.0e5, radar_snr=50.0
+        Epochs.from_mjd(61000.0, scale="tdb"),
+        radar_mode=RadarMode.DELAY,
+        radar_bandwidth_hz=1.0e5,
+        radar_snr=50.0,
     )
 
 
@@ -1196,7 +1233,7 @@ def test_green_bank_cannot_transmit():
     budget entirely."""
     with pytest.raises(ValueError, match="receive-only"):
         PlannedObservation.radar(
-            61000.0,
+            Epochs.from_mjd(61000.0, scale="tdb"),
             radar_transmit_station=RadarStation.GREEN_BANK,
             radar_bandwidth_hz=1.0e5,
             radar_freq_resolution_hz=0.1,
@@ -1209,13 +1246,15 @@ def test_an_out_of_domain_kind_is_a_valueerror_not_a_keyerror():
     the object was built unvalidated and failed much later in the wire
     lowering as a ``KeyError``."""
     with pytest.raises(ValueError, match="kind"):
-        PlannedObservation(epoch_mjd_tdb=61000.0, kind="infrared")  # type: ignore[arg-type]
+        PlannedObservation(epoch=Epochs.from_mjd(61000.0, scale="tdb"), kind="infrared")  # type: ignore[arg-type]
 
 
 def test_candidate_fields_set_after_construction_are_still_refused():
     """``PlannedObservation`` is mutable like ``PlanningConfig``, so
     ``evaluate_plan`` re-runs its validation for the same reason."""
-    mutated = PlannedObservation.optical(_EPOCH_MJD_TDB + 10.0, "F51", (0.2, 0.2))
+    mutated = PlannedObservation.optical(
+        Epochs.from_mjd(_EPOCH_MJD_TDB + 10.0, scale="tdb"), "F51", (0.2, 0.2)
+    )
     mutated.optical_sigma_arcsec = (0.0, 0.2)
     with pytest.raises(ValueError, match="optical_sigma_arcsec"):
         evaluate_plan(_plan_orbit(), [mutated])
@@ -1239,7 +1278,7 @@ def test_planned_columns_map_covers_the_whole_wire_dict():
     above cannot see it."""
     from empyrean.planning.plan import _PLANNED_COLUMNS
 
-    wire = PlannedObservation.optical(61000.0, "F51")._to_wire_dict()
+    wire = PlannedObservation.optical(Epochs.from_mjd(61000.0, scale="tdb"), "F51")._to_wire_dict()
     assert set(wire) == set(_PLANNED_COLUMNS), (
         f"_PLANNED_COLUMNS and _to_wire_dict disagree:\n"
         f"  only in wire dict: {sorted(set(wire) - set(_PLANNED_COLUMNS))}\n"
@@ -1319,7 +1358,7 @@ def test_both_basis_guards_name_the_same_one_call_conversion():
         orbit_id=helio.orbit_id,
         object_id=helio.object_id,
         coordinates=CartesianCoordinates.from_kwargs(
-            epoch=coords.epoch,
+            epochs=coords.epochs,
             x=coords.x,
             y=coords.y,
             z=coords.z,
@@ -1345,7 +1384,7 @@ def test_a_spin_capped_link_budget_records_the_cap():
         _plan_orbit(),
         [
             PlannedObservation.radar(
-                _EPOCH_MJD_TDB + 15.0,
+                Epochs.from_mjd(_EPOCH_MJD_TDB + 15.0, scale="tdb"),
                 radar_bandwidth_hz=1.0e5,
                 radar_freq_resolution_hz=0.1,
                 radar_target_h_mag=19.7,

@@ -33,8 +33,9 @@ Example
 ...     ThrustParams,
 ... )
 >>> arc = ThrustArc(
-...     start_mjd_tdb=59000.0,
-...     end_mjd_tdb=59010.0,
+...     start_mjd=59000.0,
+...     end_mjd=59010.0,
+...     scale="tdb",
 ...     thrust_n=1000.0,
 ...     mass_kg=1000.0,
 ...     steering=ConstantRTN(alpha_rad=0.1, beta_rad=0.2),
@@ -49,6 +50,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from empyrean.coordinates.enums import Origin
+from empyrean.coordinates.epoch import _scale_str
 
 __all__ = [
     "ConstantRTN",
@@ -107,10 +109,17 @@ class ThrustArc:
     """A single continuous-thrust arc with smooth on/off switching and
     optional mass depletion."""
 
-    start_mjd_tdb: float
-    """Arc start epoch (MJD TDB)."""
-    end_mjd_tdb: float
-    """Arc end epoch (MJD TDB)."""
+    start_mjd: float
+    """Arc start epoch, MJD in :attr:`scale`."""
+    end_mjd: float
+    """Arc end epoch, MJD in :attr:`scale`."""
+    scale: str
+    """Time scale of :attr:`start_mjd` / :attr:`end_mjd`: ``"utc"`` or
+    ``"tdb"``. Required and unabbreviated. An arc time is a modelling
+    statement, so the scale is stated here rather than fixed by the field
+    name. Mirrors the CLI thrust JSON (``start_mjd`` / ``end_mjd`` +
+    ``scale``) and the Rust ``Epoch`` inputs; converted to TDB once at the
+    FFI boundary."""
     thrust_n: float
     """Engine thrust force in Newtons."""
     mass_kg: float
@@ -130,6 +139,12 @@ class ThrustArc:
     r"""Specific impulse in seconds. When set, mass depletes linearly
     during the burn at :math:`\dot m = F/(I_{sp}\,g_0)`; ``None`` holds
     mass constant."""
+
+    def __post_init__(self) -> None:
+        # Normalize and validate the scale at construction so a bad scale
+        # fails here with a clear message, not deep in the FFI. Accepts a
+        # TimeScale enum or a case-insensitive string, like Epochs.
+        self.scale = _scale_str(self.scale)
 
 
 @dataclass

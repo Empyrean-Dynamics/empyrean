@@ -14,6 +14,7 @@ import math
 
 import numpy as np
 import pytest
+from empyrean.coordinates.epoch import Epochs
 from empyrean.od.determine import (
     _build_determine_results,
     _summary_row_delivered,
@@ -385,7 +386,7 @@ def test_unmatched_seed_orbit_reaches_python_from_the_engine():
 
     def seed(orbit_id: str) -> CartesianOrbits:
         coords = CartesianCoordinates.from_kwargs(
-            epoch=[60000.0],
+            epochs=Epochs.from_kwargs(mjd=[60000.0], scale="tdb"),
             x=[2.0],
             y=[0.0],
             z=[0.0],
@@ -429,7 +430,7 @@ def test_residual_marshaling_carries_every_observation_column():
         "object_id": "object_ids",
         "obs_code": "obs_codes",
         "ast_cat": "ast_cats",
-        "epoch_mjd_tdb": "epochs",
+        "epochs": "epochs",
         "ra_residual": "ra_residuals_arcsec",
         "dec_residual": "dec_residuals_arcsec",
         "chi2": "chi2",

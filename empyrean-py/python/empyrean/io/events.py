@@ -16,6 +16,7 @@ import numpy as np
 import pyarrow as pa
 
 from empyrean._convert import origin_to_naif
+from empyrean.coordinates.epoch import Epochs
 from empyrean.propagation.events import Events
 
 
@@ -23,13 +24,13 @@ class _CommonEventTable(Protocol):
     """Structural view of the columns shared by every event subtype table.
 
     Every per-event-type :class:`quivr.Table` in :class:`Events` exposes at
-    least ``orbit_id``, ``body`` and ``epoch``; accessing such a column on a
-    table *instance* yields the underlying :class:`pyarrow.Array`.
+    least ``orbit_id`` and ``body`` as :class:`pyarrow.Array` columns, plus
+    an ``epochs`` :class:`~empyrean.Epochs` sub-table.
     """
 
     orbit_id: pa.Array
     body: pa.Array
-    epoch: pa.Array
+    epochs: Epochs
 
     def __len__(self) -> int: ...
 
@@ -81,7 +82,10 @@ def _events_to_dict(
         orbit_ids.extend(table.orbit_id.to_pylist())
         event_types.extend([name] * m)
         bodies.extend(table.body.to_pylist())
-        epochs.extend(table.epoch.to_pylist())
+        # The flat on-disk form serializes MJD TDB (the parquet column is
+        # `epoch_mjd_tdb`); the in-memory Events tables carry the request
+        # scale on their `epochs` sub-tables.
+        epochs.extend(table.epochs.mjd_tdb().tolist())
         distance_au.extend(_optional_column_values(table, "distance_au", m))
         distance_km.extend(_optional_column_values(table, "distance_km", m))
         rel_v.extend(_optional_column_values(table, "relative_velocity_au_day", m))

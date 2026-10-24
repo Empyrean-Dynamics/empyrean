@@ -22,6 +22,7 @@ from empyrean import (
     PackedJoints,
 )
 from empyrean.coordinates.coordinates import CartesianCoordinates, KeplerianCoordinates
+from empyrean.coordinates.epoch import Epochs
 from empyrean.coordinates.transform import transform_coordinates, transform_orbits
 from empyrean.errors import PushError, PushErrorVariant
 
@@ -212,7 +213,7 @@ def test_removed_four_homes_fields_and_kwargs_raise() -> None:
         ThrustParams(arcs=[], correction_covariances=[[(0.0, 0.0, 0.0)]])
 
     coords = CartesianCoordinates.from_kwargs(
-        epoch=[59000.0],
+        epochs=Epochs.from_kwargs(mjd=[59000.0], scale="tdb"),
         x=[1.0],
         y=[0.0],
         z=[0.0],
@@ -234,7 +235,7 @@ def test_removed_four_homes_fields_and_kwargs_raise() -> None:
 def _cartesian_orbit_with_joint() -> CartesianOrbits:
     """A one-row Cartesian orbit carrying a width-6 state joint."""
     coords = CartesianCoordinates.from_kwargs(
-        epoch=[59000.0],
+        epochs=Epochs.from_kwargs(mjd=[59000.0], scale="tdb"),
         x=[1.2],
         y=[0.3],
         z=[0.1],
@@ -293,7 +294,7 @@ def test_state_level_transform_refuses_a_covariance_and_names_transform_orbits()
     """
     cov = empyrean.CartesianCovariance.from_matrix(np.eye(6)[np.newaxis] * 1e-6)
     coords = CartesianCoordinates.from_kwargs(
-        epoch=[59000.0],
+        epochs=Epochs.from_kwargs(mjd=[59000.0], scale="tdb"),
         x=[1.2],
         y=[0.3],
         z=[0.1],

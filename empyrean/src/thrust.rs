@@ -95,10 +95,12 @@ impl SteeringLaw {
 /// \\]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ThrustArc {
-    /// Arc start epoch (MJD TDB).
-    pub start_mjd_tdb: f64,
-    /// Arc end epoch (MJD TDB).
-    pub end_mjd_tdb: f64,
+    /// Arc start epoch. A time input: converted to TDB once at the FFI
+    /// boundary, like every other time input, so the caller states the
+    /// scale rather than the field name fixing it.
+    pub start: crate::Epoch,
+    /// Arc end epoch (converted to TDB at the FFI boundary).
+    pub end: crate::Epoch,
     /// Engine thrust force in Newtons.
     pub thrust_n: f64,
     /// Spacecraft mass at arc start in kilograms.
@@ -125,8 +127,8 @@ impl ThrustArc {
     /// Build a constant-mass arc (`isp_s = None`). Add mass depletion
     /// with [`with_isp`](Self::with_isp).
     pub fn new(
-        start_mjd_tdb: f64,
-        end_mjd_tdb: f64,
+        start: crate::Epoch,
+        end: crate::Epoch,
         thrust_n: f64,
         mass_kg: f64,
         sharpness: f64,
@@ -134,8 +136,8 @@ impl ThrustArc {
         central_body: Origin,
     ) -> Self {
         Self {
-            start_mjd_tdb,
-            end_mjd_tdb,
+            start,
+            end,
             thrust_n,
             mass_kg,
             isp_s: None,
@@ -152,15 +154,17 @@ impl ThrustArc {
         self
     }
 
-    /// Marshal into the flat FFI record. Infallible: every field maps
-    /// directly, `isp_s` uses the NaN sentinel, and the central body is a
-    /// typed [`Origin`] whose NAIF id always resolves.
-    pub(crate) fn to_ffi(&self) -> empyrean_sys::EmpyreanThrustArc {
+    /// Marshal into the flat FFI record, converting the arc's start/end
+    /// epochs to MJD TDB at this boundary. Fails only if a UTC epoch has
+    /// no defined conversion (before the leap-second era, or an instant
+    /// inside a positive leap second); `isp_s` uses the NaN sentinel, and
+    /// the central body is a typed [`Origin`] whose NAIF id always resolves.
+    pub(crate) fn to_ffi(&self) -> crate::Result<empyrean_sys::EmpyreanThrustArc> {
         let (steering_law, steering_alpha_rad, steering_beta_rad, steering_direction) =
             self.steering.to_ffi_parts();
-        empyrean_sys::EmpyreanThrustArc {
-            start_mjd_tdb: self.start_mjd_tdb,
-            end_mjd_tdb: self.end_mjd_tdb,
+        Ok(empyrean_sys::EmpyreanThrustArc {
+            start_mjd_tdb: self.start.mjd_tdb()?,
+            end_mjd_tdb: self.end.mjd_tdb()?,
             thrust_n: self.thrust_n,
             mass_kg: self.mass_kg,
             // Option<f64> across the ABI uses the NaN sentinel (shared
@@ -172,7 +176,7 @@ impl ThrustArc {
             steering_direction,
             sharpness: self.sharpness,
             central_body_naif_id: self.central_body.naif_id(),
-        }
+        })
     }
 }
 
@@ -232,8 +236,8 @@ mod tests {
 
     fn rtn_arc() -> ThrustArc {
         ThrustArc::new(
-            59000.0,
-            59010.0,
+            Epoch::from_mjd_tdb(59000.0),
+            Epoch::from_mjd_tdb(59010.0),
             1000.0,
             1000.0,
             100.0,
@@ -276,16 +280,16 @@ mod tests {
     #[test]
     fn thrust_arc_isp_uses_nan_sentinel() {
         // None -> NaN (constant mass).
-        let ffi = rtn_arc().to_ffi();
+        let ffi = rtn_arc().to_ffi().unwrap();
         assert!(ffi.isp_s.is_nan());
         // Some -> finite (mass depletion).
-        let ffi = rtn_arc().with_isp(Some(3000.0)).to_ffi();
+        let ffi = rtn_arc().with_isp(Some(3000.0)).to_ffi().unwrap();
         assert_eq!(ffi.isp_s, 3000.0);
     }
 
     #[test]
     fn thrust_arc_marshals_all_fields() {
-        let ffi = rtn_arc().to_ffi();
+        let ffi = rtn_arc().to_ffi().unwrap();
         assert_eq!(ffi.start_mjd_tdb, 59000.0);
         assert_eq!(ffi.end_mjd_tdb, 59010.0);
         assert_eq!(ffi.thrust_n, 1000.0);
@@ -304,6 +308,28 @@ mod tests {
         assert_eq!(ffi.n_thrust_arcs, 0);
         assert!(ffi.dv_corrections.is_null());
         assert_eq!(ffi.n_dv_corrections, 0);
+    }
+
+    #[test]
+    fn thrust_arc_accepts_a_utc_epoch() {
+        // A thrust-arc time is a scale-carrying input: a UTC `Epoch` is
+        // accepted and carries its scale, converting to TDB only at the FFI
+        // boundary like every other time input (the field name no longer
+        // fixes the scale).
+        let arc = ThrustArc::new(
+            Epoch::from_mjd_utc(59000.0),
+            Epoch::from_mjd_utc(59010.0),
+            1000.0,
+            1000.0,
+            100.0,
+            SteeringLaw::ConstantRTN {
+                alpha_rad: 0.1,
+                beta_rad: 0.2,
+            },
+            Origin::SUN,
+        );
+        assert_eq!(arc.start.scale(), crate::TimeScale::UTC);
+        assert_eq!(arc.end.scale(), crate::TimeScale::UTC);
     }
 
     #[test]
@@ -386,8 +412,8 @@ mod propagate_tests {
 
     fn rtn_arc() -> ThrustArc {
         ThrustArc::new(
-            59000.0,
-            59010.0,
+            Epoch::from_mjd_tdb(59000.0),
+            Epoch::from_mjd_tdb(59010.0),
             1000.0,
             1000.0,
             100.0,

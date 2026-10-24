@@ -129,7 +129,9 @@ def transform_coordinates(
             target_origin,
         )
 
-    return arrays_to_coordinates(result, representation)
+    # A transform carries no time argument, so the output echoes the input
+    # table's scale (same instants, same scale).
+    return arrays_to_coordinates(result, representation, scale=coordinates.epochs.scale)
 
 
 def transform_orbits(

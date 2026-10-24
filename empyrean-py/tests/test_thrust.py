@@ -50,7 +50,7 @@ def _orbit(orbit_id: str, with_cov: bool = True) -> CartesianOrbits:
     """A heliocentric Cartesian state with a tight diagonal covariance so
     the burn-sensitivity path can engage."""
     kwargs = {
-        "epoch": [_T0],
+        "epochs": Epochs.from_kwargs(mjd=[_T0], scale="tdb"),
         "x": [1.0],
         "y": [0.1],
         "z": [0.05],
@@ -68,8 +68,9 @@ def _orbit(orbit_id: str, with_cov: bool = True) -> CartesianOrbits:
 
 def _rtn_arc(central_body: object = Origin.SUN) -> ThrustArc:
     return ThrustArc(
-        start_mjd_tdb=59000.0,
-        end_mjd_tdb=59010.0,
+        start_mjd=59000.0,
+        end_mjd=59010.0,
+        scale="tdb",
         thrust_n=1000.0,
         mass_kg=1000.0,
         steering=ConstantRTN(alpha_rad=0.1, beta_rad=0.2),
@@ -104,8 +105,9 @@ def test_public_thrust_types_expose_wrapper_field_names() -> None:
     VelocityTangent()
 
     arc = ThrustArc(
-        start_mjd_tdb=59000.0,
-        end_mjd_tdb=59010.0,
+        start_mjd=59000.0,
+        end_mjd=59010.0,
+        scale="tdb",
         thrust_n=1000.0,
         mass_kg=1000.0,
         steering=rtn,
@@ -155,8 +157,9 @@ def test_thrust_perturbs_trajectory() -> None:
 def test_velocity_tangent_steering_perturbs_trajectory() -> None:
     """VelocityTangent steering marshals and is honored by the engine."""
     arc = ThrustArc(
-        start_mjd_tdb=59000.0,
-        end_mjd_tdb=59010.0,
+        start_mjd=59000.0,
+        end_mjd=59010.0,
+        scale="tdb",
         thrust_n=1000.0,
         mass_kg=1000.0,
         steering=VelocityTangent(),

@@ -14,9 +14,14 @@ pub struct HorizonsVectorsArgs {
     #[arg(long)]
     pub command: String,
 
-    /// Epoch in MJD TDB.
+    /// Epoch in MJD, interpreted in the scale given by `--scale`.
     #[arg(long)]
-    pub epoch_mjd_tdb: f64,
+    pub epoch: f64,
+
+    /// Time scale of `--epoch` (`utc` or `tdb`). Required: an MJD carries no
+    /// scale, so it is stated rather than assumed.
+    #[arg(long, value_enum)]
+    pub scale: crate::TimeScaleArg,
 
     /// Cache directory for Horizons JSON responses. Omit to skip caching.
     #[arg(long)]
@@ -26,16 +31,19 @@ pub struct HorizonsVectorsArgs {
 pub fn run(cmd: QueryCommand) -> Result<()> {
     match cmd {
         QueryCommand::HorizonsVectors(args) => {
-            let (pos, vel) = empyrean::query_horizons_vectors(
-                &args.command,
-                args.epoch_mjd_tdb,
-                args.cache_dir.as_deref(),
-            )
-            .context("failed to query JPL Horizons vectors")?;
+            // Pass the scale-carrying `Epoch` the CLI already parses from
+            // `--epoch` + `--scale` straight through; the wrapper converts it
+            // to MJD TDB once at the FFI boundary.
+            let epoch = args.scale.epoch(args.epoch);
+            let (pos, vel) =
+                empyrean::query_horizons_vectors(&args.command, epoch, args.cache_dir.as_deref())
+                    .context("failed to query JPL Horizons vectors")?;
 
             eprintln!(
-                "Horizons vectors for COMMAND '{}' at epoch {} MJD TDB (SSB-centered, ICRF):",
-                args.command, args.epoch_mjd_tdb
+                "Horizons vectors for COMMAND '{}' at epoch {} MJD {} (SSB-centered, ICRF):",
+                args.command,
+                args.epoch,
+                args.scale.as_str().to_uppercase()
             );
             println!(
                 "position_au:     {:+.16e} {:+.16e} {:+.16e}",

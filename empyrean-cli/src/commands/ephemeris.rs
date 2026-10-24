@@ -69,9 +69,14 @@ pub struct EphemerisArgs {
     #[arg(long, value_delimiter = ',')]
     pub observers: Vec<String>,
 
-    /// Observation epoch (MJD TDB).
+    /// Observation epoch (MJD), interpreted in the scale given by `--scale`.
     #[arg(long)]
     pub epoch: f64,
+
+    /// Time scale of `--epoch` (`utc` or `tdb`). Required: an MJD carries no
+    /// scale, so it is stated rather than assumed.
+    #[arg(long, value_enum)]
+    pub scale: crate::TimeScaleArg,
 
     /// Force model tier.
     #[arg(long, default_value = "standard")]
@@ -87,6 +92,12 @@ pub struct EphemerisArgs {
 }
 
 pub fn run(data: &DataOptions, args: EphemerisArgs) -> Result<()> {
+    // The requested instant, in the caller's scale; the engine works in TDB,
+    // so convert once here at the CLI boundary.
+    let target = args.scale.epoch(args.epoch);
+    let epoch_mjd_tdb = target
+        .mjd_tdb()
+        .context("could not interpret --epoch in the given --scale")?;
     // Try daemon first — unless a strict-offline context was requested,
     // which a running daemon's already-built context cannot honour.
     if data.daemon_eligible() {
@@ -94,7 +105,7 @@ pub fn run(data: &DataOptions, args: EphemerisArgs) -> Result<()> {
             object_ids: args.object_ids.clone(),
             input_path: args.input.as_ref().map(|p| p.display().to_string()),
             observers: args.observers.clone(),
-            epoch: args.epoch,
+            epoch: epoch_mjd_tdb,
             force_model: args.force_model.as_str().to_string(),
             out_dir: args.out_dir.display().to_string(),
             format: super::propagate::format_to_str(args.format).into(),
@@ -118,7 +129,7 @@ pub fn run(data: &DataOptions, args: EphemerisArgs) -> Result<()> {
     let observers = ctx
         .get_observers(
             &obs_refs,
-            &[empyrean::Epoch::from_mjd_tdb(args.epoch)],
+            &[target],
             // The construction basis: these observers go straight into
             // ephemeris generation, which requires it.
             empyrean::Frame::ICRF,

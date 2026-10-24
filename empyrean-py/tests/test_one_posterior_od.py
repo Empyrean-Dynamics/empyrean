@@ -65,7 +65,7 @@ def test_published_flat_is_the_joint_state_block_and_refeeds(aa_observations):
     # The covariance-bearing fitted orbit re-feeds through propagate without
     # the state-block refusal a mismatched posterior would raise: its joint
     # transports as a LINEAR covariance at every delivered epoch.
-    epoch0 = fit.orbit.coordinates.epoch.to_pylist()[0]
+    epoch0 = fit.orbit.coordinates.epochs.mjd_tdb().tolist()[0]
     epochs = Epochs.from_mjd([epoch0, epoch0 + 1.0], scale="tdb")
     result = propagate(fit.orbit, epochs, tagged_covariance=True)
     assert len(result.states) == 2, "the fitted orbit did not deliver both propagated epochs"

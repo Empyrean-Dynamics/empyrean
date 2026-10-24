@@ -66,7 +66,7 @@ def _heliocentric_orbit() -> CartesianOrbits:
     return CartesianOrbits.from_kwargs(
         orbit_id=["helio"],
         coordinates=CartesianCoordinates.from_kwargs(
-            epoch=[60000.0],
+            epochs=Epochs.from_kwargs(mjd=[60000.0], scale="tdb"),
             x=[1.0],
             y=[0.0],
             z=[0.0],
@@ -83,13 +83,13 @@ def _impactor_orbit() -> CartesianOrbits:
     """2008 TC3 with a small diagonal covariance, as Cartesian coordinates."""
     c = _TC3_COMETARY
     com = CometaryCoordinates.from_kwargs(
-        epoch=[c["epoch"]],
+        epochs=Epochs.from_kwargs(mjd=[c["epoch"]], scale="tdb"),
         q=[c["q"]],
         e=[c["e"]],
         i=[c["i"]],
         raan=[c["raan"]],
         ap=[c["ap"]],
-        tp=[c["tp"]],
+        perihelion_epochs=Epochs.from_kwargs(mjd=[c["tp"]], scale="tdb"),
         frame="ecliptic_j2000",
         origin=[str(Origin.SUN)],
     )

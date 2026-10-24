@@ -11,13 +11,13 @@ use std::panic::AssertUnwindSafe;
 use empyrean_core::time::Epoch;
 
 use crate::set_last_error;
-
-const SCALE_UTC: i32 = 0;
-const SCALE_TDB: i32 = 1;
+use crate::{EMPYREAN_TIME_SCALE_TDB, EMPYREAN_TIME_SCALE_UTC};
 
 /// Local time scale tag for FFI dispatch only. We deliberately do not
 /// depend on `villeneuve::time::TimeScale` here — the C-ABI crate sees
-/// only the (closed-source) `empyrean_core` re-exports.
+/// only the (closed-source) `empyrean_core` re-exports. The integer
+/// contract is the pinned [`EMPYREAN_TIME_SCALE_UTC`] /
+/// [`EMPYREAN_TIME_SCALE_TDB`] constants, mapped by explicit match.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Scale {
     UTC,
@@ -26,10 +26,11 @@ enum Scale {
 
 fn int_to_scale(val: i32) -> Result<Scale, String> {
     match val {
-        SCALE_UTC => Ok(Scale::UTC),
-        SCALE_TDB => Ok(Scale::TDB),
+        EMPYREAN_TIME_SCALE_UTC => Ok(Scale::UTC),
+        EMPYREAN_TIME_SCALE_TDB => Ok(Scale::TDB),
         other => Err(format!(
-            "unknown time scale: {other} (expected 0=UTC, 1=TDB)"
+            "unknown time scale: {other} (expected {EMPYREAN_TIME_SCALE_UTC}=UTC, \
+             {EMPYREAN_TIME_SCALE_TDB}=TDB)"
         )),
     }
 }
@@ -37,7 +38,9 @@ fn int_to_scale(val: i32) -> Result<Scale, String> {
 /// Parse an ISO 8601 UTC string (e.g. ``"2024-08-01T00:00:00.000Z"``)
 /// to MJD in the requested target scale.
 ///
-/// `scale` is `0` for UTC, `1` for TDB.
+/// `scale` is [`EMPYREAN_TIME_SCALE_UTC`](crate::EMPYREAN_TIME_SCALE_UTC)
+/// (`0`) for UTC or [`EMPYREAN_TIME_SCALE_TDB`](crate::EMPYREAN_TIME_SCALE_TDB)
+/// (`1`) for TDB.
 ///
 /// On success writes the MJD value to `*out_mjd` and returns 0.
 /// On failure returns a negative code; consult
@@ -98,7 +101,9 @@ pub unsafe extern "C" fn empyrean_iso_to_mjd(
 
 /// Format an MJD value (in the given scale) as an ISO 8601 UTC string.
 ///
-/// `scale` is `0` for UTC, `1` for TDB. Writes a null-terminated
+/// `scale` is [`EMPYREAN_TIME_SCALE_UTC`](crate::EMPYREAN_TIME_SCALE_UTC)
+/// (`0`) for UTC or [`EMPYREAN_TIME_SCALE_TDB`](crate::EMPYREAN_TIME_SCALE_TDB)
+/// (`1`) for TDB. Writes a null-terminated
 /// string of length ≤ `buf_len-1` into `out_buf`. A 32-byte buffer is
 /// always sufficient (typical output is 24 bytes:
 /// ``"2024-08-01T00:00:00.000Z"``).

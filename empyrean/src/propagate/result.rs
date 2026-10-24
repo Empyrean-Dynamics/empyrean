@@ -208,7 +208,10 @@ impl TaggedCovariance {
         self.joint.width
     }
 
-    pub(crate) fn from_ffi(s: &empyrean_sys::EmpyreanTaggedCovariance) -> Result<Self> {
+    pub(crate) fn from_ffi(
+        s: &empyrean_sys::EmpyreanTaggedCovariance,
+        request: crate::TimeScale,
+    ) -> Result<Self> {
         let origin = Origin::from_naif_id(s.origin).ok_or_else(|| {
             Error::invalid_input(format!(
                 "C ABI returned unknown NAIF id for tagged-covariance origin: {}",
@@ -223,7 +226,9 @@ impl TaggedCovariance {
             )
         })?;
         Ok(Self {
-            epoch: crate::Epoch::from_mjd_tdb(s.epoch_mjd_tdb),
+            // Covariance at a requested propagation epoch; expressed in the
+            // caller's request scale, like the eager `states` epochs.
+            epoch: crate::Epoch::from_mjd_tdb(s.epoch_mjd_tdb).to_scale(request)?,
             state: s.state,
             joint,
             mc_seed: (s.has_mc_seed != 0).then_some(s.mc_seed),
@@ -311,7 +316,10 @@ pub struct PropagatedState {
 }
 
 impl PropagatedState {
-    pub(crate) fn from_ffi(s: &empyrean_sys::EmpyreanPropagatedState) -> Result<Self> {
+    pub(crate) fn from_ffi(
+        s: &empyrean_sys::EmpyreanPropagatedState,
+        request: crate::TimeScale,
+    ) -> Result<Self> {
         let origin = Origin::from_naif_id(s.origin).ok_or_else(|| {
             Error::invalid_input(format!(
                 "C ABI returned unknown NAIF id for origin: {}",
@@ -320,7 +328,8 @@ impl PropagatedState {
         })?;
         let frame = crate::coordinate::int_to_frame(s.frame)?;
         Ok(Self {
-            epoch: crate::Epoch::from_mjd_tdb(s.epoch_mjd_tdb),
+            // Requested instant; expressed in the caller's request scale.
+            epoch: crate::Epoch::from_mjd_tdb(s.epoch_mjd_tdb).to_scale(request)?,
             position: [s.x, s.y, s.z],
             velocity: [s.vx, s.vy, s.vz],
             origin,
@@ -455,7 +464,10 @@ pub struct Event {
 }
 
 impl Event {
-    pub(crate) fn from_ffi(e: &empyrean_sys::EmpyreanEvent) -> Result<Self> {
+    pub(crate) fn from_ffi(
+        e: &empyrean_sys::EmpyreanEvent,
+        request: crate::TimeScale,
+    ) -> Result<Self> {
         fn cstr_to_string(ptr: *const std::ffi::c_char) -> String {
             if ptr.is_null() {
                 String::new()
@@ -493,7 +505,8 @@ impl Event {
             orbit_id: cstr_to_string(e.orbit_id),
             object_id: cstr_to_string(e.object_id),
             body,
-            epoch: crate::Epoch::from_mjd_tdb(e.epoch_mjd_tdb),
+            // Engine-found event instant, returned in the request scale.
+            epoch: crate::Epoch::from_mjd_tdb(e.epoch_mjd_tdb).to_scale(request)?,
             distance_au: e.distance_au,
             distance_km: e.distance_km,
             relative_velocity_au_day: e.relative_velocity_au_day,
@@ -666,11 +679,14 @@ pub struct MixtureChain {
     /// was no chain to carry a name. The row's position in `mixtures` is
     /// the join key in every case.
     pub orbit_id: String,
-    /// Close-approach epochs (MJD TDB) at which components were
-    /// retained. Same length as [`components`](Self::components).
-    pub ca_epochs_mjd_tdb: Vec<f64>,
+    /// Close-approach epochs at which components were retained, in the
+    /// caller's request scale. These are engine-found instants, so they
+    /// are converted once (not echoed), matching the Python
+    /// `mixtures.ca_epochs`. Same length as
+    /// [`components`](Self::components).
+    pub ca_epochs: Vec<crate::Epoch>,
     /// Retained components, one inner vector per entry of
-    /// [`ca_epochs_mjd_tdb`](Self::ca_epochs_mjd_tdb).
+    /// [`ca_epochs`](Self::ca_epochs).
     pub components: Vec<Vec<MixtureComponent>>,
 }
 
@@ -713,7 +729,7 @@ impl MixtureChain {
     pub(crate) fn empty() -> Self {
         Self {
             orbit_id: String::new(),
-            ca_epochs_mjd_tdb: Vec::new(),
+            ca_epochs: Vec::new(),
             components: Vec::new(),
         }
     }
@@ -739,6 +755,7 @@ impl MixtureChain {
     pub(crate) unsafe fn from_ffi(
         c: &empyrean_sys::EmpyreanMixtureChain,
         chain_index: usize,
+        request: crate::TimeScale,
     ) -> Result<Self> {
         let orbit_id = if c.orbit_id.is_null() {
             String::new()
@@ -751,7 +768,7 @@ impl MixtureChain {
         if n_epochs == 0 {
             return Ok(Self {
                 orbit_id,
-                ca_epochs_mjd_tdb: Vec::new(),
+                ca_epochs: Vec::new(),
                 components: Vec::new(),
             });
         }
@@ -812,9 +829,15 @@ impl MixtureChain {
                     .collect::<Result<Vec<_>>>()?,
             );
         }
+        // CA epochs are engine-found instants: convert each once into the
+        // caller's request scale (never echoed), matching the states path.
+        let ca_epochs = epochs
+            .iter()
+            .map(|&t| crate::Epoch::from_mjd_tdb(t).to_scale(request))
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             orbit_id,
-            ca_epochs_mjd_tdb: epochs.to_vec(),
+            ca_epochs,
             components,
         })
     }
@@ -919,6 +942,11 @@ pub struct PropagationResult {
     /// copies; this is kept solely to back the lazy tagged-covariance
     /// accessors.
     ffi: RetainedFfiResult,
+    /// The caller's request scale (the common scale of the `epochs`
+    /// argument), stored so the lazy tagged-covariance accessors hand each
+    /// covariance's epoch back in it: the same scale the eager `states`
+    /// epochs already carry.
+    request: crate::TimeScale,
 }
 
 /// The retained C-ABI result, owned so that dropping it frees the
@@ -983,6 +1011,7 @@ impl PropagationResult {
         mixtures: Vec<MixtureChain>,
         outcomes: Vec<OrbitOutcome>,
         ffi: empyrean_sys::EmpyreanPropagationResult,
+        request: crate::TimeScale,
     ) -> Self {
         Self {
             states,
@@ -991,6 +1020,7 @@ impl PropagationResult {
             mixtures,
             outcomes,
             ffi: RetainedFfiResult(Box::new(ffi)),
+            request,
         }
     }
 
@@ -1070,6 +1100,7 @@ impl PropagationResult {
             events,
             mixtures,
             outcomes,
+            request: _,
             ffi,
         } = self;
         // Free the engine result first, so the peak this method exists
@@ -1129,7 +1160,11 @@ impl PropagationResult {
     ) -> Option<&[MixtureComponent]> {
         let chain = self.mixtures.get(orbit_index)?;
         let mut best: Option<(usize, f64)> = None;
-        for (k, t) in chain.ca_epochs_mjd_tdb.iter().enumerate() {
+        for (k, e) in chain.ca_epochs.iter().enumerate() {
+            // The CA epochs carry the request scale; compare in TDB against
+            // the TDB query. The conversion only fails with no engine
+            // loaded, which cannot happen on a populated result.
+            let Ok(t) = e.mjd_tdb() else { continue };
             let d = (t - epoch_mjd_tdb).abs();
             if d <= tolerance_days && best.is_none_or(|(_, bd)| d < bd) {
                 best = Some((k, d));
@@ -1167,7 +1202,7 @@ impl PropagationResult {
             let series = unsafe { &*out_series };
             unsafe { std::slice::from_raw_parts(series.entries, series.num_entries) }
                 .iter()
-                .map(TaggedCovariance::from_ffi)
+                .map(|s| TaggedCovariance::from_ffi(s, self.request))
                 .collect::<Result<Vec<_>>>()
         };
         unsafe { empyrean_sys::empyrean_tagged_covariance_series_free(out_series) };
@@ -1194,7 +1229,7 @@ impl PropagationResult {
             return Err(Error::capture(code));
         }
         let init = unsafe { out.assume_init() };
-        TaggedCovariance::from_ffi(&init)
+        TaggedCovariance::from_ffi(&init, self.request)
     }
 
     /// The propagated joint at one `(orbit_index, epoch_index)` — the whole
@@ -1442,7 +1477,8 @@ mod event_kind_decode_tests {
         let mut e = blank_event();
         e.previous_kind = 0xFF;
         e.resolved_kind = 0xFF;
-        let ev = Event::from_ffi(&e).expect("0xFF is not an error — it is 'no kind here'");
+        let ev = Event::from_ffi(&e, crate::TimeScale::TDB)
+            .expect("0xFF is not an error: it is 'no kind here'");
         assert!(ev.previous_kind.is_none());
         assert!(ev.regime_resolved_kind.is_none());
     }
@@ -1461,7 +1497,7 @@ mod event_kind_decode_tests {
         let mut e = blank_event();
         e.previous_kind = 0xFF;
         e.resolved_kind = 0xFE;
-        let err = Event::from_ffi(&e)
+        let err = Event::from_ffi(&e, crate::TimeScale::TDB)
             .expect_err("an UNKNOWN covariance kind must not decode as 'no kind'");
         let msg = err.to_string();
         assert!(
@@ -1475,7 +1511,7 @@ mod event_kind_decode_tests {
         e.previous_kind = 0xFE;
         e.resolved_kind = 0xFF;
         assert!(
-            Event::from_ffi(&e).is_err(),
+            Event::from_ffi(&e, crate::TimeScale::TDB).is_err(),
             "previous_kind must refuse an UNKNOWN tag as well"
         );
     }
@@ -1553,8 +1589,17 @@ mod mixture_marshal_tests {
         let mut comps = [comp(1.0), comp(2.0), comp(3.0), comp(4.0), comp(5.0)];
         let c = chain(&mut epochs, &mut counts, &mut offsets, &mut comps, 5);
 
-        let out = unsafe { MixtureChain::from_ffi(&c, 0) }.expect("well-formed chain marshals");
-        assert_eq!(out.ca_epochs_mjd_tdb, vec![60000.0, 60100.0, 60200.0]);
+        let out = unsafe { MixtureChain::from_ffi(&c, 0, crate::TimeScale::TDB) }
+            .expect("well-formed chain marshals");
+        assert_eq!(
+            out.ca_epochs.iter().map(|e| e.mjd()).collect::<Vec<_>>(),
+            vec![60000.0, 60100.0, 60200.0]
+        );
+        assert!(
+            out.ca_epochs
+                .iter()
+                .all(|e| e.scale() == crate::TimeScale::TDB)
+        );
         assert_eq!(out.components.len(), 3);
         let weights: Vec<Vec<f64>> = out
             .components
@@ -1582,7 +1627,8 @@ mod mixture_marshal_tests {
         let mut comps = [comp(1.0), comp(2.0)];
         let c = chain(&mut epochs, &mut counts, &mut offsets, &mut comps, 2);
 
-        let err = unsafe { MixtureChain::from_ffi(&c, 7) }.expect_err("must reject");
+        let err = unsafe { MixtureChain::from_ffi(&c, 7, crate::TimeScale::TDB) }
+            .expect_err("must reject");
         assert!(
             err.message.contains("mixture chain 7") && err.message.contains("exceeds"),
             "expected a bounds error naming the chain, got: {}",
@@ -1601,7 +1647,8 @@ mod mixture_marshal_tests {
         let mut comps = [comp(1.0), comp(2.0)];
         let c = chain(&mut epochs, &mut counts, &mut offsets, &mut comps, 2);
 
-        let err = unsafe { MixtureChain::from_ffi(&c, 3) }.expect_err("must reject");
+        let err = unsafe { MixtureChain::from_ffi(&c, 3, crate::TimeScale::TDB) }
+            .expect_err("must reject");
         assert!(
             err.message.contains("components_offset[0] = 9"),
             "expected the offset axis to be named, got: {}",
@@ -1629,8 +1676,9 @@ mod mixture_marshal_tests {
             components: std::ptr::null_mut(),
             num_components_total: 0,
         };
-        let out = unsafe { MixtureChain::from_ffi(&c, 0) }.expect("empty chain marshals");
-        assert!(out.ca_epochs_mjd_tdb.is_empty());
+        let out = unsafe { MixtureChain::from_ffi(&c, 0, crate::TimeScale::TDB) }
+            .expect("empty chain marshals");
+        assert!(out.ca_epochs.is_empty());
         assert!(out.components.is_empty());
         assert_eq!(out.orbit_id, "");
     }
@@ -1647,7 +1695,8 @@ mod mixture_marshal_tests {
 
         let mut c = chain(&mut epochs, &mut counts, &mut offsets, &mut comps, 1);
         c.ca_epochs_mjd_tdb = std::ptr::null_mut();
-        let err = unsafe { MixtureChain::from_ffi(&c, 0) }.expect_err("must reject");
+        let err = unsafe { MixtureChain::from_ffi(&c, 0, crate::TimeScale::TDB) }
+            .expect_err("must reject");
         assert!(
             err.message.contains("null ca_epochs_mjd_tdb"),
             "{}",
@@ -1656,7 +1705,8 @@ mod mixture_marshal_tests {
 
         let mut c = chain(&mut epochs, &mut counts, &mut offsets, &mut comps, 1);
         c.components_per_epoch = std::ptr::null_mut();
-        let err = unsafe { MixtureChain::from_ffi(&c, 0) }.expect_err("must reject");
+        let err = unsafe { MixtureChain::from_ffi(&c, 0, crate::TimeScale::TDB) }
+            .expect_err("must reject");
         assert!(
             err.message.contains("null components_per_epoch"),
             "{}",
@@ -1665,7 +1715,8 @@ mod mixture_marshal_tests {
 
         let mut c = chain(&mut epochs, &mut counts, &mut offsets, &mut comps, 1);
         c.components_offset = std::ptr::null_mut();
-        let err = unsafe { MixtureChain::from_ffi(&c, 0) }.expect_err("must reject");
+        let err = unsafe { MixtureChain::from_ffi(&c, 0, crate::TimeScale::TDB) }
+            .expect_err("must reject");
         assert!(
             err.message.contains("null components_offset"),
             "{}",
@@ -1674,7 +1725,8 @@ mod mixture_marshal_tests {
 
         let mut c = chain(&mut epochs, &mut counts, &mut offsets, &mut comps, 1);
         c.components = std::ptr::null_mut();
-        let err = unsafe { MixtureChain::from_ffi(&c, 0) }.expect_err("must reject");
+        let err = unsafe { MixtureChain::from_ffi(&c, 0, crate::TimeScale::TDB) }
+            .expect_err("must reject");
         assert!(err.message.contains("null components"), "{}", err.message);
     }
 
@@ -1689,12 +1741,13 @@ mod mixture_marshal_tests {
         let mut bad_frame = [comp(1.0)];
         bad_frame[0].frame = 77;
         let c = chain(&mut epochs, &mut counts, &mut offsets, &mut bad_frame, 1);
-        assert!(unsafe { MixtureChain::from_ffi(&c, 0) }.is_err());
+        assert!(unsafe { MixtureChain::from_ffi(&c, 0, crate::TimeScale::TDB) }.is_err());
 
         let mut bad_origin = [comp(1.0)];
         bad_origin[0].origin = -12345;
         let c = chain(&mut epochs, &mut counts, &mut offsets, &mut bad_origin, 1);
-        let err = unsafe { MixtureChain::from_ffi(&c, 0) }.expect_err("must reject");
+        let err = unsafe { MixtureChain::from_ffi(&c, 0, crate::TimeScale::TDB) }
+            .expect_err("must reject");
         assert!(
             err.message.contains("mixture component origin"),
             "{}",
@@ -1736,7 +1789,10 @@ mod mixture_marshal_tests {
             Vec::new(),
             vec![MixtureChain {
                 orbit_id: "a".into(),
-                ca_epochs_mjd_tdb: vec![60000.0, 60000.5],
+                ca_epochs: vec![
+                    crate::Epoch::from_mjd_tdb(60000.0),
+                    crate::Epoch::from_mjd_tdb(60000.5),
+                ],
                 components: vec![vec![component(0.25)], vec![component(0.75)]],
             }],
             Vec::new(),
@@ -1752,6 +1808,7 @@ mod mixture_marshal_tests {
                 num_orbits: 0,
                 outcomes: std::ptr::null_mut(),
             },
+            crate::TimeScale::TDB,
         );
 
         let near = result
@@ -1874,6 +1931,7 @@ mod into_states_tests {
             Vec::new(),
             Vec::new(),
             empyrean_sys::EmpyreanPropagationResult::default(),
+            crate::TimeScale::TDB,
         )
     }
 

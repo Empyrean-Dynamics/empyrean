@@ -8,7 +8,7 @@ import quivr as qv
 from empyrean._convert import frame_to_int, int_to_frame, naif_to_origin, origin_to_naif
 from empyrean.coordinates.coordinates import CartesianCoordinates
 from empyrean.coordinates.enums import Frame, Origin
-from empyrean.coordinates.epoch import Epochs, _epochs_mjd_tdb, _require_epochs
+from empyrean.coordinates.epoch import Epochs, _echo_epochs, _epochs_mjd_tdb, _require_epochs
 
 
 class Observers(qv.Table):
@@ -178,8 +178,14 @@ class Observers(qv.Table):
                 "table-level frame and cannot represent a mixed-frame table"
             )
 
+        # The observer states are at the requested epochs (code-major over
+        # the N×M grid): echo the caller's own supplied values back in the
+        # caller's scale rather than storing the engine's TDB return.
+        # Ephemeris generated from these observers reads its request scale
+        # back off this sub-table.
+        out_epochs = _echo_epochs(np.asarray(result["epoch"]), epochs)
         coordinates = CartesianCoordinates.from_kwargs(
-            epoch=np.asarray(result["epoch"]),
+            epochs=out_epochs,
             x=np.asarray(result["x"]),
             y=np.asarray(result["y"]),
             z=np.asarray(result["z"]),

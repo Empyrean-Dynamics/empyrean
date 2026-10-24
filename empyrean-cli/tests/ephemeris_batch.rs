@@ -97,11 +97,45 @@ fn ephemeris(input: &Path, out: &Path) -> Output {
         "500",
         "--epoch",
         "59000.5",
+        "--scale",
+        "tdb",
         "--out-dir",
         &out.display().to_string(),
         "--format",
         "json",
     ])
+}
+
+#[test]
+fn ephemeris_without_scale_fails_naming_the_flag() {
+    // An MJD `--epoch` with no `--scale` is refused at parse time: the scale
+    // is mandatory, so an old invocation fails loudly rather than being
+    // silently reinterpreted as one clock or the other. No data dir is
+    // needed. Clap rejects the argument set before anything runs.
+    let out = run_cli(&[
+        "--data-dir",
+        "/tmp/empyrean-no-such-dir",
+        "ephemeris",
+        "--input",
+        "/tmp/empyrean-no-such-dir/orbits.json",
+        "--observers",
+        "500",
+        "--epoch",
+        "59000.5",
+        "--out-dir",
+        "/tmp/empyrean-no-such-dir/out",
+        "--format",
+        "json",
+    ]);
+    assert!(
+        !out.status.success(),
+        "omitting --scale with an MJD --epoch must fail"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--scale"),
+        "the failure must name the --scale flag\nstderr:\n{stderr}"
+    );
 }
 
 #[test]

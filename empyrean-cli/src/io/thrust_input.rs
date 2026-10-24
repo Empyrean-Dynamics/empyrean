@@ -2,11 +2,10 @@
 //!
 //! Parses a JSON thrust file into the wrapper's [`empyrean::ThrustParams`]
 //! so finite-burn / low-thrust arcs can be attached to the propagated
-//! orbits. Field names, units, and semantics are 1:1 with the engine
-//! surface (`start_mjd_tdb`, `end_mjd_tdb`, `thrust_n`, `mass_kg`,
+//! orbits. The arc times are stated with their scale (`start_mjd`,
+//! `end_mjd`, `scale`); the remaining fields (`thrust_n`, `mass_kg`,
 //! `isp_s`, `steering`, `sharpness`, `central_body`, plus
-//! `dv_corrections`) so the same fields carry through the CLI, the
-//! wrapper, and the C ABI without renaming.
+//! `dv_corrections`) match the engine surface one-for-one.
 //!
 //! JSON schema (one file describes one [`empyrean::ThrustParams`], applied
 //! to every orbit in the batch):
@@ -15,20 +14,24 @@
 //! {
 //!   "arcs": [
 //!     {
-//!       "start_mjd_tdb": 59000.0,
-//!       "end_mjd_tdb":   59010.0,
-//!       "thrust_n":      1000.0,
-//!       "mass_kg":       1000.0,
-//!       "isp_s":         3000.0,
-//!       "steering":      { "type": "constant_rtn", "alpha_rad": 0.1, "beta_rad": 0.2 },
-//!       "sharpness":     100.0,
-//!       "central_body":  10
+//!       "start_mjd":    59000.0,
+//!       "end_mjd":      59010.0,
+//!       "scale":        "tdb",
+//!       "thrust_n":     1000.0,
+//!       "mass_kg":      1000.0,
+//!       "isp_s":        3000.0,
+//!       "steering":     { "type": "constant_rtn", "alpha_rad": 0.1, "beta_rad": 0.2 },
+//!       "sharpness":    100.0,
+//!       "central_body": 10
 //!     }
 //!   ],
 //!   "dv_corrections": [[0.0, 0.0, 0.0]]
 //! }
 //! ```
 //!
+//! - `scale` is required and is `"utc"` or `"tdb"`: an MJD carries no
+//!   scale, so it is stated rather than assumed. `start_mjd` / `end_mjd`
+//!   are then converted to TDB once at the FFI boundary.
 //! - `isp_s` is optional (omit or `null` = constant mass; `Some` depletes
 //!   mass at \\( \dot m = F/(I_{sp}\,g_0) \\)).
 //! - `central_body` is a NAIF integer body code (10 = Sun, 399 = Earth,
@@ -45,7 +48,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use empyrean::{Origin, SteeringLaw, ThrustArc, ThrustParams};
+use empyrean::{Epoch, Origin, SteeringLaw, ThrustArc, ThrustParams, TimeScale};
 use serde::Deserialize;
 
 /// One steering law, tagged by `type`. Field names match the engine
@@ -85,8 +88,13 @@ impl From<SteeringLawJson> for SteeringLaw {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ThrustArcJson {
-    start_mjd_tdb: f64,
-    end_mjd_tdb: f64,
+    start_mjd: f64,
+    end_mjd: f64,
+    /// Time scale of `start_mjd` / `end_mjd`: `"utc"` or `"tdb"`.
+    /// Required. An MJD carries no scale, so it is stated here rather than
+    /// assumed, and an old file without it is refused instead of being
+    /// silently read as TDB.
+    scale: String,
     thrust_n: f64,
     mass_kg: f64,
     /// Specific impulse (seconds). Omit or `null` = constant mass.
@@ -107,9 +115,11 @@ impl ThrustArcJson {
                 self.central_body
             )
         })?;
+        let scale: TimeScale = TimeScale::from_str(&self.scale)
+            .map_err(|e| anyhow::anyhow!("thrust arc scale: {e}"))?;
         Ok(ThrustArc::new(
-            self.start_mjd_tdb,
-            self.end_mjd_tdb,
+            Epoch::new(self.start_mjd, scale),
+            Epoch::new(self.end_mjd, scale),
             self.thrust_n,
             self.mass_kg,
             self.sharpness,
@@ -188,8 +198,9 @@ mod tests {
     fn parses_full_constant_rtn_arc_with_corrections() {
         let json = r#"{
             "arcs": [{
-                "start_mjd_tdb": 59000.0,
-                "end_mjd_tdb": 59010.0,
+                "start_mjd": 59000.0,
+                "end_mjd": 59010.0,
+                "scale": "tdb",
                 "thrust_n": 1000.0,
                 "mass_kg": 1000.0,
                 "isp_s": 3000.0,
@@ -202,8 +213,10 @@ mod tests {
         let tp = parse(json).expect("parse");
         assert_eq!(tp.arcs.len(), 1);
         let arc = &tp.arcs[0];
-        assert_eq!(arc.start_mjd_tdb, 59000.0);
-        assert_eq!(arc.end_mjd_tdb, 59010.0);
+        assert_eq!(arc.start.mjd(), 59000.0);
+        assert_eq!(arc.start.scale(), TimeScale::TDB);
+        assert_eq!(arc.end.mjd(), 59010.0);
+        assert_eq!(arc.end.scale(), TimeScale::TDB);
         assert_eq!(arc.thrust_n, 1000.0);
         assert_eq!(arc.mass_kg, 1000.0);
         assert_eq!(arc.isp_s, Some(3000.0));
@@ -226,8 +239,9 @@ mod tests {
         // field must be refused by name — never silently dropped.
         let json = r#"{
             "arcs": [{
-                "start_mjd_tdb": 59000.0,
-                "end_mjd_tdb": 59010.0,
+                "start_mjd": 59000.0,
+                "end_mjd": 59010.0,
+                "scale": "tdb",
                 "thrust_n": 1000.0,
                 "mass_kg": 1000.0,
                 "steering": {"type": "velocity_tangent"},
@@ -250,8 +264,9 @@ mod tests {
     fn isp_omitted_is_constant_mass() {
         let json = r#"{
             "arcs": [{
-                "start_mjd_tdb": 59000.0,
-                "end_mjd_tdb": 59010.0,
+                "start_mjd": 59000.0,
+                "end_mjd": 59010.0,
+                "scale": "tdb",
                 "thrust_n": 1.0,
                 "mass_kg": 500.0,
                 "steering": {"type": "velocity_tangent"},
@@ -271,8 +286,9 @@ mod tests {
     fn parses_inertial_fixed_direction() {
         let json = r#"{
             "arcs": [{
-                "start_mjd_tdb": 59000.0,
-                "end_mjd_tdb": 59010.0,
+                "start_mjd": 59000.0,
+                "end_mjd": 59010.0,
+                "scale": "tdb",
                 "thrust_n": 1.0,
                 "mass_kg": 500.0,
                 "steering": {"type": "inertial_fixed", "direction": [1.0, 0.0, 0.0]},
@@ -295,8 +311,9 @@ mod tests {
         // must surface loudly, not silently fall back to a default body.
         let json = r#"{
             "arcs": [{
-                "start_mjd_tdb": 59000.0,
-                "end_mjd_tdb": 59010.0,
+                "start_mjd": 59000.0,
+                "end_mjd": 59010.0,
+                "scale": "tdb",
                 "thrust_n": 1.0,
                 "mass_kg": 500.0,
                 "steering": {"type": "velocity_tangent"},
@@ -327,8 +344,9 @@ mod tests {
         // never be silently ignored.
         let json = r#"{
             "arcs": [{
-                "start_mjd_tdb": 59000.0,
-                "end_mjd_tdb": 59010.0,
+                "start_mjd": 59000.0,
+                "end_mjd": 59010.0,
+                "scale": "tdb",
                 "thrust_n": 1.0,
                 "mass_kg": 500.0,
                 "steering": {"type": "velocity_tangent"},
@@ -343,6 +361,52 @@ mod tests {
                 || err.to_string().contains("thrust_newtons")
                 || err.to_string().contains("unknown"),
             "error should surface the unknown field: {err}"
+        );
+    }
+
+    #[test]
+    fn utc_scale_arc_carries_utc() {
+        // A UTC-scale arc keeps its scale on the typed epoch; the wrapper
+        // converts to TDB only at the FFI boundary.
+        let json = r#"{
+            "arcs": [{
+                "start_mjd": 60000.0,
+                "end_mjd": 60001.0,
+                "scale": "utc",
+                "thrust_n": 1.0,
+                "mass_kg": 500.0,
+                "steering": {"type": "velocity_tangent"},
+                "sharpness": 50.0,
+                "central_body": 10
+            }]
+        }"#;
+        let tp = parse(json).expect("parse");
+        assert_eq!(tp.arcs[0].start.scale(), TimeScale::UTC);
+        assert_eq!(tp.arcs[0].start.mjd(), 60000.0);
+        assert_eq!(tp.arcs[0].end.scale(), TimeScale::UTC);
+    }
+
+    #[test]
+    fn missing_scale_is_refused() {
+        // No `scale` key: an MJD carries no scale, so the file is refused
+        // rather than silently reinterpreted as TDB.
+        let json = r#"{
+            "arcs": [{
+                "start_mjd": 59000.0,
+                "end_mjd": 59010.0,
+                "thrust_n": 1.0,
+                "mass_kg": 500.0,
+                "steering": {"type": "velocity_tangent"},
+                "sharpness": 50.0,
+                "central_body": 10
+            }]
+        }"#;
+        let err = parse(json).expect_err("missing scale must be refused");
+        assert!(
+            err.to_string().contains("scale")
+                || err.to_string().contains("parse")
+                || err.to_string().contains("missing"),
+            "error should name the missing scale: {err}"
         );
     }
 }

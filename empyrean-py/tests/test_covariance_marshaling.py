@@ -109,15 +109,26 @@ _REPRESENTATIONS = [
 _GOOD_DIAGONAL = [1e-12, 1e-12, 1e-12, 1e-16, 1e-16, 1e-16]
 
 
+def _coord_kwargs(kwargs):
+    """Adapt element kwargs for construction: the cometary ``tp`` element is
+    now the ``perihelion_epochs`` :class:`Epochs` sub-table, in the table's
+    scale (matching ``epochs``)."""
+    if "tp" in kwargs:
+        kwargs["perihelion_epochs"] = Epochs.from_kwargs(
+            mjd=kwargs.pop("tp"), scale=kwargs["epochs"].scale
+        )
+    return kwargs
+
+
 def _coords(coord_cls, cov_cls, elements, cov_matrix=None, n=1):
     """Build one coordinate table, optionally carrying a covariance."""
     kwargs = {k: v * n for k, v in elements.items()}
-    kwargs["epoch"] = [60000.0] * n
+    kwargs["epochs"] = Epochs.from_kwargs(mjd=[60000.0] * n, scale="tdb")
     kwargs["frame"] = "ecliptic_j2000"
     kwargs["origin"] = [str(Origin.SUN)] * n
     if cov_matrix is not None:
         kwargs["covariance"] = cov_cls.from_matrix(cov_matrix)
-    return coord_cls.from_kwargs(**kwargs)
+    return coord_cls.from_kwargs(**_coord_kwargs(kwargs))
 
 
 def _cartesian_orbits(cov_matrix=None, orbit_ids=None) -> CartesianOrbits:
@@ -321,11 +332,11 @@ def test_diagonal_only_construction_still_works(coord_cls, cov_cls, elements) ->
         **{f"cov_{label}_{label}": [_GOOD_DIAGONAL[k]] for k, label in enumerate(labels)}
     )
     kwargs = dict(elements)
-    kwargs["epoch"] = [60000.0]
+    kwargs["epochs"] = Epochs.from_kwargs(mjd=[60000.0], scale="tdb")
     kwargs["frame"] = "ecliptic_j2000"
     kwargs["origin"] = [str(Origin.SUN)]
     kwargs["covariance"] = covariance
-    coords = coord_cls.from_kwargs(**kwargs)
+    coords = coord_cls.from_kwargs(**_coord_kwargs(kwargs))
 
     _, _, cov_matrices, has_cov, _, _, _ = coordinates_to_arrays(coords)
     assert has_cov.tolist() == [True]
@@ -343,10 +354,10 @@ def test_empty_table(coord_cls, cov_cls, elements) -> None:
     """REGRESSION GUARD. A zero-row table marshals to empty arrays without
     raising — the validation must not treat "no rows" as "no diagonal"."""
     kwargs = {k: [] for k in elements}
-    kwargs["epoch"] = []
+    kwargs["epochs"] = Epochs.from_kwargs(mjd=[], scale="tdb")
     kwargs["frame"] = "ecliptic_j2000"
     kwargs["origin"] = []
-    coords = coord_cls.from_kwargs(**kwargs)
+    coords = coord_cls.from_kwargs(**_coord_kwargs(kwargs))
 
     epochs, _, cov_matrices, has_cov, _, _, _ = coordinates_to_arrays(coords)
     assert len(epochs) == 0
@@ -369,11 +380,11 @@ def test_partial_off_diagonal_is_accepted() -> None:
 
     coord_cls, _, elements = _REPRESENTATIONS[0]
     kwargs = dict(elements)
-    kwargs["epoch"] = [60000.0]
+    kwargs["epochs"] = Epochs.from_kwargs(mjd=[60000.0], scale="tdb")
     kwargs["frame"] = "ecliptic_j2000"
     kwargs["origin"] = [str(Origin.SUN)]
     kwargs["covariance"] = covariance
-    coords = coord_cls.from_kwargs(**kwargs)
+    coords = coord_cls.from_kwargs(**_coord_kwargs(kwargs))
 
     _, _, cov_matrices, has_cov, _, _, _ = coordinates_to_arrays(coords)
     assert has_cov.tolist() == [True]
@@ -402,7 +413,7 @@ def _cartesian_orbit_at(x, y, z, vx, vy, vz) -> CartesianOrbits:
     """
     cov6 = np.diag([1e-10, 1e-10, 1e-10, 1e-14, 1e-14, 1e-14])
     coords = CartesianCoordinates.from_kwargs(
-        epoch=np.array([60000.0]),
+        epochs=Epochs.from_kwargs(mjd=np.array([60000.0]), scale="tdb"),
         x=[x],
         y=[y],
         z=[z],

@@ -13,6 +13,7 @@ from empyrean import (
     KeplerianCoordinates,
     Origin,
 )
+from empyrean.coordinates.epoch import Epochs
 
 # ── Tolerances (matching villeneuve's Rust tests) ────────────
 
@@ -32,7 +33,7 @@ ANGLE_TOL_DEG = np.degrees(1e-9)  # convert radian tolerance to degrees
 def cartesian_from_row(row, frame, origin):
     """Build CartesianCoordinates from a CSV row."""
     return CartesianCoordinates.from_kwargs(
-        epoch=[row["epoch_mjd_tdb"]],
+        epochs=Epochs.from_kwargs(mjd=[row["epoch_mjd_tdb"]], scale="tdb"),
         x=[row["x_au"]],
         y=[row["y_au"]],
         z=[row["z_au"]],

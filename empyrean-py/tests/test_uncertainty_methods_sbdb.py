@@ -52,7 +52,7 @@ def sbdb_orbit():
 
 @pytest.fixture(scope="module")
 def sbdb_grid(sbdb_orbit) -> np.ndarray:
-    t0 = float(sbdb_orbit.coordinates.epoch.to_numpy(zero_copy_only=False)[0])
+    t0 = float(sbdb_orbit.coordinates.epochs.mjd_tdb()[0])
     return np.array([t0, t0 + 365.0])
 
 
@@ -81,7 +81,7 @@ def sbdb_orbit_cartesian(sbdb_orbit, sbdb_grid) -> CartesianOrbits:
         orbit_id=["apo"],
         object_id=["apo"],
         coordinates=CartesianCoordinates.from_kwargs(
-            epoch=np.array([t0]),
+            epochs=Epochs.from_kwargs(mjd=np.array([t0]), scale="tdb"),
             x=[col("x")],
             y=[col("y")],
             z=[col("z")],
@@ -203,7 +203,7 @@ def test_agm_fires_and_labels_on_a_synthetic_earth_encounter() -> None:
         orbit_id=["impactor"],
         object_id=["impactor"],
         coordinates=CartesianCoordinates.from_kwargs(
-            epoch=np.array([epoch]),
+            epochs=Epochs.from_kwargs(mjd=np.array([epoch]), scale="tdb"),
             x=[state[0]],
             y=[state[1]],
             z=[state[2]],

@@ -88,7 +88,7 @@ def _mjd_to_iso(mjd: float) -> str:
 @pytest.fixture(scope="module")
 def probe_orbit() -> CartesianOrbits:
     coords = CartesianCoordinates.from_kwargs(
-        epoch=[_STATE["epoch"]],
+        epochs=Epochs.from_kwargs(mjd=[_STATE["epoch"]], scale="tdb"),
         x=[_STATE["x"]],
         y=[_STATE["y"]],
         z=[_STATE["z"]],
@@ -344,8 +344,8 @@ def test_nightly_layer_position_does_not_change_station_sigmas(probe_orbit, f51_
     [
         ("obs_code", "F51"),
         ("sigma", (0.5, 0.5)),
-        ("start_epoch_mjd_tdb", 61000.0),
-        ("end_epoch_mjd_tdb", 61010.0),
+        ("start_epoch", Epochs.from_mjd(61000.0, scale="tdb")),
+        ("end_epoch", Epochs.from_mjd(61010.0, scale="tdb")),
         ("scale", 2.0),
     ],
 )

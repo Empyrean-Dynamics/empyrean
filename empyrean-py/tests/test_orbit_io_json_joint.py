@@ -16,6 +16,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from empyrean import CartesianCoordinates, CartesianOrbits, NonGravParams, Origin
+from empyrean.coordinates.epoch import Epochs
 from empyrean.io.orbits import (
     read_orbits_json,
     read_orbits_parquet,
@@ -67,7 +68,7 @@ def _wide_orbit() -> CartesianOrbits:
     matching (zero-coefficient) Marsden model attached so the engine's
     CSV/parquet path accepts it."""
     coords = CartesianCoordinates.from_kwargs(
-        epoch=[60320.0],
+        epochs=Epochs.from_kwargs(mjd=[60320.0], scale="tdb"),
         x=[-7.85e-02],
         y=[-8.20e-01],
         z=[4.19e-02],

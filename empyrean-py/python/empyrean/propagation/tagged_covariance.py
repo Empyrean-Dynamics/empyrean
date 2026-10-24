@@ -35,6 +35,7 @@ from empyrean.coordinates.covariance import (
     _cov_column_names,
     _lower_tri_indices,
 )
+from empyrean.coordinates.epoch import Epochs
 from empyrean.orbits.joint import (
     _KIND_BY_CODE,
     _QUALITY_BY_CODE,
@@ -70,8 +71,9 @@ class TaggedCovariance:
 
     Attributes
     ----------
-    epoch_mjd_tdb : float
-        Epoch of this covariance (MJD TDB).
+    epoch : Epochs
+        Epoch of this covariance as a single-row :class:`~empyrean.Epochs`,
+        in the request scale (carrying its scale as data).
     state : np.ndarray
         Co-located propagated nominal state ``[x, y, z, vx, vy, vz]``
         (AU, AU/day), shape ``(6,)``.
@@ -90,7 +92,7 @@ class TaggedCovariance:
         Reference frame of the basis (canonical name, e.g. ``"icrf"``).
     """
 
-    epoch_mjd_tdb: float
+    epoch: Epochs
     state: np.ndarray
     joint: PackedJoint
     mc_seed: int | None
@@ -159,8 +161,8 @@ class TaggedCovariances(qv.Table):
     """Orbit primary key (matches the input ``Orbits.orbit_id``)."""
     object_id = qv.LargeStringColumn(nullable=True)
     """Object metadata label, if carried on the input orbit."""
-    epoch_mjd_tdb = qv.Float64Column()
-    """Output epoch (MJD TDB)."""
+    epochs = Epochs.as_column()
+    """Output epochs as an :class:`~empyrean.Epochs` sub-table, in the request scale."""
 
     # Co-located propagated nominal state [x, y, z, vx, vy, vz].
     state_x = qv.Float64Column()
@@ -277,7 +279,6 @@ class TaggedCovariances(qv.Table):
         ``select("orbit_id", oid)`` first to get one orbit's series.
         """
         n = len(self)
-        epochs = self.column("epoch_mjd_tdb").to_numpy(zero_copy_only=False)
         origins = self.column("origin").to_pylist()
         frames = self.column("frame").to_pylist()
         mc_seeds = self.column("mc_seed").to_pylist()
@@ -300,7 +301,9 @@ class TaggedCovariances(qv.Table):
                 continue
             out.append(
                 TaggedCovariance(
-                    epoch_mjd_tdb=float(epochs[i]),
+                    # Single-row slice of the request-scale epochs sub-table:
+                    # the per-row epoch carries its scale as data.
+                    epoch=self.epochs[i : i + 1],
                     state=np.ascontiguousarray(state[i], dtype=np.float64),
                     joint=pj,
                     mc_seed=int(mc_seeds[i]) if mc_seeds[i] is not None else None,
@@ -321,6 +324,7 @@ def build_tagged_covariances(
     orbit_ids: list[str],
     object_ids: list[str | None],
     epochs_mjd_tdb: np.ndarray,
+    request_scale: str,
 ) -> TaggedCovariances | None:
     """Build a :class:`TaggedCovariances` table from the Rust result.
 
@@ -365,7 +369,9 @@ def build_tagged_covariances(
     kwargs: dict[str, Any] = {
         "orbit_id": orbit_ids,
         "object_id": object_ids,
-        "epoch_mjd_tdb": np.asarray(epochs_mjd_tdb, dtype=np.float64),
+        "epochs": Epochs.from_kwargs(
+            mjd=np.asarray(epochs_mjd_tdb, dtype=np.float64), scale="tdb"
+        ).to_scale(request_scale),
         "state_x": state[:, 0],
         "state_y": state[:, 1],
         "state_z": state[:, 2],

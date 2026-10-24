@@ -455,7 +455,9 @@ impl ODConfig {
         let (mode, explicit) = match self.output_epoch {
             OutputEpoch::MidArc => (0, 0.0),
             OutputEpoch::LastObservation => (1, 0.0),
-            OutputEpoch::Epoch(t) => (2, t),
+            // Explicit output epoch is a scale-carrying input; convert to
+            // TDB once here, at the FFI boundary.
+            OutputEpoch::Epoch(e) => (2, e.mjd_tdb()?),
             OutputEpoch::IODEpoch => (3, 0.0),
         };
         // Materialize the photometry band→V rows (and their owned code

@@ -29,7 +29,7 @@ def _make_comet_orbit(dt: float | None) -> CartesianOrbits:
     water-ice g(r). DT comes from the caller.
     """
     coords = CartesianCoordinates.from_kwargs(
-        epoch=[60000.0],
+        epochs=Epochs.from_kwargs(mjd=[60000.0], scale="tdb"),
         x=[1.0],
         y=[0.0],
         z=[0.0],

@@ -124,6 +124,51 @@ impl Epoch {
             }
         }
     }
+
+    /// Return this epoch expressed in `scale`.
+    ///
+    /// A no-op (same value, same scale) when already in `scale`.
+    /// Otherwise converts through the leap-second + Fairhead/Bretagnon
+    /// path shared with [`mjd_tdb`](Self::mjd_tdb) / [`mjd_utc`](Self::mjd_utc).
+    /// This is the convert-once path for an **engine-found** instant (a
+    /// close approach, event, impact, rise or set time): it is handed back
+    /// in the scale the caller requested. A **requested** instant is not
+    /// converted here. The caller's own `Epoch` is echoed straight back
+    /// (same value, same scale), so an output epoch the caller asked for is
+    /// the caller's own bytes, never a formatter round-trip.
+    pub fn to_scale(&self, scale: TimeScale) -> Result<Self> {
+        if self.scale == scale {
+            return Ok(*self);
+        }
+        match scale {
+            TimeScale::TDB => Ok(Self::from_mjd_tdb(self.mjd_tdb()?)),
+            TimeScale::UTC => Ok(Self::from_mjd_utc(self.mjd_utc()?)),
+        }
+    }
+}
+
+/// The single request scale shared by a slice of input epochs.
+///
+/// Output epochs are expressed in this scale: a requested instant is
+/// echoed back as the caller's own `Epoch`, an engine-found instant is
+/// converted into it. A slice that mixes UTC and TDB is refused by name
+/// rather than silently picking one. One call carries one scale. An
+/// empty slice yields [`TimeScale::TDB`] (the engine scale), which only
+/// ever tags an empty result.
+pub(crate) fn request_scale(epochs: &[Epoch]) -> Result<TimeScale> {
+    let mut it = epochs.iter();
+    let Some(first) = it.next() else {
+        return Ok(TimeScale::TDB);
+    };
+    let scale = first.scale();
+    for e in it {
+        if e.scale() != scale {
+            return Err(Error::invalid_input(
+                "epochs mix time scales (UTC and TDB) in one call; one call carries one scale",
+            ));
+        }
+    }
+    Ok(scale)
 }
 
 /// Parse an ISO 8601 UTC string to MJD in the requested target scale.
@@ -182,4 +227,39 @@ pub fn mjd_to_iso(mjd: f64, scale: TimeScale) -> Result<String> {
     }
     let cstr = unsafe { CStr::from_ptr(buf.as_ptr() as *const std::os::raw::c_char) };
     Ok(cstr.to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_scale_reads_the_batch_and_refuses_a_mix() {
+        // The request scale is the single scale a batch carries: a UTC batch
+        // yields UTC, a TDB batch TDB, and an empty batch the engine scale.
+        assert_eq!(
+            request_scale(&[Epoch::from_mjd_utc(60000.0)]).unwrap(),
+            TimeScale::UTC
+        );
+        assert_eq!(
+            request_scale(&[Epoch::from_mjd_tdb(60000.0)]).unwrap(),
+            TimeScale::TDB
+        );
+        assert_eq!(request_scale(&[]).unwrap(), TimeScale::TDB);
+        // A batch that mixes UTC and TDB is refused by name, never silently
+        // reduced to one scale.
+        let err = request_scale(&[Epoch::from_mjd_utc(60000.0), Epoch::from_mjd_tdb(60001.0)])
+            .unwrap_err();
+        assert!(err.to_string().contains("mix time scales"));
+    }
+
+    #[test]
+    fn to_scale_within_scale_is_a_value_preserving_noop() {
+        // A requested instant handed back in its own scale is the caller's
+        // exact value, with no conversion applied.
+        let e = Epoch::from_mjd_utc(60000.123456789);
+        let same = e.to_scale(TimeScale::UTC).unwrap();
+        assert_eq!(same.scale(), TimeScale::UTC);
+        assert_eq!(same.mjd(), 60000.123456789);
+    }
 }

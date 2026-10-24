@@ -89,6 +89,25 @@ typedef struct Session Session;
 #define EMPYREAN_DATA_TIER_FULL 4
 
 /**
+ * Time scale tag for `empyrean_iso_to_mjd` / `empyrean_mjd_to_iso`:
+ * Coordinated Universal Time (civil time, with leap seconds).
+ *
+ * The public scale set is closed to `{UTC, TDB}` and the integer
+ * contract is pinned: `0` is UTC, `1` is TDB
+ * ([`EMPYREAN_TIME_SCALE_TDB`]). A scale integer is mapped by explicit
+ * match, never cast, so an unknown value is a named error rather than a
+ * silent reinterpretation.
+ */
+#define EMPYREAN_TIME_SCALE_UTC 0
+
+/**
+ * Time scale tag: Barycentric Dynamical Time, the scale every epoch the
+ * engine computes is expressed in, with no leap seconds. See
+ * [`EMPYREAN_TIME_SCALE_UTC`].
+ */
+#define EMPYREAN_TIME_SCALE_TDB 1
+
+/**
  * Which of the three Earth-orientation kernels a coverage check concerns,
  * for [`empyrean_earth_orientation_kernel_coverage`]. The historical and
  * high-precision kernels must cover a band (both a floor and a horizon);
@@ -9895,7 +9914,9 @@ int32_t empyrean_get_states(const EmpyreanContext *ctx,
  * Parse an ISO 8601 UTC string (e.g. ``"2024-08-01T00:00:00.000Z"``)
  * to MJD in the requested target scale.
  *
- * `scale` is `0` for UTC, `1` for TDB.
+ * `scale` is [`EMPYREAN_TIME_SCALE_UTC`](crate::EMPYREAN_TIME_SCALE_UTC)
+ * (`0`) for UTC or [`EMPYREAN_TIME_SCALE_TDB`](crate::EMPYREAN_TIME_SCALE_TDB)
+ * (`1`) for TDB.
  *
  * On success writes the MJD value to `*out_mjd` and returns 0.
  * On failure returns a negative code; consult
@@ -9906,7 +9927,9 @@ int32_t empyrean_get_states(const EmpyreanContext *ctx,
 /**
  * Format an MJD value (in the given scale) as an ISO 8601 UTC string.
  *
- * `scale` is `0` for UTC, `1` for TDB. Writes a null-terminated
+ * `scale` is [`EMPYREAN_TIME_SCALE_UTC`](crate::EMPYREAN_TIME_SCALE_UTC)
+ * (`0`) for UTC or [`EMPYREAN_TIME_SCALE_TDB`](crate::EMPYREAN_TIME_SCALE_TDB)
+ * (`1`) for TDB. Writes a null-terminated
  * string of length ≤ `buf_len-1` into `out_buf`. A 32-byte buffer is
  * always sufficient (typical output is 24 bytes:
  * ``"2024-08-01T00:00:00.000Z"``).

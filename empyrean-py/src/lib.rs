@@ -225,9 +225,15 @@ fn extract_thrust_arc(obj: &Bound<'_, PyAny>) -> PyResult<empyrean::ThrustArc> {
     } else {
         Some(isp_obj.extract()?)
     };
+    // The Python ThrustArc dataclass states its arc times as MJD in an
+    // explicit scale (`start_mjd` / `end_mjd` + `scale`); build typed
+    // `Epoch`s in that scale for the wrapper's ThrustArc, which converts
+    // to TDB once at the FFI boundary.
+    let scale_str: String = obj.getattr("scale")?.extract()?;
+    let scale = parse_scale(&scale_str)?;
     Ok(empyrean::ThrustArc::new(
-        obj.getattr("start_mjd_tdb")?.extract()?,
-        obj.getattr("end_mjd_tdb")?.extract()?,
+        empyrean::Epoch::new(obj.getattr("start_mjd")?.extract()?, scale),
+        empyrean::Epoch::new(obj.getattr("end_mjd")?.extract()?, scale),
         obj.getattr("thrust_n")?.extract()?,
         obj.getattr("mass_kg")?.extract()?,
         obj.getattr("sharpness")?.extract()?,
@@ -356,12 +362,14 @@ fn _earth_orientation_kernel_coverage(
     };
     let cov = empyrean::earth_orientation_kernel_coverage(std::path::Path::new(path), role)
         .map_err(to_pyerr)?;
+    // The coverage epochs are TDB-tagged (a kernel window has no request
+    // scale); hand their raw MJD values back as the tuple has always done.
     Ok((
         cov.satisfied,
-        cov.start_mjd_tdb,
-        cov.end_mjd_tdb,
-        cov.required_floor_mjd_tdb,
-        cov.required_horizon_mjd_tdb,
+        cov.start.mjd(),
+        cov.end.mjd(),
+        cov.required_floor.mjd(),
+        cov.required_horizon.mjd(),
     ))
 }
 
@@ -591,10 +599,17 @@ fn _query_horizons<'py>(
     cache_dir: Option<String>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
-    let times_vec = times.as_array().to_vec();
+    // Python converts the request Epochs to MJD TDB before calling; wrap
+    // each back as a TDB `Epoch` for the wrapper's typed query API (the
+    // wrapper converts at the FFI and echoes these instants).
+    let epochs_vec: Vec<empyrean::Epoch> = times
+        .as_array()
+        .iter()
+        .map(|&t| empyrean::Epoch::from_mjd_tdb(t))
+        .collect();
     let cache_path = cache_dir.as_ref().map(std::path::Path::new);
     let entries = py
-        .detach(|| empyrean::query_horizons(&name_refs, &obs_code, &times_vec, cache_path))
+        .detach(|| empyrean::query_horizons(&name_refs, &obs_code, &epochs_vec, cache_path))
         .map_err(to_pyerr)?;
 
     // Pack into the same flat-dict shape `_generate_ephemeris` returns.
@@ -662,8 +677,11 @@ fn _query_horizons_vectors<'py>(
     cache_dir: Option<String>,
 ) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
     let cache_path = cache_dir.as_ref().map(std::path::Path::new);
+    // The wire carries MJD TDB; wrap as a TDB `Epoch` for the wrapper's
+    // typed query API (it converts at the FFI).
+    let epoch = empyrean::Epoch::from_mjd_tdb(epoch_mjd_tdb);
     let (pos, vel) = py
-        .detach(|| empyrean::query_horizons_vectors(&command, epoch_mjd_tdb, cache_path))
+        .detach(|| empyrean::query_horizons_vectors(&command, epoch, cache_path))
         .map_err(to_pyerr)?;
     Ok((
         PyArray1::from_vec(py, pos.to_vec()),
@@ -2297,16 +2315,25 @@ fn fill_mixtures(
     for (oi, chain) in prop_result.mixtures.iter().enumerate() {
         for (k, comps) in chain.components.iter().enumerate() {
             // The chain's two vectors are built together by the
-            // un-flattening, so `ca_epochs_mjd_tdb[k]` always exists —
-            // but read it fallibly rather than indexing, so a future
-            // divergence surfaces as an error instead of a panic.
-            let epoch = *chain.ca_epochs_mjd_tdb.get(k).ok_or_else(|| {
-                PyRuntimeError::new_err(format!(
-                    "mixture chain {oi}: {} component groups but {} CA epochs",
-                    chain.components.len(),
-                    chain.ca_epochs_mjd_tdb.len()
-                ))
-            })?;
+            // un-flattening, so `ca_epochs[k]` always exists, but read it
+            // fallibly rather than indexing, so a future divergence
+            // surfaces as an error instead of a panic. The wrapper carries
+            // the CA epoch as an `Epoch` in the request scale (TDB on this
+            // path, since `_propagate` is handed MJD TDB); read its TDB
+            // value for the wire, which the Python layer re-expresses in
+            // the caller's scale.
+            let epoch = chain
+                .ca_epochs
+                .get(k)
+                .ok_or_else(|| {
+                    PyRuntimeError::new_err(format!(
+                        "mixture chain {oi}: {} component groups but {} CA epochs",
+                        chain.components.len(),
+                        chain.ca_epochs.len()
+                    ))
+                })?
+                .mjd_tdb()
+                .map_err(to_pyerr)?;
             for (ci, comp) in comps.iter().enumerate() {
                 orbit_index[row] = oi as u32;
                 orbit_id.push(
@@ -4058,7 +4085,7 @@ fn _generate_ephemeris<'py>(
                 .or_else(|| row.object_id.clone()),
         );
         s_obs_code.push(row.obs_code.clone());
-        s_epoch.push(row.epoch_mjd_tdb);
+        s_epoch.push(row.epoch.mjd_tdb().map_err(to_pyerr)?);
         s_n_params.push(row.n_params as u32);
         s_jacobian.push((!row.jacobian.is_empty()).then(|| row.jacobian.clone()));
         s_hessian.push((!row.hessian.is_empty()).then(|| row.hessian.clone()));
@@ -6441,8 +6468,10 @@ fn build_od_config_from_dict(d: &Bound<'_, PyDict>) -> PyResult<empyrean::ODConf
                         empyrean::WeightingLayer::ObservatoryRule {
                             obs_code,
                             sigma: [sigma_vec[0], sigma_vec[1]],
-                            start_epoch_mjd_tdb: start,
-                            end_epoch_mjd_tdb: end,
+                            // The wire carries the time range as MJD TDB; wrap
+                            // as TDB `Epoch`s (the wrapper converts at the FFI).
+                            start_epoch: start.map(empyrean::Epoch::from_mjd_tdb),
+                            end_epoch: end.map(empyrean::Epoch::from_mjd_tdb),
                             scale,
                             // Per-station noise model is a follow-up on the
                             // Python surface; inherit the global law.
@@ -6586,7 +6615,9 @@ fn build_od_config_from_dict(d: &Bound<'_, PyDict>) -> PyResult<empyrean::ODConf
                 let mjd = get_f64(&oe, "mjd_tdb")?.ok_or_else(|| {
                     PyValueError::new_err("output_epoch.mjd_tdb is required when mode = 'explicit'")
                 })?;
-                empyrean::OutputEpoch::Epoch(mjd)
+                // The wire carries MJD TDB; wrap as a TDB `Epoch` (the
+                // wrapper converts at the FFI).
+                empyrean::OutputEpoch::Epoch(empyrean::Epoch::from_mjd_tdb(mjd))
             }
             other => {
                 return Err(PyValueError::new_err(format!(

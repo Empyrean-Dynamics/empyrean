@@ -8,6 +8,8 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import quivr as qv
 
+from empyrean.coordinates.epoch import Epochs
+
 # pyarrow's compute functions are generated at runtime into the
 # ``pyarrow.compute`` module namespace (see ``_make_global_functions``),
 # so the bundled type stubs do not declare them and mypy cannot resolve
@@ -51,8 +53,9 @@ class ObservationResults(qv.Table):
     """MPC observatory code."""
     ast_cat = qv.LargeStringColumn(nullable=True)
     """Star catalog used for astrometric reduction (ADES `astCat`)."""
-    epoch_mjd_tdb = qv.Float64Column()
-    """Observation epoch (MJD TDB)."""
+    epochs = Epochs.as_column()
+    """Observation epochs as an :class:`~empyrean.Epochs` sub-table, in UTC
+    (ADES observation times are UTC by definition)."""
 
     # ── Core residuals ────────────────────────────────────
     ra_residual = qv.Float64Column()

@@ -129,6 +129,7 @@ impl Context {
         // Refuse an unserviceable pairing before any work starts, so a
         // caller never receives a silently downgraded uncertainty.
         config.validate()?;
+        let request = crate::time::request_scale(epochs)?;
         let (ffi_orbits, _orbit_keep) = crate::orbit::orbits_to_ffi(orbits)?;
         let (ffi_config, _config_keep) = config.to_ffi_with();
         let epochs_mjd_tdb: Vec<f64> = epochs
@@ -164,7 +165,7 @@ impl Context {
         if code != 0 {
             return Err(Error::capture(code));
         }
-        marshal_propagation_result(ffi_result, orbits.len())
+        marshal_propagation_result(ffi_result, orbits.len(), request)
     }
 }
 
@@ -183,6 +184,7 @@ impl Context {
 pub(crate) fn marshal_propagation_result(
     ffi_result: empyrean_sys::EmpyreanPropagationResult,
     num_orbits: usize,
+    request: crate::TimeScale,
 ) -> Result<PropagationResult> {
     // `slice::from_raw_parts` requires a non-null pointer even for
     // length 0, but the C ABI hands back a null pointer for an empty
@@ -192,7 +194,7 @@ pub(crate) fn marshal_propagation_result(
     } else {
         unsafe { std::slice::from_raw_parts(ffi_result.states, ffi_result.num_states) }
             .iter()
-            .map(PropagatedState::from_ffi)
+            .map(|s| PropagatedState::from_ffi(s, request))
             .collect::<Result<_>>()?
     };
     let object_ids = if ffi_result.object_ids.is_null() {
@@ -222,7 +224,7 @@ pub(crate) fn marshal_propagation_result(
     } else {
         unsafe { std::slice::from_raw_parts(ffi_result.events, ffi_result.num_events) }
             .iter()
-            .map(Event::from_ffi)
+            .map(|e| Event::from_ffi(e, request))
             .collect::<Result<Vec<_>>>()?
     };
 
@@ -239,7 +241,7 @@ pub(crate) fn marshal_propagation_result(
         unsafe { std::slice::from_raw_parts(ffi_result.mixtures, ffi_result.num_mixtures) }
             .iter()
             .enumerate()
-            .map(|(i, c)| unsafe { MixtureChain::from_ffi(c, i) })
+            .map(|(i, c)| unsafe { MixtureChain::from_ffi(c, i, request) })
             .collect::<Result<_>>()?
     };
     // Pad that wholesale-empty case to one EMPTY chain per input orbit,
@@ -301,6 +303,6 @@ pub(crate) fn marshal_propagation_result(
     // returned `PropagationResult` drops. The owned `states` / `object_ids`
     // / `events` / `mixtures` above are independent copies.
     Ok(PropagationResult::new(
-        states, object_ids, events, mixtures, outcomes, ffi_result,
+        states, object_ids, events, mixtures, outcomes, ffi_result, request,
     ))
 }

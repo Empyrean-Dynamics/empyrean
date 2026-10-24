@@ -58,7 +58,8 @@ use std::ptr::NonNull;
 use crate::context::Context;
 use crate::coordinate::{Frame, int_to_frame};
 use crate::ephemeris::{
-    EphemerisConfig, EphemerisResult, marshal_ephemeris_result, observers_to_ffi,
+    EphemerisConfig, EphemerisResult, marshal_ephemeris_result, observer_echo,
+    observers_request_scale, observers_to_ffi,
 };
 use crate::error::{Error, Result};
 use crate::observers::Observer;
@@ -356,6 +357,7 @@ impl BuiltSystem {
         // Same refusal as the one-shot path — the handle changes when
         // the force model is assembled, not what a config may ask for.
         config.validate()?;
+        let request = crate::time::request_scale(epochs)?;
         let (ffi_orbits, _orbit_keep) = orbits_to_ffi(orbits)?;
         let (ffi_config, _config_keep) = config.to_ffi_with();
         let epochs_mjd_tdb: Vec<f64> = epochs
@@ -378,7 +380,7 @@ impl BuiltSystem {
         if code != 0 {
             return Err(Error::capture(code));
         }
-        marshal_propagation_result(ffi_result, orbits.len())
+        marshal_propagation_result(ffi_result, orbits.len(), request)
     }
 
     /// Generate predicted ephemeris for orbits as seen by observers through
@@ -399,6 +401,10 @@ impl BuiltSystem {
         config: &EphemerisConfig,
     ) -> Result<EphemerisResult> {
         let (ffi_orbits, _orbit_keep) = orbits_to_ffi(orbits)?;
+        // Refuse a mixed-scale observer batch, then build the echo map that
+        // hands each output row back the caller's own observer epoch.
+        observers_request_scale(observers)?;
+        let echo = observer_echo(observers)?;
         let ffi_observers = observers_to_ffi(observers)?;
         let (ffi_config, _config_keep) = config.to_ffi_with()?;
         let mut ffi_result = empyrean_sys::EmpyreanEphemerisResult::default();
@@ -417,7 +423,7 @@ impl BuiltSystem {
         if code != 0 {
             return Err(Error::capture(code));
         }
-        marshal_ephemeris_result(&mut ffi_result)
+        marshal_ephemeris_result(&mut ffi_result, &echo)
     }
 
     /// Return a full reproducibility summary of the frozen force model and

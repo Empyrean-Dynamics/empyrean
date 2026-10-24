@@ -53,8 +53,13 @@ def get_states(
     out_frame = int_to_frame(int(result["frame"][0])) if len(result["frame"]) > 0 else frame
     origin_strs = [naif_to_origin(int(o)) for o in result["origin"]]
 
+    # One state per requested epoch, in order: the states are the
+    # requested instants, so the caller's own Epochs is echoed straight
+    # back (same values, same scale), never a round-trip of the engine's
+    # TDB return through a conversion.
+    out_epochs = epochs
     return CartesianCoordinates.from_kwargs(
-        epoch=np.asarray(result["epoch"]),
+        epochs=out_epochs,
         x=np.asarray(result["x"]),
         y=np.asarray(result["y"]),
         z=np.asarray(result["z"]),

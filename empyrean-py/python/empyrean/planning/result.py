@@ -196,8 +196,11 @@ class PlannedObservation:
     Mirrors ``empyrean::PlannedObservation``.
     """
 
-    epoch_mjd_tdb: float
-    """Planned epoch (MJD TDB) — the *receive* epoch for radar."""
+    epoch: Epochs
+    """Planned epoch as a single-row :class:`~empyrean.Epochs` (the *receive*
+    epoch for radar), a scale-carrying input (converted to TDB at the FFI),
+    mirroring the Rust ``PlannedObservation.epoch: Epoch``. Build one with
+    ``Epochs.from_mjd(value, scale="tdb")`` (or ``scale="utc"``)."""
     kind: PlannedObservationKind = PlannedObservationKind.OPTICAL
 
     # ── Optical fields ─────────────────────────────────────────
@@ -273,10 +276,10 @@ class PlannedObservation:
                 f"PlannedObservation: kind must be one of {accepted} (or the "
                 f"matching PlannedObservationKind member), got {self.kind!r}."
             ) from None
-        if not math.isfinite(self.epoch_mjd_tdb):
+        if len(self.epoch) != 1 or not math.isfinite(float(self.epoch.to_numpy()[0])):
             raise ValueError(
-                f"PlannedObservation: epoch_mjd_tdb must be a finite MJD TDB, "
-                f"got {self.epoch_mjd_tdb!r}."
+                f"PlannedObservation: epoch must be a single-row Epochs with a "
+                f"finite MJD, got {self.epoch!r}."
             )
         if self.kind == PlannedObservationKind.OPTICAL:
             # An optical candidate reads none of the radar slots; a value
@@ -427,16 +430,17 @@ class PlannedObservation:
     @classmethod
     def optical(
         cls,
-        epoch_mjd_tdb: float,
+        epoch: Epochs,
         optical_code: str,
         optical_sigma_arcsec: tuple[float, float] = (1.0, 1.0),
     ) -> PlannedObservation:
         """An optical candidate at a registered observatory.
 
-        Mirrors ``empyrean::PlannedObservation::optical``.
+        Mirrors ``empyrean::PlannedObservation::optical``. ``epoch`` is a
+        single-row scale-carrying :class:`~empyrean.Epochs`.
         """
         return cls(
-            epoch_mjd_tdb=epoch_mjd_tdb,
+            epoch=epoch,
             kind=PlannedObservationKind.OPTICAL,
             optical_code=optical_code,
             optical_sigma_arcsec=optical_sigma_arcsec,
@@ -445,7 +449,7 @@ class PlannedObservation:
     @classmethod
     def radar(
         cls,
-        epoch_mjd_tdb: float,
+        epoch: Epochs,
         *,
         radar_transmit_station: RadarStation | str = RadarStation.GOLDSTONE_DSS14,
         radar_receive_station: RadarStation | str = RadarStation.GOLDSTONE_DSS14,
@@ -468,7 +472,7 @@ class PlannedObservation:
         ``radar_integration_s``.
         """
         return cls(
-            epoch_mjd_tdb=epoch_mjd_tdb,
+            epoch=epoch,
             kind=PlannedObservationKind.RADAR,
             radar_transmit_station=RadarStation(_enum_value(radar_transmit_station)),
             radar_receive_station=RadarStation(_enum_value(radar_receive_station)),
@@ -494,7 +498,9 @@ class PlannedObservation:
         :func:`dataclasses.asdict`.
         """
         return {
-            "epoch_mjd_tdb": float(self.epoch_mjd_tdb),
+            # The wire carries MJD TDB (the engine scale); convert the
+            # scale-carrying epoch here, at the FFI boundary.
+            "epoch_mjd_tdb": float(self.epoch.mjd_tdb()[0]),
             "kind": _KIND_TO_INT[self.kind],
             "optical_code": self.optical_code,
             "optical_sigma_ra_arcsec": float(self.optical_sigma_arcsec[0]),
@@ -593,10 +599,13 @@ class ObservatoryConfig:
     """Nautical-twilight Sun altitude (degrees); default −12°."""
     astronomical_twilight_sun_altitude_deg: float | None = None
     """Astronomical-twilight Sun altitude (degrees); default −18°."""
-    explicit_anchor_utc_mjd_tdb: float | None = None
-    """A caller-supplied epoch (MJD, TDB) for the ``explicit_utc`` night
-    anchor, or ``None`` for the three site-derived anchors only. Every night
-    whose noon-to-noon span contains it also carries an anchor there."""
+    explicit_anchor_utc: Epochs | None = None
+    """A caller-supplied epoch (a single-row scale-carrying
+    :class:`~empyrean.Epochs`, converted to TDB at the FFI) for the
+    ``explicit_utc`` night anchor, or ``None`` for the three site-derived
+    anchors only; mirrors the Rust ``explicit_anchor_utc: Option<Epoch>``.
+    Every night whose noon-to-noon span contains it also carries an anchor
+    there."""
 
     def _to_wire_dict(self) -> dict[str, WireValue]:
         """Serialize to the dict shape the binding consumes.
@@ -638,8 +647,9 @@ class ObservatoryConfig:
         if set_count == 4:
             for key, value in twilight.items():
                 wire[key] = float(value)  # type: ignore[arg-type]
-        if self.explicit_anchor_utc_mjd_tdb is not None:
-            wire["explicit_anchor_utc_mjd_tdb"] = float(self.explicit_anchor_utc_mjd_tdb)
+        if self.explicit_anchor_utc is not None:
+            # Wire carries MJD TDB; convert the scale-carrying anchor here.
+            wire["explicit_anchor_utc_mjd_tdb"] = float(self.explicit_anchor_utc.mjd_tdb()[0])
         return wire
 
 
@@ -1131,7 +1141,7 @@ class VisibilityPoints(qv.Table):
 
     orbit_id = qv.LargeStringColumn()
     obs_code = qv.LargeStringColumn()
-    epoch_mjd_tdb = qv.Float64Column()
+    epochs = Epochs.as_column()
     solar_elongation_deg = qv.Float64Column()
     elevation_deg = qv.Float64Column(nullable=True)
     sun_altitude_deg = qv.Float64Column(nullable=True)
@@ -1159,13 +1169,13 @@ class VisibilityWindows(qv.Table):
     orbit_id = qv.LargeStringColumn()
     obs_code = qv.LargeStringColumn()
     night_index = qv.Int64Column()
-    start_epoch_mjd_tdb = qv.Float64Column()
-    end_epoch_mjd_tdb = qv.Float64Column()
+    start_epochs = Epochs.as_column()
+    end_epochs = Epochs.as_column()
     peak_elongation_deg = qv.Float64Column()
     brightest_mag = qv.Float64Column(nullable=True)
     hours_observable = qv.Float64Column()
     max_altitude_deg = qv.Float64Column(nullable=True)
-    max_altitude_epoch_mjd_tdb = qv.Float64Column(nullable=True)
+    max_altitude_epochs = Epochs.as_column()
     closing_gate = qv.LargeStringColumn(nullable=True)
 
 
@@ -1186,17 +1196,17 @@ class Nights(qv.Table):
     local_date_year = qv.Int64Column()
     local_date_month = qv.Int64Column()
     local_date_day = qv.Int64Column()
-    noon_start_mjd_tdb = qv.Float64Column()
-    noon_end_mjd_tdb = qv.Float64Column()
-    sunset_mjd_tdb = qv.Float64Column(nullable=True)
-    civil_dusk_mjd_tdb = qv.Float64Column(nullable=True)
-    nautical_dusk_mjd_tdb = qv.Float64Column(nullable=True)
-    astronomical_dusk_mjd_tdb = qv.Float64Column(nullable=True)
-    local_solar_midnight_mjd_tdb = qv.Float64Column(nullable=True)
-    astronomical_dawn_mjd_tdb = qv.Float64Column(nullable=True)
-    nautical_dawn_mjd_tdb = qv.Float64Column(nullable=True)
-    civil_dawn_mjd_tdb = qv.Float64Column(nullable=True)
-    sunrise_mjd_tdb = qv.Float64Column(nullable=True)
+    noon_start_epochs = Epochs.as_column()
+    noon_end_epochs = Epochs.as_column()
+    sunset_epochs = Epochs.as_column()
+    civil_dusk_epochs = Epochs.as_column()
+    nautical_dusk_epochs = Epochs.as_column()
+    astronomical_dusk_epochs = Epochs.as_column()
+    local_solar_midnight_epochs = Epochs.as_column()
+    astronomical_dawn_epochs = Epochs.as_column()
+    nautical_dawn_epochs = Epochs.as_column()
+    civil_dawn_epochs = Epochs.as_column()
+    sunrise_epochs = Epochs.as_column()
     note = qv.LargeStringColumn(nullable=True)
 
 
@@ -1215,7 +1225,7 @@ class VisibilityAnchors(qv.Table):
     obs_code = qv.LargeStringColumn()
     night_index = qv.Int64Column()
     policy = qv.LargeStringColumn()
-    epoch_mjd_tdb = qv.Float64Column(nullable=True)
+    epochs = Epochs.as_column()
     observable = qv.BooleanColumn()
     altitude_deg = qv.Float64Column(nullable=True)
     azimuth_deg = qv.Float64Column(nullable=True)

@@ -54,6 +54,7 @@ import numpy as np
 import numpy.typing as npt
 import quivr as qv
 
+from empyrean.coordinates.epoch import Epochs
 from empyrean.orbits.joint import PackedJoint, PackedJoints
 
 __all__ = ["ComponentStatus", "MixtureChains", "MixtureComponent"]
@@ -151,7 +152,7 @@ class MixtureChains(qv.Table):
 
     One row per retained component. Rows are grouped contiguously by
     ``orbit_id`` (matching propagation's orbit-major output); within an
-    orbit they are grouped by ``ca_epoch_mjd_tdb`` and ordered by
+    orbit they are grouped by ``ca_epochs`` and ordered by
     ``component_index``.
 
     An orbit whose splitter never fired contributes **zero rows**. A
@@ -168,8 +169,9 @@ class MixtureChains(qv.Table):
     """Orbit primary key (matches the input ``Orbits.orbit_id``)."""
     orbit_index = qv.UInt32Column()
     """Zero-based index into the input orbits (orbit-major order)."""
-    ca_epoch_mjd_tdb = qv.Float64Column()
-    """Close-approach epoch the components were retained at (MJD TDB)."""
+    ca_epochs = Epochs.as_column()
+    """Close-approach epochs the components were retained at, as an
+    :class:`~empyrean.Epochs` sub-table in the request scale."""
     component_index = qv.UInt32Column()
     """Zero-based index of this component within its CA epoch's group."""
     weight = qv.Float64Column()
@@ -211,10 +213,10 @@ class MixtureChains(qv.Table):
                 out.append(v)
         return out
 
-    def ca_epochs(self, orbit_index: int) -> list[float]:
+    def ca_epoch_values(self, orbit_index: int) -> list[float]:
         """Retained CA epochs (MJD TDB) for one orbit, in table order."""
         idx = self.orbit_index.to_numpy(zero_copy_only=False)
-        epochs = self.ca_epoch_mjd_tdb.to_numpy(zero_copy_only=False)
+        epochs = self.ca_epochs.mjd_tdb()
         out: list[float] = []
         for i in range(len(self)):
             if int(idx[i]) != orbit_index:
@@ -230,7 +232,7 @@ class MixtureChains(qv.Table):
         """One orbit's retained components, grouped by CA epoch.
 
         Returns one inner list per retained CA epoch of the orbit at
-        ``orbit_index``, in the order :meth:`ca_epochs` reports, with
+        ``orbit_index``, in the order :meth:`ca_epoch_values` reports, with
         each mean/covariance re-materialized as a contiguous array and
         the basis names decoded.
 
@@ -238,7 +240,7 @@ class MixtureChains(qv.Table):
         answer, not an error.
         """
         idx = self.orbit_index.to_numpy(zero_copy_only=False)
-        epochs = self.ca_epoch_mjd_tdb.to_numpy(zero_copy_only=False)
+        epochs = self.ca_epochs.mjd_tdb()
         weights = self.weight.to_numpy(zero_copy_only=False)
         statuses = self.status.to_pylist()
         rhos = self.rho.to_pylist()
@@ -306,7 +308,7 @@ class MixtureChains(qv.Table):
         return cls.from_parquet(fpath)
 
 
-def build_mixture_chains(result: dict[str, object]) -> MixtureChains:
+def build_mixture_chains(result: dict[str, object], request_scale: str) -> MixtureChains:
     """Build a :class:`MixtureChains` table from the Rust result dict.
 
     ``result`` is the dict returned by the ``_propagate`` extension,
@@ -360,7 +362,7 @@ def build_mixture_chains(result: dict[str, object]) -> MixtureChains:
     return MixtureChains.from_kwargs(
         orbit_id=orbit_id,
         orbit_index=orbit_index,
-        ca_epoch_mjd_tdb=ca_epoch,
+        ca_epochs=Epochs.from_kwargs(mjd=ca_epoch, scale="tdb").to_scale(request_scale),
         component_index=component_index,
         weight=weight,
         mean_x=mean[:, 0],

@@ -52,7 +52,7 @@ def test_possible_impact_absent_probabilities_are_null_not_nan() -> None:
         ip_agm=[np.nan],
         ip_mc=[np.nan],
     )
-    pi = _build_events(ev).possible_impacts
+    pi = _build_events(ev, "tdb").possible_impacts
     assert len(pi) == 1
     # The four nullable probability columns must be null, not NaN.
     assert pi.ip_second_order.to_pylist() == [None]
@@ -84,7 +84,7 @@ def test_possible_impact_present_probabilities_survive() -> None:
         ip_agm=[0.44],
         ip_mc=[np.nan],  # MC not run -> still null
     )
-    pi = _build_events(ev).possible_impacts
+    pi = _build_events(ev, "tdb").possible_impacts
     assert pi.ip_second_order.to_pylist() == [pytest.approx(0.42)]
     assert pi.ip_agm.to_pylist() == [pytest.approx(0.44)]
     assert pi.ip_mc.to_pylist() == [None]
@@ -108,7 +108,7 @@ def test_impacts_carry_relative_velocity_null_where_unresolved() -> None:
         # First impact resolved a speed (~2.43 km/s ≈ 0.0014 AU/day); second did not.
         relative_velocity_au_day=[0.0014, np.nan],
     )
-    imp = _build_events(ev).impacts
+    imp = _build_events(ev, "tdb").impacts
     assert len(imp) == 2
     rv = imp.relative_velocity_au_day.to_pylist()
     assert rv[0] == pytest.approx(0.0014)

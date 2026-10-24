@@ -160,20 +160,28 @@ fn ffi_batch_to_owned(batch: &empyrean_sys::EmpyreanOrbitBatch) -> Result<OrbitB
 }
 
 /// Query JPL Horizons for predicted ephemeris records at a single
-/// observatory across a list of MJD TDB epochs.
+/// observatory across a list of requested `epochs` (scale-carrying
+/// [`Epoch`](crate::Epoch)s, converted to TDB at the FFI boundary).
 ///
-/// Returns one [`EphemerisEntry`] per `(object_id × epoch)`. Optionally
-/// caches the JSON response on disk under `cache_dir`.
+/// Returns one [`EphemerisEntry`] per `(object_id × epoch)`, each at its
+/// requested epoch echoed in the request scale. Optionally caches the JSON
+/// response on disk under `cache_dir`.
 pub fn query_horizons(
     object_ids: &[&str],
     obs_code: &str,
-    times_mjd_tdb: &[f64],
+    epochs: &[crate::Epoch],
     cache_dir: Option<&Path>,
 ) -> Result<Vec<EphemerisEntry>> {
     crate::context::ensure_engine_loaded()?;
     if object_ids.is_empty() {
         return Ok(Vec::new());
     }
+    // The requested instants are scale-carrying `Epoch`s; convert to MJD TDB
+    // once here, at the FFI boundary.
+    let times_mjd_tdb: Vec<f64> = epochs
+        .iter()
+        .map(|e| e.mjd_tdb())
+        .collect::<Result<Vec<_>>>()?;
     let id_cstrings: Vec<CString> = object_ids
         .iter()
         .map(|id| {
@@ -218,10 +226,18 @@ pub fn query_horizons(
     // decode never fails here, but the marshaler is uniformly fallible now);
     // free the C result BEFORE propagating any decode error so the error path
     // leaks nothing.
+    // Each returned entry sits at a requested instant, so it echoes the
+    // caller's own `Epoch` (in the request scale), matched by value against
+    // the engine's TDB return, the same echo the ephemeris path uses.
+    let echo: std::collections::HashMap<u64, crate::Epoch> = epochs
+        .iter()
+        .zip(times_mjd_tdb.iter())
+        .map(|(e, &t)| (t.to_bits(), *e))
+        .collect();
     let entries: Result<Vec<EphemerisEntry>> = unsafe {
         std::slice::from_raw_parts(result.entries, result.num_entries)
             .iter()
-            .map(EphemerisEntry::from_ffi)
+            .map(|e| EphemerisEntry::from_ffi(e, &echo))
             .collect()
     };
     unsafe { empyrean_sys::empyrean_ephemeris_result_free(&mut result) };
@@ -231,16 +247,20 @@ pub fn query_horizons(
 /// Query JPL Horizons for a Cartesian state vector at a single epoch.
 ///
 /// `command` is the Horizons COMMAND string (e.g. `"99942;"`,
-/// `"DES=C/2019 Q4;"`); `epoch_mjd_tdb` is the epoch in MJD TDB.
+/// `"DES=C/2019 Q4;"`); `epoch` is the requested instant (a scale-carrying
+/// [`Epoch`](crate::Epoch), converted to TDB at the FFI boundary).
 /// Returns `(position, velocity)` in AU and AU/day — both solar-system
 /// barycenter (SSB) centered, ICRF. Optionally caches the JSON
 /// response on disk under `cache_dir`; pass `None` to skip caching.
 pub fn query_horizons_vectors(
     command: &str,
-    epoch_mjd_tdb: f64,
+    epoch: crate::Epoch,
     cache_dir: Option<&Path>,
 ) -> Result<([f64; 3], [f64; 3])> {
     crate::context::ensure_engine_loaded()?;
+    // The requested instant is a scale-carrying `Epoch`; convert to MJD TDB
+    // once here, at the FFI boundary.
+    let epoch_mjd_tdb = epoch.mjd_tdb()?;
     let command_c = CString::new(command.as_bytes())
         .map_err(|_| Error::invalid_input(format!("command contains a NUL byte: {command}")))?;
     let cache_cstring = cache_path_to_cstring(cache_dir)?;

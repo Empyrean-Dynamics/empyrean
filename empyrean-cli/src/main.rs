@@ -117,6 +117,36 @@ impl ForceModel {
     }
 }
 
+/// Time scale for an MJD time argument. Required wherever an MJD time is
+/// given, so an old invocation that omits it fails loudly rather than being
+/// silently read as TDB (an MJD carries no scale on its own).
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum TimeScaleArg {
+    Utc,
+    Tdb,
+}
+
+impl TimeScaleArg {
+    pub fn to_empyrean(self) -> empyrean::TimeScale {
+        match self {
+            Self::Utc => empyrean::TimeScale::UTC,
+            Self::Tdb => empyrean::TimeScale::TDB,
+        }
+    }
+
+    /// Build a typed [`empyrean::Epoch`] from an MJD value in this scale.
+    pub fn epoch(self, mjd: f64) -> empyrean::Epoch {
+        empyrean::Epoch::new(mjd, self.to_empyrean())
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Utc => "utc",
+            Self::Tdb => "tdb",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum UncertaintyMethodArg {
     FirstOrder,
@@ -270,6 +300,8 @@ mod cli_tests {
             "ephemeris",
             "--epoch",
             "60000.0",
+            "--scale",
+            "tdb",
             "--compute-stm",
         ]);
         assert!(

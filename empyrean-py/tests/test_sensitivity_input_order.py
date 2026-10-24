@@ -51,7 +51,7 @@ _E0, _E1, _E2 = 61000.5, 61010.5, 61020.5
 
 def _orbit() -> CartesianOrbits:
     coords = CartesianCoordinates.from_kwargs(
-        epoch=[_IC_EPOCH],
+        epochs=Epochs.from_kwargs(mjd=[_IC_EPOCH], scale="tdb"),
         x=[_STATE["x"]],
         y=[_STATE["y"]],
         z=[_STATE["z"]],
@@ -115,8 +115,8 @@ def test_sensitivity_rows_follow_observer_input_order() -> None:
         "sensitivity rows are not in the ephemeris entries' order"
     )
     np.testing.assert_allclose(
-        sens.epoch_mjd_tdb.to_numpy(zero_copy_only=False),
-        eph.coordinates.epoch.to_numpy(zero_copy_only=False),
+        sens.epochs.mjd_tdb(),
+        eph.coordinates.epochs.mjd_tdb(),
         atol=1e-9,
         err_msg="sensitivity epochs disagree with the entry epochs row for row",
     )
@@ -125,7 +125,7 @@ def test_sensitivity_rows_follow_observer_input_order() -> None:
     # against its observer array.
     assert sens.obs_code.to_pylist() == observers.obs_code.to_pylist()
     np.testing.assert_allclose(
-        sens.epoch_mjd_tdb.to_numpy(zero_copy_only=False),
+        sens.epochs.mjd_tdb(),
         np.array([_E0, _E1, _E0, _E1, _E2]),
         atol=1e-9,
     )

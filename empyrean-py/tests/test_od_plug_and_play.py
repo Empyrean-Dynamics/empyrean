@@ -256,7 +256,7 @@ def test_non_grav_survives_propagation_refeed(apophis_fit):
     dropped on the output orbit, the two would coincide.
     """
     orbit = apophis_fit.orbit
-    epoch0 = orbit.coordinates.epoch[0].as_py()
+    epoch0 = orbit.coordinates.epochs.mjd_tdb()[0]
     targets = Epochs.from_mjd(np.array([APOPHIS_2029_MJD_TDB]), scale="tdb")
 
     # Strip the force model: same state and covariance, but A1/A2/A3 all

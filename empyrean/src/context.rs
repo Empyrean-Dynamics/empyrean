@@ -807,15 +807,18 @@ impl EarthOrientationKernelRole {
 /// name exactly what a short file was short of.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EarthOrientationCoverage {
-    /// Start of the file's Earth ITRF93 coverage (MJD TDB).
-    pub start_mjd_tdb: f64,
-    /// End of the file's Earth ITRF93 coverage (MJD TDB).
-    pub end_mjd_tdb: f64,
-    /// Latest start the role allows (MJD TDB); NaN for a role with no
-    /// start-floor requirement (predict).
-    pub required_floor_mjd_tdb: f64,
-    /// Earliest end the role allows (MJD TDB).
-    pub required_horizon_mjd_tdb: f64,
+    /// Start of the file's Earth ITRF93 coverage. Tagged
+    /// [`TimeScale::TDB`](crate::TimeScale::TDB): a kernel coverage window
+    /// has no request scale to follow, so its scale travels as data rather
+    /// than being echoed from a caller.
+    pub start: crate::Epoch,
+    /// End of the file's Earth ITRF93 coverage (TDB).
+    pub end: crate::Epoch,
+    /// Latest start the role allows (TDB); the epoch's MJD is NaN for a
+    /// role with no start-floor requirement (predict).
+    pub required_floor: crate::Epoch,
+    /// Earliest end the role allows (TDB).
+    pub required_horizon: crate::Epoch,
     /// Whether the file's coverage satisfies the role.
     pub satisfied: bool,
 }
@@ -855,10 +858,10 @@ pub fn earth_orientation_kernel_coverage(
         return Err(Error::capture(code));
     }
     Ok(EarthOrientationCoverage {
-        start_mjd_tdb: out.start_mjd_tdb,
-        end_mjd_tdb: out.end_mjd_tdb,
-        required_floor_mjd_tdb: out.required_floor_mjd_tdb,
-        required_horizon_mjd_tdb: out.required_horizon_mjd_tdb,
+        start: crate::Epoch::from_mjd_tdb(out.start_mjd_tdb),
+        end: crate::Epoch::from_mjd_tdb(out.end_mjd_tdb),
+        required_floor: crate::Epoch::from_mjd_tdb(out.required_floor_mjd_tdb),
+        required_horizon: crate::Epoch::from_mjd_tdb(out.required_horizon_mjd_tdb),
         satisfied: out.satisfied != 0,
     })
 }

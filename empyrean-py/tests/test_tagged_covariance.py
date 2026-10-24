@@ -51,7 +51,7 @@ def _diag_cov() -> np.ndarray:
 def _orbit_with_cov(orbit_id: str = "order-lock") -> CartesianOrbits:
     cov = _diag_cov()
     coords = CartesianCoordinates.from_kwargs(
-        epoch=[_T0],
+        epochs=Epochs.from_kwargs(mjd=[_T0], scale="tdb"),
         x=[2.0],
         y=[0.0],
         z=[0.0],
@@ -67,7 +67,7 @@ def _orbit_with_cov(orbit_id: str = "order-lock") -> CartesianOrbits:
 
 def _orbit_no_cov(orbit_id: str = "no-cov") -> CartesianOrbits:
     coords = CartesianCoordinates.from_kwargs(
-        epoch=[_T0],
+        epochs=Epochs.from_kwargs(mjd=[_T0], scale="tdb"),
         x=[2.0],
         y=[0.0],
         z=[0.0],
@@ -102,7 +102,7 @@ def test_tagged_covariance_aligned_and_linear() -> None:
     assert len(series) == n
 
     states = result.states.coordinates
-    state_epochs = states.epoch.to_numpy(zero_copy_only=False)
+    state_epochs = states.epochs.mjd_tdb()
     sx = states.x.to_numpy(zero_copy_only=False)
     sy = states.y.to_numpy(zero_copy_only=False)
     sz = states.z.to_numpy(zero_copy_only=False)
@@ -112,7 +112,7 @@ def test_tagged_covariance_aligned_and_linear() -> None:
 
     for k, tagged in enumerate(series):
         # Order lock: tagged epoch == state epoch.
-        assert abs(tagged.epoch_mjd_tdb - state_epochs[k]) < 1e-9
+        assert abs(float(tagged.epoch.mjd_tdb()[0]) - state_epochs[k]) < 1e-9
         # FirstOrder + no close approach ⟹ Linear.
         assert tagged.kind is CovarianceKind.LINEAR
         # Co-located nominal state matches the propagated state.
@@ -177,8 +177,14 @@ def test_tagged_covariance_multi_orbit_separable() -> None:
                         getattr(b.coordinates, col).to_numpy(zero_copy_only=False),
                     ]
                 )
-                for col in ("epoch", "x", "y", "z", "vx", "vy", "vz")
+                for col in ("x", "y", "z", "vx", "vy", "vz")
             },
+            epochs=Epochs.from_kwargs(
+                mjd=np.concatenate(
+                    [a.coordinates.epochs.mjd_tdb(), b.coordinates.epochs.mjd_tdb()]
+                ),
+                scale="tdb",
+            ),
             frame="eclipticj2000",
             origin=["Sun", "Sun"],
             covariance=CartesianCovariance.from_matrix(np.stack([_diag_cov(), _diag_cov()])),

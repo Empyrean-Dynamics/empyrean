@@ -25,7 +25,7 @@ raw FFI pointers.
 
 ```toml
 [dependencies]
-empyrean = "0.11.0-rc.0"
+empyrean = "0.11.0-rc.1"
 ```
 
 ## What it does
@@ -51,6 +51,15 @@ let result = ctx.propagate(&orbits, &epochs, &PropagationConfig::default())?;
 println!("{} states, {} events", result.states.len(), result.events.len());
 # Ok::<(), empyrean::Error>(())
 ```
+
+Every time the wrapper takes or returns is an [`Epoch`] that carries its
+scale: build one with `Epoch::from_mjd_tdb`, `Epoch::from_mjd_utc` or
+`Epoch::from_iso_utc`, and every output epoch comes back in the scale you
+asked for. Instants you supplied are echoed as your own values; instants
+the engine found (close approaches, impacts, events, rise and set) are
+converted from TDB on the way out, and orbit-determination results come
+back in UTC, the observations' scale. Files written by the `io` module
+keep their TDB `*_mjd_tdb` columns.
 
 ## Orbit determination
 
@@ -683,7 +692,7 @@ for chain in &result.mixtures {
         let retained: f64 = group.iter().map(|c| c.weight).sum();
         println!(
             "{} @ MJD {:.3}: {} components, retained weight {retained:.4}",
-            chain.orbit_id, chain.ca_epochs_mjd_tdb[k], group.len(),
+            chain.orbit_id, chain.ca_epochs[k].mjd(), group.len(),
         );
     }
 }
@@ -721,8 +730,8 @@ let orbit = empyrean::query_sbdb(&["Apophis"], None)?.orbits.remove(0);
 // mass depleting at Isp = 3000 s, steered at constant RTN angles
 // relative to the Sun. `sharpness` sets the tanh on/off transition.
 let arc = ThrustArc::new(
-    65000.0,                                                   // start_mjd_tdb
-    65010.0,                                                   // end_mjd_tdb
+    Epoch::from_mjd_tdb(65000.0),                              // start
+    Epoch::from_mjd_tdb(65010.0),                              // end
     1.0,                                                       // thrust_n (N)
     500.0,                                                     // mass_kg
     100.0,                                                     // sharpness (1/day)

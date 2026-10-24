@@ -757,8 +757,9 @@ pub enum OutputEpoch {
     /// `epoch.eq0` and find_orb's "anchor at most recent good fit"
     /// pattern.
     IODEpoch,
-    /// Explicit MJD TDB.
-    Epoch(f64),
+    /// Explicit output epoch. A scale-carrying input (same shape as a
+    /// thrust-arc time): converted to TDB once at the FFI boundary.
+    Epoch(crate::Epoch),
 }
 
 /// Origin-policy selector for the OD pipeline.
@@ -1324,6 +1325,54 @@ pub enum CovarianceTrust {
         /// The fit's solved-for width (> 6).
         solved_width: u32,
     },
+}
+
+impl TrustGateEvent {
+    /// Re-express the event epoch in `scale`. The trust event is an
+    /// engine-found instant inside the OD result, so it is handed back in
+    /// the OD result's scale (the observations' scale).
+    fn into_scale(self, scale: crate::TimeScale) -> crate::error::Result<Self> {
+        Ok(match self {
+            Self::CloseApproach {
+                body,
+                epoch,
+                distance_au,
+            } => Self::CloseApproach {
+                body,
+                epoch: epoch.to_scale(scale)?,
+                distance_au,
+            },
+            Self::HighNonlinearity {
+                epoch,
+                nonlinearity,
+                threshold,
+            } => Self::HighNonlinearity {
+                epoch: epoch.to_scale(scale)?,
+                nonlinearity,
+                threshold,
+            },
+        })
+    }
+}
+
+impl CovarianceTrust {
+    /// Re-express the trust event's epoch in `scale` (the OD result's
+    /// scale). Only [`EncounterIntervenes`](Self::EncounterIntervenes)
+    /// carries an event epoch.
+    pub(super) fn into_scale(self, scale: crate::TimeScale) -> crate::error::Result<Self> {
+        Ok(match self {
+            Self::EncounterIntervenes {
+                event,
+                solved_width,
+                second_order_recoverable,
+            } => Self::EncounterIntervenes {
+                event: event.into_scale(scale)?,
+                solved_width,
+                second_order_recoverable,
+            },
+            other => other,
+        })
+    }
 }
 
 impl CovarianceTrust {

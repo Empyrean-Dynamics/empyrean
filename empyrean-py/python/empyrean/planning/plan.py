@@ -19,7 +19,7 @@ import numpy as np
 import numpy.typing as npt
 
 from empyrean._convert import AnyOrbits, naif_to_origin
-from empyrean.coordinates.epoch import Epochs
+from empyrean.coordinates.epoch import Epochs, _require_single_epoch
 from empyrean.od.determine import _orbits_to_dict
 from empyrean.orbits.joint import _KIND_BY_CODE, CovarianceKind, PackedJoints
 from empyrean.planning.result import (
@@ -281,7 +281,7 @@ def evaluate_plan(
     ...     fit.orbit.coordinates, CartesianCoordinates, origin="SSB"
     ... )
     >>> orbit = fit.orbit.set_column("coordinates", coords)  # doctest: +SKIP
-    >>> t0 = float(coords.epoch.to_numpy()[0])  # doctest: +SKIP
+    >>> t0 = float(coords.epochs.mjd_tdb()[0])  # doctest: +SKIP
     >>> plan = evaluate_plan(  # doctest: +SKIP
     ...     orbit,
     ...     [
@@ -462,15 +462,15 @@ def evaluate_plan(
 
 def compute_visibility(
     orbits: AnyOrbits,
-    start: float,
-    end: float,
+    start: Epochs,
+    end: Epochs,
     step_days: float,
     config: PlanningConfig | None = None,
 ) -> VisibilityResult:
     """Survey when and whether each orbit is observable from a set of sites.
 
     For every orbit in ``orbits`` and every observatory in
-    ``config.observatories``, step across ``[start, end]`` (MJD TDB) on a
+    ``config.observatories``, step across the ``[start, end]`` window on a
     ``step_days`` grid and report:
 
     - the per-epoch :class:`~empyrean.VisibilityPoints` (the four
@@ -494,8 +494,13 @@ def compute_visibility(
     orbits : Orbits
         One or more orbits to survey. Each is surveyed independently; the
         result tables carry its ``orbit_id``.
-    start, end : float
-        Survey window, MJD TDB.
+    start, end : Epochs
+        Survey window, each a single-row :class:`~empyrean.Epochs` table.
+        Both carry the same scale: build them with
+        ``Epochs.from_mjd(value, scale="utc")`` (or ``scale="tdb"``), and a
+        bare float is refused, as it carries no time scale. The result
+        tables (points, windows, twilight and anchor epochs) come back in
+        the window's scale.
     step_days : float
         Grid step in days; each twilight / midnight / transit epoch is
         refined by bisection off this grid to one second.
@@ -521,6 +526,18 @@ def compute_visibility(
         code, or a propagation failure.
     """
     from empyrean._empyrean_rs import _compute_visibility
+
+    # The window is a scale-carrying input, the same form the impact
+    # end_epoch uses: coerce each endpoint to MJD TDB for the engine and
+    # read the request scale off it. One window carries one scale.
+    start_mjd_tdb = _require_single_epoch(start, "compute_visibility() start")
+    end_mjd_tdb = _require_single_epoch(end, "compute_visibility() end")
+    window_scale = start.scale
+    if end.scale != window_scale:
+        raise ValueError(
+            f"compute_visibility(): the window start scale {window_scale!r} and end "
+            f"scale {end.scale!r} must match. One window carries one scale."
+        )
 
     if config is None:
         config = PlanningConfig()
@@ -552,8 +569,8 @@ def compute_visibility(
         out: ResultDict = _compute_visibility(
             orbit_dict,
             config_wire,
-            float(start),
-            float(end),
+            start_mjd_tdb,
+            end_mjd_tdb,
             float(step_days),
             None,
         )
@@ -583,10 +600,16 @@ def compute_visibility(
         # or None per anchor), joined positionally to the anchor rows.
         anchor_joint_wires.extend(out["anchor_joints"])
 
+    def _win_epochs(mjd: Any) -> Epochs:
+        # Planning epochs are engine-found instants within the window (grid
+        # points, twilight, transits, anchors): return them in the window's
+        # request scale rather than TDB. Nulls (absent anchors) round-trip.
+        return Epochs.from_kwargs(mjd=mjd, scale="tdb").to_scale(window_scale)
+
     points = VisibilityPoints.from_kwargs(
         orbit_id=point_cols.get("orbit_id", []),
         obs_code=point_cols.get("obs_code", []),
-        epoch_mjd_tdb=point_cols.get("epoch", []),
+        epochs=_win_epochs(point_cols.get("epoch", [])),
         solar_elongation_deg=point_cols.get("solar_elongation_deg", []),
         elevation_deg=_nan_to_null(
             np.asarray(point_cols.get("elevation_deg", []), dtype=np.float64)
@@ -616,8 +639,8 @@ def compute_visibility(
         orbit_id=window_cols.get("orbit_id", []),
         obs_code=window_cols.get("obs_code", []),
         night_index=np.asarray(window_cols.get("night_index", []), dtype=np.int64),
-        start_epoch_mjd_tdb=window_cols.get("start_epoch", []),
-        end_epoch_mjd_tdb=window_cols.get("end_epoch", []),
+        start_epochs=_win_epochs(window_cols.get("start_epoch", [])),
+        end_epochs=_win_epochs(window_cols.get("end_epoch", [])),
         peak_elongation_deg=window_cols.get("peak_elongation_deg", []),
         brightest_mag=_nan_to_null(
             np.asarray(window_cols.get("brightest_mag", []), dtype=np.float64)
@@ -626,8 +649,8 @@ def compute_visibility(
         max_altitude_deg=_nan_to_null(
             np.asarray(window_cols.get("max_altitude_deg", []), dtype=np.float64)
         ),
-        max_altitude_epoch_mjd_tdb=_nan_to_null(
-            np.asarray(window_cols.get("max_altitude_epoch", []), dtype=np.float64)
+        max_altitude_epochs=_win_epochs(
+            _nan_to_null(np.asarray(window_cols.get("max_altitude_epoch", []), dtype=np.float64))
         ),
         closing_gate=window_cols.get("closing_gate", []),
     )
@@ -639,31 +662,35 @@ def compute_visibility(
         local_date_year=np.asarray(night_cols.get("year", []), dtype=np.int64),
         local_date_month=np.asarray(night_cols.get("month", []), dtype=np.int64),
         local_date_day=np.asarray(night_cols.get("day", []), dtype=np.int64),
-        noon_start_mjd_tdb=night_cols.get("noon_start", []),
-        noon_end_mjd_tdb=night_cols.get("noon_end", []),
-        sunset_mjd_tdb=_nan_to_null(np.asarray(night_cols.get("sunset", []), dtype=np.float64)),
-        civil_dusk_mjd_tdb=_nan_to_null(
-            np.asarray(night_cols.get("civil_dusk", []), dtype=np.float64)
+        noon_start_epochs=_win_epochs(night_cols.get("noon_start", [])),
+        noon_end_epochs=_win_epochs(night_cols.get("noon_end", [])),
+        sunset_epochs=_win_epochs(
+            _nan_to_null(np.asarray(night_cols.get("sunset", []), dtype=np.float64))
         ),
-        nautical_dusk_mjd_tdb=_nan_to_null(
-            np.asarray(night_cols.get("nautical_dusk", []), dtype=np.float64)
+        civil_dusk_epochs=_win_epochs(
+            _nan_to_null(np.asarray(night_cols.get("civil_dusk", []), dtype=np.float64))
         ),
-        astronomical_dusk_mjd_tdb=_nan_to_null(
-            np.asarray(night_cols.get("astronomical_dusk", []), dtype=np.float64)
+        nautical_dusk_epochs=_win_epochs(
+            _nan_to_null(np.asarray(night_cols.get("nautical_dusk", []), dtype=np.float64))
         ),
-        local_solar_midnight_mjd_tdb=_nan_to_null(
-            np.asarray(night_cols.get("local_solar_midnight", []), dtype=np.float64)
+        astronomical_dusk_epochs=_win_epochs(
+            _nan_to_null(np.asarray(night_cols.get("astronomical_dusk", []), dtype=np.float64))
         ),
-        astronomical_dawn_mjd_tdb=_nan_to_null(
-            np.asarray(night_cols.get("astronomical_dawn", []), dtype=np.float64)
+        local_solar_midnight_epochs=_win_epochs(
+            _nan_to_null(np.asarray(night_cols.get("local_solar_midnight", []), dtype=np.float64))
         ),
-        nautical_dawn_mjd_tdb=_nan_to_null(
-            np.asarray(night_cols.get("nautical_dawn", []), dtype=np.float64)
+        astronomical_dawn_epochs=_win_epochs(
+            _nan_to_null(np.asarray(night_cols.get("astronomical_dawn", []), dtype=np.float64))
         ),
-        civil_dawn_mjd_tdb=_nan_to_null(
-            np.asarray(night_cols.get("civil_dawn", []), dtype=np.float64)
+        nautical_dawn_epochs=_win_epochs(
+            _nan_to_null(np.asarray(night_cols.get("nautical_dawn", []), dtype=np.float64))
         ),
-        sunrise_mjd_tdb=_nan_to_null(np.asarray(night_cols.get("sunrise", []), dtype=np.float64)),
+        civil_dawn_epochs=_win_epochs(
+            _nan_to_null(np.asarray(night_cols.get("civil_dawn", []), dtype=np.float64))
+        ),
+        sunrise_epochs=_win_epochs(
+            _nan_to_null(np.asarray(night_cols.get("sunrise", []), dtype=np.float64))
+        ),
         note=night_cols.get("note", []),
     )
 
@@ -672,7 +699,9 @@ def compute_visibility(
         obs_code=anchor_cols.get("obs_code", []),
         night_index=np.asarray(anchor_cols.get("night_index", []), dtype=np.int64),
         policy=anchor_cols.get("policy", []),
-        epoch_mjd_tdb=_nan_to_null(np.asarray(anchor_cols.get("epoch", []), dtype=np.float64)),
+        epochs=_win_epochs(
+            _nan_to_null(np.asarray(anchor_cols.get("epoch", []), dtype=np.float64))
+        ),
         observable=anchor_cols.get("observable", []),
         altitude_deg=_nan_to_null(
             np.asarray(anchor_cols.get("altitude_deg", []), dtype=np.float64)

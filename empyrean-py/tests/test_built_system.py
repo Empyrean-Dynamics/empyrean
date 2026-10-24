@@ -33,7 +33,7 @@ from empyrean.orbits.orbits import CartesianOrbits
 def _orbit() -> CartesianOrbits:
     """A gravity-only heliocentric ICRF Cartesian orbit (AU, AU/day)."""
     coords = CartesianCoordinates.from_kwargs(
-        epoch=[59000.0],
+        epochs=Epochs.from_kwargs(mjd=[59000.0], scale="tdb"),
         x=[1.0],
         y=[0.1],
         z=[0.05],

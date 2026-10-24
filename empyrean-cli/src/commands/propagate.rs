@@ -30,9 +30,15 @@ pub struct PropagateArgs {
     #[arg(long, conflicts_with = "object_ids")]
     pub input: Option<PathBuf>,
 
-    /// Target epoch (MJD TDB).
+    /// Target epoch (MJD), interpreted in the scale given by `--scale`.
     #[arg(long)]
     pub epoch: f64,
+
+    /// Time scale of `--epoch` (`utc` or `tdb`). Required: an MJD carries no
+    /// scale, so it is stated rather than assumed (an invocation without it
+    /// fails loudly instead of being read as TDB).
+    #[arg(long, value_enum)]
+    pub scale: crate::TimeScaleArg,
 
     /// Force model tier.
     #[arg(long, default_value = "standard")]
@@ -58,9 +64,11 @@ pub struct PropagateArgs {
 
     /// Path to a JSON thrust file describing continuous-thrust arcs
     /// (finite burns / low-thrust). Applied to every orbit in the batch.
-    /// Schema: `{ "arcs": [{ "start_mjd_tdb", "end_mjd_tdb", "thrust_n",
+    /// Schema: `{ "arcs": [{ "start_mjd", "end_mjd", "scale", "thrust_n",
     /// "mass_kg", "isp_s"?, "steering", "sharpness", "central_body" }],
-    /// "dv_corrections"?, "correction_covariances"? }`. `steering` is
+    /// "dv_corrections"? }`. `scale` is `"utc"` or `"tdb"`. An MJD carries
+    /// no scale, so it is stated and the arc times convert to TDB once at
+    /// the FFI boundary. `steering` is
     /// `{ "type": "constant_rtn", "alpha_rad", "beta_rad" }`,
     /// `{ "type": "velocity_tangent" }`, or `{ "type": "inertial_fixed",
     /// "direction": [x, y, z] }`; `central_body` is a NAIF body code
@@ -131,6 +139,14 @@ pub fn run(data: &DataOptions, args: PropagateArgs) -> Result<()> {
         .validate()
         .context("--no-events is not compatible with this --uncertainty-method")?;
 
+    // The requested target instant, in the caller's scale; convert to MJD
+    // TDB once here at the CLI boundary (the daemon wire and the engine are
+    // TDB).
+    let target = args.scale.epoch(args.epoch);
+    let epoch_mjd_tdb = target
+        .mjd_tdb()
+        .context("could not interpret --epoch in the given --scale")?;
+
     // Try daemon first — but only when neither the tagged-covariance
     // readback nor a thrust file is requested, and only when the caller
     // did not ask for a strict-offline context. The daemon protocol
@@ -148,7 +164,7 @@ pub fn run(data: &DataOptions, args: PropagateArgs) -> Result<()> {
         let request = crate::daemon::protocol::Request::Propagate {
             object_ids: args.object_ids.clone(),
             input_path: args.input.as_ref().map(|p| p.display().to_string()),
-            epoch: args.epoch,
+            epoch: epoch_mjd_tdb,
             force_model: args.force_model.as_str().to_string(),
             uncertainty_method: args.uncertainty_method.as_str().to_string(),
             out_dir: args.out_dir.display().to_string(),
@@ -197,11 +213,7 @@ pub fn run(data: &DataOptions, args: PropagateArgs) -> Result<()> {
     );
     let t1 = Instant::now();
     let result = ctx
-        .propagate(
-            &batch.orbits,
-            &[empyrean::Epoch::from_mjd_tdb(args.epoch)],
-            &config,
-        )
+        .propagate(&batch.orbits, &[target], &config)
         .map_err(crate::commands::with_orbit_context)
         .context("propagation failed")?;
     eprintln!("Propagation complete ({:.1}s)", t1.elapsed().as_secs_f64());
@@ -530,7 +542,15 @@ mod tests {
             args: PropagateArgs,
         }
 
-        let base = ["propagate", "--epoch", "61000", "--out-dir", "/tmp/x"];
+        let base = [
+            "propagate",
+            "--epoch",
+            "61000",
+            "--scale",
+            "tdb",
+            "--out-dir",
+            "/tmp/x",
+        ];
         let on = Harness::parse_from(base).args;
         assert!(
             propagation_config(&on).events.detection_enabled,
@@ -561,7 +581,15 @@ mod tests {
                 #[command(flatten)]
                 args: PropagateArgs,
             }
-            let mut argv = vec!["propagate", "--epoch", "61000", "--out-dir", "/tmp/x"];
+            let mut argv = vec![
+                "propagate",
+                "--epoch",
+                "61000",
+                "--scale",
+                "tdb",
+                "--out-dir",
+                "/tmp/x",
+            ];
             if no_events {
                 argv.push("--no-events");
             }
@@ -597,7 +625,15 @@ mod tests {
             args: PropagateArgs,
         }
         let parse = |extra: &[&str]| {
-            let mut argv = vec!["propagate", "--epoch", "61000", "--out-dir", "/tmp/x"];
+            let mut argv = vec![
+                "propagate",
+                "--epoch",
+                "61000",
+                "--scale",
+                "tdb",
+                "--out-dir",
+                "/tmp/x",
+            ];
             argv.extend_from_slice(extra);
             Harness::parse_from(argv).args
         };

@@ -34,7 +34,8 @@ def _residuals_to_dict(residuals: ObservationResults) -> dict[str, Any]:
         "object_ids": _s("object_id"),
         "obs_codes": _s("obs_code"),
         "ast_cats": _s("ast_cat"),
-        "epochs": _f("epoch_mjd_tdb"),
+        # On-disk flat form is MJD TDB (parquet column `epoch_mjd_tdb`).
+        "epochs": residuals.epochs.mjd_tdb(),
         # ── Core residuals ──
         "ra_residuals_arcsec": _f("ra_residual"),
         "dec_residuals_arcsec": _f("dec_residual"),

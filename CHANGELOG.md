@@ -27,6 +27,38 @@ so the installed skill documents the version `pip install empyrean`
 installs; the plugin folder gains the README that Anthropic's plugin
 directory shows as the listing.
 
+**Time scales.** Every time the distribution returns now carries its
+scale as data, and results come back in the scale the caller supplied.
+In Python every time-bearing column is an `Epochs` sub-table (`mjd` plus
+a table-level `scale`): a table's primary time column is `epochs` and any
+other is `<role>_epochs` (`start_epochs`, `ca_epochs`, `perihelion_epochs`
+and so on); one table carries one scale, and a mismatch is refused by
+name. The Rust wrapper returns `Epoch` values in the request scale.
+Requested instants are echoed as the caller's own values; instants the
+engine found (close approaches, impacts, events, rise and set, twilight,
+the trust-gate event) are converted from TDB once, at the FFI boundary.
+Orbit-determination results follow the observations, so residuals, the
+fitted orbit's epoch and the trust-gate event come back in UTC.
+
+Inputs follow the same rule with identical names in Rust, Python and the
+CLI. Python: `CometaryCoordinates.tp` becomes the `perihelion_epochs`
+sub-table; `ThrustArc(start_mjd, end_mjd, scale)`; `compute_visibility`
+takes `start` and `end` as `Epochs`; `PlannedObservation.epoch`,
+`explicit_anchor_utc`, `OutputEpoch.epoch`, the weighting layer's
+`start_epoch` and `end_epoch`, `query_horizons_vectors(epoch)`,
+`TaggedCovariance.epoch` and `TrustGateEvent.epoch` are `Epochs`;
+`Epochs.empty` takes a scale. Rust: `MixtureChain.ca_epochs: Vec<Epoch>`
+replaces `ca_epochs_mjd_tdb`; `OutputEpoch::Epoch(Epoch)`;
+`WeightingLayer` `start_epoch` and `end_epoch` are `Option<Epoch>`;
+`query_horizons` and `query_horizons_vectors` take `Epoch` values. CLI:
+an MJD argument requires `--scale {utc,tdb}`; JSON thrust arcs carry
+`start_mjd`, `end_mjd` and `scale`; `query horizons-vectors` takes
+`--epoch` with `--scale`. The C ABI gains the constants
+`EMPYREAN_TIME_SCALE_UTC` and `EMPYREAN_TIME_SCALE_TDB` and is otherwise
+unchanged. File and stdout outputs are still written in TDB with
+`epoch_mjd_tdb` columns, and the error-location diagnostic keeps its
+TDB-named epoch.
+
 ## [0.11.0-rc.0] — 2026-10-18
 
 **Validation.** On this candidate the orbit-determination family (354

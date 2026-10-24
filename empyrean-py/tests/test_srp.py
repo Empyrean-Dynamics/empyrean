@@ -58,7 +58,7 @@ _STATE = {"epoch": 60000.0, "x": 1.2, "y": -0.3, "z": 0.05, "vx": 0.004, "vy": 0
 
 def _coords(n: int = 1) -> CartesianCoordinates:
     return CartesianCoordinates.from_kwargs(
-        epoch=[_STATE["epoch"]] * n,
+        epochs=Epochs.from_kwargs(mjd=[_STATE["epoch"]] * n, scale="tdb"),
         x=[_STATE["x"] + 0.01 * i for i in range(n)],
         y=[_STATE["y"]] * n,
         z=[_STATE["z"]] * n,

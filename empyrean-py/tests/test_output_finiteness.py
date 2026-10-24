@@ -68,7 +68,7 @@ def _orbit_with_covariance() -> CartesianOrbits:
         orbit_id=["contract"],
         object_id=["contract"],
         coordinates=CartesianCoordinates.from_kwargs(
-            epoch=np.array([_EPOCH_MJD_TDB]),
+            epochs=Epochs.from_kwargs(mjd=np.array([_EPOCH_MJD_TDB]), scale="tdb"),
             x=[1.6],
             y=[0.1],
             z=[0.02],
@@ -92,7 +92,7 @@ def test_ephemeris_uncertainty_covariance_is_finite(orbit: CartesianOrbits) -> N
     """A covariance-bearing orbit must yield a FINITE sky covariance on
     every ephemeris row — never all-NaN. This is the exact regression
     v0.9.0-rc.0 shipped."""
-    t0 = float(orbit.coordinates.epoch.to_numpy()[0])
+    t0 = float(orbit.coordinates.epochs.mjd_tdb()[0])
     observers = empyrean.get_observer_states(
         ["500"], Epochs.from_mjd(np.array([t0, t0 + 30.0, t0 + 365.0]), scale="tdb")
     )
@@ -115,7 +115,7 @@ def test_propagate_covariance_is_finite(orbit: CartesianOrbits) -> None:
     stays finite. Kept alongside the ephemeris check so the two analytic
     covariance surfaces are guarded together — if a future change breaks
     the shared machinery, both fail, localizing the regression."""
-    t0 = float(orbit.coordinates.epoch.to_numpy()[0])
+    t0 = float(orbit.coordinates.epochs.mjd_tdb()[0])
     result = empyrean.propagate(
         orbit,
         Epochs.from_mjd(np.array([t0, t0 + 30.0, t0 + 365.0]), scale="tdb"),
@@ -137,7 +137,7 @@ def _barycentric_orbit() -> CartesianOrbits:
     """
     cov6 = np.diag([1e-14, 1e-14, 1e-14, 1e-18, 1e-18, 1e-18])
     coords = CartesianCoordinates.from_kwargs(
-        epoch=np.array([_EPOCH_MJD_TDB]),
+        epochs=Epochs.from_kwargs(mjd=np.array([_EPOCH_MJD_TDB]), scale="tdb"),
         x=[1.6],
         y=[0.1],
         z=[0.02],
@@ -169,9 +169,11 @@ def test_plan_prior_and_posterior_metrics_are_finite() -> None:
     plan = empyrean.evaluate_plan(
         _barycentric_orbit(),
         [
-            empyrean.PlannedObservation.optical(_EPOCH_MJD_TDB + 10.0, "F51", (0.2, 0.2)),
+            empyrean.PlannedObservation.optical(
+                Epochs.from_mjd(_EPOCH_MJD_TDB + 10.0, scale="tdb"), "F51", (0.2, 0.2)
+            ),
             empyrean.PlannedObservation.radar(
-                _EPOCH_MJD_TDB + 15.0,
+                Epochs.from_mjd(_EPOCH_MJD_TDB + 15.0, scale="tdb"),
                 radar_bandwidth_hz=1.0e5,
                 radar_freq_resolution_hz=0.1,
                 radar_snr=50.0,
@@ -240,8 +242,12 @@ def test_plan_candidate_metrics_are_finite() -> None:
     plan = empyrean.evaluate_plan(
         _barycentric_orbit(),
         [
-            empyrean.PlannedObservation.optical(_EPOCH_MJD_TDB + 10.0, "F51", (0.2, 0.2)),
-            empyrean.PlannedObservation.optical(_EPOCH_MJD_TDB + 11.0, "568", (0.3, 0.3)),
+            empyrean.PlannedObservation.optical(
+                Epochs.from_mjd(_EPOCH_MJD_TDB + 10.0, scale="tdb"), "F51", (0.2, 0.2)
+            ),
+            empyrean.PlannedObservation.optical(
+                Epochs.from_mjd(_EPOCH_MJD_TDB + 11.0, scale="tdb"), "568", (0.3, 0.3)
+            ),
         ],
     )
     for column in (

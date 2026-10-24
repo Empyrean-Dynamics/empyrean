@@ -645,6 +645,20 @@ pub const EMPYREAN_DATA_TIER_STANDARD: i32 = 3;
 /// the reason rather than a silent downgrade to Standard.
 pub const EMPYREAN_DATA_TIER_FULL: i32 = 4;
 
+/// Time scale tag for `empyrean_iso_to_mjd` / `empyrean_mjd_to_iso`:
+/// Coordinated Universal Time (civil time, with leap seconds).
+///
+/// The public scale set is closed to `{UTC, TDB}` and the integer
+/// contract is pinned: `0` is UTC, `1` is TDB
+/// ([`EMPYREAN_TIME_SCALE_TDB`]). A scale integer is mapped by explicit
+/// match, never cast, so an unknown value is a named error rather than a
+/// silent reinterpretation.
+pub const EMPYREAN_TIME_SCALE_UTC: i32 = 0;
+/// Time scale tag: Barycentric Dynamical Time, the scale every epoch the
+/// engine computes is expressed in, with no leap seconds. See
+/// [`EMPYREAN_TIME_SCALE_UTC`].
+pub const EMPYREAN_TIME_SCALE_TDB: i32 = 1;
+
 /// Options for [`empyrean_context_from_data_dir_with`].
 ///
 /// `memset(0)` — or passing a `NULL` pointer instead of the struct —

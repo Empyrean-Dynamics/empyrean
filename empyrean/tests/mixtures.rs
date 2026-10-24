@@ -150,7 +150,7 @@ fn gaussian_mixture_retains_components_through_an_earth_encounter() {
 
     let chain = &result.mixtures[0];
     assert_eq!(
-        chain.ca_epochs_mjd_tdb.len(),
+        chain.ca_epochs.len(),
         chain.components.len(),
         "the epoch list and the component groups are index-aligned"
     );
@@ -163,7 +163,7 @@ fn gaussian_mixture_retains_components_through_an_earth_encounter() {
 
     let mut total_components = 0usize;
     for (k, group) in chain.components.iter().enumerate() {
-        let t = chain.ca_epochs_mjd_tdb[k];
+        let t = chain.ca_epochs[k].mjd();
         assert!(
             (T0_MJD..=T1_MJD).contains(&t),
             "retained CA epoch {t} must lie inside the propagation span"
@@ -249,7 +249,7 @@ fn mixture_chains_are_positional_and_first_order_yields_empty_chains() {
     );
     for chain in &fo.mixtures {
         assert!(
-            chain.ca_epochs_mjd_tdb.is_empty() && chain.components.is_empty(),
+            chain.ca_epochs.is_empty() && chain.components.is_empty(),
             "FirstOrder retains no mixture components"
         );
     }
@@ -301,7 +301,7 @@ fn a_covariance_less_batch_still_yields_one_empty_chain_per_orbit() {
         );
         for (i, chain) in result.mixtures.iter().enumerate() {
             assert!(
-                chain.ca_epochs_mjd_tdb.is_empty() && chain.components.is_empty(),
+                chain.ca_epochs.is_empty() && chain.components.is_empty(),
                 "{label}: chain {i} must be empty — nothing split"
             );
         }

@@ -35,7 +35,7 @@ def _ephemeris_to_dict(eph: Ephemeris) -> dict[str, list[str] | FloatArray]:
         "orbit_ids": eph.orbit_id.to_pylist(),
         "obs_codes": eph.obs_code.to_pylist(),
         "cov_kind": cov_kind_codes,
-        "epoch_mjd_tdb": np.asarray(coords.epoch.to_numpy(zero_copy_only=False)),
+        "epoch_mjd_tdb": coords.epochs.mjd_tdb(),
         "ra_deg": np.asarray(coords.lon.to_numpy(zero_copy_only=False)),
         "dec_deg": np.asarray(coords.lat.to_numpy(zero_copy_only=False)),
         "rho_au": np.asarray(coords.rho.to_numpy(zero_copy_only=False)),

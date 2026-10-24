@@ -60,7 +60,7 @@ def _orbit(*, with_covariance: bool, delta: np.ndarray | None = None) -> Cartesi
     if delta is not None:
         state = state + delta
     kwargs = {
-        "epoch": [_STATE["epoch"]],
+        "epochs": Epochs.from_kwargs(mjd=[_STATE["epoch"]], scale="tdb"),
         "x": [state[0]],
         "y": [state[1]],
         "z": [state[2]],

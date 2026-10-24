@@ -16,6 +16,7 @@ import pyarrow.compute as pc
 import quivr as qv
 
 from empyrean.coordinates.enums import Origin
+from empyrean.coordinates.epoch import Epochs
 
 if TYPE_CHECKING:
     from typing import Protocol
@@ -58,7 +59,7 @@ class EventSummary(qv.Table):
     object_id = qv.LargeStringColumn(nullable=True)
     event_type = qv.LargeStringColumn()
     body = qv.LargeStringColumn()
-    epoch = qv.Float64Column()  # MJD TDB
+    epochs = Epochs.as_column()
 
 
 # ── Close approaches ────────────────────────────────────────
@@ -70,7 +71,7 @@ class CloseApproachStarts(qv.Table):
     orbit_id = qv.LargeStringColumn()
     object_id = qv.LargeStringColumn(nullable=True)
     body = qv.LargeStringColumn()
-    epoch = qv.Float64Column()
+    epochs = Epochs.as_column()
     distance_au = qv.Float64Column()
     distance_km = qv.Float64Column()
 
@@ -81,7 +82,7 @@ class CloseApproachEnds(qv.Table):
     orbit_id = qv.LargeStringColumn()
     object_id = qv.LargeStringColumn(nullable=True)
     body = qv.LargeStringColumn()
-    epoch = qv.Float64Column()
+    epochs = Epochs.as_column()
     distance_au = qv.Float64Column()
     distance_km = qv.Float64Column()
 
@@ -95,7 +96,7 @@ class Periapses(qv.Table):
     orbit_id = qv.LargeStringColumn()
     object_id = qv.LargeStringColumn(nullable=True)
     body = qv.LargeStringColumn()
-    epoch = qv.Float64Column()
+    epochs = Epochs.as_column()
     distance_au = qv.Float64Column()
     distance_km = qv.Float64Column()
     relative_velocity_au_day = qv.Float64Column()
@@ -122,7 +123,7 @@ class Impacts(qv.Table):
     orbit_id = qv.LargeStringColumn()
     object_id = qv.LargeStringColumn(nullable=True)
     body = qv.LargeStringColumn()
-    epoch = qv.Float64Column()
+    epochs = Epochs.as_column()
     latitude_deg = qv.Float64Column(nullable=True)
     longitude_deg = qv.Float64Column(nullable=True)
     altitude_km = qv.Float64Column(nullable=True)
@@ -138,7 +139,7 @@ class PossibleImpacts(qv.Table):
     orbit_id = qv.LargeStringColumn()
     object_id = qv.LargeStringColumn(nullable=True)
     body = qv.LargeStringColumn()
-    epoch = qv.Float64Column()
+    epochs = Epochs.as_column()
     miss_distance_au = qv.Float64Column()
     miss_distance_km = qv.Float64Column()
     effective_radius_au = qv.Float64Column()
@@ -170,7 +171,7 @@ class AtmosphericEntries(qv.Table):
     orbit_id = qv.LargeStringColumn()
     object_id = qv.LargeStringColumn(nullable=True)
     body = qv.LargeStringColumn()
-    epoch = qv.Float64Column()
+    epochs = Epochs.as_column()
     distance_au = qv.Float64Column()
     altitude_km = qv.Float64Column(nullable=True)
     relative_velocity_au_day = qv.Float64Column(nullable=True)
@@ -184,7 +185,7 @@ class AtmosphericExits(qv.Table):
     orbit_id = qv.LargeStringColumn()
     object_id = qv.LargeStringColumn(nullable=True)
     body = qv.LargeStringColumn()
-    epoch = qv.Float64Column()
+    epochs = Epochs.as_column()
     distance_au = qv.Float64Column()
 
 
@@ -197,7 +198,7 @@ class CaptureStarts(qv.Table):
     orbit_id = qv.LargeStringColumn()
     object_id = qv.LargeStringColumn(nullable=True)
     body = qv.LargeStringColumn()
-    epoch = qv.Float64Column()
+    epochs = Epochs.as_column()
     distance_au = qv.Float64Column()
     distance_km = qv.Float64Column()
     relative_velocity_au_day = qv.Float64Column()
@@ -214,7 +215,7 @@ class CaptureEnds(qv.Table):
     orbit_id = qv.LargeStringColumn()
     object_id = qv.LargeStringColumn(nullable=True)
     body = qv.LargeStringColumn()
-    epoch = qv.Float64Column()
+    epochs = Epochs.as_column()
     distance_au = qv.Float64Column()
     distance_km = qv.Float64Column()
     relative_velocity_au_day = qv.Float64Column()
@@ -235,7 +236,7 @@ class ShadowEntries(qv.Table):
     orbit_id = qv.LargeStringColumn()
     object_id = qv.LargeStringColumn(nullable=True)
     body = qv.LargeStringColumn()
-    epoch = qv.Float64Column()
+    epochs = Epochs.as_column()
     shadow_fraction = qv.Float64Column()
     illumination = qv.Float64Column()
 
@@ -246,7 +247,7 @@ class ShadowExits(qv.Table):
     orbit_id = qv.LargeStringColumn()
     object_id = qv.LargeStringColumn(nullable=True)
     body = qv.LargeStringColumn()
-    epoch = qv.Float64Column()
+    epochs = Epochs.as_column()
     shadow_fraction = qv.Float64Column()
     illumination = qv.Float64Column()
 
@@ -268,7 +269,7 @@ class CovarianceRegimeChanges(qv.Table):
     orbit_id = qv.LargeStringColumn()
     object_id = qv.LargeStringColumn(nullable=True)
     body = qv.LargeStringColumn(nullable=True)
-    epoch = qv.Float64Column()
+    epochs = Epochs.as_column()
     previous_kind = qv.LargeStringColumn(nullable=True)
     resolved_kind = qv.LargeStringColumn(nullable=True)
     kappa = qv.Float64Column(nullable=True)

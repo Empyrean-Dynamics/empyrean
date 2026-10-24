@@ -111,10 +111,12 @@ pub enum WeightingLayer {
         obs_code: String,
         /// 1σ (RA·cos(δ), Dec) in arcseconds.
         sigma: [f64; 2],
-        /// Start of applicable time range (MJD TDB). `None` = unbounded.
-        start_epoch_mjd_tdb: Option<f64>,
-        /// End of applicable time range (MJD TDB). `None` = unbounded.
-        end_epoch_mjd_tdb: Option<f64>,
+        /// Start of the applicable time range, a scale-carrying input
+        /// (converted to TDB at the FFI). `None` = unbounded.
+        start_epoch: Option<crate::Epoch>,
+        /// End of the applicable time range (converted to TDB at the FFI).
+        /// `None` = unbounded.
+        end_epoch: Option<crate::Epoch>,
         /// Scale factor on the final weight. Default 1.0.
         scale: f64,
         /// Per-station error **law**, or `None` to inherit the global
@@ -239,8 +241,8 @@ pub(super) fn weighting_layer_to_ffi(
         WeightingLayer::ObservatoryRule {
             obs_code,
             sigma,
-            start_epoch_mjd_tdb,
-            end_epoch_mjd_tdb,
+            start_epoch,
+            end_epoch,
             scale,
             noise_model,
         } => {
@@ -269,8 +271,18 @@ pub(super) fn weighting_layer_to_ffi(
             }
             ffi.sigma_ra_arcsec = sigma[0];
             ffi.sigma_dec_arcsec = sigma[1];
-            ffi.start_epoch_mjd_tdb = start_epoch_mjd_tdb.unwrap_or(f64::NAN);
-            ffi.end_epoch_mjd_tdb = end_epoch_mjd_tdb.unwrap_or(f64::NAN);
+            // Scale-carrying time range → TDB at the FFI; `None` stays
+            // unbounded (NaN sentinel).
+            ffi.start_epoch_mjd_tdb = start_epoch
+                .as_ref()
+                .map(|e| e.mjd_tdb())
+                .transpose()?
+                .unwrap_or(f64::NAN);
+            ffi.end_epoch_mjd_tdb = end_epoch
+                .as_ref()
+                .map(|e| e.mjd_tdb())
+                .transpose()?
+                .unwrap_or(f64::NAN);
             ffi.scale = *scale;
             // Per-station error law: a presence flag guards it so a rule
             // that sets no law INHERITS the global one rather than forcing
@@ -353,8 +365,8 @@ mod noise_model_tests {
         let layer = WeightingLayer::ObservatoryRule {
             obs_code: "F51".to_string(),
             sigma: [0.2, 0.2],
-            start_epoch_mjd_tdb: None,
-            end_epoch_mjd_tdb: None,
+            start_epoch: None,
+            end_epoch: None,
             scale: 1.0,
             noise_model: Some(NoiseModel::StudentT { nu: 4.0 }),
         };
@@ -371,8 +383,8 @@ mod noise_model_tests {
         let inherit = WeightingLayer::ObservatoryRule {
             obs_code: "F51".to_string(),
             sigma: [0.2, 0.2],
-            start_epoch_mjd_tdb: None,
-            end_epoch_mjd_tdb: None,
+            start_epoch: None,
+            end_epoch: None,
             scale: 1.0,
             noise_model: None,
         };

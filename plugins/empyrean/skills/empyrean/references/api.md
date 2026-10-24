@@ -15,7 +15,7 @@
 ## I/O helpers
 `query_sbdb(names, cache_dir=…)`
 `query_horizons(names, observer, epochs, cache_dir=…)`
-`query_horizons_vectors(command, epoch_mjd_tdb, cache_dir=…)`
+`query_horizons_vectors(command, epoch, cache_dir=…)`
 `query_observations(designations, cache_dir=…)`
 `query_radar(designations, cache_dir=…)`
 `read_ades(path_or_string)`
@@ -28,7 +28,7 @@
 ## Coordinates & orbits
 `CartesianCoordinates` (11 methods) — Cartesian state vectors.
 `KeplerianCoordinates` (10 methods) — Keplerian orbital elements.
-`CometaryCoordinates` (10 methods) — Cometary orbital elements.
+`CometaryCoordinates` (11 methods) — Cometary orbital elements.
 `SphericalCoordinates` (9 methods) — Spherical coordinates (topocentric / observer-centric).
 `CartesianCovariance` (24 methods) — Covariance matrix for Cartesian state [x, y, z, vx, vy, vz].
 `KeplerianCovariance` (24 methods) — Covariance matrix for Keplerian elements [a, e, i, raan, ap, ma].
@@ -74,18 +74,18 @@
 `MonteCarlo` — Monte Carlo sampling.
 `EventConfig` — Configuration for event detection during propagation.
 `Events` (count_by_type, select_orbit) — All events detected during propagation, grouped by type.
-`EventSummary` (body, epoch, event_type, object_id, orbit_id) — One-row-per-event summary across all event types.
-`CloseApproachStarts` (body, distance_au, distance_km, epoch, object_id, orbit_id) — Close approach zone entry events.
-`CloseApproachEnds` (body, distance_au, distance_km, epoch, object_id, orbit_id) — Close approach zone exit events.
+`EventSummary` (body, epochs, event_type, object_id, orbit_id) — One-row-per-event summary across all event types.
+`CloseApproachStarts` (body, distance_au, distance_km, epochs, object_id, orbit_id) — Close approach zone entry events.
+`CloseApproachEnds` (body, distance_au, distance_km, epochs, object_id, orbit_id) — Close approach zone exit events.
 `Periapses` (13 methods) — Periapsis (closest approach) events within a CA zone.
-`Impacts` (altitude_km, body, epoch, latitude_deg, longitude_deg, object_id, orbit_id, relative_velocity_au_day) — Nominal impact events (body surface intersection).
+`Impacts` (altitude_km, body, epochs, latitude_deg, longitude_deg, object_id, orbit_id, relative_velocity_au_day) — Nominal impact events (body surface intersection).
 `PossibleImpacts` (15 methods) — Probabilistic impact assessments from covariance analysis.
 `AtmosphericEntries` (9 methods) — Atmospheric entry events (Karman line inbound crossing).
-`AtmosphericExits` (body, distance_au, epoch, object_id, orbit_id) — Atmospheric exit events.
+`AtmosphericExits` (body, distance_au, epochs, object_id, orbit_id) — Atmospheric exit events.
 `CaptureStarts` (12 methods) — Temporary gravitational capture start events.
 `CaptureEnds` (13 methods) — Temporary gravitational capture end (escape) events.
-`ShadowEntries` (body, epoch, illumination, object_id, orbit_id, shadow_fraction) — Shadow zone entry events (Sun occluded by a body).
-`ShadowExits` (body, epoch, illumination, object_id, orbit_id, shadow_fraction) — Shadow zone exit events (Sun no longer occluded).
+`ShadowEntries` (body, epochs, illumination, object_id, orbit_id, shadow_fraction) — Shadow zone entry events (Sun occluded by a body).
+`ShadowExits` (body, epochs, illumination, object_id, orbit_id, shadow_fraction) — Shadow zone exit events (Sun no longer occluded).
 `CovarianceRegimeChanges` (9 methods) — Covariance-regime transitions from ``UncertaintyMethod.AUTO``.
 
 ### Tagged covariance

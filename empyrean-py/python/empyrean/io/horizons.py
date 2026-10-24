@@ -8,7 +8,12 @@ import numpy as np
 import pyarrow as pa
 
 from empyrean.coordinates.enums import Frame, Origin
-from empyrean.coordinates.epoch import Epochs, _epochs_mjd_tdb
+from empyrean.coordinates.epoch import (
+    Epochs,
+    _echo_epochs,
+    _epochs_mjd_tdb,
+    _require_single_epoch,
+)
 from empyrean.ephemeris.result import Ephemeris
 from empyrean.io._cache import resolve_cache_dir
 
@@ -70,8 +75,13 @@ def query_horizons(
     epoch_arr = np.asarray(result["epoch"])
     nans = np.full(m, np.nan)
 
+    # Each record is at a requested epoch (one per object × epoch): echo
+    # the caller's own supplied values back in the caller's scale rather
+    # than round-tripping the engine's TDB return through a conversion.
+    out_epochs = _echo_epochs(epoch_arr, epochs)
+
     coordinates = SphericalCoordinates.from_kwargs(
-        epoch=epoch_arr,
+        epochs=out_epochs,
         rho=np.asarray(result["rho"]),
         lon=np.asarray(result["ra"]),
         lat=np.asarray(result["dec"]),
@@ -85,7 +95,7 @@ def query_horizons(
     # Horizons doesn't return aberrated states — fill with NaN but set
     # the frame attribute so the quivr nested validation passes.
     aberrated_state = CartesianCoordinates.from_kwargs(
-        epoch=epoch_arr,
+        epochs=out_epochs,
         x=nans.copy(),
         y=nans.copy(),
         z=nans.copy(),
@@ -141,7 +151,7 @@ def query_horizons(
 
 def query_horizons_vectors(
     command: str,
-    epoch_mjd_tdb: float,
+    epoch: Epochs,
     cache_dir: str | Path | bool | None = None,
 ) -> tuple[FloatArray, FloatArray]:
     """Query JPL Horizons for a Cartesian state vector at a single epoch.
@@ -153,8 +163,12 @@ def query_horizons_vectors(
     ----------
     command : str
         Horizons COMMAND string (e.g. ``"99942;"``, ``"DES=C/2019 Q4;"``).
-    epoch_mjd_tdb : float
-        Epoch in MJD TDB.
+    epoch : Epochs
+        The requested instant as a single-row
+        :class:`~empyrean.coordinates.epoch.Epochs` table (the same shape as
+        the OD output epoch), converted to TDB internally. Build one with
+        ``Epochs.from_mjd(value, scale="tdb")`` (or ``scale="utc"``); a bare
+        float is refused, as it carries no time scale.
     cache_dir : str | Path | bool, optional
         - ``None`` (default): cache JSON responses under
           ``$EMPYREAN_CACHE_DIR/horizons`` (or
@@ -170,6 +184,9 @@ def query_horizons_vectors(
     """
     from empyrean._empyrean_rs import _query_horizons_vectors
 
+    # Coerce the scale-carrying input to MJD TDB for the engine-side query;
+    # a bare float is refused by name.
+    epoch_mjd_tdb = _require_single_epoch(epoch, "query_horizons_vectors() epoch")
     pos, vel = _query_horizons_vectors(
         command, epoch_mjd_tdb, resolve_cache_dir(cache_dir, "horizons")
     )

@@ -25,7 +25,7 @@ DuckDB, and pages through what it wrote without leaving the terminal.
 
 ## Install
 
-Current release: **0.11.0-rc.0** (release candidate).
+Current release: **0.11.0-rc.1** (release candidate).
 
 ```sh
 cargo install empyrean-cli
@@ -60,10 +60,12 @@ export EMPYREAN_LIB=$PWD/libempyrean.dylib   # or place it next to `empyrean`
 empyrean init
 
 # Propagate Apophis 10 years past its SBDB epoch.
-empyrean propagate --object-id 99942 --epoch 64922.0 --out-dir ./out
+# --scale names the scale of every MJD argument; SBDB epochs are TDB. File
+# outputs are always written in TDB with *_mjd_tdb columns.
+empyrean propagate --object-id 99942 --epoch 64922.0 --scale tdb --out-dir ./out
 
 # Generate an ephemeris from the same orbit at observatory 568.
-empyrean ephemeris --object-id 99942 --observers 568 --epoch 64922.0 --out-dir ./out
+empyrean ephemeris --object-id 99942 --observers 568 --epoch 64922.0 --scale tdb --out-dir ./out
 
 # Fit every object in an ADES PSV — one fit per designation, one command.
 empyrean determine observations.psv --out-dir ./out
@@ -240,8 +242,9 @@ is never silently dropped.
 {
   "arcs": [
     {
-      "start_mjd_tdb": 65000.0,
-      "end_mjd_tdb":    65010.0,
+      "start_mjd":     65000.0,
+      "end_mjd":       65010.0,
+      "scale":         "tdb",
       "thrust_n":       1.0,
       "mass_kg":        500.0,
       "isp_s":          3000.0,
@@ -260,7 +263,7 @@ is never silently dropped.
 - `dv_corrections` is positional with `arcs`. A per-correction burn prior rides the orbit's packed covariance joint (its thrust axes), not a separate per-segment covariance carrier; a file still declaring the removed carrier field is refused by name.
 
 ```sh
-empyrean propagate --object-id 99942 --epoch 64922.0 --thrust-arcs burn.json --out-dir ./out
+empyrean propagate --object-id 99942 --epoch 64922.0 --scale tdb --thrust-arcs burn.json --out-dir ./out
 ```
 
 ## Orbit determination

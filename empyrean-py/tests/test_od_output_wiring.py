@@ -115,7 +115,7 @@ def test_fitted_orbit_predicts_magnitudes(apophis_observations):
     h = fit.orbit.photometric.h.to_pylist()
     assert h and h[0] is not None, "fitted H was not attached to the orbit"
 
-    epoch0 = fit.orbit.coordinates.epoch.to_pylist()[0]
+    epoch0 = fit.orbit.coordinates.epochs.mjd_tdb().tolist()[0]
     epochs = Epochs.from_mjd([epoch0 + 1.0, epoch0 + 10.0], scale="tdb")
     eph = generate_ephemeris(fit.orbit, Observers.from_code("500", epochs)).ephemeris
     mags = eph.mag.to_pylist()

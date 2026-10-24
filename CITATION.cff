@@ -5,7 +5,7 @@ authors:
   - family-names: Moeyens
     given-names: Joachim
     orcid: "https://orcid.org/0000-0001-5820-3925"
-version: 0.11.0-rc.0
+version: 0.11.0-rc.1
 date-released: 2026-10-18
 identifiers:
   - type: doi

@@ -45,6 +45,7 @@ from empyrean import (
     transform_orbits,
 )
 from empyrean.coordinates.coordinates import CartesianCoordinates
+from empyrean.coordinates.epoch import Epochs
 from empyrean.errors import PushErrorVariant
 
 _HEADER = Path(__file__).parents[2] / "include" / "empyrean.h"
@@ -240,7 +241,7 @@ def test_value_parity_width9_marsden_orbit_survives_a_parquet_round_trip() -> No
     """
     empyrean.initialize()
     coords = CartesianCoordinates.from_kwargs(
-        epoch=[59000.0],
+        epochs=Epochs.from_kwargs(mjd=[59000.0], scale="tdb"),
         x=[1.2],
         y=[0.3],
         z=[0.1],

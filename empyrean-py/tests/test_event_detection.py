@@ -46,7 +46,7 @@ def _orbits() -> CartesianOrbits:
     states and nothing else."""
     xs = [APOPHIS[0] + i * 1.0e-7 for i in range(N_ORBITS)]
     coords = CartesianCoordinates.from_kwargs(
-        epoch=[T0] * N_ORBITS,
+        epochs=Epochs.from_kwargs(mjd=[T0] * N_ORBITS, scale="tdb"),
         x=xs,
         y=[APOPHIS[1]] * N_ORBITS,
         z=[APOPHIS[2]] * N_ORBITS,

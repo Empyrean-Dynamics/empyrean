@@ -74,7 +74,7 @@ def _earth_crosser_orbit(orbit_id: str, object_id: str) -> CartesianOrbits:
     propagation. Tagged with the user-supplied orbit_id / object_id."""
     s = APOPHIS_STATE
     coords = CartesianCoordinates.from_kwargs(
-        epoch=[s["epoch"]],
+        epochs=Epochs.from_kwargs(mjd=[s["epoch"]], scale="tdb"),
         x=[s["x"]],
         y=[s["y"]],
         z=[s["z"]],
@@ -163,7 +163,7 @@ def test_multiple_orbits_each_keep_their_own_id() -> None:
     """
     a, b = APOPHIS_STATE, BENNU_STATE
     coords = CartesianCoordinates.from_kwargs(
-        epoch=[a["epoch"], b["epoch"]],
+        epochs=Epochs.from_kwargs(mjd=[a["epoch"], b["epoch"]], scale="tdb"),
         x=[a["x"], b["x"]],
         y=[a["y"], b["y"]],
         z=[a["z"], b["z"]],
@@ -246,7 +246,7 @@ def _orbit_with_covariance(orbit_id: str, object_id: str) -> CartesianOrbits:
     cov_matrix = np.diag([1e-16, 1e-16, 1e-16, 1e-20, 1e-20, 1e-20])[None, :, :]
     covariance = CartesianCovariance.from_matrix(cov_matrix)
     coords = CartesianCoordinates.from_kwargs(
-        epoch=[s["epoch"]],
+        epochs=Epochs.from_kwargs(mjd=[s["epoch"]], scale="tdb"),
         x=[s["x"]],
         y=[s["y"]],
         z=[s["z"]],

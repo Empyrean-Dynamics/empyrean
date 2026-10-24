@@ -64,7 +64,7 @@ def _orbit_with_covariance() -> CartesianOrbits:
         orbit_id=["contract"],
         object_id=["contract"],
         coordinates=CartesianCoordinates.from_kwargs(
-            epoch=np.array([_EPOCH_MJD_TDB]),
+            epochs=Epochs.from_kwargs(mjd=np.array([_EPOCH_MJD_TDB]), scale="tdb"),
             x=[1.6],
             y=[0.1],
             z=[0.02],
@@ -314,7 +314,7 @@ def _earth_approaching_orbit() -> CartesianOrbits:
         orbit_id=["imp"],
         object_id=["imp"],
         coordinates=CartesianCoordinates.from_kwargs(
-            epoch=np.array([_EPOCH_MJD_TDB]),
+            epochs=Epochs.from_kwargs(mjd=np.array([_EPOCH_MJD_TDB]), scale="tdb"),
             x=[r0[0] + 0.0015],
             y=[r0[1]],
             z=[r0[2]],

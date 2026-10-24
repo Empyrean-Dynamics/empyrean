@@ -3,10 +3,13 @@
 import enum
 from collections.abc import Sequence
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeVar
 
 import numpy as np
+import pyarrow as pa
 import quivr as qv
+
+_TableT = TypeVar("_TableT", bound=qv.Table)
 
 if TYPE_CHECKING:
     from astropy.time import Time as AstropyTime
@@ -76,9 +79,50 @@ class Epochs(qv.Table):
     """
 
     mjd = qv.Float64Column()
-    scale = qv.StringAttribute()
+    # The scale carries a default only because quivr 0.8.1 builds an empty
+    # table (including a nested ``Epochs`` sub-table inside a parent's
+    # ``Table.empty()``) from the attribute's own default and cannot be
+    # handed a scale through the parent. Removing the default would break
+    # every ``.empty()`` on a table that carries epochs, including
+    # scaleless fallbacks such as ``CartesianOrbits.empty()``. A populated
+    # result is always built with an explicit ``scale=`` (the request
+    # scale), so the default only ever tags a zero-row table; the request
+    # scale is still carried onto empty results at the sites that have one.
+    scale = qv.StringAttribute(default=TimeScale.TDB.value)
 
     # ── Scale conversions ────────────────────────────────────
+
+    def _converted(self, target: str) -> "Epochs":
+        """Convert the ``mjd`` column to ``target`` scale, preserving the
+        Arrow null mask.
+
+        A nullable ``Epochs`` sub-table (an absent planning anchor, say)
+        reads a null row back as null, not as a NaN value: the null slots
+        are filled with a dummy before the ISO conversion (feeding NaN to
+        the formatter would raise) and the original null mask is restored
+        on the result.
+        """
+        from empyrean._empyrean_rs import _convert_epochs
+
+        col = self.mjd
+        values = np.asarray(col.to_numpy(zero_copy_only=False), dtype=np.float64)
+        nonfinite = ~np.isfinite(values)
+        if not nonfinite.any():
+            converted = np.asarray(_convert_epochs(values, self.scale, target), dtype=np.float64)
+            return Epochs.from_kwargs(mjd=converted, scale=target)
+        # An absent anchor surfaces as an Arrow null (rendered as NaN by
+        # ``to_numpy``) or, on a dense column, as a NaN value. Either way
+        # it is not a real instant and must not reach the ISO formatter, so
+        # the non-finite slots are filled with a dummy, converted, then
+        # restored: an originally-null slot reads back null, a NaN value
+        # stays NaN.
+        filled = np.where(nonfinite, 60000.0, values)
+        converted = np.asarray(_convert_epochs(filled, self.scale, target), dtype=np.float64)
+        converted = np.where(nonfinite, np.nan, converted)
+        if col.null_count:
+            out = pa.array(converted, type=pa.float64(), mask=nonfinite)
+            return Epochs.from_kwargs(mjd=out, scale=target)
+        return Epochs.from_kwargs(mjd=converted, scale=target)
 
     def to_tdb(self) -> "Epochs":
         """Convert to TDB.
@@ -89,36 +133,22 @@ class Epochs(qv.Table):
         secular-only truncation, so the few-millisecond annual term is
         carried. Cross-validated against astropy (ERFA) in
         ``tests/test_time_scale_astropy_parity.py``, where the two agree
-        bit for bit over the modern era.
+        bit for bit over the modern era. A nullable sub-table keeps its
+        null rows null.
         """
         if self.scale == TimeScale.TDB.value:
             return self
-
-        from empyrean._empyrean_rs import _convert_epochs
-
-        mjd_tdb = _convert_epochs(
-            np.asarray(self.mjd.to_numpy(zero_copy_only=False), dtype=np.float64),
-            self.scale,
-            TimeScale.TDB.value,
-        )
-        return Epochs.from_kwargs(mjd=np.asarray(mjd_tdb), scale=TimeScale.TDB.value)
+        return self._converted(TimeScale.TDB.value)
 
     def to_utc(self) -> "Epochs":
         """Convert to UTC.
 
-        Returns self unchanged if already UTC.
+        Returns self unchanged if already UTC. A nullable sub-table keeps
+        its null rows null.
         """
         if self.scale == TimeScale.UTC.value:
             return self
-
-        from empyrean._empyrean_rs import _convert_epochs
-
-        mjd_utc = _convert_epochs(
-            np.asarray(self.mjd.to_numpy(zero_copy_only=False), dtype=np.float64),
-            self.scale,
-            TimeScale.UTC.value,
-        )
-        return Epochs.from_kwargs(mjd=np.asarray(mjd_utc), scale=TimeScale.UTC.value)
+        return self._converted(TimeScale.UTC.value)
 
     def to_scale(self, scale: ScaleArg) -> "Epochs":
         """Convert to the named scale (``"utc"`` or ``"tdb"``)."""
@@ -311,7 +341,7 @@ class Epochs(qv.Table):
         Epochs
             Epochs in TDB at ``orbit_epoch + dt``.
         """
-        t0s = np.asarray(orbits.coordinates.epoch.to_numpy(zero_copy_only=False), dtype=np.float64)
+        t0s = orbits.coordinates.epochs.mjd_tdb()
         if len(t0s) > 1 and not np.allclose(t0s, t0s[0]):
             raise ValueError(
                 f"from_orbits requires all orbits to share the same epoch. Got epochs: {t0s}"
@@ -452,12 +482,21 @@ class Epochs(qv.Table):
     def concat(cls, *epochs: "Epochs") -> "Epochs":
         """Concatenate multiple :class:`Epochs` tables.
 
-        All inputs must share the same time scale.
+        All *non-empty* inputs must share the same time scale. A zero-row
+        table carries no instant, so its scale (which may be the carrier's
+        default) is ignored: an empty ``"tdb"`` result concatenated with a
+        real ``"utc"`` one is not a mixed-scale conflict, and the result
+        takes the scale of the first non-empty input. This mirrors
+        ``quivr.concatenate`` and keeps an empty leg from spuriously
+        refusing a well-formed one.
         """
         if not epochs:
             return cls.from_kwargs(mjd=np.zeros(0), scale=TimeScale.TDB.value)
-        scale = epochs[0].scale
-        for e in epochs[1:]:
+        non_empty = [e for e in epochs if len(e) > 0]
+        if not non_empty:
+            return cls.from_kwargs(mjd=np.zeros(0), scale=epochs[0].scale)
+        scale = non_empty[0].scale
+        for e in non_empty[1:]:
             if e.scale != scale:
                 raise ValueError(f"cannot concat Epochs with mixed scales: {scale} vs {e.scale}")
         mjd = np.concatenate(
@@ -535,3 +574,53 @@ def _require_single_epoch(value: object, where: str) -> float:
 def _epochs_mjd_tdb(value: object, where: str) -> np.ndarray:
     """Coerce a required :class:`Epochs` input to an MJD TDB array."""
     return _require_epochs(value, where).mjd_tdb()
+
+
+def _empty_in_scale(cls: type[_TableT], scale: ScaleArg) -> _TableT:
+    """Return a zero-row instance of ``cls`` whose primary ``epochs``
+    sub-table carries ``scale``.
+
+    quivr 0.8.1 builds a nested ``Epochs`` inside ``Table.empty()`` from
+    the carrier's attribute default and cannot be handed a scale, so an
+    empty result would otherwise always say ``"tdb"``. This rebuilds the
+    empty table through ``from_kwargs`` with an explicitly scaled empty
+    ``epochs`` column, so an empty result from a UTC request says
+    ``"utc"``. ``cls`` must carry its primary time column as ``epochs``.
+    """
+    empty = cls.empty()
+    cols = {name: getattr(empty, name) for name in empty.table.column_names}
+    cols["epochs"] = Epochs.from_kwargs(mjd=np.zeros(0), scale=_scale_str(scale))
+    return cls.from_kwargs(**cols)
+
+
+def _echo_epochs(engine_mjd_tdb: "np.ndarray | Sequence[float]", request: Epochs) -> Epochs:
+    """Echo the caller's supplied epoch values for a requested-instant output.
+
+    Every entry of ``engine_mjd_tdb`` is a *requested* instant the engine
+    reported back. The engine works in TDB and echoes the exact MJD TDB it
+    was handed, so each output row maps by value to one of ``request``'s
+    rows; the caller's own value, in the caller's own scale, is returned.
+    This is an echo, not a round-trip: the output epoch is the caller's
+    bytes, never the engine's TDB number re-expressed through a
+    conversion. Engine-*found* instants (close approaches, events, impacts,
+    rise/set) do not come through here. Those are converted once with
+    :meth:`Epochs.to_scale`.
+    """
+    eng = np.asarray(engine_mjd_tdb, dtype=np.float64)
+    scale = request.scale
+    if scale == TimeScale.TDB.value:
+        # The request scale is the engine scale: the echoed value is the
+        # engine's own TDB return, so no value mapping is needed.
+        return Epochs.from_kwargs(mjd=eng, scale=scale)
+    req_tdb = np.asarray(request.mjd_tdb(), dtype=np.float64)
+    req_vals = np.asarray(request.to_numpy(), dtype=np.float64)
+    lookup = dict(zip((float(t) for t in req_tdb), (float(v) for v in req_vals), strict=True))
+    try:
+        out = np.array([lookup[float(t)] for t in eng], dtype=np.float64)
+    except KeyError as exc:
+        raise ValueError(
+            "an output epoch did not match any requested instant; a "
+            "requested-instant output must echo a supplied epoch, not a "
+            "value the engine found"
+        ) from exc
+    return Epochs.from_kwargs(mjd=out, scale=scale)

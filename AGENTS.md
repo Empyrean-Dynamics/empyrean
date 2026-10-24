@@ -36,6 +36,10 @@ using the package rather than changing it, you want the skill instead:
   files, `empyrean-py/pyproject.toml`, `CITATION.cff` and
   `plugins/empyrean/.claude-plugin/plugin.json`; `prepare-release.yml` verifies they agree
   before a tag. Never bump a version as part of another change.
+- The `release` branch is written only by the release workflow, which
+  fast-forwards it to a final tag once PyPI and crates.io have both
+  published; the plugin marketplace entry and Anthropic's plugin directory
+  serve `plugins/empyrean` from it. Never push to `release` by hand.
 
 ## Where things are documented
 

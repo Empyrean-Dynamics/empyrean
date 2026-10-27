@@ -59,6 +59,22 @@ unchanged. File and stdout outputs are still written in TDB with
 `epoch_mjd_tdb` columns, and the error-location diagnostic keeps its
 TDB-named epoch.
 
+**Engines.** The C ABI binds empyrean-core 0.11.1, which pins villeneuve
+1.26.5 and scott 1.19.5. The engines now stamp their version from the
+manifest inside a pinned checkout, so `empyrean_versions`,
+`empyrean_version_string`, the Python `versions()` and the CLI `version`
+command name the engine releases instead of a `-dev` suffix, and scott
+rescues a damping-exhausted orbit solve with the
+undamped Gauss-Newton step when one exact evaluation confirms the
+predicted reduction, so a fit that used to end as a stable stall now
+latches a convergence criterion. villeneuve fixes the `auto`
+uncertainty method on an arc that crosses a capture: an epoch that
+resolves to the linear rung publishes the first-order state and
+covariance bit for bit, no re-propagation window opens where the ladder
+cannot read one, and a capture covered only by the linear rung is
+reported among the propagation warnings. Fits that never stall are
+untouched and no result in this distribution's suites moves.
+
 ## [0.11.0-rc.0] — 2026-10-18
 
 **Validation.** On this candidate the orbit-determination family (354

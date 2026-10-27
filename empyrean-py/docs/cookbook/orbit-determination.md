@@ -19,8 +19,8 @@ print(f"converged={fit.converged}, "
 ```
 
 `determine` fits **every** object the observations group into, keyed by
-ADES identifier. `fits.summary` is a row per *input* object — delivered
-or not — `fits.orbits` holds the ones that produced an orbit, and
+ADES identifier. `fits.summary` is a row per *input* object, delivered
+or not; `fits.orbits` holds the ones that produced an orbit, and
 `fits.residuals` carries every delivered fit's rows tagged with their
 `object_id`. Index by identifier for the full single-object view:
 
@@ -36,8 +36,8 @@ print(yr4.acceptability.extrapolation_acceptable)
 ```
 
 {func}`~empyrean.determine` runs initial orbit determination on the
-observation arc — using Gauss + Herget refinement or systematic
-ranging — to seed differential
+observation arc, using Gauss + Herget refinement or systematic
+ranging, to seed differential
 correction, then iterates DC with adaptive outlier rejection.
 
 ## Re-fitting with a prior
@@ -47,23 +47,26 @@ new observations:
 
 ```python
 prior  = empyrean.query_sbdb(["99942"])         # CometaryOrbits with covariance
+prior  = empyrean.transform_orbits(prior, empyrean.CartesianOrbits)  # refine needs Cartesian
 new    = empyrean.query_observations(["99942"]) # MPC ADES
-result = empyrean.refine(prior, new)            # ODResult
+result = empyrean.refine(prior, new)            # DetermineResult
 ```
 
-The prior covariance gates the Bayesian update via
-{class}`~empyrean.ODConfig`'s `use_prior` toggle.
+`refine` always uses the seed orbit's covariance as the Bayesian prior.
+The orbit must carry a covariance, and there is no opt-out toggle:
+calling `refine` is itself the prior-based path, the counterpart to
+{func}`~empyrean.determine`, which fits from the observations alone.
 
 ## Evaluating without fitting
 
-To compute residuals only — no parameter update:
+To compute residuals only, no parameter update:
 
 ```python
 result = empyrean.evaluate(orbits, observations)
 s = result.summary
 
 # RA·cos(δ) and Dec residuals (arcsec). Note the upstream RMS values
-# already apply the cos(δ) factor — they're sky-plane residuals, not
+# already apply the cos(δ) factor; they're sky-plane residuals, not
 # raw RA differences, so they stay sensible near the poles.
 print(f"sky RMS:  RA·cos(δ) {s.rms_ra_arcsec:.3f}'', Dec {s.rms_dec_arcsec:.3f}''")
 
@@ -74,7 +77,7 @@ print(f"sky RMS:  RA·cos(δ) {s.rms_ra_arcsec:.3f}'', Dec {s.rms_dec_arcsec:.3f
 print(f"AT/CT RMS: AT {s.rms_along_track_arcsec:.3f}'', CT {s.rms_cross_track_arcsec:.3f}''")
 
 # Per-observation residuals + diagnostics live on result.observations
-# (an ObservationResults quivr table) — filter with `.where()` to
+# (an ObservationResults quivr table); filter with `.where()` to
 # inspect outliers, leverage, Cook's distance, etc.
 ```
 
@@ -98,8 +101,8 @@ diff = sess.diff(0)               # compare to initial fit
 print(f"Δχ²_red = {diff.reduced_chi2_delta:+.3f}")
 ```
 
-Per-observation rejection diagnostics — Cook's distance, leverage,
-fractional information loss — are emitted on
+Per-observation rejection diagnostics (Cook's distance, leverage,
+fractional information loss) are emitted on
 {class}`~empyrean.ObservationResults` for every fit; use those to
 pick which observation to mask rather than guessing by index.
 
@@ -134,18 +137,62 @@ for row in zip(
 ```
 
 Significance ≥ 3 indicates a real systematic worth keeping fitted.
-The Schur-coupled marginalisation means the reported σ already
+The Schur-coupled marginalization means the reported σ already
 includes uncertainty inherited through the orbit fit, so you can
 report `bias_ra ± sigma_ra` directly without further inflation.
+
+## Photometry
+
+Attach a {class}`~empyrean.PhotometryConfig` to {class}`~empyrean.ODConfig`
+and the fit adds an H/G photometric solution on the result's `photometry`
+field (a {class}`~empyrean.PhotometryResult`), run after the orbit is
+solved and never touching the state: the absolute magnitude `h`, the slope
+parameters `slope1` / `slope2`, and their 3×3 `covariance`.
+
+Survey-band magnitudes convert to V before the fit through
+`band_conversions`, which defaults to the built-in MPC Magnitude Bands
+table. A caller entry layers onto that table as
+`PhotometryConfig(band_conversions={code: (offset_to_v, sigma)})`,
+replacing a code the table carries or adding one it does not. The offset
+applied to each band comes back per band on {class}`~empyrean.BandStat`'s
+`offset_applied`, so a fit is auditable against the table it ran with.
+Bands with no adopted V conversion are excluded from the photometric fit,
+never silently: the LSST codes `Lu Lg Lr Li Lz Ly` carry no MPC default
+until supplied, and the comet magnitude flags `T` and `N` are refused
+regardless; each exclusion is counted in `n_mags_dropped_unconvertible`
+and the offending codes listed in `dropped_bands`. The observations'
+astrometry is unaffected.
 
 ## Weighting and catalog debiasing
 
 Per-observation weights and pre-Gaia astrometric catalog debiasing are
-on by default — {func}`~empyrean.determine` ships with the production
+on by default; {func}`~empyrean.determine` ships with the production
 preset (Vereš, Farnocchia, Chesley & Chamberlin 2017 station floors plus
 nightly de-weighting at the floor-σ policy, and EFCC2020 catalog-bias
 correction at standard healpix resolution). For most workflows you
 don't need to touch these.
+
+Under the hood the preset is a per-station noise model.
+{class}`~empyrean.WeightingPreset`'s `VFCC2017` default carries the Vereš,
+Farnocchia, Chesley & Chamberlin 2017 station floors, and a
+{class}`~empyrean.WeightingLayer` of kind `OBSERVATORY_RULE` sets a
+per-station 1σ (RA·cosδ, Dec) that combines with each observation's
+reported σ under a {class}`~empyrean.SigmaPolicy` (`DEFAULT_ONLY` or
+`FLOOR`). Layers in `additional_layers` resolve ahead of the preset's own
+chain, the first matching layer winning, so they override the preset for
+their stations and the preset is the fallback.
+{class}`~empyrean.WeightingPreset`'s `NONE` carries no curated layers, so
+weighting falls back to the uniform `default_sigma_arcsec` (1″): the
+explicit uniform-weighting primitive, the same baseline
+`WeightingConfig(enabled=False)` selects. Outlier rejection is a separate
+pass ({class}`~empyrean.RejectionConfig`, {class}`~empyrean.RejectionKind`):
+the default `ADAPTIVE` weights rejection by information loss, while
+`CMC2003` is a tri-state hysteresis gate that rejects an observation above
+its upper χ² threshold, recovers one below the lower, and holds the rest.
+Every residual records the effective measurement covariance it was fitted
+under (`residual_cov_ra`, `residual_cov_dec`, `residual_cov_corr`, the Σ
+for which its Mahalanobis χ² is exact) and where it came from: the station
+`obs_code` and the star catalog `ast_cat`.
 
 To disable either pipeline, or to tune them:
 
@@ -155,7 +202,7 @@ from empyrean import (
     WeightingPreset, SigmaPolicy, DebiasingConfig, DebiasingResolution,
 )
 
-# Uniform 1″ weighting + no catalog debiasing — the unweighted baseline
+# Uniform 1″ weighting + no catalog debiasing, the unweighted baseline
 cfg_unweighted = ODConfig(
     weighting=WeightingConfig(enabled=False),
     debiasing=DebiasingConfig(enabled=False),
@@ -193,7 +240,7 @@ when you want to replace that pipeline rather than extend it.
 ## Convergence tolerance
 
 The default DC step-tolerance ($\Delta\mathbf{x}^\top \mathcal{N}\,\Delta\mathbf{x}$
-on the parameter update) is ``1e-5`` — sigma-quality fits suitable for
+on the parameter update) is ``1e-5``, sigma-quality fits suitable for
 impact-risk and close-approach assessment. Loosen to ``1e-3`` for
 survey-grade speed:
 

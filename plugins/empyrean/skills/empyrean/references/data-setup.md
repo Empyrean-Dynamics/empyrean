@@ -4,8 +4,9 @@
 
 empyrean propagation needs SPICE kernels (planetary ephemerides, Earth
 orientation, asteroid perturbers, observatory codes). A fresh
-`pip install empyrean` pulls all of them as PyPI dependencies — no
-network fetch on first call.
+`pip install empyrean` pulls the large kernels as PyPI dependencies, so
+those are present with no network fetch; the smaller lazy-fetched
+extras (below) are downloaded on demand the first time you initialize.
 
 ## What ships via PyPI
 
@@ -54,7 +55,7 @@ export EMPYREAN_DATA_DIR=/scratch/shared/empyrean
 ## Bundled assets
 
 `gm_de440.tpc` (gravitational parameters) ships inside the empyrean
-wheel itself — it isn't on PyPI separately.
+wheel itself; it isn't on PyPI separately.
 
 ## Lazy-fetched extras
 
@@ -93,7 +94,7 @@ empyrean.initialize(refresh=False)
 ```
 
 There is no try-the-network-and-tolerate path and no
-degrade-to-a-lower-tier path — the context either has everything the
+degrade-to-a-lower-tier path: the context either has everything the
 tier needs on disk or it is not built. A failure names **every** absent
 file, not just the first one hit, as structured data on the exception:
 
@@ -121,14 +122,14 @@ The same switch is spelled ``--no-refresh`` as an explicit CLI flag, and
 in Rust.
 
 > **Note:**
-> The explicit-paths branch — passing ``spk_path`` / ``gm_path`` to
-> `empyrean.initialize` — never fetched anything to begin with, so
+> The explicit-paths branch, passing ``de440_path`` / ``gm_path`` to
+> `empyrean.initialize`, never fetched anything to begin with, so
 > ``refresh`` does not apply there.
 
 ## Time scales
 
-empyrean does not use a SPICE leap-second kernel. UTC↔TDB conversion —
-leap seconds plus the TDB−TT periodic terms — is built into the engine,
+empyrean does not use a SPICE leap-second kernel. UTC↔TDB conversion
+(leap seconds plus the TDB−TT periodic terms) is built into the engine,
 so `Epochs.to_tdb` and the other scale conversions work with no
 separate kernel install.
 
@@ -154,7 +155,7 @@ default, responses go under ``$EMPYREAN_CACHE_DIR/<service>`` (or
 ``~/.empyrean/cache/<service>`` if ``EMPYREAN_CACHE_DIR`` is unset).
 
 ```python
-# Default — cache under EMPYREAN_CACHE_DIR.
+# Default: cache under EMPYREAN_CACHE_DIR.
 orbits = empyrean.query_sbdb(["99942"])
 
 # Force a fresh fetch (no cache read or write):

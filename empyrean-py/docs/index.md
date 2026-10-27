@@ -7,10 +7,10 @@ import empyrean
 
 empyrean.initialize()                              # one-time, loads kernels
 
-orbits = empyrean.query_sbdb(["99942"])            # CometaryOrbits — Apophis
+orbits = empyrean.query_sbdb(["99942"])            # CometaryOrbits (Apophis)
 
 # A time-scale-aware epoch grid: the scale (TDB) is carried by the
-# type, not asserted in a comment. Spans 2024-07, 2027-04, 2029-12.
+# type, not asserted in a comment. Spans 2024-07, 2027-04, 2030-01.
 epochs = empyrean.Epochs.from_mjd([60500.0, 61500.0, 62500.0], scale="tdb")
 result = empyrean.propagate(orbits, epochs)
 
@@ -21,16 +21,26 @@ print(f"{len(result.states)} states, "
 
 ## Output structure
 
-{class}`~empyrean.PropagationResult` bundles three things:
+{class}`~empyrean.PropagationResult` carries the propagated states, the
+events found along the way, the per-orbit delivery status, and the
+uncertainty products:
 
 ```python
-result.states        # CartesianOrbits (one row per epoch × orbit)
-result.events        # Events (summary + 12 typed event sub-tables)
-result.sensitivity   # StateSensitivities | None — STMs / STTs per epoch
+result.states             # CartesianOrbits (one row per epoch × orbit)
+result.events             # Events (summary + 12 typed event sub-tables)
+result.sensitivity        # StateSensitivities | None: STMs (STTs under SECOND_ORDER)
+result.status             # OrbitStatuses: each input orbit delivered or failed
+result.mixtures           # MixtureChains: adaptive Gaussian-mixture components
+result.tagged_covariance  # TaggedCovariances | None: per-epoch covariance, kind-tagged
 ```
 
-All three are [quivr](https://github.com/B612-Asteroid-Institute/quivr)
-tables — columnar, PyArrow-backed, parquet-friendly.
+`result.status` holds one row per input orbit, marking it delivered or
+failed with a classified `error_code` and `error_message` plus the
+`first_row` / `num_rows` that locate its block, so a partial batch never
+silently shortens `result.states` (`result.all_delivered` is the
+batch-level check). These are all
+[quivr](https://github.com/B612-Asteroid-Institute/quivr) tables:
+columnar, PyArrow-backed, parquet-friendly.
 
 **Output frame and origin** default to EclipticJ2000, heliocentric
 (Sun-centered), MJD TDB epochs. To get ICRF or SSB-centered output,
@@ -60,11 +70,14 @@ For the full surface, build a {class}`~empyrean.PropagationConfig`.
 | Predict observations at observatories  | {func}`empyrean.generate_ephemeris`           |
 | Fit an orbit to observations           | {func}`empyrean.determine`                    |
 | Re-fit with a Bayesian prior           | {func}`empyrean.refine`                       |
-| Residuals only — no fit                | {func}`empyrean.evaluate`                     |
+| Residuals only, no fit                 | {func}`empyrean.evaluate`                     |
 | Stateful, mask-and-refit OD            | {class}`empyrean.Session`                     |
 | Impact probability                     | {func}`empyrean.compute_impact_probabilities` |
 | B-plane geometry                       | {func}`empyrean.compute_b_planes`             |
-| Convert between coordinate types       | {func}`empyrean.transform_coordinates`        |
+| Observability per observatory and night | {func}`empyrean.compute_visibility`         |
+| Rank candidate follow-up observations  | {func}`empyrean.evaluate_plan`                |
+| Convert orbits, covariance included    | {func}`empyrean.transform_orbits`             |
+| Convert bare coordinates               | {func}`empyrean.transform_coordinates`        |
 | Body states                            | {func}`empyrean.get_states`                   |
 | Observatory states                     | {func}`empyrean.get_observer_states`          |
 | Pull an orbit from JPL SBDB            | {func}`empyrean.query_sbdb`                   |
@@ -83,6 +96,7 @@ cookbook/propagation
 cookbook/impact-probability
 cookbook/orbit-determination
 cookbook/sensitivity
+cookbook/observability
 cookbook/data-setup
 agents
 ```

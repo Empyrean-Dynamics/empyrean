@@ -53,6 +53,7 @@ _REFERENCE_PAGES = [
     ("impact-probability.md", "cookbook/impact-probability"),
     ("orbit-determination.md", "cookbook/orbit-determination"),
     ("sensitivity.md", "cookbook/sensitivity"),
+    ("observability.md", "cookbook/observability"),
     ("data-setup.md", "cookbook/data-setup"),
     ("frames-units.md", "reference/frames-units"),
     ("glossary.md", "reference/glossary"),

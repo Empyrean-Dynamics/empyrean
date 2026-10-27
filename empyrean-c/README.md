@@ -29,7 +29,7 @@ counter instead; its last published value is 2, shipped by v0.9.0. This
 tree ships the 0.11.0 ABI, reporting `1100`.
 
 **Only the base version is encoded** — the pre-release suffix is not, so
-`0.11.0-rc.0` and `0.11.0` both report `1100`. The number separates one
+`0.11.0-rc.1` and `0.11.0` both report `1100`. The number separates one
 version from another, never a version from its own pre-releases: if a
 boundary type moves inside a pre-release cycle the handshake will not
 catch it, and both sides must be rebuilt together. Within one version's

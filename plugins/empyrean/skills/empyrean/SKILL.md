@@ -132,11 +132,14 @@ This skill documents empyrean 0.11.0rc1. Check the installed version with `pytho
 | Predict observations at observatories  | `empyrean.generate_ephemeris`           |
 | Fit an orbit to observations           | `empyrean.determine`                    |
 | Re-fit with a Bayesian prior           | `empyrean.refine`                       |
-| Residuals only — no fit                | `empyrean.evaluate`                     |
+| Residuals only, no fit                 | `empyrean.evaluate`                     |
 | Stateful, mask-and-refit OD            | `empyrean.Session`                     |
 | Impact probability                     | `empyrean.compute_impact_probabilities` |
 | B-plane geometry                       | `empyrean.compute_b_planes`             |
-| Convert between coordinate types       | `empyrean.transform_coordinates`        |
+| Observability per observatory and night | `empyrean.compute_visibility`         |
+| Rank candidate follow-up observations  | `empyrean.evaluate_plan`                |
+| Convert orbits, covariance included    | `empyrean.transform_orbits`             |
+| Convert bare coordinates               | `empyrean.transform_coordinates`        |
 | Body states                            | `empyrean.get_states`                   |
 | Observatory states                     | `empyrean.get_observer_states`          |
 | Pull an orbit from JPL SBDB            | `empyrean.query_sbdb`                   |
@@ -152,6 +155,7 @@ This skill documents empyrean 0.11.0rc1. Check the installed version with `pytho
 `evaluate(orbit, observations, *, config=…)`
 `refine(orbit, observations, *, config=…)`
 `transform_coordinates(coordinates, target, frame=…, origin=…)`
+`transform_orbits(orbits, target, frame=…, origin=…)`
 `get_states(target, center, epochs, frame=…)`
 `get_observer_states(obs_codes, epochs, frame=…, origin=…)`
 `compute_impact_probabilities(orbits, end_epoch, methods, body_filter=…)`
@@ -175,14 +179,15 @@ The rest of the public API is in `references/api.md`.
 ## Reference files
 
 - `references/quickstart.md` — A complete propagation in a dozen lines:
-- `references/about.md` — empyrean is a Python toolkit for high-precision Solar System dynamics — trajectory propagation, ephemeris generation, orbit determination,…
+- `references/about.md` — empyrean is a Python toolkit for high-precision Solar System dynamics: trajectory propagation, ephemeris generation, orbit determination,…
 - `references/propagation.md` — Forward-integrate one or more orbits to a list of target epochs.
 - `references/impact-probability.md` — This is the planetary-science headline workflow: take an orbit with covariance, propagate it through a planetary close approach, and…
 - `references/orbit-determination.md` — Fit an orbit to ADES optical observations.
 - `references/sensitivity.md` — The `empyrean.StateSensitivities` and `empyrean.ObservationSensitivities` tables hold per-epoch state transition matrices (and their…
+- `references/observability.md` — Before an object can be measured it has to be observable: above the horizon, in the dark, far enough from the Sun, and bright enough to…
 - `references/data-setup.md` — empyrean propagation needs SPICE kernels (planetary ephemerides, Earth orientation, asteroid perturbers, observatory codes).
 - `references/frames-units.md` — A single-page reference for what shape inputs and outputs take across the empyrean public API.
 - `references/glossary.md` — Acronyms and conventions that appear across the empyrean docs.
-- `references/validation.md` — empyrean is validated continuously — every delivery channel (Rust / C / Python / CLI) is checked against the others, and the underlying…
+- `references/validation.md` — empyrean is validated continuously: every delivery channel (Rust / C / Python / CLI) is checked against the others, and the underlying…
 - `references/api.md` — Every public function and class, grouped, with the call signature or methods for each.
 <!-- agentdocs:generated:end -->

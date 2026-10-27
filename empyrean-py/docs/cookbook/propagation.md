@@ -11,47 +11,67 @@ plus a target time grid and returns a {class}`~empyrean.PropagationResult`:
 
 ```python
 result = empyrean.propagate(orbits, epochs, config=cfg)
-result.states        # CartesianOrbits with optional covariance
-result.events        # Events: summary + 12 typed event sub-tables (CAs, impacts, …)
-result.sensitivity   # StateSensitivities | None — STMs (and STTs if SECOND_ORDER)
+result.states             # CartesianOrbits with optional covariance
+result.events             # Events: summary + 12 typed event sub-tables (CAs, impacts, …)
+result.sensitivity        # StateSensitivities | None: STMs (STTs under SECOND_ORDER)
+result.status             # OrbitStatuses: one row per input orbit, delivered or failed
+result.mixtures           # MixtureChains: adaptive Gaussian-mixture components
+result.tagged_covariance  # TaggedCovariances | None: per-epoch covariance, kind-tagged
 ```
+
+{class}`~empyrean.OrbitStatuses` marks each input orbit delivered or
+failed, a failure carrying a classified `error_code` and the engine's
+`error_message`, with `first_row` / `num_rows` locating each orbit's
+block, so a partial batch never silently shortens `result.states`
+(`result.all_delivered` is the batch-level check).
+{class}`~empyrean.MixtureChains` holds the mixture components an adaptive
+method splits into, and the per-epoch covariance reads back as a
+{class}`~empyrean.TaggedCovariances` table, each row tagged with its
+resolved {class}`~empyrean.CovarianceKind` and a quality rank.
 
 ## Force-model tiers
 
 | Tier          | What's included                                                                  |
 |---------------|----------------------------------------------------------------------------------|
-| `Approximate` | Point-mass planets + Moon + Pluto                                                |
-| `Basic`       | + EIH (Einstein-Infeld-Hoffmann) general relativity + Sun $J_2$              |
-| `Standard`    | + 16 SB441 small-body perturbers (paired with DE440 planets) + Earth $J_2$–$J_4$ + Marsden non-grav |
+| `APPROXIMATE` | Point-mass planets + Moon + Pluto                                                |
+| `BASIC`       | + EIH (Einstein-Infeld-Hoffmann) general relativity + Sun $J_2$              |
+| `STANDARD`    | + 16 SB441 small-body perturbers (paired with DE440 planets) + Earth $J_2$–$J_4$ + Marsden non-grav |
 
-`Standard` is the default and matches ASSIST's standard NEO force
+`STANDARD` is the default and matches ASSIST's standard NEO force
 model. SB441 is the small-body kernel family JPL ships paired with
 DE441; using it alongside DE440 is standard practice and the
 difference is below the 16-perturber accuracy floor.
 
 ## Uncertainty methods
 
-| Method              | Output                                                                                                          | Cost                              |
-|---------------------|-----------------------------------------------------------------------------------------------------------------|-----------------------------------|
-| `FirstOrder`        | STM $\Phi$ via `Jet1`                                                                                           | ~10× scalar                       |
-| `SecondOrder`       | STM + STT $\Psi$ via `Jet2` (Park-Scheeres second-order Gaussian; second-order impact-probability correction)   | ~50× scalar                       |
-| `GaussianMixture(…)`| Adaptive splitting along the most non-linear direction; one mixture component per resulting sub-orbit            | depth-bounded                     |
-| `SigmaPoint(…)`     | Output covariance from unscented sigma points                                                                   | $N$ × scalar                      |
-| `MonteCarlo(…)`     | Output covariance from random samples                                                                           | $N$ × scalar                      |
+Every method works at every solved-parameter width, from the 6-element
+state to the full 17-parameter joint:
+
+| Method               | Output                                                                                                          | Cost                              |
+|----------------------|-----------------------------------------------------------------------------------------------------------------|-----------------------------------|
+| `FIRST_ORDER`        | STM $\Phi$ via `Jet1`                                                                                           | ~10× scalar                       |
+| `SECOND_ORDER`       | STM + STT $\Psi$ via `Jet2` (Park-Scheeres second-order Gaussian; second-order impact-probability correction)   | ~50× scalar                       |
+| `GaussianMixture(…)` | Adaptive splitting along the most non-linear direction; one mixture component per resulting sub-orbit            | depth-bounded                     |
+| `SigmaPoint(…)`      | Output covariance from unscented sigma points                                                                   | $N$ × scalar                      |
+| `MonteCarlo(…)`      | Output covariance from random samples                                                                           | $N$ × scalar                      |
 
 Pass an `UncertaintyMethod` enum (default parameters) or one of the
 parameterized dataclasses ({class}`~empyrean.GaussianMixture`,
 {class}`~empyrean.SigmaPoint`, {class}`~empyrean.MonteCarlo`).
+`UncertaintyMethod.AUTO` escalates on measured curvature, climbing to a
+richer method only where the dynamics demand it; an explicit method is
+pure, and where it has no honest implementation on a seam it is refused
+by name rather than silently downgraded.
 
-`FirstOrder` is the default and is adequate for the bulk of NEO
-work — STM-mapped covariance agrees with sample-based estimates to
-better than ~1% on linear arcs. Reach for `SecondOrder` when working
+`FIRST_ORDER` is the default and is adequate for the bulk of NEO
+work: STM-mapped covariance agrees with sample-based estimates to
+better than ~1% on linear arcs. Reach for `SECOND_ORDER` when working
 close to a planetary close approach (where the dynamics get
 non-linear over the uncertainty volume) or whenever you need the
 second-order impact-probability correction. `GaussianMixture` adapts
-on its own — it splits along the most non-linear directions where a
+on its own, splitting along the most non-linear directions where a
 single second-order map isn't enough, and otherwise behaves like
-`SecondOrder`, which is what you want for a deep flyby with a long
+`SECOND_ORDER`, which is what you want for a deep flyby with a long
 lead-up of linear dynamics.
 `SigmaPoint` and `MonteCarlo` are sample-based alternatives when you
 need tail probabilities or want to exercise the full distribution.
@@ -70,14 +90,14 @@ from empyrean import PropagationConfig
 
 empyrean.initialize()
 
-# The four canonical close-approach scenarios — same set the empyrean 3D
-# viewer ships as built-in fixtures. Each one stresses a different
+# The four canonical close-approach scenarios, the same set the empyrean
+# 3D viewer ships as built-in fixtures. Each one stresses a different
 # corner of the propagation pipeline.
 scenarios = empyrean.query_sbdb([
-    "99942",                # Apophis — 2029-04-13 deep Earth flyby (MJD 62239)
+    "99942",                # Apophis, 2029-04-13 deep Earth flyby (MJD 62239)
     "2024 YR4",             # 2032-12 close approach with non-zero impact corridor (MJD 63587)
     "2020 CD3",             # mini-moon temporary capture (MJD 57561)
-    "2008 TC3",             # first asteroid predicted to impact Earth — Almahata Sitta airburst (MJD 54746.12, 2008-10-07 02:46 UTC)
+    "2008 TC3",             # first asteroid predicted to impact Earth, Almahata Sitta airburst (MJD 54746.12, 2008-10-07 02:46 UTC)
 ])
 
 cfg = PropagationConfig(num_threads=8)             # 1 core per orbit, up to 8
@@ -90,12 +110,14 @@ result = empyrean.propagate(
 print(f"{len(result.states)} state rows = "
       f"{len(scenarios)} orbits × {len(result.states) // len(scenarios)} epochs")
 
-# Pull just one scenario's chain:
-apophis = result.states.select("orbit_id", "(99942) Apophis")
+# Pull just one scenario's chain (object_id is the stable key, taken
+# from the orbits table rather than hard-coded):
+apophis_id = scenarios.object_id[0].as_py()
+apophis = result.states.select("object_id", apophis_id)
 ```
 
 The `orbit_id` column on every output table (`states`, the 12 event
-sub-tables, `sensitivity`) preserves the input identifier — that's
+sub-tables, `sensitivity`) preserves the input identifier, which is
 your join key for risk-list operations. The four scenarios above are
 the same fixtures bundled with the empyrean 3D viewer, so any state
 you produce here can be cross-referenced against the rendered
@@ -113,7 +135,7 @@ from empyrean import NonGravParams
 # Apophis Yarkovsky: A2 ≈ -2.9e-14 AU/day², radial / normal terms
 # negligible. Values from JPL SBDB.
 yarkovsky = NonGravParams.from_kwargs(
-    model=["inverse_square"],   # g(r) ∝ 1/r² — the standard Yarkovsky form (required)
+    model=["inverse_square"],   # g(r) ∝ 1/r², the standard Yarkovsky form (required)
     a1=[0.0],
     a2=[-2.9e-14],
     a3=[0.0],
@@ -130,9 +152,9 @@ result = empyrean.propagate(apophis_with_yark, epochs)
 SBDB's `query_sbdb` already attaches non-grav parameters when JPL has
 fitted them, so the manual construction above is only needed when
 overriding or for objects without a SBDB non-grav fit. Standard force
-model honours non-grav by default; Approximate / Basic ignore it.
+model honors non-grav by default; Approximate / Basic ignore it.
 
-### Cometary outgassing — `model`, `g(r)`, and `dt`
+### Cometary outgassing: `model`, `g(r)`, and `dt`
 
 For asteroids the inverse-square Marsden law is the right default
 (``model="inverse_square"``). Comets with measurable water-ice
@@ -149,7 +171,7 @@ For non-water-ice volatiles or custom fits, use ``model="marsden"``
 and set ``alpha``/``r0``/``m``/``n``/``k`` explicitly.
 
 Some Jupiter-family comets and 2I/Borisov also fit a peak-outgassing
-**time delay** $\Delta t$ relative to perihelion — SBDB exposes this
+**time delay** $\Delta t$ relative to perihelion; SBDB exposes this
 as `model_pars[]`'s `DT` field. Set it via the ``dt`` column on
 ``NonGravParams``:
 
@@ -161,7 +183,7 @@ as `model_pars[]`'s `DT` field. Set it via the ``dt`` column on
 | 2I/Borisov          | −65               |
 
 Asteroids and short-period comets that SBDB doesn't fit a delay for
-should leave ``dt`` unset (`None` / null) — the default.
+should leave ``dt`` unset (`None` / null), the default.
 
 ### Fitting non-grav parameters
 
@@ -186,3 +208,16 @@ cfg = PropagationConfig(
     ),
 )
 ```
+
+## Ephemeris rows
+
+{func}`empyrean.generate_ephemeris` returns an
+{class}`~empyrean.EphemerisResult` whose `ephemeris` table is one row per
+orbit, observer and epoch, with the topocentric astrometry and its
+covariance on `coordinates`. Each row also carries the derivation kind of
+its sky covariance in `cov_kind` (a {class}`~empyrean.CovarianceKind`
+value, the same vocabulary the propagation result uses) and the
+covariance itself as `joint`, the one {class}`~empyrean.PackedJoints`
+packed-joint column the propagation states carry, whose leading 6×6 state
+block is the sky covariance on `coordinates`. `joint` is null for a row
+that carried no covariance.

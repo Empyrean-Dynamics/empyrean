@@ -13,6 +13,7 @@
    empyrean.evaluate
    empyrean.refine
    empyrean.transform_coordinates
+   empyrean.transform_orbits
    empyrean.get_states
    empyrean.get_observer_states
    empyrean.compute_impact_probabilities
@@ -103,6 +104,10 @@
 
    empyrean.PropagationConfig
    empyrean.PropagationResult
+   empyrean.OrbitStatuses
+   empyrean.OrbitOutcome
+   empyrean.MixtureChains
+   empyrean.ComponentStatus
    empyrean.DiagnosticsConfig
    empyrean.AdvancedIntegratorConfig
    empyrean.IntegratorChoice
@@ -218,6 +223,23 @@ blocks alongside the 6×6 state block.
    empyrean.PlannedObservationKind
    empyrean.RadarMode
    empyrean.RadarStation
+   empyrean.LogDetWithheld
+```
+
+## Visibility
+
+```{eval-rst}
+.. autosummary::
+   :toctree: _generated
+   :nosignatures:
+
+   empyrean.compute_visibility
+   empyrean.VisibilityResult
+   empyrean.VisibilityPoints
+   empyrean.VisibilityWindows
+   empyrean.Nights
+   empyrean.VisibilityAnchors
+   empyrean.ObservatorySummary
 ```
 
 ## Math primitives
@@ -318,4 +340,16 @@ blocks alongside the 6×6 state block.
    empyrean.AutoEscalationPolicy
    empyrean.AcceptabilityThresholds
    empyrean.CovarianceRepresentation
+```
+
+## Errors
+
+```{eval-rst}
+.. autosummary::
+   :toctree: _generated
+   :nosignatures:
+
+   empyrean.KernelCoverageError
+   empyrean.PushError
+   empyrean.PushErrorVariant
 ```

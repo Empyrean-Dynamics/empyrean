@@ -7,6 +7,7 @@
 `evaluate(orbit, observations, *, config=…)`
 `refine(orbit, observations, *, config=…)`
 `transform_coordinates(coordinates, target, frame=…, origin=…)`
+`transform_orbits(orbits, target, frame=…, origin=…)`
 `get_states(target, center, epochs, frame=…)`
 `get_observer_states(obs_codes, epochs, frame=…, origin=…)`
 `compute_impact_probabilities(orbits, end_epoch, methods, body_filter=…)`
@@ -62,6 +63,10 @@
 ## Propagation
 `PropagationConfig` — Configuration for orbit propagation.
 `PropagationResult` (from_dir, mixture_chains, rows_for, tagged_covariance_series, to_dir) — Result of orbit propagation.
+`OrbitStatuses` (error_code, error_message, first_row, num_rows, orbit_id, orbit_index, outcome) — One row per input orbit, in input order — a batch's delivery table.
+`OrbitOutcome` — Delivery outcome of one input orbit in a batch.
+`MixtureChains` (21 methods) — Flat per-``(orbit, CA epoch, component)`` AGM component readback.
+`ComponentStatus` — How one adaptive-Gaussian-mixture component resolved at a close approach.
 `DiagnosticsConfig` — Per-trajectory diagnostic outputs (sensitivity, nonlinearity,
 `AdvancedIntegratorConfig` — Integrator-tuning knobs.
 `IntegratorChoice` — Integrator backend selector.
@@ -132,6 +137,16 @@
 `PlannedObservationKind` — What a :class:`PlannedObservation` would measure.
 `RadarMode` — Which radar observable(s) a candidate would measure.
 `RadarStation` — A radar dish the planner can schedule against.
+`LogDetWithheld` — Why a :attr:`PlanMetrics.log_det` is NaN — the nonlinear transport
+
+## Visibility
+`compute_visibility(orbits, start, end, step_days, config=…)`
+`VisibilityResult` — The result of :func:`empyrean.compute_visibility` — four quivr tables
+`VisibilityPoints` (16 methods) — Per-epoch observability — one row per orbit × observatory × grid
+`VisibilityWindows` (11 methods) — Contiguous observable windows. Mirrors ``empyrean::VisibilityWindow``.
+`Nights` (18 methods) — The structure of one local night at one observatory — one row per
+`VisibilityAnchors` (21 methods) — Night anchors — one row per (night, policy). Mirrors ``empyrean::Anchor``
+`ObservatorySummary` (earth_orientation_analytic_iau_2006_epochs, earth_orientation_bpc_epochs, earth_orientation_present, note, obs_code, orbit_id, resolved_method) — Per-observatory survey provenance — one row per orbit × observatory.
 
 ## Math primitives
 `eigenvector_max_6x6(matrix)`
@@ -197,3 +212,8 @@
 `AutoEscalationPolicy` — Trigger thresholds for :attr:`SolveForParams.AUTO` escalation.
 `AcceptabilityThresholds` — Thresholds for the post-DC fit-acceptability sub-checks. Mirrors
 `CovarianceRepresentation` — Coordinate basis the OD output covariance is reported in.
+
+## Errors
+`KernelCoverageError` — A kernel a data package shipped for a slot does not cover the slot.
+`PushError` — A packed-joint wire refusal, tagged with its cause.
+`PushErrorVariant` — The cause of a packed-joint wire refusal.

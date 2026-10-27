@@ -9,8 +9,7 @@ covariance propagation, nonlinearity diagnostics, and Bayesian updates.
 
 ## Getting a table in the first place
 
-Partials exist whenever the propagation **traced the STM** — not, as the
-docs used to say, whenever an input covariance was supplied. An input
+Partials exist whenever the propagation **traced the STM**. An input
 covariance is one way to make the engine trace it; asking directly is
 the other, and it is the one to reach for when there is no prior:
 
@@ -40,12 +39,13 @@ eph = empyrean.generate_ephemeris(
 ## Filter to one chain
 
 Sensitivity tables hold every `(orbit, epoch)` row across all
-propagated orbits — group with the standard quivr `select` pattern
+propagated orbits; group with the standard quivr `select` pattern
 before pulling matrices:
 
 ```python
 result = empyrean.propagate(orbits, epochs)
-chain  = result.sensitivity.select("orbit_id", "99942")
+apophis = orbits.object_id[0].as_py()
+chain   = result.sensitivity.select("object_id", apophis)
 
 epoch  = empyrean.Epochs.from_mjd([61500.0], scale="tdb")
 phi    = chain.stms_array()[chain.index_at(epoch)]     # (6, 6) Φ matrix
@@ -71,7 +71,7 @@ i_a, i_b = chain.index_at(t_a), chain.index_at(t_b)
 phi_ba = chain.stms_array()[i_b] @ np.linalg.inv(chain.stms_array()[i_a])
 ```
 
-Multi-chain methods raise with a hint to filter — calling
+Multi-chain methods raise with a hint to filter: calling
 `stms_array()` on a multi-orbit table raises:
 
 ```
@@ -105,7 +105,7 @@ Control Dyn. 29(6).
 ## Nonlinearity diagnostic
 
 For Jet2-propagated chains, `chain.kappa(cov_0)` returns the per-epoch
-local nonlinearity diagnostic — a scalar measure of how much the
+local nonlinearity diagnostic, a scalar measure of how much the
 second-order STT contribution would shift the propagated mean
 relative to the linear map:
 
@@ -113,7 +113,7 @@ relative to the linear map:
 kappas = chain.kappa(cov_0)        # array of length n_t
 ```
 
-The diagnostic is per-row, not a single number — the same orbit can
+The diagnostic is per-row, not a single number: the same orbit can
 be linear at the last-observation epoch and strongly non-linear over
 a multi-year propagation through a planetary close approach. Use it
 qualitatively: large local values flag epochs where the first-order
@@ -139,7 +139,7 @@ sigma_h, dmu_h = chain.propagate_covariance(cov_0)   # returns (cov, mean-shift)
 
 `n_params` is 6 for state-only DC, 9 when fitting non-grav A1/A2/A3.
 
-The six rows of `H` — and the six axes of `sigma_h` — are the
+The six rows of `H` (and the six axes of `sigma_h`) are the
 topocentric spherical observable, in this order:
 
 | row | constant                   | observable | unit per input unit |
@@ -152,7 +152,7 @@ topocentric spherical observable, in this order:
 | 5   | `SENSITIVITY_ROW_VDEC`     | Dec rate   | deg/day             |
 
 Range comes first, so row 0 is *not* RA. Index with the constants
-rather than with literals — a hand-written `0` reads a range partial in
+rather than with literals: a hand-written `0` reads a range partial in
 AU where an RA partial in degrees was meant, and the result is finite
 and plausible-looking either way. To get the sky-plane 2×2 in deg²,
 take the RA/Dec submatrix (multiply the RA row and column by

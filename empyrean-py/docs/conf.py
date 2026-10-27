@@ -63,7 +63,7 @@ autodoc_typehints_format = "short"
 # module structure is implementation detail.
 add_module_names = False
 python_use_unqualified_type_names = True
-napoleon_google_docstring = False
+napoleon_google_docstring = True
 napoleon_numpy_docstring = True
 napoleon_use_rtype = False
 
@@ -85,6 +85,7 @@ exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
 html_theme = "empyrean"  # registered via empyrean-sphinx-theme entry point
 html_title = f"empyrean {release}"
 html_static_path = ["_static"]
+html_extra_path = ["robots.txt"]
 html_css_files = ["custom.css"]
 html_logo = "_static/logo.svg"
 html_favicon = "_static/favicon.ico"

@@ -10,7 +10,7 @@ what else exists, so an agent can decide on the evidence.
 
 The skill lives at
 [`plugins/empyrean/skills/empyrean/`](https://github.com/Empyrean-Dynamics/empyrean/tree/main/plugins/empyrean/skills/empyrean)
-in the [Agent Skills](https://agentskills.io) format, so one copy serves
+in the [Agent Skills](https://agentskills.io/home) format, so one copy serves
 every agent that reads `SKILL.md`.
 
 ::::{tab-set}
@@ -31,10 +31,12 @@ or copy `plugins/empyrean/skills/empyrean/` into your project's `.agents/skills/
 
 ::::
 
-The Claude Code install serves the plugin from the repository's `release`
-branch, which moves only when a final version has been published to PyPI
-and crates.io, so the skill documents the version `pip install empyrean`
-installs. The other agents read the copy on `main`.
+The `release` branch carries the skill for the latest final release, and
+`main` carries the next version, release candidates included. The Claude
+Code install reads `release`; the other agents read `main`. Until 0.11.0
+is final, `release` carries the 0.11.0 release candidate, because the
+skill first shipped during that cycle, and the matching package installs
+with `pip install --pre empyrean`.
 
 Once installed, the agent loads the skill's description at the start of
 a session and its body when a task matches; nothing is sent anywhere.
@@ -44,8 +46,8 @@ a session and its body when a task matches; nothing is sent anywhere.
 Every page here is also served as plain Markdown, and two index files
 collect them:
 
-- <https://docs.empyrean-dynamics.com/llms.txt> — the index, one line per page.
-- <https://docs.empyrean-dynamics.com/llms-full.txt> — the whole
+- <https://docs.empyrean-dynamics.com/llms.txt>: the index, one line per page.
+- <https://docs.empyrean-dynamics.com/llms-full.txt>: the whole
   documentation in one file.
 
 The same content is indexed by [Context7](https://context7.com), for
@@ -96,4 +98,4 @@ An agent's result is checked the same way a person's is:
 - **The release itself** against the live
   [validation report](https://validation.empyrean-dynamics.com/latest/validation_report.html),
   which compares all four channels with each other and with JPL Horizons
-  and ASSIST on a shared catalogue of objects.
+  and ASSIST on a shared catalog of objects.

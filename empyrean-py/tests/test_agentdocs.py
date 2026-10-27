@@ -32,6 +32,7 @@ EXPECTED_ORDER = [
     "cookbook/impact-probability",
     "cookbook/orbit-determination",
     "cookbook/sensitivity",
+    "cookbook/observability",
     "cookbook/data-setup",
     "agents",
     "reference/frames-units",
